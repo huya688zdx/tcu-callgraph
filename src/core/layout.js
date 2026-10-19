@@ -431,7 +431,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       dirBoxes.get(dir).push(fn);
     }
   }
-  const containers = [...dirBoxes.entries()]
+  const dirEntries = [...dirBoxes.entries()];
+  const maxDepth = dirEntries.reduce((m, [p]) => Math.max(m, p.split('/').length), 1);
+  const containers = dirEntries
     .map(([p, list]) => {
       let x0 = Infinity;
       let y0 = Infinity;
@@ -443,33 +445,73 @@ export function layoutGrouped(nodes, edges, opts = {}) {
         x1 = Math.max(x1, g.x + g.w);
         y1 = Math.max(y1, g.y + g.h);
       }
+      const depth = p.split('/').length;
+      // 外层比内层多留出 (maxDepth - depth) * 22，保证每层标题不重叠
+      const extra = (maxDepth - depth) * 22;
       return {
         id: p,
         label: p.split('/').pop(),
-        x: x0 - 18,
-        y: y0 - 32,
-        w: x1 - x0 + 36,
-        h: y1 - y0 + 50,
-        depth: p.split('/').length,
+        x: x0 - 18 - extra,
+        y: y0 - 34 - extra,
+        w: x1 - x0 + 36 + extra * 2,
+        h: y1 - y0 + 52 + extra * 2,
+        depth,
       };
     })
     .sort((a, b) => a.depth - b.depth);
+
+  const fileGroups = fileLay.nodes.map((n) => ({
+    id: n.id,
+    label: n.name,
+    x: n.x,
+    y: n.y,
+    w: n.w,
+    h: n.h,
+    layer: n.layer,
+  }));
+
+  // 外层容器的负 padding 会把框推到负坐标，整体平移回正区
+  let minX = Infinity;
+  let minY = Infinity;
+  for (const c of containers) {
+    minX = Math.min(minX, c.x);
+    minY = Math.min(minY, c.y);
+  }
+  for (const g of fileGroups) {
+    minX = Math.min(minX, g.x);
+    minY = Math.min(minY, g.y);
+  }
+  const ox = Number.isFinite(minX) && minX < 40 ? 40 - minX : 0;
+  const oy = Number.isFinite(minY) && minY < 40 ? 40 - minY : 0;
+  if (ox || oy) {
+    for (const n of mergedNodes) {
+      n.x += ox;
+      n.y += oy;
+    }
+    for (const g of fileGroups) {
+      g.x += ox;
+      g.y += oy;
+    }
+    for (const c of containers) {
+      c.x += ox;
+      c.y += oy;
+    }
+    for (const e of routed) {
+      if (!e.points) continue;
+      for (const p of e.points) {
+        p[0] += ox;
+        p[1] += oy;
+      }
+    }
+  }
 
   return {
     nodes: mergedNodes,
     edges: routed,
     containers,
-    groups: fileLay.nodes.map((n) => ({
-      id: n.id,
-      label: n.name,
-      x: n.x,
-      y: n.y,
-      w: n.w,
-      h: n.h,
-      layer: n.layer,
-    })),
-    width,
-    height: maxY + 30,
+    groups: fileGroups,
+    width: width + ox,
+    height: maxY + 30 + oy,
     layers: fileLay.layers,
   };
 }

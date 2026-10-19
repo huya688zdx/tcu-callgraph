@@ -91,6 +91,21 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+/** 节点只能在所属文件框内移动，避免跑出框外导致结构散架 */
+function clampToGroup(n) {
+  const v = state.view;
+  if (!v || !v.groups || !n.group) return;
+  const g = v.groups.find((x) => x.id === n.group);
+  if (!g) return;
+  const pad = 8;
+  const left = g.x + pad;
+  const right = g.x + g.w - n.w - pad;
+  const top = g.y + 32;
+  const bottom = g.y + g.h - n.h - pad;
+  if (right >= left) n.x = Math.max(left, Math.min(right, n.x));
+  if (bottom >= top) n.y = Math.max(top, Math.min(bottom, n.y));
+}
+
 /** 文件框跟随节点：节点拖出框外时框自动扩大 */
 function updateGroups() {
   const v = state.view;
@@ -159,7 +174,6 @@ function draw() {
   if (v.containers) for (const c of v.containers) drawContainer(ctx, c);
 
   if (v.groups) {
-    updateGroups();
     for (const g of v.groups) drawGroup(ctx, g);
   }
 
@@ -430,7 +444,6 @@ async function loadView(rootId) {
   history.idx = -1;
   pushHistory();
 }
-
 async function loadStats() {
   const d = await (await fetch('/api/stats')).json();
   const s = d.stats;
@@ -871,6 +884,7 @@ els.cv.addEventListener('pointermove', (e) => {
     const rawDy = (e.clientY - state.dragStart.y) / cam.k;
     state.dragNode.x = state.dragStart.nx + rawDx;
     state.dragNode.y = state.dragStart.ny + rawDy;
+    clampToGroup(state.dragNode);
     if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
     liveReroute(state.dragNode.id); // 相连的边实时避障重布
     draw();
