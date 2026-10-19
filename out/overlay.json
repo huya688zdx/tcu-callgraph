@@ -1,0 +1,102 @@
+{
+ "nodes": {
+  "adc.c::Adc_Init": {
+   "note": "",
+   "tag": "10",
+   "color": "#FCEBEB",
+   "updatedAt": "2026-10-19T16:05:26.180Z"
+  }
+ },
+ "edges": {},
+ "notes": [],
+ "layout": {
+  "group": {
+   "nodes": {
+    "adc.c::Adc_Init": {
+     "x": 59,
+     "y": 97
+    },
+    "adc.c::Adc_Read": {
+     "x": 58,
+     "y": 161
+    },
+    "tcu/main.c::main": {
+     "x": 880,
+     "y": 259
+    },
+    "tcu/main.c::Task_10ms": {
+     "x": 558,
+     "y": 237
+    },
+    "tcu/main.c::Task_100ms": {
+     "x": 854,
+     "y": 410
+    },
+    "tcu/main.c::Task_Shift": {
+     "x": 563,
+     "y": 418
+    },
+    "tcu/can.c::Can_Init": {
+     "x": 186,
+     "y": 559
+    },
+    "tcu/can.c::Can_SendRaw": {
+     "x": 411,
+     "y": 701
+    },
+    "tcu/can.c::Can_GetRpm": {
+     "x": 108,
+     "y": 660
+    },
+    "tcu/can.c::Can_SendGearStatus": {
+     "x": 342,
+     "y": 543
+    },
+    "tcu/can.c::Can_GetSpeed": {
+     "x": 523,
+     "y": 560
+    },
+    "tcu/adc.c::Adc_Init": {
+     "x": 721,
+     "y": 567
+    },
+    "tcu/adc.c::Adc_Read": {
+     "x": 692,
+     "y": 698
+    },
+    "tcu/gear.c::Gear_Init": {
+     "x": 919,
+     "y": 617
+    },
+    "tcu/gear.c::Gear_CheckSpeed": {
+     "x": 1063,
+     "y": 617
+    },
+    "tcu/gear.c::Gear_ShiftUp": {
+     "x": 1229,
+     "y": 617
+    },
+    "tcu/gear.c::Gear_ShiftDown": {
+     "x": 1481,
+     "y": 552
+    }
+   },
+   "edges": {
+    "tcu/main.c::main->tcu/can.c::Can_GetRpm:55": {
+     "toSide": "top"
+    },
+    "tcu/adc.c::Adc_Init->tcu/gear.c::Gear_Init:20": {
+     "toSide": "left"
+    },
+    "tcu/adc.c::Adc_Init->tcu/gear.c::Gear_CheckSpeed:20": {
+     "toSide": "bottom"
+    },
+    "tcu/main.c::Task_10ms->tcu/can.c::Can_GetRpm:55": {
+     "fromSide": "bottom",
+     "toSide": "top"
+    }
+   },
+   "manual": []
+  }
+ }
+}

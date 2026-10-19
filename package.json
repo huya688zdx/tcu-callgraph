@@ -1,0 +1,17 @@
+{
+  "name": "tcu-callgraph",
+  "version": "0.2.0",
+  "description": "汽车变速箱 TCU 的 C 语言调用关系流程图工具",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "app": "electron .",
+    "serve": "node src/server.js",
+    "scan": "node src/cli/scan.js",
+    "export": "node src/cli/export.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^44.9.0"
+  }
+}

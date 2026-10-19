@@ -1,0 +1,75 @@
+/* 手写的调用图 DOT 示例：用于验证 DOT 解析器 */
+digraph TCU_CallGraph {
+    rankdir = TB;
+    nodesep = 0.4;
+    ranksep = 0.7;
+    fontname = "Microsoft YaHei";
+    node [shape = box, style = "rounded,filled", fillcolor = "#E6F1FB",
+          color = "#185FA5", fontsize = 11];
+    edge [color = "#5F5E5A", arrowsize = 0.7];
+
+    subgraph cluster_isr {
+        label = "ISR 层";
+        style = "dashed";
+        color = "#D4537E";
+        SysTick_Handler [label = "SysTick_Handler", fillcolor = "#FBEAF0"];
+    }
+
+    subgraph cluster_task {
+        label = "调度层";
+        style = "dashed";
+        color = "#854F0B";
+        main          [label = "main"];
+        Task_10ms     [label = "Task_10ms"];
+        Task_100ms    [label = "Task_100ms"];
+        Task_Shift    [label = "Task_Shift"];
+    }
+
+    subgraph cluster_app {
+        label = "应用层";
+        style = "dashed";
+        color = "#185FA5";
+        Gear_Apply      [label = "Gear_Apply"];
+        Gear_CheckSpeed [label = "Gear_CheckSpeed"];
+        Gear_ShiftUp    [label = "Gear_ShiftUp"];
+        Gear_ShiftDown  [label = "Gear_ShiftDown"];
+        Gear_Retry      [label = "Gear_Retry", fillcolor = "#FAEEDA"];
+    }
+
+    subgraph cluster_drv {
+        label = "驱动层";
+        style = "dashed";
+        color = "#3B6D11";
+        Can_GetRpm        [label = "Can_GetRpm"];
+        Can_GetSpeed      [label = "Can_GetSpeed"];
+        Can_SendGearStatus[label = "Can_SendGearStatus"];
+        Can_SendRaw       [label = "Can_SendRaw", style = "rounded,filled,dashed"];
+        Adc_Read          [label = "Adc_Read"];
+    }
+
+    EnterCritical [label = "EnterCritical", fillcolor = "#F1EFE8"];
+    ExitCritical  [label = "ExitCritical",  fillcolor = "#F1EFE8"];
+
+    SysTick_Handler -> Task_10ms [label = "via CALL()", style = "dashed", color = "#854F0B"];
+    main -> Task_10ms;
+    main -> Task_100ms;
+    Task_10ms -> Task_Shift;
+    Task_10ms -> Can_GetRpm;
+    Task_Shift -> Gear_CheckSpeed [label = "SPORT_MODE"];
+    Task_Shift -> Gear_ShiftUp    [label = "via fnptr"];
+    Task_Shift -> Gear_ShiftDown  [label = "via fnptr"];
+    Task_Shift -> Task_100ms;
+    Task_100ms -> Can_SendGearStatus;
+    Gear_ShiftUp -> Gear_Apply    [label = "via SET_GEAR", color = "#993C1D"];
+    Gear_ShiftDown -> EnterCritical;
+    Gear_ShiftDown -> Gear_Apply  [label = "via SET_GEAR_SAFE", color = "#993C1D"];
+    Gear_ShiftDown -> ExitCritical;
+    Gear_Apply -> Gear_CheckSpeed;
+    Gear_Apply -> Gear_Retry      [label = "retry"];
+    Gear_Retry -> Gear_Apply;
+    Gear_Apply -> Can_GetRpm;
+    Gear_Apply -> Can_GetSpeed;
+    Gear_Apply -> Can_SendGearStatus;
+    Gear_CheckSpeed -> Adc_Read   [label = "via READ_ADC", color = "#993C1D"];
+    Can_SendGearStatus -> Can_SendRaw;
+}

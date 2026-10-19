@@ -1,0 +1,11 @@
+# 默认按 LF 存储
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF，否则 cmd 解析多行块会出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制
+*.png binary
+*.xlsx binary
+*.exe binary

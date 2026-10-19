@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="app.title">TCU 调用关系图</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px; color: #2C2C2A; background: #F7F6F2;
+  }
+  #app {
+    display: grid; height: 100vh;
+    grid-template-columns: 250px 1fr 310px;
+    grid-template-rows: 48px 1fr;
+    grid-template-areas: "top top top" "left main right";
+  }
+  header {
+    grid-area: top; display: flex; align-items: center; gap: 8px;
+    padding: 0 12px; background: #fff; border-bottom: 1px solid rgba(0,0,0,.1);
+  }
+  .brand { font-weight: 500; font-size: 14px; margin-right: 4px; white-space: nowrap; }
+  .brand small { color: #888780; font-weight: 400; margin-left: 6px; }
+  input[type=search] {
+    width: 220px; height: 30px; padding: 0 10px; font-size: 13px;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 8px; background: #fff; outline: none;
+  }
+  input[type=search]:focus { border-color: #185FA5; }
+  select, button {
+    height: 30px; padding: 0 9px; font-size: 12.5px; border-radius: 8px;
+    border: 1px solid rgba(0,0,0,.16); background: #fff; color: #2C2C2A; cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { background: #F1EFE8; }
+  button.primary { background: #185FA5; color: #fff; border-color: #185FA5; }
+  button.primary:hover { background: #0C447C; }
+  .spacer { flex: 1; }
+  .hint { color: #888780; font-size: 11.5px; white-space: nowrap; }
+  .chk { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: #5F5E5A; cursor: pointer; user-select: none; white-space: nowrap; }
+  .chk input { width: 14px; height: 14px; cursor: pointer; margin: 0; }
+
+  aside { background: #fff; overflow: auto; }
+  #left { grid-area: left; border-right: 1px solid rgba(0,0,0,.08); }
+  #right { grid-area: right; border-left: 1px solid rgba(0,0,0,.08); }
+  main { grid-area: main; position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; cursor: default; }
+  canvas.panning { cursor: grabbing; }
+  canvas.over-node { cursor: move; }
+  canvas.linking { cursor: crosshair; }
+
+  .sec { padding: 12px 14px; border-bottom: 1px solid rgba(0,0,0,.07); }
+  .sec h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
+  .stat-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12.5px; }
+  .stat-row span:last-child { color: #185FA5; font-variant-numeric: tabular-nums; }
+  .chip {
+    display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 11px;
+    background: #E6F1FB; color: #0C447C; margin: 2px 3px 2px 0;
+  }
+  .chip.macro { background: #FAECE7; color: #993C1D; }
+  .chip.fnptr { background: #EEEDFE; color: #534AB7; }
+  .chip.manual { background: #EAF3DE; color: #3B6D11; }
+
+  #results { list-style: none; margin: 0; padding: 0; }
+  #results li { padding: 7px 8px; border-radius: 7px; cursor: pointer; margin-bottom: 2px; }
+  #results li:hover { background: #F1EFE8; }
+  #results li .fn { font-weight: 500; font-size: 12.5px; }
+  #results li .meta { color: #888780; font-size: 11.5px; margin-top: 1px; }
+
+  .detail-title { font-size: 14px; font-weight: 500; margin-bottom: 4px; word-break: break-all; }
+  .detail-meta { color: #888780; font-size: 12px; margin-bottom: 10px; }
+  .field { margin-bottom: 10px; }
+  .field label { display: block; font-size: 11.5px; color: #5F5E5A; margin-bottom: 4px; }
+  .field textarea, .field input[type=text] {
+    width: 100%; padding: 6px 8px; font-size: 12.5px; font-family: inherit;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 7px; outline: none; resize: vertical;
+  }
+  .field textarea:focus, .field input:focus { border-color: #185FA5; }
+  .swatches { display: flex; gap: 6px; }
+  .sw { width: 22px; height: 22px; border-radius: 6px; cursor: pointer; border: 2px solid transparent; }
+  .sw.on { border-color: #2C2C2A; }
+  .edge-item { font-size: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(0,0,0,.08); }
+  .edge-item:last-child { border: 0; }
+  .edge-item b { font-weight: 500; }
+  .empty { color: #B4B2A9; font-size: 12px; padding: 8px 0; }
+
+  #tooltip {
+    position: absolute; pointer-events: none; background: #2C2C2A; color: #fff;
+    padding: 6px 9px; border-radius: 7px; font-size: 12px; opacity: 0;
+    transition: opacity .12s; max-width: 320px; line-height: 1.5; z-index: 10;
+  }
+  .legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: #5F5E5A; }
+  .legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand"><span data-i18n="app.title">TCU 调用关系图</span><small id="rootName"></small></div>
+    <input id="search" type="search" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
+    <select id="depth" data-i18n-title="depth.down1">
+      <option value="1" data-i18n="depth.down1">向下 1 层</option>
+      <option value="2" data-i18n="depth.down2">向下 2 层</option>
+      <option value="3" selected data-i18n="depth.down3">向下 3 层</option>
+      <option value="5" data-i18n="depth.down5">向下 5 层</option>
+      <option value="9" data-i18n="depth.downAll">向下全部</option>
+    </select>
+    <select id="updepth">
+      <option value="0" selected data-i18n="depth.up0">向上 0 层</option>
+      <option value="1" data-i18n="depth.up1">向上 1 层</option>
+      <option value="2" data-i18n="depth.up2">向上 2 层</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
+    <button id="fit" data-i18n="btn.fit">适应</button>
+    <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
+    <div class="spacer"></div>
+    <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击下钻 · 拖节点自动重布线 · 选中连线拖线段调整走向 · 双击连线恢复自动</span>
+    <button id="exportSvg" data-i18n="btn.svg">导出 SVG</button>
+    <button id="exportPng" data-i18n="btn.png">PNG</button>
+    <button id="exportHtml" data-i18n="btn.html">HTML</button>
+    <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
+  </header>
+
+  <aside id="left">
+    <div class="sec">
+      <h3 data-i18n="panel.overview">工程概览</h3>
+      <div id="stats"></div>
+    </div>
+    <div class="sec">
+      <h3 data-i18n="panel.results">搜索结果</h3>
+      <ul id="results"><li class="empty" data-i18n="empty.search">输入函数名开始搜索</li></ul>
+    </div>
+    <div class="sec">
+      <h3 data-i18n="panel.legend">图例</h3>
+      <div class="legend">
+        <div><i style="border-color:#888780"></i><span data-i18n="legend.direct">直接调用</span></div>
+        <div><i style="border-color:#D85A30;border-top-style:dashed"></i><span data-i18n="legend.macro">经宏</span></div>
+        <div><i style="border-color:#7F77DD;border-top-style:dashed"></i><span data-i18n="legend.fnptr">函数指针</span></div>
+        <div><i style="border-color:#639922"></i><span data-i18n="legend.manual">手动画线</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <main>
+    <canvas id="cv"></canvas>
+    <div id="tooltip"></div>
+  </main>
+
+  <aside id="right">
+    <div class="sec">
+      <h3 data-i18n="panel.detail">节点详情</h3>
+      <div id="detail"><div class="empty" data-i18n="empty.detail">点击图中节点查看详情</div></div>
+    </div>
+    <div class="sec">
+      <h3 data-i18n="panel.edges">调用关系</h3>
+      <div id="edges"><div class="empty" data-i18n="empty.edges">—</div></div>
+    </div>
+  </aside>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

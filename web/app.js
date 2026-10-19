@@ -1,0 +1,1151 @@
+import { t, applyI18n } from './i18n.js';
+import { routeEdges, collectSegments, nearestSide, roundedPathD } from '/core/routing.js';
+
+const els = {
+  cv: document.getElementById('cv'),
+  ctx: document.getElementById('cv').getContext('2d'),
+  search: document.getElementById('search'),
+  depth: document.getElementById('depth'),
+  updepth: document.getElementById('updepth'),
+  fit: document.getElementById('fit'),
+  resetLayout: document.getElementById('resetLayout'),
+  groupMode: document.getElementById('groupMode'),
+  stats: document.getElementById('stats'),
+  results: document.getElementById('results'),
+  detail: document.getElementById('detail'),
+  edges: document.getElementById('edges'),
+  rootName: document.getElementById('rootName'),
+  tooltip: document.getElementById('tooltip'),
+};
+
+const state = {
+  view: null,
+  root: null,
+  selected: null,
+  hover: null,
+  down: 3,
+  up: 0,
+  group: true,
+  selectedEdge: null,
+  dragSeg: null,
+  dragEnd: null,
+  dragNode: null,
+  dragStart: null,
+  dragMoved: false,
+  panning: false,
+  linkFrom: null,
+  linkPos: null,
+};
+
+const cam = { x: 0, y: 0, k: 1 };
+
+const COLORS = {
+  direct: '#9A9890',
+  macro: '#D85A30',
+  fnptr: '#7F77DD',
+  manual: '#639922',
+  unknown: '#C9C7BE',
+};
+
+const FONT = '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
+
+const shortFile = (f) => {
+  if (!f) return '';
+  const parts = String(f).split(/[\\/]/);
+  return parts.slice(-2).join('/');
+};
+
+const esc = (s) =>
+  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+const nodeById = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
+
+// ---------------- 画布 ----------------
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = els.cv.clientWidth;
+  const h = els.cv.clientHeight;
+  els.cv.width = Math.round(w * dpr);
+  els.cv.height = Math.round(h * dpr);
+  draw();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/** 文件框跟随节点：节点拖出框外时框自动扩大 */
+function updateGroups() {
+  const v = state.view;
+  if (!v || !v.groups) return;
+  const byGroup = new Map();
+  for (const n of v.nodes) {
+    if (!n.group) continue;
+    if (!byGroup.has(n.group)) byGroup.set(n.group, []);
+    byGroup.get(n.group).push(n);
+  }
+  for (const g of v.groups) {
+    const list = byGroup.get(g.id);
+    if (!list || !list.length) continue;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of list) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.w > maxX) maxX = n.x + n.w;
+      if (n.y + n.h > maxY) maxY = n.y + n.h;
+    }
+    g.x = minX - 14;
+    g.y = minY - 34;
+    g.w = maxX - minX + 28;
+    g.h = maxY - minY + 48;
+  }
+}
+
+function draw() {
+  const { ctx, cv } = els;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.width / dpr;
+  const H = cv.height / dpr;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const v = state.view;
+  if (!v) {
+    ctx.fillStyle = '#B4B2A9';
+    ctx.font = `13px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('…', W / 2, H / 2);
+    return;
+  }
+
+  ctx.save();
+  ctx.translate(cam.x, cam.y);
+  ctx.scale(cam.k, cam.k);
+
+  if (!v.nodes.length) {
+    ctx.restore();
+    ctx.fillStyle = '#B4B2A9';
+    ctx.font = `13px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
+    return;
+  }
+
+  if (v.groups) {
+    updateGroups();
+    for (const g of v.groups) drawGroup(ctx, g);
+  }
+
+  for (const e of v.edges) {
+    const related = state.selected && (e.from === state.selected || e.to === state.selected);
+    drawEdge(ctx, e, related, state.selectedEdge === e);
+  }
+
+  if (state.linkFrom && state.linkPos) {
+    const a = state.linkFrom;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(a.x + a.w / 2, a.y + a.h);
+    ctx.lineTo(state.linkPos.x, state.linkPos.y);
+    ctx.strokeStyle = COLORS.manual;
+    ctx.lineWidth = 1.8;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (state.dragEnd) {
+    const pts = edgePoints(state.dragEnd.edge);
+    const from = state.dragEnd.which === 'from' ? pts[pts.length - 1] : pts[0];
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(from[0], from[1]);
+    ctx.lineTo(state.dragEnd.pos.x, state.dragEnd.pos.y);
+    ctx.strokeStyle = '#185FA5';
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([4, 4]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (const n of v.nodes) drawNode(ctx, n);
+
+  ctx.restore();
+
+  ctx.fillStyle = '#B4B2A9';
+  ctx.font = `11px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
+}
+
+function drawGroup(ctx, g) {
+  ctx.save();
+  roundRect(ctx, g.x, g.y, g.w, g.h, 12);
+  ctx.fillStyle = 'rgba(230, 241, 251, 0.45)';
+  ctx.fill();
+  ctx.strokeStyle = '#B5D4F4';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  const hh = 26;
+  ctx.save();
+  roundRect(ctx, g.x, g.y, g.w, g.h, 12);
+  ctx.clip();
+  ctx.fillStyle = 'rgba(181, 212, 244, 0.5)';
+  ctx.fillRect(g.x, g.y, g.w, hh);
+  ctx.restore();
+
+  ctx.fillStyle = '#0C447C';
+  ctx.font = `500 ${Math.min(26, Math.max(12, 11 / cam.k))}px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  const label = g.label;
+  ctx.fillText(label, g.x + 12, g.y + hh / 2 + 1);
+  ctx.restore();
+}
+
+/** 圆角正交折线（严格水平/垂直段，折点用二次贝塞尔过渡） */
+function strokeRounded(ctx, pts, r = 7) {
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const prev = pts[i - 1];
+    const next = pts[i + 1];
+    const l1 = Math.hypot(p[0] - prev[0], p[1] - prev[1]);
+    const l2 = Math.hypot(next[0] - p[0], next[1] - p[1]);
+    if (l1 < 1 || l2 < 1) {
+      ctx.lineTo(p[0], p[1]);
+      continue;
+    }
+    const rr = Math.min(r, l1 / 2, l2 / 2);
+    ctx.lineTo(p[0] - ((p[0] - prev[0]) / l1) * rr, p[1] - ((p[1] - prev[1]) / l1) * rr);
+    ctx.quadraticCurveTo(
+      p[0],
+      p[1],
+      p[0] + ((next[0] - p[0]) / l2) * rr,
+      p[1] + ((next[1] - p[1]) / l2) * rr
+    );
+  }
+  const last = pts[pts.length - 1];
+  ctx.lineTo(last[0], last[1]);
+}
+
+function drawEdge(ctx, e, related, selected) {
+  const pts = edgePoints(e);
+  if (!pts || pts.length < 2) return;
+
+  const color = COLORS[e.kind] || COLORS.direct;
+  ctx.save();
+  ctx.beginPath();
+  strokeRounded(ctx, pts);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = selected ? 2.6 : related ? 2.4 : e.kind === 'manual' ? 1.8 : 1.3;
+  ctx.globalAlpha = state.selected && !related && !selected ? 0.26 : 1;
+  if (e.kind === 'macro' || e.kind === 'fnptr') ctx.setLineDash([5, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const a = pts[pts.length - 2];
+  const b = pts[pts.length - 1];
+  let dx = b[0] - a[0];
+  let dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy) || 1;
+  dx /= len;
+  dy /= len;
+  const s = 6;
+  ctx.beginPath();
+  ctx.moveTo(b[0], b[1]);
+  ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
+  ctx.lineTo(b[0] - s * dx + s * 0.55 * dy, b[1] - s * dy - s * 0.55 * dx);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+
+  if (selected) {
+    // 中间线段手柄（拖动可调整该段的走向，保持正交）
+    const hs = 4.5 / cam.k;
+    for (let i = 1; i <= pts.length - 3; i++) {
+      const mx = (pts[i][0] + pts[i + 1][0]) / 2;
+      const my = (pts[i][1] + pts[i + 1][1]) / 2;
+      ctx.beginPath();
+      ctx.rect(mx - hs, my - hs, hs * 2, hs * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.strokeStyle = '#185FA5';
+      ctx.lineWidth = 1.5 / cam.k;
+      ctx.stroke();
+    }
+
+    // 两端圆形手柄（可拖到其他节点上重连）
+    const r = 5 / cam.k;
+    for (const p of [pts[0], pts[pts.length - 1]]) {
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.strokeStyle = '#185FA5';
+      ctx.lineWidth = 2 / cam.k;
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawNode(ctx, n) {
+  const { x, y, w, h } = n;
+  const selected = state.selected === n.id;
+  const hover = state.hover === n.id;
+  const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
+  const dimmed = state.selected && !selected && !isNeighbor(n.id);
+
+  ctx.save();
+  ctx.globalAlpha = dimmed ? 0.3 : 1;
+
+  roundRect(ctx, x, y, w, h, 8);
+  ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || (n.external ? '#FAFAF7' : '#FFFFFF');
+  ctx.fill();
+
+  ctx.lineWidth = dropTarget ? 2.6 : selected ? 2.2 : hover ? 1.6 : 1;
+  ctx.strokeStyle = dropTarget
+    ? '#639922'
+    : selected
+    ? '#185FA5'
+    : hover
+    ? '#378ADD'
+    : n.external
+    ? '#D3D1C7'
+    : '#B5D4F4';
+  if (n.external) ctx.setLineDash([4, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  if (n.note) {
+    ctx.beginPath();
+    ctx.arc(x + 8, y + 8, 3.2, 0, Math.PI * 2);
+    ctx.fillStyle = '#EF9F27';
+    ctx.fill();
+  }
+
+  const cx = x + w / 2;
+
+  if (cam.k >= 0.32) {
+    ctx.fillStyle = '#2C2C2A';
+    ctx.font = `500 12.5px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    let label = n.name || n.id;
+    const maxW = w - 18;
+    if (ctx.measureText(label).width > maxW) {
+      while (label.length > 4 && ctx.measureText(label + '…').width > maxW) {
+        label = label.slice(0, -1);
+      }
+      label += '…';
+    }
+    ctx.fillText(label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
+
+    if (cam.k >= 0.62) {
+      ctx.font = `10.5px ${FONT}`;
+      ctx.fillStyle = '#888780';
+      const sub = n.external ? t('node.external') : `${shortFile(n.file)}:${n.line}`;
+      ctx.fillText(sub, cx, y + h / 2 + 10);
+    }
+  }
+
+  ctx.restore();
+}
+
+function isNeighbor(id) {
+  const v = state.view;
+  if (!v || !state.selected) return false;
+  if (id === state.selected) return true;
+  return v.edges.some(
+    (e) => (e.from === state.selected && e.to === id) || (e.to === state.selected && e.from === id)
+  );
+}
+
+function fit() {
+  const v = state.view;
+  if (!v) return;
+  const W = els.cv.clientWidth;
+  const H = els.cv.clientHeight;
+  const k = Math.min(W / v.width, H / v.height, 1.8) * 0.93;
+  cam.k = Math.max(0.08, k);
+  cam.x = (W - v.width * cam.k) / 2;
+  cam.y = (H - v.height * cam.k) / 2;
+  draw();
+}
+
+// ---------------- 数据 ----------------
+
+async function loadView(rootId) {
+  const q = new URLSearchParams({
+    down: state.down,
+    up: state.up,
+    group: state.group ? '1' : '0',
+  });
+  if (rootId) q.set('root', rootId);
+  const res = await fetch('/api/view?' + q);
+  const data = await res.json();
+  state.view = data;
+  state.root = data.root;
+  state.selected = null;
+  state.selectedEdge = null;
+  if (data.edges && data.edges.some((e) => !e.points || e.points.length < 2)) {
+    fullReroute(); // 兜底：服务端数据缺折线时本地补算
+  }
+  const rootNode = data.nodes.find((n) => n.id === data.root);
+  els.rootName.textContent = rootNode ? `· ${rootNode.name}` : '';
+  fit();
+  renderDetail(null);
+}
+
+async function loadStats() {
+  const d = await (await fetch('/api/stats')).json();
+  const s = d.stats;
+  const row = (label, val) => `<div class="stat-row"><span>${label}</span><span>${val}</span></div>`;
+  els.stats.innerHTML = [
+    row(t('stat.files'), s.files),
+    row(t('stat.functions'), s.functions),
+    row(t('stat.edges'), s.edges),
+    row(t('stat.macros'), s.macros),
+    row(t('stat.macroEdges'), s.macroEdges),
+    row(t('stat.fnptrEdges'), s.fnptrEdges),
+    row(t('stat.cycles'), s.cycles),
+    row(t('stat.maxFanOut'), s.maxFanOut),
+  ].join('');
+}
+
+let searchTimer;
+els.search.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(runSearch, 140);
+});
+
+async function runSearch() {
+  const q = els.search.value.trim();
+  if (!q) {
+    els.results.innerHTML = `<li class="empty">${t('empty.search')}</li>`;
+    return;
+  }
+  const list = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+  if (!list.length) {
+    els.results.innerHTML = `<li class="empty">${t('empty.noMatch')}</li>`;
+    return;
+  }
+  els.results.innerHTML = list
+    .map(
+      (f) => `<li data-id="${esc(f.id)}">
+        <div class="fn">${esc(f.name)}</div>
+        <div class="meta">${esc(shortFile(f.file))}:${f.line} · ↑${f.inCount} ↓${f.outCount}</div>
+      </li>`
+    )
+    .join('');
+}
+
+els.results.addEventListener('click', (e) => {
+  const li = e.target.closest('li[data-id]');
+  if (!li) return;
+  loadView(li.dataset.id);
+});
+
+els.search.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    const first = els.results.querySelector('li[data-id]');
+    if (first) loadView(first.dataset.id);
+  }
+});
+
+// ---------------- 详情 ----------------
+
+async function renderDetail(id) {
+  if (!id) {
+    els.detail.innerHTML = `<div class="empty">${t('empty.detail')}</div>`;
+    els.edges.innerHTML = `<div class="empty">${t('empty.edges')}</div>`;
+    return;
+  }
+  const d = await (await fetch('/api/node?id=' + encodeURIComponent(id))).json();
+  if (d.error) return;
+  const n = d.node;
+  const ov = d.overlay || {};
+  const colorList = ['', '#FCEBEB', '#FAEEDA', '#EAF3DE', '#E6F1FB', '#EEEDFE', '#FBEAF0'];
+
+  els.detail.innerHTML = `
+    <div class="detail-title">${esc(n.name)}</div>
+    <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    <div class="field">
+      <label>${t('detail.note')}</label>
+      <textarea id="note" rows="3" placeholder="${t('detail.notePlaceholder')}">${esc(ov.note || '')}</textarea>
+    </div>
+    <div class="field">
+      <label>${t('detail.color')}</label>
+      <div class="swatches" id="swatches">
+        ${colorList
+          .map(
+            (c) =>
+              `<div class="sw ${(ov.color || '') === c ? 'on' : ''}" data-color="${c}" style="background:${c || '#fff'};border-color:${c ? 'transparent' : '#D3D1C7'}"></div>`
+          )
+          .join('')}
+      </div>
+    </div>
+    <div class="field">
+      <label>${t('detail.tag')}</label>
+      <input id="tag" type="text" placeholder="${t('detail.tagPlaceholder')}" value="${esc(ov.tag || '')}">
+    </div>
+    <button class="primary" id="saveNote" style="width:100%">${t('detail.save')}</button>
+  `;
+
+  let pickedColor = ov.color || '';
+  els.detail.querySelector('#swatches').addEventListener('click', (e) => {
+    const sw = e.target.closest('.sw');
+    if (!sw) return;
+    pickedColor = sw.dataset.color;
+    els.detail.querySelectorAll('.sw').forEach((s) => s.classList.toggle('on', s === sw));
+  });
+
+  els.detail.querySelector('#saveNote').addEventListener('click', async () => {
+    const note = els.detail.querySelector('#note').value;
+    const tag = els.detail.querySelector('#tag').value;
+    await fetch('/api/overlay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nodeId: id, data: { note, tag, color: pickedColor } }),
+    });
+    const target = nodeById(id);
+    if (target) {
+      target.note = note;
+      target.tag = tag;
+      target.color = pickedColor;
+    }
+    draw();
+    const btn = els.detail.querySelector('#saveNote');
+    btn.textContent = t('detail.saved');
+    setTimeout(() => (btn.textContent = t('detail.save')), 1200);
+  });
+
+  const inE = d.inEdges || [];
+  const outE = d.outEdges || [];
+  const item = (e, dir) => {
+    const other = dir === 'in' ? e.from : e.to;
+    const nm = e.callee || other.split('::')[1] || other;
+    let chip = '';
+    if (e.kind === 'macro') chip = `<span class="chip macro">宏${e.via ? ':' + esc(e.via) : ''}</span>`;
+    else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">指针${e.via ? ':' + esc(e.via) : ''}</span>`;
+    else if (e.kind === 'manual') chip = `<span class="chip manual">手动</span>`;
+    const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
+    return `<div class="edge-item">${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span> ${chip}${cond}</div>`;
+  };
+
+  els.edges.innerHTML =
+    (inE.length
+      ? `<div style="font-size:11.5px;color:#888780;margin-bottom:4px">${t('edge.calledBy')} (${inE.length})</div>` +
+        inE.map((e) => item(e, 'in')).join('')
+      : '') +
+      (outE.length
+        ? `<div style="font-size:11.5px;color:#888780;margin:8px 0 4px">${t('edge.calls')} (${outE.length})</div>` +
+          outE.map((e) => item(e, 'out')).join('')
+        : '') || `<div class="empty">${t('empty.noEdges')}</div>`;
+}
+
+// ---------------- 交互 ----------------
+
+function worldPos(e) {
+  const rect = els.cv.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left - cam.x) / cam.k,
+    y: (e.clientY - rect.top - cam.y) / cam.k,
+  };
+}
+
+function hitTest(e) {
+  if (!state.view) return null;
+  const p = worldPos(e);
+  const nodes = state.view.nodes;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (p.x >= n.x && p.x <= n.x + n.w && p.y >= n.y && p.y <= n.y + n.h) return n;
+  }
+  return null;
+}
+
+/** 边的折线由共享路由器维护（严格正交）；此处只做读取 */
+function edgePoints(e) {
+  return (e && e.points) || [];
+}
+
+/** 对一组边做增量重路由（其余边的线段作为避让约束） */
+function rerouteScope(subset) {
+  const v = state.view;
+  if (!v || !subset.length) return;
+  const others = v.edges.filter((e) => !subset.includes(e));
+  routeEdges(v.nodes, subset, { existing: collectSegments(others) });
+}
+
+/** 节点拖动过程中：只实时重路由与该节点相连的边 */
+function liveReroute(nodeId) {
+  const v = state.view;
+  if (!v) return;
+  rerouteScope(v.edges.filter((e) => e.from === nodeId || e.to === nodeId));
+}
+
+/** 全量重路由（拖拽结束等时机），并扩展画布尺寸 */
+function fullReroute() {
+  const v = state.view;
+  if (!v) return;
+  routeEdges(v.nodes, v.edges, { bounds: { minX: 40, maxX: Math.max(v.width, 600) } });
+  let maxX = 0;
+  let maxY = 0;
+  for (const n of v.nodes) {
+    maxX = Math.max(maxX, n.x + n.w);
+    maxY = Math.max(maxY, n.y + n.h);
+  }
+  for (const e of v.edges) {
+    for (const p of e.points || []) {
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] > maxY) maxY = p[1];
+    }
+  }
+  v.width = Math.max(v.width, maxX + 40);
+  v.height = Math.max(v.height, maxY + 40);
+}
+
+function distToSegment(p, a, b) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len2 = dx * dx + dy * dy;
+  if (!len2) return Math.hypot(p.x - a[0], p.y - a[1]);
+  let t = ((p.x - a[0]) * dx + (p.y - a[1]) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a[0] + t * dx), p.y - (a[1] + t * dy));
+}
+
+function hitEdge(e) {
+  if (!state.view) return null;
+  const p = worldPos(e);
+  let best = null;
+  let bestD = 9 / cam.k;
+  for (const edge of state.view.edges) {
+    const pts = edgePoints(edge);
+    for (let i = 0; i < pts.length - 1; i++) {
+      const d = distToSegment(p, pts[i], pts[i + 1]);
+      if (d < bestD) {
+        bestD = d;
+        best = edge;
+      }
+    }
+  }
+  return best;
+}
+
+/** 命中选中边的中间线段手柄（水平段/垂直段，拖动可调整走向） */
+function hitSegment(e) {
+  if (!state.selectedEdge) return null;
+  const p = worldPos(e);
+  const pts = edgePoints(state.selectedEdge);
+  const r = 8 / cam.k;
+  for (let i = 1; i <= pts.length - 3; i++) {
+    const mx = (pts[i][0] + pts[i + 1][0]) / 2;
+    const my = (pts[i][1] + pts[i + 1][1]) / 2;
+    if (Math.hypot(p.x - mx, p.y - my) <= r) {
+      const orient = Math.abs(pts[i + 1][0] - pts[i][0]) < 0.5 ? 'v' : 'h';
+      return { edge: state.selectedEdge, index: i, orient };
+    }
+  }
+  return null;
+}
+
+function hitEnd(e) {
+  if (!state.selectedEdge) return null;
+  const p = worldPos(e);
+  const pts = edgePoints(state.selectedEdge);
+  const r = 10 / cam.k;
+  if (Math.hypot(p.x - pts[0][0], p.y - pts[0][1]) <= r) return 'from';
+  const last = pts[pts.length - 1];
+  if (Math.hypot(p.x - last[0], p.y - last[1]) <= r) return 'to';
+  return null;
+}
+
+const edgeKey = (e) => `${e.from}->${e.to}:${e.line}`;
+const modifiedEdges = new Set();
+
+/** 拖动线段：水平段只改 y、垂直段只改 x —— 正交性由构造保证 */
+function moveSeg(seg, x, y) {
+  const pts = seg.edge.points;
+  const i = seg.index;
+  if (seg.orient === 'h') {
+    pts[i][1] = y;
+    pts[i + 1][1] = y;
+  } else {
+    pts[i][0] = x;
+    pts[i + 1][0] = x;
+  }
+}
+
+let justDragged = false;
+
+els.cv.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0) return;
+
+  const end = hitEnd(e);
+  if (end) {
+    state.dragEnd = { edge: state.selectedEdge, which: end, pos: worldPos(e), hover: null };
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
+
+  const seg = hitSegment(e);
+  if (seg) {
+    seg.edge.custom = true; // 从此该边折线由用户接管
+    state.dragSeg = seg;
+    els.cv.style.cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
+
+  const n = hitTest(e);
+
+  if (n && e.shiftKey) {
+    state.linkFrom = n;
+    state.linkPos = worldPos(e);
+    els.cv.classList.add('linking');
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
+
+  if (n) {
+    state.dragNode = n;
+    state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
+    state.dragMoved = false;
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
+
+  state.panning = true;
+  state.panMoved = false;
+  state.last = { x: e.clientX, y: e.clientY };
+  els.cv.classList.add('panning');
+  els.cv.setPointerCapture(e.pointerId);
+});
+
+els.cv.addEventListener('pointermove', (e) => {
+  if (state.dragEnd) {
+    state.dragEnd.pos = worldPos(e);
+    const n = hitTest(e);
+    const other = state.dragEnd.which === 'from' ? state.dragEnd.edge.to : state.dragEnd.edge.from;
+    state.dragEnd.hover = n && n.id !== other ? n : null;
+    draw();
+    return;
+  }
+
+  if (state.dragSeg) {
+    const p = worldPos(e);
+    moveSeg(state.dragSeg, p.x, p.y);
+    draw();
+    return;
+  }
+
+  if (state.dragNode) {
+    const rawDx = (e.clientX - state.dragStart.x) / cam.k;
+    const rawDy = (e.clientY - state.dragStart.y) / cam.k;
+    state.dragNode.x = state.dragStart.nx + rawDx;
+    state.dragNode.y = state.dragStart.ny + rawDy;
+    if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
+    liveReroute(state.dragNode.id); // 相连的边实时避障重布
+    draw();
+    return;
+  }
+
+  if (state.linkFrom) {
+    state.linkPos = worldPos(e);
+    draw();
+    return;
+  }
+
+  if (state.panning) {
+    const dx = e.clientX - state.last.x;
+    const dy = e.clientY - state.last.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) state.panMoved = true;
+    cam.x += dx;
+    cam.y += dy;
+    state.last = { x: e.clientX, y: e.clientY };
+    draw();
+    return;
+  }
+
+  const n = hitTest(e);
+  const next = n ? n.id : null;
+  if (next !== state.hover) {
+    state.hover = next;
+    els.cv.classList.toggle('over-node', !!next);
+    draw();
+  }
+
+  // 光标反馈：选中边的端点 / 线段手柄
+  if (state.selectedEdge) {
+    let cursor = '';
+    if (hitEnd(e)) cursor = 'crosshair';
+    else {
+      const seg = hitSegment(e);
+      if (seg) cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
+    }
+    els.cv.style.cursor = cursor;
+  } else if (els.cv.style.cursor) {
+    els.cv.style.cursor = '';
+  }
+
+  if (n) {
+    const rect = els.cv.getBoundingClientRect();
+    els.tooltip.style.opacity = '1';
+    els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
+    els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
+    els.tooltip.innerHTML = `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>`;
+  } else {
+    els.tooltip.style.opacity = '0';
+  }
+});
+
+els.cv.addEventListener('pointerup', (e) => {
+  els.cv.classList.remove('panning', 'linking');
+  els.cv.style.cursor = '';
+
+  if (state.dragEnd) {
+    const { edge, which, hover, pos } = state.dragEnd;
+    state.dragEnd = null;
+    if (hover) {
+      if (which === 'from') {
+        edge.from = hover.id;
+        edge.fromSide = nearestSide(hover, pos);
+      } else {
+        edge.to = hover.id;
+        edge.toSide = nearestSide(hover, pos);
+      }
+      edge.custom = false; // 重连后恢复自动布线
+      modifiedEdges.add(edgeKey(edge));
+      rerouteScope([edge]);
+      saveLayout();
+    }
+    draw();
+    return;
+  }
+
+  if (state.dragSeg) {
+    modifiedEdges.add(edgeKey(state.dragSeg.edge));
+    state.dragSeg = null;
+    saveLayout();
+    draw();
+    return;
+  }
+
+  if (state.dragNode) {
+    const n = state.dragNode;
+    const moved = state.dragMoved;
+    state.dragNode = null;
+    state.dragMoved = false;
+    if (moved) {
+      justDragged = true;
+      setTimeout(() => (justDragged = false), 260);
+      fullReroute(); // 松手后全量避障重布
+      for (const ed of state.view.edges) {
+        if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
+      }
+      saveLayout();
+    } else {
+      selectNode(n.id);
+    }
+    draw();
+    return;
+  }
+
+  if (state.linkFrom) {
+    const from = state.linkFrom;
+    const target = hitTest(e);
+    state.linkFrom = null;
+    state.linkPos = null;
+    if (target && target.id !== from.id) addManualEdge(from.id, target.id);
+    draw();
+    return;
+  }
+
+  if (state.panning) {
+    state.panning = false;
+    if (!state.panMoved) {
+      const edge = hitEdge(e);
+      if (edge) {
+        state.selectedEdge = edge;
+        state.selected = null;
+        draw();
+        renderDetail(null);
+      } else {
+        state.selectedEdge = null;
+        selectNode(null);
+      }
+    }
+    return;
+  }
+});
+
+els.cv.addEventListener('dblclick', (e) => {
+  if (justDragged) return;
+  const n = hitTest(e);
+  if (n) {
+    loadView(n.id);
+    return;
+  }
+  // 双击手动布线的边：恢复自动布线
+  const edge = hitEdge(e);
+  if (edge && edge.custom) {
+    edge.custom = false;
+    modifiedEdges.add(edgeKey(edge));
+    rerouteScope([edge]);
+    saveLayout();
+    draw();
+  }
+});
+
+els.cv.addEventListener(
+  'wheel',
+  (e) => {
+    e.preventDefault();
+    const rect = els.cv.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    const wx = (sx - cam.x) / cam.k;
+    const wy = (sy - cam.y) / cam.k;
+    cam.k = Math.min(4, Math.max(0.06, cam.k * Math.exp(-e.deltaY * 0.0014)));
+    cam.x = sx - wx * cam.k;
+    cam.y = sy - wy * cam.k;
+    draw();
+  },
+  { passive: false }
+);
+
+function selectNode(id) {
+  state.selected = id;
+  draw();
+  renderDetail(id);
+}
+
+async function saveLayout() {
+  const nodes = {};
+  for (const n of state.view.nodes) {
+    nodes[n.id] = { x: Math.round(n.x), y: Math.round(n.y) };
+  }
+
+  const edges = {};
+  for (const e of state.view.edges) {
+    const k = edgeKey(e);
+    if (!modifiedEdges.has(k)) continue;
+    const rec = {};
+    if (e.custom && Array.isArray(e.points) && e.points.length >= 2) {
+      rec.custom = true;
+      rec.points = e.points.map((p) => [Math.round(p[0]), Math.round(p[1])]);
+    }
+    if (e.fromSide) rec.fromSide = e.fromSide;
+    if (e.toSide) rec.toSide = e.toSide;
+    if (Object.keys(rec).length) edges[k] = rec;
+  }
+
+  await fetch('/api/layout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      nodes,
+      manual: collectManual(),
+      edges,
+      mode: state.group ? 'group' : 'flat',
+    }),
+  });
+}
+
+function collectManual() {
+  return state.view.edges.filter((e) => e.manual).map((e) => ({ from: e.from, to: e.to }));
+}
+
+async function addManualEdge(from, to) {
+  const a = nodeById(from);
+  const b = nodeById(to);
+  if (!a || !b) return;
+  const e = {
+    from,
+    to,
+    callee: b.name,
+    kind: 'manual',
+    line: 0,
+    via: '手动',
+    manual: true,
+  };
+  state.view.edges.push(e);
+  rerouteScope([e]); // 由共享路由器布线
+  draw();
+  await fetch('/api/layout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      manual: collectManual(),
+      mode: state.group ? 'group' : 'flat',
+    }),
+  });
+}
+
+window.addEventListener('keydown', (e) => {
+  if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
+  if (e.key === 'f' || e.key === 'F') fit();
+});
+
+els.depth.addEventListener('change', () => {
+  state.down = Number(els.depth.value);
+  loadView(state.root);
+});
+els.updepth.addEventListener('change', () => {
+  state.up = Number(els.updepth.value);
+  loadView(state.root);
+});
+
+els.groupMode.addEventListener('change', () => {
+  state.group = els.groupMode.checked;
+  state.selectedEdge = null;
+  loadView(state.root);
+});
+els.fit.addEventListener('click', fit);
+
+els.resetLayout.addEventListener('click', async () => {
+  await fetch('/api/layout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clear: true, mode: state.group ? 'group' : 'flat' }),
+  });
+  modifiedEdges.clear();
+  loadView(state.root);
+});
+
+// ---------------- 导出 ----------------
+
+function download(name, blob) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function buildSVG() {
+  const v = state.view;
+  updateGroups(); // 分组框跟随当前节点位置
+  const pad = 24;
+
+  // 实际内容范围（含手动布线 / 侧边车道）
+  let minX = 0;
+  let minY = 0;
+  let maxX = v.width;
+  let maxY = v.height;
+  for (const n of v.nodes) {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.w);
+    maxY = Math.max(maxY, n.y + n.h);
+  }
+  for (const e of v.edges) {
+    for (const p of e.points || []) {
+      minX = Math.min(minX, p[0]);
+      minY = Math.min(minY, p[1]);
+      maxX = Math.max(maxX, p[0]);
+      maxY = Math.max(maxY, p[1]);
+    }
+  }
+  const ox = -pad - Math.min(0, minX);
+  const oy = -pad - Math.min(0, minY);
+  const W = maxX - minX + pad * 2;
+  const H = maxY - minY + pad * 2;
+
+  const out = [];
+  out.push(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${ox} ${oy} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
+  );
+  out.push(`<rect x="${ox}" y="${oy}" width="${W}" height="${H}" fill="#F7F6F2"/>`);
+  out.push('<defs>');
+  for (const [k, c] of Object.entries(COLORS)) {
+    out.push(
+      `<marker id="mk-${k}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M2 1L8 5L2 9" fill="none" stroke="${c}" stroke-width="1.5" stroke-linecap="round"/></marker>`
+    );
+  }
+  out.push('</defs>');
+
+  if (v.groups) {
+    for (const g of v.groups) {
+      out.push(
+        `<rect x="${g.x.toFixed(1)}" y="${g.y.toFixed(1)}" width="${g.w.toFixed(1)}" height="${g.h.toFixed(1)}" rx="12" fill="rgba(230,241,251,0.45)" stroke="#B5D4F4" stroke-width="1.2"/>`
+      );
+      out.push(
+        `<path d="M ${g.x.toFixed(1)} ${(g.y + 26).toFixed(1)} H ${(g.x + g.w).toFixed(1)}" stroke="none"/>`
+      );
+      out.push(
+        `<text x="${(g.x + 12).toFixed(1)}" y="${(g.y + 14).toFixed(1)}" font-size="13" font-weight="500" fill="#0C447C">${esc(g.label)}</text>`
+      );
+    }
+  }
+
+  for (const e of v.edges) {
+    const d = roundedPathD(e.points, 7);
+    const c = COLORS[e.kind] || COLORS.direct;
+    const dash = e.kind === 'macro' || e.kind === 'fnptr' ? ' stroke-dasharray="5 3"' : '';
+    out.push(
+      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+    );
+  }
+
+  for (const n of v.nodes) {
+    out.push(`<g data-id="${esc(n.id)}">`);
+    out.push(
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${n.color || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
+    );
+    out.push(
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.name)}</text>`
+    );
+    out.push(
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? t('node.external') : shortFile(n.file) + ':' + n.line)}</text>`
+    );
+    out.push('</g>');
+  }
+
+  out.push('</svg>');
+  return out.join('\n');
+}
+
+document.getElementById('exportSvg').addEventListener('click', () => {
+  if (!state.view) return;
+  download('callgraph.svg', new Blob([buildSVG()], { type: 'image/svg+xml' }));
+});
+
+document.getElementById('exportPng').addEventListener('click', () => {
+  els.cv.toBlob((b) => download('callgraph.png', b));
+});
+
+document.getElementById('exportHtml').addEventListener('click', () => {
+  if (!state.root) return;
+  window.location.href = `/api/export/html?root=${encodeURIComponent(state.root)}&up=${state.up}&down=${state.down}`;
+});
+
+document.getElementById('exportXlsx').addEventListener('click', () => {
+  window.location.href = '/api/export/xlsx';
+});
+
+// ---------------- 启动 ----------------
+
+applyI18n();
+window.addEventListener('resize', resize);
+resize();
+loadStats();
+loadView(new URLSearchParams(location.search).get('root'));

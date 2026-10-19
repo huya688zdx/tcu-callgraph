@@ -1,0 +1,440 @@
+/**
+ * 分层布局（Sugiyama 简化版）
+ * 找回边 → Kahn 分层 → 重心法减少交叉 → 通道需求估算层间高度 → 坐标分配
+ * 边路由统一交给 ./routing.js（前后端共享的正交路由器）
+ */
+
+import { routeEdges, collectSegments, STUB, SPACING, PORT_INSET } from './routing.js';
+
+export function textWidth(s) {
+  let w = 0;
+  for (const ch of String(s)) {
+    w += ch.charCodeAt(0) > 255 ? 14 : 7.6;
+  }
+  return w;
+}
+
+const pushTo = (m, k, v) => {
+  if (!m.has(k)) m.set(k, []);
+  m.get(k).push(v);
+};
+
+/** 区间最大重叠（贪心扫描），用于估算层间通道数 */
+function maxOverlap(intervals) {
+  const ev = [];
+  for (const [a, b] of intervals) {
+    ev.push([a, 1]);
+    ev.push([b, -1]);
+  }
+  ev.sort((u, v) => u[0] - v[0] || v[1] - u[1]);
+  let cur = 0;
+  let best = 0;
+  for (const [, d] of ev) {
+    cur += d;
+    if (cur > best) best = cur;
+  }
+  return best;
+}
+
+/** 与路由器 portAt 一致的近似端口 x（沿节点边展开） */
+function spreadX(n, i, total) {
+  const inset = Math.min(PORT_INSET, n.w / 4);
+  return n.x + inset + ((i + 1) / (total + 1)) * Math.max(1, n.w - 2 * inset);
+}
+
+export function layout(nodes, edges, opts = {}) {
+  const {
+    nodeH = 44,
+    subH = 58,
+    gapX = 34,
+    gapY = 76,
+    padding = 40,
+    maxLabelWidth = 260,
+    minWidth = 120,
+  } = opts;
+
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+  const ids = nodes.map((n) => n.id);
+  const idSet = new Set(ids);
+  const es = edges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
+
+  // ---- 1. 找回边 ----
+  const out = new Map();
+  for (const e of es) pushTo(out, e.from, e);
+  const state = new Map();
+  const backSet = new Set();
+  const dfs = (v) => {
+    state.set(v, 1);
+    for (const e of out.get(v) || []) {
+      const st = state.get(e.to);
+      if (st === 1) backSet.add(e);
+      else if (st === undefined) dfs(e.to);
+    }
+    state.set(v, 2);
+  };
+  for (const id of ids) if (!state.has(id)) dfs(id);
+
+  // ---- 2. Kahn 分层 ----
+  const layer = new Map(ids.map((id) => [id, 0]));
+  const indeg = new Map(ids.map((id) => [id, 0]));
+  for (const e of es) {
+    if (backSet.has(e)) continue;
+    indeg.set(e.to, indeg.get(e.to) + 1);
+  }
+  const q = ids.filter((id) => indeg.get(id) === 0);
+  const placed = new Set();
+  while (q.length) {
+    const v = q.shift();
+    placed.add(v);
+    for (const e of out.get(v) || []) {
+      if (backSet.has(e)) continue;
+      if (layer.get(e.to) < layer.get(v) + 1) layer.set(e.to, layer.get(v) + 1);
+      indeg.set(e.to, indeg.get(e.to) - 1);
+      if (indeg.get(e.to) === 0) q.push(e.to);
+    }
+  }
+  for (const id of ids) {
+    if (placed.has(id)) continue;
+    let mp = 0;
+    for (const e of es) {
+      if (e.to === id && placed.has(e.from)) mp = Math.max(mp, layer.get(e.from) + 1);
+    }
+    layer.set(id, mp);
+  }
+
+  // ---- 3. 分组 + 重心排序 ----
+  const maxLayer = Math.max(0, ...ids.map((id) => layer.get(id)));
+  const layers = [];
+  for (let i = 0; i <= maxLayer; i++) layers.push([]);
+  for (const id of ids) layers[layer.get(id)].push(id);
+  const nonEmpty = layers.filter((l) => l.length);
+  layers.length = 0;
+  layers.push(...nonEmpty);
+
+  const pos = new Map();
+  const reindex = () => layers.forEach((arr) => arr.forEach((id, i) => pos.set(id, i)));
+  reindex();
+
+  const normPos = (id) => {
+    const L = layer.get(id);
+    const arr = layers[L];
+    if (!arr || arr.length <= 1) return 0.5;
+    return pos.get(id) / (arr.length - 1);
+  };
+
+  const preds = new Map();
+  const succs = new Map();
+  for (const e of es) {
+    if (backSet.has(e)) continue;
+    pushTo(succs, e.from, e.to);
+    pushTo(preds, e.to, e.from);
+  }
+
+  for (let it = 0; it < 8; it++) {
+    const down = it % 2 === 0;
+    const seq = [];
+    if (down) for (let i = 1; i < layers.length; i++) seq.push(i);
+    else for (let i = layers.length - 2; i >= 0; i--) seq.push(i);
+
+    for (const li of seq) {
+      const arr = layers[li];
+      const bc = new Map();
+      for (const id of arr) {
+        const nb = down ? preds.get(id) || [] : succs.get(id) || [];
+        let s = 0;
+        let c = 0;
+        for (const x of nb) {
+          if (pos.has(x)) {
+            s += normPos(x);
+            c++;
+          }
+        }
+        bc.set(id, c ? s / c : normPos(id));
+      }
+      arr.sort((a, b) => bc.get(a) - bc.get(b));
+      arr.forEach((id, i) => pos.set(id, i));
+    }
+  }
+
+  // ---- 4. 尺寸 ----
+  const widthOf = (n) => {
+    if (n.w) return n.w;
+    const label = n.label || n.name || n.id;
+    return Math.min(maxLabelWidth, Math.max(minWidth, textWidth(label) + 28));
+  };
+  const heightOf = (n) => n.h || (n.sub ? subH : nodeH);
+
+  const nodeW = new Map(nodes.map((n) => [n.id, widthOf(n)]));
+  const layerH = layers.map((arr) => Math.max(...arr.map((id) => heightOf(nodeMap.get(id)))));
+  const maxW = Math.max(
+    ...layers.map(
+      (arr) => arr.reduce((s, id) => s + nodeW.get(id), 0) + gapX * (arr.length - 1)
+    )
+  );
+
+  // ---- 5. x 坐标（先于 y：层间高度估算需要端口 x） ----
+  const geo = new Map();
+  for (let li = 0; li < layers.length; li++) {
+    const arr = layers[li];
+    const totalW = arr.reduce((s, id) => s + nodeW.get(id), 0) + gapX * (arr.length - 1);
+    let x = padding + (maxW - totalW) / 2;
+    for (const id of arr) {
+      const n = nodeMap.get(id);
+      geo.set(id, { x, y: 0, w: nodeW.get(id), h: heightOf(n) });
+      x += nodeW.get(id) + gapX;
+    }
+  }
+
+  // ---- 6. 层间空隙高度：按相邻层边的水平通道需求（区间最大重叠）估算 ----
+  const gapEdges = [];
+  for (let i = 0; i < Math.max(1, layers.length - 1); i++) gapEdges.push([]);
+  for (const e of es) {
+    const la = layer.get(e.from);
+    const lb = layer.get(e.to);
+    if (backSet.has(e) || lb !== la + 1) continue;
+    gapEdges[la].push(e);
+  }
+
+  const gapHeights = gapEdges.map((list, li) => {
+    if (!list.length) return gapY;
+    // 近似端口 x：与路由器同款「按对端位置排序后沿边展开」
+    const outMap = new Map();
+    const inMap = new Map();
+    for (const e of list) {
+      pushTo(outMap, e.from, e);
+      pushTo(inMap, e.to, e);
+    }
+    const sx = new Map();
+    const tx = new Map();
+    for (const [id, l] of outMap) {
+      const n = geo.get(id);
+      l.sort(
+        (p, q) =>
+          geo.get(q.to).x + geo.get(q.to).w / 2 - (geo.get(p.to).x + geo.get(p.to).w / 2)
+      );
+      l.forEach((e, i) => sx.set(e, spreadX(n, i, l.length)));
+    }
+    for (const [id, l] of inMap) {
+      const n = geo.get(id);
+      l.sort(
+        (p, q) =>
+          geo.get(q.from).x + geo.get(q.from).w / 2 - (geo.get(p.from).x + geo.get(p.from).w / 2)
+      );
+      l.forEach((e, i) => tx.set(e, spreadX(n, i, l.length)));
+    }
+    const intervals = list.map((e) => {
+      const a = sx.get(e);
+      const b = tx.get(e);
+      return [Math.min(a, b), Math.max(a, b)];
+    });
+    const bands = Math.max(1, maxOverlap(intervals));
+    // +SPACING 余量：容纳长边落在该间隙里的通道
+    return Math.max(gapY, STUB * 2 + (bands - 1) * SPACING + 14 + SPACING);
+  });
+
+  // ---- 7. y 坐标 ----
+  let y = padding;
+  const layerBottom = [];
+  for (let li = 0; li < layers.length; li++) {
+    const arr = layers[li];
+    for (const id of arr) {
+      const g = geo.get(id);
+      g.y = y + (layerH[li] - g.h) / 2;
+    }
+    y += layerH[li];
+    layerBottom[li] = y;
+    if (li < layers.length - 1) y += gapHeights[li] ?? gapY;
+  }
+  const totalH = y + padding;
+
+  // ---- 8. 正交路由（共享路由器） ----
+  const geoNodes = nodes.map((n) => {
+    const g = geo.get(n.id);
+    return { ...n, ...g };
+  });
+  routeEdges(geoNodes, es);
+
+  // 侧边车道可能越界：整体平移 + 扩画布
+  let maxRight = 0;
+  let minLeft = Infinity;
+  for (const g of geoNodes) {
+    if (g.x + g.w > maxRight) maxRight = g.x + g.w;
+    if (g.x < minLeft) minLeft = g.x;
+  }
+  let laneRight = -Infinity;
+  let laneLeft = Infinity;
+  for (const e of es) {
+    if (!e.points) continue;
+    for (const p of e.points) {
+      if (p[0] > laneRight) laneRight = p[0];
+      if (p[0] < laneLeft) laneLeft = p[0];
+    }
+  }
+  let shift = 0;
+  if (laneLeft < minLeft && laneLeft < padding) shift = Math.min(minLeft, padding) - laneLeft;
+  if (shift > 0) {
+    for (const n of geoNodes) n.x += shift;
+    for (const e of es) {
+      if (e.points) for (const p of e.points) p[0] += shift;
+    }
+    laneRight += shift;
+  }
+  const width = Math.max(maxRight + shift, laneRight) + padding;
+
+  return {
+    nodes: geoNodes,
+    edges: es,
+    width,
+    height: totalH,
+    layers: layers.length,
+    backEdges: backSet.size,
+  };
+}
+
+function shortName(f) {
+  const parts = String(f).split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+/**
+ * 分组布局：每个文件一个大框，框内是该文件的函数
+ * 先对文件级图分层，再对每个文件内部独立布局，最后合并坐标
+ * 组内边随内部布局平移，跨组边用共享路由器统一布线
+ */
+export function layoutGrouped(nodes, edges, opts = {}) {
+  const { fileOf = (n) => n.file || 'unknown', headerH = 26, ...rest } = opts;
+
+  const groups = new Map();
+  for (const n of nodes) {
+    const f = fileOf(n);
+    if (!groups.has(f)) groups.set(f, []);
+    groups.get(f).push(n);
+  }
+
+  // 1. 组内布局
+  const inner = new Map();
+  for (const [file, list] of groups) {
+    const ids = new Set(list.map((n) => n.id));
+    const innerEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    const laid = layout(list, innerEdges, {
+      ...rest,
+      padding: 16,
+      gapX: 24,
+      gapY: 50,
+      maxLabelWidth: 190,
+    });
+    for (const n of laid.nodes) n.y += headerH;
+    for (const e of laid.edges) {
+      if (e.points) for (const p of e.points) p[1] += headerH;
+    }
+    laid.height += headerH;
+    inner.set(file, laid);
+  }
+
+  // 2. 文件级图（跨文件调用去重）
+  const fileOfId = new Map(nodes.map((n) => [n.id, fileOf(n)]));
+  const fileEdges = [];
+  const seen = new Set();
+  for (const e of edges) {
+    const a = fileOfId.get(e.from);
+    const b = fileOfId.get(e.to);
+    if (!a || !b || a === b) continue;
+    const k = a + '\u0000' + b;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    fileEdges.push({ from: a, to: b, kind: 'direct' });
+  }
+
+  const fileNodes = [...groups.keys()].map((f) => ({
+    id: f,
+    name: shortName(f),
+    label: shortName(f),
+    w: inner.get(f).width,
+    h: inner.get(f).height,
+    isGroup: true,
+  }));
+
+  const fileLay = layout(fileNodes, fileEdges, {
+    padding: 30,
+    gapX: 46,
+    gapY: 62,
+    minWidth: 140,
+  });
+
+  // 3. 合并坐标 + 组内边平移
+  const geo = new Map();
+  const offsetOf = new Map();
+  const innerEdgeMap = new Map(); // from|to|line → 平移后的 points
+  for (const fn of fileLay.nodes) {
+    offsetOf.set(fn.id, { x: fn.x, y: fn.y });
+    const laid = inner.get(fn.id);
+    const idx = new Map();
+    for (const e of laid.edges) {
+      idx.set(`${e.from}|${e.to}|${e.line}`, e);
+    }
+    for (const n of laid.nodes) {
+      geo.set(n.id, { ...n, x: n.x + fn.x, y: n.y + fn.y, group: fn.id });
+    }
+    for (const e of laid.edges) {
+      innerEdgeMap.set(`${e.from}|${e.to}|${e.line}`, {
+        ...e,
+        points: e.points.map((p) => [p[0] + fn.x, p[1] + fn.y]),
+      });
+    }
+  }
+
+  // 4. 边：组内直接平移，跨组用共享路由器
+  const mergedNodes = [...geo.values()];
+  const routed = [];
+  const crossEdges = [];
+  for (const e of edges) {
+    const a = geo.get(e.from);
+    const b = geo.get(e.to);
+    if (!a || !b) continue;
+    if (a.group === b.group) {
+      const m = innerEdgeMap.get(`${e.from}|${e.to}|${e.line}`);
+      if (m) {
+        routed.push(m);
+        continue;
+      }
+    }
+    crossEdges.push(e);
+  }
+
+  // 跨组边路由：组内边线段作为避让约束
+  const innerRouted = routed.slice();
+  const res = routeEdges(mergedNodes, crossEdges, {
+    existing: collectSegments(innerRouted),
+  });
+  routed.push(...crossEdges);
+
+  let maxX = 0;
+  let maxY = 0;
+  for (const n of fileLay.nodes) {
+    maxX = Math.max(maxX, n.x + n.w);
+    maxY = Math.max(maxY, n.y + n.h);
+  }
+  let laneRight = -Infinity;
+  for (const e of crossEdges) {
+    if (!e.points) continue;
+    for (const p of e.points) if (p[0] > laneRight) laneRight = p[0];
+  }
+  const width = Math.max(maxX, laneRight) + 30;
+
+  return {
+    nodes: mergedNodes,
+    edges: routed,
+    groups: fileLay.nodes.map((n) => ({
+      id: n.id,
+      label: n.name,
+      x: n.x,
+      y: n.y,
+      w: n.w,
+      h: n.h,
+      layer: n.layer,
+    })),
+    width,
+    height: maxY + 30,
+    layers: fileLay.layers,
+  };
+}
