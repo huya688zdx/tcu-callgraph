@@ -90,8 +90,34 @@
     padding: 6px 9px; border-radius: 7px; font-size: 12px; opacity: 0;
     transition: opacity .12s; max-width: 320px; line-height: 1.5; z-index: 10;
   }
-  .legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: #5F5E5A; }
-  .legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+  #legend {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 14px; align-items: center;
+    background: rgba(255, 255, 255, 0.94); padding: 6px 14px; border-radius: 20px;
+    border: 1px solid rgba(0, 0, 0, 0.08); font-size: 11.5px; color: #5F5E5A;
+    pointer-events: none; z-index: 5;
+  }
+  #legend span { display: inline-flex; align-items: center; }
+  #legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; margin-right: 5px; }
+  #legend em { font-style: normal; }
+
+  .tree-sec { max-height: 58vh; overflow: auto; }
+  #tree { font-size: 12.5px; user-select: none; }
+  .tn {
+    display: flex; align-items: center; gap: 3px; padding: 2px 4px;
+    border-radius: 5px; cursor: pointer; white-space: nowrap;
+  }
+  .tn:hover { background: #F1EFE8; }
+  .tn .tw { width: 12px; flex: 0 0 12px; color: #888780; font-size: 10px; text-align: center; }
+  .tn .nm { overflow: hidden; text-overflow: ellipsis; }
+  .tn.fn .nm { color: #5F5E5A; }
+  .tn.fn input { margin: 0 1px 0 0; width: 13px; height: 13px; cursor: pointer; }
+  .results-list { list-style: none; margin: 0 0 6px; padding: 0; }
+  .results-list:empty { display: none; }
+  .results-list li { padding: 5px 6px; border-radius: 6px; cursor: pointer; background: #F7F6F2; margin-bottom: 3px; }
+  .results-list li:hover { background: #E6F1FB; }
+  .results-list li .fn { font-weight: 500; }
+  .results-list li .meta { color: #888780; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -113,6 +139,8 @@
     </select>
     <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
     <button id="fit" data-i18n="btn.fit">适应</button>
+    <button id="undoBtn" title="撤回 (Ctrl+Z)" disabled>&#8630;</button>
+    <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" disabled>&#8631;</button>
     <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
     <div class="spacer"></div>
     <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击下钻 · 拖节点自动重布线 · 选中连线拖线段调整走向 · 双击连线恢复自动</span>
@@ -123,27 +151,25 @@
   </header>
 
   <aside id="left">
+    <div class="sec tree-sec">
+      <h3>文件</h3>
+      <ul id="results" class="results-list"></ul>
+      <div id="tree"><div class="empty">加载中…</div></div>
+    </div>
     <div class="sec">
       <h3 data-i18n="panel.overview">工程概览</h3>
       <div id="stats"></div>
-    </div>
-    <div class="sec">
-      <h3 data-i18n="panel.results">搜索结果</h3>
-      <ul id="results"><li class="empty" data-i18n="empty.search">输入函数名开始搜索</li></ul>
-    </div>
-    <div class="sec">
-      <h3 data-i18n="panel.legend">图例</h3>
-      <div class="legend">
-        <div><i style="border-color:#888780"></i><span data-i18n="legend.direct">直接调用</span></div>
-        <div><i style="border-color:#D85A30;border-top-style:dashed"></i><span data-i18n="legend.macro">经宏</span></div>
-        <div><i style="border-color:#7F77DD;border-top-style:dashed"></i><span data-i18n="legend.fnptr">函数指针</span></div>
-        <div><i style="border-color:#639922"></i><span data-i18n="legend.manual">手动画线</span></div>
-      </div>
     </div>
   </aside>
 
   <main>
     <canvas id="cv"></canvas>
+    <div id="legend">
+      <span><i style="border-color:#9A9890"></i><em data-i18n="legend.direct">直接调用</em></span>
+      <span><i style="border-color:#D85A30;border-top-style:dashed"></i><em data-i18n="legend.macro">经宏</em></span>
+      <span><i style="border-color:#7F77DD;border-top-style:dashed"></i><em data-i18n="legend.fnptr">函数指针</em></span>
+      <span><i style="border-color:#639922"></i><em data-i18n="legend.manual">手动画线</em></span>
+    </div>
     <div id="tooltip"></div>
   </main>
 

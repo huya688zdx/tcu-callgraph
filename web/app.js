@@ -1,6 +1,16 @@
 import { t, applyI18n } from './i18n.js';
 import { routeEdges, collectSegments, nearestSide, roundedPathD } from '/core/routing.js';
 
+window.addEventListener('error', (e) => {
+  console.error('PAGE_ERROR', e.message, `${e.filename}:${e.lineno}:${e.colno}`);
+  document.body.setAttribute('data-err', `${e.message} @${e.lineno}`);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const m = (e.reason && (e.reason.stack || e.reason.message)) || String(e.reason);
+  console.error('PAGE_REJECT', m);
+  document.body.setAttribute('data-err', 'REJECT: ' + m);
+});
+
 const els = {
   cv: document.getElementById('cv'),
   ctx: document.getElementById('cv').getContext('2d'),
@@ -121,6 +131,10 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
+  document.body.setAttribute(
+    'data-draw',
+    v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
+  );
   if (!v) {
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
@@ -141,6 +155,8 @@ function draw() {
     ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
     return;
   }
+
+  if (v.containers) for (const c of v.containers) drawContainer(ctx, c);
 
   if (v.groups) {
     updateGroups();
@@ -189,6 +205,25 @@ function draw() {
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
 }
 
+function drawContainer(ctx, c) {
+  ctx.save();
+  roundRect(ctx, c.x, c.y, c.w, c.h, 14);
+  ctx.fillStyle = `rgba(230, 241, 251, ${0.16 + Math.min(0.1, c.depth * 0.04)})`;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(133, 183, 235, 0.6)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.fillStyle = '#185FA5';
+  ctx.font = `500 ${Math.min(20, Math.max(11, 10 / cam.k))}px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(c.label, c.x + 10, c.y + 14);
+  ctx.restore();
+}
+
 function drawGroup(ctx, g) {
   ctx.save();
   roundRect(ctx, g.x, g.y, g.w, g.h, 12);
@@ -216,29 +251,9 @@ function drawGroup(ctx, g) {
 }
 
 /** 圆角正交折线（严格水平/垂直段，折点用二次贝塞尔过渡） */
-function strokeRounded(ctx, pts, r = 7) {
+function strokeRounded(ctx, pts) {
   ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length - 1; i++) {
-    const p = pts[i];
-    const prev = pts[i - 1];
-    const next = pts[i + 1];
-    const l1 = Math.hypot(p[0] - prev[0], p[1] - prev[1]);
-    const l2 = Math.hypot(next[0] - p[0], next[1] - p[1]);
-    if (l1 < 1 || l2 < 1) {
-      ctx.lineTo(p[0], p[1]);
-      continue;
-    }
-    const rr = Math.min(r, l1 / 2, l2 / 2);
-    ctx.lineTo(p[0] - ((p[0] - prev[0]) / l1) * rr, p[1] - ((p[1] - prev[1]) / l1) * rr);
-    ctx.quadraticCurveTo(
-      p[0],
-      p[1],
-      p[0] + ((next[0] - p[0]) / l2) * rr,
-      p[1] + ((next[1] - p[1]) / l2) * rr
-    );
-  }
-  const last = pts[pts.length - 1];
-  ctx.lineTo(last[0], last[1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
 function drawEdge(ctx, e, related, selected) {
@@ -411,6 +426,9 @@ async function loadView(rootId) {
   els.rootName.textContent = rootNode ? `· ${rootNode.name}` : '';
   fit();
   renderDetail(null);
+  history.stack = [];
+  history.idx = -1;
+  pushHistory();
 }
 
 async function loadStats() {
@@ -426,7 +444,97 @@ async function loadStats() {
     row(t('stat.fnptrEdges'), s.fnptrEdges),
     row(t('stat.cycles'), s.cycles),
     row(t('stat.maxFanOut'), s.maxFanOut),
-  ].join('');
+  ].join('') +
+    (s.files > 1500
+      ? '<div class="stat-row" style="color:#993C1D"><span>提示</span><span>文件较多，首次解析稍慢</span></div>'
+      : '');
+}
+
+// ---------------- 文件树 ----------------
+
+let treeData = null;
+
+async function loadTree() {
+  try {
+    treeData = await (await fetch('/api/tree')).json();
+    renderTree();
+  } catch {
+    document.getElementById('tree').innerHTML = '<div class="empty">加载失败</div>';
+  }
+}
+
+function renderTree() {
+  const el = document.getElementById('tree');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!treeData) return;
+  const frag = document.createDocumentFragment();
+  for (const child of treeData.children || []) frag.appendChild(buildTreeNode(child, 0));
+  el.appendChild(frag);
+}
+
+function buildTreeNode(node, depth) {
+  const wrap = document.createElement('div');
+  const row = document.createElement('div');
+  row.className = 'tn ' + node.type;
+  row.style.paddingLeft = depth * 12 + 'px';
+
+  const hasKids =
+    (node.children && node.children.length) || (node.functions && node.functions.length);
+  const tw = document.createElement('span');
+  tw.className = 'tw';
+  tw.textContent = hasKids ? '▸' : '';
+  row.appendChild(tw);
+
+  const nm = document.createElement('span');
+  nm.className = 'nm';
+  nm.textContent = node.name;
+  nm.title = node.path;
+  row.appendChild(nm);
+  wrap.appendChild(row);
+
+  const kids = document.createElement('div');
+  const openByDefault = node.type === 'dir';
+  kids.style.display = openByDefault ? 'block' : 'none';
+  if (openByDefault && hasKids) tw.textContent = '▾';
+  if (node.children) for (const c of node.children) kids.appendChild(buildTreeNode(c, depth + 1));
+  if (node.functions) {
+    for (const f of node.functions) {
+      const fr = document.createElement('div');
+      fr.className = 'tn fn';
+      fr.style.paddingLeft = (depth + 1) * 12 + 'px';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.dataset.id = f.id;
+      const lab = document.createElement('span');
+      lab.className = 'nm';
+      lab.textContent = f.name;
+      lab.title = `${node.path}:${f.line}`;
+      fr.appendChild(cb);
+      fr.appendChild(lab);
+      kids.appendChild(fr);
+    }
+  }
+  wrap.appendChild(kids);
+
+  row.addEventListener('click', (ev) => {
+    if (ev.target.tagName === 'INPUT' || !hasKids) return;
+    const open = kids.style.display !== 'none';
+    kids.style.display = open ? 'none' : 'block';
+    tw.textContent = open ? '▸' : '▾';
+  });
+
+  kids.addEventListener('change', (ev) => {
+    if (ev.target.tagName !== 'INPUT') return;
+    const id = ev.target.dataset.id;
+    if (!ev.target.checked) return;
+    document.querySelectorAll('#tree input[type=checkbox]').forEach((c) => {
+      if (c !== ev.target) c.checked = false;
+    });
+    loadView(id);
+  });
+
+  return wrap;
 }
 
 let searchTimer;
@@ -531,6 +639,7 @@ async function renderDetail(id) {
       target.color = pickedColor;
     }
     draw();
+    pushHistory();
     const btn = els.detail.querySelector('#saveNote');
     btn.textContent = t('detail.saved');
     setTimeout(() => (btn.textContent = t('detail.save')), 1200);
@@ -836,6 +945,7 @@ els.cv.addEventListener('pointerup', (e) => {
       modifiedEdges.add(edgeKey(edge));
       rerouteScope([edge]);
       saveLayout();
+      pushHistory();
     }
     draw();
     return;
@@ -845,6 +955,7 @@ els.cv.addEventListener('pointerup', (e) => {
     modifiedEdges.add(edgeKey(state.dragSeg.edge));
     state.dragSeg = null;
     saveLayout();
+    pushHistory();
     draw();
     return;
   }
@@ -862,6 +973,7 @@ els.cv.addEventListener('pointerup', (e) => {
         if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
       }
       saveLayout();
+      pushHistory();
     } else {
       selectNode(n.id);
     }
@@ -938,7 +1050,110 @@ function selectNode(id) {
   renderDetail(id);
 }
 
-async function saveLayout() {
+// ---------------- 撤回 / 重做 ----------------
+
+const history = { stack: [], idx: -1, limit: 60, frozen: false };
+
+function snapshotView() {
+  const v = state.view;
+  if (!v) return null;
+  return JSON.stringify({
+    nodes: v.nodes.map((n) => ({
+      id: n.id,
+      x: n.x,
+      y: n.y,
+      w: n.w,
+      h: n.h,
+      group: n.group,
+      name: n.name,
+      file: n.file,
+      line: n.line,
+      color: n.color,
+      note: n.note,
+      external: n.external,
+    })),
+    edges: v.edges.map((e) => ({
+      from: e.from,
+      to: e.to,
+      callee: e.callee,
+      kind: e.kind,
+      line: e.line,
+      via: e.via,
+      cond: e.cond,
+      manual: e.manual,
+      fromSide: e.fromSide,
+      toSide: e.toSide,
+      custom: e.custom,
+      points: e.points,
+    })),
+    groups: v.groups || null,
+  });
+}
+
+function pushHistory() {
+  if (history.frozen || !state.view) return;
+  const snap = snapshotView();
+  if (!snap) return;
+  if (history.idx >= 0 && history.stack[history.idx] === snap) return;
+  history.stack = history.stack.slice(0, history.idx + 1);
+  history.stack.push(snap);
+  if (history.stack.length > history.limit) history.stack.shift();
+  history.idx = history.stack.length - 1;
+  updateHistoryButtons();
+}
+
+function applySnapshot(str) {
+  const s = JSON.parse(str);
+  const v = state.view;
+  if (!v) return;
+  v.nodes = s.nodes;
+  v.edges = s.edges.map((e) => ({ ...e }));
+  if (s.groups) v.groups = s.groups;
+  state.selected = null;
+  state.selectedEdge = null;
+  state.hover = null;
+  draw();
+  saveLayout(true);
+  updateHistoryButtons();
+}
+
+function undo() {
+  if (history.idx <= 0) return;
+  history.idx--;
+  history.frozen = true;
+  applySnapshot(history.stack[history.idx]);
+  history.frozen = false;
+}
+
+function redo() {
+  if (history.idx >= history.stack.length - 1) return;
+  history.idx++;
+  history.frozen = true;
+  applySnapshot(history.stack[history.idx]);
+  history.frozen = false;
+}
+
+function updateHistoryButtons() {
+  const u = document.getElementById('undoBtn');
+  const r = document.getElementById('redoBtn');
+  if (u) u.disabled = history.idx <= 0;
+  if (r) r.disabled = history.idx >= history.stack.length - 1;
+}
+
+document.getElementById('undoBtn')?.addEventListener('click', undo);
+document.getElementById('redoBtn')?.addEventListener('click', redo);
+
+window.addEventListener('keydown', (e) => {
+  const tag = document.activeElement && document.activeElement.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    if (e.shiftKey) redo();
+    else undo();
+  }
+});
+
+async function saveLayout(full = false) {
   const nodes = {};
   for (const n of state.view.nodes) {
     nodes[n.id] = { x: Math.round(n.x), y: Math.round(n.y) };
@@ -947,9 +1162,9 @@ async function saveLayout() {
   const edges = {};
   for (const e of state.view.edges) {
     const k = edgeKey(e);
-    if (!modifiedEdges.has(k)) continue;
+    if (!full && !modifiedEdges.has(k)) continue;
     const rec = {};
-    if (e.custom && Array.isArray(e.points) && e.points.length >= 2) {
+    if (Array.isArray(e.points) && e.points.length >= 2 && (full || e.custom)) {
       rec.custom = true;
       rec.points = e.points.map((p) => [Math.round(p[0]), Math.round(p[1])]);
     }
@@ -998,6 +1213,7 @@ async function addManualEdge(from, to) {
       mode: state.group ? 'group' : 'flat',
     }),
   });
+  pushHistory();
 }
 
 window.addEventListener('keydown', (e) => {
@@ -1148,4 +1364,5 @@ applyI18n();
 window.addEventListener('resize', resize);
 resize();
 loadStats();
+loadTree();
 loadView(new URLSearchParams(location.search).get('root'));

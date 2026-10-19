@@ -31,8 +31,38 @@ try {
   overlay = { nodes: {}, edges: {}, notes: [] };
 }
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
+function buildFileTree(model) {
+  const root = { name: '', type: 'dir', path: '', children: new Map() };
+  for (const fn of model.functions) {
+    const parts = String(fn.file).split('/');
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      const isFile = i === parts.length - 1;
+      if (!cur.children.has(name)) {
+        cur.children.set(name, {
+          name,
+          type: isFile ? 'file' : 'dir',
+          path: parts.slice(0, i + 1).join('/'),
+          children: isFile ? null : new Map(),
+          functions: isFile ? [] : undefined,
+        });
+      }
+      cur = cur.children.get(name);
+      if (isFile) cur.functions.push({ id: fn.id, name: fn.name, line: fn.line });
+    }
+  }
+  const toObj = (n) => ({
+    name: n.name,
+    type: n.type,
+    path: n.path,
+    functions: n.functions,
+    children: n.children ? [...n.children.values()].map(toObj) : undefined,
+  });
+  return toObj(root);
+}
+
+const MIME = {  '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
@@ -147,6 +177,10 @@ const server = http.createServer((req, res) => {
         files: MODEL.files,
         cycles: S.cycleGroups,
       });
+    }
+
+    if (u.pathname === '/api/tree') {
+      return json(res, buildFileTree(MODEL));
     }
 
     if (u.pathname === '/api/search') {

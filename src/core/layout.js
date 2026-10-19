@@ -421,9 +421,44 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   }
   const width = Math.max(maxX, laneRight) + 30;
 
+  // 目录容器：按路径前缀聚合文件框，形成 src / db / se 多层嵌套
+  const dirBoxes = new Map();
+  for (const fn of fileLay.nodes) {
+    const parts = String(fn.id).split('/');
+    for (let i = 1; i < parts.length; i++) {
+      const dir = parts.slice(0, i).join('/');
+      if (!dirBoxes.has(dir)) dirBoxes.set(dir, []);
+      dirBoxes.get(dir).push(fn);
+    }
+  }
+  const containers = [...dirBoxes.entries()]
+    .map(([p, list]) => {
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (const g of list) {
+        x0 = Math.min(x0, g.x);
+        y0 = Math.min(y0, g.y);
+        x1 = Math.max(x1, g.x + g.w);
+        y1 = Math.max(y1, g.y + g.h);
+      }
+      return {
+        id: p,
+        label: p.split('/').pop(),
+        x: x0 - 18,
+        y: y0 - 32,
+        w: x1 - x0 + 36,
+        h: y1 - y0 + 50,
+        depth: p.split('/').length,
+      };
+    })
+    .sort((a, b) => a.depth - b.depth);
+
   return {
     nodes: mergedNodes,
     edges: routed,
+    containers,
     groups: fileLay.nodes.map((n) => ({
       id: n.id,
       label: n.name,

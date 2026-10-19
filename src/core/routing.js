@@ -781,28 +781,12 @@ export function collectSegments(edges) {
 }
 
 /** 生成带圆角的 SVG path d（折点用二次贝塞尔过渡） */
-export function roundedPathD(pts, r = 6) {
+export function roundedPathD(pts, r = 0) {
   if (!pts || pts.length < 2) return '';
   const f = (x) => Math.round(x * 10) / 10;
   let d = `M ${f(pts[0][0])} ${f(pts[0][1])}`;
-  for (let i = 1; i < pts.length - 1; i++) {
-    const p = pts[i];
-    const prev = pts[i - 1];
-    const next = pts[i + 1];
-    const l1 = Math.hypot(p[0] - prev[0], p[1] - prev[1]);
-    const l2 = Math.hypot(next[0] - p[0], next[1] - p[1]);
-    if (l1 < 1 || l2 < 1) {
-      d += ` L ${f(p[0])} ${f(p[1])}`;
-      continue;
-    }
-    const rr = Math.min(r, l1 / 2, l2 / 2);
-    const ax = p[0] - ((p[0] - prev[0]) / l1) * rr;
-    const ay = p[1] - ((p[1] - prev[1]) / l1) * rr;
-    const bx = p[0] + ((next[0] - p[0]) / l2) * rr;
-    const by = p[1] + ((next[1] - p[1]) / l2) * rr;
-    d += ` L ${f(ax)} ${f(ay)} Q ${f(p[0])} ${f(p[1])} ${f(bx)} ${f(by)}`;
+  for (let i = 1; i < pts.length; i++) {
+    d += ` L ${f(pts[i][0])} ${f(pts[i][1])}`;
   }
-  const last = pts[pts.length - 1];
-  d += ` L ${f(last[0])} ${f(last[1])}`;
   return d;
 }
