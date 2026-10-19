@@ -25,8 +25,8 @@
      "y": 375
     },
     "deep/src/app/main.c::Task_Shift": {
-     "x": 714,
-     "y": 274
+     "x": 720,
+     "y": 266
     },
     "deep/src/db/can.c::Can_Init": {
      "x": 190,
@@ -78,6 +78,7 @@
      "toSide": "right"
     },
     "deep/src/app/main.c::Task_Shift->deep/src/db/can.c::Can_SendGearStatus:39": {
+     "fromSide": "bottom",
      "toSide": "right"
     }
    },
