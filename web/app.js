@@ -418,6 +418,50 @@ function fit() {
   draw();
 }
 
+// ---------------- 视角动画 ----------------
+
+const camAnim = { on: false, t0: 0, dur: 420, from: null, to: null };
+
+function stopCamAnim() {
+  camAnim.on = false;
+}
+
+function stepCam(now) {
+  if (!camAnim.on) return;
+  const t = Math.min(1, (now - camAnim.t0) / camAnim.dur);
+  const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // easeInOutQuad
+  const f = camAnim.from;
+  const to = camAnim.to;
+  cam.x = f.x + (to.x - f.x) * e;
+  cam.y = f.y + (to.y - f.y) * e;
+  cam.k = f.k + (to.k - f.k) * e;
+  draw();
+  if (t < 1) requestAnimationFrame(stepCam);
+  else camAnim.on = false;
+}
+
+function animateCam(to, dur = 420) {
+  camAnim.on = true;
+  camAnim.t0 = performance.now();
+  camAnim.dur = dur;
+  camAnim.from = { x: cam.x, y: cam.y, k: cam.k };
+  camAnim.to = to;
+  requestAnimationFrame(stepCam);
+}
+
+/** 把文件框 / 目录容器整体居中并适配到视野 */
+function focusBox(box, pad = 90) {
+  const W = els.cv.clientWidth;
+  const H = els.cv.clientHeight;
+  if (!W || !H || !box.w || !box.h) return;
+  const k = Math.max(0.08, Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2), 1.6));
+  animateCam({
+    x: W / 2 - (box.x + box.w / 2) * k,
+    y: H / 2 - (box.y + box.h / 2) * k,
+    k,
+  });
+}
+
 // ---------------- 数据 ----------------
 
 async function loadView(rootId) {
@@ -704,6 +748,80 @@ function hitTest(e) {
   return null;
 }
 
+/**
+ * 命中文件框 / 目录容器的标题：点击标题把该区域整体居中放大。
+ * 文件框有标题栏（整条可点），目录容器只有左上角一行文字，按实际文字宽度判定，
+ * 避免大容器的标题命中区挡住内部的文件框
+ */
+function hitTitle(e) {
+  const v = state.view;
+  if (!v) return null;
+  const p = worldPos(e);
+
+  for (const g of v.groups || []) {
+    if (p.x >= g.x && p.x <= g.x + g.w && p.y >= g.y && p.y <= g.y + 26) {
+      return { box: g, kind: 'file' };
+    }
+  }
+
+  // 深层的先判，避免被外层容器的大标题区吞掉
+  const conts = (v.containers || []).slice().sort((a, b) => b.depth - a.depth);
+  for (const c of conts) {
+    const fs = Math.min(20, Math.max(11, 10 / cam.k));
+    els.ctx.font = `500 ${fs}px ${FONT}`;
+    const tw = els.ctx.measureText(String(c.label)).width;
+    if (p.x >= c.x && p.x <= c.x + 18 + tw && p.y >= c.y - 4 && p.y <= c.y + 30) {
+      return { box: c, kind: 'dir' };
+    }
+  }
+  return null;
+}
+
+/** 节点是否与其它节点相撞（留一点视觉间隙，避免边框贴死） */
+function collidesWith(n, pad = 6) {
+  const v = state.view;
+  if (!v) return false;
+  for (const o of v.nodes) {
+    if (o.id === n.id) continue;
+    if (
+      n.x < o.x + o.w + pad &&
+      n.x + n.w + pad > o.x &&
+      n.y < o.y + o.h + pad &&
+      n.y + n.h + pad > o.y
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 拖动落位：整体移动被挡住时退化为单轴滑动（贴着别的节点滑过去），
+ * 两个方向都过不去就停在原位 —— 保证拖动过程中节点之间永不重叠
+ */
+function moveNodeNoOverlap(n, tx, ty) {
+  const ox = n.x;
+  const oy = n.y;
+
+  n.x = tx;
+  n.y = ty;
+  clampToGroup(n);
+  if (!collidesWith(n)) return;
+
+  n.x = tx;
+  n.y = oy;
+  clampToGroup(n);
+  if (!collidesWith(n)) return;
+
+  n.x = ox;
+  n.y = ty;
+  clampToGroup(n);
+  if (!collidesWith(n)) return;
+
+  n.x = ox;
+  n.y = oy;
+}
+
 /** 边的折线由共享路由器维护（严格正交）；此处只做读取 */
 function edgePoints(e) {
   return (e && e.points) || [];
@@ -823,6 +941,7 @@ let justDragged = false;
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  stopCamAnim();
 
   const end = hitEnd(e);
   if (end) {
@@ -837,6 +956,13 @@ els.cv.addEventListener('pointerdown', (e) => {
     state.dragSeg = seg;
     els.cv.style.cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
     els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
+
+  // 点标题：把该文件框 / 目录容器整体居中放大
+  const title = hitTitle(e);
+  if (title) {
+    focusBox(title.box);
     return;
   }
 
@@ -885,9 +1011,7 @@ els.cv.addEventListener('pointermove', (e) => {
   if (state.dragNode) {
     const rawDx = (e.clientX - state.dragStart.x) / cam.k;
     const rawDy = (e.clientY - state.dragStart.y) / cam.k;
-    state.dragNode.x = state.dragStart.nx + rawDx;
-    state.dragNode.y = state.dragStart.ny + rawDy;
-    clampToGroup(state.dragNode);
+    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
     if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
     liveReroute(state.dragNode.id); // 相连的边实时避障重布
     draw();
@@ -918,6 +1042,8 @@ els.cv.addEventListener('pointermove', (e) => {
     els.cv.classList.toggle('over-node', !!next);
     draw();
   }
+  // 标题上显示可点击
+  els.cv.style.cursor = next ? '' : hitTitle(e) ? 'pointer' : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
   if (state.selectedEdge) {
@@ -1049,6 +1175,7 @@ els.cv.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
+    stopCamAnim();
     const rect = els.cv.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
@@ -1393,3 +1520,37 @@ resize();
 loadStats();
 loadTree();
 loadView(new URLSearchParams(location.search).get('root'));
+
+// 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
+window.__cg = {
+  get view() {
+    return state.view;
+  },
+  get cam() {
+    return { x: cam.x, y: cam.y, k: cam.k };
+  },
+  get root() {
+    return state.root;
+  },
+  /** 当前视图内是否存在节点互相重叠 */
+  overlaps(pad = 0) {
+    const v = state.view;
+    if (!v) return [];
+    const hits = [];
+    for (let i = 0; i < v.nodes.length; i++) {
+      for (let j = i + 1; j < v.nodes.length; j++) {
+        const a = v.nodes[i];
+        const b = v.nodes[j];
+        if (
+          a.x < b.x + b.w + pad &&
+          a.x + a.w + pad > b.x &&
+          a.y < b.y + b.h + pad &&
+          a.y + a.h + pad > b.y
+        ) {
+          hits.push([a.id, b.id]);
+        }
+      }
+    }
+    return hits;
+  },
+};
