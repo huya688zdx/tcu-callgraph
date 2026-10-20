@@ -433,6 +433,7 @@ async function loadView(rootId) {
   state.root = data.root;
   state.selected = null;
   state.selectedEdge = null;
+  modifiedNodes.clear(); // 新视图的节点都是自动布局位置，尚未被拖动
   if (data.edges && data.edges.some((e) => !e.points || e.points.length < 2)) {
     fullReroute(); // 兜底：服务端数据缺折线时本地补算
   }
@@ -802,6 +803,8 @@ function hitEnd(e) {
 
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}`;
 const modifiedEdges = new Set();
+/** 被用户拖动过的节点：只有这些节点的坐标需要持久化 */
+const modifiedNodes = new Set();
 
 /** 拖动线段：水平段只改 y、垂直段只改 x —— 正交性由构造保证 */
 function moveSeg(seg, x, y) {
@@ -982,6 +985,7 @@ els.cv.addEventListener('pointerup', (e) => {
     if (moved) {
       justDragged = true;
       setTimeout(() => (justDragged = false), 260);
+      modifiedNodes.add(n.id);
       fullReroute(); // 松手后全量避障重布
       for (const ed of state.view.edges) {
         if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
@@ -1168,8 +1172,11 @@ window.addEventListener('keydown', (e) => {
 });
 
 async function saveLayout(full = false) {
+  // 只持久化真正被拖动过的节点：未拖动的节点每次都由自动布局重新计算，
+  // 否则切换入口/调整深度后旧坐标会套用到新布局上，导致节点跑到文件框外
   const nodes = {};
   for (const n of state.view.nodes) {
+    if (!full && !modifiedNodes.has(n.id)) continue;
     nodes[n.id] = { x: Math.round(n.x), y: Math.round(n.y) };
   }
 
@@ -1191,6 +1198,7 @@ async function saveLayout(full = false) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      root: state.root,
       nodes,
       manual: collectManual(),
       edges,
@@ -1255,9 +1263,14 @@ els.resetLayout.addEventListener('click', async () => {
   await fetch('/api/layout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ clear: true, mode: state.group ? 'group' : 'flat' }),
+    body: JSON.stringify({
+      clear: true,
+      root: state.root,
+      mode: state.group ? 'group' : 'flat',
+    }),
   });
   modifiedEdges.clear();
+  modifiedNodes.clear();
   loadView(state.root);
 });
 

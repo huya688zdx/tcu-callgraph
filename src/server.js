@@ -79,23 +79,130 @@ const json = (res, obj, code = 200) => {
   res.end(body);
 };
 
+/**
+ * 布局存档按「入口函数 + 布局模式」隔离。
+ * 不同入口的子图节点集合与文件框位置完全不同，绝对坐标不可跨视图复用，
+ * 否则会出现函数节点脱离所属文件框、散落到框外的问题。
+ */
+const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
+
+/** 文件框兜底：节点被手动坐标移出框时扩展框，保证节点始终被框包住（只扩不缩） */
+function fitGroups(groups, nodes) {
+  if (!groups || !groups.length) return;
+  const byGroup = new Map();
+  for (const n of nodes) {
+    if (!n.group) continue;
+    if (!byGroup.has(n.group)) byGroup.set(n.group, []);
+    byGroup.get(n.group).push(n);
+  }
+  for (const g of groups) {
+    const list = byGroup.get(g.id);
+    if (!list || !list.length) continue;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of list) {
+      if (n.x < minX) minX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.x + n.w > maxX) maxX = n.x + n.w;
+      if (n.y + n.h > maxY) maxY = n.y + n.h;
+    }
+    const nx = Math.min(g.x, minX - 14);
+    const ny = Math.min(g.y, minY - 34);
+    const nr = Math.max(g.x + g.w, maxX + 14);
+    const nb = Math.max(g.y + g.h, maxY + 14);
+    g.x = nx;
+    g.y = ny;
+    g.w = nr - nx;
+    g.h = nb - ny;
+  }
+}
+
+/** 目录容器跟随文件框：文件框被扩展后，上层目录框也要同步包住 */
+function fitContainers(containers, fileGroups) {
+  if (!containers || !containers.length || !fileGroups || !fileGroups.length) return;
+  const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
+  for (const c of containers) {
+    const inner = fileGroups.filter((g) => String(g.id).startsWith(c.id + '/'));
+    if (!inner.length) continue;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    for (const g of inner) {
+      if (g.x < x0) x0 = g.x;
+      if (g.y < y0) y0 = g.y;
+      if (g.x + g.w > x1) x1 = g.x + g.w;
+      if (g.y + g.h > y1) y1 = g.y + g.h;
+    }
+    const extra = (maxDepth - c.depth) * 22;
+    c.x = x0 - 18 - extra;
+    c.y = y0 - 34 - extra;
+    c.w = x1 - x0 + 36 + extra * 2;
+    c.h = y1 - y0 + 52 + extra * 2;
+  }
+}
+
 function buildView(rootId, up, down, group = false) {
   const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
   const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
   const laid = group ? layoutGrouped(clean, g.edges) : layout(clean, g.edges);
 
-  // 手动布局按模式分开存：flat / group 坐标不通用
+  // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
-  const slot = overlay.layout?.[mode] || {};
+  const slot = overlay.layout?.[layoutKey(g.root, mode)] || {};
 
-  // 手动拖拽的节点位置优先
+  // 手动拖拽的节点位置优先。
+  // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
+  // 出框的坐标只可能是跨视图/跨深度的陈旧存档，直接丢弃并回落自动布局
   const savedNodes = slot.nodes || {};
+  const groupBox = new Map((laid.groups || []).map((bg) => [bg.id, bg]));
+  const savedApplied = [];
   for (const n of laid.nodes) {
     const p = savedNodes[n.id];
-    if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
-      n.x = p.x;
-      n.y = p.y;
+    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
+    const gb = groupBox.get(n.group);
+    if (gb) {
+      const tol = 2;
+      const inside =
+        p.x >= gb.x - tol &&
+        p.y >= gb.y - tol &&
+        p.x + n.w <= gb.x + gb.w + tol &&
+        p.y + n.h <= gb.y + gb.h + tol;
+      if (!inside) continue;
     }
+    n._autoX = n.x;
+    n._autoY = n.y;
+    n.x = p.x;
+    n.y = p.y;
+    savedApplied.push(n);
+  }
+
+  // 存档坐标防叠压：旧存档 / 跨深度的坐标可能压在其他节点上，
+  // 出现矩形相交时该节点回退自动布局位置（自动布局本身保证互不重叠）
+  for (const n of savedApplied) {
+    let clash = false;
+    for (const m of laid.nodes) {
+      if (m === n) continue;
+      if (
+        n.x < m.x + m.w - 4 &&
+        m.x < n.x + n.w - 4 &&
+        n.y < m.y + m.h - 4 &&
+        m.y < n.y + n.h - 4
+      ) {
+        clash = true;
+        break;
+      }
+    }
+    if (clash) {
+      n.x = n._autoX;
+      n.y = n._autoY;
+    }
+  }
+  for (const n of laid.nodes) {
+    delete n._autoX;
+    delete n._autoY;
   }
 
   // 手动画的连线（不预置折线，统一交给路由器）
@@ -131,6 +238,13 @@ function buildView(rootId, up, down, group = false) {
   // 基于最终节点位置统一重路由（严格正交）
   routeEdges(laid.nodes, laid.edges);
 
+  // 兜底：坐标若与当前布局不匹配（旧存档 / 手动拖拽），把文件框扩到包住节点，
+  // 避免函数节点看起来脱离了所属文件的层级
+  if (laid.groups) {
+    fitGroups(laid.groups, laid.nodes);
+    fitContainers(laid.containers, laid.groups);
+  }
+
   // 侧边车道可能超出画布：扩一下尺寸
   let maxX = -Infinity;
   let maxY = -Infinity;
@@ -143,6 +257,10 @@ function buildView(rootId, up, down, group = false) {
       if (p[0] > maxX) maxX = p[0];
       if (p[1] > maxY) maxY = p[1];
     }
+  }
+  for (const box of [...(laid.groups || []), ...(laid.containers || [])]) {
+    if (box.x + box.w > maxX) maxX = box.x + box.w;
+    if (box.y + box.h > maxY) maxY = box.y + box.h;
   }
   laid.width = Math.max(laid.width, maxX + 40);
   laid.height = Math.max(laid.height, maxY + 40);
@@ -289,9 +407,11 @@ const server = http.createServer((req, res) => {
         try {
           const patch = JSON.parse(body);
           const mode = patch.mode === 'group' ? 'group' : 'flat';
+          const rootId = String(patch.root || '');
           overlay.layout = overlay.layout || {};
-          if (!overlay.layout[mode]) overlay.layout[mode] = { nodes: {}, edges: {}, manual: [] };
-          const slot = overlay.layout[mode];
+          const key = layoutKey(rootId, mode);
+          if (!overlay.layout[key]) overlay.layout[key] = { nodes: {}, edges: {}, manual: [] };
+          const slot = overlay.layout[key];
 
           if (patch.clear) {
             slot.nodes = {};
