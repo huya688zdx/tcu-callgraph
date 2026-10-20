@@ -26,6 +26,7 @@ const els = {
   edges: document.getElementById('edges'),
   rootName: document.getElementById('rootName'),
   tooltip: document.getElementById('tooltip'),
+  restoreDeleted: document.getElementById('restoreDeleted'),
 };
 
 const state = {
@@ -50,6 +51,9 @@ const state = {
 };
 
 const cam = { x: 0, y: 0, k: 1 };
+
+/** 最近的删除记录栈，Ctrl+Z 可以逐次恢复 */
+const deleteStack = [];
 
 const COLORS = {
   direct: '#9A9890',
@@ -365,32 +369,6 @@ function drawEdge(ctx, e, related, selected) {
     }
   }
 
-  // 同一对节点的多次调用已合并成一条边，这里用徽标标注调用次数
-  const callCount = e.calls ? e.calls.length : 1;
-  if (callCount > 1) {
-    const mi = Math.max(1, Math.floor(pts.length / 2));
-    const p0 = pts[mi - 1];
-    const p1 = pts[Math.min(pts.length - 1, mi)];
-    const mx = (p0[0] + p1[0]) / 2;
-    const my = (p0[1] + p1[1]) / 2;
-    const fs = Math.min(15, Math.max(9, 9 / cam.k));
-    ctx.font = `600 ${fs}px ${FONT}`;
-    const label = `×${callCount}`;
-    const tw = ctx.measureText(label).width;
-    const bw = tw + fs * 0.9;
-    const bh = fs * 1.5;
-    roundRect(ctx, mx - bw / 2, my - bh / 2, bw, bh, bh / 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.94)';
-    ctx.fill();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = Math.max(0.7, 1 / cam.k);
-    ctx.stroke();
-    ctx.fillStyle = color;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(label, mx, my + 0.5);
-  }
-
   ctx.restore();
 }
 
@@ -569,6 +547,16 @@ async function loadStats() {
     (s.files > 1500
       ? '<div class="stat-row" style="color:#993C1D"><span>提示</span><span>文件较多，首次解析稍慢</span></div>'
       : '');
+
+  // 有删除记录时才让「恢复删除」可点，并在按钮上显示数量
+  const del = d.deleted || { nodes: 0, edges: 0 };
+  const delTotal = (del.nodes || 0) + (del.edges || 0);
+  if (els.restoreDeleted) {
+    els.restoreDeleted.disabled = delTotal === 0;
+    els.restoreDeleted.textContent = delTotal
+      ? `${t('btn.restoreDeleted')} (${delTotal})`
+      : t('btn.restoreDeleted');
+  }
 }
 
 // ---------------- 文件树 ----------------
@@ -1263,6 +1251,64 @@ function selectNode(id) {
   renderDetail(id);
 }
 
+// ---------------- 删除函数 / 连线 ----------------
+
+async function postDelete(body) {
+  await fetch('/api/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
+async function reloadKeepCam() {
+  const before = { x: cam.x, y: cam.y, k: cam.k };
+  await loadView(state.root);
+  cam.x = before.x;
+  cam.y = before.y;
+  cam.k = before.k;
+  draw();
+}
+
+async function deleteSelection() {
+  const v = state.view;
+  if (!v) return;
+  let body = null;
+
+  if (state.selectedEdge) {
+    body = { edges: [edgeKey(state.selectedEdge)] };
+  } else if (state.selected) {
+    body = { nodes: [state.selected] };
+  } else {
+    return;
+  }
+
+  // 删掉的正是当前入口时，回退到自动选择入口，避免停在一个空视图上
+  if (body.nodes && body.nodes.includes(state.root)) state.root = null;
+
+  await postDelete(body);
+  deleteStack.push({ ...body, at: Date.now() });
+  if (deleteStack.length > 30) deleteStack.shift();
+
+  state.selected = null;
+  state.selectedEdge = null;
+  state.hover = null;
+  await reloadKeepCam();
+  renderDetail(null);
+  pushHistory();
+  loadStats();
+}
+
+async function restoreLastDelete() {
+  const rec = deleteStack.pop();
+  if (!rec) return false;
+  await postDelete({ nodes: rec.nodes || [], edges: rec.edges || [], restore: true });
+  await reloadKeepCam();
+  pushHistory();
+  return true;
+}
+
 // ---------------- 撤回 / 重做 ----------------
 
 const history = { stack: [], idx: -1, limit: 60, frozen: false };
@@ -1361,8 +1407,21 @@ window.addEventListener('keydown', (e) => {
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault();
-    if (e.shiftKey) redo();
-    else undo();
+    if (e.shiftKey) {
+      redo();
+    } else if (deleteStack.length && Date.now() - deleteStack[deleteStack.length - 1].at < 20000) {
+      // 优先恢复刚删掉的函数 / 连线（20 秒内有效，可逐次回退）
+      restoreLastDelete();
+    } else {
+      undo();
+    }
+    return;
+  }
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (state.selected || state.selectedEdge) {
+      e.preventDefault();
+      deleteSelection();
+    }
   }
 });
 
@@ -1467,6 +1526,18 @@ els.resetLayout.addEventListener('click', async () => {
   modifiedEdges.clear();
   modifiedNodes.clear();
   loadView(state.root);
+});
+
+// 一次性恢复所有被删除的函数与连线
+els.restoreDeleted.addEventListener('click', async () => {
+  await fetch('/api/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ clear: true }),
+  });
+  deleteStack.length = 0;
+  await reloadKeepCam();
+  await loadStats();
 });
 
 // ---------------- 导出 ----------------

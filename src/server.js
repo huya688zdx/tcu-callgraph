@@ -31,6 +31,19 @@ try {
   overlay = { nodes: {}, edges: {}, notes: [] };
 }
 
+// 用户在界面上删掉的函数 / 连线：按 id 记下来，所有视图里都不再显示
+overlay.deleted = overlay.deleted || { nodes: {}, edges: {} };
+overlay.deleted.nodes = overlay.deleted.nodes || {};
+overlay.deleted.edges = overlay.deleted.edges || {};
+
+const saveOverlay = () => {
+  fs.mkdirSync(OUT, { recursive: true });
+  fs.writeFileSync(OVERLAY_PATH, JSON.stringify(overlay, null, 1), 'utf8');
+};
+
+/** 与前端 edgeKey 保持一致 */
+const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
+
 function buildFileTree(model) {
   const root = { name: '', type: 'dir', path: '', children: new Map() };
   for (const fn of model.functions) {
@@ -146,8 +159,18 @@ function fitContainers(containers, fileGroups) {
 
 function buildView(rootId, up, down, group = false) {
   const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
-  const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
-  const laid = group ? layoutGrouped(clean, g.edges) : layout(clean, g.edges);
+  // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
+  // 所以某个文件或目录里的函数被删空时，对应层级会自动消失
+  const alive = g.nodes.filter((n) => !overlay.deleted.nodes[n.id]);
+  const aliveIds = new Set(alive.map((n) => n.id));
+  const viewEdges = g.edges.filter(
+    (e) => aliveIds.has(e.from) && aliveIds.has(e.to) && !overlay.deleted.edges[edgeKeyOf(e)]
+  );
+  const clean = alive.map(({ bodyTokens, ...rest }) => rest);
+  if (!clean.length) {
+    return { nodes: [], edges: [], width: 480, height: 260, root: g.root, empty: true };
+  }
+  const laid = group ? layoutGrouped(clean, viewEdges) : layout(clean, viewEdges);
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
@@ -294,6 +317,10 @@ const server = http.createServer((req, res) => {
         fnptrTables: MODEL.fnptrTables,
         files: MODEL.files,
         cycles: S.cycleGroups,
+        deleted: {
+          nodes: Object.keys(overlay.deleted.nodes).length,
+          edges: Object.keys(overlay.deleted.edges).length,
+        },
       });
     }
 
@@ -456,6 +483,41 @@ const server = http.createServer((req, res) => {
           fs.mkdirSync(OUT, { recursive: true });
           fs.writeFileSync(OVERLAY_PATH, JSON.stringify(overlay, null, 1), 'utf8');
           json(res, { ok: true });
+        } catch (err) {
+          json(res, { error: String(err) }, 400);
+        }
+      });
+      return;
+    }
+
+    // 删除 / 恢复函数与连线：只记录 id，不改动源码
+    if (u.pathname === '/api/delete' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        try {
+          const p = JSON.parse(body);
+          if (p.clear) {
+            // 一次性恢复所有被删除的函数与连线
+            overlay.deleted = { nodes: {}, edges: {} };
+            saveOverlay();
+            return json(res, { ok: true, nodes: 0, edges: 0 });
+          }
+          const restore = !!p.restore;
+          for (const id of p.nodes || []) {
+            if (restore) delete overlay.deleted.nodes[id];
+            else overlay.deleted.nodes[id] = 1;
+          }
+          for (const k of p.edges || []) {
+            if (restore) delete overlay.deleted.edges[k];
+            else overlay.deleted.edges[k] = 1;
+          }
+          saveOverlay();
+          json(res, {
+            ok: true,
+            nodes: Object.keys(overlay.deleted.nodes).length,
+            edges: Object.keys(overlay.deleted.edges).length,
+          });
         } catch (err) {
           json(res, { error: String(err) }, 400);
         }

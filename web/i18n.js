@@ -36,6 +36,7 @@ const dict = {
     'stat.functions': '函数',
     'stat.edges': '调用边',
     'stat.calls': '调用记录',
+    'btn.restoreDeleted': '恢复删除',
     'stat.macros': '宏定义',
     'stat.macroEdges': '经宏的边',
     'stat.fnptrEdges': '函数指针边',
