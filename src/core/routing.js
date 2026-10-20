@@ -371,6 +371,41 @@ function assignPorts(autos, nodeMap) {
   }
 }
 
+/** 同侧同色自动出边共用一个源端口，后续母线再从公共出口处分叉。 */
+function shareSourcePorts(items, edges) {
+  const bySourceSide = new Map();
+  const sideUsers = new Map();
+  const addUser = (id, side, item, isSource) => {
+    const key = `${id}\u0000${side}`;
+    if (!sideUsers.has(key)) sideUsers.set(key, []);
+    sideUsers.get(key).push({ item, isSource });
+  };
+
+  for (const item of items) {
+    addUser(item.e.from, item.sa, item, true);
+    addUser(item.e.to, item.sb, item, false);
+    const key = `${item.e.from}\u0000${item.sa}\u0000${item.sb}\u0000${item.e.kind || 'direct'}`;
+    if (!bySourceSide.has(key)) bySourceSide.set(key, []);
+    bySourceSide.get(key).push(item);
+  }
+
+  for (const list of bySourceSide.values()) {
+    if (list.length < 2) continue;
+    const source = list[0].a;
+    const side = list[0].sa;
+    // 用户显式指定的端口或手工折线优先，避免挪动其锚点。
+    if (
+      list.some((item) => item.e.custom || item.e.fromSide) ||
+      edges.some((e) => e.from === source.id && e.custom && (!SIDES.has(e.fromSide) || e.fromSide === side))
+    ) continue;
+    const users = sideUsers.get(`${source.id}\u0000${side}`) || [];
+    if (users.length !== list.length || users.some((user) => !user.isSource || !list.includes(user.item))) continue;
+
+    const sharedPort = portAt(source, side, 0.5);
+    for (const item of list) item.e._p0 = sharedPort;
+  }
+}
+
 // ---------------- 路由：直连（垂直出线，一条水平通道） ----------------
 
 function routeDirectV(e, a, b, sa, sb, ctx) {
@@ -971,6 +1006,7 @@ export function routeEdges(nodes, edges, opts = {}) {
   const items = [...pairFirst.values()];
 
   assignPorts(items, nodeMap);
+  shareSourcePorts(items, edges);
 
   // 稳定排序：直连 → 混合 → 长边；同类型按端口 y 再 x
   const rank = { direct: 0, side: 0, mixed: 1, long: 2 };
