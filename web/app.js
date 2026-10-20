@@ -630,7 +630,13 @@ function renderTree() {
   el.innerHTML = '';
   if (!treeData) return;
   const frag = document.createDocumentFragment();
-  for (const child of treeData.children || []) frag.appendChild(buildTreeNode(child, 0));
+  // 根节点就是打开的目录本身（名字由服务端给出），
+  // 直接铺子节点会让人看不出这些文件属于哪个根目录
+  if (treeData.name) {
+    frag.appendChild(buildTreeNode(treeData, 0));
+  } else {
+    for (const child of treeData.children || []) frag.appendChild(buildTreeNode(child, 0));
+  }
   el.appendChild(frag);
 }
 
@@ -650,7 +656,7 @@ function buildTreeNode(node, depth) {
   const nm = document.createElement('span');
   nm.className = 'nm';
   nm.textContent = node.name;
-  nm.title = node.path;
+  nm.title = node.path || node.name;
   row.appendChild(nm);
   wrap.appendChild(row);
 
@@ -1750,6 +1756,18 @@ function buildSVG() {
     );
   }
   out.push('</defs>');
+
+  if (v.containers) {
+    // 浅的先画（外层容器垫底），与画布绘制顺序一致
+    for (const c of [...v.containers].sort((a, b) => a.depth - b.depth)) {
+      out.push(
+        `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="rgba(230,241,251,${(0.16 + Math.min(0.1, c.depth * 0.04)).toFixed(2)})" stroke="rgba(107,163,224,${(0.55 + Math.min(0.25, c.depth * 0.08)).toFixed(2)})" stroke-width="1.4"/>`
+      );
+      out.push(
+        `<text x="${(c.x + 12).toFixed(1)}" y="${(c.y + 18).toFixed(1)}" font-size="13" font-weight="600" fill="#0C447C">${esc(c.label)}</text>`
+      );
+    }
+  }
 
   if (v.groups) {
     for (const g of v.groups) {

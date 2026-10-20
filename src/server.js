@@ -15,6 +15,16 @@ const OUT = path.resolve(__dirname, '../out');
 const target = process.argv[2] || 'samples/tcu';
 const PORT = Number(process.argv[3] || 5173);
 const root = path.resolve(target);
+// 打开的根目录名：文件路径都是相对它的，所以要把这一层补进层级里。
+// 直接选了单个文件时，索引的是它所在目录，根名取目录名（否则会和文件框重名）
+const rootIsFile = (() => {
+  try {
+    return fs.statSync(root).isFile();
+  } catch {
+    return false;
+  }
+})();
+const ROOT_LABEL = path.basename(rootIsFile ? path.dirname(root) : root) || root;
 
 console.log(`[加载] ${root}`);
 const MODEL = loadModel(root);
@@ -45,7 +55,7 @@ const saveOverlay = () => {
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
 
 function buildFileTree(model) {
-  const root = { name: '', type: 'dir', path: '', children: new Map() };
+  const root = { name: ROOT_LABEL, type: 'dir', path: '', children: new Map() };
   for (const fn of model.functions) {
     const parts = String(fn.file).split('/');
     let cur = root;
@@ -132,29 +142,60 @@ function fitGroups(groups, nodes) {
   }
 }
 
-/** 目录容器跟随文件框：文件框被扩展后，上层目录框也要同步包住 */
+/**
+ * 目录容器 / 根容器兜底：文件框被 fitGroups 撑大后，上层框要跟着包住。
+ * 只扩不缩 —— 嵌套几何已经在 layoutGrouped 里算好了（含每级外扩的一圈），
+ * 这里若重新算一套坐标，手动布局存档的坐标系就会整体偏移。
+ */
 function fitContainers(containers, fileGroups) {
   if (!containers || !containers.length || !fileGroups || !fileGroups.length) return;
-  const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
-  for (const c of containers) {
-    const inner = fileGroups.filter((g) => String(g.id).startsWith(c.id + '/'));
-    if (!inner.length) continue;
+
+  const grow = (c, x0, y0, x1, y1, left, top, right, bottom) => {
+    const nx = Math.min(c.x, x0 - left);
+    const ny = Math.min(c.y, y0 - top);
+    const nr = Math.max(c.x + c.w, x1 + right);
+    const nb = Math.max(c.y + c.h, y1 + bottom);
+    c.x = nx;
+    c.y = ny;
+    c.w = nr - nx;
+    c.h = nb - ny;
+  };
+
+  // 深的先算：子容器长大后再撑父容器
+  const dirs = containers.filter((c) => !c.root).sort((a, b) => b.depth - a.depth);
+  for (const c of dirs) {
+    const boxes = [
+      ...fileGroups.filter((g) => String(g.id).startsWith(c.id + '/')),
+      ...dirs.filter((k) => k !== c && String(k.id).startsWith(c.id + '/')),
+    ];
+    if (!boxes.length) continue;
     let x0 = Infinity;
     let y0 = Infinity;
     let x1 = -Infinity;
     let y1 = -Infinity;
-    for (const g of inner) {
-      if (g.x < x0) x0 = g.x;
-      if (g.y < y0) y0 = g.y;
-      if (g.x + g.w > x1) x1 = g.x + g.w;
-      if (g.y + g.h > y1) y1 = g.y + g.h;
+    for (const b of boxes) {
+      if (b.x < x0) x0 = b.x;
+      if (b.y < y0) y0 = b.y;
+      if (b.x + b.w > x1) x1 = b.x + b.w;
+      if (b.y + b.h > y1) y1 = b.y + b.h;
     }
-    const extra = (maxDepth - c.depth) * 22;
-    c.x = x0 - 18 - extra;
-    c.y = y0 - 34 - extra;
-    c.w = x1 - x0 + 36 + extra * 2;
-    c.h = y1 - y0 + 52 + extra * 2;
+    grow(c, x0, y0, x1, y1, 18, 34, 18, 18);
   }
+
+  const rootC = containers.find((c) => c.root);
+  if (!rootC) return;
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const b of [...fileGroups, ...dirs]) {
+    if (b.x < x0) x0 = b.x;
+    if (b.y < y0) y0 = b.y;
+    if (b.x + b.w > x1) x1 = b.x + b.w;
+    if (b.y + b.h > y1) y1 = b.y + b.h;
+  }
+  if (!Number.isFinite(x0)) return;
+  grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
 function buildView(rootId, up, down, group = false) {
@@ -170,7 +211,7 @@ function buildView(rootId, up, down, group = false) {
   if (!clean.length) {
     return { nodes: [], edges: [], width: 480, height: 260, root: g.root, empty: true };
   }
-  const laid = group ? layoutGrouped(clean, viewEdges) : layout(clean, viewEdges);
+  const laid = group ? layoutGrouped(clean, viewEdges, { rootLabel: ROOT_LABEL }) : layout(clean, viewEdges);
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
