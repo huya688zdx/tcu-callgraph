@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadModel, stats, subgraph, search } from './core/index.js';
+import { loadModel, stats, subgraph, search, dataflowOf } from './core/index.js';
 import { layout, layoutGrouped } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
 import { exportXlsx } from './core/export-xlsx.js';
@@ -198,7 +198,7 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(rootId, up, down, group = false) {
+function buildView(rootId, up, down, group = false, dfNode = null) {
   const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
   // 所以某个文件或目录里的函数被删空时，对应层级会自动消失
@@ -211,6 +211,33 @@ function buildView(rootId, up, down, group = false) {
   if (!clean.length) {
     return { nodes: [], edges: [], width: 480, height: 260, root: g.root, empty: true };
   }
+  // 数据流（按需展开）：把相关的函数也拉进视图，否则只有连线看不到两端
+  if (dfNode) {
+    const flows = dataflowOf(MODEL, dfNode);
+    const ids = new Set(clean.map((n) => n.id));
+    for (const f of flows) {
+      for (const id of [f.from, f.to]) {
+        if (ids.has(id) || overlay.deleted.nodes[id]) continue;
+        const fn = MODEL._index.byId.get(id);
+        if (!fn) continue;
+        const { bodyTokens, ...rest } = fn;
+        clean.push(rest);
+        ids.add(id);
+      }
+    }
+    for (const f of flows) {
+      if (!ids.has(f.from) || !ids.has(f.to)) continue;
+      viewEdges.push({
+        from: f.from,
+        to: f.to,
+        callee: f.varName,
+        kind: 'dataflow',
+        line: 0,
+        via: f.varName,
+      });
+    }
+  }
+
   const laid = group ? layoutGrouped(clean, viewEdges, { rootLabel: ROOT_LABEL }) : layout(clean, viewEdges);
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
@@ -399,6 +426,7 @@ const server = http.createServer((req, res) => {
       const up = Number(u.searchParams.get('up') || 0);
       const down = Number(u.searchParams.get('down') || 2);
       const group = u.searchParams.get('group') === '1';
+      const df = u.searchParams.get('df') || null;
       if (!rootId) {
         if (!MODEL.functions.length) {
           return json(res, {
@@ -419,9 +447,9 @@ const server = http.createServer((req, res) => {
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
-        return json(res, buildView(pick.id, up, Math.max(down, 3), group));
+        return json(res, buildView(pick.id, up, Math.max(down, 3), group, df));
       }
-      return json(res, buildView(rootId, up, down, group));
+      return json(res, buildView(rootId, up, down, group, df));
     }
 
     if (u.pathname === '/api/node') {

@@ -49,6 +49,8 @@ const state = {
   linkPos: null,
   /** 点击标题后的短暂高亮：{ box, until, dur } */
   flash: null,
+  /** 当前展开数据流的函数 id（一次只展开一个，避免关系爆炸） */
+  dataflowNode: null,
 };
 
 const cam = { x: 0, y: 0, k: 1 };
@@ -328,8 +330,9 @@ function drawEdge(ctx, e, related, selected) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = EDGE_COLOR[e.change] || EDGE_COLOR.existing;
+  // 原有=黑、新增=红；数据流用紫色区分；删除沿用原色，另在中央画 X
+  const color =
+    e.kind === 'dataflow' ? '#7F77DD' : EDGE_COLOR[e.change] || EDGE_COLOR.existing;
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
@@ -337,8 +340,9 @@ function drawEdge(ctx, e, related, selected) {
   ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = state.selected && !related && !selected ? 0.26 : 1;
-  // 变量访问=虚线，函数调用=实线
+  // 变量访问=虚线，函数调用=实线，数据流=点线
   if (e.kind === 'var') ctx.setLineDash([7, 4]);
+  else if (e.kind === 'dataflow') ctx.setLineDash([2, 3]);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -561,6 +565,7 @@ async function loadView(rootId) {
     group: state.group ? '1' : '0',
   });
   if (rootId) q.set('root', rootId);
+  if (state.dataflowNode) q.set('df', state.dataflowNode);
   const res = await fetch('/api/view?' + q);
   const data = await res.json();
   state.view = data;
@@ -1064,9 +1069,18 @@ els.cv.addEventListener('contextmenu', (e) => {
       return;
     }
     selectNode(n.id);
-    showMenu(e.clientX, e.clientY, t('menu.change'), CHANGE_ITEMS, n.change || 'existing', (v) =>
-      setNodeChange(n, v)
-    );
+    const items = [
+      ...CHANGE_ITEMS,
+      { divider: true },
+      {
+        value: '__df',
+        label: state.dataflowNode === n.id ? 'menu.dataflowOff' : 'menu.dataflowOn',
+      },
+    ];
+    showMenu(e.clientX, e.clientY, t('menu.change'), items, n.change || 'existing', (v) => {
+      if (v === '__df') toggleDataflow(n.id);
+      else setNodeChange(n, v);
+    });
     return;
   }
 
@@ -1363,11 +1377,12 @@ function showMenu(x, y, title, items, current, onPick) {
   el.innerHTML =
     `<div class="title">${title}</div>` +
     items
-      .map(
-        (it, i) =>
-          `<button data-i="${i}" class="${it.value === current ? 'active' : ''}">` +
-          `<span class="swatch" style="background:${it.color}"></span>` +
-          `<span>${t(it.label)}</span></button>`
+      .map((it, i) =>
+        it.divider
+          ? '<div class="sep"></div>'
+          : `<button data-i="${i}" class="${it.value === current ? 'active' : ''}">` +
+            (it.color ? `<span class="swatch" style="background:${it.color}"></span>` : '') +
+            `<span>${t(it.label)}</span></button>`
       )
       .join('');
   el.style.left = `${x}px`;
@@ -1407,6 +1422,12 @@ async function setEdgeChange(edge, change) {
     body: JSON.stringify({ edgeKey: edgeKey(edge), data: { change } }),
   });
   pushHistory();
+}
+
+/** 展开 / 收起某个函数的数据流（经由全局变量传递的状态） */
+async function toggleDataflow(nodeId) {
+  state.dataflowNode = state.dataflowNode === nodeId ? null : nodeId;
+  await reloadKeepCam();
 }
 
 function selectNode(id) {

@@ -113,7 +113,7 @@ if (!nodeInfo) {
   } else {
     console.log(`  菜单标题: ${menuShown.title}`);
     console.log(`  菜单项: ${menuShown.items.join(' | ')}`);
-    // 第 3 项 = 追加モジュール
+    // 第 3 项 = 追加模块
     await evaluate(`document.querySelectorAll('#ctxMenu button')[2].click()`);
     await sleep(500);
     const after = await evaluate(`(() => {
@@ -123,6 +123,34 @@ if (!nodeInfo) {
     console.log(`  change: ${nodeInfo.change} -> ${after.change}`);
     console.log(`  结论: ${after.change === 'added' ? '✅ 已标记为追加' : '❌ 状态未更新'}`);
     console.log(`  菜单已关闭: ${after.menuOpen ? '❌' : '✅'}`);
+  }
+}
+
+// ---- 测试1b：右键开启数据流 ----
+if (nodeInfo) {
+  console.log(`\n[测试1b] 右键 ${nodeInfo.name}() 开启数据流`);
+  await rightClick(nodeInfo.x, nodeInfo.y);
+  const items2 = await evaluate(`[...document.querySelectorAll('#ctxMenu button')].map(b => b.textContent.trim())`);
+  if (!items2 || !items2.some((x) => x.includes('数据流'))) {
+    console.log(`  ❌ 菜单里没有数据流项（${items2 ? items2.join(' | ') : '菜单未出现'}）`);
+  } else {
+    // 最后一项就是数据流开关
+    await evaluate(`(() => { const b = document.querySelectorAll('#ctxMenu button'); b[b.length-1].click(); })()`);
+    await sleep(900);
+    const df = await evaluate(`(() => {
+      const v = window.__cg.view;
+      const edges = v.edges.filter(e => e.kind === 'dataflow');
+      return { count: edges.length, pairs: edges.map(e => e.from.split('::').pop() + '->' + e.to.split('::').pop()) };
+    })()`);
+    console.log(`  数据流边: ${df.count} 条 ${df.pairs.length ? '(' + df.pairs.join(', ') + ')' : ''}`);
+    console.log(`  结论: ${df.count > 0 ? '✅ 已展开数据流' : '❌ 未出现数据流边'}`);
+
+    // 再点一次收起
+    await rightClick(nodeInfo.x, nodeInfo.y);
+    await evaluate(`(() => { const b = document.querySelectorAll('#ctxMenu button'); b[b.length-1].click(); })()`);
+    await sleep(900);
+    const df2 = await evaluate(`window.__cg.view.edges.filter(e => e.kind === 'dataflow').length`);
+    console.log(`  再次点击后数据流边: ${df2}  收起: ${df2 === 0 ? '✅' : '❌'}`);
   }
 }
 

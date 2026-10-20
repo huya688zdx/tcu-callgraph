@@ -117,23 +117,79 @@ function findGlobalVars(tokens, file) {
   return out;
 }
 
-/** 扫描函数体里对全局变量的引用 */
-function scanVarRefs(bodyTokens, lookup) {
-  const hits = [];
-  const seen = new Set();
+const WRITE_OPS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=']);
+
+/**
+ * 判断 tokens[i] 处的变量引用是「纯写」「读写」还是「读」。
+ * 需要穿过成员链（a.b.c）和数组下标（a[i][j]），再看紧跟的运算符。
+ * 注意 lexer 把 `==` 识别为单独的 token，所以 `=` 一定是赋值。
+ */
+function writeKind(tokens, i) {
+  let j = i + 1;
+  while (j < tokens.length) {
+    const v = tokens[j].v;
+    if (v === '.' || v === '->') {
+      j += 2;
+      continue;
+    }
+    if (v === '[') {
+      let d = 0;
+      for (; j < tokens.length; j++) {
+        if (tokens[j].v === '[') d++;
+        else if (tokens[j].v === ']') {
+          d--;
+          if (d === 0) {
+            j++;
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    break;
+  }
+  const op = tokens[j];
+  if (!op) return null;
+  if (op.v === '=') return 'write';
+  if (WRITE_OPS.has(op.v)) return 'readwrite'; // += 之类，先读旧值再写
+  if (op.v === '++' || op.v === '--') return 'readwrite';
+  return null;
+}
+
+/** 扫描函数体里对全局变量的读写 */
+function scanVarAccess(bodyTokens, lookup) {
+  const hits = new Map();
   for (let i = 0; i < bodyTokens.length; i++) {
     const t = bodyTokens[i];
     if (t.t !== 'id') continue;
     const id = lookup(t.v);
-    if (!id || seen.has(id)) continue;
+    if (!id) continue;
     const prev = bodyTokens[i - 1];
-    if (prev && (prev.v === '.' || prev.v === '->')) continue; // 成员名，不是全局变量
+    if (prev && (prev.v === '.' || prev.v === '->')) continue; // 成员名
     const next = bodyTokens[i + 1];
     if (next && next.v === '(') continue; // 函数调用
-    seen.add(id);
-    hits.push({ id, line: t.line, name: t.v });
+
+    let rec = hits.get(id);
+    if (!rec) {
+      rec = { id, name: t.v, line: t.line, read: false, write: false };
+      hits.set(id, rec);
+    }
+    const kind = writeKind(bodyTokens, i);
+    if (kind === 'write') rec.write = true;
+    else if (kind === 'readwrite') {
+      rec.write = true;
+      rec.read = true;
+    } else if (prev && (prev.v === '++' || prev.v === '--')) {
+      rec.write = true;
+      rec.read = true;
+    } else if (prev && prev.v === '&') {
+      // 取地址交给别的函数写，保守算作写
+      rec.write = true;
+    } else {
+      rec.read = true;
+    }
   }
-  return hits;
+  return [...hits.values()];
 }
 
 export function listSourceFiles(root) {
@@ -269,16 +325,34 @@ export function buildIndex(root) {
         macroChain: c.macroChain,
       });
     }
-    // 全局变量读写：画成虚线
-    for (const r of scanVarRefs(fn.bodyTokens, (n) => lookupVar(fn.file, n))) {
+    // 全局变量读写：画成虚线，同时记录方向供数据流分析
+    const access = scanVarAccess(fn.bodyTokens, (n) => lookupVar(fn.file, n));
+    fn.varAccess = access;
+    for (const a of access) {
       edges.push({
         from: fn.id,
-        to: r.id,
-        callee: r.name,
+        to: a.id,
+        callee: a.name,
         kind: 'var',
-        line: r.line,
-        via: '变量',
+        line: a.line,
+        via: a.write ? (a.read ? '读写' : '写') : '读',
       });
+    }
+  }
+
+  // 数据流索引：变量 → 写它的函数 / 读它的函数
+  const varWriters = new Map();
+  const varReaders = new Map();
+  for (const fn of functions) {
+    for (const a of fn.varAccess || []) {
+      if (a.write) {
+        if (!varWriters.has(a.id)) varWriters.set(a.id, []);
+        varWriters.get(a.id).push(fn.id);
+      }
+      if (a.read) {
+        if (!varReaders.has(a.id)) varReaders.set(a.id, []);
+        varReaders.get(a.id).push(fn.id);
+      }
     }
   }
 
@@ -325,7 +399,7 @@ export function buildIndex(root) {
     macros: [...macros.values()],
     fnptrTables: [...fnptrTables.entries()].map(([name, map]) => ({ name, map })),
     includes,
-    _index: { byId: allNodes, byName, outAdj, inAdj },
+    _index: { byId: allNodes, byName, outAdj, inAdj, varWriters, varReaders },
   };
 
   return model;
@@ -403,6 +477,35 @@ export function stats(model) {
     cycleGroups: sccs.filter((c) => c.length > 1),
     elapsedMs: model.elapsedMs,
   };
+}
+
+/**
+ * 数据流：经由同一个全局变量的「写者 → 读者」关系。
+ * A 写 g_x、B 读 g_x，即使两者之间没有调用，也存在 A → B 的数据流。
+ * 这种关系数量可能爆炸，所以默认不展开，只在用户对某个函数显式开启时计算。
+ */
+export function dataflowOf(model, nodeId) {
+  const idx = model._index || {};
+  const varWriters = idx.varWriters || new Map();
+  const varReaders = idx.varReaders || new Map();
+  const fn = idx.byId ? idx.byId.get(nodeId) : null;
+  if (!fn || !fn.varAccess) return [];
+
+  const out = [];
+  const seen = new Set();
+  const push = (from, to, a) => {
+    if (from === to) return;
+    const k = `${from}|${to}|${a.id}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ from, to, varId: a.id, varName: a.name, kind: 'dataflow' });
+  };
+
+  for (const a of fn.varAccess) {
+    if (a.write) for (const r of varReaders.get(a.id) || []) push(fn.id, r, a);
+    if (a.read) for (const w of varWriters.get(a.id) || []) push(w, fn.id, a);
+  }
+  return out;
 }
 
 /** Tarjan 强连通分量 */

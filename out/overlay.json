@@ -1,0 +1,59 @@
+{
+ "nodes": {
+  "main.c::SysTick_Handler": {
+   "change": "existing",
+   "updatedAt": "2026-10-20T08:42:15.110Z"
+  },
+  "main.c::Task_10ms": {
+   "change": "existing",
+   "updatedAt": "2026-10-20T08:42:24.703Z"
+  },
+  "main.c::Task_Shift": {
+   "change": "existing",
+   "updatedAt": "2026-10-20T08:42:24.942Z"
+  },
+  "main.c::Task_100ms": {
+   "change": "existing",
+   "updatedAt": "2026-10-20T08:42:25.181Z"
+  },
+  "main.c::main": {
+   "change": "existing",
+   "updatedAt": "2026-10-20T08:57:42.634Z"
+  }
+ },
+ "edges": {
+  "main.c::SysTick_Handler->main.c::Task_10ms:17": {
+   "change": "existing"
+  },
+  "main.c::Task_10ms->main.c::Task_Shift:24": {
+   "change": "added"
+  },
+  "main.c::Task_Shift->main.c::Task_100ms:25": {
+   "change": "deleted"
+  },
+  "main.c::Task_10ms->main.c::Task_Shift:26": {
+   "change": "existing"
+  },
+  "main.c::Task_Shift->main.c::Task_100ms:50": {
+   "change": "existing"
+  },
+  "main.c::Task_Shift->can.c::Can_GetSpeed:39": {
+   "change": "existing"
+  },
+  "main.c::main->main.c::Task_Writer:34": {
+   "change": "existing"
+  }
+ },
+ "notes": [],
+ "layout": {
+  "main.c::main::group": {
+   "nodes": {},
+   "edges": {},
+   "manual": []
+  }
+ },
+ "deleted": {
+  "nodes": {},
+  "edges": {}
+ }
+}
