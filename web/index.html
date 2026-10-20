@@ -156,17 +156,18 @@
   }
   .ctx-menu button:hover { background: #F0F4F9; }
   .ctx-menu button.active { background: #E6F1FB; color: #0C447C; font-weight: 600; }
+  .ctx-menu .sec-title {
+    padding: 6px 10px 2px;
+    color: #B4B2A9;
+    font-size: 10.5px;
+    letter-spacing: 0.02em;
+  }
   .ctx-menu .swatch {
     width: 11px;
     height: 11px;
     border-radius: 3px;
     border: 1px solid rgba(0, 0, 0, 0.16);
     flex: 0 0 auto;
-  }
-  .ctx-menu .sep {
-    height: 1px;
-    margin: 4px 6px;
-    background: #EFEDE7;
   }
 </style>
 </head>
@@ -220,7 +221,8 @@
       <span><i style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
       <span><i style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
       <span><i style="border-color:#2C2C2A"></i><em data-i18n="legend.deleted">删除</em></span>
-      <span><i style="border-color:#7F77DD;border-top-style:dotted"></i><em data-i18n="legend.dataflow">数据流</em></span>
+      <span><i style="border-color:#C2410C;border-top-style:dotted"></i><em data-i18n="legend.dfWrite">写入共享变量</em></span>
+      <span><i style="border-color:#0E7490;border-top-style:dotted"></i><em data-i18n="legend.dfRead">读取共享变量</em></span>
     </div>
     <div id="tooltip"></div>
     <div id="ctxMenu" class="ctx-menu"></div>

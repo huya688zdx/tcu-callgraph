@@ -13,5 +13,9 @@
   "license": "MIT",
   "devDependencies": {
     "electron": "^44.9.0"
+  },
+  "dependencies": {
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.25.10"
   }
 }

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf } from './core/index.js';
 import { layout, layoutGrouped } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
+import { dataflowFor, sharedVariables } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 
@@ -462,6 +463,26 @@ const server = http.createServer((req, res) => {
         outEdges: MODEL._index.outAdj.get(id) || [],
         overlay: overlay.nodes?.[id] || {},
       });
+    }
+
+    // 数据流：按需分析，不在扫描阶段做
+    if (u.pathname === '/api/dataflow') {
+      const fnId = u.searchParams.get('fn');
+      const dir = u.searchParams.get('dir') || 'out';
+      if (!fnId) return json(res, { error: 'missing fn' }, 400);
+      if (!MODEL._index) return json(res, { error: '该视图不支持数据流分析' }, 400);
+      return dataflowFor(MODEL, fnId, dir)
+        .then((r) => json(res, r))
+        .catch((err) => {
+          console.error('[数据流]', err);
+          json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+    }
+
+    if (u.pathname === '/api/shared-vars') {
+      return sharedVariables(MODEL)
+        .then((list) => json(res, { list }))
+        .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
     }
 
     if (u.pathname === '/api/export/xlsx') {
