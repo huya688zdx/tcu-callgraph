@@ -383,14 +383,10 @@ export function layout(nodes, edges, opts = {}) {
   };
 }
 
-function shortName(f) {
-  const parts = String(f).split(/[\\/]/);
-  return parts[parts.length - 1];
-}
-
 /**
- * 分组布局：每个文件一个大框，框内是该文件的函数
- * 先对文件级图分层，再对每个文件内部独立布局，最后合并坐标
+ * 分组布局：文件框 + 目录容器，按目录树自底向上递归排布
+ * 每个文件内部独立布局；同一父目录下的文件框 / 子目录用 layout() 排开，
+ * 兄弟之间互不重叠；目录容器直接取节点自身的矩形，因此层级之间不会交叉
  * 组内边随内部布局平移，跨组边用共享路由器统一布线
  */
 export function layoutGrouped(nodes, edges, opts = {}) {
@@ -410,9 +406,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     const innerEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
     const laid = layout(list, innerEdges, {
       ...rest,
-      padding: 16,
-      gapX: 24,
-      gapY: 50,
+      padding: 20,
+      gapX: 34,
+      gapY: 62,
       maxLabelWidth: 190,
     });
     for (const n of laid.nodes) n.y += headerH;
@@ -423,54 +419,132 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     inner.set(file, laid);
   }
 
-  // 2. 文件级图（跨文件调用去重）
+  // 2. 目录树：文件框是叶子，目录是中间节点。
+  //    自底向上逐层用 layout() 排开兄弟节点 —— 兄弟之间由布局保证互不重叠，
+  //    目录容器直接取节点自身的矩形，而不是事后套一个包围盒。
+  //    这样文件框、目录容器都不会交叉，父子嵌套也天然成立。
   const fileOfId = new Map(nodes.map((n) => [n.id, fileOf(n)]));
-  const fileEdges = [];
-  const seen = new Set();
-  for (const e of edges) {
-    const a = fileOfId.get(e.from);
-    const b = fileOfId.get(e.to);
-    if (!a || !b || a === b) continue;
-    const k = a + '\u0000' + b;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    fileEdges.push({ from: a, to: b, kind: 'direct' });
+  const root = {
+    path: '',
+    name: '',
+    type: 'dir',
+    children: new Map(),
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+  };
+  for (const file of groups.keys()) {
+    const parts = String(file).split('/');
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const isFile = i === parts.length - 1;
+      const p = parts.slice(0, i + 1).join('/');
+      if (!cur.children.has(p)) {
+        cur.children.set(p, {
+          path: p,
+          name: parts[i],
+          type: isFile ? 'file' : 'dir',
+          children: isFile ? null : new Map(),
+          x: 0,
+          y: 0,
+          w: 0,
+          h: 0,
+        });
+      }
+      cur = cur.children.get(p);
+    }
   }
 
-  const fileNodes = [...groups.keys()].map((f) => ({
-    id: f,
-    name: shortName(f),
-    label: shortName(f),
-    w: inner.get(f).width,
-    h: inner.get(f).height,
-    isGroup: true,
-  }));
-
-  const fileLay = layout(fileNodes, fileEdges, {
-    padding: 30,
-    gapX: 46,
-    gapY: 62,
-    minWidth: 140,
-  });
-
-  // 3. 合并坐标 + 组内边平移
-  const geo = new Map();
-  const offsetOf = new Map();
-  const innerEdgeMap = new Map(); // from|to|line → 平移后的 points
-  for (const fn of fileLay.nodes) {
-    offsetOf.set(fn.id, { x: fn.x, y: fn.y });
-    const laid = inner.get(fn.id);
-    const idx = new Map();
-    for (const e of laid.edges) {
-      idx.set(`${e.from}|${e.to}|${e.line}`, e);
+  // 叶子尺寸 = 文件框尺寸
+  const leafOf = new Map();
+  const walkLeaf = (node) => {
+    if (node.type === 'file') {
+      const l = inner.get(node.path);
+      node.w = l.width;
+      node.h = l.height;
+      leafOf.set(node.path, node);
+      return;
     }
+    for (const c of node.children.values()) walkLeaf(c);
+  };
+  walkLeaf(root);
+
+  const ownerChild = (node, filePath) => {
+    for (const c of node.children.values()) {
+      if (filePath === c.path || filePath.startsWith(c.path + '/')) return c;
+    }
+    return null;
+  };
+
+  // 子节点之间的边：把文件级调用聚合到当前目录层级，供该层排序使用
+  const childEdgesOf = (node) => {
+    const seen = new Set();
+    const out = [];
+    for (const e of edges) {
+      const fa = fileOfId.get(e.from);
+      const fb = fileOfId.get(e.to);
+      if (!fa || !fb || fa === fb) continue;
+      const a = ownerChild(node, fa);
+      const b = ownerChild(node, fb);
+      if (!a || !b || a === b) continue;
+      const k = a.path + '\u0000' + b.path;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push({ from: a.path, to: b.path, kind: 'direct' });
+    }
+    return out;
+  };
+
+  // 文件框 / 目录框之间的物理间隔：连线走这些空隙，相邻大框不能贴在一起
+  const BOX = { padding: 30, gapX: 92, gapY: 86, minWidth: 140 };
+
+  const layoutDir = (node) => {
+    if (node.type === 'file') return;
+    const list = [...node.children.values()];
+    for (const c of list) layoutDir(c);
+    if (!list.length) {
+      node.w = 0;
+      node.h = 0;
+      return;
+    }
+    const cn = list.map((c) => ({ id: c.path, name: c.name, w: c.w, h: c.h }));
+    const laid = layout(cn, childEdgesOf(node), BOX);
+    const byId = new Map(list.map((c) => [c.path, c]));
     for (const n of laid.nodes) {
-      geo.set(n.id, { ...n, x: n.x + fn.x, y: n.y + fn.y, group: fn.id });
+      const c = byId.get(n.id);
+      c.x = n.x;
+      c.y = n.y;
+      c.w = n.w;
+      c.h = n.h;
+    }
+    node.w = laid.width;
+    node.h = laid.height;
+    node.layers = laid.layers;
+  };
+  layoutDir(root);
+
+  // 3. 相对坐标累加成绝对坐标
+  const abs = (node, ox, oy) => {
+    node.x += ox;
+    node.y += oy;
+    if (node.type === 'dir') for (const c of node.children.values()) abs(c, node.x, node.y);
+  };
+  for (const c of root.children.values()) abs(c, 0, 0);
+
+  // 4. 合并坐标 + 组内边平移
+  const geo = new Map();
+  const innerEdgeMap = new Map(); // from|to|line → 平移后的 points
+  for (const [file, laid] of inner) {
+    const leaf = leafOf.get(file);
+    if (!leaf) continue;
+    for (const n of laid.nodes) {
+      geo.set(n.id, { ...n, x: n.x + leaf.x, y: n.y + leaf.y, group: file });
     }
     for (const e of laid.edges) {
       innerEdgeMap.set(`${e.from}|${e.to}|${e.line}`, {
         ...e,
-        points: e.points.map((p) => [p[0] + fn.x, p[1] + fn.y]),
+        points: e.points.map((p) => [p[0] + leaf.x, p[1] + leaf.y]),
       });
     }
   }
@@ -500,11 +574,45 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   });
   routed.push(...crossEdges);
 
+  // 6. 容器 = 目录节点自身的矩形：父子天然嵌套，兄弟由布局保证不重叠
+  const containers = [];
+  const collectDir = (node) => {
+    for (const c of node.children.values()) {
+      if (c.type !== 'dir') continue;
+      containers.push({
+        id: c.path,
+        label: c.name,
+        x: c.x,
+        y: c.y,
+        w: c.w,
+        h: c.h,
+        depth: c.path.split('/').length,
+      });
+      collectDir(c);
+    }
+  };
+  collectDir(root);
+  containers.sort((a, b) => a.depth - b.depth);
+
+  const fileGroups = [...leafOf.values()].map((n) => ({
+    id: n.path,
+    label: n.name,
+    x: n.x,
+    y: n.y,
+    w: n.w,
+    h: n.h,
+  }));
+
+  // 7. 画布尺寸：内容与侧边车道取并集
   let maxX = 0;
   let maxY = 0;
-  for (const n of fileLay.nodes) {
-    maxX = Math.max(maxX, n.x + n.w);
-    maxY = Math.max(maxY, n.y + n.h);
+  for (const g of fileGroups) {
+    maxX = Math.max(maxX, g.x + g.w);
+    maxY = Math.max(maxY, g.y + g.h);
+  }
+  for (const c of containers) {
+    maxX = Math.max(maxX, c.x + c.w);
+    maxY = Math.max(maxY, c.y + c.h);
   }
   let laneRight = -Infinity;
   for (const e of crossEdges) {
@@ -513,97 +621,13 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   }
   const width = Math.max(maxX, laneRight) + 30;
 
-  // 目录容器：按路径前缀聚合文件框，形成 src / db / se 多层嵌套
-  const dirBoxes = new Map();
-  for (const fn of fileLay.nodes) {
-    const parts = String(fn.id).split('/');
-    for (let i = 1; i < parts.length; i++) {
-      const dir = parts.slice(0, i).join('/');
-      if (!dirBoxes.has(dir)) dirBoxes.set(dir, []);
-      dirBoxes.get(dir).push(fn);
-    }
-  }
-  const dirEntries = [...dirBoxes.entries()];
-  const maxDepth = dirEntries.reduce((m, [p]) => Math.max(m, p.split('/').length), 1);
-  const containers = dirEntries
-    .map(([p, list]) => {
-      let x0 = Infinity;
-      let y0 = Infinity;
-      let x1 = -Infinity;
-      let y1 = -Infinity;
-      for (const g of list) {
-        x0 = Math.min(x0, g.x);
-        y0 = Math.min(y0, g.y);
-        x1 = Math.max(x1, g.x + g.w);
-        y1 = Math.max(y1, g.y + g.h);
-      }
-      const depth = p.split('/').length;
-      // 外层比内层多留出 (maxDepth - depth) * 22，保证每层标题不重叠
-      const extra = (maxDepth - depth) * 22;
-      return {
-        id: p,
-        label: p.split('/').pop(),
-        x: x0 - 18 - extra,
-        y: y0 - 34 - extra,
-        w: x1 - x0 + 36 + extra * 2,
-        h: y1 - y0 + 52 + extra * 2,
-        depth,
-      };
-    })
-    .sort((a, b) => a.depth - b.depth);
-
-  const fileGroups = fileLay.nodes.map((n) => ({
-    id: n.id,
-    label: n.name,
-    x: n.x,
-    y: n.y,
-    w: n.w,
-    h: n.h,
-    layer: n.layer,
-  }));
-
-  // 外层容器的负 padding 会把框推到负坐标，整体平移回正区
-  let minX = Infinity;
-  let minY = Infinity;
-  for (const c of containers) {
-    minX = Math.min(minX, c.x);
-    minY = Math.min(minY, c.y);
-  }
-  for (const g of fileGroups) {
-    minX = Math.min(minX, g.x);
-    minY = Math.min(minY, g.y);
-  }
-  const ox = Number.isFinite(minX) && minX < 40 ? 40 - minX : 0;
-  const oy = Number.isFinite(minY) && minY < 40 ? 40 - minY : 0;
-  if (ox || oy) {
-    for (const n of mergedNodes) {
-      n.x += ox;
-      n.y += oy;
-    }
-    for (const g of fileGroups) {
-      g.x += ox;
-      g.y += oy;
-    }
-    for (const c of containers) {
-      c.x += ox;
-      c.y += oy;
-    }
-    for (const e of routed) {
-      if (!e.points) continue;
-      for (const p of e.points) {
-        p[0] += ox;
-        p[1] += oy;
-      }
-    }
-  }
-
   return {
     nodes: mergedNodes,
     edges: routed,
     containers,
     groups: fileGroups,
-    width: width + ox,
-    height: maxY + 30 + oy,
-    layers: fileLay.layers,
+    width,
+    height: maxY + 30,
+    layers: root.layers || 1,
   };
 }
