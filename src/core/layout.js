@@ -1,6 +1,8 @@
 /**
  * 分层布局（Sugiyama 简化版）
- * 找回边 → Kahn 分层 → 重心法减少交叉 → 通道需求估算层间高度 → 坐标分配
+ * 找回边 → Kahn 分层（压缩空层）→ 重心法减少交叉 →
+ * 优先级对齐分配 x（子随父 / 父就子两遍取平均，空间随结构展开）→
+ * 通道需求估算层间高度 → 坐标分配
  * 边路由统一交给 ./routing.js（前后端共享的正交路由器）
  */
 
@@ -111,13 +113,17 @@ export function layout(nodes, edges, opts = {}) {
   layers.length = 0;
   layers.push(...nonEmpty);
 
+  // 压缩后的层号映射：层序（排序/高度估算）必须用压缩索引，
+  // 用原始层号索引 layers 会在有空层时指向错误的层
+  const layerIdx = new Map();
+  layers.forEach((arr, li) => arr.forEach((id) => layerIdx.set(id, li)));
+
   const pos = new Map();
   const reindex = () => layers.forEach((arr) => arr.forEach((id, i) => pos.set(id, i)));
   reindex();
 
   const normPos = (id) => {
-    const L = layer.get(id);
-    const arr = layers[L];
+    const arr = layers[layerIdx.get(id)];
     if (!arr || arr.length <= 1) return 0.5;
     return pos.get(id) / (arr.length - 1);
   };
@@ -166,33 +172,119 @@ export function layout(nodes, edges, opts = {}) {
 
   const nodeW = new Map(nodes.map((n) => [n.id, widthOf(n)]));
   const layerH = layers.map((arr) => Math.max(...arr.map((id) => heightOf(nodeMap.get(id)))));
-  const maxW = Math.max(
-    ...layers.map(
-      (arr) => arr.reduce((s, id) => s + nodeW.get(id), 0) + gapX * (arr.length - 1)
-    )
-  );
 
-  // ---- 5. x 坐标（先于 y：层间高度估算需要端口 x） ----
+  // ---- 4b. 每层动态水平间距：层越宽自动越紧凑，空间按需分配 ----
+  const minGapX = opts.minGapX ?? 16;
+  const layerGap = layers.map((arr) => {
+    const k = Math.sqrt(12 / Math.max(1, arr.length)); // 约 12 个节点起开始收紧
+    return Math.max(minGapX, Math.min(gapX, gapX * k));
+  });
+
+  // ---- 5. x 坐标：优先级对齐（子随父 / 父就子，两遍取平均）----
+  // 逐层居中会让窄层全部挤向中线、两侧大片留白；改为按邻接关系对齐，
+  // 节点跟随其在图中的结构位置展开，空间随结构自然分配。
+  const packCentered = (li) => {
+    const arr = layers[li];
+    const g = layerGap[li];
+    const totalW = arr.reduce((s, id) => s + nodeW.get(id), 0) + g * (arr.length - 1);
+    const xs = new Map();
+    let x = -totalW / 2;
+    for (const id of arr) {
+      xs.set(id, x);
+      x += nodeW.get(id) + g;
+    }
+    return xs;
+  };
+  const xInit = new Map();
+  for (let li = 0; li < layers.length; li++) {
+    for (const [id, x] of packCentered(li)) xInit.set(id, x);
+  }
+
+  /**
+   * 一层内落位：按期望 x 排序 → 向右推送消重叠 → 向左回拉去右偏 → 按期望均值整体校正。
+   * 单向推送会让「期望相同的一串节点」整体偏向一侧，回拉 + 均值校正使其对称居中。
+   */
+  const placeLayer = (li, desired, out) => {
+    const arr = layers[li].slice().sort((a, b) => desired.get(a) - desired.get(b));
+    const g = layerGap[li];
+    const x = new Map(arr.map((id) => [id, desired.get(id)]));
+    let right = -Infinity;
+    for (const id of arr) {
+      if (x.get(id) < right + g) x.set(id, right + g);
+      right = x.get(id) + nodeW.get(id);
+    }
+    let left = Infinity;
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const id = arr[i];
+      if (x.get(id) + nodeW.get(id) > left - g) x.set(id, left - g - nodeW.get(id));
+      left = x.get(id);
+    }
+    let sumD = 0;
+    let sumX = 0;
+    for (const id of arr) {
+      sumD += desired.get(id);
+      sumX += x.get(id);
+    }
+    const shift = arr.length ? sumD / arr.length - sumX / arr.length : 0;
+    for (const id of arr) out.set(id, x.get(id) + shift);
+  };
+
+  const alignPass = (down, from) => {
+    const out = new Map(from);
+    const seq = [];
+    if (down) for (let i = 0; i < layers.length; i++) seq.push(i);
+    else for (let i = layers.length - 1; i >= 0; i--) seq.push(i);
+    for (const li of seq) {
+      const desired = new Map();
+      for (const id of layers[li]) {
+        const nb = down ? preds.get(id) || [] : succs.get(id) || [];
+        let s = 0;
+        let c = 0;
+        for (const t of nb) {
+          s += out.get(t) + nodeW.get(t) / 2;
+          c++;
+        }
+        desired.set(id, c ? s / c - nodeW.get(id) / 2 : xInit.get(id));
+      }
+      placeLayer(li, desired, out);
+    }
+    return out;
+  };
+
+  const xDown = alignPass(true, xInit); // 子对齐父
+  const xUp = alignPass(false, xInit); // 父对齐子
+  const xAvg = new Map(ids.map((id) => [id, (xDown.get(id) + xUp.get(id)) / 2]));
+  const xFinal = new Map();
+  for (let li = 0; li < layers.length; li++) placeLayer(li, xAvg, xFinal);
+
+  // 平移到正区：左边贴 padding
+  let minX = Infinity;
+  for (const id of ids) minX = Math.min(minX, xFinal.get(id));
+  const shiftX = padding - minX;
+  for (const id of ids) xFinal.set(id, xFinal.get(id) + shiftX);
+
   const geo = new Map();
   for (let li = 0; li < layers.length; li++) {
-    const arr = layers[li];
-    const totalW = arr.reduce((s, id) => s + nodeW.get(id), 0) + gapX * (arr.length - 1);
-    let x = padding + (maxW - totalW) / 2;
-    for (const id of arr) {
+    for (const id of layers[li]) {
       const n = nodeMap.get(id);
-      geo.set(id, { x, y: 0, w: nodeW.get(id), h: heightOf(n) });
-      x += nodeW.get(id) + gapX;
+      geo.set(id, { x: xFinal.get(id), y: 0, w: nodeW.get(id), h: heightOf(n) });
     }
   }
 
-  // ---- 6. 层间空隙高度：按相邻层边的水平通道需求（区间最大重叠）估算 ----
-  const gapEdges = [];
-  for (let i = 0; i < Math.max(1, layers.length - 1); i++) gapEdges.push([]);
+  // ---- 6. 层间空隙高度：按压缩层号估算相邻层边的水平通道需求（区间最大重叠） ----
+  const gapCount = Math.max(0, layers.length - 1);
+  const gapEdges = Array.from({ length: gapCount }, () => []);
+  const addGap = (li, e) => {
+    if (li >= 0 && li < gapCount && !gapEdges[li].includes(e)) gapEdges[li].push(e);
+  };
   for (const e of es) {
-    const la = layer.get(e.from);
-    const lb = layer.get(e.to);
-    if (backSet.has(e) || lb !== la + 1) continue;
-    gapEdges[la].push(e);
+    if (e.from === e.to) continue;
+    const la = layerIdx.get(e.from);
+    const lb = layerIdx.get(e.to);
+    if (la === lb) continue;
+    // 长边/回边同样占据源层与目标层相邻间隙的水平通道，一并计入
+    addGap(la < lb ? la : la - 1, e);
+    addGap(lb > la ? lb - 1 : lb, e);
   }
 
   const gapHeights = gapEdges.map((list, li) => {

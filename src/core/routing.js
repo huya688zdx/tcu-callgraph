@@ -227,7 +227,25 @@ function collapse(pts) {
       const colX = Math.abs(a[0] - b[0]) < 0.5 && Math.abs(b[0] - p[0]) < 0.5;
       const colY = Math.abs(a[1] - b[1]) < 0.5 && Math.abs(b[1] - p[1]) < 0.5;
       if (colX || colY) {
-        out[n - 1] = [p[0], p[1]];
+        // 链式合并的相对容差会让漂移逐段累积（0.4+0.4=0.8），直接融合产生斜线。
+        // 只有合并后 a→p 仍轴向对齐才融合；否则在折点处补肘弯保持严格正交。
+        const okX = colX && Math.abs(a[0] - p[0]) < 0.5;
+        const okY = colY && Math.abs(a[1] - p[1]) < 0.5;
+        if (okX || okY) {
+          out[n - 1] = [p[0], p[1]];
+          continue;
+        }
+        if (colX && Math.abs(b[1] - a[1]) >= 0.5 && Math.abs(p[1] - b[1]) >= 0.5) {
+          out[n - 1] = [a[0], b[1]];
+          out.push([p[0], b[1]], [p[0], p[1]]);
+          continue;
+        }
+        if (colY && Math.abs(b[0] - a[0]) >= 0.5 && Math.abs(p[0] - b[0]) >= 0.5) {
+          out[n - 1] = [b[0], a[1]];
+          out.push([b[0], p[1]], [p[0], p[1]]);
+          continue;
+        }
+        out.push([p[0], p[1]]);
         continue;
       }
     }
