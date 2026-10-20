@@ -15,6 +15,7 @@ import {
 } from './geometry.js';
 import { draw } from './render.js';
 import { stopCamAnim, focusBox } from './camera.js';
+import { pathBlockedByNodes } from '/core/routing.js';
 import {
   selectNode,
   showMenu,
@@ -129,12 +130,19 @@ function hitEnd(e) {
 function moveSeg(seg, x, y) {
   const pts = seg.edge.points;
   const i = seg.index;
+  const axis = seg.orient === 'h' ? 1 : 0;
+  const oldA = pts[i][axis];
+  const oldB = pts[i + 1][axis];
   if (seg.orient === 'h') {
     pts[i][1] = y;
     pts[i + 1][1] = y;
   } else {
     pts[i][0] = x;
     pts[i + 1][0] = x;
+  }
+  if (pathBlockedByNodes(pts, state.view.nodes, new Set([seg.edge.from, seg.edge.to]))) {
+    pts[i][axis] = oldA;
+    pts[i + 1][axis] = oldB;
   }
 }
 

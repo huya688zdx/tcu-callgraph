@@ -210,7 +210,7 @@ function hEscape(y, xA, xB, nodes, skip, jogX = null, jogY = null) {
   return best;
 }
 
-function pathBlockedByNodes(points, nodes, skip) {
+export function pathBlockedByNodes(points, nodes, skip) {
   for (let i = 0; i < points.length - 1; i++) {
     const [x1, y1] = points[i];
     const [x2, y2] = points[i + 1];
@@ -221,6 +221,49 @@ function pathBlockedByNodes(points, nodes, skip) {
     } else return true;
   }
   return false;
+}
+
+/** 找一条避开所有非端点节点的正交外绕路径。 */
+function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixedFromSide, fixedToSide) {
+  const sideOrder = (fixed, preferred) => {
+    if (SIDES.has(fixed)) return [fixed];
+    return [preferred, ...[...SIDES].filter((side) => side !== preferred)];
+  };
+  const fromSides = sideOrder(fixedFromSide, fromSide);
+  const toSides = sideOrder(fixedToSide, toSide);
+  const skip = new Set([a.id, b.id]);
+  const minX = Math.min(...ctx.nodes.map((n) => n.x)) - CLEAR - SPACING;
+  const maxX = Math.max(...ctx.nodes.map((n) => n.x + n.w)) + CLEAR + SPACING;
+  const minY = Math.min(...ctx.nodes.map((n) => n.y)) - CLEAR - SPACING;
+  const maxY = Math.max(...ctx.nodes.map((n) => n.y + n.h)) + CLEAR + SPACING;
+  const laneXs = [minX, minX - SPACING * 2, maxX, maxX + SPACING * 2];
+  const laneYs = [minY, minY - SPACING * 2, maxY, maxY + SPACING * 2];
+  for (const sa of fromSides) {
+    for (const sb of toSides) {
+      const p0 = portAt(a, sa, sa === fromSide && fromPoint ? sideFrac(a, sa, fromPoint) : 0.5);
+      const p1 = portAt(b, sb, sb === toSide && toPoint ? sideFrac(b, sb, toPoint) : 0.5);
+      const s0 = [p0[0] + DIR[sa][0] * STUB, p0[1] + DIR[sa][1] * STUB];
+      const s1 = [p1[0] + DIR[sb][0] * STUB, p1[1] + DIR[sb][1] * STUB];
+      const candidates = [];
+      let best = null;
+      for (const y of laneYs) {
+        candidates.push(collapse([p0, s0, [s0[0], y], [s1[0], y], s1, p1]));
+      }
+      for (const x of laneXs) {
+        candidates.push(collapse([p0, s0, [x, s0[1]], [x, s1[1]], s1, p1]));
+      }
+      for (const points of candidates) {
+        if (pathBlockedByNodes(points, ctx.nodes, skip)) continue;
+        const length = points.slice(1).reduce((sum, p, i) =>
+          sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
+        const score = length + points.length * 6;
+        if (!best || score < best.score) best = { points, score };
+      }
+      // 优先保留原端口方向；只在该方向完全无安全通道时尝试其他端口侧。
+      if (best) return best.points;
+    }
+  }
+  return null;
 }
 
 /** 直连通道被占时，沿所有节点包络之外绕行，避免退回穿过函数框。 */
@@ -920,7 +963,7 @@ function retargetCustom(e, a, b) {
     } else {
       pts.splice(1, 0, [np0[0], np1[1]]);
     }
-    return;
+    return { sa, sb };
   }
   if (pts[1]) {
     if (DIR[sa][1] !== 0) pts[1][0] = np0[0];
@@ -931,6 +974,7 @@ function retargetCustom(e, a, b) {
     if (DIR[sb][1] !== 0) pts[n1][0] = np1[0];
     else pts[n1][1] = np1[1];
   }
+  return { sa, sb };
 }
 
 // ---------------- 主入口 ----------------
@@ -974,18 +1018,29 @@ export function routeEdges(nodes, edges, opts = {}) {
   ctx.placed.v.sort((u, v) => u.k - v.k);
 
   const autos = [];
+  const restoreCustom = new Set();
   for (const e of edges) {
     const a = nodeMap.get(e.from);
     const b = nodeMap.get(e.to);
     if (!a || !b) continue;
     if (a === b) {
       e.points = routeSelf(e, a, ctx);
+      if (pathBlockedByNodes(e.points, nodes, new Set([a.id]))) {
+        e.points = routeAroundNodes(a, b, 'bottom', 'top', ctx, e.points[0], e.points.at(-1)) || [];
+      }
       e.back = true;
       continue;
     }
     if (e.custom && Array.isArray(e.points) && e.points.length >= 2) {
-      retargetCustom(e, a, b);
+      const { sa, sb } = retargetCustom(e, a, b);
       e.back = false;
+      if (!pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id]))) continue;
+
+      // 自定义折线与函数框冲突时改用安全自动路由；保留 custom 标记供用户继续编辑。
+      e.custom = false;
+      restoreCustom.add(e);
+      const c = classify({ ...e, fromSide: e.fromSide || sa, toSide: e.toSide || sb }, a, b);
+      autos.push({ e, a, b, ...c });
       continue;
     }
     const c = classify(e, a, b);
@@ -1079,11 +1134,30 @@ export function routeEdges(nodes, edges, opts = {}) {
     }
   }
 
+  // 所有自动/母线路由再统一校验一次。启发式无路可走时尝试图外安全通道，
+  // 找不到合法路径就隐藏该边，不能退回穿过函数框的折线。
+  for (const it of items) {
+    if (!pathBlockedByNodes(it.e.points || [], nodes, new Set([it.a.id, it.b.id]))) continue;
+    it.e.points = routeAroundNodes(
+      it.a,
+      it.b,
+      it.sa,
+      it.sb,
+      ctx,
+      it.e._p0,
+      it.e._p1,
+      SIDES.has(it.e.fromSide) ? it.e.fromSide : null,
+      SIDES.has(it.e.toSide) ? it.e.toSide : null
+    ) || [];
+  }
+
   // 重复边直接复用首条折线（展示上完全重合 = 合并为一条线）
   for (const it of pairDups) {
     const f = pairFirst.get(pairKey(it.e));
     if (f && f.e.points) it.e.points = f.e.points.map((p) => [p[0], p[1]]);
   }
+
+  for (const e of restoreCustom) e.custom = true;
 
   return {
     placed: ctx.placed,
