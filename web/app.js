@@ -2,7 +2,7 @@
  * 入口：视图加载、删除、工具栏与快捷键、启动
  * 具体职责已拆到 lib/ 下的模块
  */
-import { applyI18n } from './i18n.js';
+import { t, applyI18n } from './i18n.js';
 import { els, state, cam, deleteStack, edgeKey, modifiedEdges, modifiedNodes } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
@@ -23,6 +23,7 @@ async function loadView(rootId) {
     up: state.up,
     down: state.down,
     group: state.group,
+    optimal: state.optimal,
   });
   state.view = data;
   state.root = data.root;
@@ -142,6 +143,14 @@ els.groupMode.addEventListener('change', () => {
   state.selectedEdge = null;
   loadView(state.root);
 });
+els.optimalLayout.addEventListener('click', () => {
+  state.optimal = !state.optimal;
+  els.optimalLayout.textContent = t(state.optimal ? 'btn.optimal' : 'btn.manualLayout');
+  els.optimalLayout.setAttribute('aria-pressed', String(state.optimal));
+  els.optimalLayout.classList.toggle('primary', state.optimal);
+  state.selectedEdge = null;
+  loadView(state.root);
+});
 els.fit.addEventListener('click', fit);
 
 els.resetLayout.addEventListener('click', async () => {
@@ -184,6 +193,9 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
+els.optimalLayout.textContent = t('btn.optimal');
+els.optimalLayout.setAttribute('aria-pressed', 'true');
+els.optimalLayout.classList.add('primary');
 window.addEventListener('resize', resize);
 resize();
 loadStats();

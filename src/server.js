@@ -199,7 +199,7 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(rootId, up, down, group = false, dfNode = null) {
+function buildView(rootId, up, down, group = false, dfNode = null, optimal = false) {
   const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
   // 所以某个文件或目录里的函数被删空时，对应层级会自动消失
@@ -243,7 +243,7 @@ function buildView(rootId, up, down, group = false, dfNode = null) {
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
-  const slot = overlay.layout?.[layoutKey(g.root, mode)] || {};
+  const slot = optimal ? {} : overlay.layout?.[layoutKey(g.root, mode)] || {};
 
   // 手动拖拽的节点位置优先。
   // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
@@ -428,6 +428,7 @@ const server = http.createServer((req, res) => {
       const down = Number(u.searchParams.get('down') || 2);
       const group = u.searchParams.get('group') === '1';
       const df = u.searchParams.get('df') || null;
+      const optimal = u.searchParams.get('optimal') === '1';
       if (!rootId) {
         if (!MODEL.functions.length) {
           return json(res, {
@@ -448,9 +449,9 @@ const server = http.createServer((req, res) => {
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
-        return json(res, buildView(pick.id, up, Math.max(down, 3), group, df));
+        return json(res, buildView(pick.id, up, Math.max(down, 3), group, df, optimal));
       }
-      return json(res, buildView(rootId, up, down, group, df));
+      return json(res, buildView(rootId, up, down, group, df, optimal));
     }
 
     if (u.pathname === '/api/node') {

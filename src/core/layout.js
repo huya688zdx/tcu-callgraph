@@ -44,7 +44,7 @@ function spreadX(n, i, total) {
   return n.x + inset + ((i + 1) / (total + 1)) * Math.max(1, n.w - 2 * inset);
 }
 
-export function layout(nodes, edges, opts = {}) {
+function layoutBase(nodes, edges, opts = {}) {
   const {
     nodeH = 44,
     subH = 58,
@@ -385,6 +385,346 @@ export function layout(nodes, edges, opts = {}) {
   };
 }
 
+function cloneEdges(edges) {
+  return edges.map((e) => {
+    const copy = { ...e };
+    if (e.points) copy.points = e.points.map((p) => [p[0], p[1]]);
+    delete copy._p0;
+    delete copy._p1;
+    return copy;
+  });
+}
+
+function overlapNodes(nodes) {
+  for (let i = 0; i < nodes.length; i++) {
+    const a = nodes[i];
+    for (let j = i + 1; j < nodes.length; j++) {
+      const b = nodes[j];
+      if (
+        Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 0.5 &&
+        Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0.5
+      ) return true;
+    }
+  }
+  return false;
+}
+
+function routeLengthAndCrossings(edges) {
+  const horizontal = [];
+  const vertical = [];
+  const pathKeys = new Set();
+  let bends = 0;
+  let rawLength = 0;
+  for (const e of edges) {
+    const pts = e.points || [];
+    const signature = pts.map((p) => `${Math.round(p[0])},${Math.round(p[1])}`).join(';');
+    if (signature && !pathKeys.has(signature)) {
+      pathKeys.add(signature);
+      bends += Math.max(0, pts.length - 2);
+      let pathLength = 0;
+      for (let i = 0; i < pts.length - 1; i++) pathLength += Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
+      rawLength += pathLength;
+    }
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x1, y1] = pts[i];
+      const [x2, y2] = pts[i + 1];
+      if (Math.abs(y1 - y2) < 0.5) {
+        horizontal.push({ y: Math.round((y1 + y2) / 2), x1: Math.min(x1, x2), x2: Math.max(x1, x2), edge: e });
+      } else if (Math.abs(x1 - x2) < 0.5) {
+        vertical.push({ x: Math.round((x1 + x2) / 2), y1: Math.min(y1, y2), y2: Math.max(y1, y2), edge: e });
+      }
+    }
+  }
+
+  // 共线共享干线只按画面上实际占用的长度计一次。
+  const unionLength = (segments, axis, coord) => {
+    const byLine = new Map();
+    for (const s of segments) {
+      const key = Math.round(s[axis] / 2) * 2;
+      if (!byLine.has(key)) byLine.set(key, []);
+      byLine.get(key).push([s[coord[0]], s[coord[1]]]);
+    }
+    let total = 0;
+    for (const list of byLine.values()) {
+      list.sort((a, b) => a[0] - b[0]);
+      let lo = null;
+      let hi = null;
+      for (const [a, b] of list) {
+        if (lo === null) [lo, hi] = [a, b];
+        else if (a <= hi + 1) hi = Math.max(hi, b);
+        else {
+          total += hi - lo;
+          [lo, hi] = [a, b];
+        }
+      }
+      if (lo !== null) total += hi - lo;
+    }
+    return total;
+  };
+  const length = unionLength(horizontal, 'y', ['x1', 'x2']) + unionLength(vertical, 'x', ['y1', 'y2']);
+
+  const intersections = new Set();
+  for (const h of horizontal) {
+    for (const v of vertical) {
+      if (v.x <= h.x1 + 0.5 || v.x >= h.x2 - 0.5 || h.y <= v.y1 + 0.5 || h.y >= v.y2 - 0.5) continue;
+      const related = h.edge.from === v.edge.from || h.edge.from === v.edge.to || h.edge.to === v.edge.from || h.edge.to === v.edge.to;
+      if (!related) intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
+    }
+  }
+  return { length, rawLength, sharedLength: Math.max(0, rawLength - length), crossings: intersections.size, bends };
+}
+
+function normalizeCandidate(nodes, edges, padding) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = 0;
+  let maxY = 0;
+  const take = (x, y) => {
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x);
+    maxY = Math.max(maxY, y);
+  };
+  for (const n of nodes) {
+    take(n.x, n.y);
+    maxX = Math.max(maxX, n.x + n.w);
+    maxY = Math.max(maxY, n.y + n.h);
+  }
+  for (const e of edges) for (const p of e.points || []) take(p[0], p[1]);
+  if (!Number.isFinite(minX)) return { width: padding * 2, height: padding * 2 };
+  const dx = Math.max(0, padding - minX);
+  const dy = Math.max(0, padding - minY);
+  if (dx || dy) {
+    for (const n of nodes) { n.x += dx; n.y += dy; }
+    for (const e of edges) for (const p of e.points || []) { p[0] += dx; p[1] += dy; }
+    maxX += dx;
+    maxY += dy;
+  }
+  return { width: maxX + padding, height: maxY + padding };
+}
+
+function candidateScore(candidate) {
+  if (overlapNodes(candidate.nodes)) return Infinity;
+  const { length, sharedLength, crossings, bends } = routeLengthAndCrossings(candidate.edges);
+  let width = candidate.width;
+  let height = candidate.height;
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    let maxX = 0;
+    let maxY = 0;
+    for (const n of candidate.nodes) {
+      maxX = Math.max(maxX, n.x + n.w);
+      maxY = Math.max(maxY, n.y + n.h);
+    }
+    for (const e of candidate.edges) for (const p of e.points || []) {
+      maxX = Math.max(maxX, p[0]);
+      maxY = Math.max(maxY, p[1]);
+    }
+    width = maxX + 40;
+    height = maxY + 40;
+  }
+  const area = width * height;
+  const bundleCredit = Math.min(length * 0.65, sharedLength * 1.1);
+  return length - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008;
+}
+
+function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
+  if (nodes.length > 80 || edges.length > 180 || edges.some((e) => e.custom)) return;
+  const groupById = new Map(groups.map((g) => [g.id, g]));
+  const currentNodes = nodes.map((n) => ({ ...n }));
+  const currentEdges = cloneEdges(edges);
+  routeEdges(currentNodes, currentEdges);
+  const byId = new Map(currentNodes.map((n) => [n.id, n]));
+  const neighbors = new Map(currentNodes.map((n) => [n.id, new Set()]));
+  const extDegree = new Map(currentNodes.map((n) => [n.id, 0]));
+  const degree = new Map(currentNodes.map((n) => [n.id, 0]));
+  const fanoutTargets = new Map();
+  for (const e of currentEdges) {
+    const a = byId.get(e.from);
+    const b = byId.get(e.to);
+    if (!a || !b) continue;
+    neighbors.get(a.id).add(b.id);
+    neighbors.get(b.id).add(a.id);
+    degree.set(a.id, degree.get(a.id) + 1);
+    degree.set(b.id, degree.get(b.id) + 1);
+    if (a.group !== b.group) {
+      extDegree.set(a.id, extDegree.get(a.id) + 1);
+      extDegree.set(b.id, extDegree.get(b.id) + 1);
+      if (!fanoutTargets.has(a.id)) fanoutTargets.set(a.id, new Set());
+      fanoutTargets.get(a.id).add(b.id);
+    }
+  }
+  // 保持调用者锚点稳定，让多个目标仍可在各自文件框内靠拢以形成共享干线。
+  const bundledSources = new Set();
+  for (const [sourceId, targetIds] of fanoutTargets) {
+    if (targetIds.size < 2) continue;
+    bundledSources.add(sourceId);
+  }
+  const order = currentNodes.slice().sort(
+    (a, b) => extDegree.get(b.id) - extDegree.get(a.id) || degree.get(b.id) - degree.get(a.id) || a.id.localeCompare(b.id)
+  ).filter((n) => extDegree.get(n.id) > 0 && !bundledSources.has(n.id)).slice(0, 24);
+  let score = candidateScore({ nodes: currentNodes, edges: currentEdges });
+
+  for (const original of order) {
+    let node = byId.get(original.id);
+    const box = groupById.get(node.group);
+    if (!box) continue;
+    const alignedOptions = [];
+    const options = [];
+    for (const neighborId of neighbors.get(node.id) || []) {
+      const other = byId.get(neighborId);
+      if (!other) continue;
+      if (other.group !== node.group) {
+        // 外部调用点可能与节点不在同一行/列。扫描所属文件框内与调用点对齐的空位，
+        // 让被调用节点有机会靠到文件框右侧并直接接入共享线路。
+        const minX = box.x + 8;
+        const maxX = box.x + box.w - node.w - 8;
+        const y = other.y + (other.h - node.h) / 2;
+        for (let x = minX; x <= maxX; x += 24) {
+          alignedOptions.push({ x, y });
+        }
+        const minY = box.y + headerH + 4;
+        const maxY = box.y + box.h - node.h - 6;
+        const x = Math.max(minX, Math.min(maxX, other.x + (other.w - node.w) / 2));
+        for (let yy = minY; yy <= maxY; yy += 24) {
+          alignedOptions.push({ x, y: yy });
+        }
+      }
+      options.push(
+        { x: other.x + other.w + 24, y: other.y + (other.h - node.h) / 2 },
+        { x: other.x - node.w - 24, y: other.y + (other.h - node.h) / 2 },
+        { x: other.x + (other.w - node.w) / 2, y: other.y + other.h + 24 },
+        { x: other.x + (other.w - node.w) / 2, y: other.y - node.h - 24 }
+      );
+    }
+    const seen = new Set();
+    for (const p of [...alignedOptions, ...options].slice(0, 40)) {
+      const key = `${Math.round(p.x)},${Math.round(p.y)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (
+        p.x < box.x + 8 || p.y < box.y + headerH + 4 ||
+        p.x + node.w > box.x + box.w - 8 || p.y + node.h > box.y + box.h - 6
+      ) continue;
+      const trialNodes = currentNodes.map((n) => n.id === node.id ? { ...n, ...p } : { ...n });
+      if (overlapNodes(trialNodes)) continue;
+      const trialEdges = cloneEdges(edges);
+      routeEdges(trialNodes, trialEdges);
+      const trialScore = candidateScore({ nodes: trialNodes, edges: trialEdges });
+      const movementCost = (Math.abs(p.x - node.x) + Math.abs(p.y - node.y)) * 0.06;
+      if (trialScore + movementCost < score - 1) {
+        currentNodes.splice(0, currentNodes.length, ...trialNodes);
+        currentEdges.splice(0, currentEdges.length, ...trialEdges);
+        score = trialScore;
+        for (const n of currentNodes) byId.set(n.id, n);
+        node = byId.get(node.id);
+      }
+    }
+  }
+
+  for (const n of nodes) {
+    const p = byId.get(n.id);
+    n.x = p.x;
+    n.y = p.y;
+  }
+  for (let i = 0; i < edges.length; i++) Object.assign(edges[i], currentEdges[i]);
+}
+
+/** 同时比较上下流向和左右流向，并在小图上试探邻接节点四周的局部摆位。 */
+export function layout(nodes, edges, opts = {}) {
+  const padding = opts.padding ?? 40;
+  const vertical = layoutBase(nodes.map((n) => ({ ...n })), cloneEdges(edges), opts);
+  Object.assign(vertical, normalizeCandidate(vertical.nodes, vertical.edges, padding));
+  const candidates = [vertical];
+
+  // 手工折线的位置有明确含义，自动旋转不会改写这类用户布局。
+  if (!edges.some((e) => e.custom && Array.isArray(e.points) && e.points.length >= 2) && nodes.length > 1) {
+    const widthOf = (n) => {
+      if (n.w) return n.w;
+      const label = n.label || n.name || n.id;
+      return Math.min(opts.maxLabelWidth ?? 260, Math.max(opts.minWidth ?? 120, textWidth(label) + 28 + (n.kind === 'var' ? 0 : 16)));
+    };
+    const heightOf = (n) => n.h || (n.sub ? (opts.subH ?? 58) : (opts.nodeH ?? 44));
+    const swapped = nodes.map((n) => ({ ...n, w: heightOf(n), h: widthOf(n) }));
+    const rotated = layoutBase(swapped, cloneEdges(edges), {
+      ...opts,
+      gapX: opts.gapY ?? 76,
+      gapY: opts.gapX ?? 34,
+    });
+    const rotatedById = new Map(rotated.nodes.map((n) => [n.id, n]));
+    const horizontalNodes = nodes.map((n) => {
+      const p = rotatedById.get(n.id);
+      return { ...n, x: p.y, y: p.x, w: p.h, h: p.w };
+    });
+    const horizontalEdges = cloneEdges(edges);
+    routeEdges(horizontalNodes, horizontalEdges);
+    const size = normalizeCandidate(horizontalNodes, horizontalEdges, padding);
+    candidates.push({ ...rotated, nodes: horizontalNodes, edges: horizontalEdges, ...size });
+  }
+
+  let best = candidates[0];
+  let bestScore = candidateScore(best);
+  for (let i = 1; i < candidates.length; i++) {
+    const score = candidateScore(candidates[i]);
+    if (score < bestScore - 0.5) {
+      best = candidates[i];
+      bestScore = score;
+    }
+  }
+
+  // 小图上允许单个节点换到邻居左右/上下；大图只比较两种整体方向，控制计算量。
+  if (best.nodes.length <= 36 && best.edges.length <= 120 && !edges.some((e) => e.custom)) {
+    let current = { ...best, nodes: best.nodes.map((n) => ({ ...n })), edges: cloneEdges(best.edges) };
+    let currentScore = candidateScore(current);
+    const degree = new Map(current.nodes.map((n) => [n.id, 0]));
+    const neighbors = new Map(current.nodes.map((n) => [n.id, new Set()]));
+    for (const e of current.edges) {
+      degree.set(e.from, (degree.get(e.from) || 0) + 1);
+      degree.set(e.to, (degree.get(e.to) || 0) + 1);
+      neighbors.get(e.from)?.add(e.to);
+      neighbors.get(e.to)?.add(e.from);
+    }
+    const nodeById = new Map(current.nodes.map((n) => [n.id, n]));
+    const order = current.nodes.slice().sort((a, b) => (degree.get(b.id) || 0) - (degree.get(a.id) || 0) || a.id.localeCompare(b.id));
+    for (const n0 of order) {
+      let n = nodeById.get(n0.id);
+      const points = [];
+      for (const id of neighbors.get(n.id) || []) {
+        const other = nodeById.get(id);
+        if (!other) continue;
+        points.push(
+          { x: other.x + other.w + 32, y: other.y + (other.h - n.h) / 2 },
+          { x: other.x - n.w - 32, y: other.y + (other.h - n.h) / 2 },
+          { x: other.x + (other.w - n.w) / 2, y: other.y + other.h + 32 },
+          { x: other.x + (other.w - n.w) / 2, y: other.y - n.h - 32 }
+        );
+      }
+      const seen = new Set();
+      for (const p of points) {
+        const key = `${Math.round(p.x)},${Math.round(p.y)}`;
+        if (seen.has(key) || p.x < padding || p.y < padding) continue;
+        seen.add(key);
+        const trialNodes = current.nodes.map((x) => x.id === n.id ? { ...x, ...p } : { ...x });
+        if (overlapNodes(trialNodes)) continue;
+        const trialEdges = cloneEdges(edges);
+        routeEdges(trialNodes, trialEdges);
+        const size = normalizeCandidate(trialNodes, trialEdges, padding);
+        const trial = { ...current, nodes: trialNodes, edges: trialEdges, ...size };
+        const score = candidateScore(trial);
+        const move = Math.abs(p.x - n.x) + Math.abs(p.y - n.y);
+        const adjusted = score + move * 0.06;
+        if (adjusted < currentScore - 1) {
+          current = trial;
+          currentScore = score;
+          for (const updated of current.nodes) nodeById.set(updated.id, updated);
+          n = nodeById.get(n.id);
+        }
+      }
+    }
+    best = current;
+  }
+  return best;
+}
+
 /**
  * 分区式紧凑布局：把一组矩形（文件框 / 目录框）按调用方向分级，
  * 级内按重心排序，再按「每列 R 级」列优先蛇形折行成多列二维分区
@@ -401,6 +741,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
     colGap = 72, // 列间距（跨列连线走这里）
     maxRowWidth = 780, // 单行最大宽度，超过拆行
     targetAspect = 1.8, // 期望的整体宽高比（横向分区构图，参考草图）
+    scorePlacement = null,
   } = opts;
 
   const byId = new Map(items.map((it) => [it.id, it]));
@@ -476,8 +817,8 @@ export function layoutPartitioned(items, edges, opts = {}) {
   const succs = new Map();
   for (const e of es) {
     if (back.has(e)) continue;
-    pushTo(succs, e.from, e.to);
-    pushTo(preds, e.to, e.from);
+    pushTo(succs, e.from, { id: e.to, weight: Math.max(1, e.weight || 1) });
+    pushTo(preds, e.to, { id: e.from, weight: Math.max(1, e.weight || 1) });
   }
   for (let it = 0; it < 4; it++) {
     const down = it % 2 === 0;
@@ -491,9 +832,9 @@ export function layoutPartitioned(items, edges, opts = {}) {
         const nb = down ? preds.get(id) || [] : succs.get(id) || [];
         let s = 0;
         let c = 0;
-        for (const x of nb) {
-          s += norm(x);
-          c++;
+        for (const { id: x, weight } of nb) {
+          s += norm(x) * weight;
+          c += weight;
         }
         bc.set(id, c ? s / c : norm(id));
       }
@@ -544,7 +885,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
     const ra = rankIdx.get(e.from);
     const rb = rankIdx.get(e.to);
     if (ra === rb || rb < ra) continue;
-    for (let r = ra; r < rb && r < n - 1; r++) gapNeed[r] += 1;
+    for (let r = ra; r < rb && r < n - 1; r++) gapNeed[r] += Math.max(1, e.weight || 1);
   }
   const gapBetween = Array.from({ length: Math.max(0, n - 1) }, (_, r) => {
     if (!gapNeed[r]) return rowGap;
@@ -558,7 +899,8 @@ export function layoutPartitioned(items, edges, opts = {}) {
       if (r < ra || r >= rb) continue;
       const a = approxX.get(e.from);
       const b = approxX.get(e.to);
-      ev.push([Math.min(a, b), 1], [Math.max(a, b), -1]);
+      const weight = Math.max(1, e.weight || 1);
+      ev.push([Math.min(a, b), weight], [Math.max(a, b), -weight]);
     }
     ev.sort((u, v) => u[0] - v[0] || v[1] - u[1]);
     let cur = 0;
@@ -577,7 +919,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
   };
   const m = units.length;
   let best = null;
-  for (let R = 1; R <= m; R++) {
+  const placeUnits = (R) => {
     const C = Math.ceil(m / R);
     const colW = [];
     const colH = [];
@@ -591,50 +933,59 @@ export function layoutPartitioned(items, edges, opts = {}) {
       colW.push(w);
       colH.push(h);
     }
-    const W = colW.reduce((a, b) => a + b, 0) + colGap * (C - 1) + padding * 2;
-    const H = Math.max(...colH) + padding * 2;
-    const aspect = W / Math.max(1, H);
-    const spread = (Math.max(...colH) - Math.min(...colH)) / Math.max(1, Math.max(...colH));
-    const score = Math.abs(Math.log(aspect / targetAspect)) + spread * 0.25 + (C - 1) * 0.02;
-    if (!best || score < best.score) best = { R, score };
-  }
-  const R = best.R;
-  const C = Math.ceil(m / R);
-
-  // ---- 6. 落位：列优先蛇形（列内自上而下，列间自左向右）----
-  const colX = [];
-  let x = padding;
-  for (let c = 0; c < C; c++) {
-    let w = 0;
-    for (let u = c * R; u < Math.min(m, (c + 1) * R); u++) w = Math.max(w, units[u].w);
-    colX.push(x);
-    x += w + colGap;
-  }
-  const placed = new Map();
-  for (let u = 0; u < m; u++) {
-    const c = Math.floor(u / R);
-    let y = padding;
-    for (let v = c * R; v < u; v++) y += units[v].h + unitGap(v);
-    const unit = units[u];
-    let ix = colX[c];
-    for (const id of unit.ids) {
-      placed.set(id, { x: ix, y: y + (unit.h - hOf(id)) / 2 });
-      ix += wOf(id) + gapX;
+    let x = padding;
+    const colX = [];
+    for (let c = 0; c < C; c++) {
+      colX.push(x);
+      x += colW[c] + colGap;
     }
-  }
-  let maxH = 0;
-  for (let c = 0; c < C; c++) {
-    let h = 0;
-    for (let u = c * R; u < Math.min(m, (c + 1) * R); u++) h += units[u].h + (h ? unitGap(u - 1) : 0);
-    maxH = Math.max(maxH, h);
+    const placed = new Map();
+    for (let u = 0; u < m; u++) {
+      const c = Math.floor(u / R);
+      let y = padding;
+      for (let v = c * R; v < u; v++) y += units[v].h + unitGap(v);
+      const unit = units[u];
+      let ix = colX[c];
+      for (const id of unit.ids) {
+        placed.set(id, { x: ix, y: y + (unit.h - hOf(id)) / 2 });
+        ix += wOf(id) + gapX;
+      }
+    }
+    return {
+      pos: placed,
+      width: x - colGap + padding,
+      height: Math.max(...colH) + padding * 2,
+      columns: C,
+      ranks: n,
+      R,
+      colH,
+    };
+  };
+  for (let R = 1; R <= m; R++) {
+    const candidate = placeUnits(R);
+    const W = candidate.width;
+    const H = candidate.height;
+    const aspect = W / Math.max(1, H);
+    const spread = (Math.max(...candidate.colH) - Math.min(...candidate.colH)) / Math.max(1, Math.max(...candidate.colH));
+    const aspectScore = Math.abs(Math.log(aspect / targetAspect)) + spread * 0.25 + (candidate.columns - 1) * 0.02;
+    const trialNodes = items.map((it) => ({ ...it, ...(candidate.pos.get(it.id) || {}) }));
+    const trialEdges = edges.map((e) => ({ ...e }));
+    routeEdges(trialNodes, trialEdges);
+    const metrics = routeLengthAndCrossings(trialEdges);
+    const bundleCredit = Math.min(metrics.length * 0.65, metrics.sharedLength * 1.1);
+    const wireScore = scorePlacement
+      ? scorePlacement(candidate.pos, candidate.width, candidate.height)
+      : (metrics.length - bundleCredit) / Math.max(1, W + H) + metrics.crossings * 2 + metrics.bends * 0.12;
+    const score = aspectScore * 0.25 + wireScore;
+    if (!best || score < best.score - 0.001) best = { ...candidate, score };
   }
 
   return {
-    pos: placed,
-    width: x - colGap + padding,
-    height: maxH + padding * 2,
-    columns: C,
-    ranks: n,
+    pos: best.pos,
+    width: best.width,
+    height: best.height,
+    columns: best.columns,
+    ranks: best.ranks,
   };
 }
 
@@ -744,8 +1095,7 @@ export function layoutGrouped(nodes, edges, opts = {}) {
 
   // 子节点之间的边：把文件级调用聚合到当前目录层级，供该层排序使用
   const childEdgesOf = (node) => {
-    const seen = new Set();
-    const out = [];
+    const links = new Map();
     for (const e of edges) {
       const fa = fileOfId.get(e.from);
       const fb = fileOfId.get(e.to);
@@ -754,11 +1104,11 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       const b = ownerChild(node, fb);
       if (!a || !b || a === b) continue;
       const k = a.path + '\u0000' + b.path;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push({ from: a.path, to: b.path, kind: 'direct' });
+      const link = links.get(k) || { from: a.path, to: b.path, kind: 'direct', weight: 0 };
+      link.weight++;
+      links.set(k, link);
     }
-    return out;
+    return [...links.values()];
   };
 
   // 文件框 / 目录框之间的物理间隔：连线走这些空隙。
@@ -777,7 +1127,70 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     }
     const cn = list.map((c) => ({ id: c.path, name: c.name, w: c.w, h: c.h }));
     // 分区式紧凑布局：列优先蛇形折行，宽高比最优，不再排成一列
-    const laid = layoutPartitioned(cn, childEdgesOf(node), BOX);
+    const childOfFile = new Map();
+    const filesByChild = new Map();
+    const addFiles = (top, cur, ox, oy) => {
+      if (cur.type === 'file') {
+        childOfFile.set(cur.path, top.path);
+        if (!filesByChild.has(top.path)) filesByChild.set(top.path, []);
+        filesByChild.get(top.path).push({ file: cur.path, x: ox, y: oy });
+        return;
+      }
+      for (const c of cur.children.values()) addFiles(top, c, ox + c.x, oy + c.y);
+    };
+    for (const c of list) addFiles(c, c, 0, 0);
+
+    const crossingFunctionEdges = edges.filter((e) => {
+      const a = childOfFile.get(fileOfId.get(e.from));
+      const b = childOfFile.get(fileOfId.get(e.to));
+      return a && b && a !== b;
+    });
+    const fanoutByGroupPair = new Map();
+    for (const e of crossingFunctionEdges) {
+      const sourceGroup = childOfFile.get(fileOfId.get(e.from));
+      const targetGroup = childOfFile.get(fileOfId.get(e.to));
+      const key = `${sourceGroup}\u0000${targetGroup}`;
+      if (!fanoutByGroupPair.has(key)) fanoutByGroupPair.set(key, { sourceGroup, targetGroup, targets: new Set() });
+      fanoutByGroupPair.get(key).targets.add(e.to);
+    }
+    const fanoutBundles = [...fanoutByGroupPair.values()].filter((b) => b.targets.size > 1);
+    const childDims = new Map(cn.map((child) => [child.id, child]));
+    const actualNodes = [...filesByChild.values()].reduce((sum, files) =>
+      sum + files.reduce((n, f) => n + (inner.get(f.file)?.nodes.length || 0), 0), 0);
+    const scorePlacement = actualNodes <= 160 && crossingFunctionEdges.length <= 160
+      ? (positions, width, height) => {
+          const tempNodes = [];
+          for (const [childPath, files] of filesByChild) {
+            const base = positions.get(childPath);
+            if (!base) continue;
+            for (const f of files) {
+              const laidFile = inner.get(f.file);
+              if (!laidFile) continue;
+              for (const fn of laidFile.nodes) {
+                tempNodes.push({ ...fn, x: base.x + f.x + fn.x, y: base.y + f.y + fn.y, group: f.file });
+              }
+            }
+          }
+          const tempEdges = cloneEdges(crossingFunctionEdges);
+          routeEdges(tempNodes, tempEdges);
+          const metrics = routeLengthAndCrossings(tempEdges);
+          const bundleCredit = Math.min(metrics.length * 0.75, metrics.sharedLength * 1.5);
+          // 高扇出跨文件调用优先让文件并排；这样路由器能用一根纵向主干分发到多个目标。
+          let fanoutAxisPenalty = 0;
+          for (const bundle of fanoutBundles) {
+            const a = positions.get(bundle.sourceGroup);
+            const b = positions.get(bundle.targetGroup);
+            const da = childDims.get(bundle.sourceGroup);
+            const db = childDims.get(bundle.targetGroup);
+            if (!a || !b || !da || !db) continue;
+            const dx = Math.abs((b.x + db.w / 2) - (a.x + da.w / 2));
+            const dy = Math.abs((b.y + db.h / 2) - (a.y + da.h / 2));
+            if (dx < dy * 1.15) fanoutAxisPenalty += Math.min(2, bundle.targets.size - 1) * 1.5;
+          }
+          return (metrics.length - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
+        }
+      : null;
+    const laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
     const byId = new Map(list.map((c) => [c.path, c]));
     for (const it of cn) {
       const c = byId.get(it.id);
@@ -961,6 +1374,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   }
 
   const allContainers = rootC ? [rootC, ...containers] : containers;
+
+  // 跨文件连线也参与局部摆位：只在所属文件框内移动节点，避免破坏目录/文件层级。
+  refineGroupedNodes(mergedNodes, routed, fileGroups, headerH);
 
   // 7. 画布尺寸：内容与侧边车道取并集
   let maxX = 0;

@@ -17,6 +17,8 @@ const dict = {
     'depth.up2': '向上 2 层',
     'btn.fit': '适应',
     'btn.group': '文件分组',
+    'btn.optimal': '最优布局',
+    'btn.manualLayout': '手动布局',
     'btn.svg': '导出 SVG',
     'btn.png': 'PNG',
     'btn.html': 'HTML',

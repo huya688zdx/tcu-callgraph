@@ -4,9 +4,11 @@
  * 核心思路：
  *  1. 几何分类：按两端节点相对位置决定出/入边方向（可被 e.fromSide/e.toSide 覆盖）
  *  2. 端口分配：同一节点同侧的多条边按对端位置排序后沿边均匀展开
- *  3. 直连路由（相邻/同排）：单通道 Z 形，通道位置做「节点避障 + 已布通道避让」搜索
- *  4. 长边路由（跨多层 / 回边）：先尝试图内垂直走廊，失败则绕侧边车道
- *  5. 手动布线（e.custom）：保留用户折线，仅随节点移动重新锚定端点
+ *  3. 共线合并：同一对节点的同类型调用边共用一条折线（不同调用行不再平行重复）
+ *  4. 公用母线：同源（或同目标）的同类型同色直连边共享一条水平母线，只留竖直分支
+ *  5. 直连路由（相邻/同排）：单通道 Z 形，通道位置做「节点避障 + 已布通道避让」搜索
+ *  6. 长边路由（跨多层 / 回边）：先尝试图内垂直走廊，失败则绕侧边车道
+ *  7. 手动布线（e.custom）：保留用户折线，仅随节点移动重新锚定端点
  *
  * 硬性约束：所有输出线段严格水平或垂直（无斜线）。
  */
@@ -208,6 +210,58 @@ function hEscape(y, xA, xB, nodes, skip, jogX = null, jogY = null) {
   return best;
 }
 
+function pathBlockedByNodes(points, nodes, skip) {
+  for (let i = 0; i < points.length - 1; i++) {
+    const [x1, y1] = points[i];
+    const [x2, y2] = points[i + 1];
+    if (Math.abs(y1 - y2) < 0.5) {
+      if (hLineBlocked(y1, x1, x2, nodes, skip)) return true;
+    } else if (Math.abs(x1 - x2) < 0.5) {
+      if (vLineBlocked(x1, y1, y2, nodes, skip)) return true;
+    } else return true;
+  }
+  return false;
+}
+
+/** 直连通道被占时，沿所有节点包络之外绕行，避免退回穿过函数框。 */
+function routeOuterLane(p0, p1, a, b, sa, sb, ctx) {
+  if (DIR[sa][1] !== 0 || DIR[sb][1] !== 0) return null;
+  const nodes = ctx.nodes;
+  const skip = new Set([a.id, b.id]);
+  const x0 = p0[0] + DIR[sa][0] * STUB;
+  const x1 = p1[0] + DIR[sb][0] * STUB;
+  const minY = Math.min(...nodes.map((n) => n.y)) - CLEAR - SPACING;
+  const maxY = Math.max(...nodes.map((n) => n.y + n.h)) + CLEAR + SPACING;
+  let best = null;
+  for (const y of [minY, maxY]) {
+    const points = collapse([p0, [x0, p0[1]], [x0, y], [x1, y], [x1, p1[1]], p1]);
+    if (pathBlockedByNodes(points, nodes, skip)) continue;
+    const length = points.slice(1).reduce((sum, p, i) =>
+      sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
+    if (!best || length < best.length) best = { points, length };
+  }
+  return best?.points || null;
+}
+
+function routeOuterColumn(p0, p1, a, b, sa, sb, ctx) {
+  if (DIR[sa][0] !== 0 || DIR[sb][0] !== 0) return null;
+  const nodes = ctx.nodes;
+  const skip = new Set([a.id, b.id]);
+  const y0 = p0[1] + DIR[sa][1] * STUB;
+  const y1 = p1[1] + DIR[sb][1] * STUB;
+  const minX = Math.min(...nodes.map((n) => n.x)) - CLEAR - SPACING;
+  const maxX = Math.max(...nodes.map((n) => n.x + n.w)) + CLEAR + SPACING;
+  let best = null;
+  for (const x of [minX, maxX]) {
+    const points = collapse([p0, [p0[0], y0], [x, y0], [x, y1], [p1[0], y1], p1]);
+    if (pathBlockedByNodes(points, nodes, skip)) continue;
+    const length = points.slice(1).reduce((sum, p, i) =>
+      sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
+    if (!best || length < best.length) best = { points, length };
+  }
+  return best?.points || null;
+}
+
 // ---------------- 折线整理 ----------------
 
 /** 去掉零长度段、合并共线点，保证输出为严格正交折线 */
@@ -261,18 +315,19 @@ function classify(e, a, b) {
   let sb = SIDES.has(e.toSide) ? e.toSide : null;
   let g0;
   let g1;
-  if (b.y >= a.y + a.h - 2) {
-    g0 = 'bottom';
-    g1 = 'top';
-  } else if (a.y >= b.y + b.h - 2) {
-    g0 = 'top';
-    g1 = 'bottom';
-  } else if (b.x + b.w / 2 >= a.x + a.w / 2) {
-    g0 = 'right';
-    g1 = 'left';
+  const dx = b.x + b.w / 2 - (a.x + a.w / 2);
+  const dy = b.y + b.h / 2 - (a.y + a.h / 2);
+  const gapX = Math.max(0, Math.max(a.x - (b.x + b.w), b.x - (a.x + a.w)));
+  const gapY = Math.max(0, Math.max(a.y - (b.y + b.h), b.y - (a.y + a.h)));
+  // 先选两节点之间空隙更大的方向。若上下有重叠，优先从左右出线，
+  // 避免纵向路由为了靠近目标而把通道折回源节点内部。
+  const horizontal = gapX > gapY || (gapX === gapY && Math.abs(dx) >= Math.abs(dy));
+  if (horizontal) {
+    g0 = dx >= 0 ? 'right' : 'left';
+    g1 = dx >= 0 ? 'left' : 'right';
   } else {
-    g0 = 'left';
-    g1 = 'right';
+    g0 = dy >= 0 ? 'bottom' : 'top';
+    g1 = dy >= 0 ? 'top' : 'bottom';
   }
   sa = sa || g0;
   sb = sb || g1;
@@ -280,6 +335,7 @@ function classify(e, a, b) {
     const span = DIR[sa][1] > 0 ? b.y - (a.y + a.h) : a.y - (b.y + b.h);
     return { sa, sb, type: span > LOOP_THRESHOLD ? 'long' : 'direct' };
   }
+  if (DIR[sa][0] !== 0 && DIR[sb][0] !== 0) return { sa, sb, type: 'direct' };
   return { sa, sb, type: 'mixed' };
 }
 
@@ -326,10 +382,12 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
 
   const y0s = p0[1] + d0 * STUB; // 源端 stub 线（源节点外侧）
   const y1s = p1[1] + DIR[sb][1] * STUB; // 目标进入线（目标节点外侧）
-  const lo = Math.min(y0s, y1s);
-  const hi = Math.max(y0s, y1s);
+  // 折点必须落在两个端口之间，不能因为外侧 stub 交叠而选到源节点背后。
+  const lo = Math.min(p0[1], p1[1]);
+  const hi = Math.max(p0[1], p1[1]);
+  const prefer = clamp((y0s + y1s) / 2, lo, hi);
   const cy = findFreeH(
-    (y0s + y1s) / 2,
+    prefer,
     lo,
     hi,
     Math.min(p0[0], p1[0]),
@@ -338,6 +396,10 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
     skip,
     ctx.placed
   );
+  if (hLineBlocked(cy, Math.min(p0[0], p1[0]), Math.max(p0[0], p1[0]), nodes, skip)) {
+    // 节点间通道被占时走长边路由，让它从节点外侧绕行。
+    return routeOuterColumn(p0, p1, a, b, sa, sb, ctx) || routeLong(e, a, b, sa, sb, ctx);
+  }
 
   // 源端 → 通道
   const pts = [[p0[0], p0[1]]];
@@ -378,7 +440,164 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
   }
 
   addH(ctx.placed, cy, sx, tx);
-  return collapse(pts.concat([[tx, cy]], tpts.reverse()));
+  const points = collapse(pts.concat([[tx, cy]], tpts.reverse()));
+  if (pathBlockedByNodes(points, nodes, skip)) {
+    return routeOuterColumn(p0, p1, a, b, sa, sb, ctx) || points;
+  }
+  return points;
+}
+
+// ---------------- 路由：公用母线（同源 / 同目标的同向直连边） ----------------
+
+/**
+ * 一组方向相同（dir=+1 向下 / -1 向上）的 direct 边共用一条水平母线：
+ * 端口 → 竖直短线 → 母线 → 竖直短线 → 目标端口。
+ * 多条平行通道被合并成一条横线 + 若干竖直分支，大幅减少线的杂乱。
+ * 任何一支竖直段被节点挡住则整体放弃（返回 false），由调用方逐边兜底。
+ */
+function routeBus(list, ctx, dir) {
+  const nodes = ctx.nodes;
+  const srcEdge =
+    dir > 0
+      ? Math.max(...list.map((it) => it.a.y + it.a.h))
+      : Math.min(...list.map((it) => it.a.y));
+  const dstEdge =
+    dir > 0
+      ? Math.min(...list.map((it) => it.b.y))
+      : Math.max(...list.map((it) => it.b.y + it.b.h));
+  if ((dstEdge - srcEdge) * dir < (STUB + 6) * 2) return false; // 间隙放不下母线
+
+  const x1 = Math.min(...list.map((it) => Math.min(it.e._p0[0], it.e._p1[0])));
+  const x2 = Math.max(...list.map((it) => Math.max(it.e._p0[0], it.e._p1[0])));
+  const skip = new Set(list.flatMap((it) => [it.a.id, it.b.id]));
+
+  // 母线贴着源侧：向下时在源下方，向上时在源上方
+  const prefer = srcEdge + dir * STUB;
+  const lo = dir > 0 ? srcEdge + 8 : dstEdge + STUB;
+  const hi = dir > 0 ? dstEdge - STUB : srcEdge - 8;
+  const busY = findFreeH(prefer, lo, hi, x1, x2, nodes, skip, ctx.placed);
+  if (!Number.isFinite(busY)) return false;
+  if ((busY - srcEdge) * dir < 8 || (dstEdge - busY) * dir < STUB) return false;
+
+  // 先验证所有竖直分支无阻挡，再统一登记（避免半途失败留下脏通道）
+  for (const it of list) {
+    const p0 = it.e._p0;
+    const p1 = it.e._p1;
+    const branchSkip = new Set([it.a.id, it.b.id]);
+    if (vLineBlocked(p0[0], p0[1], busY, nodes, branchSkip)) return false;
+    if (vLineBlocked(p1[0], busY, p1[1], nodes, branchSkip)) return false;
+  }
+
+  addH(ctx.placed, busY, x1, x2);
+  for (const it of list) {
+    const p0 = it.e._p0;
+    const p1 = it.e._p1;
+    addV(ctx.placed, p0[0], p0[1], busY);
+    addV(ctx.placed, p1[0], busY, p1[1]);
+    it.e.points = collapse([p0, [p0[0], busY], [p1[0], busY], p1]);
+  }
+  return true;
+}
+
+/** 左右出线的同源/同目标边共用竖向母线。 */
+function routeBusH(list, ctx, dir) {
+  const nodes = ctx.nodes;
+  const srcEdge =
+    dir > 0
+      ? Math.max(...list.map((it) => it.a.x + it.a.w))
+      : Math.min(...list.map((it) => it.a.x));
+  const dstEdge =
+    dir > 0
+      ? Math.min(...list.map((it) => it.b.x))
+      : Math.max(...list.map((it) => it.b.x + it.b.w));
+  if ((dstEdge - srcEdge) * dir < (STUB + 6) * 2) return false;
+
+  const y1 = Math.min(...list.map((it) => Math.min(it.e._p0[1], it.e._p1[1])));
+  const y2 = Math.max(...list.map((it) => Math.max(it.e._p0[1], it.e._p1[1])));
+  const skip = new Set(list.flatMap((it) => [it.a.id, it.b.id]));
+  const prefer = srcEdge + dir * STUB;
+  const lo = dir > 0 ? srcEdge + 8 : dstEdge + STUB;
+  const hi = dir > 0 ? dstEdge - STUB : srcEdge - 8;
+  const busX = findFreeV(prefer, lo, hi, y1, y2, nodes, skip, ctx.placed);
+  if (!Number.isFinite(busX)) return false;
+  if ((busX - srcEdge) * dir < 8 || (dstEdge - busX) * dir < STUB) return false;
+
+  for (const it of list) {
+    const p0 = it.e._p0;
+    const p1 = it.e._p1;
+    const branchSkip = new Set([it.a.id, it.b.id]);
+    if (hLineBlocked(p0[1], p0[0], busX, nodes, branchSkip)) return false;
+    if (hLineBlocked(p1[1], busX, p1[0], nodes, branchSkip)) return false;
+  }
+
+  addV(ctx.placed, busX, y1, y2);
+  for (const it of list) {
+    const p0 = it.e._p0;
+    const p1 = it.e._p1;
+    addH(ctx.placed, p0[1], p0[0], busX);
+    addH(ctx.placed, p1[1], busX, p1[0]);
+    it.e.points = collapse([p0, [busX, p0[1]], [busX, p1[1]], p1]);
+  }
+  return true;
+}
+
+/** 同一调用者的横向多目标边共用节点簇外的水平干线。 */
+function routeFanoutBus(list, ctx) {
+  if (list.length < 2 || list.some((it) => it.e.fromSide || it.e.toSide || it.e.custom)) return false;
+  const source = list[0].a;
+  const sourceCx = source.x + source.w / 2;
+  const targetCxs = list.map((it) => it.b.x + it.b.w / 2);
+  const xDir = targetCxs.every((x) => x > sourceCx + 8) ? 1
+    : targetCxs.every((x) => x < sourceCx - 8) ? -1 : 0;
+  if (!xDir) return false;
+  const minY = Math.min(source.y, ...list.map((it) => it.b.y));
+  const maxY = Math.max(source.y + source.h, ...list.map((it) => it.b.y + it.b.h));
+
+  let best = null;
+  for (const yDir of [-1, 1]) {
+    const sourceSide = yDir < 0 ? 'top' : 'bottom';
+    const targetSide = yDir < 0 ? 'top' : 'bottom';
+    const p0 = portAt(source, sourceSide, 0.5);
+    const targetPorts = list.map((it) => portAt(it.b, targetSide, 0.5));
+    const x1 = Math.min(p0[0], ...targetPorts.map((p) => p[0]));
+    const x2 = Math.max(p0[0], ...targetPorts.map((p) => p[0]));
+    const prefer = yDir < 0 ? minY - STUB : maxY + STUB;
+    const lo = yDir < 0 ? prefer - 240 : prefer;
+    const hi = yDir < 0 ? prefer : prefer + 240;
+    const skipAll = new Set([source.id, ...list.map((it) => it.b.id)]);
+    const busY = findFreeH(prefer, lo, hi, x1, x2, ctx.nodes, skipAll, ctx.placed);
+    if (!Number.isFinite(busY) || hLineBlocked(busY, x1, x2, ctx.nodes, new Set())) continue;
+    if (vLineBlocked(p0[0], p0[1], busY, ctx.nodes, new Set([source.id]))) continue;
+    let clear = true;
+    let length = x2 - x1 + Math.abs(p0[1] - busY);
+    for (let i = 0; i < list.length; i++) {
+      const p1 = targetPorts[i];
+      if (vLineBlocked(p1[0], busY, p1[1], ctx.nodes, new Set([list[i].b.id]))) {
+        clear = false;
+        break;
+      }
+      length += Math.abs(p1[1] - busY);
+    }
+    if (clear && (!best || length < best.length)) {
+      best = { busY, x1, x2, sourceSide, targetSide, p0, targetPorts, length };
+    }
+  }
+  if (!best) return false;
+
+  addV(ctx.placed, best.p0[0], best.p0[1], best.busY);
+  addH(ctx.placed, best.busY, best.x1, best.x2);
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i];
+    const p0 = best.p0;
+    const p1 = best.targetPorts[i];
+    it.sa = best.sourceSide;
+    it.sb = best.targetSide;
+    it.e._p0 = p0;
+    it.e._p1 = p1;
+    addV(ctx.placed, p1[0], best.busY, p1[1]);
+    it.e.points = collapse([p0, [p0[0], best.busY], [p1[0], best.busY], p1]);
+  }
+  return true;
 }
 
 // ---------------- 路由：直连（水平出线，一条垂直通道） ----------------
@@ -409,7 +628,6 @@ function routeDirectH(e, a, b, sa, sb, ctx) {
     skip,
     ctx.placed
   );
-
   const pts = [[p0[0], p0[1]]];
   let sy;
   if (!hLineBlocked(p0[0], p0[1], cx, nodes, skip)) {
@@ -443,7 +661,11 @@ function routeDirectH(e, a, b, sa, sb, ctx) {
   }
 
   addV(ctx.placed, cx, sy, ty);
-  return collapse(pts.concat([[cx, ty]], tpts.reverse()));
+  const points = collapse(pts.concat([[cx, ty]], tpts.reverse()));
+  if (pathBlockedByNodes(points, nodes, skip)) {
+    return routeOuterLane(p0, p1, a, b, sa, sb, ctx) || points;
+  }
+  return points;
 }
 
 // ---------------- 路由：混合出线（源垂直 / 目标水平，或反之） ----------------
@@ -736,11 +958,23 @@ export function routeEdges(nodes, edges, opts = {}) {
     autos.push({ e, a, b, ...c });
   }
 
-  assignPorts(autos, nodeMap);
+  // ---- 共线合并：同一对节点、相同类型的调用边（不同调用行）只布一条折线 ----
+  // 类型决定颜色（direct/macro/fnptr/manual 各不同色），跨类型不合并，避免遮盖错色
+  const pairKey = (e) => e.from + '\u0000' + e.to + '\u0000' + (e.kind || 'direct');
+  const pairFirst = new Map();
+  const pairDups = [];
+  for (const it of autos) {
+    const k = pairKey(it.e);
+    if (pairFirst.has(k)) pairDups.push(it);
+    else pairFirst.set(k, it);
+  }
+  const items = [...pairFirst.values()];
+
+  assignPorts(items, nodeMap);
 
   // 稳定排序：直连 → 混合 → 长边；同类型按端口 y 再 x
   const rank = { direct: 0, side: 0, mixed: 1, long: 2 };
-  autos.sort(
+  items.sort(
     (x, y) =>
       rank[x.type] - rank[y.type] ||
       (x.e._p0[1] + x.e._p1[1]) - (y.e._p0[1] + y.e._p1[1]) ||
@@ -748,7 +982,47 @@ export function routeEdges(nodes, edges, opts = {}) {
       (x.e.line || 0) - (y.e.line || 0)
   );
 
-  for (const it of autos) {
+  // ---- 公用母线：同源（再同目标）、同类型且方向一致的直连边共享通道 ----
+  // 上下连接共用水平母线，左右连接共用竖直母线。
+  // 母线成员必须同类型同色，不同颜色的线不得互相借用通道
+  const bused = new Set();
+  // 先尝试完整的高扇出组合，避免简单母线先吃掉其中一部分后破坏整体汇流。
+  const fanouts = new Map();
+  for (const it of items) {
+    const targetRegion = it.b.group ?? 'all';
+    const key = it.e.from + '\u0000' + (it.e.kind || 'direct') + '\u0000' + targetRegion;
+    if (!fanouts.has(key)) fanouts.set(key, []);
+    fanouts.get(key).push(it);
+  }
+  for (const list of fanouts.values()) {
+    if (routeFanoutBus(list, ctx)) for (const it of list) bused.add(it);
+  }
+
+  for (const keyFn of [(it) => it.e.from + '\u0000' + it.e.kind, (it) => it.e.to + '\u0000' + it.e.kind]) {
+    for (const axis of ['vertical', 'horizontal']) {
+      for (const dir of [1, -1]) {
+      const groups = new Map();
+      for (const it of items) {
+        if (bused.has(it) || it.type !== 'direct') continue;
+        const matches = axis === 'vertical'
+          ? dir === 1 ? it.sa === 'bottom' && it.sb === 'top' : it.sa === 'top' && it.sb === 'bottom'
+          : dir === 1 ? it.sa === 'right' && it.sb === 'left' : it.sa === 'left' && it.sb === 'right';
+        if (!matches) continue;
+        const k = keyFn(it);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(it);
+      }
+      for (const list of groups.values()) {
+        if (list.length < 2) continue;
+        const routed = axis === 'vertical' ? routeBus(list, ctx, dir) : routeBusH(list, ctx, dir);
+        if (routed) for (const it of list) bused.add(it);
+      }
+      }
+    }
+  }
+
+  for (const it of items) {
+    if (bused.has(it)) continue;
     const { e, a, b, sa, sb, type } = it;
     const vertA = DIR[sa][1] !== 0;
     const vertB = DIR[sb][1] !== 0;
@@ -767,6 +1041,12 @@ export function routeEdges(nodes, edges, opts = {}) {
       // 兜底：端口间 L 形（仍保持正交）
       e.points = collapse([e._p0, [e._p1[0], e._p0[1]], e._p1]);
     }
+  }
+
+  // 重复边直接复用首条折线（展示上完全重合 = 合并为一条线）
+  for (const it of pairDups) {
+    const f = pairFirst.get(pairKey(it.e));
+    if (f && f.e.points) it.e.points = f.e.points.map((p) => [p[0], p[1]]);
   }
 
   return {

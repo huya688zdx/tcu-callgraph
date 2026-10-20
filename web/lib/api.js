@@ -12,9 +12,10 @@ const post = (url, body) =>
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数 */
-  view({ root, up = 0, down = 3, group = true }) {
+  view({ root, up = 0, down = 3, group = true, optimal = false }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
     if (root) q.set('root', root);
+    if (optimal) q.set('optimal', '1');
     return get('/api/view?' + q);
   },
   stats: () => get('/api/stats'),
