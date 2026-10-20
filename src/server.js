@@ -288,10 +288,18 @@ function buildView(rootId, up, down, group = false) {
   laid.width = Math.max(laid.width, maxX + 40);
   laid.height = Math.max(laid.height, maxY + 40);
 
-  // 合并标注
+  // 合并标注 + 变更状态
   for (const n of laid.nodes) {
     const ov = overlay.nodes?.[n.id];
     if (ov) Object.assign(n, { note: ov.note, color: ov.color, tag: ov.tag });
+    // 既存 / 変更 / 追加 / 削除，前端据此决定背景色与线框样式
+    n.change = (ov && ov.change) || 'existing';
+    n.kind = n.kind === 'var' ? 'var' : 'fn';
+  }
+  for (const e of laid.edges) {
+    const ov = overlay.edges?.[edgeKeyOf(e)];
+    // 原有 / 新增 / 删除
+    e.change = (ov && ov.change) || 'existing';
   }
   return { ...laid, root: g.root };
 }

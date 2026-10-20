@@ -27,6 +27,7 @@ const els = {
   rootName: document.getElementById('rootName'),
   tooltip: document.getElementById('tooltip'),
   restoreDeleted: document.getElementById('restoreDeleted'),
+  ctxMenu: document.getElementById('ctxMenu'),
 };
 
 const state = {
@@ -61,6 +62,21 @@ const COLORS = {
   fnptr: '#7F77DD',
   manual: '#639922',
   unknown: '#C9C7BE',
+};
+
+/** 函数框背景色：既存 / 変更 / 追加 / 削除 */
+const CHANGE_FILL = {
+  existing: '#CCFFCC',
+  modified: '#FFFF99',
+  added: '#FFCCFF',
+  deleted: '#BFBFBF',
+};
+
+/** 连线颜色：原有黑、新增红（删除沿用原色，另加 X 标记） */
+const EDGE_COLOR = {
+  existing: '#2C2C2A',
+  added: '#D9303E',
+  deleted: '#2C2C2A',
 };
 
 const FONT = '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
@@ -249,10 +265,9 @@ function drawContainer(ctx, c) {
   ctx.fillStyle = `rgba(230, 241, 251, ${0.16 + Math.min(0.1, c.depth * 0.04)})`;
   ctx.fill();
   ctx.strokeStyle = `rgba(107, 163, 224, ${0.55 + Math.min(0.25, c.depth * 0.08)})`;
-  ctx.lineWidth = 1.2;
-  ctx.setLineDash([5, 4]);
+  ctx.lineWidth = 1.4;
+  // 层级框用实线（函数才是虚线）
   ctx.stroke();
-  ctx.setLineDash([]);
 
   // 标题做成带底色的胶囊，避免在大容器上完全看不见层级名
   const fs = Math.min(22, Math.max(12, 11 / cam.k));
@@ -313,15 +328,17 @@ function drawEdge(ctx, e, related, selected) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  const color = COLORS[e.kind] || COLORS.direct;
+  // 原有=黑、新增=红；删除沿用原色，另在中央画 X
+  const color = EDGE_COLOR[e.change] || EDGE_COLOR.existing;
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
   ctx.strokeStyle = color;
-  ctx.lineWidth = selected ? 2.6 : related ? 2.4 : e.kind === 'manual' ? 1.8 : 1.3;
+  ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = state.selected && !related && !selected ? 0.26 : 1;
-  if (e.kind === 'macro' || e.kind === 'fnptr') ctx.setLineDash([5, 3]);
+  // 变量访问=虚线，函数调用=实线
+  if (e.kind === 'var') ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -369,11 +386,31 @@ function drawEdge(ctx, e, related, selected) {
     }
   }
 
+  // 已删除的连线：在中央画一个黑色 X
+  if (e.change === 'deleted') {
+    const mi = Math.max(1, Math.floor(pts.length / 2));
+    const p0 = pts[mi - 1];
+    const p1 = pts[Math.min(pts.length - 1, mi)];
+    const mx = (p0[0] + p1[0]) / 2;
+    const my = (p0[1] + p1[1]) / 2;
+    const xs = 5 / cam.k;
+    ctx.strokeStyle = '#2C2C2A';
+    ctx.lineWidth = 2.2 / cam.k;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(mx - xs, my - xs);
+    ctx.lineTo(mx + xs, my + xs);
+    ctx.moveTo(mx + xs, my - xs);
+    ctx.lineTo(mx - xs, my + xs);
+    ctx.stroke();
+  }
+
   ctx.restore();
 }
 
 function drawNode(ctx, n) {
   const { x, y, w, h } = n;
+  const isVar = n.kind === 'var';
   const selected = state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
@@ -383,7 +420,13 @@ function drawNode(ctx, n) {
   ctx.globalAlpha = dimmed ? 0.3 : 1;
 
   roundRect(ctx, x, y, w, h, 8);
-  ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || (n.external ? '#FAFAF7' : '#FFFFFF');
+  // 函数框按变更分类上色；变量框统一白底
+  const baseFill = isVar
+    ? n.external
+      ? '#FAFAF7'
+      : '#FFFFFF'
+    : CHANGE_FILL[n.change] || CHANGE_FILL.existing;
+  ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
   ctx.lineWidth = dropTarget ? 2.6 : selected ? 2.2 : hover ? 1.6 : 1;
@@ -395,8 +438,11 @@ function drawNode(ctx, n) {
     ? '#378ADD'
     : n.external
     ? '#D3D1C7'
-    : '#B5D4F4';
-  if (n.external) ctx.setLineDash([4, 3]);
+    : isVar
+    ? '#5A5A55'
+    : '#3A3A36';
+  // 函数用虚线框，变量用实线框
+  if (!isVar) ctx.setLineDash([5, 3]);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -415,7 +461,8 @@ function drawNode(ctx, n) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
-    let label = n.name || n.id;
+    // 函数名统一带 ()，变量名不带，便于一眼区分
+    let label = isVar ? n.name || n.id : `${n.name || n.id}()`;
     const maxW = w - 18;
     if (ctx.measureText(label).width > maxW) {
       while (label.length > 4 && ctx.measureText(label + '…').width > maxW) {
@@ -428,7 +475,11 @@ function drawNode(ctx, n) {
     if (cam.k >= 0.62) {
       ctx.font = `10.5px ${FONT}`;
       ctx.fillStyle = '#888780';
-      const sub = n.external ? t('node.external') : `${shortFile(n.file)}:${n.line}`;
+      const sub = n.external
+        ? t('node.external')
+        : isVar
+        ? n.typeText || t('node.variable')
+        : `${shortFile(n.file)}:${n.line}`;
       ctx.fillText(sub, cx, y + h / 2 + 10);
     }
   }
@@ -535,6 +586,7 @@ async function loadStats() {
   els.stats.innerHTML = [
     row(t('stat.files'), s.files),
     row(t('stat.functions'), s.functions),
+    ...(s.variables ? [row(t('stat.variables'), s.variables)] : []),
     row(t('stat.edges'), s.edges),
     // 只有存在重复调用（同一对函数被调多次）时才显示，用来解释与边数的差额
     ...(s.calls && s.calls !== s.edges ? [row(t('stat.calls'), s.calls)] : []),
@@ -993,8 +1045,41 @@ function moveSeg(seg, x, y) {
 
 let justDragged = false;
 
+els.cv.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (!state.view) return;
+
+  const n = hitTest(e);
+  if (n) {
+    if (n.kind === 'var') {
+      // 变量没有变更分类，只做选中
+      selectNode(n.id);
+      hideMenu();
+      return;
+    }
+    selectNode(n.id);
+    showMenu(e.clientX, e.clientY, t('menu.change'), CHANGE_ITEMS, n.change || 'existing', (v) =>
+      setNodeChange(n, v)
+    );
+    return;
+  }
+
+  const edge = hitEdge(e);
+  if (edge) {
+    state.selected = null;
+    state.selectedEdge = edge;
+    draw();
+    showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
+      setEdgeChange(edge, v)
+    );
+    return;
+  }
+  hideMenu();
+});
+
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  hideMenu();
   stopCamAnim();
 
   const end = hitEnd(e);
@@ -1244,6 +1329,79 @@ els.cv.addEventListener(
   },
   { passive: false }
 );
+
+// ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
+
+const CHANGE_ITEMS = [
+  { value: 'existing', label: 'change.existing', color: CHANGE_FILL.existing },
+  { value: 'modified', label: 'change.modified', color: CHANGE_FILL.modified },
+  { value: 'added', label: 'change.added', color: CHANGE_FILL.added },
+  { value: 'deleted', label: 'change.deleted', color: CHANGE_FILL.deleted },
+];
+
+const EDGE_ITEMS = [
+  { value: 'existing', label: 'edgeState.existing', color: EDGE_COLOR.existing },
+  { value: 'added', label: 'edgeState.added', color: EDGE_COLOR.added },
+  { value: 'deleted', label: 'edgeState.deleted', color: EDGE_COLOR.existing },
+];
+
+function hideMenu() {
+  if (!els.ctxMenu) return;
+  els.ctxMenu.classList.remove('show');
+  els.ctxMenu.innerHTML = '';
+}
+
+function showMenu(x, y, title, items, current, onPick) {
+  const el = els.ctxMenu;
+  if (!el) return;
+  el.innerHTML =
+    `<div class="title">${title}</div>` +
+    items
+      .map(
+        (it, i) =>
+          `<button data-i="${i}" class="${it.value === current ? 'active' : ''}">` +
+          `<span class="swatch" style="background:${it.color}"></span>` +
+          `<span>${t(it.label)}</span></button>`
+      )
+      .join('');
+  el.style.left = `${x}px`;
+  el.style.top = `${y}px`;
+  el.classList.add('show');
+
+  const r = el.getBoundingClientRect();
+  if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
+  if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
+
+  el.onclick = (ev) => {
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    const it = items[Number(btn.dataset.i)];
+    hideMenu();
+    if (it) onPick(it.value);
+  };
+}
+
+async function setNodeChange(n, change) {
+  n.change = change;
+  draw();
+  await fetch('/api/overlay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nodeId: n.id, data: { change } }),
+  });
+  pushHistory();
+}
+
+async function setEdgeChange(edge, change) {
+  edge.change = change;
+  draw();
+  await fetch('/api/overlay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ edgeKey: edgeKey(edge), data: { change } }),
+  });
+  pushHistory();
+}
 
 function selectNode(id) {
   state.selected = id;

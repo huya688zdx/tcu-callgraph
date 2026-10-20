@@ -41,6 +41,101 @@ function decodeSource(buf) {
   }
 }
 
+// ---------------- 全局 / 静态变量 ----------------
+
+const TYPE_KW = new Set([
+  'void', 'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned',
+  'const', 'volatile', 'static', 'extern', 'register', 'auto', 'struct', 'union',
+  'enum', 'inline', 'typedef', '_Bool', 'bool', 'size_t',
+  'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+  'int8_t', 'int16_t', 'int32_t', 'int64_t',
+]);
+
+/** 解析一条文件作用域的声明，判断它是不是变量定义 */
+function parseVarDecl(stmt, file) {
+  if (!stmt.length) return null;
+  if (stmt.some((t) => t.v === '(')) return null; // 函数声明 / 宏
+  if (stmt.some((t) => t.v === 'typedef')) return null; // 类型别名
+
+  let nameTok = null;
+  let hasType = false;
+  for (let i = 0; i < stmt.length; i++) {
+    const t = stmt[i];
+    if (t.t !== 'id') continue;
+    if (TYPE_KW.has(t.v)) {
+      hasType = true;
+      continue;
+    }
+    const next = stmt[i + 1];
+    if (next && (next.v === ';' || next.v === '=' || next.v === '[' || next.v === ',')) {
+      nameTok = t;
+      break;
+    }
+  }
+  if (!hasType || !nameTok) return null;
+
+  const words = stmt.filter((t) => t.t === 'id').map((t) => t.v);
+  return {
+    name: nameTok.v,
+    file,
+    line: nameTok.line,
+    isStatic: words.includes('static'),
+    isExtern: words.includes('extern'),
+    isConst: words.includes('const'),
+    typeText: words.filter((w) => TYPE_KW.has(w) && w !== 'static' && w !== 'extern').join(' '),
+  };
+}
+
+/** 提取文件作用域（花括号深度 0）的变量声明 */
+function findGlobalVars(tokens, file) {
+  const out = [];
+  let depth = 0;
+  let stmt = [];
+  const flush = () => {
+    const d = parseVarDecl(stmt, file);
+    if (d) out.push(d);
+    stmt = [];
+  };
+  for (const tk of tokens) {
+    if (tk.t === 'preproc') continue;
+    if (tk.v === '{') {
+      if (depth === 0) stmt = []; // 进入函数体 / 结构体，丢掉声明头
+      depth++;
+      continue;
+    }
+    if (tk.v === '}') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (tk.v === ';') {
+      flush();
+      continue;
+    }
+    stmt.push(tk);
+  }
+  return out;
+}
+
+/** 扫描函数体里对全局变量的引用 */
+function scanVarRefs(bodyTokens, lookup) {
+  const hits = [];
+  const seen = new Set();
+  for (let i = 0; i < bodyTokens.length; i++) {
+    const t = bodyTokens[i];
+    if (t.t !== 'id') continue;
+    const id = lookup(t.v);
+    if (!id || seen.has(id)) continue;
+    const prev = bodyTokens[i - 1];
+    if (prev && (prev.v === '.' || prev.v === '->')) continue; // 成员名，不是全局变量
+    const next = bodyTokens[i + 1];
+    if (next && next.v === '(') continue; // 函数调用
+    seen.add(id);
+    hits.push({ id, line: t.line, name: t.v });
+  }
+  return hits;
+}
+
 export function listSourceFiles(root) {
   const out = [];
   const walk = (dir) => {
@@ -110,6 +205,25 @@ export function buildIndex(root) {
     byName.get(fn.name).push(fn);
   }
 
+  // 全局 / 静态变量：作为独立节点参与绘图，函数读写它们时连虚线
+  const variables = [];
+  const varById = new Map();
+  for (const p of parsed) {
+    for (const v of findGlobalVars(p.tokens, p.rel)) {
+      // static 变量按文件区分；普通全局变量跨文件同名即同一个
+      v.id = v.isStatic ? `var::${p.rel}::${v.name}` : `var::${v.name}`;
+      v.kind = 'var';
+      v.params = [];
+      const prev = varById.get(v.id);
+      // extern 只是声明，真实定义优先
+      if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
+    }
+  }
+  for (const v of varById.values()) {
+    variables.push(v);
+    byId.set(v.id, v);
+  }
+
   const resolveCallee = (name, fromFile) => {
     const all = byName.get(name);
     if (!all || !all.length) return `ext::${name}`;
@@ -123,6 +237,22 @@ export function buildIndex(root) {
 
   const edges = [];
   const ctx = { macros, fnptr: fnptrTables };
+
+  // 变量名 → 节点：优先本文件的 static，其次同名全局
+  const varByName = new Map();
+  for (const v of variables) {
+    if (!varByName.has(v.name)) varByName.set(v.name, []);
+    varByName.get(v.name).push(v);
+  }
+  const lookupVar = (fnFile, name) => {
+    const list = varByName.get(name);
+    if (!list || !list.length) return null;
+    const local = list.find((v) => v.file === fnFile && v.isStatic);
+    if (local) return local.id;
+    const glob = list.find((v) => !v.isStatic);
+    return (glob || list[0]).id;
+  };
+
   for (const fn of functions) {
     const raw = [];
     scanCalls(fn.bodyTokens, ctx, raw);
@@ -137,6 +267,17 @@ export function buildIndex(root) {
         cond: c.cond,
         via: c.via,
         macroChain: c.macroChain,
+      });
+    }
+    // 全局变量读写：画成虚线
+    for (const r of scanVarRefs(fn.bodyTokens, (n) => lookupVar(fn.file, n))) {
+      edges.push({
+        from: fn.id,
+        to: r.id,
+        callee: r.name,
+        kind: 'var',
+        line: r.line,
+        via: '变量',
       });
     }
   }
@@ -178,6 +319,7 @@ export function buildIndex(root) {
     elapsedMs: Date.now() - t0,
     files: parsed.map((p) => ({ rel: p.rel, isHeader: p.isHeader, bytes: p.bytes })),
     functions,
+    variables,
     externals: [...externals.values()],
     edges,
     macros: [...macros.values()],
@@ -245,6 +387,7 @@ export function stats(model) {
   return {
     files: model.files.length,
     functions: model.functions.length,
+    variables: model.variables.length,
     externals: model.externals.length,
     edges: pairs.size,
     calls: model.edges.length,

@@ -97,8 +97,8 @@
     border: 1px solid rgba(0, 0, 0, 0.08); font-size: 11.5px; color: #5F5E5A;
     pointer-events: none; z-index: 5;
   }
-  #legend span { display: inline-flex; align-items: center; }
-  #legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; margin-right: 5px; }
+  #legend span { display: inline-flex; align-items: center; white-space: nowrap; }
+  #legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; margin-right: 5px; flex: 0 0 auto; }
   #legend em { font-style: normal; }
 
   .tree-sec { max-height: 58vh; overflow: auto; }
@@ -118,6 +118,51 @@
   .results-list li:hover { background: #E6F1FB; }
   .results-list li .fn { font-weight: 500; }
   .results-list li .meta { color: #888780; font-size: 11px; }
+
+  /* 右键菜单：标记函数变更分类 / 连线状态 */
+  .ctx-menu {
+    position: fixed;
+    display: none;
+    z-index: 1000;
+    min-width: 150px;
+    padding: 4px;
+    background: #fff;
+    border: 1px solid #D3D1C7;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+    font-size: 12.5px;
+  }
+  .ctx-menu.show { display: block; }
+  .ctx-menu .title {
+    padding: 5px 10px 6px;
+    color: #888780;
+    font-size: 11px;
+    border-bottom: 1px solid #EFEDE7;
+    margin-bottom: 3px;
+  }
+  .ctx-menu button {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 6px 10px;
+    border: 0;
+    background: transparent;
+    border-radius: 5px;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    color: #2C2C2A;
+  }
+  .ctx-menu button:hover { background: #F0F4F9; }
+  .ctx-menu button.active { background: #E6F1FB; color: #0C447C; font-weight: 600; }
+  .ctx-menu .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    border: 1px solid rgba(0, 0, 0, 0.16);
+    flex: 0 0 auto;
+  }
 </style>
 </head>
 <body>
@@ -166,12 +211,13 @@
   <main>
     <canvas id="cv"></canvas>
     <div id="legend">
-      <span><i style="border-color:#9A9890"></i><em data-i18n="legend.direct">直接调用</em></span>
-      <span><i style="border-color:#D85A30;border-top-style:dashed"></i><em data-i18n="legend.macro">经宏</em></span>
-      <span><i style="border-color:#7F77DD;border-top-style:dashed"></i><em data-i18n="legend.fnptr">函数指针</em></span>
-      <span><i style="border-color:#639922"></i><em data-i18n="legend.manual">手动画线</em></span>
+      <span><i style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
+      <span><i style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
+      <span><i style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
+      <span><i style="border-color:#2C2C2A"></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>
+    <div id="ctxMenu" class="ctx-menu"></div>
   </main>
 
   <aside id="right">

@@ -166,7 +166,9 @@ export function layout(nodes, edges, opts = {}) {
   const widthOf = (n) => {
     if (n.w) return n.w;
     const label = n.label || n.name || n.id;
-    return Math.min(maxLabelWidth, Math.max(minWidth, textWidth(label) + 28));
+    // 函数名显示时带 ()，比裸名字多留两个字符
+    const extra = n.kind === 'var' ? 0 : 16;
+    return Math.min(maxLabelWidth, Math.max(minWidth, textWidth(label) + 28 + extra));
   };
   const heightOf = (n) => n.h || (n.sub ? subH : nodeH);
 
