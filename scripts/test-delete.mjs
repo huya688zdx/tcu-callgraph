@@ -154,8 +154,10 @@ for (const nid of target.ids) {
 }
 const after1 = await snapshot();
 const fileGone = !after1.files.includes(target.file);
+const btnAfterDel = await evaluate("document.getElementById('restoreDeleted').textContent");
 console.log(`  剩余: ${after1.nodes} 节点 / ${after1.files.length} 文件框`);
 console.log(`  文件框 ${target.file} 已消失: ${fileGone ? '✅' : '❌'}`);
+console.log(`  「恢复删除」按钮: ${btnAfterDel}`);
 if (after1.err) console.log('  页面错误:', after1.err);
 
 // ---- 测试2：Ctrl+Z 逐次恢复 ----
@@ -180,37 +182,53 @@ for (let i = 0; i < target.ids.length; i++) {
   await sleep(600);
 }
 const after2 = await snapshot();
+const btnAfterUndo = await evaluate("document.getElementById('restoreDeleted').textContent");
 console.log(`  恢复后: ${after2.nodes} 节点 / ${after2.files.length} 文件框`);
+console.log(`  「恢复删除」按钮: ${btnAfterUndo}`);
 console.log(`  结论: ${after2.nodes === before.nodes ? '✅ 全部恢复' : '❌ 未完全恢复'}`);
+console.log(`  按钮计数已清零: ${!/\(\d+\)/.test(btnAfterUndo) ? '✅' : '❌ 仍显示数字'}`);
 
-// ---- 测试3：删除一条连线 ----
-const edgeInfo = await evaluate(`(() => {
+// ---- 测试3：删除一条连线（逐段尝试，避开节点）----
+const edgeCandidates = await evaluate(`(() => {
   const v = window.__cg.view;
   const c = window.__cg.cam;
-  const e = v.edges.find(x => Array.isArray(x.points) && x.points.length >= 2);
-  if (!e) return null;
-  const p = e.points[Math.floor(e.points.length / 2)];
   const r = document.getElementById('cv').getBoundingClientRect();
-  return {
-    key: e.from + '->' + e.to + ':' + e.line,
-    x: r.left + c.x + p[0] * c.k,
-    y: r.top + c.y + p[1] * c.k,
-    edges: v.edges.length,
-  };
+  const out = [];
+  for (const e of v.edges) {
+    const pts = e.points || [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const mx = (pts[i][0] + pts[i + 1][0]) / 2;
+      const my = (pts[i][1] + pts[i + 1][1]) / 2;
+      // 该点若落在任何节点内，跳过（节点点击优先）
+      const onNode = v.nodes.some(n => mx >= n.x && mx <= n.x + n.w && my >= n.y && my <= n.y + n.h);
+      if (onNode) continue;
+      out.push({
+        key: e.from + '->' + e.to + ':' + e.line,
+        x: r.left + c.x + mx * c.k,
+        y: r.top + c.y + my * c.k,
+      });
+    }
+  }
+  return { list: out.slice(0, 12), total: v.edges.length };
 })()`);
 
-if (edgeInfo) {
-  console.log(`\n[测试3] 删除一条连线 (${edgeInfo.key})`);
-  await click(edgeInfo.x, edgeInfo.y);
-  await sleep(150);
-  const sel = await evaluate('!!document.body && true');
-  await pressKey('Delete', 'Delete', 46);
-  const after3 = await snapshot();
-  console.log(`  边数: ${edgeInfo.edges} -> ${after3.edges}`);
-  console.log(`  结论: ${after3.edges === edgeInfo.edges - 1 ? '✅ 已删除' : '⚠️ 边数未按预期减少'}`);
-} else {
-  console.log('\n[测试3] 跳过：没有可点击的连线');
+let edgeDone = false;
+for (const cand of edgeCandidates.list) {
+  await click(cand.x, cand.y);
+  await sleep(120);
+  const sel = await evaluate('window.__cg.selected');
+  if (sel && sel.edge) {
+    console.log(`\n[测试3] 删除连线 (${sel.edge})`);
+    console.log(`  边数: ${edgeCandidates.total}`);
+    await pressKey('Delete', 'Delete', 46);
+    const after3 = await snapshot();
+    console.log(`  删除后: ${after3.edges}`);
+    console.log(`  结论: ${after3.edges === edgeCandidates.total - 1 ? '✅ 已删除' : '⚠️ 边数未按预期减少'}`);
+    edgeDone = true;
+    break;
+  }
 }
+if (!edgeDone) console.log('\n[测试3] 跳过：没有可点中的连线（都被节点挡住）');
 
 // 清理：清空所有删除记录
 await evaluate(`fetch('/api/delete', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ clear: true }) }).then(r=>r.json())`);

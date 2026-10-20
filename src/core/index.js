@@ -13,6 +13,34 @@ import { parseDot, modelFromDot } from './dot.js';
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
 
+/**
+ * 源码解码：先按 UTF-8 严格解码，失败则回退 CP932(Shift-JIS)。
+ * 汽车电子不少 TCU 工程出自日文环境，源码是 CP932 编码，
+ * 直接按 UTF-8 读会把注释和字符串里的日文变成乱码。
+ * 同时兼容 UTF-8 BOM / UTF-16 BOM。
+ */
+function decodeSource(buf) {
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(buf.subarray(3));
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  }
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    // 不是合法 UTF-8，继续尝试 CP932
+  }
+  try {
+    return new TextDecoder('shift_jis').decode(buf);
+  } catch {
+    return buf.toString('latin1');
+  }
+}
+
 export function listSourceFiles(root) {
   const out = [];
   const walk = (dir) => {
@@ -49,7 +77,7 @@ export function buildIndex(root) {
 
   const parseFile = (abs) => {
     const rel = path.relative(root, abs).replace(/\\/g, '/');
-    const src = fs.readFileSync(abs, 'utf8');
+    const src = decodeSource(fs.readFileSync(abs));
     const toks = lex(src, rel);
     const { tokens, includes: inc } = preprocess(toks, macros, rel);
     includes.push(...inc);
@@ -167,7 +195,7 @@ export function loadModel(target) {
   if (st.isFile()) {
     const ext = path.extname(target).toLowerCase();
     if (ext === '.dot' || ext === '.gv') {
-      const src = fs.readFileSync(target, 'utf8');
+      const src = decodeSource(fs.readFileSync(target));
       return modelFromDot(parseDot(src), path.basename(target));
     }
     if (SRC_EXT.test(ext) || HDR_EXT.test(ext)) {

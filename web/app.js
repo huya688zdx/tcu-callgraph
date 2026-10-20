@@ -1306,6 +1306,7 @@ async function restoreLastDelete() {
   await postDelete({ nodes: rec.nodes || [], edges: rec.edges || [], restore: true });
   await reloadKeepCam();
   pushHistory();
+  loadStats(); // 同步「恢复删除 (N)」上的计数
   return true;
 }
 
@@ -1674,6 +1675,13 @@ window.__cg = {
   /** 当前高亮的框 id（点击标题后短暂存在） */
   get flash() {
     return state.flash ? state.flash.box.id : null;
+  },
+  /** 当前选中项 */
+  get selected() {
+    return {
+      node: state.selected,
+      edge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
+    };
   },
   /** 当前视图内是否存在节点互相重叠 */
   overlaps(pad = 0) {
