@@ -45,6 +45,8 @@ const state = {
   panning: false,
   linkFrom: null,
   linkPos: null,
+  /** 点击标题后的短暂高亮：{ box, until, dur } */
+  flash: null,
 };
 
 const cam = { x: 0, y: 0, k: 1 };
@@ -211,6 +213,24 @@ function draw() {
 
   for (const n of v.nodes) drawNode(ctx, n);
 
+  // 点击标题后的短暂高亮：框住刚点中的那个层级，避免「点了没反应」的错觉
+  if (state.flash) {
+    const f = state.flash;
+    const left = f.until - performance.now();
+    if (left <= 0) {
+      state.flash = null;
+    } else {
+      const a = Math.min(1, left / f.dur);
+      ctx.save();
+      roundRect(ctx, f.box.x - 2, f.box.y - 2, f.box.w + 4, f.box.h + 4, 16);
+      ctx.strokeStyle = `rgba(24, 95, 165, ${0.9 * a})`;
+      ctx.lineWidth = 3 / cam.k;
+      ctx.stroke();
+      ctx.restore();
+      requestAnimationFrame(() => draw());
+    }
+  }
+
   ctx.restore();
 
   ctx.fillStyle = '#B4B2A9';
@@ -224,17 +244,32 @@ function drawContainer(ctx, c) {
   roundRect(ctx, c.x, c.y, c.w, c.h, 14);
   ctx.fillStyle = `rgba(230, 241, 251, ${0.16 + Math.min(0.1, c.depth * 0.04)})`;
   ctx.fill();
-  ctx.strokeStyle = 'rgba(133, 183, 235, 0.6)';
-  ctx.lineWidth = 1;
-  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = `rgba(107, 163, 224, ${0.55 + Math.min(0.25, c.depth * 0.08)})`;
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([5, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  ctx.fillStyle = '#185FA5';
-  ctx.font = `500 ${Math.min(20, Math.max(11, 10 / cam.k))}px ${FONT}`;
+  // 标题做成带底色的胶囊，避免在大容器上完全看不见层级名
+  const fs = Math.min(22, Math.max(12, 11 / cam.k));
+  ctx.font = `600 ${fs}px ${FONT}`;
+  const label = String(c.label);
+  const tw = ctx.measureText(label).width;
+  const padX = fs * 0.5;
+  const bh = fs * 1.4;
+  const bx = c.x + 6;
+  const by = c.y + 4;
+  roundRect(ctx, bx, by, tw + padX * 2, bh, bh / 2);
+  ctx.fillStyle = 'rgba(133, 183, 235, 0.32)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(107, 163, 224, 0.55)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.fillStyle = '#0C447C';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  ctx.fillText(c.label, c.x + 10, c.y + 14);
+  ctx.fillText(label, bx + padX, by + bh / 2 + 0.5);
   ctx.restore();
 }
 
@@ -328,6 +363,32 @@ function drawEdge(ctx, e, related, selected) {
       ctx.lineWidth = 2 / cam.k;
       ctx.stroke();
     }
+  }
+
+  // 同一对节点的多次调用已合并成一条边，这里用徽标标注调用次数
+  const callCount = e.calls ? e.calls.length : 1;
+  if (callCount > 1) {
+    const mi = Math.max(1, Math.floor(pts.length / 2));
+    const p0 = pts[mi - 1];
+    const p1 = pts[Math.min(pts.length - 1, mi)];
+    const mx = (p0[0] + p1[0]) / 2;
+    const my = (p0[1] + p1[1]) / 2;
+    const fs = Math.min(15, Math.max(9, 9 / cam.k));
+    ctx.font = `600 ${fs}px ${FONT}`;
+    const label = `×${callCount}`;
+    const tw = ctx.measureText(label).width;
+    const bw = tw + fs * 0.9;
+    const bh = fs * 1.5;
+    roundRect(ctx, mx - bw / 2, my - bh / 2, bw, bh, bh / 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.94)';
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(0.7, 1 / cam.k);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, mx, my + 0.5);
   }
 
   ctx.restore();
@@ -497,6 +558,8 @@ async function loadStats() {
     row(t('stat.files'), s.files),
     row(t('stat.functions'), s.functions),
     row(t('stat.edges'), s.edges),
+    // 只有存在重复调用（同一对函数被调多次）时才显示，用来解释与边数的差额
+    ...(s.calls && s.calls !== s.edges ? [row(t('stat.calls'), s.calls)] : []),
     row(t('stat.macros'), s.macros),
     row(t('stat.macroEdges'), s.macroEdges),
     row(t('stat.fnptrEdges'), s.fnptrEdges),
@@ -767,10 +830,13 @@ function hitTitle(e) {
   // 深层的先判，避免被外层容器的大标题区吞掉
   const conts = (v.containers || []).slice().sort((a, b) => b.depth - a.depth);
   for (const c of conts) {
-    const fs = Math.min(20, Math.max(11, 10 / cam.k));
-    els.ctx.font = `500 ${fs}px ${FONT}`;
+    const fs = Math.min(22, Math.max(12, 11 / cam.k));
+    els.ctx.font = `600 ${fs}px ${FONT}`;
     const tw = els.ctx.measureText(String(c.label)).width;
-    if (p.x >= c.x && p.x <= c.x + 18 + tw && p.y >= c.y - 4 && p.y <= c.y + 30) {
+    const padX = fs * 0.5;
+    const bh = fs * 1.4;
+    // 与 drawContainer 里标题胶囊的几何保持一致
+    if (p.x >= c.x + 2 && p.x <= c.x + 10 + tw + padX * 2 && p.y >= c.y + 2 && p.y <= c.y + 8 + bh) {
       return { box: c, kind: 'dir' };
     }
   }
@@ -963,6 +1029,8 @@ els.cv.addEventListener('pointerdown', (e) => {
   const title = hitTitle(e);
   if (title) {
     focusBox(title.box);
+    state.flash = { box: title.box, until: performance.now() + 1300, dur: 1300 };
+    draw();
     return;
   }
 
@@ -1531,6 +1599,10 @@ window.__cg = {
   },
   get root() {
     return state.root;
+  },
+  /** 当前高亮的框 id（点击标题后短暂存在） */
+  get flash() {
+    return state.flash ? state.flash.box.id : null;
   },
   /** 当前视图内是否存在节点互相重叠 */
   overlaps(pad = 0) {

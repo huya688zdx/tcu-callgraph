@@ -35,6 +35,7 @@ const dict = {
     'stat.files': '文件',
     'stat.functions': '函数',
     'stat.edges': '调用边',
+    'stat.calls': '调用记录',
     'stat.macros': '宏定义',
     'stat.macroEdges': '经宏的边',
     'stat.fnptrEdges': '函数指针边',

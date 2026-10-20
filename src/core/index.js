@@ -183,21 +183,31 @@ export function loadModel(target) {
 
 /** 统计画像 */
 export function stats(model) {
-  const { outAdj, inAdj } = model._index;
+  // 统计口径与画布一致：同一对节点的多次调用只算一条关系边
+  const pairs = new Set(model.edges.map((e) => `${e.from}|${e.to}`));
+  const outSet = new Map();
+  const inSet = new Map();
+  for (const e of model.edges) {
+    if (!outSet.has(e.from)) outSet.set(e.from, new Set());
+    outSet.get(e.from).add(e.to);
+    if (!inSet.has(e.to)) inSet.set(e.to, new Set());
+    inSet.get(e.to).add(e.from);
+  }
+
   let maxFanOut = 0;
   let maxFanOutFn = '';
   let maxFanIn = 0;
   let maxFanInFn = '';
 
-  for (const [id, list] of outAdj) {
-    if (list.length > maxFanOut) {
-      maxFanOut = list.length;
+  for (const [id, set] of outSet) {
+    if (set.size > maxFanOut) {
+      maxFanOut = set.size;
       maxFanOutFn = id;
     }
   }
-  for (const [id, list] of inAdj) {
-    if (list.length > maxFanIn) {
-      maxFanIn = list.length;
+  for (const [id, set] of inSet) {
+    if (set.size > maxFanIn) {
+      maxFanIn = set.size;
       maxFanInFn = id;
     }
   }
@@ -208,7 +218,8 @@ export function stats(model) {
     files: model.files.length,
     functions: model.functions.length,
     externals: model.externals.length,
-    edges: model.edges.length,
+    edges: pairs.size,
+    calls: model.edges.length,
     macros: model.macros.length,
     macroEdges: model.edges.filter((e) => e.kind === 'macro').length,
     fnptrEdges: model.edges.filter((e) => e.kind === 'fnptr').length,
@@ -280,7 +291,10 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   const nodes = new Map();
   const edges = [];
-  const seenEdge = new Set();
+  const seenCall = new Set();
+  // 同一对节点之间的多次调用合并成一条边，调用次数与行号记在 calls 里，
+  // 避免画出并排的多条平行边
+  const byPair = new Map();
 
   const addNode = (id) => {
     if (nodes.has(id)) return false;
@@ -292,6 +306,29 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   addNode(rootId);
 
+  const kindRank = { direct: 3, macro: 2, fnptr: 1, unknown: 0 };
+
+  const addEdge = (e) => {
+    const callKey = `${e.from}|${e.to}|${e.line}|${e.kind}`;
+    if (seenCall.has(callKey)) return;
+    seenCall.add(callKey);
+    const pairKey = `${e.from}|${e.to}`;
+    let m = byPair.get(pairKey);
+    if (!m) {
+      m = { ...e, calls: [] };
+      byPair.set(pairKey, m);
+      edges.push(m);
+    } else if ((kindRank[e.kind] ?? 0) > (kindRank[m.kind] ?? 0)) {
+      // 同一对节点既有直接调用又有宏/函数指针调用时，以更具体的类型展示
+      m.kind = e.kind;
+      m.line = e.line;
+      m.callee = e.callee;
+      m.via = e.via;
+      m.cond = e.cond;
+    }
+    m.calls.push({ line: e.line, kind: e.kind, cond: e.cond, via: e.via });
+  };
+
   const walk = (adj, depth) => {
     let frontier = [rootId];
     for (let d = 0; d < depth; d++) {
@@ -299,11 +336,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
       for (const id of frontier) {
         for (const e of adj.get(id) || []) {
           const other = adj === outAdj ? e.to : e.from;
-          const key = `${e.from}->${e.to}:${e.line}`;
-          if (!seenEdge.has(key)) {
-            seenEdge.add(key);
-            edges.push(e);
-          }
+          addEdge(e);
           if (nodes.size >= maxNodes) continue;
           if (addNode(other)) next.push(other);
         }

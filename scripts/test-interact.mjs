@@ -108,15 +108,29 @@ for (let i = 0; i < 60; i++) {
 const err = await evaluate('document.body.getAttribute("data-err")');
 console.log('页面错误:', err || '无');
 
-// 1) 点击标题 -> 视角应放大聚焦（有目录容器时优先点容器，否则点文件框）
+// 1) 点击标题 -> 视角应放大聚焦（可用第 3 个参数指定目标 id）
+const wantTarget = process.argv[3] || '';
 const info = await evaluate(`(() => {
   const v = window.__cg.view;
   const c = window.__cg.cam;
   const cv = document.getElementById('cv');
   const r = cv.getBoundingClientRect();
   const conts = (v.containers || []).slice().sort((a, b) => b.depth - a.depth);
-  const box = conts.length ? conts[0] : v.groups[0];
-  const kind = conts.length ? 'dir' : 'file';
+  const want = ${JSON.stringify(wantTarget)};
+  let box;
+  let kind;
+  if (want) {
+    box = (v.containers || []).find((x) => x.id === want);
+    if (box) kind = 'dir';
+    else {
+      box = (v.groups || []).find((x) => x.id === want);
+      kind = 'file';
+    }
+  }
+  if (!box) {
+    box = conts.length ? conts[0] : v.groups[0];
+    kind = conts.length ? 'dir' : 'file';
+  }
   const ox = kind === 'dir' ? 12 : 40;
   return {
     k: c.k,
@@ -130,13 +144,18 @@ const info = await evaluate(`(() => {
 console.log(`\n[测试1] 点击${info.kind === 'dir' ? '目录层级' : '文件'}标题聚焦 (${info.target})`);
 console.log(`  点击前缩放 ${Math.round(info.k * 100)}%  位置 (${info.tx.toFixed(0)}, ${info.ty.toFixed(0)})`);
 await click(info.tx, info.ty);
+const flashId = await evaluate('window.__cg.flash');
 await sleep(700);
 const after = await evaluate(`(() => ({
   k: window.__cg.cam.k,
   err: document.body.getAttribute('data-err'),
 }))()`);
-console.log(`  点击后缩放 ${Math.round(after.k * 100)}%`);
-console.log(`  结论: ${after.k > info.k * 1.15 ? '✅ 已聚焦放大' : '❌ 视角未变化'}`);
+console.log(`  点击后缩放 ${Math.round(after.k * 100)}%  高亮框: ${flashId || '无'}`);
+const focused = after.k > info.k * 1.15;
+const flashed = flashId === info.target;
+if (focused) console.log('  结论: ✅ 已聚焦放大');
+else if (flashed) console.log('  结论: ✅ 目标已占满视野（缩放无需变化），高亮已触发');
+else console.log('  结论: ❌ 点击未生效');
 if (after.err) console.log('  JS错误:', after.err);
 
 // 2) 把一个节点拖到另一个节点身上 -> 应被挡住，不能重叠
