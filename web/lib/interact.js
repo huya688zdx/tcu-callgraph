@@ -18,14 +18,14 @@ import { stopCamAnim, focusBox } from './camera.js';
 import { pathBlockedByNodes } from '/core/routing.js';
 import {
   selectNode,
-  showMenu,
   showNodeMenu,
-  hideMenu,
   setNodeChange,
   setEdgeChange,
   CHANGE_ITEMS,
   EDGE_ITEMS,
 } from './menu.js';
+import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
+import { locateBox } from './locate.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail } from './panels.js';
 import { hooks } from './hooks.js';
@@ -148,6 +148,28 @@ function moveSeg(seg, x, y) {
 
 let justDragged = false;
 
+/**
+ * 命中文件框 / 目录容器本体（不含函数节点）
+ * 右键它们时要能「定位到当前文件 / 当前目录」——越靠里越优先
+ */
+function hitBox(e) {
+  const v = state.view;
+  if (!v) return null;
+  const p = worldPos(e);
+  for (const g of v.groups || []) {
+    if (p.x >= g.x && p.x <= g.x + g.w && p.y >= g.y && p.y <= g.y + g.h) {
+      return { kind: 'file', box: g };
+    }
+  }
+  const conts = (v.containers || []).slice().sort((a, b) => b.depth - a.depth);
+  for (const c of conts) {
+    if (p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h) {
+      return { kind: 'dir', box: c };
+    }
+  }
+  return null;
+}
+
 els.cv.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!state.view) return;
@@ -172,6 +194,26 @@ els.cv.addEventListener('contextmenu', (e) => {
     draw();
     showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
+    );
+    return;
+  }
+
+  // 文件框 / 目录容器：定位到当前文件或当前目录
+  const box = hitBox(e);
+  if (box) {
+    const title = String(box.box.label || box.box.id || '');
+    showMenuSections(
+      e.clientX,
+      e.clientY,
+      title,
+      [
+        {
+          id: 'locate',
+          label: 'menu.locate',
+          items: [{ value: 'locate', label: box.kind === 'file' ? 'locate.file' : 'locate.dir' }],
+        },
+      ],
+      () => locateBox(box.kind, box.box.id, [])
     );
     return;
   }

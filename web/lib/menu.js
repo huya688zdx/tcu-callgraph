@@ -1,8 +1,8 @@
 /**
  * 右键菜单：变更分类标记、连线状态、选中
  */
-import { t } from '../i18n.js';
-import { els, state, edgeKey, esc, CHANGE_FILL, EDGE_COLOR } from './state.js';
+import { state, edgeKey, CHANGE_FILL, EDGE_COLOR } from './state.js';
+import { hideMenu, showMenu, showMenuSections } from './ctxmenu.js';
 import { api } from './api.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
@@ -22,80 +22,6 @@ const EDGE_ITEMS = [
   { value: 'added', label: 'edgeState.added', color: EDGE_COLOR.added },
   { value: 'deleted', label: 'edgeState.deleted', color: EDGE_COLOR.existing },
 ];
-
-function hideMenu() {
-  if (!els.ctxMenu) return;
-  els.ctxMenu.classList.remove('show');
-  els.ctxMenu.innerHTML = '';
-}
-
-function showMenu(x, y, title, items, current, onPick) {
-  const el = els.ctxMenu;
-  if (!el) return;
-  el.innerHTML =
-    `<div class="title">${title}</div>` +
-    items
-      .map(
-        (it, i) =>
-          `<button data-i="${i}" class="${it.value === current ? 'active' : ''}">` +
-          `<span class="swatch" style="background:${it.color}"></span>` +
-          `<span>${t(it.label)}</span></button>`
-      )
-      .join('');
-  el.style.left = `${x}px`;
-  el.style.top = `${y}px`;
-  el.classList.add('show');
-
-  const r = el.getBoundingClientRect();
-  if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
-  if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
-
-  el.onclick = (ev) => {
-    const btn = ev.target.closest('button');
-    if (!btn) return;
-    const it = items[Number(btn.dataset.i)];
-    hideMenu();
-    if (it) onPick(it.value);
-  };
-}
-
-/**
- * 分组右键菜单：支持多个分区（数据流 / 变更分类）
- * sections: [{ id, label, items: [{ value, label, color?, active? }] }]
- */
-export function showMenuSections(x, y, title, sections, onPick) {
-  const el = els.ctxMenu;
-  if (!el) return;
-  const html = [`<div class="title">${esc(title)}</div>`];
-  sections.forEach((sec, si) => {
-    if (sec.label) html.push(`<div class="sec-title">${esc(t(sec.label))}</div>`);
-    for (let ii = 0; ii < sec.items.length; ii++) {
-      const it = sec.items[ii];
-      html.push(
-        `<button data-s="${si}" data-i="${ii}" class="${it.active ? 'active' : ''}">` +
-          (it.color ? `<span class="swatch" style="background:${it.color}"></span>` : '') +
-          `<span>${esc(t(it.label))}</span></button>`
-      );
-    }
-  });
-  el.innerHTML = html.join('');
-  el.style.left = `${x}px`;
-  el.style.top = `${y}px`;
-  el.classList.add('show');
-
-  const r = el.getBoundingClientRect();
-  if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
-  if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
-
-  el.onclick = (ev) => {
-    const btn = ev.target.closest('button');
-    if (!btn) return;
-    const sec = sections[Number(btn.dataset.s)];
-    const it = sec && sec.items[Number(btn.dataset.i)];
-    hideMenu();
-    if (it && onPick) onPick(it.value, sec.id);
-  };
-}
 
 /** 函数节点的右键菜单：数据流分析 + 变更分类 */
 export function showNodeMenu(x, y, n) {
@@ -144,6 +70,7 @@ export {
   EDGE_ITEMS,
   hideMenu,
   showMenu,
+  showMenuSections,
   selectNode,
   setNodeChange,
   setEdgeChange,

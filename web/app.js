@@ -10,23 +10,33 @@ import { fit } from './lib/camera.js';
 import { draw, resize } from './lib/render.js';
 import { fullReroute } from './lib/geometry.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, renderDetail } from './lib/panels.js';
+import { loadStats, loadTree, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { buildSVG, download } from './lib/svg.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
 import { clearDataflow } from './lib/df.js';
 
+/**
+ * 加载视图
+ * @param {string|string[]|null} rootId 单个函数 id、多个函数 id（文件树多选）、或 null（默认入口）
+ */
+let viewSeq = 0;
+
 async function loadView(rootId) {
+  const seq = ++viewSeq;
   clearDataflow(false); // 换视图时旧的叠加层不再适用
+  const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const data = await api.view({
-    root: rootId,
+    roots,
     up: state.up,
     down: state.down,
     group: state.group,
     optimal: state.optimal,
   });
+  if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   state.view = data;
   state.root = data.root;
+  state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
   state.selected = null;
   state.selectedEdge = null;
   modifiedNodes.clear(); // 新视图的节点都是自动布局位置，尚未被拖动
@@ -34,7 +44,10 @@ async function loadView(rootId) {
     fullReroute(); // 兜底：服务端数据缺折线时本地补算
   }
   const rootNode = data.nodes.find((n) => n.id === data.root);
-  els.rootName.textContent = rootNode ? `· ${rootNode.name}` : '';
+  els.rootName.textContent = rootNode
+    ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
+    : '';
+  syncTreeSelection(state.roots);
   fit();
   renderDetail(null);
   history.stack = [];
@@ -44,6 +57,7 @@ async function loadView(rootId) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
+hooks.renderDetail = renderDetail;
 
 async function postDelete(body) {
   await api.del(body);
@@ -52,7 +66,7 @@ async function postDelete(body) {
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
 async function reloadKeepCam() {
   const before = { x: cam.x, y: cam.y, k: cam.k };
-  await loadView(state.root);
+  await loadView(state.roots.length ? state.roots : state.root);
   cam.x = before.x;
   cam.y = before.y;
   cam.k = before.k;
@@ -72,8 +86,14 @@ async function deleteSelection() {
     return;
   }
 
-  // 删掉的正是当前入口时，回退到自动选择入口，避免停在一个空视图上
-  if (body.nodes && body.nodes.includes(state.root)) state.root = null;
+  // 删掉的正是当前入口时，把它从入口集合里摘掉；全删空则回退到自动选择
+  if (body.nodes && body.nodes.length) {
+    const rest = state.roots.filter((id) => !body.nodes.includes(id));
+    if (rest.length !== state.roots.length) {
+      state.roots = rest;
+      state.root = rest[0] || null;
+    }
+  }
 
   await postDelete(body);
   deleteStack.push({ ...body, at: Date.now() });

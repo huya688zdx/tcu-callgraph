@@ -199,8 +199,29 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(rootId, up, down, group = false, dfNode = null, optimal = false) {
-  const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
+function buildView(rootIds, up, down, group = false, dfNode = null, optimal = false) {
+  // 支持多个入口（文件树多选）：各自取子图后合并节点与边
+  const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
+  const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
+  const nodeMap = new Map();
+  const edgeList = [];
+  const seenEdge = new Set();
+  for (const r of roots) {
+    const part = subgraph(MODEL, r, { up, down, maxNodes: perRoot });
+    for (const n of part.nodes) if (!nodeMap.has(n.id)) nodeMap.set(n.id, n);
+    for (const e of part.edges) {
+      const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
+      if (seenEdge.has(k)) continue;
+      seenEdge.add(k);
+      edgeList.push(e);
+    }
+  }
+  const g = {
+    root: roots[0] || null,
+    roots,
+    nodes: [...nodeMap.values()],
+    edges: edgeList,
+  };
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
   // 所以某个文件或目录里的函数被删空时，对应层级会自动消失
   const alive = g.nodes.filter((n) => !overlay.deleted.nodes[n.id]);
@@ -243,7 +264,8 @@ function buildView(rootId, up, down, group = false, dfNode = null, optimal = fal
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
-  const slot = optimal ? {} : overlay.layout?.[layoutKey(g.root, mode)] || {};
+  // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
+  const slot = optimal ? {} : overlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
 
   // 手动拖拽的节点位置优先。
   // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
@@ -370,7 +392,7 @@ function buildView(rootId, up, down, group = false, dfNode = null, optimal = fal
     // 原有 / 新增 / 删除
     e.change = (ov && ov.change) || 'existing';
   }
-  return { ...laid, root: g.root };
+  return { ...laid, root: g.root, roots };
 }
 
 const server = http.createServer((req, res) => {
@@ -423,13 +445,19 @@ const server = http.createServer((req, res) => {
     }
 
     if (u.pathname === '/api/view') {
+      const rootsParam = u.searchParams.get('roots');
       const rootId = u.searchParams.get('root');
+      const roots = rootsParam
+        ? rootsParam.split(',').filter(Boolean)
+        : rootId
+        ? [rootId]
+        : [];
       const up = Number(u.searchParams.get('up') || 0);
       const down = Number(u.searchParams.get('down') || 2);
       const group = u.searchParams.get('group') === '1';
       const df = u.searchParams.get('df') || null;
       const optimal = u.searchParams.get('optimal') === '1';
-      if (!rootId) {
+      if (!roots.length) {
         if (!MODEL.functions.length) {
           return json(res, {
             nodes: [],
@@ -449,9 +477,9 @@ const server = http.createServer((req, res) => {
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
-        return json(res, buildView(pick.id, up, Math.max(down, 3), group, df, optimal));
+        return json(res, buildView([pick.id], up, Math.max(down, 3), group, df, optimal));
       }
-      return json(res, buildView(rootId, up, down, group, df, optimal));
+      return json(res, buildView(roots, up, down, group, df, optimal));
     }
 
     if (u.pathname === '/api/node') {

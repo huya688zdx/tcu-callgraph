@@ -7,6 +7,8 @@ import { api } from './api.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 import { hooks } from './hooks.js';
+import { showMenuSections } from './ctxmenu.js';
+import { locateNode, locateBox } from './locate.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -68,6 +70,77 @@ function renderTree() {
   el.appendChild(frag);
 }
 
+/** 当前勾选的所有函数 id（文件树支持多选） */
+function checkedIds() {
+  return [...document.querySelectorAll('#tree input[type=checkbox]')]
+    .filter((c) => c.checked)
+    .map((c) => c.dataset.id);
+}
+
+let selectTimer = null;
+
+/** 勾选变化后统一重新加载：多个函数同时作为入口；全不勾则回到默认入口 */
+function applyTreeSelection() {
+  clearTimeout(selectTimer);
+  // 连续勾选时合并成一次请求，避免连点几下就闪几次
+  selectTimer = setTimeout(() => {
+    const ids = checkedIds();
+    hooks.loadView(ids.length ? ids : null);
+  }, 120);
+}
+
+/** 视图切换后回填勾选状态，保证树和画布一致 */
+export function syncTreeSelection(ids) {
+  const set = new Set(ids || []);
+  document.querySelectorAll('#tree input[type=checkbox]').forEach((c) => {
+    c.checked = set.has(c.dataset.id);
+  });
+}
+
+/** 目录/文件节点下的所有函数 id —— 定位时如果它不在视图里，用这些函数当入口 */
+function collectFnIds(node) {
+  const out = [];
+  const walk = (n) => {
+    for (const f of n.functions || []) out.push(f.id);
+    for (const c of n.children || []) walk(c);
+  };
+  walk(node);
+  return out;
+}
+
+/** 文件树右键：函数 → 定位到函数；文件 → 定位到文件；目录 → 定位到目录 */
+function openTreeMenu(ev, kind, payload) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const items = [];
+  if (kind === 'fn') {
+    items.push({ value: 'locate', label: 'locate.fn' });
+    items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
+  } else if (kind === 'file') {
+    items.push({ value: 'locate', label: 'locate.file' });
+  } else {
+    items.push({ value: 'locate', label: 'locate.dir' });
+  }
+  showMenuSections(
+    ev.clientX,
+    ev.clientY,
+    payload.label,
+    [{ id: 'locate', label: 'menu.locate', items }],
+    (v) => {
+      if (v === 'locate') {
+        if (kind === 'fn') locateNode(payload.id);
+        else locateBox(kind === 'file' ? 'file' : 'dir', payload.id, payload.fnIds || []);
+      } else if (v === 'toggle') {
+        const cb = document.querySelector(`#tree input[data-id="${CSS.escape(payload.id)}"]`);
+        if (cb) {
+          cb.checked = !cb.checked;
+          applyTreeSelection();
+        }
+      }
+    }
+  );
+}
+
 function buildTreeNode(node, depth) {
   const wrap = document.createElement('div');
   const row = document.createElement('div');
@@ -107,10 +180,22 @@ function buildTreeNode(node, depth) {
       lab.title = `${node.path}:${f.line}`;
       fr.appendChild(cb);
       fr.appendChild(lab);
+      fr.addEventListener('contextmenu', (ev) =>
+        openTreeMenu(ev, 'fn', { id: f.id, label: f.name, checked: cb.checked })
+      );
       kids.appendChild(fr);
     }
   }
   wrap.appendChild(kids);
+
+  // 文件 / 目录行右键：定位到该文件或该目录
+  row.addEventListener('contextmenu', (ev) =>
+    openTreeMenu(ev, node.type === 'file' ? 'file' : 'dir', {
+      id: node.path,
+      label: node.name,
+      fnIds: collectFnIds(node),
+    })
+  );
 
   row.addEventListener('click', (ev) => {
     if (ev.target.tagName === 'INPUT' || !hasKids) return;
@@ -119,14 +204,10 @@ function buildTreeNode(node, depth) {
     tw.textContent = open ? '▸' : '▾';
   });
 
+  // 多选：勾选变化只做汇总，不再互斥
   kids.addEventListener('change', (ev) => {
     if (ev.target.tagName !== 'INPUT') return;
-    const id = ev.target.dataset.id;
-    if (!ev.target.checked) return;
-    document.querySelectorAll('#tree input[type=checkbox]').forEach((c) => {
-      if (c !== ev.target) c.checked = false;
-    });
-    hooks.loadView(id);
+    applyTreeSelection();
   });
 
   return wrap;

@@ -24,7 +24,10 @@ const els = {
 
 const state = {
   view: null,
+  /** 当前入口函数（多选时是第一个） */
   root: null,
+  /** 当前所有入口函数（文件树多选时会有多个） */
+  roots: [],
   selected: null,
   hover: null,
   down: 3,
