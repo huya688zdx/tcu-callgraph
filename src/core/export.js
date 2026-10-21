@@ -4,164 +4,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { stats, tarjan } from './index.js';
+import { stats } from './index.js';
 import { layout } from './layout.js';
 import { roundedPathD } from './routing.js';
-
-const KIND_LABEL = { direct: '直接调用', macro: '经宏调用', fnptr: '函数指针', unknown: '未知' };
-
-async function exportXlsxLegacy(model, outPath) {
-  const { default: ExcelJS } = await import('exceljs');
-  const wb = new ExcelJS.Workbook();
-  wb.creator = 'TCU CallGraph';
-  wb.created = new Date();
-
-  const S = stats(model);
-  const { byId, outAdj, inAdj } = model._index;
-
-  // ---- 概览 ----
-  const ov = wb.addWorksheet('概览');
-  ov.columns = [
-    { header: '指标', key: 'k', width: 24 },
-    { header: '数值', key: 'v', width: 46 },
-  ];
-  ov.getRow(1).font = { bold: true };
-  const rows = [
-    ['工程根目录', model.root],
-    ['文件数', S.files],
-    ['函数数', S.functions],
-    ['外部符号', S.externals],
-    ['调用边总数', S.edges],
-    ['经宏的边', S.macroEdges],
-    ['函数指针边', S.fnptrEdges],
-    ['宏定义数', S.macros],
-    ['最大扇出', `${S.maxFanOut}  (${S.maxFanOutFn})`],
-    ['最大扇入', `${S.maxFanIn}  (${S.maxFanInFn})`],
-    ['调用环组数', S.cycles],
-    ['解析耗时', `${S.elapsedMs} ms`],
-    ['生成时间', new Date().toLocaleString('zh-CN')],
-  ];
-  rows.forEach((r) => ov.addRow({ k: r[0], v: r[1] }));
-
-  // ---- 函数表 ----
-  const fnSheet = wb.addWorksheet('函数');
-  fnSheet.columns = [
-    { header: '函数名', key: 'name', width: 30 },
-    { header: '文件', key: 'file', width: 26 },
-    { header: '行号', key: 'line', width: 8 },
-    { header: '扇入', key: 'fanIn', width: 8 },
-    { header: '扇出', key: 'fanOut', width: 8 },
-    { header: 'static', key: 'isStatic', width: 8 },
-    { header: '参数', key: 'params', width: 26 },
-    { header: '条件编译', key: 'cond', width: 26 },
-    { header: '备注', key: 'note', width: 34 },
-  ];
-  fnSheet.getRow(1).font = { bold: true };
-  for (const f of model.functions) {
-    fnSheet.addRow({
-      name: f.name,
-      file: f.file,
-      line: f.line,
-      fanIn: (inAdj.get(f.id) || []).length,
-      fanOut: (outAdj.get(f.id) || []).length,
-      isStatic: f.isStatic ? 'Y' : '',
-      params: (f.params || []).join(', '),
-      cond: f.cond || '',
-      note: '',
-    });
-  }
-  fnSheet.autoFilter = { from: 'A1', to: `I${fnSheet.rowCount}` };
-  fnSheet.views = [{ state: 'frozen', ySplit: 1 }];
-
-  // ---- 调用边 ----
-  const edSheet = wb.addWorksheet('调用边');
-  edSheet.columns = [
-    { header: '调用方', key: 'from', width: 30 },
-    { header: '被调方', key: 'to', width: 30 },
-    { header: '文件', key: 'file', width: 22 },
-    { header: '调用点行号', key: 'line', width: 12 },
-    { header: '类型', key: 'kind', width: 12 },
-    { header: '宏 / 指针来源', key: 'via', width: 30 },
-    { header: '条件编译', key: 'cond', width: 26 },
-  ];
-  edSheet.getRow(1).font = { bold: true };
-  for (const e of model.edges) {
-    const fromFn = byId.get(e.from);
-    edSheet.addRow({
-      from: fromFn ? fromFn.name : e.from,
-      to: e.callee,
-      file: fromFn ? fromFn.file : '',
-      line: e.line || '',
-      kind: KIND_LABEL[e.kind] || e.kind,
-      via: e.via || '',
-      cond: e.cond || '',
-    });
-  }
-  edSheet.autoFilter = { from: 'A1', to: `G${edSheet.rowCount}` };
-  edSheet.views = [{ state: 'frozen', ySplit: 1 }];
-
-  // ---- 宏表 ----
-  const macSheet = wb.addWorksheet('宏定义');
-  macSheet.columns = [
-    { header: '宏名', key: 'name', width: 24 },
-    { header: '参数', key: 'params', width: 20 },
-    { header: '宏体', key: 'raw', width: 62 },
-    { header: '定义位置', key: 'where', width: 26 },
-    { header: '条件编译', key: 'cond', width: 24 },
-    { header: '展开出的调用', key: 'calls', width: 40 },
-  ];
-  macSheet.getRow(1).font = { bold: true };
-  for (const m of model.macros) {
-    if (!m.raw || !m.raw.trim()) continue;
-    const calls = [
-      ...new Set(
-        model.edges
-          .filter((e) => e.macroChain && e.macroChain.includes(m.name))
-          .map((e) => e.callee)
-      ),
-    ];
-    macSheet.addRow({
-      name: m.name,
-      params: m.params ? m.params.join(', ') : '(对象宏)',
-      raw: m.raw,
-      where: `${m.file}:${m.line}`,
-      cond: m.cond || '',
-      calls: calls.join(', '),
-    });
-  }
-
-  // ---- 函数指针表 ----
-  if (model.fnptrTables.length) {
-    const fpSheet = wb.addWorksheet('函数指针表');
-    fpSheet.columns = [
-      { header: '表变量', key: 'table', width: 24 },
-      { header: '成员', key: 'field', width: 22 },
-      { header: '实际函数', key: 'fn', width: 30 },
-    ];
-    fpSheet.getRow(1).font = { bold: true };
-    for (const t of model.fnptrTables) {
-      for (const [k, v] of Object.entries(t.map)) {
-        fpSheet.addRow({ table: t.name, field: k, fn: v });
-      }
-    }
-  }
-
-  // ---- 调用环 ----
-  const sccs = tarjan(model).filter((c) => c.length > 1);
-  if (sccs.length) {
-    const cySheet = wb.addWorksheet('调用环');
-    cySheet.columns = [
-      { header: '组', key: 'g', width: 8 },
-      { header: '成员', key: 'm', width: 80 },
-    ];
-    cySheet.getRow(1).font = { bold: true };
-    sccs.forEach((c, i) => cySheet.addRow({ g: i + 1, m: c.join(' → ') }));
-  }
-
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  await wb.xlsx.writeFile(outPath);
-  return outPath;
-}
 
 export function buildSVGFromLayout(laid) {
   const pad = 24;
@@ -216,6 +61,17 @@ function esc(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/**
+ * 内联进 <script> 的 JSON：转义 < 与 U+2028/2029。
+ * 宏体、文件名里出现 "</script>" 时，不转义会提前闭合脚本块并把后续源码当 HTML 解析。
+ */
+function inlineJson(v) {
+  return JSON.stringify(v)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 export function exportSvg(model, outPath, opts = {}) {
@@ -306,7 +162,8 @@ ul{padding:0;margin:0}
 <ul id="macros"></ul>
 </aside>
 <script>
-const DATA = ${JSON.stringify(payload)};
+const DATA = ${inlineJson(payload)};
+const escHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const stage = document.getElementById('stage');
 const wrap = document.getElementById('wrap');
 let k = 1, tx = 0, ty = 0, dragging = false, moved = false, lx = 0, ly = 0;
@@ -349,17 +206,17 @@ function select(id){
   const n = DATA.nodes.find(x => x.id === id);
   const out = DATA.edges.filter(e => e.from === id);
   const inc = DATA.edges.filter(e => e.to === id);
-  const chip = e => e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + e.via : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + e.via : '') + '</span>' : '';
-  info.innerHTML = '<div style="font-weight:500;font-size:13px;color:#2C2C2A;margin-bottom:2px">' + n.name + '</div>' +
-    '<div style="margin-bottom:8px">' + n.file + ':' + n.line + ' · ↑' + n.fanIn + ' ↓' + n.fanOut + '</div>' +
-    (out.length ? '<div style="margin-bottom:2px">调用：</div>' + out.map(e => '<div>→ ' + e.callee + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '') +
-    (inc.length ? '<div style="margin-top:6px;margin-bottom:2px">被调用：</div>' + inc.map(e => '<div>← ' + (DATA.nodes.find(x => x.id === e.from) || {}).name + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '');
+  const chip = e => e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : '';
+  info.innerHTML = '<div style="font-weight:500;font-size:13px;color:#2C2C2A;margin-bottom:2px">' + escHtml(n.name) + '</div>' +
+    '<div style="margin-bottom:8px">' + escHtml(n.file) + ':' + n.line + ' · ↑' + n.fanIn + ' ↓' + n.fanOut + '</div>' +
+    (out.length ? '<div style="margin-bottom:2px">调用：</div>' + out.map(e => '<div>→ ' + escHtml(e.callee) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '') +
+    (inc.length ? '<div style="margin-top:6px;margin-bottom:2px">被调用：</div>' + inc.map(e => '<div>← ' + escHtml((DATA.nodes.find(x => x.id === e.from) || {}).name) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '');
   document.querySelectorAll('path[data-from]').forEach(p => {
     p.classList.toggle('hit', p.dataset.from !== id && p.dataset.to !== id);
   });
 }
 document.getElementById('macros').innerHTML = DATA.macros.map(m =>
-  '<li><b>' + m.name + (m.params ? '(' + m.params.join(',') + ')' : '') + '</b><br><span style="color:#888780">' + m.raw.slice(0, 70) + '</span></li>'
+  '<li><b>' + escHtml(m.name) + (m.params ? '(' + escHtml(m.params.join(',')) + ')' : '') + '</b><br><span style="color:#888780">' + escHtml(m.raw.slice(0, 70)) + '</span></li>'
 ).join('');
 document.getElementById('q').addEventListener('input', e => {
   const q = e.target.value.trim().toLowerCase();

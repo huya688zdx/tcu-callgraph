@@ -2,6 +2,8 @@
 import { loadModel, subgraph } from '../src/core/index.js';
 import { layout } from '../src/core/layout.js';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const model = loadModel('samples/tcu');
 const g = subgraph(model, 'main.c::main', { up: 0, down: 3, maxNodes: 600 });
@@ -37,5 +39,6 @@ for (const n of laid.nodes) {
   out.push(`<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 4).toFixed(1)}" text-anchor="middle" font-size="12" fill="#2C2C2A">${n.name || n.id}</text>`);
 }
 out.push('</svg>');
-fs.writeFileSync(process.argv[2] || 'layout-preview.svg', out.join('\n'), 'utf8');
-console.log(`written: ${Math.round(W)}x${Math.round(H)}, nodes=${laid.nodes.length}, edges=${laid.edges.length}`);
+const outFile = process.argv[2] || path.join(os.tmpdir(), 'layout-preview.svg');
+fs.writeFileSync(outFile, out.join('\n'), 'utf8');
+console.log(`written: ${Math.round(W)}x${Math.round(H)}, nodes=${laid.nodes.length}, edges=${laid.edges.length} → ${outFile}`);

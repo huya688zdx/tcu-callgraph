@@ -21,6 +21,37 @@ const pushTo = (m, k, v) => {
   m.get(k).push(v);
 };
 
+/**
+ * 找回边（DFS 染色法）：把指向「仍在栈上」的节点的边判为回边。
+ * 用显式栈实现，避免长链图（12000 节点）触发递归栈溢出。
+ */
+function findBackEdges(ids, out) {
+  const state = new Map(); // 1 = 在栈上, 2 = 已访问完
+  const backSet = new Set();
+  for (const root of ids) {
+    if (state.has(root)) continue;
+    state.set(root, 1);
+    const stack = [{ v: root, i: 0 }];
+    while (stack.length) {
+      const frame = stack[stack.length - 1];
+      const list = out.get(frame.v) || [];
+      if (frame.i < list.length) {
+        const e = list[frame.i++];
+        const st = state.get(e.to);
+        if (st === 1) backSet.add(e);
+        else if (st === undefined) {
+          state.set(e.to, 1);
+          stack.push({ v: e.to, i: 0 });
+        }
+      } else {
+        state.set(frame.v, 2);
+        stack.pop();
+      }
+    }
+  }
+  return backSet;
+}
+
 /** 区间最大重叠（贪心扫描），用于估算层间通道数 */
 function maxOverlap(intervals) {
   const ev = [];
@@ -63,18 +94,7 @@ function layoutBase(nodes, edges, opts = {}) {
   // ---- 1. 找回边 ----
   const out = new Map();
   for (const e of es) pushTo(out, e.from, e);
-  const state = new Map();
-  const backSet = new Set();
-  const dfs = (v) => {
-    state.set(v, 1);
-    for (const e of out.get(v) || []) {
-      const st = state.get(e.to);
-      if (st === 1) backSet.add(e);
-      else if (st === undefined) dfs(e.to);
-    }
-    state.set(v, 2);
-  };
-  for (const id of ids) if (!state.has(id)) dfs(id);
+  const backSet = findBackEdges(ids, out);
 
   // ---- 2. Kahn 分层 ----
   const layer = new Map(ids.map((id) => [id, 0]));
@@ -328,7 +348,6 @@ function layoutBase(nodes, edges, opts = {}) {
 
   // ---- 7. y 坐标 ----
   let y = padding;
-  const layerBottom = [];
   for (let li = 0; li < layers.length; li++) {
     const arr = layers[li];
     for (const id of arr) {
@@ -336,7 +355,6 @@ function layoutBase(nodes, edges, opts = {}) {
       g.y = y + (layerH[li] - g.h) / 2;
     }
     y += layerH[li];
-    layerBottom[li] = y;
     if (li < layers.length - 1) y += gapHeights[li] ?? gapY;
   }
   const totalH = y + padding;
@@ -405,6 +423,21 @@ function overlapNodes(nodes) {
         Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0.5
       ) return true;
     }
+  }
+  return false;
+}
+
+/** 只检查第 idx 个节点是否与其它节点重叠（其余节点对在基线布局里已无重叠） */
+function overlapsAny(nodes, idx) {
+  const a = nodes[idx];
+  if (!a) return false;
+  for (let j = 0; j < nodes.length; j++) {
+    if (j === idx) continue;
+    const b = nodes[j];
+    if (
+      Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 0.5 &&
+      Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0.5
+    ) return true;
   }
   return false;
 }
@@ -528,7 +561,13 @@ function candidateScore(candidate) {
 }
 
 function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
-  if (nodes.length > 80 || edges.length > 180 || edges.some((e) => e.custom)) return;
+  if (nodes.length > 120 || edges.length > 260 || edges.some((e) => e.custom)) return;
+  // 试算预算：每个候选位置都要做一次完整重路由 + 交叉数统计，
+  // 不设预算时 80 节点 / 180 边会跑到 5 秒级（服务端同步阻塞整个请求）。
+  const TRIAL_BUDGET = 120;
+  const TRIAL_TIME_BUDGET = 150;
+  const trialStart = Date.now();
+  let trials = 0;
   const groupById = new Map(groups.map((g) => [g.id, g]));
   const currentNodes = nodes.map((n) => ({ ...n }));
   const currentEdges = cloneEdges(edges);
@@ -565,6 +604,7 @@ function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
   let score = candidateScore({ nodes: currentNodes, edges: currentEdges });
 
   for (const original of order) {
+    if (trials >= TRIAL_BUDGET || Date.now() - trialStart > TRIAL_TIME_BUDGET) break;
     let node = byId.get(original.id);
     const box = groupById.get(node.group);
     if (!box) continue;
@@ -598,6 +638,8 @@ function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
     }
     const seen = new Set();
     for (const p of [...alignedOptions, ...options].slice(0, 40)) {
+      if (trials >= TRIAL_BUDGET || Date.now() - trialStart > TRIAL_TIME_BUDGET) break;
+      trials++;
       const key = `${Math.round(p.x)},${Math.round(p.y)}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -605,8 +647,13 @@ function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
         p.x < box.x + 8 || p.y < box.y + headerH + 4 ||
         p.x + node.w > box.x + box.w - 8 || p.y + node.h > box.y + box.h - 6
       ) continue;
-      const trialNodes = currentNodes.map((n) => n.id === node.id ? { ...n, ...p } : { ...n });
-      if (overlapNodes(trialNodes)) continue;
+      // 只替换被移动的那一个节点对象，其余节点原样复用（浅拷贝）
+      const nodeIdx = currentNodes.indexOf(node);
+      if (nodeIdx < 0) continue;
+      const trialNodes = currentNodes.slice();
+      trialNodes[nodeIdx] = { ...node, ...p };
+      // 基线布局里节点两两不重叠，所以只有被移动的节点可能新产生重叠
+      if (overlapsAny(trialNodes, nodeIdx)) continue;
       const trialEdges = cloneEdges(edges);
       routeEdges(trialNodes, trialEdges);
       const trialScore = candidateScore({ nodes: trialNodes, edges: trialEdges });
@@ -755,18 +802,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
   // ---- 1. 分级（找环回边 → Kahn 最长路径）----
   const out = new Map();
   for (const e of es) pushTo(out, e.from, e);
-  const state = new Map();
-  const back = new Set();
-  const dfs = (v) => {
-    state.set(v, 1);
-    for (const e of out.get(v) || []) {
-      const st = state.get(e.to);
-      if (st === 1) back.add(e);
-      else if (st === undefined) dfs(e.to);
-    }
-    state.set(v, 2);
-  };
-  for (const id of ids) if (!state.has(id)) dfs(id);
+  const back = findBackEdges(ids, out);
 
   const rank = new Map(ids.map((id) => [id, 0]));
   const indeg = new Map(ids.map((id) => [id, 0]));
@@ -1072,12 +1108,13 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     }
   }
 
-  // 叶子尺寸 = 文件框尺寸
+  // 叶子尺寸 = 文件框尺寸。标题按画布字号估宽，标题比内容宽时以标题为准，
+  // 否则长文件名会越出文件框（设计规格「文字占位」要求）
   const leafOf = new Map();
   const walkLeaf = (node) => {
     if (node.type === 'file') {
       const l = inner.get(node.path);
-      node.w = l.width;
+      node.w = Math.max(l.width, textWidth(node.name) + 24);
       node.h = l.height;
       leafOf.set(node.path, node);
       return;
@@ -1116,6 +1153,26 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   // 列间留出跨列连线的走廊（colGap）
   const BOX = { padding: 14, gapX: 40, rowGap: 56, colGap: 72 };
 
+  // 目录容器最终矩形 = 子框包围盒 + 一圈外扩（见下面 6a）。
+  // 排布兄弟时必须按「含这圈的外框」占位，否则外扩会吃掉兄弟之间的间距，
+  // 目录框就会互相压住（18px 那类重叠就是这么来的）。
+  const depthBase = rootLabel ? 1 : 0;
+  const depthOfPath = (p) => p.split('/').length + depthBase;
+  let treeMaxDepth = 1;
+  const walkDepth = (n) => {
+    for (const c of n.children ? n.children.values() : []) {
+      if (c.type === 'dir') {
+        if (depthOfPath(c.path) > treeMaxDepth) treeMaxDepth = depthOfPath(c.path);
+        walkDepth(c);
+      }
+    }
+  };
+  walkDepth(root);
+  const ringOf = (path) => {
+    const extra = (treeMaxDepth - depthOfPath(path)) * 10;
+    return { side: 14 + extra, top: 30 + extra, bottom: 14 + extra };
+  };
+
   const layoutDir = (node) => {
     if (node.type === 'file') return;
     const list = [...node.children.values()];
@@ -1125,7 +1182,11 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       node.h = 0;
       return;
     }
-    const cn = list.map((c) => ({ id: c.path, name: c.name, w: c.w, h: c.h }));
+    const cn = list.map((c) => {
+      if (c.type === 'file') return { id: c.path, name: c.name, w: c.w, h: c.h };
+      const r = ringOf(c.path);
+      return { id: c.path, name: c.name, w: c.w + r.side * 2, h: c.h + r.top + r.bottom };
+    });
     // 分区式紧凑布局：列优先蛇形折行，宽高比最优，不再排成一列
     const childOfFile = new Map();
     const filesByChild = new Map();
@@ -1195,12 +1256,20 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     for (const it of cn) {
       const c = byId.get(it.id);
       const p = laid.pos.get(it.id);
-      c.x = p.x;
-      c.y = p.y;
-      c.w = it.w;
-      c.h = it.h;
+      if (c.type === 'file') {
+        c.x = p.x;
+        c.y = p.y;
+        c.w = it.w;
+        c.h = it.h;
+      } else {
+        // 槽位是「含外扩圈的外框」，目录自身坐标往里缩一圈；
+        // w/h 保持紧凑包围盒，父层再按同一套公式外扩，避免重复计算
+        const r = ringOf(c.path);
+        c.x = p.x + r.side;
+        c.y = p.y + r.top;
+      }
     }
-    node.w = laid.width;
+    node.w = Math.max(laid.width, textWidth(node.name) + 24);
     node.h = laid.height;
     node.columns = laid.columns;
   };
@@ -1216,7 +1285,16 @@ export function layoutGrouped(nodes, edges, opts = {}) {
 
   // 4. 合并坐标 + 组内边平移
   const geo = new Map();
-  const innerEdgeMap = new Map(); // from|to|line → 平移后的 points
+  // from|to|line|kind|序号 → 平移后的 points。序号用于区分同一行重复调用产生的平行边，
+  // 否则两条边会指向同一个数组，后面整体平移时被平移两次
+  const innerEdgeMap = new Map();
+  const innerSeq = new Map();
+  const innerKey = (e, seq) => `${e.from}|${e.to}|${e.line}|${e.kind || 'direct'}|${seq}`;
+  const bump = (seqMap, base) => {
+    const n = (seqMap.get(base) || 0) + 1;
+    seqMap.set(base, n);
+    return n;
+  };
   for (const [file, laid] of inner) {
     const leaf = leafOf.get(file);
     if (!leaf) continue;
@@ -1224,9 +1302,10 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       geo.set(n.id, { ...n, x: n.x + leaf.x, y: n.y + leaf.y, group: file });
     }
     for (const e of laid.edges) {
-      innerEdgeMap.set(`${e.from}|${e.to}|${e.line}`, {
+      const base = `${e.from}|${e.to}|${e.line}|${e.kind || 'direct'}`;
+      innerEdgeMap.set(innerKey(e, bump(innerSeq, base)), {
         ...e,
-        points: e.points.map((p) => [p[0] + leaf.x, p[1] + leaf.y]),
+        points: (e.points || []).map((p) => [p[0] + leaf.x, p[1] + leaf.y]),
       });
     }
   }
@@ -1235,14 +1314,17 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   const mergedNodes = [...geo.values()];
   const routed = [];
   const crossEdges = [];
+  const seenSeq = new Map();
   for (const e of edges) {
     const a = geo.get(e.from);
     const b = geo.get(e.to);
     if (!a || !b) continue;
     if (a.group === b.group) {
-      const m = innerEdgeMap.get(`${e.from}|${e.to}|${e.line}`);
+      const base = `${e.from}|${e.to}|${e.line}|${e.kind || 'direct'}`;
+      const m = innerEdgeMap.get(innerKey(e, bump(seenSeq, base)));
       if (m) {
-        routed.push(m);
+        // 每条边独立一份 points，避免平行边共享可变数组
+        routed.push({ ...m, points: m.points.map((p) => [p[0], p[1]]) });
         continue;
       }
     }
@@ -1266,8 +1348,7 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     h: n.h,
   }));
 
-  // 根容器占掉 depth 1，目录容器整体下移一层，嵌套关系保持不变
-  const depthBase = rootLabel ? 1 : 0;
+  // 根容器占掉 depth 1，目录容器整体下移一层（depthBase 在上面已算好）
   const containers = [];
   const collectDir = (node) => {
     for (const c of node.children.values()) {
@@ -1293,9 +1374,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   //     否则两边各算一套坐标系，手动布局存档会对不上
   const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
   for (const c of containers.slice().sort((a, b) => b.depth - a.depth)) {
-    const inner = fileGroups.filter((g) => String(g.id).startsWith(c.id + '/'));
+    const innerFiles = fileGroups.filter((g) => String(g.id).startsWith(c.id + '/'));
     const kids = containers.filter((k) => k !== c && String(k.id).startsWith(c.id + '/'));
-    const boxes = inner.concat(kids);
+    const boxes = innerFiles.concat(kids);
     if (!boxes.length) continue;
     let x0 = Infinity;
     let y0 = Infinity;
@@ -1310,7 +1391,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     const extra = (maxDepth - c.depth) * 10;
     c.x = x0 - 14 - extra;
     c.y = y0 - 30 - extra;
-    c.w = x1 - x0 + 28 + extra * 2;
+    // 目录标题（font-size 13，画在 x+12）也要放得下：父级槽位已按 node.w 预留过标题宽度，
+    // 这里取包围盒与标题的较大值即可，不会把兄弟框挤到一起
+    c.w = Math.max(x1 - x0 + 28 + extra * 2, textWidth(c.label) + 24);
     c.h = y1 - y0 + 44 + extra * 2;
   }
 
@@ -1338,7 +1421,7 @@ export function layoutGrouped(nodes, edges, opts = {}) {
         depth: 1,
         x: x0 - RING.side,
         y: y0 - RING.top,
-        w: x1 - x0 + RING.side * 2,
+        w: Math.max(x1 - x0 + RING.side * 2, textWidth(rootLabel) + 24),
         h: y1 - y0 + RING.top + RING.bottom,
       };
     }
@@ -1358,7 +1441,8 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       n.x += dx;
       n.y += dy;
     }
-    for (const e of routed) {
+    // routed 里可能有同一条边被引用多次（平行边），按对象去重后再平移
+    for (const e of new Set(routed)) {
       if (e.points) for (const p of e.points) { p[0] += dx; p[1] += dy; }
     }
     for (const b of fileGroups) {

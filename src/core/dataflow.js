@@ -37,8 +37,9 @@ export async function buildDataflowIndex(model) {
   if (model._df) return model._df;
   if (model._dfPending) return model._dfPending;
 
-  model._dfPending = (async () => {
+  const pending = (async () => {
     const defs = [];
+    let failedFiles = 0;
     const defsByName = new Map();
     const fnAccess = new Map(); // fnId -> { writes: Map, reads: Map }
     const readers = new Map(); // varId -> Set<fnId>
@@ -59,7 +60,9 @@ export async function buildDataflowIndex(model) {
       let rec;
       try {
         rec = await parseFile(abs, f.rel, decode(fs.readFileSync(abs)));
-      } catch {
+      } catch (err) {
+        failedFiles += 1;
+        console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);
         continue; // 单个文件解析失败不影响整体
       }
 
@@ -112,12 +115,21 @@ export async function buildDataflowIndex(model) {
       readers,
       writers,
     };
+    if (failedFiles) {
+      console.warn(`[数据流] 共跳过 ${failedFiles} 个文件，变量面板可能不完整`);
+    }
     model._df = idx;
-    model._dfPending = null;
     return idx;
   })();
 
-  return model._dfPending;
+  model._dfPending = pending;
+  try {
+    return await pending;
+  } catch (err) {
+    // 失败后清空占位：否则 rejected promise 会被永久复用，面板直到重启都不可用
+    model._dfPending = null;
+    throw err;
+  }
 }
 
 const fnNodeOf = (model, id) => {
@@ -251,6 +263,28 @@ export async function dataflowFor(model, fnId, dir = 'out') {
     reads: acc.reads.size,
     truncated,
   };
+}
+
+/**
+ * 全工程的全局变量 / 常量清单（供右侧面板勾选）
+ * 与 sharedVariables 不同：不过滤「有没有跨函数共享」，常量、只在单个函数里用到的也算
+ */
+export async function listGlobals(model) {
+  const idx = await buildDataflowIndex(model);
+  const nameOf = (id) => model._index.byId.get(id)?.name || id;
+  return idx.defs
+    .map((d) => ({
+      id: d.id,
+      name: d.name,
+      typeText: d.typeText,
+      file: d.file,
+      line: d.line,
+      isConst: d.isConst,
+      isStatic: d.isStatic,
+      writers: [...(idx.writers.get(d.id) || [])].map((id) => ({ id, name: nameOf(id) })),
+      readers: [...(idx.readers.get(d.id) || [])].map((id) => ({ id, name: nameOf(id) })),
+    }))
+    .sort((a, b) => (a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1));
 }
 
 /** 全局共享变量清单（供报告/统计用） */

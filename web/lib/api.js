@@ -12,16 +12,21 @@ const post = (url, body) =>
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数 */
-  view({ root, roots, up = 0, down = 3, group = true, optimal = false }) {
+  view({ root, roots, up = 0, down = 3, group = true, optimal = false, vars, hiddenVars, fixed = false }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
     // 支持多入口：勾选多个函数时一起入图
     const list = (roots && roots.length ? roots : root ? [root] : []).filter(Boolean);
     if (list.length === 1) q.set('root', list[0]);
     else if (list.length > 1) q.set('roots', list.join(','));
     if (optimal) q.set('optimal', '1');
+    if (fixed) q.set('fixed', '1');
+    if (vars && vars.length) q.set('vars', vars.join(','));
+    if (hiddenVars && hiddenVars.length) q.set('novars', hiddenVars.join(','));
     return get('/api/view?' + q);
   },
   stats: () => get('/api/stats'),
+  /** 全工程全局变量 / 常量清单 */
+  vars: () => get('/api/vars'),
   tree: () => get('/api/tree'),
   search: (q) => get('/api/search?q=' + encodeURIComponent(q)),
   node: (id) => get('/api/node?id=' + encodeURIComponent(id)),

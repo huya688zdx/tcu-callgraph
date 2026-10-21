@@ -225,26 +225,68 @@ export function buildIndex(root) {
   const macros = new Map();
   const parsed = [];
   const includes = [];
+  const warnings = [];
+  // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
+  const macroDefs = new Map();
+  const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-  const parseFile = (abs) => {
+  /** 把头文件解析后的宏表并回全局表（含 #undef 带来的删除效果） */
+  const mergeMacros = (target, snap) => {
+    for (const name of [...target.keys()]) if (!snap.has(name)) target.delete(name);
+    for (const [name, def] of snap) target.set(name, def);
+  };
+
+  const parseFile = (abs, isHeader) => {
     const rel = path.relative(root, abs).replace(/\\/g, '/');
-    const src = decodeSource(fs.readFileSync(abs));
+    let buf;
+    try {
+      const size = fs.statSync(abs).size;
+      if (size > MAX_FILE_BYTES) {
+        warnings.push({ file: rel, error: `文件过大（${(size / 1048576).toFixed(1)} MB），已跳过` });
+        return;
+      }
+      buf = fs.readFileSync(abs);
+    } catch (err) {
+      // 单个文件读失败（权限 / 被占用 / 扫描期间被删）不应让整次索引失败
+      warnings.push({ file: rel, error: `读取失败：${err.message}` });
+      return;
+    }
+    // UTF-16 源码（带 BOM）里 ASCII 字符后面就是 0x00，不能按二进制跳过
+    const isUtf16 =
+      buf.length >= 2 &&
+      ((buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff));
+    if (!isUtf16 && buf.includes(0)) {
+      warnings.push({ file: rel, error: '疑似二进制文件（含 \\0），已跳过' });
+      return;
+    }
+    const src = decodeSource(buf);
     const toks = lex(src, rel);
-    const { tokens, includes: inc } = preprocess(toks, macros, rel);
+    // 每个文件一份宏表快照：本文件的 #define/#undef 只作用于本文件，
+    // 避免 a.c 里定义的宏泄漏到 b.c；头文件解析完再并回全局表，
+    // 保证「头文件 → 源文件」这一方向的累积仍然成立。
+    const fileMacros = new Map(macros);
+    const { tokens, includes: inc } = preprocess(toks, fileMacros, rel);
+    if (isHeader) mergeMacros(macros, fileMacros);
+    // 本文件自己定义的宏进入清单（继承来的头文件宏不算，避免重复）
+    for (const def of fileMacros.values()) if (def.file === rel) macroDefs.set(def.name, def);
     includes.push(...inc);
-    parsed.push({ abs, rel, tokens, isHeader: HDR_EXT.test(abs), bytes: src.length });
+    parsed.push({ abs, rel, tokens, macros: fileMacros, isHeader, bytes: src.length });
   };
 
   // 先头文件（宏定义先入表），再源文件
-  for (const f of headers) parseFile(f);
-  for (const f of sources) parseFile(f);
+  for (const f of headers) parseFile(f, true);
+  for (const f of sources) parseFile(f, false);
 
   const functions = [];
   const fnptrTables = new Map();
+  const seenFnId = new Set();
 
   for (const p of parsed) {
     for (const fn of findFunctions(p.tokens, p.rel)) {
       fn.id = `${fn.file}::${fn.name}`;
+      // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
+      if (seenFnId.has(fn.id)) continue;
+      seenFnId.add(fn.id);
       fn.bodyTokens = p.tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
       functions.push(fn);
     }
@@ -292,7 +334,8 @@ export function buildIndex(root) {
   };
 
   const edges = [];
-  const ctx = { macros, fnptr: fnptrTables };
+  // 每个函数用它所属文件的宏快照展开，避免跨文件互相污染
+  const macrosByFile = new Map(parsed.map((p) => [p.rel, p.macros]));
 
   // 变量名 → 节点：优先本文件的 static，其次同名全局
   const varByName = new Map();
@@ -311,7 +354,7 @@ export function buildIndex(root) {
 
   for (const fn of functions) {
     const raw = [];
-    scanCalls(fn.bodyTokens, ctx, raw);
+    scanCalls(fn.bodyTokens, { macros: macrosByFile.get(fn.file) || macros, fnptr: fnptrTables }, raw);
     for (const c of raw) {
       if (!c.callee) continue;
       edges.push({
@@ -396,9 +439,10 @@ export function buildIndex(root) {
     variables,
     externals: [...externals.values()],
     edges,
-    macros: [...macros.values()],
+    macros: [...macroDefs.values()],
     fnptrTables: [...fnptrTables.entries()].map(([name, map]) => ({ name, map })),
     includes,
+    warnings,
     _index: { byId: allNodes, byName, outAdj, inAdj, varWriters, varReaders },
   };
 
@@ -457,15 +501,30 @@ export function stats(model) {
   }
 
   const sccs = tarjan(model);
+  // 自递归（函数直接调用自己）在 tarjan 里是单点分量，同样要算作一个环。
+  // cycleGroups 保持「id 数组的数组」旧结构（cli/scan.js 直接 join 打印），
+  // 自环另外在 selfLoops 里给出，便于界面区分「自递归」与「环组」。
+  const outAdj = model._index?.outAdj;
+  const cycleGroups = [];
+  const selfLoops = [];
+  for (const c of sccs) {
+    if (c.length > 1) {
+      cycleGroups.push(c);
+    } else if (c.length === 1 && (outAdj?.get(c[0]) || []).some((e) => e.to === c[0])) {
+      cycleGroups.push(c);
+      selfLoops.push(c[0]);
+    }
+  }
 
   return {
     files: model.files.length,
-    functions: model.functions.length,
-    variables: model.variables.length,
-    externals: model.externals.length,
+    // 同名函数在 #if/#else 两分支各定义一次时会有重复 id，按 id 去重后再计数
+    functions: new Set(model.functions.map((f) => f.id)).size,
+    variables: model.variables?.length ?? 0,
+    externals: model.externals?.length ?? 0,
     edges: pairs.size,
     calls: model.edges.length,
-    macros: model.macros.length,
+    macros: model.macros?.length ?? 0,
     macroEdges: model.edges.filter((e) => e.kind === 'macro').length,
     fnptrEdges: model.edges.filter((e) => e.kind === 'fnptr').length,
     unknownEdges: model.edges.filter((e) => e.kind === 'unknown').length,
@@ -473,8 +532,9 @@ export function stats(model) {
     maxFanOutFn,
     maxFanIn,
     maxFanInFn,
-    cycles: sccs.filter((c) => c.length > 1).length,
-    cycleGroups: sccs.filter((c) => c.length > 1),
+    cycles: cycleGroups.length,
+    cycleGroups,
+    selfLoops,
     elapsedMs: model.elapsedMs,
   };
 }

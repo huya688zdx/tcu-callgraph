@@ -27,7 +27,7 @@ async function loadStats() {
     row(t('stat.maxFanOut'), s.maxFanOut),
   ].join('') +
     (s.files > 1500
-      ? '<div class="stat-row" style="color:#993C1D"><span>提示</span><span>文件较多，首次解析稍慢</span></div>'
+      ? `<div class="stat-row" style="color:#993C1D"><span>${t('stat.hintTitle')}</span><span>${t('stat.hintSlow')}</span></div>`
       : '');
 
   // 有删除记录时才让「恢复删除」可点，并在按钮上显示数量
@@ -41,6 +41,150 @@ async function loadStats() {
   }
 }
 
+// ---------------- 全局变量 / 常量 ----------------
+
+let varList = null;
+
+async function loadVars() {
+  try {
+    varList = (await api.vars()).list || [];
+  } catch {
+    varList = [];
+  }
+  renderVars();
+}
+
+/** 当前视图里出现过的文件（变量面板按它过滤） */
+function filesInView() {
+  const v = state.view;
+  const set = new Set();
+  if (!v) return set;
+  for (const n of v.nodes) {
+    if (n.file && n.file !== '<external>') set.add(n.file);
+  }
+  return set;
+}
+
+/** 类型显示：常量已经用 const 标签标了，类型里就不再重复 */
+const typeLabel = (x) =>
+  String(x.typeText || '')
+    .replace(/\bconst\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** 变量面板的筛选词与折叠状态（跨重绘保留） */
+let varQuery = '';
+const collapsedFiles = new Set();
+
+/**
+ * 渲染右侧「全局变量 / 常量」清单
+ * 范围跟随当前点选的框：点文件框 → 该文件；点层级框 → 该目录下所有文件；
+ * 什么都没点 → 提示先选一个框
+ * 变量多时：顶部筛选框 + 文件分组可折叠 + 紧凑单行（类型省略、读写数用 9/7）
+ */
+export function renderVars() {
+  const el = els.vars;
+  if (!el) return;
+  const v = state.view;
+  const ctx = state.ctxBox;
+  if (!varList || !v || !ctx) {
+    el.innerHTML = `<div class="empty">${t('vars.hint')}</div>`;
+    return;
+  }
+
+  const prefix = ctx.id ? ctx.id + '/' : '';
+  const scope = varList.filter((x) =>
+    ctx.kind === 'file' ? x.file === ctx.id : x.file === ctx.id || x.file.startsWith(prefix)
+  );
+  if (!scope.length) {
+    el.innerHTML = `<div class="empty">${t('vars.none')}</div>`;
+    return;
+  }
+
+  const q = varQuery.trim().toLowerCase();
+  const list = q
+    ? scope.filter(
+        (x) =>
+          x.name.toLowerCase().includes(q) || String(x.typeText || '').toLowerCase().includes(q)
+      )
+    : scope;
+
+  const inView = new Set(v.nodes.filter((n) => n.kind === 'var').map((n) => n.id));
+  const multiFile = new Set(scope.map((x) => x.file)).size > 1;
+  const checkedCount = scope.filter(
+    (x) => (state.vars.has(x.id) || inView.has(x.id)) && !state.hiddenVars.has(x.id)
+  ).length;
+
+  const parts = [];
+  // 顶部：筛选框 + 计数（变量多的时候才出现，少的时候保持简洁）
+  if (scope.length > 6) {
+    parts.push(`<div class="vars-bar">
+      <input id="varFilter" type="search" placeholder="${esc(t('vars.filter'))}" value="${esc(varQuery)}">
+      <span class="vars-cnt">${checkedCount}/${scope.length}</span>
+    </div>`);
+  }
+
+  let lastFile = null;
+  for (const x of list) {
+    if (multiFile && x.file !== lastFile) {
+      const inFile = list.filter((y) => y.file === x.file);
+      const selInFile = inFile.filter(
+        (y) => (state.vars.has(y.id) || inView.has(y.id)) && !state.hiddenVars.has(y.id)
+      ).length;
+      const folded = collapsedFiles.has(x.file);
+      parts.push(`<div class="var-file" data-file="${esc(x.file)}">
+        <span class="tw">${folded ? '\u25b6' : '\u25bc'}</span><span class="fn">${esc(
+        shortFile(x.file)
+      )}</span><span class="cnt">${selInFile}/${inFile.length}</span>
+      </div>`);
+      lastFile = x.file;
+      if (folded) continue;
+    } else if (multiFile && collapsedFiles.has(x.file)) {
+      continue;
+    }
+    const checked = (state.vars.has(x.id) || inView.has(x.id)) && !state.hiddenVars.has(x.id);
+    parts.push(`<label class="var-row" data-id="${esc(x.id)}" title="${esc(x.file)}:${x.line} \u00b7 ${esc(
+      typeLabel(x)
+    )} \u00b7 ${x.writers.length} \u5199 / ${x.readers.length} \u8bfb">
+      <input type="checkbox" ${checked ? 'checked' : ''}>
+      <span class="vn">${esc(x.name)}</span>
+      ${x.isConst ? '<span class="vg">const</span>' : ''}
+      <span class="vt">${esc(typeLabel(x))}</span>
+      <span class="vc">${x.writers.length}/${x.readers.length}</span>
+    </label>`);
+  }
+
+  if (!list.length) parts.push(`<div class="empty">${t('vars.noMatch')}</div>`);
+  el.innerHTML = parts.join('');
+
+  const filter = el.querySelector('#varFilter');
+  if (filter) {
+    filter.addEventListener('input', () => {
+      varQuery = filter.value;
+      renderVars();
+      const again = els.vars.querySelector('#varFilter');
+      if (again) {
+        again.focus();
+        again.setSelectionRange(again.value.length, again.value.length);
+      }
+    });
+  }
+  el.querySelectorAll('.var-file').forEach((h) => {
+    h.addEventListener('click', () => {
+      const f = h.dataset.file;
+      if (collapsedFiles.has(f)) collapsedFiles.delete(f);
+      else collapsedFiles.add(f);
+      renderVars();
+    });
+  });
+  el.querySelectorAll('.var-row input').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = cb.closest('.var-row').dataset.id;
+      hooks.toggleVar(id, cb.checked);
+    });
+  });
+}
+
 // ---------------- 文件树 ----------------
 
 let treeData = null;
@@ -50,7 +194,7 @@ async function loadTree() {
     treeData = await api.tree();
     renderTree();
   } catch {
-    document.getElementById('tree').innerHTML = '<div class="empty">加载失败</div>';
+    document.getElementById('tree').innerHTML = `<div class="empty">${t('tree.loadFail')}</div>`;
   }
 }
 
@@ -97,6 +241,55 @@ export function syncTreeSelection(ids) {
   });
 }
 
+/** 展开某一行的所有祖先目录（并可选展开它自己） */
+function expandRow(row, includeSelf = false) {
+  const open = (head) => {
+    const kids = head && head.nextElementSibling;
+    if (!kids || kids.tagName !== 'DIV') return;
+    if (kids.style.display === 'none') kids.style.display = 'block';
+    const tw = head.querySelector('.tw');
+    if (tw && head.dataset.kids !== '0') tw.textContent = '▾';
+  };
+  if (includeSelf) open(row);
+  let p = row.parentElement;
+  while (p && p.id !== 'tree') {
+    if (p.style && p.style.display === 'none') {
+      p.style.display = 'block';
+      const head = p.previousElementSibling;
+      const tw = head && head.querySelector('.tw');
+      if (tw) tw.textContent = '▾';
+    }
+    p = p.parentElement;
+  }
+}
+
+function flashRow(row) {
+  row.classList.add('hl');
+  setTimeout(() => row.classList.remove('hl'), 1600);
+}
+
+/**
+ * 在左侧文件列里定位：展开父目录、滚动到可见、高亮一下
+ * @param {'fn'|'file'|'dir'} kind
+ * @param {string} id 函数 id / 文件相对路径 / 目录路径
+ */
+export function revealInTree(kind, id) {
+  let row = null;
+  if (kind === 'fn') {
+    row = document.querySelector(`#tree .tn.fn[data-fnid="${CSS.escape(id)}"]`);
+  } else {
+    const cls = kind === 'file' ? 'file' : 'dir';
+    row = [...document.querySelectorAll(`#tree .tn.${cls}`)].find(
+      (r) => r.dataset.path === (id || '')
+    );
+  }
+  if (!row) return false;
+  expandRow(row, kind === 'file'); // 定位到文件时顺手展开它下面的函数
+  row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  flashRow(row);
+  return true;
+}
+
 /** 目录/文件节点下的所有函数 id —— 定位时如果它不在视图里，用这些函数当入口 */
 function collectFnIds(node) {
   const out = [];
@@ -114,12 +307,12 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
-    items.push({ value: 'locate', label: 'locate.fn' });
+    items.push({ value: 'locate', label: 'locate.canvasFn' });
     items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
   } else if (kind === 'file') {
-    items.push({ value: 'locate', label: 'locate.file' });
+    items.push({ value: 'locate', label: 'locate.canvasFile' });
   } else {
-    items.push({ value: 'locate', label: 'locate.dir' });
+    items.push({ value: 'locate', label: 'locate.canvasDir' });
   }
   showMenuSections(
     ev.clientX,
@@ -145,6 +338,7 @@ function buildTreeNode(node, depth) {
   const wrap = document.createElement('div');
   const row = document.createElement('div');
   row.className = 'tn ' + node.type;
+  row.dataset.path = node.path == null ? '' : node.path;
   row.style.paddingLeft = depth * 12 + 'px';
 
   const hasKids =
@@ -170,6 +364,7 @@ function buildTreeNode(node, depth) {
     for (const f of node.functions) {
       const fr = document.createElement('div');
       fr.className = 'tn fn';
+      fr.dataset.fnid = f.id;
       fr.style.paddingLeft = (depth + 1) * 12 + 'px';
       const cb = document.createElement('input');
       cb.type = 'checkbox';
@@ -219,13 +414,18 @@ els.search.addEventListener('input', () => {
   searchTimer = setTimeout(runSearch, 140);
 });
 
+/** 搜索请求序号：快速输入时只认最后一次，避免慢响应覆盖新结果 */
+let searchSeq = 0;
+
 async function runSearch() {
+  const my = ++searchSeq;
   const q = els.search.value.trim();
   if (!q) {
     els.results.innerHTML = `<li class="empty">${t('empty.search')}</li>`;
     return;
   }
   const list = await api.search(q);
+  if (my !== searchSeq) return; // 已经有更新的搜索，丢弃这次的结果
   if (!list.length) {
     els.results.innerHTML = `<li class="empty">${t('empty.noMatch')}</li>`;
     return;
@@ -253,13 +453,38 @@ els.search.addEventListener('keydown', (e) => {
   }
 });
 
+/**
+ * 节点详情 / 调用关系只对函数节点有意义：
+ * 点文件框、目录层级、变量节点时直接收起来，免得留两块空面板
+ */
+function syncDetailSections(isFn) {
+  if (els.secDetail) els.secDetail.style.display = isFn ? '' : 'none';
+  if (els.secEdges) els.secEdges.style.display = isFn ? '' : 'none';
+}
+
+/**
+ * 详情请求序号：快速点 A→B 时，A 的慢响应不能覆盖 B 的面板
+ * （否则面板显示 A 的内容却标在 B 上，或把备注写到已经切换掉的节点）
+ */
+let detailSeq = 0;
+
 async function renderDetail(id) {
+  const my = ++detailSeq;
+  const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
+  const isFn = !!target && target.kind !== 'var';
+  syncDetailSections(isFn);
+  if (!isFn) {
+    els.detail.innerHTML = '';
+    els.edges.innerHTML = '';
+    return;
+  }
   if (!id) {
     els.detail.innerHTML = `<div class="empty">${t('empty.detail')}</div>`;
     els.edges.innerHTML = `<div class="empty">${t('empty.edges')}</div>`;
     return;
   }
   const d = await api.node(id);
+  if (my !== detailSeq) return; // 已经切到别的节点，丢弃这次的结果
   if (d.error) return;
   const n = d.node;
   const ov = d.overlay || {};
@@ -321,9 +546,9 @@ async function renderDetail(id) {
     const other = dir === 'in' ? e.from : e.to;
     const nm = e.callee || other.split('::')[1] || other;
     let chip = '';
-    if (e.kind === 'macro') chip = `<span class="chip macro">宏${e.via ? ':' + esc(e.via) : ''}</span>`;
-    else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">指针${e.via ? ':' + esc(e.via) : ''}</span>`;
-    else if (e.kind === 'manual') chip = `<span class="chip manual">手动</span>`;
+    if (e.kind === 'macro') chip = `<span class="chip macro">${t('edge.chipMacro')}${e.via ? ':' + esc(e.via) : ''}</span>`;
+    else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">${t('edge.chipFnptr')}${e.via ? ':' + esc(e.via) : ''}</span>`;
+    else if (e.kind === 'manual') chip = `<span class="chip manual">${t('edge.chipManual')}</span>`;
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
     return `<div class="edge-item">${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span> ${chip}${cond}</div>`;
   };
@@ -338,4 +563,4 @@ async function renderDetail(id) {
           outE.map((e) => item(e, 'out')).join('')
         : '') || `<div class="empty">${t('empty.noEdges')}</div>`;
 }
-export { loadStats, loadTree, renderTree, buildTreeNode, runSearch, renderDetail };
+export { loadStats, loadTree, loadVars, renderTree, buildTreeNode, runSearch, renderDetail };

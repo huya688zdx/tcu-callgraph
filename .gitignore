@@ -1,9 +1,13 @@
 # 依赖（Electron 二进制很大，不入库）
 node_modules/
 
-# 运行时产物：只保留用户的标注与手动布局
+# 运行时产物（含用户标注与手动布局，属于本地状态，不入库）
 out/*
-!out/overlay.json
+
+# 生成脚本产物
+samples/large/
+layout-preview.svg
+/*.png
 
 # 工具数据
 .workbuddy-ai/

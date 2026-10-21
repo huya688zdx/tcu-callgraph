@@ -9,8 +9,8 @@ import { hooks } from './lib/hooks.js';
 import { fit } from './lib/camera.js';
 import { draw, resize } from './lib/render.js';
 import { fullReroute } from './lib/geometry.js';
-import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { history, pushHistory, undo, redo, savePositionsOnly } from './lib/history.js';
+import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { buildSVG, download } from './lib/svg.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
@@ -22,8 +22,20 @@ import { clearDataflow } from './lib/df.js';
  */
 let viewSeq = 0;
 
-async function loadView(rootId) {
+/** 视图跳转历史（双击下钻 / 树里勾选 / 搜索结果），Ctrl+Z 逐级回退 */
+const navStack = [];
+const NAV_MAX = 30;
+
+async function loadView(rootId, opts = {}) {
+  const { nav = true } = opts;
+  // 记录跳转前的入口与视角，供 Ctrl+Z 回退
+  if (nav && state.view && state.roots.length) {
+    navStack.push({ roots: [...state.roots], cam: { x: cam.x, y: cam.y, k: cam.k } });
+    if (navStack.length > NAV_MAX) navStack.shift();
+  }
   const seq = ++viewSeq;
+  // 固定布局：先把当前所有节点坐标落盘，服务端据此把已有节点钉在原位
+  if (state.fixed && state.view) await savePositionsOnly();
   clearDataflow(false); // 换视图时旧的叠加层不再适用
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const data = await api.view({
@@ -32,6 +44,9 @@ async function loadView(rootId) {
     down: state.down,
     group: state.group,
     optimal: state.optimal,
+    fixed: state.fixed,
+    vars: [...state.vars],
+    hiddenVars: [...state.hiddenVars],
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   state.view = data;
@@ -48,6 +63,7 @@ async function loadView(rootId) {
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';
   syncTreeSelection(state.roots);
+  renderVars();
   fit();
   renderDetail(null);
   history.stack = [];
@@ -59,14 +75,38 @@ async function loadView(rootId) {
 hooks.loadView = loadView;
 hooks.renderDetail = renderDetail;
 
+// 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
+hooks.toggleVar = (id, on) => {
+  if (on) {
+    state.vars.add(id);
+    state.hiddenVars.delete(id);
+  } else {
+    state.vars.delete(id);
+    state.hiddenVars.add(id);
+  }
+  reloadKeepCam();
+};
+
 async function postDelete(body) {
   await api.del(body);
+}
+
+/** 回退到上一个视图（入口 + 视角一起还原） */
+async function navigateBack() {
+  const prev = navStack.pop();
+  if (!prev) return false;
+  await loadView(prev.roots.length ? prev.roots : null, { nav: false });
+  cam.x = prev.cam.x;
+  cam.y = prev.cam.y;
+  cam.k = prev.cam.k;
+  draw();
+  return true;
 }
 
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
 async function reloadKeepCam() {
   const before = { x: cam.x, y: cam.y, k: cam.k };
-  await loadView(state.roots.length ? state.roots : state.root);
+  await loadView(state.roots.length ? state.roots : state.root, { nav: false });
   cam.x = before.x;
   cam.y = before.y;
   cam.k = before.k;
@@ -96,7 +136,8 @@ async function deleteSelection() {
   }
 
   await postDelete(body);
-  deleteStack.push({ ...body, at: Date.now() });
+  // 记下删除时所在的入口集合：换视图后不能拿这条记录去恢复（见 canRestoreDelete）
+  deleteStack.push({ ...body, roots: state.roots.join('+'), at: Date.now() });
   if (deleteStack.length > 30) deleteStack.shift();
 
   state.selected = null;
@@ -118,6 +159,18 @@ async function restoreLastDelete() {
   return true;
 }
 
+/**
+ * 栈顶删除记录是否还能在当前视图里恢复。
+ * 删除记录是跨视图共享的（切视图不清栈），所以必须校验入口集合一致，
+ * 否则在 A 视图删了东西、下钻到 B 视图按 Ctrl+Z，会把 A 的删除恢复进 B。
+ */
+function canRestoreDelete() {
+  const rec = deleteStack[deleteStack.length - 1];
+  if (!rec) return false;
+  if (rec.roots !== state.roots.join('+')) return false;
+  return Date.now() - rec.at < 20000;
+}
+
 document.getElementById('undoBtn')?.addEventListener('click', undo);
 document.getElementById('redoBtn')?.addEventListener('click', redo);
 
@@ -128,9 +181,14 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (e.shiftKey) {
       redo();
-    } else if (deleteStack.length && Date.now() - deleteStack[deleteStack.length - 1].at < 20000) {
+    } else if (canRestoreDelete()) {
       // 优先恢复刚删掉的函数 / 连线（20 秒内有效，可逐次回退）
       restoreLastDelete();
+    } else if (history.idx > 0) {
+      undo();
+    } else if (navStack.length) {
+      // 当前视图内已无可撤销的操作，退回上一次跳转（双击下钻 / 勾选函数）
+      navigateBack();
     } else {
       undo();
     }
@@ -163,13 +221,18 @@ els.groupMode.addEventListener('change', () => {
   state.selectedEdge = null;
   loadView(state.root);
 });
-els.optimalLayout.addEventListener('click', () => {
-  state.optimal = !state.optimal;
-  els.optimalLayout.textContent = t(state.optimal ? 'btn.optimal' : 'btn.manualLayout');
-  els.optimalLayout.setAttribute('aria-pressed', String(state.optimal));
-  els.optimalLayout.classList.toggle('primary', state.optimal);
+function applyLayoutMode() {
+  els.optimalLayout.textContent = t(state.fixed ? 'btn.fixed' : 'btn.auto');
+  els.optimalLayout.setAttribute('aria-pressed', String(state.fixed));
+  els.optimalLayout.classList.toggle('primary', state.fixed);
+}
+
+els.optimalLayout.addEventListener('click', async () => {
+  state.fixed = !state.fixed;
   state.selectedEdge = null;
-  loadView(state.root);
+  applyLayoutMode();
+  if (state.fixed) await savePositionsOnly(); // 切到固定：先把当前布局钉住
+  loadView(state.roots.length ? state.roots : state.root);
 });
 els.fit.addEventListener('click', fit);
 
@@ -213,13 +276,12 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
-els.optimalLayout.textContent = t('btn.optimal');
-els.optimalLayout.setAttribute('aria-pressed', 'true');
-els.optimalLayout.classList.add('primary');
+applyLayoutMode();
 window.addEventListener('resize', resize);
 resize();
 loadStats();
 loadTree();
+loadVars();
 loadView(new URLSearchParams(location.search).get('root'));
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）

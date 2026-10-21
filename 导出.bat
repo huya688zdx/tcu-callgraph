@@ -2,11 +2,15 @@
 setlocal
 pushd "%~dp0"
 
-if not exist "node_modules\electron\dist\electron.exe" (
+where node >nul 2>nul
+if errorlevel 1 (
     echo.
-    echo   [ERROR] Node.js is required for CLI export.
-    echo   Run: node src\cli\export.js "TARGET" out
+    echo   [ERROR] Node.js not found in PATH.
+    echo   Install Node.js 22+ and run this file again.
     echo.
+    pause
+    popd
+    exit /b 1
 )
 
 if "%~1"=="" (
@@ -14,9 +18,18 @@ if "%~1"=="" (
 ) else (
     node src\cli\export.js "%~1" out
 )
+set "rc=%errorlevel%"
+
+if not "%rc%"=="0" (
+    echo.
+    echo   [ERROR] Export failed with exit code %rc%.
+    pause
+    popd
+    exit /b %rc%
+)
 
 echo.
 echo   Output folder: out\
 pause
 popd
-endlocal
+endlocal & exit /b %rc%

@@ -21,6 +21,8 @@ function validate(laid, label) {
   const reasons = [];
 
   for (const e of laid.edges) {
+    // 数据流边（kind:'var'）不是调用边，本来就不参与布线，不算「丢边」
+    if (e.kind === 'var') continue;
     const pts = e.points;
     if (!pts || pts.length < 2) {
       noPts++;
@@ -132,3 +134,4 @@ for (const fn of model.functions) {
 }
 
 console.log('\n==== 总体: ' + (allOk ? 'PASS' : 'FAIL') + ' ====');
+process.exitCode = allOk ? 0 : 1;

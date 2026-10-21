@@ -3,12 +3,18 @@
   "version": "0.2.0",
   "description": "汽车变速箱 TCU 的 C 语言调用关系流程图工具",
   "type": "module",
+  "private": true,
   "main": "electron/main.cjs",
+  "engines": {
+    "node": ">=22.12"
+  },
   "scripts": {
+    "start": "npm run app",
     "app": "electron .",
     "serve": "node src/server.js",
     "scan": "node src/cli/scan.js",
-    "export": "node src/cli/export.js"
+    "export": "node src/cli/export.js",
+    "test": "node --test test/*.test.js"
   },
   "license": "MIT",
   "devDependencies": {

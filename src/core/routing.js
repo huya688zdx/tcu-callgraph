@@ -55,10 +55,18 @@ export function nearestSide(n, p) {
   return dy > 0 ? 'bottom' : 'top';
 }
 
-/** 水平线段 y，从 x1 到 x2 是否撞到节点（clear 间隙） */
-function hLineBlocked(y, x1, x2, nodes, skip, clear = CLEAR) {
-  const lo = Math.min(x1, x2);
-  const hi = Math.max(x1, x2);
+/**
+ * 水平线段是否撞到节点（clear 间隙）。
+ * 线段用对象 {y, x1, x2} 传入：位置参数 (y, x1, x2) 与 (x, y, …) 太像，曾经被写反过。
+ * @param {{y:number,x1:number,x2:number}} seg
+ * @param {Array} nodes
+ * @param {Set<string>} [skip] 需要忽略的节点 id（如两端节点自身）
+ * @param {number} [clear]
+ */
+function hLineBlocked(seg, nodes, skip, clear = CLEAR) {
+  const { y } = seg;
+  const lo = Math.min(seg.x1, seg.x2);
+  const hi = Math.max(seg.x1, seg.x2);
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (skip && skip.has(n.id)) continue;
@@ -69,10 +77,17 @@ function hLineBlocked(y, x1, x2, nodes, skip, clear = CLEAR) {
   return false;
 }
 
-/** 垂直线段 x，从 y1 到 y2 是否撞到节点 */
-function vLineBlocked(x, y1, y2, nodes, skip, clear = CLEAR) {
-  const lo = Math.min(y1, y2);
-  const hi = Math.max(y1, y2);
+/**
+ * 垂直线段是否撞到节点。
+ * @param {{x:number,y1:number,y2:number}} seg
+ * @param {Array} nodes
+ * @param {Set<string>} [skip]
+ * @param {number} [clear]
+ */
+function vLineBlocked(seg, nodes, skip, clear = CLEAR) {
+  const { x } = seg;
+  const lo = Math.min(seg.y1, seg.y2);
+  const hi = Math.max(seg.y1, seg.y2);
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (skip && skip.has(n.id)) continue;
@@ -81,6 +96,69 @@ function vLineBlocked(x, y1, y2, nodes, skip, clear = CLEAR) {
     }
   }
   return false;
+}
+
+/**
+ * 折线是否穿过节点「内部」（贴着边界或落在端口点不算）。
+ * pathBlockedByNodes 会跳过两端节点，因此端点自身被穿过时查不出来；这里补上。
+ */
+function pathCrossesBody(points, n, eps = 0.5) {
+  if (!points || points.length < 2) return false;
+  const x0 = n.x + eps;
+  const x1 = n.x + n.w - eps;
+  const y0 = n.y + eps;
+  const y1 = n.y + n.h - eps;
+  if (x1 <= x0 || y1 <= y0) return false;
+  for (let i = 0; i < points.length - 1; i++) {
+    const [ax, ay] = points[i];
+    const [bx, by] = points[i + 1];
+    if (Math.abs(ay - by) < 0.5) {
+      if (ay > y0 && ay < y1 && Math.max(ax, bx) > x0 && Math.min(ax, bx) < x1) return true;
+    } else if (Math.abs(ax - bx) < 0.5) {
+      if (ax > x0 && ax < x1 && Math.max(ay, by) > y0 && Math.min(ay, by) < y1) return true;
+    }
+  }
+  return false;
+}
+
+/** 折线是否穿过了自己的两个端点（源/目标本体） */
+function crossesEndpoints(points, a, b) {
+  if (pathCrossesBody(points, a)) return true;
+  return b !== a && pathCrossesBody(points, b);
+}
+
+/** 节点包络内的「行间空隙」中线（相邻两排之间的空档），供外绕时当备用通道 */
+function buildGaps(nodes, axis) {
+  const bands = nodes
+    .map((n) => (axis === 'y' ? [n.y, n.y + n.h] : [n.x, n.x + n.w]))
+    .sort((u, v) => u[0] - v[0]);
+  const gaps = [];
+  let end = null;
+  for (const [lo, hi] of bands) {
+    if (end !== null && lo - end > SPACING * 2) gaps.push((lo + end) / 2);
+    if (end === null || hi > end) end = hi;
+  }
+  return gaps;
+}
+
+/** 取离 center 最近的至多 limit 个空隙（按距离排序，确定性） */
+function nearestGaps(gaps, center, limit) {
+  if (!gaps || !gaps.length) return [];
+  let lo = 0;
+  let hi = gaps.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (gaps[m] < center) lo = m + 1;
+    else hi = m;
+  }
+  const out = [];
+  let i = lo - 1;
+  let j = lo;
+  while (out.length < limit && (i >= 0 || j < gaps.length)) {
+    if (j >= gaps.length || (i >= 0 && center - gaps[i] <= gaps[j] - center)) out.push(gaps[i--]);
+    else out.push(gaps[j++]);
+  }
+  return out;
 }
 
 /** 节点矩形（扩 clear）与点是否相交 */
@@ -147,7 +225,7 @@ function findFreeH(prefer, lo, hi, x1, x2, nodes, skip, placed) {
   const ok = (y) =>
     y >= lo - 4 &&
     y <= hi + 4 &&
-    !hLineBlocked(y, x1, x2, nodes, skip) &&
+    !hLineBlocked({ y, x1, x2 }, nodes, skip) &&
     !hitsH(placed, y, Math.min(x1, x2), Math.max(x1, x2));
   const cands = [];
   if (Number.isFinite(prefer)) cands.push(prefer);
@@ -165,7 +243,7 @@ function findFreeV(prefer, lo, hi, y1, y2, nodes, skip, placed) {
   const ok = (x) =>
     x >= lo - 4 &&
     x <= hi + 4 &&
-    !vLineBlocked(x, y1, y2, nodes, skip) &&
+    !vLineBlocked({ x, y1, y2 }, nodes, skip) &&
     !hitsV(placed, x, Math.min(y1, y2), Math.max(y1, y2));
   const cands = [];
   if (Number.isFinite(prefer)) cands.push(prefer);
@@ -187,8 +265,8 @@ function vEscape(x, yA, yB, nodes, skip, jogY = null, jogX = null) {
     if (x <= n.x - CLEAR || x >= n.x + n.w + CLEAR) continue;
     if (Math.min(yA, yB) >= n.y + n.h + CLEAR || Math.max(yA, yB) <= n.y - CLEAR) continue;
     for (const c of [n.x - CLEAR - 0.5, n.x + n.w + CLEAR + 0.5]) {
-      if (vLineBlocked(c, yA, yB, nodes, skip)) continue;
-      if (jogY !== null && hLineBlocked(jogY, c, jogX, nodes, skip)) continue;
+      if (vLineBlocked({ x: c, y1: yA, y2: yB }, nodes, skip)) continue;
+      if (jogY !== null && hLineBlocked({ y: jogY, x1: c, x2: jogX }, nodes, skip)) continue;
       if (best === null || Math.abs(c - x) < Math.abs(best - x)) best = c;
     }
   }
@@ -202,8 +280,8 @@ function hEscape(y, xA, xB, nodes, skip, jogX = null, jogY = null) {
     if (y <= n.y - CLEAR || y >= n.y + n.h + CLEAR) continue;
     if (Math.min(xA, xB) >= n.x + n.w + CLEAR || Math.max(xA, xB) <= n.x - CLEAR) continue;
     for (const c of [n.y - CLEAR - 0.5, n.y + n.h + CLEAR + 0.5]) {
-      if (hLineBlocked(c, xA, xB, nodes, skip)) continue;
-      if (jogX !== null && vLineBlocked(jogX, c, jogY, nodes, skip)) continue;
+      if (hLineBlocked({ y: c, x1: xA, x2: xB }, nodes, skip)) continue;
+      if (jogX !== null && vLineBlocked({ x: jogX, y1: c, y2: jogY }, nodes, skip)) continue;
       if (best === null || Math.abs(c - y) < Math.abs(best - y)) best = c;
     }
   }
@@ -215,15 +293,18 @@ export function pathBlockedByNodes(points, nodes, skip) {
     const [x1, y1] = points[i];
     const [x2, y2] = points[i + 1];
     if (Math.abs(y1 - y2) < 0.5) {
-      if (hLineBlocked(y1, x1, x2, nodes, skip)) return true;
+      if (hLineBlocked({ y: y1, x1, x2 }, nodes, skip)) return true;
     } else if (Math.abs(x1 - x2) < 0.5) {
-      if (vLineBlocked(x1, y1, y2, nodes, skip)) return true;
+      if (vLineBlocked({ x: x1, y1, y2 }, nodes, skip)) return true;
     } else return true;
   }
   return false;
 }
 
-/** 找一条避开所有非端点节点的正交外绕路径。 */
+/**
+ * 找一条避开所有节点、且不穿过两端节点本体的正交外绕路径。
+ * 车道按端口法向过滤：朝右出线的端口不允许选左侧车道，否则横段会从节点里穿过去。
+ */
 function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixedFromSide, fixedToSide) {
   const sideOrder = (fixed, preferred) => {
     if (SIDES.has(fixed)) return [fixed];
@@ -236,24 +317,38 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixed
   const maxX = Math.max(...ctx.nodes.map((n) => n.x + n.w)) + CLEAR + SPACING;
   const minY = Math.min(...ctx.nodes.map((n) => n.y)) - CLEAR - SPACING;
   const maxY = Math.max(...ctx.nodes.map((n) => n.y + n.h)) + CLEAR + SPACING;
-  const laneXs = [minX, minX - SPACING * 2, maxX, maxX + SPACING * 2];
-  const laneYs = [minY, minY - SPACING * 2, maxY, maxY + SPACING * 2];
+  // 图外车道之外，再补几条节点包络内部的行间/列间空隙（拥挤文件框里图外车道常被挡死）
+  if (!ctx.rowGaps) ctx.rowGaps = buildGaps(ctx.nodes, 'y');
+  if (!ctx.colGaps) ctx.colGaps = buildGaps(ctx.nodes, 'x');
+  const midX = (a.x + a.w / 2 + b.x + b.w / 2) / 2;
+  const midY = (a.y + a.h / 2 + b.y + b.h / 2) / 2;
+  const laneXs = [minX, minX - SPACING * 2, maxX, maxX + SPACING * 2, ...nearestGaps(ctx.colGaps, midX, 4)];
+  const laneYs = [minY, minY - SPACING * 2, maxY, maxY + SPACING * 2, ...nearestGaps(ctx.rowGaps, midY, 4)];
+  // 车道必须在端口法向的同一侧，否则连接段会折回节点内部
+  const away = (lane, from, dir) => dir === 0 || (lane - from) * dir >= -0.5;
   for (const sa of fromSides) {
     for (const sb of toSides) {
       const p0 = portAt(a, sa, sa === fromSide && fromPoint ? sideFrac(a, sa, fromPoint) : 0.5);
       const p1 = portAt(b, sb, sb === toSide && toPoint ? sideFrac(b, sb, toPoint) : 0.5);
       const s0 = [p0[0] + DIR[sa][0] * STUB, p0[1] + DIR[sa][1] * STUB];
       const s1 = [p1[0] + DIR[sb][0] * STUB, p1[1] + DIR[sb][1] * STUB];
+      // 引出线：贴边不算穿框，但拐进本体要拒绝；其它节点照常避让
+      if (pathCrossesBody([p0, s0], a) || pathCrossesBody([s1, p1], b)) continue;
+      if (pathBlockedByNodes([p0, s0], ctx.nodes, skip)) continue;
+      if (pathBlockedByNodes([s1, p1], ctx.nodes, skip)) continue;
       const candidates = [];
       let best = null;
       for (const y of laneYs) {
+        if (!away(y, s0[1], DIR[sa][1]) || !away(y, s1[1], DIR[sb][1])) continue;
         candidates.push(collapse([p0, s0, [s0[0], y], [s1[0], y], s1, p1]));
       }
       for (const x of laneXs) {
+        if (!away(x, s0[0], DIR[sa][0]) || !away(x, s1[0], DIR[sb][0])) continue;
         candidates.push(collapse([p0, s0, [x, s0[1]], [x, s1[1]], s1, p1]));
       }
       for (const points of candidates) {
         if (pathBlockedByNodes(points, ctx.nodes, skip)) continue;
+        if (crossesEndpoints(points, a, b)) continue;
         const length = points.slice(1).reduce((sum, p, i) =>
           sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
         const score = length + points.length * 6;
@@ -474,7 +569,7 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
     skip,
     ctx.placed
   );
-  if (hLineBlocked(cy, Math.min(p0[0], p1[0]), Math.max(p0[0], p1[0]), nodes, skip)) {
+  if (hLineBlocked({ y: cy, x1: Math.min(p0[0], p1[0]), x2: Math.max(p0[0], p1[0]) }, nodes, skip)) {
     // 节点间通道被占时走长边路由，让它从节点外侧绕行。
     return routeOuterColumn(p0, p1, a, b, sa, sb, ctx) || routeLong(e, a, b, sa, sb, ctx);
   }
@@ -484,7 +579,7 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
   let sx;
   if (Math.abs(p0[1] - cy) < 0.5) {
     sx = p0[0];
-  } else if (!vLineBlocked(p0[0], p0[1], cy, nodes, skip)) {
+  } else if (!vLineBlocked({ x: p0[0], y1: p0[1], y2: cy }, nodes, skip)) {
     pts.push([p0[0], cy]);
     sx = p0[0];
   } else {
@@ -503,7 +598,7 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
   let tx;
   if (Math.abs(p1[1] - cy) < 0.5) {
     tx = p1[0];
-  } else if (!vLineBlocked(p1[0], cy, p1[1], nodes, skip)) {
+  } else if (!vLineBlocked({ x: p1[0], y1: cy, y2: p1[1] }, nodes, skip)) {
     tpts.push([p1[0], cy]);
     tx = p1[0];
   } else {
@@ -519,8 +614,9 @@ function routeDirectV(e, a, b, sa, sb, ctx) {
 
   addH(ctx.placed, cy, sx, tx);
   const points = collapse(pts.concat([[tx, cy]], tpts.reverse()));
-  if (pathBlockedByNodes(points, nodes, skip)) {
-    return routeOuterColumn(p0, p1, a, b, sa, sb, ctx) || points;
+  // skip 含两端节点，vEscape 折回本体时查不出来，这里单独判一次
+  if (pathBlockedByNodes(points, nodes, skip) || crossesEndpoints(points, a, b)) {
+    return routeOuterColumn(p0, p1, a, b, sa, sb, ctx) || routeLong(e, a, b, sa, sb, ctx);
   }
   return points;
 }
@@ -562,8 +658,8 @@ function routeBus(list, ctx, dir) {
     const p0 = it.e._p0;
     const p1 = it.e._p1;
     const branchSkip = new Set([it.a.id, it.b.id]);
-    if (vLineBlocked(p0[0], p0[1], busY, nodes, branchSkip)) return false;
-    if (vLineBlocked(p1[0], busY, p1[1], nodes, branchSkip)) return false;
+    if (vLineBlocked({ x: p0[0], y1: p0[1], y2: busY }, nodes, branchSkip)) return false;
+    if (vLineBlocked({ x: p1[0], y1: busY, y2: p1[1] }, nodes, branchSkip)) return false;
   }
 
   addH(ctx.placed, busY, x1, x2);
@@ -604,8 +700,8 @@ function routeBusH(list, ctx, dir) {
     const p0 = it.e._p0;
     const p1 = it.e._p1;
     const branchSkip = new Set([it.a.id, it.b.id]);
-    if (hLineBlocked(p0[1], p0[0], busX, nodes, branchSkip)) return false;
-    if (hLineBlocked(p1[1], busX, p1[0], nodes, branchSkip)) return false;
+    if (hLineBlocked({ y: p0[1], x1: p0[0], x2: busX }, nodes, branchSkip)) return false;
+    if (hLineBlocked({ y: p1[1], x1: busX, x2: p1[0] }, nodes, branchSkip)) return false;
   }
 
   addV(ctx.placed, busX, y1, y2);
@@ -644,13 +740,13 @@ function routeFanoutBus(list, ctx) {
     const hi = yDir < 0 ? prefer : prefer + 240;
     const skipAll = new Set([source.id, ...list.map((it) => it.b.id)]);
     const busY = findFreeH(prefer, lo, hi, x1, x2, ctx.nodes, skipAll, ctx.placed);
-    if (!Number.isFinite(busY) || hLineBlocked(busY, x1, x2, ctx.nodes, new Set())) continue;
-    if (vLineBlocked(p0[0], p0[1], busY, ctx.nodes, new Set([source.id]))) continue;
+    if (!Number.isFinite(busY) || hLineBlocked({ y: busY, x1, x2 }, ctx.nodes, new Set())) continue;
+    if (vLineBlocked({ x: p0[0], y1: p0[1], y2: busY }, ctx.nodes, new Set([source.id]))) continue;
     let clear = true;
     let length = x2 - x1 + Math.abs(p0[1] - busY);
     for (let i = 0; i < list.length; i++) {
       const p1 = targetPorts[i];
-      if (vLineBlocked(p1[0], busY, p1[1], ctx.nodes, new Set([list[i].b.id]))) {
+      if (vLineBlocked({ x: p1[0], y1: busY, y2: p1[1] }, ctx.nodes, new Set([list[i].b.id]))) {
         clear = false;
         break;
       }
@@ -708,7 +804,7 @@ function routeDirectH(e, a, b, sa, sb, ctx) {
   );
   const pts = [[p0[0], p0[1]]];
   let sy;
-  if (!hLineBlocked(p0[0], p0[1], cx, nodes, skip)) {
+  if (!hLineBlocked({ y: p0[1], x1: p0[0], x2: cx }, nodes, skip)) {
     pts.push([cx, p0[1]]);
     sy = p0[1];
   } else {
@@ -724,7 +820,7 @@ function routeDirectH(e, a, b, sa, sb, ctx) {
 
   const tpts = [[p1[0], p1[1]]];
   let ty;
-  if (!hLineBlocked(cx, p1[1], p1[0], nodes, skip)) {
+  if (!hLineBlocked({ y: p1[1], x1: cx, x2: p1[0] }, nodes, skip)) {
     tpts.push([cx, p1[1]]);
     ty = p1[1];
   } else {
@@ -740,7 +836,8 @@ function routeDirectH(e, a, b, sa, sb, ctx) {
 
   addV(ctx.placed, cx, sy, ty);
   const points = collapse(pts.concat([[cx, ty]], tpts.reverse()));
-  if (pathBlockedByNodes(points, nodes, skip)) {
+  // skip 含两端节点，hEscape 折回本体时查不出来，这里单独判一次
+  if (pathBlockedByNodes(points, nodes, skip) || crossesEndpoints(points, a, b)) {
     return routeOuterLane(p0, p1, a, b, sa, sb, ctx) || points;
   }
   return points;
@@ -771,7 +868,7 @@ function routeMixedVH(e, a, b, sa, sb, ctx) {
   );
 
   let vx = xq;
-  if (vLineBlocked(xq, my, p1[1], nodes, skip)) {
+  if (vLineBlocked({ x: xq, y1: my, y2: p1[1] }, nodes, skip)) {
     const esc = vEscape(xq, my, p1[1], nodes, skip);
     if (esc !== null) vx = esc;
   }
@@ -802,7 +899,7 @@ function routeMixedHV(e, a, b, sa, sb, ctx) {
   );
 
   let vy = yq;
-  if (hLineBlocked(p1[0], mx, yq, nodes, skip)) {
+  if (hLineBlocked({ y: yq, x1: mx, x2: p1[0] }, nodes, skip)) {
     const esc = hEscape(yq, mx, p1[0], nodes, skip);
     if (esc !== null) vy = esc;
   }
@@ -857,7 +954,7 @@ function routeLong(e, a, b, sa, sb, ctx) {
   cands.sort((u, v) => Math.abs(u - midX) - Math.abs(v - midX));
   let vx = null;
   for (const c of cands) {
-    if (!vLineBlocked(c, yTop, yBot, nodes, skip)) {
+    if (!vLineBlocked({ x: c, y1: yTop, y2: yBot }, nodes, skip)) {
       vx = c;
       break;
     }
@@ -1012,6 +1109,8 @@ export function routeEdges(nodes, edges, opts = {}) {
     laneLeftMin: null,
     laneRightMax: null,
     selfLoops: 0,
+    rowGaps: null,
+    colGaps: null,
   };
   // existing 需按 k 排序以便二分
   ctx.placed.h.sort((u, v) => u.k - v.k);
@@ -1023,10 +1122,13 @@ export function routeEdges(nodes, edges, opts = {}) {
     const a = nodeMap.get(e.from);
     const b = nodeMap.get(e.to);
     if (!a || !b) continue;
+    e.blocked = false;
     if (a === b) {
       e.points = routeSelf(e, a, ctx);
-      if (pathBlockedByNodes(e.points, nodes, new Set([a.id]))) {
-        e.points = routeAroundNodes(a, b, 'bottom', 'top', ctx, e.points[0], e.points.at(-1)) || [];
+      if (pathBlockedByNodes(e.points, nodes, new Set([a.id])) || pathCrossesBody(e.points, a)) {
+        const alt = routeAroundNodes(a, b, 'bottom', 'top', ctx, e.points[0], e.points.at(-1));
+        if (alt && !pathCrossesBody(alt, a)) e.points = alt;
+        else e.blocked = true; // 找不到安全绕行就保留原折线并标记，别把边丢掉
       }
       e.back = true;
       continue;
@@ -1034,7 +1136,7 @@ export function routeEdges(nodes, edges, opts = {}) {
     if (e.custom && Array.isArray(e.points) && e.points.length >= 2) {
       const { sa, sb } = retargetCustom(e, a, b);
       e.back = false;
-      if (!pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id]))) continue;
+      if (!pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id])) && !crossesEndpoints(e.points, a, b)) continue;
 
       // 自定义折线与函数框冲突时改用安全自动路由；保留 custom 标记供用户继续编辑。
       e.custom = false;
@@ -1134,11 +1236,13 @@ export function routeEdges(nodes, edges, opts = {}) {
     }
   }
 
-  // 所有自动/母线路由再统一校验一次。启发式无路可走时尝试图外安全通道，
-  // 找不到合法路径就隐藏该边，不能退回穿过函数框的折线。
+  // 所有自动/母线路由再统一校验一次：撞到别的节点、或从两端节点本体里穿过去都不允许。
+  // 找不到合法路径时保留原折线并打 blocked 标记（前端画警示样式），不再静默丢边。
   for (const it of items) {
-    if (!pathBlockedByNodes(it.e.points || [], nodes, new Set([it.a.id, it.b.id]))) continue;
-    it.e.points = routeAroundNodes(
+    const skip = new Set([it.a.id, it.b.id]);
+    const cur = it.e.points || [];
+    if (!pathBlockedByNodes(cur, nodes, skip) && !crossesEndpoints(cur, it.a, it.b)) continue;
+    const alt = routeAroundNodes(
       it.a,
       it.b,
       it.sa,
@@ -1148,13 +1252,21 @@ export function routeEdges(nodes, edges, opts = {}) {
       it.e._p1,
       SIDES.has(it.e.fromSide) ? it.e.fromSide : null,
       SIDES.has(it.e.toSide) ? it.e.toSide : null
-    ) || [];
+    );
+    if (alt && !crossesEndpoints(alt, it.a, it.b)) {
+      it.e.points = alt;
+    } else {
+      it.e.blocked = true;
+    }
   }
 
   // 重复边直接复用首条折线（展示上完全重合 = 合并为一条线）
   for (const it of pairDups) {
     const f = pairFirst.get(pairKey(it.e));
-    if (f && f.e.points) it.e.points = f.e.points.map((p) => [p[0], p[1]]);
+    if (f && f.e.points) {
+      it.e.points = f.e.points.map((p) => [p[0], p[1]]);
+      it.e.blocked = !!f.e.blocked;
+    }
   }
 
   for (const e of restoreCustom) e.custom = true;

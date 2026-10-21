@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 内容安全策略：源码里的函数名/文件名会进 DOM，禁掉内联脚本与外链加载，
+     避免被扫描的 C 工程内容成为注入入口 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
 <title data-i18n="app.title">TCU 调用关系图</title>
 <style>
   * { box-sizing: border-box; }
@@ -108,6 +111,51 @@
     border-radius: 5px; cursor: pointer; white-space: nowrap;
   }
   .tn:hover { background: #F1EFE8; }
+  .tn.hl { background: #FDF0C8; box-shadow: inset 0 0 0 1px #EFC35A; border-radius: 4px; }
+  #vars { max-height: 260px; overflow-y: auto; overflow-x: hidden; margin: -2px -2px 0; padding: 0 2px; }
+  .vars-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 4px; }
+  .vars-bar input {
+    flex: 1 1 auto; min-width: 0; height: 22px; padding: 0 6px;
+    border: 1px solid #E4E1D8; border-radius: 5px; background: #FBFAF6;
+    font: inherit; font-size: 11.5px; color: #2C2C2A;
+  }
+  .vars-bar input:focus { outline: none; border-color: #B5D4F4; background: #fff; }
+  .vars-cnt { flex: 0 0 auto; color: #B4B2A9; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .var-row {
+    display: grid;
+    grid-template-columns: 13px minmax(0, 1.15fr) auto minmax(0, 1fr) 32px;
+    align-items: center;
+    column-gap: 5px;
+    padding: 1px 2px;
+    font-size: 11.5px;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 17px;
+  }
+  .var-row:hover { background: #F5F3EC; }
+  .var-row input { margin: 0; width: 12px; height: 12px; cursor: pointer; }
+  .var-row .vn {
+    color: #2C2C2A; font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .var-row .vt { color: #B4B2A9; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .var-row .vc { color: #888780; font-size: 10px; text-align: right; font-variant-numeric: tabular-nums; }
+  .var-row .vg {
+    padding: 0 3px; border-radius: 3px; background: #EFEDE7; color: #888780;
+    font-size: 9px; line-height: 14px; letter-spacing: .02em;
+  }
+  .var-file {
+    position: sticky; top: 0; z-index: 1;
+    display: flex; align-items: center; gap: 4px;
+    overflow: hidden;
+    margin: 3px 0 1px; padding: 2px 2px;
+    background: #fff; color: #888780; font-size: 10.5px;
+    cursor: pointer; user-select: none;
+  }
+  .var-file:hover { color: #2C2C2A; }
+  .var-file .tw { width: 9px; font-size: 7px; color: #A8A69C; line-height: 1; }
+  .var-file .cnt { margin-left: auto; color: #C9C6BC; font-size: 10px; flex: 0 0 auto; }
+  .var-file .fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tn .tw { width: 12px; flex: 0 0 12px; color: #888780; font-size: 10px; text-align: center; }
   .tn .nm { overflow: hidden; text-overflow: ellipsis; }
   .tn.fn .nm { color: #5F5E5A; }
@@ -189,14 +237,14 @@
       <option value="2" data-i18n="depth.up2">向上 2 层</option>
     </select>
     <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
-    <button id="optimalLayout" class="primary" aria-pressed="true" data-i18n="btn.optimal">最优布局</button>
+    <button id="optimalLayout" class="primary" aria-pressed="true" title="固定布局：增删函数/变量时保持现有位置，只有放不下才调整" data-i18n="btn.fixed" data-i18n-title="btn.fixedTitle">固定布局</button>
     <button id="fit" data-i18n="btn.fit">适应</button>
-    <button id="undoBtn" title="撤回 (Ctrl+Z)" disabled>&#8630;</button>
-    <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" disabled>&#8631;</button>
+    <button id="undoBtn" title="撤回 (Ctrl+Z)" data-i18n-title="btn.undo" disabled>&#8630;</button>
+    <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
     <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
     <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
     <div class="spacer"></div>
-    <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击下钻 · 拖节点自动重布线 · 选中连线拖线段调整走向 · 双击连线恢复自动</span>
+    <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击函数下钻 · Ctrl+Z 回退视图 · 拖节点自动重布线 · 双击连线恢复自动</span>
     <button id="exportSvg" data-i18n="btn.svg">导出 SVG</button>
     <button id="exportPng" data-i18n="btn.png">PNG</button>
     <button id="exportHtml" data-i18n="btn.html">HTML</button>
@@ -205,9 +253,9 @@
 
   <aside id="left">
     <div class="sec tree-sec">
-      <h3>文件</h3>
+      <h3 data-i18n="panel.files">文件</h3>
       <ul id="results" class="results-list"></ul>
-      <div id="tree"><div class="empty">加载中…</div></div>
+      <div id="tree"><div class="empty" data-i18n="tree.loading">加载中…</div></div>
     </div>
     <div class="sec">
       <h3 data-i18n="panel.overview">工程概览</h3>
@@ -230,11 +278,15 @@
   </main>
 
   <aside id="right">
-    <div class="sec">
+    <div class="sec" id="secDetail">
       <h3 data-i18n="panel.detail">节点详情</h3>
       <div id="detail"><div class="empty" data-i18n="empty.detail">点击图中节点查看详情</div></div>
     </div>
     <div class="sec">
+      <h3 data-i18n="panel.vars">全局变量 / 常量</h3>
+      <div id="vars"><div class="empty" data-i18n="empty.vars">当前视图里没有全局变量</div></div>
+    </div>
+    <div class="sec" id="secEdges">
       <h3 data-i18n="panel.edges">调用关系</h3>
       <div id="edges"><div class="empty" data-i18n="empty.edges">—</div></div>
     </div>

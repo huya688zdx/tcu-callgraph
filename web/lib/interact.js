@@ -9,13 +9,12 @@ import {
   moveNodeNoOverlap,
   rerouteScope,
   fullReroute,
-  liveReroute,
   edgePoints,
   distToSegment,
 } from './geometry.js';
 import { draw } from './render.js';
 import { stopCamAnim, focusBox } from './camera.js';
-import { pathBlockedByNodes } from '/core/routing.js';
+import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
   showNodeMenu,
@@ -25,9 +24,8 @@ import {
   EDGE_ITEMS,
 } from './menu.js';
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
-import { locateBox } from './locate.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
-import { renderDetail } from './panels.js';
+import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { hooks } from './hooks.js';
 import { nearestSide } from '/core/routing.js';
 function worldPos(e) {
@@ -149,6 +147,39 @@ function moveSeg(seg, x, y) {
 let justDragged = false;
 
 /**
+ * 拖拽节点时的重路由缓存。
+ * liveReroute 每帧都要 filter 一遍全表边、再 collectSegments 一遍其余边，
+ * 但这两个集合在一帧内是不变的，所以在 pointerdown 时算一次：
+ *   related  = 与该节点相连的边（每帧只重布这些）
+ *   segments = 其余边的线段（作为避让约束）
+ * 等价于 geometry.js 的 liveReroute(nodeId)，只是把 O(E) 的准备工作挪到了拖拽开始。
+ */
+let dragCache = null;
+
+/** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
+function resetDragState() {
+  state.dragNode = null;
+  state.dragEnd = null;
+  state.dragSeg = null;
+  state.dragStart = null;
+  state.panning = false;
+  state.dragMoved = false;
+  dragCache = null;
+  els.cv.classList.remove('panning', 'linking');
+  els.cv.style.cursor = '';
+}
+
+/** pointercancel / lostpointercapture：直接丢弃这次手势，不提交任何变更 */
+function cancelDrag() {
+  const active = state.dragNode || state.dragEnd || state.dragSeg || state.panning || state.linkFrom;
+  resetDragState();
+  state.linkFrom = null;
+  state.linkPos = null;
+  state.panMoved = false;
+  if (active) draw();
+}
+
+/**
  * 命中文件框 / 目录容器本体（不含函数节点）
  * 右键它们时要能「定位到当前文件 / 当前目录」——越靠里越优先
  */
@@ -176,13 +207,14 @@ els.cv.addEventListener('contextmenu', (e) => {
 
   const n = hitTest(e);
   if (n) {
+    selectNode(n.id);
     if (n.kind === 'var') {
-      // 变量没有变更分类，只做选中
-      selectNode(n.id);
-      hideMenu();
+      // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
+      showMenu(e.clientX, e.clientY, n.name || n.id, CHANGE_ITEMS, n.change || 'existing', (v) =>
+        setNodeChange(n, v)
+      );
       return;
     }
-    selectNode(n.id);
     showNodeMenu(e.clientX, e.clientY, n);
     return;
   }
@@ -201,6 +233,8 @@ els.cv.addEventListener('contextmenu', (e) => {
   // 文件框 / 目录容器：定位到当前文件或当前目录
   const box = hitBox(e);
   if (box) {
+    state.ctxBox = { kind: box.kind, id: box.box.id };
+    renderVars();
     const title = String(box.box.label || box.box.id || '');
     showMenuSections(
       e.clientX,
@@ -210,10 +244,15 @@ els.cv.addEventListener('contextmenu', (e) => {
         {
           id: 'locate',
           label: 'menu.locate',
-          items: [{ value: 'locate', label: box.kind === 'file' ? 'locate.file' : 'locate.dir' }],
+          items: [
+            {
+              value: 'locate',
+              label: box.kind === 'file' ? 'locate.treeFile' : 'locate.treeDir',
+            },
+          ],
         },
       ],
-      () => locateBox(box.kind, box.box.id, [])
+      () => revealInTree(box.kind, box.box.id)
     );
     return;
   }
@@ -224,6 +263,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   hideMenu();
   stopCamAnim();
+  resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
 
   const end = hitEnd(e);
   if (end) {
@@ -246,6 +286,11 @@ els.cv.addEventListener('pointerdown', (e) => {
   if (title) {
     focusBox(title.box);
     state.flash = { box: title.box, until: performance.now() + 1300, dur: 1300 };
+    // 点层级/文件标题 = 切换右侧变量面板的范围
+    state.ctxBox = { kind: title.kind === 'file' ? 'file' : 'dir', id: title.box.id };
+    state.selected = null;
+    renderDetail(null); // 收起节点详情 / 调用关系
+    renderVars();
     draw();
     return;
   }
@@ -264,6 +309,10 @@ els.cv.addEventListener('pointerdown', (e) => {
     state.dragNode = n;
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
     state.dragMoved = false;
+    // 拖拽期间每帧都要重布这些边：相关边与其他边线段只在这里算一次
+    const related = state.view.edges.filter((ed) => ed.from === n.id || ed.to === n.id);
+    const others = state.view.edges.filter((ed) => ed.from !== n.id && ed.to !== n.id);
+    dragCache = { related, segments: collectSegments(others) };
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
@@ -297,7 +346,10 @@ els.cv.addEventListener('pointermove', (e) => {
     const rawDy = (e.clientY - state.dragStart.y) / cam.k;
     moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
     if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
-    liveReroute(state.dragNode.id); // 相连的边实时避障重布
+    // 相连的边实时避障重布：用 pointerdown 时缓存的边集合与避让线段，不再每帧扫全表
+    if (dragCache) {
+      routeEdges(state.view.nodes, dragCache.related, { existing: dragCache.segments });
+    }
     draw();
     return;
   }
@@ -354,12 +406,19 @@ els.cv.addEventListener('pointermove', (e) => {
 });
 
 els.cv.addEventListener('pointerup', (e) => {
-  els.cv.classList.remove('panning', 'linking');
-  els.cv.style.cursor = '';
+  // 先把本次手势的拖拽态取成快照，再统一清理：后面的分支只依赖快照，
+  // 这样「清理」和「收尾」只有一处，pointercancel 也能复用同一套复位逻辑
+  const dragEnd = state.dragEnd;
+  const dragSeg = state.dragSeg;
+  const dragNode = state.dragNode;
+  const moved = state.dragMoved;
+  const linkFrom = state.linkFrom;
+  const panning = state.panning;
+  const panMoved = state.panMoved;
+  resetDragState();
 
-  if (state.dragEnd) {
-    const { edge, which, hover, pos } = state.dragEnd;
-    state.dragEnd = null;
+  if (dragEnd) {
+    const { edge, which, hover, pos } = dragEnd;
     if (hover) {
       if (which === 'from') {
         edge.from = hover.id;
@@ -378,24 +437,19 @@ els.cv.addEventListener('pointerup', (e) => {
     return;
   }
 
-  if (state.dragSeg) {
-    modifiedEdges.add(edgeKey(state.dragSeg.edge));
-    state.dragSeg = null;
+  if (dragSeg) {
+    modifiedEdges.add(edgeKey(dragSeg.edge));
     saveLayout();
     pushHistory();
     draw();
     return;
   }
 
-  if (state.dragNode) {
-    const n = state.dragNode;
-    const moved = state.dragMoved;
-    state.dragNode = null;
-    state.dragMoved = false;
+  if (dragNode) {
     if (moved) {
       justDragged = true;
       setTimeout(() => (justDragged = false), 260);
-      modifiedNodes.add(n.id);
+      modifiedNodes.add(dragNode.id);
       fullReroute(); // 松手后全量避障重布
       for (const ed of state.view.edges) {
         if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
@@ -403,25 +457,21 @@ els.cv.addEventListener('pointerup', (e) => {
       saveLayout();
       pushHistory();
     } else {
-      selectNode(n.id);
+      selectNode(dragNode.id);
     }
     draw();
     return;
   }
 
-  if (state.linkFrom) {
-    const from = state.linkFrom;
+  if (linkFrom) {
     const target = hitTest(e);
-    state.linkFrom = null;
-    state.linkPos = null;
-    if (target && target.id !== from.id) addManualEdge(from.id, target.id);
+    if (target && target.id !== linkFrom.id) addManualEdge(linkFrom.id, target.id);
     draw();
     return;
   }
 
-  if (state.panning) {
-    state.panning = false;
-    if (!state.panMoved) {
+  if (panning) {
+    if (!panMoved) {
       const edge = hitEdge(e);
       if (edge) {
         state.selectedEdge = edge;
@@ -437,10 +487,20 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 });
 
+// 系统手势 / 切窗口 / 指针捕获被抢走：浏览器发 pointercancel 或 lostpointercapture 而不会发 pointerup。
+// 不处理的话 state.dragNode 等会永久留着，回页面后鼠标一动节点就跟着跑。
+els.cv.addEventListener('pointercancel', cancelDrag);
+els.cv.addEventListener('lostpointercapture', cancelDrag);
+
 els.cv.addEventListener('dblclick', (e) => {
   if (justDragged) return;
   const n = hitTest(e);
   if (n) {
+    // 变量没有下游可下钻，双击只做选中，避免跳到一个空视图
+    if (n.kind === 'var') {
+      selectNode(n.id);
+      return;
+    }
     hooks.loadView(n.id);
     return;
   }

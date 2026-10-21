@@ -7,4 +7,6 @@ export const hooks = {
   loadView: () => {},
   /** 刷新右侧节点详情 */
   renderDetail: () => {},
+  /** 勾选 / 取消勾选一个全局变量 */
+  toggleVar: () => {},
 };

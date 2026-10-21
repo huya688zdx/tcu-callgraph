@@ -5,6 +5,23 @@
 import { t } from '../i18n.js';
 import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile } from './state.js';
 import { edgePoints } from './geometry.js';
+
+/**
+ * 下一帧重绘（去重）。
+ * flash 高亮的动画尾巴不能直接 requestAnimationFrame(() => draw())：
+ * draw() 在拖拽时每帧都会被调用，每次调用都新开一条 rAF 链，
+ * 1.3s 的高亮期内能叠出上百条并发全量重绘。这里保证同一时刻只有一条链。
+ */
+let rafPending = false;
+function scheduleDraw() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    draw();
+  });
+}
+
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   const w = els.cv.clientWidth;
@@ -52,6 +69,19 @@ function updateGroups() {
     g.w = maxX - minX + 28;
     g.h = maxY - minY + 48;
   }
+}
+
+/** 选中节点的邻接集合：每次 draw 算一遍，避免 drawNode 里对每个节点扫全表边（O(N×E) → O(N+E)） */
+function neighborSet() {
+  const v = state.view;
+  const sel = state.selected;
+  if (!v || !sel) return null;
+  const set = new Set([sel]);
+  for (const e of v.edges) {
+    if (e.from === sel) set.add(e.to);
+    else if (e.to === sel) set.add(e.from);
+  }
+  return set;
 }
 
 function draw() {
@@ -127,7 +157,8 @@ function draw() {
     ctx.restore();
   }
 
-  for (const n of v.nodes) drawNode(ctx, n);
+  const nb = neighborSet();
+  for (const n of v.nodes) drawNode(ctx, n, nb);
 
   // 点击标题后的短暂高亮：框住刚点中的那个层级，避免「点了没反应」的错觉
   if (state.flash) {
@@ -143,7 +174,7 @@ function draw() {
       ctx.lineWidth = 3 / cam.k;
       ctx.stroke();
       ctx.restore();
-      requestAnimationFrame(() => draw());
+      scheduleDraw();
     }
   }
 
@@ -330,28 +361,29 @@ function drawEdge(ctx, e, related, selected) {
   ctx.restore();
 }
 
-function drawNode(ctx, n) {
+/**
+ * @param {Set<string>|null} nb 选中节点的邻接集合（draw 时统一算好传进来；为空表示没有选中）
+ */
+function drawNode(ctx, n, nb = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
   const selected = state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const dimByDf = state.dfFocus && !state.dfFocus.has(n.id);
-  const dimmed = dimByDf || (state.selected && !selected && !isNeighbor(n.id));
+  const dimmed =
+    dimByDf || (state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id)));
 
   ctx.save();
   ctx.globalAlpha = dimmed ? 0.3 : 1;
 
   roundRect(ctx, x, y, w, h, 8);
-  // 函数框按变更分类上色；变量框统一白底
-  const baseFill = isVar
-    ? n.external
-      ? '#FAFAF7'
-      : n.dfVar
-      ? '#FFF7ED'
-      : '#FFFFFF'
-    : n.dfPeer
+  // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除），
+  // 只在数据流叠加时换成淡琥珀，提示它属于本次分析
+  const baseFill = n.dfVar || n.dfPeer
     ? '#FDF6EC'
+    : n.external
+    ? '#FAFAF7'
     : CHANGE_FILL[n.change] || CHANGE_FILL.existing;
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
@@ -365,11 +397,9 @@ function drawNode(ctx, n) {
     ? '#378ADD'
     : n.external
     ? '#D3D1C7'
-    : isVar
-    ? '#5A5A55'
     : '#3A3A36';
-  // 函数用虚线框，变量用实线框
-  if (!isVar) ctx.setLineDash([5, 3]);
+  // 变量与函数统一用虚线框，靠名字（变量不带括号）区分
+  ctx.setLineDash([5, 3]);
   ctx.stroke();
   ctx.setLineDash([]);
 

@@ -6,7 +6,7 @@ import { hideMenu, showMenu, showMenuSections } from './ctxmenu.js';
 import { api } from './api.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
-import { renderDetail } from './panels.js';
+import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { df, expandDataflow, clearDataflow } from './df.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
@@ -27,6 +27,11 @@ const EDGE_ITEMS = [
 export function showNodeMenu(x, y, n) {
   const sections = [
     {
+      id: 'locate',
+      label: 'menu.locate',
+      items: [{ value: 'tree:fn', label: 'locate.treeFn' }],
+    },
+    {
       id: 'df',
       label: 'menu.dataflow',
       items: [
@@ -38,6 +43,7 @@ export function showNodeMenu(x, y, n) {
     { id: 'change', label: 'menu.change', items: CHANGE_ITEMS },
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
+    if (v === 'tree:fn') return revealInTree('fn', n.id);
     if (v === 'df:out') return expandDataflow(n.id, 'out');
     if (v === 'df:in') return expandDataflow(n.id, 'in');
     if (v === 'df:clear') return clearDataflow();
@@ -61,8 +67,15 @@ async function setEdgeChange(edge, change) {
 
 function selectNode(id) {
   state.selected = id;
+  if (id) {
+    const n = state.view ? state.view.nodes.find((x) => x.id === id) : null;
+    if (n && n.group) state.ctxBox = { kind: 'file', id: n.group };
+  } else {
+    state.ctxBox = null;
+  }
   draw();
   renderDetail(id);
+  renderVars(); // 变量面板跟着当前点选的框走
 }
 
 export {

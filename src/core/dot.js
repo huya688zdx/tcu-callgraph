@@ -346,6 +346,7 @@ export function modelFromDot(dot, fileLabel = '<dot>') {
 
   const clusters = dot.clusters.map((c) => ({ id: c.id, label: c.label || c.id, attrs: c.attrs }));
 
+  // 字段与 buildIndex() 的 model 保持同构，避免上层（stats / 导出 / 前端）按字段直读时崩溃
   return {
     root: fileLabel,
     generatedAt: new Date().toISOString(),
@@ -353,13 +354,22 @@ export function modelFromDot(dot, fileLabel = '<dot>') {
     source: 'dot',
     files: [{ rel: fileLabel, isHeader: false, bytes: 0 }],
     functions,
+    variables: [],
     externals: [],
     edges,
     macros: [],
     fnptrTables: [],
     includes: [],
+    warnings: [],
     clusters,
     graphAttrs: dot.graphAttrs,
-    _index: { byId, byName: new Map(), outAdj, inAdj },
+    _index: {
+      byId,
+      byName: new Map(),
+      outAdj,
+      inAdj,
+      varWriters: new Map(),
+      varReaders: new Map(),
+    },
   };
 }

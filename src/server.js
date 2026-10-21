@@ -1,17 +1,26 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf } from './core/index.js';
 import { layout, layoutGrouped } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
-import { dataflowFor, sharedVariables } from './core/dataflow.js';
+import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.resolve(__dirname, '../web');
 const OUT = path.resolve(__dirname, '../out');
+
+// 静态文件二次校验用：解析软链后的真实根目录
+let REAL_WEB = WEB;
+try {
+  REAL_WEB = fs.realpathSync(WEB);
+} catch {
+  /* web 目录不存在时保持原值，静态请求统一 404 */
+}
 
 const target = process.argv[2] || 'samples/tcu';
 const PORT = Number(process.argv[3] || 5173);
@@ -29,18 +38,39 @@ const ROOT_LABEL = path.basename(rootIsFile ? path.dirname(root) : root) || root
 
 console.log(`[加载] ${root}`);
 const MODEL = loadModel(root);
+// 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
+// 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
+try {
+  await buildDataflowIndex(MODEL);
+} catch (err) {
+  console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
+}
 const S = stats(MODEL);
 console.log(
   `[就绪] 文件 ${S.files} / 函数 ${S.functions} / 边 ${S.edges} / 宏 ${S.macros} / 耗时 ${S.elapsedMs}ms`
 );
 
 const OVERLAY_PATH = path.join(OUT, 'overlay.json');
+const emptyOverlay = () => ({ nodes: {}, edges: {}, notes: [] });
 let overlay = {};
 try {
   overlay = JSON.parse(fs.readFileSync(OVERLAY_PATH, 'utf8'));
-} catch {
-  overlay = { nodes: {}, edges: {}, notes: [] };
+} catch (err) {
+  // 首次运行（ENOENT）属正常；其余错误说明文件损坏/不可读，先备份再回落，
+  // 否则用户的标注、删除记录会被下一次保存直接覆盖掉
+  if (err.code !== 'ENOENT') {
+    const backup = path.join(OUT, `overlay.corrupt-${Date.now()}.json`);
+    try {
+      fs.copyFileSync(OVERLAY_PATH, backup);
+      console.error(`[overlay] 读取失败，已备份为 ${backup}：`, err.message);
+    } catch (copyErr) {
+      console.error('[overlay] 读取失败且备份失败：', err.message, copyErr.message);
+    }
+  }
+  overlay = emptyOverlay();
 }
+// JSON 合法但不是对象（null / 数组 / 字符串）时同样回落，避免下面取字段直接抛
+if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) overlay = emptyOverlay();
 
 // 用户在界面上删掉的函数 / 连线：按 id 记下来，所有视图里都不再显示
 overlay.deleted = overlay.deleted || { nodes: {}, edges: {} };
@@ -49,7 +79,10 @@ overlay.deleted.edges = overlay.deleted.edges || {};
 
 const saveOverlay = () => {
   fs.mkdirSync(OUT, { recursive: true });
-  fs.writeFileSync(OVERLAY_PATH, JSON.stringify(overlay, null, 1), 'utf8');
+  // 先写临时文件再改名：进程在写一半被杀时不会留下半截 JSON
+  const tmp = `${OVERLAY_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(overlay, null, 1), 'utf8');
+  fs.renameSync(tmp, OVERLAY_PATH);
 };
 
 /** 与前端 edgeKey 保持一致 */
@@ -103,6 +136,100 @@ const json = (res, obj, code = 200) => {
   res.end(body);
 };
 
+const bad = (res, msg) => json(res, { ok: false, error: msg }, 400);
+
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
+const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
+
+/**
+ * 写接口守卫：拒绝跨站来源与非 JSON 请求。
+ * Origin 为空时放行（curl、同源导航不带 Origin）；跨站带 application/json 的请求
+ * 会先触发预检，这里不回应预检，浏览器侧根本发不出来，415 再兜住 text/plain 表单提交。
+ */
+function guardWrite(req, res) {
+  const origin = req.headers.origin;
+  if (origin && !LOCAL_ORIGIN.test(origin)) {
+    json(res, { ok: false, error: 'forbidden origin' }, 403);
+    return false;
+  }
+  const type = String(req.headers['content-type'] || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  if (type !== 'application/json') {
+    json(res, { ok: false, error: 'unsupported media type' }, 415);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 读取 JSON body：Buffer 分片收集（多字节字符不会跨片被截断）+ 体积上限 + 顶层结构校验。
+ * 失败时响应已写好，调用方只需 catch 掉拒绝。
+ */
+function readJson(req, res, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let done = false;
+    const fail = (code, msg, drain = false) => {
+      if (done) return;
+      done = true;
+      json(res, { ok: false, error: msg }, code);
+      if (drain) {
+        // 继续排空入站数据再断开：带着未读数据直接 destroy 会发 RST，客户端可能收不到 413
+        req.resume();
+        const timer = setTimeout(() => req.destroy(), 2000);
+        timer.unref?.();
+        req.on('end', () => {
+          clearTimeout(timer);
+          if (!req.destroyed) req.destroy();
+        });
+      }
+      reject(new Error(msg));
+    };
+    req.on('data', (c) => {
+      if (done) return;
+      size += c.length;
+      if (size > limit) return fail(413, '请求体过大', true);
+      chunks.push(c);
+    });
+    req.on('error', () => fail(400, '读取请求体失败'));
+    req.on('end', () => {
+      if (done) return;
+      let parsed;
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      } catch {
+        return fail(400, 'body 不是合法 JSON');
+      }
+      if (!isPlainObject(parsed)) return fail(400, 'body 必须是 JSON 对象');
+      done = true;
+      resolve(parsed);
+    });
+  });
+}
+
+/**
+ * 流式回传文件：打开失败时若还没发头就回 500，已发头则直接断开，
+ * 避免 ReadStream 的 error 事件没人接导致进程退出。
+ */
+function sendFile(res, file, headers) {
+  const rs = fs.createReadStream(file);
+  rs.on('error', (err) => {
+    console.error(`[文件] 读取失败 ${file}:`, err.message);
+    if (!res.headersSent) json(res, { ok: false, error: '文件读取失败' }, 500);
+    else res.destroy();
+  });
+  rs.once('open', () => {
+    res.writeHead(200, headers);
+    rs.pipe(res);
+  });
+  res.on('close', () => rs.destroy());
+}
+
 /**
  * 布局存档按「入口函数 + 布局模式」隔离。
  * 不同入口的子图节点集合与文件框位置完全不同，绝对坐标不可跨视图复用，
@@ -140,6 +267,114 @@ function fitGroups(groups, nodes) {
     g.y = ny;
     g.w = nr - nx;
     g.h = nb - ny;
+  }
+}
+
+/** 固定布局用：按节点实际位置精确重算文件框与目录容器（可扩可缩） */
+function refitBoxes(groups, containers, nodes) {
+  const byGroup = new Map();
+  for (const n of nodes) {
+    if (!n.group) continue;
+    if (!byGroup.has(n.group)) byGroup.set(n.group, []);
+    byGroup.get(n.group).push(n);
+  }
+  const bounds = (list) => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const n of list) {
+      if (n.x < x0) x0 = n.x;
+      if (n.y < y0) y0 = n.y;
+      if (n.x + n.w > x1) x1 = n.x + n.w;
+      if (n.y + n.h > y1) y1 = n.y + n.h;
+    }
+    return { x0, y0, x1, y1 };
+  };
+
+  for (const g of groups || []) {
+    const list = byGroup.get(g.id);
+    if (!list || !list.length) continue;
+    const { x0, y0, x1, y1 } = bounds(list);
+    g.x = x0 - 14;
+    g.y = y0 - 30;
+    g.w = x1 - x0 + 28;
+    g.h = y1 - y0 + 44;
+  }
+
+  if (!containers || !containers.length) return;
+  const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
+  // 深的先算：父容器用子容器的最终矩形求并集
+  for (const c of containers.slice().sort((a, b) => b.depth - a.depth)) {
+    const prefix = c.id ? c.id + '/' : '';
+    const kids = [...(groups || []), ...containers].filter(
+      (b) => b !== c && String(b.id).startsWith(prefix) && b.w > 0 && b.h > 0
+    );
+    if (!kids.length) continue;
+    const { x0, y0, x1, y1 } = bounds(kids);
+    const extra = (maxDepth - c.depth) * 10;
+    c.x = x0 - 14 - extra;
+    c.y = y0 - 30 - extra;
+    c.w = x1 - x0 + 28 + extra * 2;
+    c.h = y1 - y0 + 44 + extra * 2;
+  }
+}
+
+/** 在所属文件框里找一个空位放新节点；框里放不下就贴着框底往下排（框随后被撑大） */
+function relocateNewNode(n, laid) {
+  const g = (laid.groups || []).find((x) => x.id === n.group);
+  const clash = (x, y) =>
+    laid.nodes.some(
+      (m) => m !== n && x < m.x + m.w + 6 && m.x < x + n.w + 6 && y < m.y + m.h + 6 && m.y < y + n.h + 6
+    );
+  const baseX = g ? g.x + 14 : n.x;
+  const baseY = g ? g.y + 34 : n.y;
+  const stepX = n.w + 16;
+  const stepY = n.h + 16;
+  const cols = g ? Math.max(1, Math.floor((g.w - 28) / stepX)) : 1;
+  for (let r = 0; r < 40; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = baseX + c * stepX;
+      const y = baseY + r * stepY;
+      if (!clash(x, y)) {
+        n.x = x;
+        n.y = y;
+        return true;
+      }
+    }
+  }
+  n.x = baseX;
+  n.y = g ? g.y + g.h + 10 : n.y + n.h + 20;
+  return false;
+}
+
+/** 固定布局下把互相压住的兄弟文件框整体推开（连带其中的节点与折线） */
+function pushApartGroups(groups, nodes, edges) {
+  if (!groups || groups.length < 2) return;
+  const shift = (g, dy) => {
+    g.y += dy;
+    const ids = new Set();
+    for (const n of nodes) {
+      if (n.group !== g.id) continue;
+      n.y += dy;
+      ids.add(n.id);
+    }
+    for (const e of edges) {
+      if (!ids.has(e.from) && !ids.has(e.to)) continue;
+      if (e.points) for (const p of e.points) p[1] += dy;
+    }
+  };
+  for (let iter = 0; iter < 12; iter++) {
+    let moved = false;
+    for (let i = 0; i < groups.length; i++) {
+      for (let j = i + 1; j < groups.length; j++) {
+        const a = groups[i];
+        const b = groups[j];
+        const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+        const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+        if (ox <= 1 || oy <= 1) continue;
+        shift(a.y >= b.y ? a : b, oy + 20);
+        moved = true;
+      }
+    }
+    if (!moved) break;
   }
 }
 
@@ -199,7 +434,7 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(rootIds, up, down, group = false, dfNode = null, optimal = false) {
+function buildView(rootIds, up, down, group = false, dfNode = null, optimal = false, varSel = {}, fixed = false) {
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
   const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
@@ -224,15 +459,83 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
   };
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
   // 所以某个文件或目录里的函数被删空时，对应层级会自动消失
-  const alive = g.nodes.filter((n) => !overlay.deleted.nodes[n.id]);
+  const wantVars = new Set(varSel.want || []);
+  const skipVars = new Set(varSel.skip || []);
+
+  let alive = g.nodes.filter((n) => !overlay.deleted.nodes[n.id]);
+  // 右侧面板里被取消勾选的全局变量：连节点带边一起去掉
+  if (skipVars.size) alive = alive.filter((n) => !(n.kind === 'var' && skipVars.has(n.id)));
   const aliveIds = new Set(alive.map((n) => n.id));
-  const viewEdges = g.edges.filter(
-    (e) => aliveIds.has(e.from) && aliveIds.has(e.to) && !overlay.deleted.edges[edgeKeyOf(e)]
+  let viewEdges = g.edges.filter(
+    (e) =>
+      aliveIds.has(e.from) &&
+      aliveIds.has(e.to) &&
+      !overlay.deleted.edges[edgeKeyOf(e)] &&
+      !(e.kind === 'var' && (skipVars.has(e.to) || skipVars.has(e.from)))
   );
-  const clean = alive.map(({ bodyTokens, ...rest }) => rest);
+  let clean = alive.map(({ bodyTokens, ...rest }) => rest);
   if (!clean.length) {
     return { nodes: [], edges: [], width: 480, height: 260, root: g.root, empty: true };
   }
+  // 右侧面板里勾选的全局变量：补节点 + 视图内函数对它的引用边
+  if (wantVars.size) {
+    const ids = new Set(clean.map((n) => n.id));
+    const df = MODEL._df;
+    for (const id of wantVars) {
+      if (ids.has(id) || overlay.deleted.nodes[id]) continue;
+      const def = (df && df.byId.get(id)) || MODEL._index.byId.get(id);
+      if (!def) continue;
+      clean.push({
+        id,
+        name: def.name,
+        kind: 'var',
+        file: def.file,
+        line: def.line,
+        typeText: def.typeText,
+        isStatic: !!def.isStatic,
+        isConst: !!def.isConst,
+        params: [],
+      });
+      ids.add(id);
+    }
+    // 引用关系：视图内的函数 → 该变量（AST 索引里记着每个变量的写者/读者）
+    const seen = new Set(viewEdges.map((e) => `${e.from}|${e.to}|${e.line}`));
+    const varEdgeOf = new Map(); // fnId|varId → edge，读写合并成一条
+    const pushVarEdge = (fnId, varId, via) => {
+      if (!ids.has(fnId) || !ids.has(varId)) return;
+      const k = `${fnId}|${varId}|0`;
+      const prev = varEdgeOf.get(k);
+      if (prev) {
+        if (prev.via !== via) prev.via = '读写';
+        return;
+      }
+      if (seen.has(k)) return;
+      seen.add(k);
+      const def = (df && df.byId.get(varId)) || MODEL._index.byId.get(varId);
+      const edge = {
+        from: fnId,
+        to: varId,
+        callee: def ? def.name : varId,
+        kind: 'var',
+        line: 0,
+        via,
+      };
+      varEdgeOf.set(k, edge);
+      viewEdges.push(edge);
+    };
+    if (df) {
+      for (const id of wantVars) {
+        for (const fnId of df.writers.get(id) || []) pushVarEdge(fnId, id, '写');
+        for (const fnId of df.readers.get(id) || []) pushVarEdge(fnId, id, '读');
+      }
+    } else {
+      for (const e of MODEL.edges) {
+        if (e.kind !== 'var' || !wantVars.has(e.to)) continue;
+        pushVarEdge(e.from, e.to, e.via || '变量');
+      }
+    }
+  }
+
   // 数据流（按需展开）：把相关的函数也拉进视图，否则只有连线看不到两端
   if (dfNode) {
     const flows = dataflowOf(MODEL, dfNode);
@@ -265,7 +568,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
   // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
-  const slot = optimal ? {} : overlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
+  const slot = optimal && !fixed ? {} : overlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
 
   // 手动拖拽的节点位置优先。
   // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
@@ -277,7 +580,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
     const p = savedNodes[n.id];
     if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
     const gb = groupBox.get(n.group);
-    if (gb) {
+    if (gb && !fixed) {
       const tol = 2;
       const inside =
         p.x >= gb.x - tol &&
@@ -291,6 +594,20 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
     n.x = p.x;
     n.y = p.y;
     savedApplied.push(n);
+  }
+
+  // 固定布局：已有节点钉在原位，新加入的节点（变量/函数）自己找空位，
+  // 只有在框里放不下时才撑大框，并把压到的兄弟框整体推开
+  if (fixed) {
+    const savedSet = new Set(savedApplied.map((n) => n.id));
+    for (const n of laid.nodes) {
+      if (savedSet.has(n.id)) continue;
+      const clash = laid.nodes.some(
+        (m) => m !== n && n.x < m.x + m.w + 6 && m.x < n.x + n.w + 6 && n.y < m.y + m.h + 6 && m.y < n.y + n.h + 6
+      );
+      if (clash) relocateNewNode(n, laid);
+    }
+    pushApartGroups(laid.groups, laid.nodes, laid.edges);
   }
 
   // 存档坐标防叠压：旧存档 / 跨深度的坐标可能压在其他节点上，
@@ -355,8 +672,14 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
   // 兜底：坐标若与当前布局不匹配（旧存档 / 手动拖拽），把文件框扩到包住节点，
   // 避免函数节点看起来脱离了所属文件的层级
   if (laid.groups) {
-    fitGroups(laid.groups, laid.nodes);
-    fitContainers(laid.containers, laid.groups);
+    if (fixed) {
+      // 固定布局：框跟着节点「精确贴合」——加变量时撑大，撤销时也能缩回去，
+      // 不会留下大片空白
+      refitBoxes(laid.groups, laid.containers, laid.nodes);
+    } else {
+      fitGroups(laid.groups, laid.nodes);
+      fitContainers(laid.containers, laid.groups);
+    }
   }
 
   // 侧边车道可能超出画布：扩一下尺寸
@@ -396,7 +719,15 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
 }
 
 const server = http.createServer((req, res) => {
-  const u = new URL(req.url, `http://localhost:${PORT}`);
+  // 畸形请求目标（如 "//["）会让 new URL 抛异常，必须挡在 try 内，
+  // 否则异常冒泡成未捕获异常，整个进程退出
+  let u;
+  try {
+    u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('bad request');
+  }
 
   try {
     if (u.pathname === '/api/stats') {
@@ -457,6 +788,9 @@ const server = http.createServer((req, res) => {
       const group = u.searchParams.get('group') === '1';
       const df = u.searchParams.get('df') || null;
       const optimal = u.searchParams.get('optimal') === '1';
+      const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
+      const varSel = { want: split('vars'), skip: split('novars') };
+      const fixed = u.searchParams.get('fixed') === '1';
       if (!roots.length) {
         if (!MODEL.functions.length) {
           return json(res, {
@@ -477,9 +811,9 @@ const server = http.createServer((req, res) => {
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
-        return json(res, buildView([pick.id], up, Math.max(down, 3), group, df, optimal));
+        return json(res, buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed));
       }
-      return json(res, buildView(roots, up, down, group, df, optimal));
+      return json(res, buildView(roots, up, down, group, df, optimal, varSel, fixed));
     }
 
     if (u.pathname === '/api/node') {
@@ -508,6 +842,12 @@ const server = http.createServer((req, res) => {
         });
     }
 
+    if (u.pathname === '/api/vars') {
+      return listGlobals(MODEL)
+        .then((list) => json(res, { list }))
+        .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
+    }
+
     if (u.pathname === '/api/shared-vars') {
       return sharedVariables(MODEL)
         .then((list) => json(res, { list }))
@@ -515,13 +855,15 @@ const server = http.createServer((req, res) => {
     }
 
     if (u.pathname === '/api/export/xlsx') {
-      const out = path.join(OUT, 'callgraph.xlsx');
+      // 随机文件名：并发导出不会互相覆盖，也不会读到别人写了一半的文件
+      const out = path.join(OUT, `callgraph-${randomUUID()}.xlsx`);
+      res.on('close', () => fs.unlink(out, () => {}));
       exportXlsx(MODEL, out);
-      res.writeHead(200, {
+      return sendFile(res, out, {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         'Content-Disposition': 'attachment; filename="callgraph.xlsx"',
+        'Cache-Control': 'no-store',
       });
-      return fs.createReadStream(out).pipe(res);
     }
 
     if (u.pathname === '/api/export/html') {
@@ -545,27 +887,32 @@ const server = http.createServer((req, res) => {
         edges: g.edges,
         _index: { byId, byName: new Map(), outAdj, inAdj },
       };
-      const out = path.join(OUT, 'view.html');
+      const out = path.join(OUT, `view-${randomUUID()}.html`);
+      res.on('close', () => fs.unlink(out, () => {}));
       exportHtml(tmp, out);
-      res.writeHead(200, {
+      return sendFile(res, out, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Disposition': 'attachment; filename="callgraph.html"',
+        'Cache-Control': 'no-store',
       });
-      return fs.createReadStream(out).pipe(res);
     }
 
     if (u.pathname === '/api/layout' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => (body += c));
-      req.on('end', () => {
-        try {
-          const patch = JSON.parse(body);
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((patch) => {
+          if (patch.nodes !== undefined && !isPlainObject(patch.nodes)) return bad(res, 'nodes 必须是对象');
+          if (patch.edges !== undefined && !isPlainObject(patch.edges)) return bad(res, 'edges 必须是对象');
+          if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = String(patch.root || '');
           overlay.layout = overlay.layout || {};
           const key = layoutKey(rootId, mode);
-          if (!overlay.layout[key]) overlay.layout[key] = { nodes: {}, edges: {}, manual: [] };
+          if (!isPlainObject(overlay.layout[key])) overlay.layout[key] = {};
           const slot = overlay.layout[key];
+          if (!isPlainObject(slot.nodes)) slot.nodes = {};
+          if (!isPlainObject(slot.edges)) slot.edges = {};
+          if (!Array.isArray(slot.manual)) slot.manual = [];
 
           if (patch.clear) {
             slot.nodes = {};
@@ -576,22 +923,22 @@ const server = http.createServer((req, res) => {
             if (patch.manual) slot.manual = patch.manual;
             if (patch.edges) Object.assign(slot.edges, patch.edges);
           }
-          fs.mkdirSync(OUT, { recursive: true });
-          fs.writeFileSync(OVERLAY_PATH, JSON.stringify(overlay, null, 1), 'utf8');
+          saveOverlay();
           json(res, { ok: true });
-        } catch (err) {
-          json(res, { error: String(err) }, 400);
-        }
-      });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
       return;
     }
 
     if (u.pathname === '/api/overlay' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => (body += c));
-      req.on('end', () => {
-        try {
-          const patch = JSON.parse(body);
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((patch) => {
+          if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
+          if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
+          if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           overlay.nodes = overlay.nodes || {};
           overlay.edges = overlay.edges || {};
           if (patch.nodeId) {
@@ -607,23 +954,29 @@ const server = http.createServer((req, res) => {
               ...patch.data,
             };
           }
-          fs.mkdirSync(OUT, { recursive: true });
-          fs.writeFileSync(OVERLAY_PATH, JSON.stringify(overlay, null, 1), 'utf8');
+          saveOverlay();
           json(res, { ok: true });
-        } catch (err) {
-          json(res, { error: String(err) }, 400);
-        }
-      });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
       return;
     }
 
     // 删除 / 恢复函数与连线：只记录 id，不改动源码
     if (u.pathname === '/api/delete' && req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => (body += c));
-      req.on('end', () => {
-        try {
-          const p = JSON.parse(body);
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const nodeIds = p.nodes === undefined ? [] : p.nodes;
+          const edgeKeys = p.edges === undefined ? [] : p.edges;
+          // 必须是字符串数组：否则 for...of 会把字符串按字符拆开写进 overlay
+          if (!Array.isArray(nodeIds) || nodeIds.some((x) => typeof x !== 'string')) {
+            return bad(res, 'nodes 必须是字符串数组');
+          }
+          if (!Array.isArray(edgeKeys) || edgeKeys.some((x) => typeof x !== 'string')) {
+            return bad(res, 'edges 必须是字符串数组');
+          }
           if (p.clear) {
             // 一次性恢复所有被删除的函数与连线
             overlay.deleted = { nodes: {}, edges: {} };
@@ -631,11 +984,11 @@ const server = http.createServer((req, res) => {
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
-          for (const id of p.nodes || []) {
+          for (const id of nodeIds) {
             if (restore) delete overlay.deleted.nodes[id];
             else overlay.deleted.nodes[id] = 1;
           }
-          for (const k of p.edges || []) {
+          for (const k of edgeKeys) {
             if (restore) delete overlay.deleted.edges[k];
             else overlay.deleted.edges[k] = 1;
           }
@@ -645,32 +998,59 @@ const server = http.createServer((req, res) => {
             nodes: Object.keys(overlay.deleted.nodes).length,
             edges: Object.keys(overlay.deleted.edges).length,
           });
-        } catch (err) {
-          json(res, { error: String(err) }, 400);
-        }
-      });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
       return;
     }
 
     // 共享路由模块（浏览器端动态重路由用）
     if (u.pathname === '/core/routing.js') {
-      res.writeHead(200, {
+      return sendFile(res, path.join(__dirname, 'core', 'routing.js'), {
         'Content-Type': 'text/javascript; charset=utf-8',
         'Cache-Control': 'no-store',
       });
-      return fs.createReadStream(path.join(__dirname, 'core', 'routing.js')).pipe(res);
     }
 
     // 静态文件
-    let p = u.pathname === '/' ? '/index.html' : u.pathname;
-    const file = path.join(WEB, p);
-    if (!file.startsWith(WEB)) {
+    const p = u.pathname === '/' ? '/index.html' : u.pathname;
+    // 先按相对路径判定，再 realpath 二次校验：前者挡住 ../，后者挡住软链逃逸
+    const rel = path.relative(WEB, path.resolve(WEB, '.' + p));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
       res.writeHead(403);
       return res.end('forbidden');
     }
-    if (fs.existsSync(file) && fs.statSync(file).isFile()) {
-      res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
-      return fs.createReadStream(file).pipe(res);
+    let file;
+    try {
+      file = fs.realpathSync(path.join(WEB, rel));
+    } catch {
+      res.writeHead(404);
+      return res.end('not found');
+    }
+    if (file !== REAL_WEB && !file.startsWith(REAL_WEB + path.sep)) {
+      res.writeHead(403);
+      return res.end('forbidden');
+    }
+    let st = null;
+    try {
+      st = fs.statSync(file);
+    } catch {
+      st = null;
+    }
+    if (st && st.isFile()) {
+      const ext = path.extname(file);
+      const headers = {
+        'Content-Type': MIME[ext] || 'application/octet-stream',
+      };
+      // 页面 CSP：源码里的函数名/文件名会进 DOM，禁掉内联脚本与外链加载
+      if (ext === '.html') {
+        headers['Content-Security-Policy'] =
+          "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+          "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
+        headers['X-Content-Type-Options'] = 'nosniff';
+      }
+      return sendFile(res, file, headers);
     }
 
     res.writeHead(404);
@@ -681,7 +1061,17 @@ const server = http.createServer((req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+// 只接受本机连接：原本不传 host 会绑到 0.0.0.0，同网段可直接读写用户的布局存档
+server.on('clientError', (err, socket) => {
+  if (!socket.destroyed) socket.destroy();
+});
+
+// 兜底：任何漏网的未捕获异常只记日志，避免 Electron 侧只看到「exited with 1」
+process.on('uncaughtException', (err) => {
+  console.error('[未捕获异常]', err && err.stack ? err.stack : err);
+});
+
+server.listen(PORT, '127.0.0.1', () => {
   const actual = server.address().port;
   console.log(`[服务] http://localhost:${actual}`);
   if (process.send) process.send({ ready: true, port: actual });

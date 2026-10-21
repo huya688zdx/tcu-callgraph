@@ -20,6 +20,9 @@ const els = {
   tooltip: document.getElementById('tooltip'),
   restoreDeleted: document.getElementById('restoreDeleted'),
   ctxMenu: document.getElementById('ctxMenu'),
+  vars: document.getElementById('vars'),
+  secDetail: document.getElementById('secDetail'),
+  secEdges: document.getElementById('secEdges'),
 };
 
 const state = {
@@ -28,12 +31,20 @@ const state = {
   root: null,
   /** 当前所有入口函数（文件树多选时会有多个） */
   roots: [],
+  /** 当前点选的框：{ kind:'file'|'dir', id } —— 右侧变量面板按它过滤 */
+  ctxBox: null,
+  /** 手动勾选要显示在图里的全局变量 id */
+  vars: new Set(),
+  /** 手动取消勾选（即使视图里有函数引用它也不显示） */
+  hiddenVars: new Set(),
   selected: null,
   hover: null,
   down: 3,
   up: 0,
   group: true,
   optimal: true,
+  /** 固定布局：增删节点时保持现有位置，只有溢出才调整 */
+  fixed: true,
   selectedEdge: null,
   dragSeg: null,
   dragEnd: null,
@@ -41,8 +52,14 @@ const state = {
   dragStart: null,
   dragMoved: false,
   panning: false,
+  /** 本次拖拽是否已经产生位移（用于区分「点击」和「拖动」） */
+  panMoved: false,
+  /** 平移时上一次 pointer 的客户端坐标 { x, y }（clientX/clientY） */
+  last: null,
   linkFrom: null,
   linkPos: null,
+  /** 数据流叠加层的高亮范围（节点 id 集合），null 表示未开启 */
+  dfFocus: null,
   /** 点击标题后的短暂高亮：{ box, until, dur } */
   flash: null,
 };
@@ -84,7 +101,12 @@ const shortFile = (f) => {
 };
 
 const esc = (s) =>
-  String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 const nodeById = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
 

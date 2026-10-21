@@ -2,7 +2,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const OUT = process.argv[2] || 'samples/multi';
+const OUT = path.resolve(process.argv[2] || 'samples/multi');
+// 下面会递归删除 OUT，必须确保它位于 samples/ 之下且不是 samples 本身
+const SAMPLES = path.resolve('samples');
+if (OUT === SAMPLES || !OUT.startsWith(SAMPLES + path.sep)) {
+  console.error(`[ERROR] 输出目录必须位于 samples/ 之下：${OUT}`);
+  process.exit(1);
+}
 const DIRS = [
   ['src/core', 8],
   ['src/drivers', 8],

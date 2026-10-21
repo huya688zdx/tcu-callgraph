@@ -54,6 +54,7 @@ export async function locateBox(kind, id, fnIds = []) {
     box = pick(state.view).find((b) => b.id === id);
   }
   if (!box) return false;
+  state.ctxBox = { kind, id };
   focusBox(box, 70);
   flash(box);
   return true;

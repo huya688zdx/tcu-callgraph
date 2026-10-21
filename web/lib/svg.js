@@ -3,9 +3,13 @@
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
  */
 import { t } from '../i18n.js';
-import { state, COLORS, esc, shortFile } from './state.js';
+import { state, COLORS, CHANGE_FILL, esc, shortFile } from './state.js';
 import { updateGroups } from './render.js';
 import { roundedPathD } from '/core/routing.js';
+
+/** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
 function download(name, blob) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -87,14 +91,23 @@ function buildSVG() {
     const c = COLORS[e.kind] || COLORS.direct;
     const dash = e.kind === 'macro' || e.kind === 'fnptr' ? ' stroke-dasharray="5 3"' : '';
     out.push(
-      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 
   for (const n of v.nodes) {
     out.push(`<g data-id="${esc(n.id)}">`);
+    // 与画布保持一致：按变更分类上色，变量/函数都用虚线框
+    const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
+    const fill =
+      custom ||
+      (n.dfVar || n.dfPeer
+        ? '#FDF6EC'
+        : n.external
+        ? '#FAFAF7'
+        : CHANGE_FILL[n.change] || CHANGE_FILL.existing);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${n.color || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="#3A3A36" stroke-width="1" stroke-dasharray="5 3"/>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.name)}</text>`

@@ -8,6 +8,7 @@ const ROOT = path.resolve(__dirname, '..');
 let win = null;
 let child = null;
 let currentTarget = null;
+let serverOrigin = null;
 
 function stopServer() {
   if (child) {
@@ -36,6 +37,11 @@ function startTarget(target) {
   child.on('message', (m) => {
     if (m && m.ready) {
       const url = `http://127.0.0.1:${m.port}`;
+      try {
+        serverOrigin = new URL(url).origin;
+      } catch {
+        serverOrigin = null;
+      }
       if (win) win.loadURL(url);
       else createWindow(url);
     }
@@ -63,8 +69,27 @@ function createWindow(url) {
 
   win.loadURL(url);
   win.webContents.setWindowOpenHandler(({ url: u }) => {
-    shell.openExternal(u);
+    let protocol = '';
+    try {
+      protocol = new URL(u).protocol;
+    } catch {
+      return { action: 'deny' };
+    }
+    // 只把常规网页/邮件链接交给系统浏览器，拒绝 file:/ms-*: 等协议处理器
+    if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:') {
+      shell.openExternal(u);
+    }
     return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (event, targetUrl) => {
+    let origin = null;
+    try {
+      origin = new URL(targetUrl).origin;
+    } catch {
+      origin = null;
+    }
+    // 只允许停留在本机 server，避免被源码内容或外链把窗口带出应用
+    if (!serverOrigin || origin !== serverOrigin) event.preventDefault();
   });
   win.on('closed', () => {
     win = null;
@@ -114,7 +139,7 @@ function buildMenu() {
         label: '视图',
         submenu: [
           { role: 'reload', label: '刷新界面' },
-          { role: 'toggleDevTools', label: '开发者工具' },
+          ...(app.isPackaged ? [] : [{ role: 'toggleDevTools', label: '开发者工具' }]),
           { type: 'separator' },
           { role: 'resetZoom', label: '实际大小' },
           { role: 'zoomIn', label: '放大' },
@@ -158,6 +183,13 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   stopServer();
   app.quit();
+});
+
+app.on('activate', () => {
+  // macOS 点 Dock 图标：没有窗口时按当前目标重建
+  if (BrowserWindow.getAllWindows().length) return;
+  if (currentTarget) startTarget(currentTarget);
+  else pickFolder();
 });
 
 app.on('before-quit', stopServer);

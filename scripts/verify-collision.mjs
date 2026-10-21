@@ -97,3 +97,4 @@ if (!badViews) {
     for (const b of s.bad.slice(0, 4)) console.log(`    ${b}`);
   }
 }
+process.exitCode = badViews ? 1 : 0;

@@ -115,6 +115,20 @@ export function lex(src, file = '') {
       col++;
       while (i < n) {
         if (src[i] === '\\') {
+          // 续行：与预处理分支保持一致，\ + LF / CRLF 都要吞掉并推进行号，
+          // 否则 CRLF 文件里的续行字符串会被 '\n' 截断，串内容被当成代码。
+          if (src[i + 1] === '\n') {
+            i += 2;
+            line++;
+            col = 1;
+            continue;
+          }
+          if (src[i + 1] === '\r' && src[i + 2] === '\n') {
+            i += 3;
+            line++;
+            col = 1;
+            continue;
+          }
           i += 2;
           col += 2;
           continue;

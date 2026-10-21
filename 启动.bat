@@ -16,7 +16,12 @@ if not exist "node_modules\electron\dist\electron.exe" (
     exit /b 1
 )
 
-start "" "node_modules\electron\dist\electron.exe" . %*
+if "%~1"=="" (
+    start /wait "" "node_modules\electron\dist\electron.exe" .
+) else (
+    start /wait "" "node_modules\electron\dist\electron.exe" . "%~1"
+)
+set "rc=%errorlevel%"
 
 popd
-endlocal
+endlocal & exit /b %rc%

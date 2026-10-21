@@ -50,8 +50,64 @@ function matchParenBack(tokens, closeIdx) {
   return -1;
 }
 
+/** 函数声明/定义前后的注解关键字：void f(void) __attribute__((noreturn)) { } */
+const ANNOTATIONS = new Set([
+  '__attribute__', '__attribute', '__declspec', '__asm', '__asm__', 'asm', '_Pragma',
+]);
+
+/** 若 idx 处的 ')' 是 __attribute__((..)) / __declspec(..) 这类注解块的右括号，返回注解关键字下标 */
+function annotationStartAt(tokens, idx) {
+  if (idx < 0 || tokens[idx].v !== ')') return -1;
+  const open = matchParenBack(tokens, idx);
+  if (open < 1) return -1;
+  const kw = tokens[open - 1];
+  if (!kw || kw.t !== 'id' || !ANNOTATIONS.has(kw.v)) return -1;
+  return open - 1;
+}
+
+/**
+ * 从 idx 处的 ')' 往前定位真正的参数列表：跳过尾部的注解块
+ * 返回 { open, close }（参数列表的 '(' 与 ')' 下标），失败返回 null
+ */
+function paramListEnd(tokens, idx) {
+  let end = idx;
+  for (;;) {
+    const kw = annotationStartAt(tokens, end);
+    if (kw < 0) break;
+    end = kw - 1;
+    if (end < 0 || tokens[end].v !== ')') return null;
+  }
+  const open = matchParenBack(tokens, end);
+  if (open < 1) return null;
+  return { open, close: end };
+}
+
+/** ')' 与 '{' 之间是否只由老式参数声明组成（int a; char *b;） */
+function isKnRDecls(tokens, from, to) {
+  if (to - from < 2) return false; // 至少要有 "int a;"
+  if (tokens[to - 1].v !== ';') return false;
+  for (let k = from; k < to; k++) {
+    const v = tokens[k].v;
+    if (v === '(' || v === ')' || v === '=' || v === '{' || v === '}') return false;
+  }
+  return true;
+}
+
+/** 从一段参数 token 里取参数名，追加进 names（重名只留一个） */
+function pushParamName(names, toks) {
+  if (!toks.length) return;
+  const ids = toks.filter((t) => t.t === 'id' && !TYPE_WORDS.has(t.v));
+  if (!ids.length) {
+    names.push('_');
+    return;
+  }
+  const name = ids[ids.length - 1].v;
+  if (!names.includes(name)) names.push(name);
+}
+
 /**
  * 识别函数定义
+ * 支持：普通定义、带 __attribute__/__declspec 注解、K&R 老式定义
  * @returns {Array<{name,line,endLine,params,isStatic,cond,bodyStart,bodyEnd}>}
  */
 export function findFunctions(tokens, file) {
@@ -59,25 +115,55 @@ export function findFunctions(tokens, file) {
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].v !== '{') continue;
     const prev = tokens[i - 1];
-    if (!prev || prev.v !== ')') continue;
+    if (!prev) continue;
 
-    const open = matchParenBack(tokens, i - 1);
-    if (open < 1) continue;
+    let pl = null;
+    let knr = false;
+    if (prev.v === ')') {
+      pl = paramListEnd(tokens, i - 1);
+    } else if (prev.v === ';') {
+      // K&R 定义：int add(a, b) int a; int b; { ... } —— '{' 前是 ';'
+      // 回溯限制在 80 个 token 内，避免在长文件里跨语句线性回溯
+      let k = i - 2;
+      while (k >= 0 && k > i - 80 && tokens[k].v !== ')') k--;
+      if (k >= 0 && tokens[k].v === ')') {
+        const cand = paramListEnd(tokens, k);
+        // 中间必须是老式参数声明，排除 return foo(1); { 这类假阳
+        if (cand && isKnRDecls(tokens, cand.close + 1, i)) {
+          pl = cand;
+          knr = true;
+        }
+      }
+    }
+    if (!pl) continue;
 
+    const { open, close: paramsClose } = pl;
     const nameTok = tokens[open - 1];
     if (!nameTok || nameTok.t !== 'id') continue;
     if (CONTROL.has(nameTok.v)) continue;
 
-    // 函数名前面必须像类型（id / * / 类型关键字），排除 a = foo() { 这类
+    // 函数名前面必须像类型（id / * / 类型关键字），排除 a = foo() { 这类；
+    // 函数名与类型之间可能夹着注解块：void __attribute__((unused)) f(void)
     let j = open - 2;
-    while (j >= 0 && (tokens[j].v === '*' || tokens[j].v === 'const')) j--;
+    for (;;) {
+      if (j >= 0 && (tokens[j].v === '*' || tokens[j].v === 'const')) {
+        j--;
+        continue;
+      }
+      const kw = annotationStartAt(tokens, j);
+      if (kw >= 0) {
+        j = kw - 1;
+        continue;
+      }
+      break;
+    }
     const typeTok = tokens[j];
     if (!typeTok || (typeTok.t !== 'id' && typeTok.v !== ']')) continue;
     if (typeTok.v === '=' || typeTok.v === ',' || typeTok.v === '(') continue;
 
-    // 参数
+    // 参数：K&R 时参数列表只到 paramsClose，后面的老式声明另行补名字
     const params = [];
-    const inner = tokens.slice(open + 1, i - 1);
+    const inner = tokens.slice(open + 1, paramsClose);
     if (!(inner.length === 1 && inner[0].v === 'void') && inner.length) {
       let cur = [];
       let depth = 0;
@@ -85,20 +171,33 @@ export function findFunctions(tokens, file) {
         if (t.v === '(' || t.v === '[') depth++;
         if (t.v === ')' || t.v === ']') depth--;
         if (t.v === ',' && depth === 0) {
-          params.push(cur);
+          pushParamName(params, cur);
           cur = [];
           continue;
         }
         cur.push(t);
       }
-      if (cur.length) params.push(cur);
+      if (cur.length) pushParamName(params, cur);
+    }
+    if (knr) {
+      // int a; int b; —— 只补名字（已有同名参数时不重复）
+      let cur = [];
+      for (let k = paramsClose + 1; k < i; k++) {
+        if (tokens[k].v === ';') {
+          pushParamName(params, cur);
+          cur = [];
+          continue;
+        }
+        cur.push(tokens[k]);
+      }
+      if (cur.length) pushParamName(params, cur);
     }
 
     const close = matchBrace(tokens, i);
 
     // static 判定：向前找最近的 ; { } 之间是否有 static
     let isStatic = false;
-    for (let k = open - 2; k >= 0 && k > open - 12; k--) {
+    for (let k = open - 2; k >= 0 && k > open - 24; k--) {
       if (tokens[k].v === ';' || tokens[k].v === '}' || tokens[k].v === '{') break;
       if (tokens[k].v === 'static') {
         isStatic = true;
@@ -111,10 +210,7 @@ export function findFunctions(tokens, file) {
       file,
       line: nameTok.line,
       endLine: tokens[close] ? tokens[close].line : nameTok.line,
-      params: params.map((p) => {
-        const ids = p.filter((t) => t.t === 'id' && !TYPE_WORDS.has(t.v));
-        return ids.length ? ids[ids.length - 1].v : '_';
-      }),
+      params,
       isStatic,
       cond: nameTok.cond,
       bodyStart: i,

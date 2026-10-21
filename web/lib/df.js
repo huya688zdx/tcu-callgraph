@@ -8,6 +8,7 @@
  * 这样做的目的就是避免引用爆炸：全工程的共享变量关系不会一次性铺开。
  */
 
+import { t } from '../i18n.js';
 import { state, esc } from './state.js';
 import { api } from './api.js';
 import { draw } from './render.js';
@@ -80,18 +81,18 @@ function hidePanel() {
 }
 
 function summaryHtml(res) {
-  const head = `数据流 · <b>${esc(res.fn?.name || '')}</b> · ${
-    res.dir === 'in' ? '上游（谁写了它读的变量）' : '下游（谁读它写的变量）'
+  const head = `${t('df.title')} · <b>${esc(res.fn?.name || '')}</b> · ${
+    res.dir === 'in' ? t('df.upstream') : t('df.downstream')
   }`;
   if (!res.vars || !res.vars.length) {
-    return `${head}<div style="color:#888780;margin-top:4px">没有跨函数的共享变量读写</div>
-      <div style="margin-top:6px"><button class="link" data-df="clear">清除</button></div>`;
+    return `${head}<div style="color:#888780;margin-top:4px">${t('df.empty')}</div>
+      <div style="margin-top:6px"><button class="link" data-df="clear">${t('df.clearShort')}</button></div>`;
   }
   const rows = res.vars
     .map((v) => {
-      const arrow = v.mode === 'write' ? '写' : '读';
+      const arrow = v.mode === 'write' ? t('df.write') : t('df.read');
       const peers = v.peers.map((p) => esc(p.name)).join('、');
-      const extra = v.indirect ? ' <span style="color:#B4B2A9">(经指针)</span>' : '';
+      const extra = v.indirect ? ` <span style="color:#B4B2A9">${t('df.viaPtr')}</span>` : '';
       return `<div style="margin-top:5px"><code style="background:#FAF6EF;padding:1px 4px;border-radius:3px">${esc(
         v.name
       )}</code> ${arrow}${extra} → <span style="color:#0C447C">${peers}</span>${
@@ -100,18 +101,18 @@ function summaryHtml(res) {
     })
     .join('');
   return `${head}${rows}
-    <div style="margin-top:8px;color:#888780">共 ${res.vars.length} 个变量 · 点线为数据流（琥珀=写入，青=读取）</div>
-    <div style="margin-top:6px"><button class="link" data-df="clear">清除数据流叠加</button></div>`;
+    <div style="margin-top:8px;color:#888780">${t('df.summary', { n: res.vars.length })}</div>
+    <div style="margin-top:6px"><button class="link" data-df="clear">${t('df.clear')}</button></div>`;
 }
 
 /** 清除叠加：把这次加进来的节点/边从视图里摘掉 */
 export function clearDataflow(redraw = true) {
   const v = state.view;
   if (v && df.active) {
-    const ids = new Set(df.nodes.map((n) => n.id));
-    const edgeRefs = new Set(df.edges);
-    v.nodes = v.nodes.filter((n) => !ids.has(n.id));
-    v.edges = v.edges.filter((e) => !edgeRefs.has(e));
+    // 按标记删，不按对象身份：history.applySnapshot 会重建所有节点/边对象，
+    // 引用比对必然失配，会留下指向已删节点的幽灵边
+    v.nodes = v.nodes.filter((n) => !(n.dfVar || n.dfPeer));
+    v.edges = v.edges.filter((e) => e.df !== true);
   }
   df.active = false;
   state.dfFocus = null;
@@ -143,18 +144,20 @@ export async function expandDataflow(fnId, dir = 'out') {
   }
   clearDataflow(false);
 
-  showPanel('数据流分析中…');
+  showPanel(t('df.loading'));
   let res;
   try {
     res = await api.dataflow(fnId, dir);
   } catch (err) {
-    showPanel(`<b style="color:#A32D2D">数据流分析失败</b><div style="margin-top:4px">${esc(String(err))}</div>`);
+    showPanel(
+      `<b style="color:#A32D2D">${t('df.failed')}</b><div style="margin-top:4px">${esc(String(err))}</div>`
+    );
     return;
   }
   if (!res || res.ok === false) {
     showPanel(
-      `<b style="color:#A32D2D">数据流分析失败</b><div style="margin-top:4px">${esc(
-        res?.error || '未知错误'
+      `<b style="color:#A32D2D">${t('df.failed')}</b><div style="margin-top:4px">${esc(
+        res?.error || t('df.unknownError')
       )}</div>`
     );
     return;
