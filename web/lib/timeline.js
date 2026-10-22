@@ -96,6 +96,13 @@ function describe(e) {
       return '打开工程（历史起点）';
     case 'import':
       return '导入旧版 out/overlay.json';
+    case 'session.import': {
+      const im = b.import || {};
+      const base = `导入会话「${target}」· 标注 ${im.annotations || 0} · 布局 ${im.layout || 0} · 书签 ${
+        im.bookmarks || 0
+      }`;
+      return b.codeMismatch ? base + '（代码版本不一致）' : base;
+    }
     case 'restore_point':
       return `恢复到 ${target || '历史时刻'}`;
     case 'bookmark.save':

@@ -262,6 +262,18 @@ const cnt = (v) => (Array.isArray(v) ? v.length : v && typeof v === 'object' ? O
 function briefOf(e) {
   const a = e.after || {};
   const brief = {};
+  // 会话导入的 after 是整份 overlay（回放要用），直接数节点会得出
+  // 「导入后一共有多少个节点」，那不是用户想看的；改用随事件带的 summary
+  if (e.op === 'session.import') {
+    const s = a.summary || {};
+    brief.import = {
+      annotations: Number(s.annotations) || 0,
+      layout: Number(s.layout) || 0,
+      bookmarks: Number(s.bookmarks) || 0,
+    };
+    if (s.sameCode === false) brief.codeMismatch = 1;
+    return brief;
+  }
   if (a.change !== undefined) brief.change = a.change;
   if (a.note !== undefined) brief.note = String(a.note).slice(0, 80);
   if (a.tag !== undefined) brief.tag = String(a.tag).slice(0, 40);
@@ -290,7 +302,11 @@ function applyEvent(ov, e) {
     // 携带全量状态的节点：直接整体替换
     case 'baseline':
     case 'restore_point':
-    case 'import': {
+    case 'import':
+    // 会话导入同样是「把这一刻的整个状态钉下来」：它的 after 里带着导入后的
+    // 全量 overlay，不回放的话 at=这一刻 会显示成导入前的样子，
+    // restore 还会把导入进来的标注一起抹掉
+    case 'session.import': {
       if (!after.nodes && !after.layout && !after.deleted) return;
       ov.nodes = { ...(after.nodes || {}) };
       ov.edges = { ...(after.edges || {}) };
@@ -454,9 +470,12 @@ export function openStore({ dbPath, userData } = {}) {
   const buildEventQuery = (kind, projectId, { beforeId = 0, ops = [], q: query = '', limit = 50 } = {}) => {
     const where = ['project_id = ?'];
     const params = [projectId];
-    if (kind === 'select' && beforeId) {
+    // 游标和 limit 都在这里再兜一次：调用方传进 NaN 的话，绑定到 SQL 里会变成
+    // datatype mismatch（500），或者被当成 NULL 变成「不限条数」
+    const cursor = Number(beforeId);
+    if (kind === 'select' && Number.isFinite(cursor) && cursor > 0) {
       where.push('id < ?');
-      params.push(Number(beforeId));
+      params.push(cursor);
     }
     if (ops.length) {
       where.push(`op IN (${ops.map(() => '?').join(',')})`);
@@ -469,12 +488,13 @@ export function openStore({ dbPath, userData } = {}) {
       params.push(`%${query}%`, `%${query}%`);
     }
     const body = where.join(' AND ');
+    const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 50;
     if (kind === 'count') {
       return { sql: `SELECT COUNT(*) AS c FROM event WHERE ${body}`, params };
     }
     return {
       sql: `SELECT * FROM event WHERE ${body} ORDER BY id DESC LIMIT ?`,
-      params: [...params, Number(limit)],
+      params: [...params, safeLimit],
     };
   };
 

@@ -1197,10 +1197,14 @@ const server = http.createServer(async (req, res) => {
         bookmarks: store.listBookmarks(PROJECT.id),
         events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
       };
-      const safe = String(PROJECT.name || 'session').replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_');
+      // 中文工程名不能直接塞进 header：HTTP 头是 latin1，Node 会抛
+      // ERR_INVALID_CHAR，导出直接 500。按 RFC 5987 给一份 ASCII 兜底名 +
+      // 一份 UTF-8 名（现代浏览器优先用 filename*）。
+      const safe = String(PROJECT.name || 'session').replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_') || 'session';
+      const ascii = safe.replace(/[^\x20-\x7e]/g, '_') || 'session';
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Content-Disposition': `attachment; filename="${safe}.cgx"`,
+        'Content-Disposition': `attachment; filename="${ascii}.cgx"; filename*=UTF-8''${encodeURIComponent(`${safe}.cgx`)}`,
         'Cache-Control': 'no-store',
       });
       return res.end(JSON.stringify(payload, null, 1));
@@ -1214,62 +1218,89 @@ const server = http.createServer(async (req, res) => {
         .then((p) => {
           if (!p || p.format !== 'tcu-callgraph-session') return bad(res, '不是 .cgx 会话文件');
           if (Number(p.version) > 1) return bad(res, `会话文件版本 ${p.version} 高于当前支持的 1`);
+          if (p.overlay !== undefined && !isPlainObject(p.overlay)) return bad(res, 'overlay 必须是对象');
+          if (p.bookmarks !== undefined && !Array.isArray(p.bookmarks)) return bad(res, 'bookmarks 必须是数组');
 
           const ov = p.overlay || {};
-          let annotations = 0;
-          for (const [id, data] of Object.entries(ov.nodes || {})) {
-            store.setAnnotation(PROJECT.id, 'node', id, data);
-            annotations++;
-          }
-          for (const [k, data] of Object.entries(ov.edges || {})) {
-            store.setAnnotation(PROJECT.id, 'edge', k, data);
-            annotations++;
-          }
+          const nodes = isPlainObject(ov.nodes) ? ov.nodes : {};
+          const edges = isPlainObject(ov.edges) ? ov.edges : {};
+          const layoutSlots = isPlainObject(ov.layout) ? ov.layout : {};
+          const delNodes = Object.keys(isPlainObject(ov.deleted?.nodes) ? ov.deleted.nodes : {});
+          const delEdges = Object.keys(isPlainObject(ov.deleted?.edges) ? ov.deleted.edges : {});
 
-          const delNodes = Object.keys((ov.deleted || {}).nodes || {});
-          const delEdges = Object.keys((ov.deleted || {}).edges || {});
-          if (delNodes.length || delEdges.length) {
-            store.setDeleted(PROJECT.id, { nodes: delNodes, edges: delEdges });
-          }
-
-          let layout = 0;
-          for (const [key, slot] of Object.entries(ov.layout || {})) {
-            const idx = key.lastIndexOf('::');
-            if (idx < 0) continue;
-            store.saveLayout(PROJECT.id, key.slice(0, idx), key.slice(idx + 2), {
-              nodes: slot.nodes || {},
-              edges: slot.edges || {},
-              manual: slot.manual || [],
-            });
-            layout++;
-          }
-
-          let bookmarks = 0;
-          for (const b of p.bookmarks || []) {
-            try {
-              store.saveBookmark(PROJECT.id, b);
-              bookmarks++;
-            } catch {
-              /* 单条书签不合法不影响整体导入 */
+          // 整段导入放一个事务：半路失败不留半份数据，也不会出现
+          // 「标注进来了、事件没记」导致回放和现状对不上
+          const result = store.transaction(() => {
+            let annotations = 0;
+            for (const [id, data] of Object.entries(nodes)) {
+              // 值必须是对象：字符串/数字会变成 {...'abc'} 这种垃圾写进库
+              if (!isPlainObject(data)) continue;
+              store.setAnnotation(PROJECT.id, 'node', id, data);
+              annotations++;
             }
-          }
+            for (const [k, data] of Object.entries(edges)) {
+              if (!isPlainObject(data)) continue;
+              store.setAnnotation(PROJECT.id, 'edge', k, data);
+              annotations++;
+            }
 
-          // 代码版本对不上时标注可能挂不到节点上，返回给前端提示
-          const fp = fingerprintFiles(MODEL.files);
-          const sameCode = !p.project?.fingerprint || p.project.fingerprint === fp;
+            if (delNodes.length || delEdges.length) {
+              store.setDeleted(PROJECT.id, { nodes: delNodes, edges: delEdges });
+            }
 
-          store.appendEvent(PROJECT.id, {
-            op: 'session.import',
-            target: p.project?.name || 'session',
-            after: { annotations, layout, bookmarks, sameCode },
+            let layout = 0;
+            for (const [key, slot] of Object.entries(layoutSlots)) {
+              const idx = key.lastIndexOf('::');
+              if (idx < 0 || !isPlainObject(slot)) continue;
+              store.saveLayout(PROJECT.id, key.slice(0, idx), key.slice(idx + 2), {
+                nodes: isPlainObject(slot.nodes) ? slot.nodes : {},
+                edges: isPlainObject(slot.edges) ? slot.edges : {},
+                manual: Array.isArray(slot.manual) ? slot.manual : [],
+              });
+              layout++;
+            }
+
+            let bookmarks = 0;
+            for (const b of p.bookmarks || []) {
+              try {
+                if (!isPlainObject(b)) continue;
+                store.saveBookmark(PROJECT.id, b);
+                bookmarks++;
+              } catch {
+                /* 单条书签不合法不影响整体导入 */
+              }
+            }
+
+            // 代码版本对不上时标注可能挂不到节点上，返回给前端提示
+            const fp = fingerprintFiles(MODEL.files);
+            const sameCode = !p.project?.fingerprint || p.project.fingerprint === fp;
+
+            // 事件必须带**导入后的全量状态**：回放靠它把这一刻整体覆盖回来。
+            // 只记几个计数的话，at=这一刻 重放出来是导入前的样子，restore 还会把导入的东西抹掉。
+            store.appendEvent(PROJECT.id, {
+              op: 'session.import',
+              target: p.project?.name || 'session',
+              after: {
+                ...store.loadOverlay(PROJECT.id),
+                summary: { annotations, layout, bookmarks, sameCode },
+              },
+            });
+
+            return { annotations, layout, bookmarks, delNodes, delEdges, sameCode };
           });
+
           reloadOverlay();
 
           json(res, {
             ok: true,
-            sameCode,
+            sameCode: result.sameCode,
             from: p.project?.name || '',
-            imported: { annotations, layout, bookmarks, deleted: delNodes.length + delEdges.length },
+            imported: {
+              annotations: result.annotations,
+              layout: result.layout,
+              bookmarks: result.bookmarks,
+              deleted: result.delNodes.length + result.delEdges.length,
+            },
           });
         })
         .catch((err) => {
@@ -1280,7 +1311,10 @@ const server = http.createServer(async (req, res) => {
 
     // 时间轴：分页 + 过滤。默认只回 brief，不回完整载荷
     if (u.pathname === '/api/events') {
-      const limit = Math.min(200, Math.max(1, Number(u.searchParams.get('limit') || 50)));
+      // 用 Number.isFinite 兜住 limit=abc 这种输入：Math.max(1, NaN) 还是 NaN，
+      // 一路传进 SQL 的 LIMIT 会变成 datatype mismatch（500）
+      const rawLimit = Number(u.searchParams.get('limit') ?? 50);
+      const limit = Math.min(200, Math.max(1, Number.isFinite(rawLimit) ? Math.trunc(rawLimit) : 50));
       const beforeId = Number(u.searchParams.get('before') || 0) || 0;
       const ops = (u.searchParams.get('ops') || '').split(',').filter(Boolean);
       const query = (u.searchParams.get('q') || '').trim();

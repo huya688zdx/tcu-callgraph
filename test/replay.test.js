@@ -121,7 +121,8 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
 
   await jsonPost(base, '/api/bookmarks/delete', { id });
 
-  const events = await (await fetch(`${base}/api/events?limit=20`)).json();
+  // detail=1 才回完整载荷：默认列表只给 brief，用来渲染时间轴
+  const events = await (await fetch(`${base}/api/events?limit=20&detail=1`)).json();
   const del = events.events.find((e) => e.op === 'bookmark.delete' && e.target === '换挡链路');
   assert.ok(del, '删除应留下时间轴事件');
   // 整份视图参数都要在，否则「删了再想恢复」只剩个名字
