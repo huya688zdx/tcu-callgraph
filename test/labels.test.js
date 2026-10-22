@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import {
   CONN_PREFIX,
   LABEL_MAX_DIST,
+  LABEL_PRESETS,
   clampLabelCenter,
   labelSize,
   labelText,
@@ -131,4 +132,26 @@ test('clampLabelCenter：拖太远会被拉回，压住节点则拒绝移动', (
 
   const nodes = [{ id: 'n', x: 40, y: 60, w: 120, h: 80 }];
   assert.equal(clampLabelCenter({ x: 100, y: 100 }, { size, pts, nodes }), null);
+});
+
+test('normalizeLabel：只给 preset 时套用预设样式，显式 null 才是「不要边框」', () => {
+  // MCP / 脚本通常只传 preset：不套预设的话结合点会变成黑字无框，跟界面里不一样
+  const conn = normalizeLabel({ preset: 'conn' });
+  assert.equal(conn.border, LABEL_PRESETS.conn.border);
+  assert.equal(conn.color, LABEL_PRESETS.conn.color);
+  assert.equal(conn.num, 1);
+
+  const task = normalizeLabel({ preset: 'task', text: 'TASK:2ms' });
+  assert.equal(task.border, LABEL_PRESETS.task.border);
+
+  // 用户手动去掉边框 → 存 null → 读回来必须还是 null，不能被预设补回去
+  const noBorder = normalizeLabel({ preset: 'task', text: 'x', border: null });
+  assert.equal(noBorder.border, null);
+});
+
+test('normalizeLabel：custom 预设没有默认样式，颜色退回默认黑', () => {
+  const l = normalizeLabel({ preset: 'custom', text: '随便写' });
+  assert.equal(l.preset, 'custom');
+  assert.equal(l.border, null);
+  assert.equal(l.color, '#2C2C2A');
 });

@@ -57,8 +57,19 @@ export function normalizeLabel(raw) {
     const m = /(\d+)\s*$/.exec(String(raw.text || ''));
     num = m ? Math.max(1, parseInt(m[1], 10)) : 1;
   }
-  const border = raw.border == null || raw.border === '' ? null : HEX.test(raw.border) ? raw.border : null;
-  const color = HEX.test(raw.color || '') ? raw.color : '#2C2C2A';
+  // 边框 / 文字色：字段「没给」时用预设的样式（MCP 只传 preset 也能得到红框红字），
+  // 显式传 null 才表示「不要边框」——两者必须区分开，否则用户去掉边框后
+  // 再读回来又会被补上。
+  const presetDef = LABEL_PRESETS[preset] || null;
+  const border =
+    raw.border === undefined
+      ? (presetDef && presetDef.border) || null
+      : raw.border == null || raw.border === ''
+      ? null
+      : HEX.test(raw.border)
+      ? raw.border
+      : null;
+  const color = HEX.test(raw.color || '') ? raw.color : (presetDef && presetDef.color) || '#2C2C2A';
   const dx = Number.isFinite(Number(raw.dx)) ? clamp(Number(raw.dx), -600, 600) : 0;
   const dy = Number.isFinite(Number(raw.dy)) ? clamp(Number(raw.dy), -600, 600) : 0;
   const text =

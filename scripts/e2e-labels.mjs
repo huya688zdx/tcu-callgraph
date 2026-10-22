@@ -325,6 +325,28 @@ check(
 await screenshot(SHOT);
 console.log('截图:', SHOT);
 
+// 12) 撤销：标签是即时落库的，撤销必须把差异也写回，否则刷新后又变回来
+console.log('12) 撤销标签');
+{
+  const before = (await evaluate('window.__cg.labels()')).length;
+  const pick = await evaluate(PICK_EDGE);
+  await click(pick.x, pick.y);
+  await waitFor(`!!document.querySelector('.lbl-preset')`);
+  await evaluate(`document.querySelector('.lbl-preset[data-preset="task"]').click()`);
+  await sleep(600);
+  check((await evaluate('window.__cg.labels()')).length === before + 1, '加了一条新标签');
+
+  await pressKey({ key: 'z', code: 'KeyZ', vk: 90, modifiers: 2 }); // Ctrl+Z
+  await sleep(800);
+  check((await evaluate('window.__cg.labels()')).length === before, '撤销后画布上的标签消失');
+
+  // 关键断言：刷新后不能复活。复活说明撤销只改了画布、没写回库
+  await evaluate('location.reload()');
+  await waitFor('!!(window.__cg && window.__cg.view)', { timeoutMs: 20000 });
+  await sleep(600);
+  check((await evaluate('window.__cg.labels()')).length === before, '刷新后标签仍是撤销后的状态（撤销已写回库）');
+}
+
 await cdp.close();
 await server.close();
 console.log(ok ? '\n全部通过' : '\n有检查失败');

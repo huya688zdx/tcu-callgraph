@@ -79,17 +79,45 @@ function applySnapshot(str) {
   const s = JSON.parse(str);
   const v = state.view;
   if (!v) return;
+  // 标签是「改了就落库」的（不像坐标要等 savePositionsOnly），
+  // 所以撤销时必须把标签差异也写回服务端，否则画布回退了、库里还是新值，
+  // 刷新一下又变回来——看起来像撤销没生效。
+  const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.label || null)]));
   v.nodes = s.nodes;
   v.edges = s.edges.map((e) => ({ ...e }));
   if (s.groups) v.groups = s.groups;
   state.selected = null;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   state.hover = null;
   draw();
+  persistLabelDiff(before);
   // 只落盘节点坐标。不能走 saveLayout(true)：那会把每条边都写成 {custom:true, points}，
   // 服务端从此不再自动布线（见下面 savePositionsOnly 的注释）
   savePositionsOnly();
   updateHistoryButtons();
+}
+
+/** 把快照恢复后与恢复前的标签差异逐条写回；失败只打日志，不打断撤销流程 */
+function persistLabelDiff(before) {
+  const v = state.view;
+  if (!v) return;
+  const changed = v.edges.filter((e) => {
+    const key = edgeKey(e);
+    return before.has(key) && before.get(key) !== JSON.stringify(e.label || null);
+  });
+  if (!changed.length) return;
+  (async () => {
+    for (const e of changed) {
+      try {
+        const r = await api.overlay({ edgeKey: edgeKey(e), data: { label: e.label || null } });
+        // 回看模式（state.at > 0）会拦写操作，这不是错误，安静跳过
+        if (r && r.ok === false && r.error !== 'review-mode') console.warn('[撤销] 标签写回被拒：', r.error);
+      } catch (err) {
+        console.warn('[撤销] 标签写回失败：', err);
+      }
+    }
+  })();
 }
 
 function undo() {

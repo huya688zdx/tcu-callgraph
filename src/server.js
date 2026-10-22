@@ -13,7 +13,7 @@ import { exportSvg } from './core/export-svg.js';
 import { createMcpServer } from './mcp.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
-import { normalizeLabel } from './core/labels.js';
+import { normalizeLabel, nextConnNumber, CONN_PREFIX } from './core/labels.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.resolve(__dirname, '../web');
@@ -1244,6 +1244,10 @@ const server = http.createServer(async (req, res) => {
             }
             for (const [k, data] of Object.entries(edges)) {
               if (!isPlainObject(data)) continue;
+              // 会话文件是外部来源：标签同样要过一遍规整，别把别人手改的颜色 / 超长文字写进库
+              if (data.label !== undefined) {
+                data.label = data.label === null ? null : normalizeLabel(data.label);
+              }
               store.setAnnotation(PROJECT.id, 'edge', k, data);
               annotations++;
             }
@@ -1564,7 +1568,19 @@ const server = http.createServer(async (req, res) => {
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           // 连线标签：写入前先按同一套规则规整，脏数据不落库
           if (patch.data.label !== undefined) {
-            patch.data.label = patch.data.label === null ? null : normalizeLabel(patch.data.label);
+            const raw = patch.data.label;
+            patch.data.label = raw === null ? null : normalizeLabel(raw);
+            // 结合点编号本该由系统分配。界面会自己算好 num 传上来，
+            // 但 MCP / 脚本调 cg_annotate 时通常只给 preset，规整后大家都会变成
+            // 「結合点：1」——同一画面里全重号。这里替外部写入补一次最小未占用值。
+            if (patch.data.label && patch.data.label.preset === 'conn' && !Number.isFinite(Number(raw?.num))) {
+              const used = Object.values(overlay.edges || {})
+                .map((o) => normalizeLabel(o && o.label))
+                .filter(Boolean);
+              const num = nextConnNumber(used);
+              patch.data.label.num = num;
+              patch.data.label.text = CONN_PREFIX + num;
+            }
           }
           overlay.nodes = overlay.nodes || {};
           overlay.edges = overlay.edges || {};

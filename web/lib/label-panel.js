@@ -20,6 +20,32 @@ const PRESET_UI = [
 ];
 
 let saveTimer = null;
+// 待落库的那条边：面板重绘 / 换选中时要把这次保存**冲掉再换**，不能直接丢
+let pendingEdge = null;
+
+/**
+ * 立刻执行挂起的保存。
+ * 以前这里是 clearTimeout 直接丢掉——用户改完立刻点别的连线，
+ * 面板一重绘，那次改动就再也不会写库了（画布上看着改了，刷新就没了）。
+ */
+function flushPendingSave() {
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const edge = pendingEdge;
+  pendingEdge = null;
+  if (edge) commit(edge);
+}
+
+function scheduleCommit(edge, delay = 160) {
+  flushPendingSave(); // 上一条边的挂起保存先落地，别被下一条覆盖
+  pendingEdge = edge;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    pendingEdge = null;
+    commit(edge);
+  }, delay);
+}
 
 function nodeName(id) {
   const n = state.view?.nodes.find((x) => x.id === id);
@@ -34,20 +60,12 @@ async function commit(edge) {
   pushHistory();
 }
 
-function scheduleCommit(edge, delay = 160) {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    commit(edge);
-  }, delay);
-}
-
 export function renderLabelPanel() {
   const sec = els.secLabel;
   const box = els.labelPanel;
   if (!sec || !box) return;
-  clearTimeout(saveTimer);
-  saveTimer = null;
+  // 重绘前先把挂起的改动落库：直接 clearTimeout 会把它丢掉
+  flushPendingSave();
 
   const edge = state.selectedEdge;
   if (!edge) {
