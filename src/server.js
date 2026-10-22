@@ -944,6 +944,54 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 书签：把「入口集合 + 深度 + 模式」存成名字，一键跳回
+    if (u.pathname === '/api/bookmarks') {
+      if (req.method === 'GET') return json(res, { list: store.listBookmarks(PROJECT.id) });
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        readJson(req, res)
+          .then((p) => {
+            try {
+              const r = store.saveBookmark(PROJECT.id, p);
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.save',
+                target: r.bookmark.name,
+                after: {
+                  roots: r.bookmark.roots,
+                  up: r.bookmark.up,
+                  down: r.bookmark.down,
+                  group: r.bookmark.group,
+                },
+              });
+              json(res, { ok: true, ...r });
+            } catch (err) {
+              bad(res, String(err.message || err));
+            }
+          })
+          .catch((err) => {
+            if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+          });
+        return;
+      }
+    }
+
+    if (u.pathname === '/api/bookmarks/delete' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const id = Number(p.id);
+          if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          const gone = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
+          const ok = store.deleteBookmark(PROJECT.id, id);
+          if (ok) store.appendEvent(PROJECT.id, { op: 'bookmark.delete', target: gone?.name || `#${id}` });
+          json(res, { ok, removed: ok ? 1 : 0 });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
     // 时间轴：操作事件列表（倒序，最新在前）
     if (u.pathname === '/api/events') {
       const limit = Math.min(1000, Math.max(1, Number(u.searchParams.get('limit') || 200)));

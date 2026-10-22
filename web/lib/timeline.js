@@ -84,6 +84,10 @@ function describe(e) {
       return '导入旧版 out/overlay.json';
     case 'restore_point':
       return `恢复到 ${target || '历史时刻'}`;
+    case 'bookmark.save':
+      return `保存书签「${target}」`;
+    case 'bookmark.delete':
+      return `删除书签「${target}」`;
     default:
       return t(`op.${e.op}`) || e.op;
   }

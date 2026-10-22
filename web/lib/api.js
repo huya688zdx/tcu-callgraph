@@ -17,7 +17,7 @@ const post = (url, body) =>
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks']);
 const guardWrite = (name) => {
   if (state.at > 0 && WRITE_OPS.has(name)) {
     document.dispatchEvent(new CustomEvent('cg:review-blocked'));
@@ -55,6 +55,10 @@ export const api = {
   /** 失效标注：库里指向已不存在的函数 / 连线的条目 */
   orphans: () => get('/api/orphans'),
   purgeOrphans: () => guardWrite('orphans') || post('/api/orphans/purge', {}),
+  /** 书签：保存的视图（入口集合 + 深度 + 模式） */
+  bookmarks: () => get('/api/bookmarks'),
+  saveBookmark: (body) => guardWrite('bookmarks') || post('/api/bookmarks', body),
+  deleteBookmark: (id) => guardWrite('bookmarks') || post('/api/bookmarks/delete', { id }),
   /** 全工程全局变量 / 常量清单 */
   vars: () => get('/api/vars'),
   tree: () => get('/api/tree'),

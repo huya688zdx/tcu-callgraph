@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS project (
@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS parse_cache (
   stats       TEXT,
   model       BLOB
 );
+
+CREATE TABLE IF NOT EXISTS bookmark (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  roots      TEXT NOT NULL DEFAULT '[]',
+  up         INTEGER NOT NULL DEFAULT 0,
+  down       INTEGER NOT NULL DEFAULT 3,
+  grouped    INTEGER NOT NULL DEFAULT 1,
+  fixed      INTEGER NOT NULL DEFAULT 1,
+  vars       TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (project_id, name)
+);
+CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS setting (
   key   TEXT PRIMARY KEY,
@@ -200,8 +216,20 @@ const parse = (s, fallback) => {
 
 const str = (s) => JSON.stringify(s ?? null);
 
-const toEvent = (r) => ({
+const toBookmark = (r) => ({
   id: r.id,
+  name: r.name,
+  roots: parse(r.roots, []),
+  up: r.up,
+  down: r.down,
+  group: !!r.grouped,
+  fixed: !!r.fixed,
+  vars: parse(r.vars, []),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at,
+});
+
+const toEvent = (r) => ({  id: r.id,
   ts: r.ts,
   seq: r.seq,
   actor: r.actor,
@@ -285,11 +313,42 @@ function applyEvent(ov, e) {
   }
 }
 
+/**
+ * 版本化迁移。
+ * 新库直接跑全量 SCHEMA（永远是最新结构）；老库按版本号逐级补差量。
+ * 每次加表都要：把 DDL 写进 SCHEMA（给新库）、再补一条 ALTER 分支（给老库）、
+ * SCHEMA_VERSION 加一。漏掉任何一步都会出现「新库能用、老库报 no such table」。
+ */
 function migrate(db) {
   const row = db.prepare('PRAGMA user_version').get() || {};
   const cur = Number(row.user_version ?? 0);
   if (cur >= SCHEMA_VERSION) return cur;
-  db.exec(SCHEMA);
+
+  if (cur < 1) {
+    db.exec(SCHEMA); // 全量建表，含最新加的表
+  } else {
+    // v1 → v2：书签
+    if (cur < 2) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS bookmark (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+          name       TEXT NOT NULL,
+          roots      TEXT NOT NULL DEFAULT '[]',
+          up         INTEGER NOT NULL DEFAULT 0,
+          down       INTEGER NOT NULL DEFAULT 3,
+          grouped    INTEGER NOT NULL DEFAULT 1,
+          fixed      INTEGER NOT NULL DEFAULT 1,
+          vars       TEXT NOT NULL DEFAULT '[]',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE (project_id, name)
+        );
+        CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
+      `);
+    }
+  }
+
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   return SCHEMA_VERSION;
 }
@@ -383,6 +442,18 @@ export function openStore({ dbPath, userData } = {}) {
     cachePrune: db.prepare(
       'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC LIMIT ?)'
     ),
+
+    bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),
+    bmByName: db.prepare('SELECT * FROM bookmark WHERE project_id = ? AND name = ?'),
+    bmUpsert: db.prepare(
+      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, fixed, vars, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, name) DO UPDATE SET
+         roots = excluded.roots, up = excluded.up, down = excluded.down,
+         grouped = excluded.grouped, fixed = excluded.fixed, vars = excluded.vars,
+         updated_at = excluded.updated_at`
+    ),
+    bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
   };
 
   let seqInMs = 0;
@@ -607,6 +678,41 @@ export function openStore({ dbPath, userData } = {}) {
 
     setSetting(key, value) {
       q.settingPut.run(key, str(value));
+    },
+
+    /** 书签：把「入口集合 + 深度 + 模式」存成一个名字，一键跳回去 */
+    listBookmarks(projectId) {
+      return q.bmList.all(projectId).map(toBookmark);
+    },
+
+    /**
+     * 保存书签。同名视为覆盖（UNIQUE(project_id,name) + upsert），
+     * 用户不用先删再存；返回是否覆盖，前端据此提示。
+     */
+    saveBookmark(projectId, { name, roots = [], up = 0, down = 3, group = true, fixed = true, vars = [] }) {
+      const clean = String(name || '').trim();
+      if (!clean) throw new Error('书签名称不能为空');
+      if (!Array.isArray(roots)) throw new Error('roots 必须是数组');
+      const existed = !!q.bmByName.get(projectId, clean);
+      const ts = nowMs();
+      q.bmUpsert.run(
+        projectId,
+        clean,
+        str(roots),
+        Number(up) || 0,
+        Number(down) || 0,
+        group ? 1 : 0,
+        fixed ? 1 : 0,
+        str(Array.isArray(vars) ? vars : []),
+        ts,
+        ts
+      );
+      return { bookmark: toBookmark(q.bmByName.get(projectId, clean)), overwritten: existed };
+    },
+
+    deleteBookmark(projectId, id) {
+      const r = q.bmDelete.run(projectId, Number(id));
+      return r.changes > 0;
     },
 
     /**

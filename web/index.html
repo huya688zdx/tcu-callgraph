@@ -281,6 +281,18 @@
     font-size: 11px; color: #888780; padding: 10px 9px 4px; font-weight: 500;
   }
 
+  /* 书签行 */
+  .bm { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 9px; cursor: pointer; }
+  .bm:hover { background: #F5F4EF; }
+  .bm .nm { font-size: 13px; font-weight: 500; word-break: break-all; }
+  .bm .meta { color: #888780; font-size: 11.5px; margin-top: 1px; }
+  .bm .del {
+    opacity: 0; border: 0; background: transparent; color: #A32D2D;
+    cursor: pointer; font-size: 15px; line-height: 1; padding: 3px 7px; border-radius: 6px;
+  }
+  .bm:hover .del { opacity: 1; }
+  .bm .del:hover { background: #FCEBEB; }
+
   /* 失效标注提示：贴在工程面板底部，有内容才出现 */
   .orphan-box { display: none; }
   .orphan-box.show {
@@ -339,6 +351,7 @@
     <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
     <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
     <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
+    <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
     <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
     <div class="spacer"></div>
     <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击函数下钻 · Ctrl+Z 回退视图 · 拖节点自动重布线 · 双击连线恢复自动</span>
@@ -401,6 +414,18 @@
       <button class="modal-close" data-close="timelineModal">&times;</button>
     </div>
     <div class="modal-body" id="timelineList"></div>
+  </div>
+
+  <div id="bookmarkModal" class="modal">
+    <div class="modal-head">
+      <h2 data-i18n="bookmark.title">视图书签</h2>
+      <button class="modal-close" data-close="bookmarkModal">&times;</button>
+    </div>
+    <div class="modal-body" id="bookmarkList"></div>
+    <div class="modal-foot">
+      <input id="bookmarkName" type="text" placeholder="给当前视图起个名字，如「换挡链路」" data-i18n-ph="bookmark.placeholder">
+      <button id="bookmarkSave" class="primary" data-i18n="bookmark.save">保存当前视图</button>
+    </div>
   </div>
 
   <aside id="right">

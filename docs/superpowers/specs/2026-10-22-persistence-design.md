@@ -342,3 +342,37 @@ Electron：无参数启动时先读本地库，回到最近打开的工程；有
 - `npm test` 52/52（`store.test.js` 新增 3 项：目标汇总、只删传入条目、空槽位回收；`orphans.test.js` 新增 5 项，其中一条是变量误判的真实回归）。
 - `e2e-session.mjs` 新增测试 7：造一条失效标注 → 面板出现提示 → 点清理 → 提示消失且 `/api/orphans` 归零。
 - 服务端实测：造节点标注 + 连线标注 + 失效入口槽位共 3 条，`dry` 不动库，清理后正常标注（`main.c::main`）保留。
+
+## 第三阶段（其二）：视图书签（已完成）
+
+把「入口集合 + 上下深度 + 分组/固定模式 + 勾选的变量」存成一个名字，下次一键跳回。TCU 这种图每次找入口要点好几下文件树，书签解决的是这个。
+
+### 表结构
+
+`bookmark(project_id, name, roots, up, down, grouped, fixed, vars, created_at, updated_at)`，`UNIQUE(project_id, name)`。
+
+同名保存走 `ON CONFLICT DO UPDATE`，等于覆盖，用户不用先删再存；接口返回 `overwritten` 让前端提示「已覆盖同名书签」。
+
+### schema 版本化（v1 → v2）
+
+这是第一次真的需要增量迁移——线上库已经是 v1 了。`migrate()` 改成：
+
+- `cur < 1`：跑全量 `SCHEMA`（永远是最新结构，新库一步到位）
+- `cur === 1`：只补 `bookmark` 的 DDL
+- 最后统一写 `user_version = 2`
+
+加表时必须同步三处：`SCHEMA` 里的 DDL（给新库）、`ALTER` 分支（给老库）、`SCHEMA_VERSION` 加一。漏掉中间那步就是典型的「新装的能用、老用户报 no such table」。
+
+### 接口与界面
+
+- `GET /api/bookmarks`、`POST /api/bookmarks`、`POST /api/bookmarks/delete`
+- 保存 / 删除都记事件（`bookmark.save` / `bookmark.delete`），时间轴里显示「保存书签「换挡链路」」
+- `web/lib/bookmarks.js`：顶栏「书签」按钮 → 面板，底部输入名字保存当前视图；点条目跳回，悬停出现删除
+- 跳回时同步更新工具栏的深度下拉、分组勾选、固定布局按钮，否则界面和实际视图会对不上
+- 书签也是写操作，回看模式下同样被 `api.js` 拦掉
+
+### 验收
+
+- `npm test` 55/55（新增 3 项：书签按工程隔离且同名覆盖、空名与跨工程删除校验、v1 老库自动补表且数据不丢）。
+- `e2e-session.mjs` 新增测试 8：保存「换挡链路」→ 把深度改成 1 层 → 点书签跳回 → 深度和入口都还原 → 删除成功。
+- 真实库已从 v1 升到 v2，`bookmark` 表就位，原有标注 / 布局 / 事件一条没丢。

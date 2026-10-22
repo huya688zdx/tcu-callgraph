@@ -18,6 +18,7 @@ import { clearDataflow } from './lib/df.js';
 // 工程切换与时间轴面板同样自带事件注册
 import './lib/projects.js';
 import './lib/timeline.js';
+import './lib/bookmarks.js';
 
 /**
  * 加载视图
@@ -79,6 +80,26 @@ async function loadView(rootId, opts = {}) {
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
 hooks.renderDetail = renderDetail;
+
+/** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
+hooks.applyBookmark = async (b) => {
+  state.at = 0;
+  state.up = Number(b.up) || 0;
+  state.down = Number(b.down) || 3;
+  state.group = !!b.group;
+  state.fixed = !!b.fixed;
+  state.vars = new Set(b.vars || []);
+  state.hiddenVars.clear();
+
+  els.depth.value = String(state.down);
+  els.updepth.value = String(state.up);
+  els.groupMode.checked = state.group;
+  applyLayoutMode();
+
+  const roots = (b.roots || []).filter(Boolean);
+  await loadView(roots.length ? roots : null);
+  await loadVars();
+};
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async () => {

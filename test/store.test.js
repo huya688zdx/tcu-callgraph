@@ -252,3 +252,71 @@ test('store：purgeTargets 清掉槽位里最后一个节点时整个槽位一�
   store.purgeTargets(p.id, { layoutNodes: [{ viewKey: 'x.c::f', mode: 'flat', ids: ['keep.c::f'] }] });
   assert.equal(store.loadOverlay(p.id).layout['x.c::f::flat'], undefined, '空槽位应被删掉');
 });
+
+test('store：书签按工程隔离，同名保存覆盖而不是新增', (t) => {
+  const store = tmpStore(t);
+  const a = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  const b = store.upsertProject({ path: PROJ_B, name: 'beta' });
+
+  const r1 = store.saveBookmark(a.id, { name: '换挡链路', roots: ['gear.c::Gear_Apply'], up: 1, down: 2 });
+  assert.equal(r1.overwritten, false);
+  assert.deepEqual(r1.bookmark.roots, ['gear.c::Gear_Apply']);
+
+  const r2 = store.saveBookmark(a.id, { name: '换挡链路', roots: ['gear.c::Gear_Apply'], up: 0, down: 5 });
+  assert.equal(r2.overwritten, true);
+  assert.equal(r2.bookmark.id, r1.bookmark.id, '同名保存应复用同一条记录');
+  assert.equal(r2.bookmark.down, 5);
+
+  assert.equal(store.listBookmarks(a.id).length, 1);
+  assert.equal(store.listBookmarks(b.id).length, 0, '别的工程看不到');
+});
+
+test('store：书签名称不能为空，删除按工程校验', (t) => {
+  const store = tmpStore(t);
+  const a = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  const b = store.upsertProject({ path: PROJ_B, name: 'beta' });
+
+  assert.throws(() => store.saveBookmark(a.id, { name: '   ', roots: [] }), /名称不能为空/);
+
+  const { bookmark } = store.saveBookmark(a.id, { name: 'x', roots: ['a::b'] });
+  assert.equal(store.deleteBookmark(b.id, bookmark.id), false, '不能删别的工程的书签');
+  assert.equal(store.deleteBookmark(a.id, bookmark.id), true);
+  assert.equal(store.listBookmarks(a.id).length, 0);
+});
+
+test('store：v1 老库能自动补出 bookmark 表且数据不丢', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mig-'));
+  const file = path.join(dir, 'callgraph.db');
+  let second = null;
+  // 清理必须在 close 之后：WAL 文件被占用时 rm 会 EBUSY
+  t.after(() => {
+    try {
+      second?.close();
+    } catch {
+      /* 已关闭 */
+    }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* 临时目录删不掉不影响结论 */
+    }
+  });
+
+  // 造一个「v1 结构」的库：有标注、没有 bookmark 表
+  const first = openStore({ dbPath: file });
+  const p = first.upsertProject({ path: PROJ_A, name: 'alpha' });
+  first.setAnnotation(p.id, 'node', 'x.c::f', { note: '老数据' });
+  first.db.exec('DROP TABLE bookmark');
+  first.db.exec('PRAGMA user_version = 1');
+  first.close();
+
+  // 再用新代码打开，应自动补表
+  second = openStore({ dbPath: file });
+  assert.ok(second.version >= 2);
+  const hasTable = !!second.db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmark'")
+    .get();
+  assert.equal(hasTable, true);
+  assert.equal(second.loadOverlay(p.id).nodes['x.c::f'].note, '老数据');
+  assert.deepEqual(second.listBookmarks(p.id), []);
+});
