@@ -315,3 +315,47 @@ test('e2e：默认权限 readonly——写工具被拒、读与导出可用', as
     await srv.close();
   }
 });
+
+test('e2e：/mcp 与其他写端点同一道跨站守卫（CSRF 回归）', async () => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  try {
+    const base = srv.baseUrl;
+    const body = rpc('tools/call', { name: 'cg_stats', arguments: {} }, 1);
+
+    // 1) 伪造外站 Origin：必须 403。浏览器发的跨站请求一定带 Origin，
+    //    挡在这里，恶意页面就无法借用户的 localhost 服务改图。
+    const evil = await fetch(base + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'http://evil.example' },
+      body,
+    });
+    assert.equal(evil.status, 403, '跨站 Origin 必须被拒');
+
+    // 2) text/plain 的「简单请求」不触发预检，靠 Content-Type 兜住
+    const form = await fetch(base + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body,
+    });
+    assert.equal(form.status, 415, '非 JSON 的 Content-Type 必须被拒');
+
+    // 3) 正常客户端（无 Origin + application/json）不受影响
+    const ok = await fetch(base + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    assert.equal(ok.status, 200, '正常 MCP 客户端应放行');
+    assert.ok((await ok.json()).result, '正常客户端应拿到结果');
+
+    // 4) 本机来源也放行（Electron / 浏览器内的 MCP 面板）
+    const local = await fetch(base + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: base },
+      body,
+    });
+    assert.equal(local.status, 200, '本机来源应放行');
+  } finally {
+    await srv.close();
+  }
+});

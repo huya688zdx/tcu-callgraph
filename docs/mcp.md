@@ -44,6 +44,19 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 
 运行时查询：`GET /api/mcp-config` 返回 `{ level, source }`（source ∈ env / setting / default）。
 
+### 访问来源限制
+
+`/mcp` 与其他写接口共用同一道守卫：
+
+- **Origin**：带了 Origin 且不是 `http(s)://127.0.0.1` / `localhost` 的请求一律 403；
+- **Content-Type**：必须是 `application/json`，`text/plain` 之类的「简单请求」一律 415。
+
+这两条是防 CSRF 的：浏览器发跨站请求一定带 Origin，而 `text/plain` 的 POST 不触发预检，
+不挡的话任意网页都能借用户开着的本地服务调用工具（`readwrite` 下等于能改标注、删节点）。
+命令行 / MCP 客户端（Claude Desktop 等）不带 Origin、发 `application/json`，不受影响。
+
+服务本身只监听 `127.0.0.1`，不对局域网开放。
+
 ## 工具清单（19 个）
 
 前缀 `cg_`。所有写操作在时间轴里以 `actor=ai` 记录，与人工改动可区分、可恢复。

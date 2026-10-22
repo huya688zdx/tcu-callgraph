@@ -389,3 +389,46 @@ test('store：导出的事件按 id 升序且带完整载荷', (t) => {
   assert.ok(dump[0].id < dump[1].id, '导出必须按 id 升序，导入方才能按序重放');
   assert.deepEqual(dump[0].after, { change: 'added' });
 });
+
+test('store：busy_timeout 已设置，撞写锁会等而不是立刻 SQLITE_BUSY', (t) => {
+  const s = tmpStore(t);
+  const ms = s.db.prepare('PRAGMA busy_timeout').get().timeout;
+  assert.equal(ms, 5000);
+});
+
+test('store：transaction 可嵌套，外层回滚会连同内层一起撤销', (t) => {
+  const s = tmpStore(t);
+  const p = s.upsertProject({ path: PROJ_A, name: 'alpha' });
+
+  // 嵌套提交：内层的 setAnnotation 自己开了事务，外层包一层不应报
+  // "cannot start a transaction within a transaction"
+  s.transaction(() => {
+    s.setAnnotation(p.id, 'node', 'a.c::f', { note: '外层' });
+    s.transaction(() => {
+      s.setAnnotation(p.id, 'node', 'b.c::g', { note: '内层' });
+    });
+  });
+  assert.equal(s.loadOverlay(p.id).nodes['a.c::f'].note, '外层');
+  assert.equal(s.loadOverlay(p.id).nodes['b.c::g'].note, '内层');
+
+  // 外层抛错 → 内层写入也必须一起回滚，不能留下半截状态
+  assert.throws(() =>
+    s.transaction(() => {
+      s.setAnnotation(p.id, 'node', 'c.c::h', { note: '该被撤销' });
+      s.transaction(() => s.setAnnotation(p.id, 'node', 'd.c::i', { note: '也该被撤销' }));
+      throw new Error('boom');
+    })
+  );
+  const ov = s.loadOverlay(p.id);
+  assert.equal(ov.nodes['c.c::h'], undefined, '外层写入应回滚');
+  assert.equal(ov.nodes['d.c::i'], undefined, '内层写入应随外层回滚');
+  assert.equal(ov.nodes['a.c::f'].note, '外层', '回滚不应影响之前已提交的数据');
+});
+
+test('store：同一路径不同大小写认成同一个工程（Windows 大小写不敏感）', (t) => {
+  const s = tmpStore(t);
+  const a = s.upsertProject({ path: 'C:/Proj/Alpha', name: 'alpha' });
+  const b = s.upsertProject({ path: 'c:/proj/alpha', name: 'alpha' });
+  assert.equal(b.id, a.id, '大小写不同不应新建工程');
+  assert.equal(s.listProjects().length, 1, '工程表里只应有一条');
+});

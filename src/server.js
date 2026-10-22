@@ -38,6 +38,8 @@ let MODEL = null;
 let S = null;
 let PROJECT = null;
 let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {} }, layout: {} };
+// 工程切换互斥：openTarget 里有 await，不挡的话两个切换请求会交错改写上面这批变量
+let switching = false;
 
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
@@ -241,6 +243,21 @@ const json = (res, obj, code = 200) => {
 const bad = (res, msg) => json(res, { ok: false, error: msg }, 400);
 
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * 书签事件的载荷：把一份书签摊平成「能完整重建它」的最小集合。
+ * 时间轴的 before/after 都用它——漏字段的话事件就是有损的，
+ * 以后想「恢复到删掉书签之前」会还原出一个缺 fixed / vars 的残本。
+ */
+const bookmarkEventPayload = (b) => ({
+  name: b.name,
+  roots: b.roots || [],
+  up: b.up,
+  down: b.down,
+  group: !!b.group,
+  fixed: !!b.fixed,
+  vars: b.vars || [],
+});
 
 /** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
 const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
@@ -884,6 +901,10 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'POST' });
         return res.end(JSON.stringify({ error: '只支持 POST' }));
       }
+      // 与其他写端点同一道守卫：拒绝跨站来源与非 JSON 请求。
+      // 少了这一步，任意网页都能用 text/plain 的「简单请求」（不触发预检）跨站调用工具，
+      // 在 readwrite 权限下等于把改标注 / 删节点的能力开放给整个互联网。
+      if (!guardWrite(req, res)) return;
       let raw;
       try {
         raw = await readRawBody(req);
@@ -1027,6 +1048,10 @@ const server = http.createServer(async (req, res) => {
     // 切换工程：重新解析目标并整体替换会话状态，前端拿到新统计后重载数据即可
     if (u.pathname === '/api/switch' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
+      // openTarget 里有 await（重建数据流索引），期间第二个切换请求会插进来
+      // 交错改写 MODEL / PROJECT / overlay——A 工程的标注就可能写进 B 的 project_id。
+      // 这里用一把简单的锁：切换期间再来的请求直接 409，让前端等上一次完成。
+      if (switching) return json(res, { ok: false, error: '正在切换工程，请稍候' }, 409);
       readJson(req, res)
         .then(async (p) => {
           let targetPath = typeof p.path === 'string' ? p.path : '';
@@ -1036,6 +1061,7 @@ const server = http.createServer(async (req, res) => {
             targetPath = pr.path;
           }
           if (!targetPath) return bad(res, 'id 或 path 必须给一个');
+          switching = true;
           try {
             const { project, stats: st } = await openTarget(targetPath);
             json(res, {
@@ -1045,9 +1071,12 @@ const server = http.createServer(async (req, res) => {
             });
           } catch (err) {
             json(res, { ok: false, error: String(err.message || err) }, 400);
+          } finally {
+            switching = false;
           }
         })
         .catch((err) => {
+          switching = false;
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
         });
       return;
@@ -1068,12 +1097,15 @@ const server = http.createServer(async (req, res) => {
           if (!total) return json(res, { ok: true, removed: 0 });
           // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
           if (p.dry) return json(res, { ok: true, removed: 0, wouldRemove: total, detail: o });
-          const removed = store.purgeTargets(PROJECT.id, o);
-          store.appendEvent(PROJECT.id, {
-            op: 'orphan.purge',
-            target: 'orphans',
-            after: o,
-            actor: p.actor === 'ai' ? 'ai' : 'user',
+          const removed = store.transaction(() => {
+            const removed = store.purgeTargets(PROJECT.id, o);
+            store.appendEvent(PROJECT.id, {
+              op: 'orphan.purge',
+              target: 'orphans',
+              after: o,
+              actor: p.actor === 'ai' ? 'ai' : 'user',
+            });
+            return removed;
           });
           reloadOverlay();
           json(res, { ok: true, removed: total, detail: removed });
@@ -1092,16 +1124,21 @@ const server = http.createServer(async (req, res) => {
         readJson(req, res)
           .then((p) => {
             try {
-              const r = store.saveBookmark(PROJECT.id, p);
-              store.appendEvent(PROJECT.id, {
-                op: 'bookmark.save',
-                target: r.bookmark.name,
-                after: {
-                  roots: r.bookmark.roots,
-                  up: r.bookmark.up,
-                  down: r.bookmark.down,
-                  group: r.bookmark.group,
-                },
+              // 状态 + 事件同一个事务：崩溃时要么都进库、要么都不进，
+              // 不会出现「书签改了但时间轴没记」这种回放对不上的状态
+              const r = store.transaction(() => {
+                const name = String(p.name || '').trim();
+                const prev = store.findBookmark(PROJECT.id, name);
+                const r = store.saveBookmark(PROJECT.id, p);
+                store.appendEvent(PROJECT.id, {
+                  op: 'bookmark.save',
+                  target: r.bookmark.name,
+                  // 整份视图参数都记下来：少存 fixed / vars 的话，
+                  // 以后想按事件重建书签就是有损的
+                  before: prev ? bookmarkEventPayload(prev) : null,
+                  after: bookmarkEventPayload(r.bookmark),
+                });
+                return r;
               });
               json(res, { ok: true, ...r });
             } catch (err) {
@@ -1121,9 +1158,19 @@ const server = http.createServer(async (req, res) => {
         .then((p) => {
           const id = Number(p.id);
           if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
-          const gone = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
-          const ok = store.deleteBookmark(PROJECT.id, id);
-          if (ok) store.appendEvent(PROJECT.id, { op: 'bookmark.delete', target: gone?.name || `#${id}` });
+          const ok = store.transaction(() => {
+            const gone = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
+            const ok = store.deleteBookmark(PROJECT.id, id);
+            // 删掉的整份内容进 before，将来要按事件重建才不至于只剩个名字
+            if (ok) {
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.delete',
+                target: gone?.name || `#${id}`,
+                before: gone ? bookmarkEventPayload(gone) : null,
+              });
+            }
+            return ok;
+          });
           json(res, { ok, removed: ok ? 1 : 0 });
         })
         .catch((err) => {
@@ -1259,12 +1306,16 @@ const server = http.createServer(async (req, res) => {
           const latest = store.latestEventId(PROJECT.id);
           if (at > latest) return bad(res, 'eventId 超出范围');
           const restored = store.overlayAt(PROJECT.id, at);
-          store.replaceOverlay(PROJECT.id, restored);
-          store.appendEvent(PROJECT.id, {
-            op: 'restore_point',
-            target: `event#${at}`,
-            after: restored,
-            actor: p.actor === 'ai' ? 'ai' : 'user',
+          // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
+          // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
+          store.transaction(() => {
+            store.replaceOverlay(PROJECT.id, restored);
+            store.appendEvent(PROJECT.id, {
+              op: 'restore_point',
+              target: `event#${at}`,
+              after: restored,
+              actor: p.actor === 'ai' ? 'ai' : 'user',
+            });
           });
           // 同步内存镜像，后续请求直接读到恢复后的状态
           overlay.nodes = restored.nodes;
@@ -1434,28 +1485,30 @@ const server = http.createServer(async (req, res) => {
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = String(patch.root || '');
           const key = layoutKey(rootId, mode);
-          const before = store.getLayout(PROJECT.id, rootId, mode);
-          const slot = store.saveLayout(PROJECT.id, rootId, mode, {
-            nodes: patch.nodes,
-            edges: patch.edges,
-            manual: patch.manual,
-            clear: !!patch.clear,
+          const slot = store.transaction(() => {
+            const before = store.getLayout(PROJECT.id, rootId, mode);
+            const slot = store.saveLayout(PROJECT.id, rootId, mode, {
+              nodes: patch.nodes,
+              edges: patch.edges,
+              manual: patch.manual,
+              clear: !!patch.clear,
+            });
+            // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
+            store.appendEvent(PROJECT.id, {
+              op: patch.clear ? 'layout.clear' : 'layout.save',
+              target: key,
+              before: {
+                nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
+                edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
+                manual: patch.manual ? before.manual : undefined,
+              },
+              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual },
+              actor: patch.actor === 'ai' ? 'ai' : 'user',
+            });
+            return slot;
           });
           overlay.layout = overlay.layout || {};
           overlay.layout[key] = slot;
-
-          // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
-          store.appendEvent(PROJECT.id, {
-            op: patch.clear ? 'layout.clear' : 'layout.save',
-            target: key,
-            before: {
-              nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
-              edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
-              manual: patch.manual ? before.manual : undefined,
-            },
-            after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual },
-            actor: patch.actor === 'ai' ? 'ai' : 'user',
-          });
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -1477,16 +1530,21 @@ const server = http.createServer(async (req, res) => {
           const targetId = patch.nodeId || patch.edgeKey || null;
           if (!kind) return bad(res, 'nodeId 或 edgeKey 必须给一个');
           const bucket = kind === 'node' ? overlay.nodes : overlay.edges;
-          const before = pickKeys(bucket[targetId], Object.keys(patch.data));
-          const merged = store.setAnnotation(PROJECT.id, kind, targetId, patch.data);
-          bucket[targetId] = merged;
-          store.appendEvent(PROJECT.id, {
-            op: kind === 'node' ? 'node.annotate' : 'edge.annotate',
-            target: targetId,
-            before,
-            after: patch.data,
-            actor: patch.actor === 'ai' ? 'ai' : 'user',
+          const merged = store.transaction(() => {
+            // before 从库里取，不用内存镜像——镜像可能是旧的（切工程 / 外部改动），
+            // 记错了会让「恢复到这一刻」还原出错误的值
+            const before = pickKeys(store.getAnnotation(PROJECT.id, kind, targetId), Object.keys(patch.data));
+            const merged = store.setAnnotation(PROJECT.id, kind, targetId, patch.data);
+            store.appendEvent(PROJECT.id, {
+              op: kind === 'node' ? 'node.annotate' : 'edge.annotate',
+              target: targetId,
+              before,
+              after: patch.data,
+              actor: patch.actor === 'ai' ? 'ai' : 'user',
+            });
+            return merged;
           });
+          bucket[targetId] = merged;
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -1511,13 +1569,25 @@ const server = http.createServer(async (req, res) => {
           }
           if (p.clear) {
             // 一次性恢复所有被删除的函数与连线
-            store.clearDeleted(PROJECT.id);
+            store.transaction(() => {
+              store.clearDeleted(PROJECT.id);
+              store.appendEvent(PROJECT.id, { op: 'delete.clear', actor: p.actor === 'ai' ? 'ai' : 'user' });
+            });
             overlay.deleted = { nodes: {}, edges: {} };
-            store.appendEvent(PROJECT.id, { op: 'delete.clear', actor: p.actor === 'ai' ? 'ai' : 'user' });
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
-          const counts = store.setDeleted(PROJECT.id, { nodes: nodeIds, edges: edgeKeys }, restore);
+          const counts = store.transaction(() => {
+            const counts = store.setDeleted(PROJECT.id, { nodes: nodeIds, edges: edgeKeys }, restore);
+            store.appendEvent(PROJECT.id, {
+              op: restore ? 'delete.restore' : 'delete',
+              target: nodeIds.length === 1 && !edgeKeys.length ? nodeIds[0] : null,
+              // 回放要区分节点和边，不能只留一个拼接字符串
+              after: { nodes: nodeIds, edges: edgeKeys },
+              actor: p.actor === 'ai' ? 'ai' : 'user',
+            });
+            return counts;
+          });
           for (const id of nodeIds) {
             if (restore) delete overlay.deleted.nodes[id];
             else overlay.deleted.nodes[id] = 1;
@@ -1526,13 +1596,6 @@ const server = http.createServer(async (req, res) => {
             if (restore) delete overlay.deleted.edges[k];
             else overlay.deleted.edges[k] = 1;
           }
-          store.appendEvent(PROJECT.id, {
-            op: restore ? 'delete.restore' : 'delete',
-            target: nodeIds.length === 1 && !edgeKeys.length ? nodeIds[0] : null,
-            // 回放要区分节点和边，不能只留一个拼接字符串
-            after: { nodes: nodeIds, edges: edgeKeys },
-            actor: p.actor === 'ai' ? 'ai' : 'user',
-          });
           json(res, { ok: true, nodes: counts.nodes, edges: counts.edges });
         })
         .catch((err) => {

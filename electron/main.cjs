@@ -5,12 +5,30 @@ const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
 
+/**
+ * 单实例锁：两个实例会各起一个 server 子进程写同一个 SQLite 库，
+ * 写锁冲突下轻则报错、重则界面白屏（子进程被 SQLITE_BUSY 打死）。
+ * 拿不到锁就把当前实例退出，把已有窗口叫到前面来。
+ */
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return;
+}
+
 let win = null;
 let child = null;
 let currentTarget = null;
 let serverOrigin = null;
 // 启动后是否自动展开工程选择面板（有多个历史工程时才有意义）
 let openPickerOnLoad = false;
+// 子进程最近输出：启动失败时贴进错误框，否则用户只看到白屏、拿不到任何线索
+let serverLog = '';
+// 主动停旧进程时置位，避免把「切换工程」误判成启动失败
+let stopping = false;
+
+const noteServerLog = (s) => {
+  serverLog = (serverLog + s).slice(-4000);
+};
 
 /**
  * 从本地库里取最近打开的工程。
@@ -34,35 +52,80 @@ function readProjects(limit = 20) {
   }
 }
 
+/**
+ * 停掉当前 server 子进程，并**等它真的退出**再返回。
+ * 以前是 kill 完立刻 fork 新的，两个进程会短暂同时持有 SQLite 库；
+ * Windows 上 kill 等于 TerminateProcess，旧连接要过一会儿才释放。
+ */
 function stopServer() {
-  if (child) {
-    try {
-      child.kill();
-    } catch {
-      /* ignore */
-    }
+  return new Promise((resolve) => {
+    if (!child) return resolve();
+    const c = child;
     child = null;
+    stopping = true;
+    const done = () => {
+      stopping = false;
+      resolve();
+    };
+    c.once('exit', done);
+    try {
+      c.kill();
+    } catch {
+      done();
+      return;
+    }
+    // 兜底：万一 exit 事件没来，2s 后继续，不让切工程卡死
+    const t = setTimeout(done, 2000);
+    if (t.unref) t.unref();
+  });
+}
+
+/** 启动失败时给用户一个能看懂的框，而不是一片白 */
+function reportStartupFailure(code) {
+  const tail = serverLog.trim().split('\n').slice(-12).join('\n');
+  const msg = `本地服务没能启动（退出码 ${code}）。\n\n${tail || '（子进程没有输出）'}`;
+  console.error('[server] 启动失败\n' + msg);
+  try {
+    dialog.showErrorBox('TCU 调用关系图：启动失败', msg);
+  } catch {
+    /* 对话框本身失败就算了，控制台里还有一份 */
   }
 }
 
-function startTarget(target) {
-  stopServer();
+async function startTarget(target) {
+  await stopServer();
   currentTarget = target;
+  serverLog = '';
 
-  child = fork(path.join(ROOT, 'src', 'server.js'), [target, '0'], {
-    cwd: ROOT,
-    // 数据库放在 Electron 的 userData 目录。只有主进程能拿到这个路径，
-    // 解析跑在子进程里，所以必须用环境变量传过去，否则打包后两边指向不同目录，
-    // 症状是「标注保存了但重启就没了」。
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  try {
+    child = fork(path.join(ROOT, 'src', 'server.js'), [target, '0'], {
+      cwd: ROOT,
+      // 数据库放在 Electron 的 userData 目录。只有主进程能拿到这个路径，
+      // 解析跑在子进程里，所以必须用环境变量传过去，否则打包后两边指向不同目录，
+      // 症状是「标注保存了但重启就没了」。
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+  } catch (err) {
+    // fork 本身失败（例如打包漏了 src/server.js）：别再让 Promise 静默 reject
+    noteServerLog(String(err && err.message ? err.message : err));
+    reportStartupFailure(-1);
+    return;
+  }
+
+  let ready = false;
+  child.stdout.on('data', (d) => {
+    noteServerLog(String(d));
+    process.stdout.write('[server] ' + d);
   });
-
-  child.stdout.on('data', (d) => process.stdout.write('[server] ' + d));
-  child.stderr.on('data', (d) => process.stderr.write('[server] ' + d));
+  child.stderr.on('data', (d) => {
+    noteServerLog(String(d));
+    process.stderr.write('[server] ' + d);
+  });
 
   child.on('message', (m) => {
     if (m && m.ready) {
+      ready = true;
       const url = `http://127.0.0.1:${m.port}`;
       try {
         serverOrigin = new URL(url).origin;
@@ -77,9 +140,16 @@ function startTarget(target) {
   });
 
   child.on('exit', (code) => {
-    if (code && code !== 0) console.error('[server] exited with', code);
+    // 主动停（切工程 / 退出）不算失败
+    if (stopping) return;
+    if (code && code !== 0) {
+      console.error('[server] exited with', code);
+      // 只有「还没就绪就退出」才打扰用户：跑起来之后的崩溃由页面自己报
+      if (!ready) reportStartupFailure(code);
+    }
   });
 }
+
 
 /** 页面就绪后自动展开工程选择面板，让用户下次打开能直接挑工程 */
 function maybeOpenPicker(w) {
@@ -250,8 +320,15 @@ app.whenReady().then(async () => {
   startTarget(r.filePaths[0]);
 });
 
-app.on('window-all-closed', () => {
-  stopServer();
+app.on('second-instance', () => {
+  // 用户又双击了一次图标：把已有窗口叫到前面，不要开第二个实例
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.focus();
+});
+
+app.on('window-all-closed', async () => {
+  await stopServer();
   app.quit();
 });
 

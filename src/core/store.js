@@ -21,6 +21,30 @@ import { DatabaseSync } from 'node:sqlite';
 
 const SCHEMA_VERSION = 3;
 
+/**
+ * v2 新增的表：书签。
+ * 单独抽成常量，SCHEMA（新库全量建）和 migrate 的 v1→v2 分支（老库补差量）
+ * 都引用同一份 DDL——两处各写一遍，改表时漏掉一边就会出现
+ * 「新库能用、老库报 no such table」，这类错只有老用户会踩到。
+ */
+const BOOKMARK_DDL = `
+CREATE TABLE IF NOT EXISTS bookmark (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  roots      TEXT NOT NULL DEFAULT '[]',
+  up         INTEGER NOT NULL DEFAULT 0,
+  down       INTEGER NOT NULL DEFAULT 3,
+  grouped    INTEGER NOT NULL DEFAULT 1,
+  fixed      INTEGER NOT NULL DEFAULT 1,
+  vars       TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (project_id, name)
+);
+CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
+`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS project (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,21 +132,7 @@ CREATE TABLE IF NOT EXISTS parse_cache (
   model       BLOB
 );
 
-CREATE TABLE IF NOT EXISTS bookmark (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-  name       TEXT NOT NULL,
-  roots      TEXT NOT NULL DEFAULT '[]',
-  up         INTEGER NOT NULL DEFAULT 0,
-  down       INTEGER NOT NULL DEFAULT 3,
-  grouped    INTEGER NOT NULL DEFAULT 1,
-  fixed      INTEGER NOT NULL DEFAULT 1,
-  vars       TEXT NOT NULL DEFAULT '[]',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  UNIQUE (project_id, name)
-);
-CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
+${BOOKMARK_DDL}
 
 CREATE TABLE IF NOT EXISTS setting (
   key   TEXT PRIMARY KEY,
@@ -349,46 +359,44 @@ function applyEvent(ov, e) {
 /**
  * 版本化迁移。
  * 新库直接跑全量 SCHEMA（永远是最新结构）；老库按版本号逐级补差量。
- * 每次加表都要：把 DDL 写进 SCHEMA（给新库）、再补一条 ALTER 分支（给老库）、
- * SCHEMA_VERSION 加一。漏掉任何一步都会出现「新库能用、老库报 no such table」。
+ * 每次加表都要：把 DDL 抽成常量（SCHEMA 与补差量分支共用）、补一条版本分支、
+ * SCHEMA_VERSION 加一。
+ *
+ * 整段包在事务里：SQLite 的 DDL 是事务性的，中途失败会整体回滚，
+ * user_version 不会被提前改写，下次启动还能从原版本重来。表都用
+ * IF NOT EXISTS，所以就算不包事务也是幂等的，但事务能保证「要么全成、要么全无」。
  */
 function migrate(db) {
   const row = db.prepare('PRAGMA user_version').get() || {};
   const cur = Number(row.user_version ?? 0);
   if (cur >= SCHEMA_VERSION) return cur;
 
-  if (cur < 1) {
-    db.exec(SCHEMA); // 全量建表，含最新加的表
-  } else {
-    // v1 → v2：书签
-    if (cur < 2) {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS bookmark (
-          id         INTEGER PRIMARY KEY AUTOINCREMENT,
-          project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-          name       TEXT NOT NULL,
-          roots      TEXT NOT NULL DEFAULT '[]',
-          up         INTEGER NOT NULL DEFAULT 0,
-          down       INTEGER NOT NULL DEFAULT 3,
-          grouped    INTEGER NOT NULL DEFAULT 1,
-          fixed      INTEGER NOT NULL DEFAULT 1,
-          vars       TEXT NOT NULL DEFAULT '[]',
-          created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL,
-          UNIQUE (project_id, name)
-        );
-        CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
-      `);
+  db.exec('BEGIN');
+  try {
+    if (cur < 1) {
+      db.exec(SCHEMA); // 全量建表，含最新加的表
+    } else {
+      // v1 → v2：书签
+      if (cur < 2) db.exec(BOOKMARK_DDL);
     }
     // v2 → v3：时间轴按 id 倒序翻页的索引。
     // 原来的 (project_id, ts, seq) 对「id < ? ORDER BY id DESC」帮不上忙，
     // 多工程共用一库时会退化成扫全表。
+    // 放在 else 外面：cur=0 时 SCHEMA 已建过（IF NOT EXISTS 是空操作），
+    // cur=1/2 的老库靠这一句补上。
     if (cur < 3) {
       db.exec('CREATE INDEX IF NOT EXISTS event_by_project_id ON event(project_id, id DESC);');
     }
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* 回滚失败时保留原始异常 */
+    }
+    throw err;
   }
-
-  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   return SCHEMA_VERSION;
 }
 
@@ -400,10 +408,21 @@ export function openStore({ dbPath, userData } = {}) {
   // WAL：读写不互相阻塞，进程被强杀时也不会留下半截事务
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
+  // 默认 busy_timeout 是 0——撞上写锁立刻抛 SQLITE_BUSY 而不是等一等。
+  // Electron 切工程时会「杀旧子进程 → 立刻起新进程」，两个进程短暂同时持有库，
+  // 没有这个等待窗口就是启动即崩。5s 足够覆盖一次正常写入。
+  db.exec('PRAGMA busy_timeout = 5000');
   const version = migrate(db);
 
-  /** 事务包装：回调抛错就回滚，避免事件写了而状态没写这种半截状态 */
+  /**
+   * 事务包装：回调抛错就回滚，避免事件写了而状态没写这种半截状态。
+   * 可重入——已经在事务里时直接执行，由最外层提交。这样调用方可以放心把
+   * 「改状态 + 记事件」包成一个事务，而不必关心内部方法自己是否也开了事务。
+   */
+  let txDepth = 0;
   const tx = (fn) => {
+    if (txDepth > 0) return fn();
+    txDepth++;
     db.exec('BEGIN');
     try {
       const out = fn();
@@ -416,6 +435,8 @@ export function openStore({ dbPath, userData } = {}) {
         /* 回滚失败时保留原始异常 */
       }
       throw err;
+    } finally {
+      txDepth--;
     }
   };
 
@@ -458,7 +479,7 @@ export function openStore({ dbPath, userData } = {}) {
   };
 
   const q = {
-    projectByPath: db.prepare('SELECT * FROM project WHERE path = ?'),
+    projectByPath: db.prepare('SELECT * FROM project WHERE path = ? COLLATE NOCASE'),
     projectById: db.prepare('SELECT * FROM project WHERE id = ?'),
     projectByFingerprint: db.prepare('SELECT * FROM project WHERE fingerprint = ? ORDER BY opened_at DESC'),
     projectInsert: db.prepare(
@@ -541,6 +562,12 @@ export function openStore({ dbPath, userData } = {}) {
     file,
     version,
     db,
+    /**
+     * 把多个写操作合成一个事务（可嵌套）。
+     * 调用方用它保证「状态 + 事件」同时落库：否则进程在两次提交之间退出，
+     * 状态进了库、事件没进，回放出来的历史就和现状对不上，restore 会静默丢改动。
+     */
+    transaction: tx,
 
     /** 同一毫秒内的多条事件用 seq 排先后，保证时间轴顺序稳定 */
     nextStamp() {
@@ -552,6 +579,9 @@ export function openStore({ dbPath, userData } = {}) {
 
     upsertProject({ path: projectPath, name, fingerprint, gitRemote, gitCommit }) {
       const abs = path.resolve(projectPath);
+      // Windows 路径大小写不敏感，但 TEXT 的 UNIQUE 区分大小写：
+      // 用户从资源管理器（S:\）和命令行（s:\）各打开一次，会得到两个工程、两套标注。
+      // 查已有工程时用 COLLATE NOCASE 认成同一个，避免重复入库。
       const existing = q.projectByPath.get(abs);
       const ts = nowMs();
       if (existing) {
@@ -604,6 +634,11 @@ export function openStore({ dbPath, userData } = {}) {
         };
       }
       return ov;
+    },
+
+    /** 读单条标注（库里没有就是空对象）。写事件时用它取真实的 before，别信内存镜像 */
+    getAnnotation(projectId, kind, targetId) {
+      return parse((q.annGet.get(projectId, kind, targetId) || {}).data, {});
     },
 
     /**
@@ -801,6 +836,12 @@ export function openStore({ dbPath, userData } = {}) {
       return q.bmList.all(projectId).map(toBookmark);
     },
 
+    /** 按名字找书签：保存时用来取「覆盖前」的旧值，写进时间轴的 before */
+    findBookmark(projectId, name) {
+      const r = q.bmByName.get(projectId, String(name || '').trim());
+      return r ? toBookmark(r) : null;
+    },
+
     /**
      * 保存书签。同名视为覆盖（UNIQUE(project_id,name) + upsert），
      * 用户不用先删再存；返回是否覆盖，前端据此提示。
@@ -956,34 +997,39 @@ export function importLegacyOverlay(store, projectId, legacy) {
     Object.keys(current.layout).length;
   if (already) return { imported: false, reason: 'exists' };
 
-  let n = 0;
-  for (const [id, data] of Object.entries(legacy.nodes || {})) {
-    store.setAnnotation(projectId, 'node', id, data);
-    n++;
-  }
-  for (const [k, data] of Object.entries(legacy.edges || {})) {
-    store.setAnnotation(projectId, 'edge', k, data);
-    n++;
-  }
-  const delNodes = Object.keys((legacy.deleted || {}).nodes || {});
-  const delEdges = Object.keys((legacy.deleted || {}).edges || {});
-  if (delNodes.length || delEdges.length) store.setDeleted(projectId, { nodes: delNodes, edges: delEdges });
-  for (const [key, slot] of Object.entries(legacy.layout || {})) {
-    const idx = key.lastIndexOf('::');
-    if (idx < 0) continue;
-    store.saveLayout(projectId, key.slice(0, idx), key.slice(idx + 2), {
-      nodes: slot.nodes || {},
-      edges: slot.edges || {},
-      manual: slot.manual || [],
+  // 整段导入放一个事务：中途失败就整体回滚。
+  // 以前是逐条提交，失败后库里留下半份数据，下次再进来 `already` 判定为真，
+  // 于是永远停在「导入了一半」的状态，而且源文件也不会被改名留底。
+  return store.transaction(() => {
+    let n = 0;
+    for (const [id, data] of Object.entries(legacy.nodes || {})) {
+      store.setAnnotation(projectId, 'node', id, data);
+      n++;
+    }
+    for (const [k, data] of Object.entries(legacy.edges || {})) {
+      store.setAnnotation(projectId, 'edge', k, data);
+      n++;
+    }
+    const delNodes = Object.keys((legacy.deleted || {}).nodes || {});
+    const delEdges = Object.keys((legacy.deleted || {}).edges || {});
+    if (delNodes.length || delEdges.length) store.setDeleted(projectId, { nodes: delNodes, edges: delEdges });
+    for (const [key, slot] of Object.entries(legacy.layout || {})) {
+      const idx = key.lastIndexOf('::');
+      if (idx < 0) continue;
+      store.saveLayout(projectId, key.slice(0, idx), key.slice(idx + 2), {
+        nodes: slot.nodes || {},
+        edges: slot.edges || {},
+        manual: slot.manual || [],
+      });
+    }
+    // 事件里带上全量状态：时间轴回放要靠它确定「可信起点」，
+    // 只记「导入了 2 条」是无法重建当时画面的
+    store.appendEvent(projectId, {
+      op: 'import',
+      target: 'out/overlay.json',
+      after: store.loadOverlay(projectId),
+      actor: 'system',
     });
-  }
-  // 事件里带上全量状态：时间轴回放要靠它确定「可信起点」，
-  // 只记「导入了 2 条」是无法重建当时画面的
-  store.appendEvent(projectId, {
-    op: 'import',
-    target: 'out/overlay.json',
-    after: store.loadOverlay(projectId),
-    actor: 'system',
+    return { imported: true, annotations: n, deletedNodes: delNodes.length, deletedEdges: delEdges.length };
   });
-  return { imported: true, annotations: n, deletedNodes: delNodes.length, deletedEdges: delEdges.length };
 }

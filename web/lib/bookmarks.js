@@ -17,7 +17,9 @@ const saveBtn = document.getElementById('bookmarkSave');
 
 const meta = (b) => {
   const base = t('bookmark.meta').replace('{n}', b.roots.length).replace('{down}', b.down);
-  return `${base} · ${b.group ? '分组' : '平铺'}${b.fixed ? ' · 固定' : ''}`;
+  // 分组 / 平铺 / 固定 也要走 t()：写死中文的话，切到别的语言会中英混排
+  const mode = b.group ? t('bookmark.grouped') : t('bookmark.flat');
+  return `${base} · ${mode}${b.fixed ? ' · ' + t('bookmark.fixed') : ''}`;
 };
 
 /** 按钮上短暂显示一句提示，不弹 toast（这个界面没有 toast 系统） */
@@ -53,7 +55,7 @@ async function render() {
         <div class="nm">${esc(b.name)}</div>
         <div class="meta">${esc(meta(b))}</div>
       </div>
-      <button class="del" data-del="${b.id}" title="删除书签">&times;</button>
+      <button class="del" data-del="${b.id}" title="${esc(t('bookmark.deleteTitle'))}">&times;</button>
     </div>`
     )
     .join('');
@@ -63,7 +65,12 @@ async function render() {
       const b = rows.find((x) => x.id === Number(row.dataset.id));
       if (!b) return;
       closeModal();
-      await hooks.applyBookmark(b);
+      try {
+        await hooks.applyBookmark(b);
+      } catch (err) {
+        // 书签指向的函数可能已经被删了 / 工程换过，跳不过去时别静默失败
+        console.warn('[书签] 跳转失败：', err);
+      }
     });
   });
 
@@ -71,8 +78,13 @@ async function render() {
     el.addEventListener('click', async (e) => {
       e.stopPropagation();
       const id = Number(el.dataset.del);
-      const r = await api.deleteBookmark(id);
-      if (r && r.ok) await render();
+      try {
+        const r = await api.deleteBookmark(id);
+        if (r && r.ok) await render();
+      } catch (err) {
+        // 网络断了 / 服务重启中：保持列表原样，不要因为一个未捕获异常把面板卡死
+        console.warn('[书签] 删除失败：', err);
+      }
     });
   });
 }
@@ -82,15 +94,21 @@ async function save() {
   if (!name) return flash(t('bookmark.needName'), false);
   if (!state.roots.length) return flash(t('bookmark.noRoot'), false);
 
-  const r = await api.saveBookmark({
-    name,
-    roots: state.roots,
-    up: state.up,
-    down: state.down,
-    group: state.group,
-    fixed: state.fixed,
-    vars: [...state.vars],
-  });
+  let r;
+  try {
+    r = await api.saveBookmark({
+      name,
+      roots: state.roots,
+      up: state.up,
+      down: state.down,
+      group: state.group,
+      fixed: state.fixed,
+      vars: [...state.vars],
+    });
+  } catch (err) {
+    // fetch 本身失败（服务重启 / 断网）会 reject，不接住就是一条 unhandled rejection
+    return flash(`${t('bookmark.failed')}：${err?.message || err}`, false);
+  }
   if (!r || !r.ok) return flash(`${t('bookmark.failed')}：${r?.error || ''}`, false);
 
   if (nameInput) nameInput.value = '';
