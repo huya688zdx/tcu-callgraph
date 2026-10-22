@@ -9,4 +9,6 @@ export const hooks = {
   renderDetail: () => {},
   /** 勾选 / 取消勾选一个全局变量 */
   toggleVar: () => {},
+  /** 换工程后整体重载（统计 / 文件树 / 变量 / 视图） */
+  reloadAll: async () => {},
 };

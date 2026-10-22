@@ -5,6 +5,8 @@
  * 所以 E2E 不用再要求「人手先起 5173」，多开也不会撞端口。
  */
 import { fork } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,8 +23,13 @@ const SERVER = path.join(ROOT, 'src', 'server.js');
  * @returns {Promise<{baseUrl:string, port:number, close:() => Promise<void>, child:object}>}
  */
 export async function launchServer({ target = 'samples/tcu', port = 0, timeoutMs = 30000 } = {}) {
+  // 每个实例一份临时库：E2E 会改标注、删节点，绝不能写进用户真实的 userData 库
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-e2e-'));
+  const dbPath = path.join(tmpDir, 'callgraph.db');
+
   const child = fork(SERVER, [target, String(port)], {
     cwd: ROOT,
+    env: { ...process.env, CALLGRAPH_DB: dbPath },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
 
@@ -72,6 +79,11 @@ export async function launchServer({ target = 'samples/tcu', port = 0, timeoutMs
         resolve();
       });
     });
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* 临时目录删不掉不影响测试结论 */
+    }
   };
 
   return {

@@ -213,6 +213,79 @@ export function listSourceFiles(root) {
 }
 
 /**
+ * 扫描源码文件清单（带大小与 mtime），供解析缓存算 key。
+ * 比 listSourceFiles 多做一次 stat：解析本身要读整个文件，多这一次 stat 可以忽略，
+ * 但 mtime 是判断「文件到底变没变」最可靠的低成本信号。
+ */
+export function scanSources(root) {
+  const out = [];
+  for (const abs of listSourceFiles(root)) {
+    let st;
+    try {
+      st = fs.statSync(abs);
+    } catch {
+      continue; // 扫描期间被删 / 无权限，交给 buildIndex 自己记 warning
+    }
+    out.push({
+      abs,
+      rel: path.relative(root, abs).replace(/\\/g, '/'),
+      bytes: st.size,
+      mtimeMs: Math.round(st.mtimeMs),
+      isHeader: HDR_EXT.test(abs),
+    });
+  }
+  return out;
+}
+
+/**
+ * 从纯数据重建 _index。
+ * 解析缓存反序列化后必须走这一步：JSON 留不住对象引用，
+ * 直接把 _index 存下来会让 byId 里的函数和 functions 数组变成两份互不相干的副本，
+ * 之后任何一处改字段，另一处都看不到。
+ */
+export function rebuildIndex(model) {
+  const functions = model.functions || [];
+  const externals = model.externals || [];
+  const edges = model.edges || [];
+
+  const byId = new Map();
+  const byName = new Map();
+  for (const fn of functions) {
+    byId.set(fn.id, fn);
+    if (!byName.has(fn.name)) byName.set(fn.name, []);
+    byName.get(fn.name).push(fn);
+  }
+  for (const ex of externals) byId.set(ex.id, ex);
+
+  const outAdj = new Map();
+  const inAdj = new Map();
+  for (const e of edges) {
+    if (!outAdj.has(e.from)) outAdj.set(e.from, []);
+    outAdj.get(e.from).push(e);
+    if (!inAdj.has(e.to)) inAdj.set(e.to, []);
+    inAdj.get(e.to).push(e);
+  }
+
+  const varWriters = new Map();
+  const varReaders = new Map();
+  for (const fn of functions) {
+    for (const a of fn.varAccess || []) {
+      if (a.write) {
+        if (!varWriters.has(a.id)) varWriters.set(a.id, []);
+        varWriters.get(a.id).push(fn.id);
+      }
+      if (a.read) {
+        if (!varReaders.has(a.id)) varReaders.set(a.id, []);
+        varReaders.get(a.id).push(fn.id);
+      }
+    }
+  }
+
+  model._index = { byId, byName, outAdj, inAdj, varWriters, varReaders };
+  return model;
+}
+
+/**
  * @param {string} root 工程根目录
  * @returns {object} model
  */

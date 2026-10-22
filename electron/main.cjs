@@ -9,6 +9,30 @@ let win = null;
 let child = null;
 let currentTarget = null;
 let serverOrigin = null;
+// 启动后是否自动展开工程选择面板（有多个历史工程时才有意义）
+let openPickerOnLoad = false;
+
+/**
+ * 从本地库里取最近打开的工程。
+ * 主进程能直接读 node:sqlite（Electron 内嵌 Node 24），
+ * 所以不必等子进程起来再问它。
+ */
+function readProjects(limit = 20) {
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    const file = path.join(app.getPath('userData'), 'callgraph.db');
+    if (!fs.existsSync(file)) return [];
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      return db.prepare('SELECT id, path, name FROM project ORDER BY opened_at DESC LIMIT ?').all(limit);
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    console.warn('[工程] 读取本地库失败：', err.message);
+    return [];
+  }
+}
 
 function stopServer() {
   if (child) {
@@ -27,7 +51,10 @@ function startTarget(target) {
 
   child = fork(path.join(ROOT, 'src', 'server.js'), [target, '0'], {
     cwd: ROOT,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    // 数据库放在 Electron 的 userData 目录。只有主进程能拿到这个路径，
+    // 解析跑在子进程里，所以必须用环境变量传过去，否则打包后两边指向不同目录，
+    // 症状是「标注保存了但重启就没了」。
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
 
@@ -42,13 +69,30 @@ function startTarget(target) {
       } catch {
         serverOrigin = null;
       }
-      if (win) win.loadURL(url);
-      else createWindow(url);
+      if (win) {
+        maybeOpenPicker(win);
+        win.loadURL(url);
+      } else createWindow(url);
     }
   });
 
   child.on('exit', (code) => {
     if (code && code !== 0) console.error('[server] exited with', code);
+  });
+}
+
+/** 页面就绪后自动展开工程选择面板，让用户下次打开能直接挑工程 */
+function maybeOpenPicker(w) {
+  if (!openPickerOnLoad) return;
+  openPickerOnLoad = false;
+  w.webContents.once('did-finish-load', () => {
+    setTimeout(() => {
+      w.webContents
+        .executeJavaScript("document.getElementById('projectBtn')?.click()")
+        .catch(() => {
+          /* 页面还没准备好就算了，用户可以手动点 */
+        });
+    }, 700);
   });
 }
 
@@ -67,6 +111,7 @@ function createWindow(url) {
     },
   });
 
+  maybeOpenPicker(win);
   win.loadURL(url);
   win.webContents.setWindowOpenHandler(({ url: u }) => {
     let protocol = '';
@@ -123,6 +168,16 @@ function buildMenu() {
       {
         label: '文件',
         submenu: [
+          {
+            label: '切换工程…',
+            accelerator: 'CmdOrCtrl+P',
+            click: () => {
+              if (!win) return;
+              win.webContents
+                .executeJavaScript("document.getElementById('projectBtn')?.click()")
+                .catch(() => {});
+            },
+          },
           { label: '打开文件夹…', accelerator: 'CmdOrCtrl+O', click: pickFolder },
           { label: '打开 DOT / C 文件…', accelerator: 'CmdOrCtrl+Shift+O', click: pickFile },
           { type: 'separator' },
@@ -165,6 +220,21 @@ app.whenReady().then(async () => {
 
   if (arg) {
     startTarget(path.resolve(arg));
+    return;
+  }
+
+  // 没有命令行参数：优先回到最近打开的工程，并展开选择面板让用户换
+  const projects = readProjects(20).filter((p) => {
+    try {
+      return fs.existsSync(p.path);
+    } catch {
+      return false;
+    }
+  });
+  if (projects.length) {
+    openPickerOnLoad = projects.length > 1;
+    console.log(`[工程] 最近打开：${projects[0].name}（共 ${projects.length} 个）`);
+    startTarget(projects[0].path);
     return;
   }
 

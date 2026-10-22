@@ -3,12 +3,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { loadModel, stats, subgraph, search, dataflowOf } from './core/index.js';
+import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
 import { layout, layoutGrouped } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
+import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
+import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.resolve(__dirname, '../web');
@@ -24,66 +26,154 @@ try {
 
 const target = process.argv[2] || 'samples/tcu';
 const PORT = Number(process.argv[3] || 5173);
-const root = path.resolve(target);
-// 打开的根目录名：文件路径都是相对它的，所以要把这一层补进层级里。
-// 直接选了单个文件时，索引的是它所在目录，根名取目录名（否则会和文件框重名）
-const rootIsFile = (() => {
+
+// ---- 会话状态（可切换工程）----
+// 这些绑定在切工程时整体替换。处理器都在请求到达时才读它们，
+// 所以用 let + 重新赋值就够，不必把每个 handler 都改成传参。
+let root = '';
+let ROOT_LABEL = '';
+let MODEL = null;
+let S = null;
+let PROJECT = null;
+let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {} }, layout: {} };
+
+// 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
+const store = openStore();
+
+// 旧版 out/overlay.json 一次性导入：成功后改名留底，不删原文件。
+// 只在用「默认库」时执行——CALLGRAPH_DB 显式指定的多半是测试/E2E 的临时库，
+// 让它去消费并改名真实文件，等于把用户的历史数据搬进一个马上被删掉的库。
+const LEGACY_OVERLAY = path.join(OUT, 'overlay.json');
+function migrateLegacy(project) {
+  if (process.env.CALLGRAPH_DB || !fs.existsSync(LEGACY_OVERLAY)) return;
   try {
-    return fs.statSync(root).isFile();
-  } catch {
-    return false;
+    const legacy = JSON.parse(fs.readFileSync(LEGACY_OVERLAY, 'utf8'));
+    const r = importLegacyOverlay(store, project.id, legacy);
+    if (r.imported) {
+      fs.renameSync(LEGACY_OVERLAY, path.join(OUT, `overlay.imported-${Date.now()}.json`));
+      console.log(
+        `[迁移] 旧 overlay 已导入：标注 ${r.annotations} / 删除节点 ${r.deletedNodes} / 删除边 ${r.deletedEdges}`
+      );
+    }
+  } catch (err) {
+    console.warn('[迁移] 旧 overlay 导入失败，原文件保留：', err.message);
   }
-})();
-const ROOT_LABEL = path.basename(rootIsFile ? path.dirname(root) : root) || root;
-
-console.log(`[加载] ${root}`);
-const MODEL = loadModel(root);
-// 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
-// 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
-try {
-  await buildDataflowIndex(MODEL);
-} catch (err) {
-  console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
 }
-const S = stats(MODEL);
-console.log(
-  `[就绪] 文件 ${S.files} / 函数 ${S.functions} / 边 ${S.edges} / 宏 ${S.macros} / 耗时 ${S.elapsedMs}ms`
-);
 
-const OVERLAY_PATH = path.join(OUT, 'overlay.json');
-const emptyOverlay = () => ({ nodes: {}, edges: {}, notes: [] });
-let overlay = {};
-try {
-  overlay = JSON.parse(fs.readFileSync(OVERLAY_PATH, 'utf8'));
-} catch (err) {
-  // 首次运行（ENOENT）属正常；其余错误说明文件损坏/不可读，先备份再回落，
-  // 否则用户的标注、删除记录会被下一次保存直接覆盖掉
-  if (err.code !== 'ENOENT') {
-    const backup = path.join(OUT, `overlay.corrupt-${Date.now()}.json`);
-    try {
-      fs.copyFileSync(OVERLAY_PATH, backup);
-      console.error(`[overlay] 读取失败，已备份为 ${backup}：`, err.message);
-    } catch (copyErr) {
-      console.error('[overlay] 读取失败且备份失败：', err.message, copyErr.message);
+/**
+ * 加载一个工程并切换会话状态。
+ * 解析结果是纯派生的，切工程时整份重建；标注 / 布局从库里按 project_id 读。
+ */
+async function openTarget(targetPath, { first = false } = {}) {
+  const abs = path.resolve(targetPath);
+  let isFile = false;
+  try {
+    isFile = fs.statSync(abs).isFile();
+  } catch {
+    throw new Error(`路径不存在：${abs}`);
+  }
+  // 打开的根目录名：文件路径都是相对它的，所以要把这一层补进层级里。
+  // 直接选了单个文件时，索引的是它所在目录，根名取目录名（否则会和文件框重名）
+  const label = path.basename(isFile ? path.dirname(abs) : abs) || abs;
+
+  console.log(`[加载] ${abs}`);
+  const t0 = Date.now();
+
+  // 解析缓存：源码没动过就直接反序列化模型，省掉整轮词法 + 语法分析。
+  // .dot / .gv 走另一套模型（没有文件清单），不参与缓存。
+  const isDot = isFile && /\.(dot|gv)$/i.test(abs);
+  const scanRoot = isFile ? path.dirname(abs) : abs;
+  const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
+  const key = isDot ? '' : cacheKey(scanSources(scanRoot), focus);
+
+  let model = key ? store.getCachedModel(key) : null;
+  const fromCache = !!model;
+  if (model) {
+    model.root = isFile ? path.dirname(abs) : abs;
+    if (focus) model.focusFile = focus;
+    rebuildIndex(model);
+  } else {
+    model = loadModel(abs);
+    if (key) {
+      const r = store.putCachedModel(key, model);
+      if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
     }
   }
-  overlay = emptyOverlay();
+  const loadMs = Date.now() - t0;
+  model.elapsedMs = loadMs;
+
+  // 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
+  // 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
+  try {
+    await buildDataflowIndex(model);
+  } catch (err) {
+    console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
+  }
+  const st = stats(model);
+  const project = store.upsertProject({
+    path: abs,
+    name: label,
+    fingerprint: fingerprintFiles(model.files),
+  });
+
+  if (first) migrateLegacy(project);
+
+  const ov = store.loadOverlay(project.id);
+  ov.deleted = ov.deleted || { nodes: {}, edges: {} };
+  ov.deleted.nodes = ov.deleted.nodes || {};
+  ov.deleted.edges = ov.deleted.edges || {};
+
+  root = abs;
+  ROOT_LABEL = label;
+  MODEL = model;
+  S = st;
+  PROJECT = project;
+  overlay = ov;
+
+  // 已有数据但还没钉过起点时，补一条 baseline：
+  // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
+  if (!store.hasAnchor(project.id)) {
+    store.appendEvent(project.id, { op: 'baseline', target: 'open', after: ov, actor: 'system' });
+  }
+
+  console.log(
+    `[就绪] 文件 ${st.files} / 函数 ${st.functions} / 边 ${st.edges} / 宏 ${st.macros} / 耗时 ${loadMs}ms${
+      fromCache ? '（解析缓存）' : ''
+    }`
+  );
+  console.log(`[存储] ${store.file} · 工程 #${project.id} ${project.isNew ? '(新建)' : ''}`);
+  return { project, stats: st };
 }
-// JSON 合法但不是对象（null / 数组 / 字符串）时同样回落，避免下面取字段直接抛
-if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) overlay = emptyOverlay();
 
-// 用户在界面上删掉的函数 / 连线：按 id 记下来，所有视图里都不再显示
-overlay.deleted = overlay.deleted || { nodes: {}, edges: {} };
-overlay.deleted.nodes = overlay.deleted.nodes || {};
-overlay.deleted.edges = overlay.deleted.edges || {};
+await openTarget(target, { first: true });
 
-const saveOverlay = () => {
-  fs.mkdirSync(OUT, { recursive: true });
-  // 先写临时文件再改名：进程在写一半被杀时不会留下半截 JSON
-  const tmp = `${OVERLAY_PATH}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(overlay, null, 1), 'utf8');
-  fs.renameSync(tmp, OVERLAY_PATH);
+/** 重新从库里载入 overlay 到内存镜像（清理孤儿标注后用） */
+function reloadOverlay() {
+  const ov = store.loadOverlay(PROJECT.id);
+  ov.deleted = ov.deleted || { nodes: {}, edges: {} };
+  ov.deleted.nodes = ov.deleted.nodes || {};
+  ov.deleted.edges = ov.deleted.edges || {};
+  overlay = ov;
+  return ov;
+}
+
+/**
+ * 找出库里指向「已经不存在的函数 / 连线」的条目。
+ * 判定规则在 core/orphans.js，那边能直接拿真实模型写单测。
+ */
+function collectOrphans() {
+  return collectOrphansOf(MODEL, store.listAllTargets(PROJECT.id));
+}
+
+/** 只取 patch 里涉及到的键，事件里存增量而不是全量，避免时间轴被坐标淹没 */
+const pickKeys = (obj, keys) => {
+  const out = {};
+  for (const k of keys) out[k] = obj && Object.prototype.hasOwnProperty.call(obj, k) ? obj[k] : null;
+  return out;
 };
+
+
+
 
 /** 与前端 edgeKey 保持一致 */
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
@@ -434,7 +524,18 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(rootIds, up, down, group = false, dfNode = null, optimal = false, varSel = {}, fixed = false) {
+function buildView(
+  rootIds,
+  up,
+  down,
+  group = false,
+  dfNode = null,
+  optimal = false,
+  varSel = {},
+  fixed = false,
+  // 时间轴回看时传历史 overlay：视图构建逻辑完全复用，只是输入换了一份
+  viewOverlay = overlay
+) {
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
   const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
@@ -462,7 +563,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
   const wantVars = new Set(varSel.want || []);
   const skipVars = new Set(varSel.skip || []);
 
-  let alive = g.nodes.filter((n) => !overlay.deleted.nodes[n.id]);
+  let alive = g.nodes.filter((n) => !viewOverlay.deleted.nodes[n.id]);
   // 右侧面板里被取消勾选的全局变量：连节点带边一起去掉
   if (skipVars.size) alive = alive.filter((n) => !(n.kind === 'var' && skipVars.has(n.id)));
   const aliveIds = new Set(alive.map((n) => n.id));
@@ -470,7 +571,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
     (e) =>
       aliveIds.has(e.from) &&
       aliveIds.has(e.to) &&
-      !overlay.deleted.edges[edgeKeyOf(e)] &&
+      !viewOverlay.deleted.edges[edgeKeyOf(e)] &&
       !(e.kind === 'var' && (skipVars.has(e.to) || skipVars.has(e.from)))
   );
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
@@ -482,7 +583,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
     const ids = new Set(clean.map((n) => n.id));
     const df = MODEL._df;
     for (const id of wantVars) {
-      if (ids.has(id) || overlay.deleted.nodes[id]) continue;
+      if (ids.has(id) || viewOverlay.deleted.nodes[id]) continue;
       const def = (df && df.byId.get(id)) || MODEL._index.byId.get(id);
       if (!def) continue;
       clean.push({
@@ -542,7 +643,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
     const ids = new Set(clean.map((n) => n.id));
     for (const f of flows) {
       for (const id of [f.from, f.to]) {
-        if (ids.has(id) || overlay.deleted.nodes[id]) continue;
+        if (ids.has(id) || viewOverlay.deleted.nodes[id]) continue;
         const fn = MODEL._index.byId.get(id);
         if (!fn) continue;
         const { bodyTokens, ...rest } = fn;
@@ -568,7 +669,7 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
   // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
-  const slot = optimal && !fixed ? {} : overlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
+  const slot = optimal && !fixed ? {} : viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
 
   // 手动拖拽的节点位置优先。
   // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
@@ -704,14 +805,14 @@ function buildView(rootIds, up, down, group = false, dfNode = null, optimal = fa
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
-    const ov = overlay.nodes?.[n.id];
+    const ov = viewOverlay.nodes?.[n.id];
     if (ov) Object.assign(n, { note: ov.note, color: ov.color, tag: ov.tag });
     // 既存 / 変更 / 追加 / 削除，前端据此决定背景色与线框样式
     n.change = (ov && ov.change) || 'existing';
     n.kind = n.kind === 'var' ? 'var' : 'fn';
   }
   for (const e of laid.edges) {
-    const ov = overlay.edges?.[edgeKeyOf(e)];
+    const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = (ov && ov.change) || 'existing';
   }
@@ -758,6 +859,129 @@ const server = http.createServer((req, res) => {
       return json(res, buildFileTree(MODEL));
     }
 
+    // 当前工程身份：前端用它显示工程名、判断是否需要提示「代码已变更」
+    if (u.pathname === '/api/project') {
+      const fp = fingerprintFiles(MODEL.files);
+      return json(res, {
+        id: PROJECT.id,
+        name: PROJECT.name,
+        path: root,
+        fingerprint: fp,
+        scannedFingerprint: PROJECT.prevFingerprint || PROJECT.fingerprint,
+        changed: !!PROJECT.prevFingerprint && PROJECT.prevFingerprint !== fp,
+        db: store.file,
+      });
+    }
+
+    // 最近打开的工程列表，供启动页选择
+    if (u.pathname === '/api/projects') {
+      return json(
+        res,
+        store.listProjects(50).map((p) => ({
+          id: p.id,
+          name: p.name,
+          path: p.path,
+          pinned: !!p.pinned,
+          openedAt: p.opened_at,
+          fingerprint: p.fingerprint,
+          current: p.id === PROJECT.id,
+        }))
+      );
+    }
+
+    // 切换工程：重新解析目标并整体替换会话状态，前端拿到新统计后重载数据即可
+    if (u.pathname === '/api/switch' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then(async (p) => {
+          let targetPath = typeof p.path === 'string' ? p.path : '';
+          if (!targetPath && p.id !== undefined) {
+            const pr = store.getProject(Number(p.id));
+            if (!pr) return bad(res, '工程不存在');
+            targetPath = pr.path;
+          }
+          if (!targetPath) return bad(res, 'id 或 path 必须给一个');
+          try {
+            const { project, stats: st } = await openTarget(targetPath);
+            json(res, {
+              ok: true,
+              project: { id: project.id, name: project.name, path: root },
+              stats: st,
+            });
+          } catch (err) {
+            json(res, { ok: false, error: String(err.message || err) }, 400);
+          }
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
+    // 孤儿标注：库里指向已不存在的函数 / 连线的条目
+    if (u.pathname === '/api/orphans') {
+      const o = collectOrphans();
+      return json(res, { ...o, total: countOrphans(o) });
+    }
+
+    if (u.pathname === '/api/orphans/purge' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const o = collectOrphans();
+          const total = countOrphans(o);
+          if (!total) return json(res, { ok: true, removed: 0 });
+          // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
+          if (p.dry) return json(res, { ok: true, removed: 0, wouldRemove: total, detail: o });
+          const removed = store.purgeTargets(PROJECT.id, o);
+          store.appendEvent(PROJECT.id, { op: 'orphan.purge', target: 'orphans', after: o });
+          reloadOverlay();
+          json(res, { ok: true, removed: total, detail: removed });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
+    // 时间轴：操作事件列表（倒序，最新在前）
+    if (u.pathname === '/api/events') {
+      const limit = Math.min(1000, Math.max(1, Number(u.searchParams.get('limit') || 200)));
+      return json(res, {
+        latest: store.latestEventId(PROJECT.id),
+        events: store.listEvents(PROJECT.id, limit),
+      });
+    }
+
+    // 恢复到此：把历史某一刻的状态整体写回，并追加一条 restore_point 事件
+    if (u.pathname === '/api/restore' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const at = Number(p.eventId);
+          if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
+          const latest = store.latestEventId(PROJECT.id);
+          if (at > latest) return bad(res, 'eventId 超出范围');
+          const restored = store.overlayAt(PROJECT.id, at);
+          store.replaceOverlay(PROJECT.id, restored);
+          store.appendEvent(PROJECT.id, {
+            op: 'restore_point',
+            target: `event#${at}`,
+            after: restored,
+          });
+          // 同步内存镜像，后续请求直接读到恢复后的状态
+          overlay.nodes = restored.nodes;
+          overlay.edges = restored.edges;
+          overlay.deleted = restored.deleted;
+          overlay.layout = restored.layout;
+          json(res, { ok: true, eventId: store.latestEventId(PROJECT.id) });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
     if (u.pathname === '/api/search') {
       const q = u.searchParams.get('q') || '';
       const list = search(MODEL, q, 40);
@@ -791,6 +1015,9 @@ const server = http.createServer((req, res) => {
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: split('vars'), skip: split('novars') };
       const fixed = u.searchParams.get('fixed') === '1';
+      // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
+      const at = Number(u.searchParams.get('at') || 0);
+      const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
       if (!roots.length) {
         if (!MODEL.functions.length) {
           return json(res, {
@@ -811,9 +1038,12 @@ const server = http.createServer((req, res) => {
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
-        return json(res, buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed));
+        return json(
+          res,
+          buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed, viewOverlay)
+        );
       }
-      return json(res, buildView(roots, up, down, group, df, optimal, varSel, fixed));
+      return json(res, buildView(roots, up, down, group, df, optimal, varSel, fixed, viewOverlay));
     }
 
     if (u.pathname === '/api/node') {
@@ -906,24 +1136,28 @@ const server = http.createServer((req, res) => {
           if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = String(patch.root || '');
-          overlay.layout = overlay.layout || {};
           const key = layoutKey(rootId, mode);
-          if (!isPlainObject(overlay.layout[key])) overlay.layout[key] = {};
-          const slot = overlay.layout[key];
-          if (!isPlainObject(slot.nodes)) slot.nodes = {};
-          if (!isPlainObject(slot.edges)) slot.edges = {};
-          if (!Array.isArray(slot.manual)) slot.manual = [];
+          const before = store.getLayout(PROJECT.id, rootId, mode);
+          const slot = store.saveLayout(PROJECT.id, rootId, mode, {
+            nodes: patch.nodes,
+            edges: patch.edges,
+            manual: patch.manual,
+            clear: !!patch.clear,
+          });
+          overlay.layout = overlay.layout || {};
+          overlay.layout[key] = slot;
 
-          if (patch.clear) {
-            slot.nodes = {};
-            slot.edges = {};
-            slot.manual = [];
-          } else {
-            if (patch.nodes) Object.assign(slot.nodes, patch.nodes);
-            if (patch.manual) slot.manual = patch.manual;
-            if (patch.edges) Object.assign(slot.edges, patch.edges);
-          }
-          saveOverlay();
+          // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
+          store.appendEvent(PROJECT.id, {
+            op: patch.clear ? 'layout.clear' : 'layout.save',
+            target: key,
+            before: {
+              nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
+              edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
+              manual: patch.manual ? before.manual : undefined,
+            },
+            after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual },
+          });
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -941,20 +1175,19 @@ const server = http.createServer((req, res) => {
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           overlay.nodes = overlay.nodes || {};
           overlay.edges = overlay.edges || {};
-          if (patch.nodeId) {
-            overlay.nodes[patch.nodeId] = {
-              ...(overlay.nodes[patch.nodeId] || {}),
-              ...patch.data,
-              updatedAt: new Date().toISOString(),
-            };
-          }
-          if (patch.edgeKey) {
-            overlay.edges[patch.edgeKey] = {
-              ...(overlay.edges[patch.edgeKey] || {}),
-              ...patch.data,
-            };
-          }
-          saveOverlay();
+          const kind = patch.nodeId ? 'node' : patch.edgeKey ? 'edge' : null;
+          const targetId = patch.nodeId || patch.edgeKey || null;
+          if (!kind) return bad(res, 'nodeId 或 edgeKey 必须给一个');
+          const bucket = kind === 'node' ? overlay.nodes : overlay.edges;
+          const before = pickKeys(bucket[targetId], Object.keys(patch.data));
+          const merged = store.setAnnotation(PROJECT.id, kind, targetId, patch.data);
+          bucket[targetId] = merged;
+          store.appendEvent(PROJECT.id, {
+            op: kind === 'node' ? 'node.annotate' : 'edge.annotate',
+            target: targetId,
+            before,
+            after: patch.data,
+          });
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -979,11 +1212,13 @@ const server = http.createServer((req, res) => {
           }
           if (p.clear) {
             // 一次性恢复所有被删除的函数与连线
+            store.clearDeleted(PROJECT.id);
             overlay.deleted = { nodes: {}, edges: {} };
-            saveOverlay();
+            store.appendEvent(PROJECT.id, { op: 'delete.clear' });
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
+          const counts = store.setDeleted(PROJECT.id, { nodes: nodeIds, edges: edgeKeys }, restore);
           for (const id of nodeIds) {
             if (restore) delete overlay.deleted.nodes[id];
             else overlay.deleted.nodes[id] = 1;
@@ -992,12 +1227,13 @@ const server = http.createServer((req, res) => {
             if (restore) delete overlay.deleted.edges[k];
             else overlay.deleted.edges[k] = 1;
           }
-          saveOverlay();
-          json(res, {
-            ok: true,
-            nodes: Object.keys(overlay.deleted.nodes).length,
-            edges: Object.keys(overlay.deleted.edges).length,
+          store.appendEvent(PROJECT.id, {
+            op: restore ? 'delete.restore' : 'delete',
+            target: nodeIds.length === 1 && !edgeKeys.length ? nodeIds[0] : null,
+            // 回放要区分节点和边，不能只留一个拼接字符串
+            after: { nodes: nodeIds, edges: edgeKeys },
           });
+          json(res, { ok: true, nodes: counts.nodes, edges: counts.edges });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);

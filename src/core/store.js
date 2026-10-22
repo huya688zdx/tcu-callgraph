@@ -1,0 +1,767 @@
+/**
+ * 本地持久化层：单个 SQLite 库，按工程隔离。
+ *
+ * 为什么不是 JSON 文件：
+ * - 一个 overlay.json 装不下多个工程，节点 id 又是「文件::函数」，换个工程同名文件就串味；
+ * - 时间轴需要按 (project, ts) 翻页查询，JSON 每次都得全量解析。
+ *
+ * 为什么用 node:sqlite 而不是 better-sqlite3：
+ * 内置模块零依赖，不需要按 Electron ABI 重编译原生模块。
+ *
+ * 数据分层原则（见 docs/superpowers/specs/2026-10-22-persistence-design.md）：
+ * 只存「输入」——标注、删除、手工布局、视图参数、操作事件；
+ * 不存「派生」——自动布局坐标、路由折线、文件框几何都由这些输入算出来。
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { DatabaseSync } from 'node:sqlite';
+
+const SCHEMA_VERSION = 1;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS project (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  path        TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  fingerprint TEXT,
+  git_remote  TEXT,
+  git_commit  TEXT,
+  created_at  INTEGER NOT NULL,
+  opened_at   INTEGER NOT NULL,
+  pinned      INTEGER NOT NULL DEFAULT 0,
+  note        TEXT,
+  cover       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS annotation (
+  project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL,
+  target_id   TEXT NOT NULL,
+  data        TEXT NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  PRIMARY KEY (project_id, target_kind, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS deleted (
+  project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  target_kind TEXT NOT NULL,
+  target_id   TEXT NOT NULL,
+  PRIMARY KEY (project_id, target_kind, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS layout (
+  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  view_key   TEXT NOT NULL,
+  mode       TEXT NOT NULL,
+  nodes      TEXT NOT NULL DEFAULT '{}',
+  edges      TEXT NOT NULL DEFAULT '{}',
+  manual     TEXT NOT NULL DEFAULT '[]',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (project_id, view_key, mode)
+);
+
+CREATE TABLE IF NOT EXISTS view_state (
+  project_id INTEGER PRIMARY KEY REFERENCES project(id) ON DELETE CASCADE,
+  roots      TEXT,
+  up         INTEGER,
+  down       INTEGER,
+  grouped    INTEGER,
+  zoom       REAL,
+  pan_x      REAL,
+  pan_y      REAL,
+  selected   TEXT,
+  updated_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS event (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  ts         INTEGER NOT NULL,
+  seq        INTEGER NOT NULL DEFAULT 0,
+  actor      TEXT NOT NULL DEFAULT 'user',
+  op         TEXT NOT NULL,
+  target     TEXT,
+  before     TEXT,
+  after      TEXT,
+  ctx        TEXT
+);
+CREATE INDEX IF NOT EXISTS event_by_project ON event(project_id, ts, seq);
+
+CREATE TABLE IF NOT EXISTS snapshot (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  ts         INTEGER NOT NULL,
+  label      TEXT,
+  kind       TEXT NOT NULL DEFAULT 'auto',
+  event_id   INTEGER,
+  state      BLOB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS parse_cache (
+  fingerprint TEXT PRIMARY KEY,
+  created_at  INTEGER NOT NULL,
+  stats       TEXT,
+  model       BLOB
+);
+
+CREATE TABLE IF NOT EXISTS setting (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+const nowMs = () => Date.now();
+
+/** 空 overlay：与旧 out/overlay.json 结构保持一致，前端和 buildView 都不用改 */
+export const emptyOverlay = () => ({
+  nodes: {},
+  edges: {},
+  notes: [],
+  deleted: { nodes: {}, edges: {} },
+  layout: {},
+});
+
+/**
+ * 默认数据目录：跟 Electron 的 app.getPath('userData') 对齐。
+ * 两边必须指向同一个地方，否则 `npm run serve` 和 `npm start` 会各自读写一份库，
+ * 症状是「命令行里标的注，桌面版打开就没了」。
+ */
+function defaultDataDir() {
+  const home = os.homedir();
+  if (process.platform === 'win32') {
+    return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'tcu-callgraph');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'tcu-callgraph');
+  }
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'tcu-callgraph');
+}
+
+/**
+ * 库文件位置，优先级：
+ *   1. 显式传参 / CALLGRAPH_DB
+ *   2. Electron 主进程注入的 userData 目录（CALLGRAPH_USER_DATA）
+ *   3. 平台默认数据目录（与 Electron userData 同一位置）
+ */
+export function resolveDbPath({ explicit, userData } = {}) {
+  if (explicit) return path.resolve(explicit);
+  if (process.env.CALLGRAPH_DB) return path.resolve(process.env.CALLGRAPH_DB);
+  const dir = userData || process.env.CALLGRAPH_USER_DATA;
+  if (dir) return path.join(path.resolve(dir), 'callgraph.db');
+  return path.join(defaultDataDir(), 'callgraph.db');
+}
+
+/**
+ * 工程内容指纹：文件清单 + 字节数的 hash。
+ * 不用 mtime 是因为它会被 git checkout / 复制目录整体刷新，误报太多；
+ * 不读文件内容是因为大工程每次启动全量读一遍代价太高。
+ * 纯注释改动不会改变指纹——那种改动本来也不改变调用图。
+ */
+export function fingerprintFiles(files = []) {
+  const h = createHash('sha1');
+  const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (const f of list) {
+    h.update(`${f.rel}\u0000${f.bytes}\u0000${f.isHeader ? 1 : 0}\n`);
+  }
+  return h.digest('hex');
+}
+
+/**
+ * 解析缓存的 key。
+ * 和工程指纹分开：这里必须带上 mtime，否则「大小没变的改写」会命中旧缓存，
+ * 图就永远停在改动前。工程指纹不带 mtime，是为了避免 git checkout 之类的
+ * 时间戳抖动让界面上一直挂个「代码已变更」的星号。
+ */
+export function cacheKey(files = [], focus = '') {
+  const h = createHash('sha1');
+  const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  for (const f of list) {
+    h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
+  }
+  if (focus) h.update(`focus\u0000${focus}\n`);
+  return h.digest('hex');
+}
+
+/** Map 在 JSON 里会变成 {}，fnptrTables 的 map 字段要靠这两个函数往返 */
+const mapReplacer = (k, v) => (v instanceof Map ? { __map: [...v] } : v);
+const mapReviver = (k, v) =>
+  v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.__map) ? new Map(v.__map) : v;
+
+const parse = (s, fallback) => {
+  try {
+    return s ? JSON.parse(s) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const str = (s) => JSON.stringify(s ?? null);
+
+const toEvent = (r) => ({
+  id: r.id,
+  ts: r.ts,
+  seq: r.seq,
+  actor: r.actor,
+  op: r.op,
+  target: r.target,
+  before: parse(r.before, null),
+  after: parse(r.after, null),
+  ctx: parse(r.ctx, null),
+});
+
+/** 把一条事件应用到 overlay 上（时间轴回放的唯一入口，必须和写接口一一对应） */
+function applyEvent(ov, e) {
+  const after = e.after || {};
+  switch (e.op) {
+    // 携带全量状态的节点：直接整体替换
+    case 'baseline':
+    case 'restore_point':
+    case 'import': {
+      if (!after.nodes && !after.layout && !after.deleted) return;
+      ov.nodes = { ...(after.nodes || {}) };
+      ov.edges = { ...(after.edges || {}) };
+      ov.deleted = {
+        nodes: { ...((after.deleted || {}).nodes || {}) },
+        edges: { ...((after.deleted || {}).edges || {}) },
+      };
+      ov.layout = { ...(after.layout || {}) };
+      return;
+    }
+    case 'node.annotate':
+    case 'edge.annotate': {
+      const bucket = e.op === 'node.annotate' ? ov.nodes : ov.edges;
+      const merged = { ...(bucket[e.target] || {}), ...after };
+      for (const k of Object.keys(merged)) if (merged[k] === null) delete merged[k];
+      if (Object.keys(merged).length) bucket[e.target] = merged;
+      else delete bucket[e.target];
+      return;
+    }
+    case 'delete': {
+      for (const id of after.nodes || []) ov.deleted.nodes[id] = 1;
+      for (const k of after.edges || []) ov.deleted.edges[k] = 1;
+      return;
+    }
+    case 'delete.restore': {
+      for (const id of after.nodes || []) delete ov.deleted.nodes[id];
+      for (const k of after.edges || []) delete ov.deleted.edges[k];
+      return;
+    }
+    case 'delete.clear': {
+      ov.deleted = { nodes: {}, edges: {} };
+      return;
+    }
+    case 'layout.save': {
+      const slot = ov.layout[e.target] || { nodes: {}, edges: {}, manual: [] };
+      if (after.nodes) Object.assign(slot.nodes, after.nodes);
+      if (after.edges) Object.assign(slot.edges, after.edges);
+      if (after.manual) slot.manual = after.manual;
+      ov.layout[e.target] = slot;
+      return;
+    }
+    case 'layout.clear': {
+      delete ov.layout[e.target];
+      return;
+    }
+    case 'orphan.purge': {
+      for (const a of after.annotations || []) {
+        delete (a.kind === 'node' ? ov.nodes : ov.edges)[a.id];
+      }
+      for (const d of after.deleted || []) {
+        delete (d.kind === 'node' ? ov.deleted.nodes : ov.deleted.edges)[d.id];
+      }
+      for (const s of after.layoutSlots || []) delete ov.layout[`${s.viewKey}::${s.mode}`];
+      for (const n of after.layoutNodes || []) {
+        const slot = ov.layout[`${n.viewKey}::${n.mode}`];
+        if (slot) for (const id of n.ids) delete slot.nodes[id];
+      }
+      return;
+    }
+    default:
+      // view.switch 之类的浏览事件不改变状态
+      return;
+  }
+}
+
+function migrate(db) {
+  const row = db.prepare('PRAGMA user_version').get() || {};
+  const cur = Number(row.user_version ?? 0);
+  if (cur >= SCHEMA_VERSION) return cur;
+  db.exec(SCHEMA);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  return SCHEMA_VERSION;
+}
+
+export function openStore({ dbPath, userData } = {}) {
+  const file = resolveDbPath({ explicit: dbPath, userData });
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+
+  const db = new DatabaseSync(file);
+  // WAL：读写不互相阻塞，进程被强杀时也不会留下半截事务
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA foreign_keys = ON');
+  const version = migrate(db);
+
+  /** 事务包装：回调抛错就回滚，避免事件写了而状态没写这种半截状态 */
+  const tx = (fn) => {
+    db.exec('BEGIN');
+    try {
+      const out = fn();
+      db.exec('COMMIT');
+      return out;
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* 回滚失败时保留原始异常 */
+      }
+      throw err;
+    }
+  };
+
+  const q = {
+    projectByPath: db.prepare('SELECT * FROM project WHERE path = ?'),
+    projectById: db.prepare('SELECT * FROM project WHERE id = ?'),
+    projectByFingerprint: db.prepare('SELECT * FROM project WHERE fingerprint = ? ORDER BY opened_at DESC'),
+    projectInsert: db.prepare(
+      `INSERT INTO project (path, name, fingerprint, git_remote, git_commit, created_at, opened_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ),
+    projectTouch: db.prepare('UPDATE project SET opened_at = ?, fingerprint = COALESCE(?, fingerprint) WHERE id = ?'),
+    projectList: db.prepare('SELECT * FROM project ORDER BY pinned DESC, opened_at DESC LIMIT ?'),
+
+    annList: db.prepare('SELECT target_id, data FROM annotation WHERE project_id = ? AND target_kind = ?'),
+    annAll: db.prepare('SELECT target_kind, target_id, data FROM annotation WHERE project_id = ?'),
+    annGet: db.prepare(
+      'SELECT data FROM annotation WHERE project_id = ? AND target_kind = ? AND target_id = ?'
+    ),
+    annPut: db.prepare(
+      `INSERT INTO annotation (project_id, target_kind, target_id, data, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, target_kind, target_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
+    ),
+    annDel: db.prepare('DELETE FROM annotation WHERE project_id = ? AND target_kind = ? AND target_id = ?'),
+
+    delList: db.prepare('SELECT target_id FROM deleted WHERE project_id = ? AND target_kind = ?'),
+    delAll: db.prepare('SELECT target_kind, target_id FROM deleted WHERE project_id = ?'),
+    delPut: db.prepare(
+      'INSERT OR IGNORE INTO deleted (project_id, target_kind, target_id) VALUES (?, ?, ?)'
+    ),
+    delDel: db.prepare('DELETE FROM deleted WHERE project_id = ? AND target_kind = ? AND target_id = ?'),
+    delClear: db.prepare('DELETE FROM deleted WHERE project_id = ?'),
+
+    layoutList: db.prepare('SELECT view_key, mode, nodes, edges, manual FROM layout WHERE project_id = ?'),
+    layoutGet: db.prepare('SELECT nodes, edges, manual FROM layout WHERE project_id = ? AND view_key = ? AND mode = ?'),
+    layoutPut: db.prepare(
+      `INSERT INTO layout (project_id, view_key, mode, nodes, edges, manual, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(project_id, view_key, mode) DO UPDATE SET
+         nodes = excluded.nodes, edges = excluded.edges, manual = excluded.manual, updated_at = excluded.updated_at`
+    ),
+    layoutDel: db.prepare('DELETE FROM layout WHERE project_id = ? AND view_key = ? AND mode = ?'),
+
+    eventInsert: db.prepare(
+      `INSERT INTO event (project_id, ts, seq, actor, op, target, before, after, ctx)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ),
+    eventList: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY ts DESC, seq DESC LIMIT ?'),
+    eventUpTo: db.prepare('SELECT * FROM event WHERE project_id = ? AND id <= ? ORDER BY id ASC'),
+    eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
+    eventAnchor: db.prepare("SELECT id FROM event WHERE project_id = ? AND op = 'baseline' LIMIT 1"),
+
+    settingGet: db.prepare('SELECT value FROM setting WHERE key = ?'),
+    settingPut: db.prepare(
+      'INSERT INTO setting (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    ),
+
+    cacheGet: db.prepare('SELECT model FROM parse_cache WHERE fingerprint = ?'),
+    cachePut: db.prepare(
+      `INSERT INTO parse_cache (fingerprint, created_at, stats, model) VALUES (?, ?, ?, ?)
+       ON CONFLICT(fingerprint) DO UPDATE SET created_at = excluded.created_at, stats = excluded.stats, model = excluded.model`
+    ),
+    cacheDel: db.prepare('DELETE FROM parse_cache WHERE fingerprint = ?'),
+    cachePrune: db.prepare(
+      'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC LIMIT ?)'
+    ),
+  };
+
+  let seqInMs = 0;
+  let lastTs = 0;
+
+  const api = {
+    file,
+    version,
+    db,
+
+    /** 同一毫秒内的多条事件用 seq 排先后，保证时间轴顺序稳定 */
+    nextStamp() {
+      const ts = nowMs();
+      seqInMs = ts === lastTs ? seqInMs + 1 : 0;
+      lastTs = ts;
+      return { ts, seq: seqInMs };
+    },
+
+    upsertProject({ path: projectPath, name, fingerprint, gitRemote, gitCommit }) {
+      const abs = path.resolve(projectPath);
+      const existing = q.projectByPath.get(abs);
+      const ts = nowMs();
+      if (existing) {
+        q.projectTouch.run(ts, fingerprint ?? null, existing.id);
+        return {
+          ...existing,
+          fingerprint: fingerprint ?? existing.fingerprint,
+          opened_at: ts,
+          isNew: false,
+          // 上次会话记录的指纹：用来判断「代码在你上次打开之后变过没有」
+          prevFingerprint: existing.fingerprint,
+        };
+      }
+      const info = q.projectInsert.run(
+        abs,
+        name || path.basename(abs),
+        fingerprint ?? null,
+        gitRemote ?? null,
+        gitCommit ?? null,
+        ts,
+        ts
+      );
+      return { ...q.projectById.get(info.lastInsertRowid), isNew: true, prevFingerprint: null };
+    },
+
+    getProject(id) {
+      return q.projectById.get(id) || null;
+    },
+
+    /** 路径变了但内容没变时用来认亲（第一阶段只提供查询，UI 后续接） */
+    findByFingerprint(fp) {
+      return fp ? q.projectByFingerprint.all(fp) : [];
+    },
+
+    listProjects(limit = 50) {
+      return q.projectList.all(limit);
+    },
+
+    loadOverlay(projectId) {
+      const ov = emptyOverlay();
+      for (const r of q.annList.all(projectId, 'node')) ov.nodes[r.target_id] = parse(r.data, {});
+      for (const r of q.annList.all(projectId, 'edge')) ov.edges[r.target_id] = parse(r.data, {});
+      for (const r of q.delList.all(projectId, 'node')) ov.deleted.nodes[r.target_id] = 1;
+      for (const r of q.delList.all(projectId, 'edge')) ov.deleted.edges[r.target_id] = 1;
+      for (const r of q.layoutList.all(projectId)) {
+        ov.layout[`${r.view_key}::${r.mode}`] = {
+          nodes: parse(r.nodes, {}),
+          edges: parse(r.edges, {}),
+          manual: parse(r.manual, []),
+        };
+      }
+      return ov;
+    },
+
+    /**
+     * 写节点/边标注。data 里传 null 的字段表示清除该字段，
+     * 传 undefined 表示不动——与旧接口「只 merge 传进来的键」保持一致。
+     */
+    setAnnotation(projectId, kind, targetId, data) {
+      return tx(() => {
+        const prev = parse((q.annGet.get(projectId, kind, targetId) || {}).data, {});
+        const merged = { ...prev, ...data };
+        for (const k of Object.keys(merged)) {
+          if (merged[k] === null) delete merged[k];
+        }
+        merged.updatedAt = new Date().toISOString();
+        q.annPut.run(projectId, kind, targetId, str(merged), nowMs());
+        return merged;
+      });
+    },
+
+    /** 删除 / 恢复函数与连线：只记 id，不动源码 */
+    setDeleted(projectId, { nodes = [], edges = [] }, restore = false) {
+      return tx(() => {
+        for (const id of nodes) {
+          if (restore) q.delDel.run(projectId, 'node', id);
+          else q.delPut.run(projectId, 'node', id);
+        }
+        for (const k of edges) {
+          if (restore) q.delDel.run(projectId, 'edge', k);
+          else q.delPut.run(projectId, 'edge', k);
+        }
+        return {
+          nodes: q.delList.all(projectId, 'node').length,
+          edges: q.delList.all(projectId, 'edge').length,
+        };
+      });
+    },
+
+    clearDeleted(projectId) {
+      q.delClear.run(projectId);
+    },
+
+    /** 读一个布局槽位；不存在时返回空槽，调用方不用判空 */
+    getLayout(projectId, viewKey, mode) {
+      const r = q.layoutGet.get(projectId, viewKey, mode);
+      if (!r) return { nodes: {}, edges: {}, manual: [] };
+      return { nodes: parse(r.nodes, {}), edges: parse(r.edges, {}), manual: parse(r.manual, []) };
+    },
+
+    /**
+     * 写布局槽位。clear=true 清空该槽位；否则按字段 merge，
+     * manual 是整体替换（它表示「当前视图里所有手工边」的完整集合）。
+     */
+    saveLayout(projectId, viewKey, mode, patch = {}) {
+      return tx(() => {
+        const slot = api.getLayout(projectId, viewKey, mode);
+        if (patch.clear) {
+          q.layoutDel.run(projectId, viewKey, mode);
+          return { nodes: {}, edges: {}, manual: [] };
+        }
+        if (patch.nodes) Object.assign(slot.nodes, patch.nodes);
+        if (patch.edges) Object.assign(slot.edges, patch.edges);
+        if (patch.manual) slot.manual = patch.manual;
+        q.layoutPut.run(projectId, viewKey, mode, str(slot.nodes), str(slot.edges), str(slot.manual), nowMs());
+        return slot;
+      });
+    },
+
+    appendEvent(projectId, { op, target = null, before = null, after = null, ctx = null, actor = 'user' }) {
+      const { ts, seq } = api.nextStamp();
+      const info = q.eventInsert.run(
+        projectId,
+        ts,
+        seq,
+        actor,
+        op,
+        target,
+        before === null ? null : str(before),
+        after === null ? null : str(after),
+        ctx === null ? null : str(ctx)
+      );
+      return Number(info.lastInsertRowid);
+    },
+
+    listEvents(projectId, limit = 200) {
+      return q.eventList.all(projectId, limit).map(toEvent);
+    },
+
+    /** 时间轴回放用：按 id 升序取到某个事件为止 */
+    eventsUpTo(projectId, eventId) {
+      return q.eventUpTo.all(projectId, eventId).map(toEvent);
+    },
+
+    latestEventId(projectId) {
+      const r = q.eventMax.get(projectId);
+      return Number(r?.id || 0);
+    },
+
+    /** 有没有「可信起点」：只有 baseline 保证携带全量状态（import 的载荷可能只是摘要） */
+    hasAnchor(projectId) {
+      return !!q.eventAnchor.get(projectId);
+    },
+
+    /**
+     * 把 overlay 重放到指定事件之后的状态。
+     * 从空状态开始按 id 顺序应用，遇到 baseline / restore_point / import 这类
+     * 携带全量状态的节点就整体替换——它们标志着一份「可信起点」。
+     * 比它更早的事件在语义上已经被覆盖，所以不需要特殊处理。
+     */
+    overlayAt(projectId, eventId) {
+      const ov = emptyOverlay();
+      for (const e of api.eventsUpTo(projectId, eventId)) applyEvent(ov, e);
+      return ov;
+    },
+
+    /** 整体替换：恢复到此 / 导入时用。写库和事件分开，调用方决定要不要记事件 */
+    replaceOverlay(projectId, next) {
+      return tx(() => {
+        db.prepare('DELETE FROM annotation WHERE project_id = ?').run(projectId);
+        db.prepare('DELETE FROM deleted WHERE project_id = ?').run(projectId);
+        db.prepare('DELETE FROM layout WHERE project_id = ?').run(projectId);
+        const ts = nowMs();
+        for (const [id, data] of Object.entries(next.nodes || {})) {
+          q.annPut.run(projectId, 'node', id, str(data), ts);
+        }
+        for (const [k, data] of Object.entries(next.edges || {})) {
+          q.annPut.run(projectId, 'edge', k, str(data), ts);
+        }
+        for (const id of Object.keys((next.deleted || {}).nodes || {})) q.delPut.run(projectId, 'node', id);
+        for (const k of Object.keys((next.deleted || {}).edges || {})) q.delPut.run(projectId, 'edge', k);
+        for (const [key, slot] of Object.entries(next.layout || {})) {
+          const idx = key.lastIndexOf('::');
+          if (idx < 0) continue;
+          q.layoutPut.run(
+            projectId,
+            key.slice(0, idx),
+            key.slice(idx + 2),
+            str(slot.nodes || {}),
+            str(slot.edges || {}),
+            str(slot.manual || []),
+            ts
+          );
+        }
+      });
+    },
+
+    getSetting(key, fallback = null) {
+      const r = q.settingGet.get(key);
+      return r ? parse(r.value, fallback) : fallback;
+    },
+
+    setSetting(key, value) {
+      q.settingPut.run(key, str(value));
+    },
+
+    /**
+     * 取解析缓存。命中时返回「纯数据模型」，_index 需要调用方 rebuildIndex 重建。
+     * 读不出来（损坏 / 老版本格式）就当没命中，顺手删掉这条坏记录。
+     */
+    getCachedModel(key) {
+      const r = q.cacheGet.get(key);
+      if (!r || !r.model) return null;
+      try {
+        const json = gunzipSync(Buffer.from(r.model)).toString('utf8');
+        return JSON.parse(json, mapReviver);
+      } catch {
+        q.cacheDel.run(key);
+        return null;
+      }
+    },
+
+    /**
+     * 写解析缓存。超过 maxBytes 的模型不缓存——大工程的 token 数组可能有几十 MB，
+     * 塞进库里会让备份和启动都变慢，还不如每次重解析。
+     */
+    putCachedModel(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
+      // _index 里全是对象引用，存下来只会变成两份互不相干的副本
+      const { _index, ...plain } = model;
+      let json;
+      try {
+        json = JSON.stringify(plain, mapReplacer);
+      } catch {
+        return { cached: false, reason: 'serialize' };
+      }
+      if (Buffer.byteLength(json) > maxBytes) return { cached: false, reason: 'too-large', bytes: json.length };
+      const gz = gzipSync(Buffer.from(json), { level: 6 });
+      q.cachePut.run(key, nowMs(), null, gz);
+      q.cachePrune.run(keep);
+      return { cached: true, rawBytes: json.length, gzBytes: gz.length };
+    },
+
+    pruneCache(keep = 12) {
+      q.cachePrune.run(keep);
+    },
+
+    /** 全量导出本工程存下来的目标，供孤儿标注检测使用 */
+    listAllTargets(projectId) {
+      return {
+        annotations: q.annAll
+          .all(projectId)
+          .map((r) => ({ kind: r.target_kind, id: r.target_id, data: parse(r.data, {}) })),
+        deleted: q.delAll.all(projectId).map((r) => ({ kind: r.target_kind, id: r.target_id })),
+        layouts: q.layoutList.all(projectId).map((r) => ({
+          viewKey: r.view_key,
+          mode: r.mode,
+          nodes: parse(r.nodes, {}),
+        })),
+      };
+    },
+
+    /**
+     * 删除失效条目。只删传进来的这些，不做「顺手清理」——
+     * 判断哪些该删是调用方（服务端按当前模型算）的事，存储层不猜。
+     */
+    purgeTargets(projectId, { annotations = [], deleted = [], layoutSlots = [], layoutNodes = [] } = {}) {
+      return tx(() => {
+        for (const a of annotations) q.annDel.run(projectId, a.kind, a.id);
+        for (const d of deleted) q.delDel.run(projectId, d.kind, d.id);
+        for (const s of layoutSlots) q.layoutDel.run(projectId, s.viewKey, s.mode);
+        for (const n of layoutNodes) {
+          const slot = api.getLayout(projectId, n.viewKey, n.mode);
+          let touched = false;
+          for (const id of n.ids) {
+            if (Object.prototype.hasOwnProperty.call(slot.nodes, id)) {
+              delete slot.nodes[id];
+              touched = true;
+            }
+          }
+          if (!touched) continue;
+          // 节点全清空且没有手工边时，整个槽位没意义了
+          if (!Object.keys(slot.nodes).length && !slot.manual.length) {
+            q.layoutDel.run(projectId, n.viewKey, n.mode);
+          } else {
+            q.layoutPut.run(projectId, n.viewKey, n.mode, str(slot.nodes), str(slot.edges), str(slot.manual), nowMs());
+          }
+        }
+        return {
+          annotations: annotations.length,
+          deleted: deleted.length,
+          layoutSlots: layoutSlots.length,
+          layoutNodes: layoutNodes.reduce((s, n) => s + n.ids.length, 0),
+        };
+      });
+    },
+
+    close() {
+      try {
+        db.close();
+      } catch {
+        /* 已关闭时忽略 */
+      }
+    },
+  };
+
+  return api;
+}
+
+/**
+ * 旧 out/overlay.json 一次性导入。
+ * 只在库里还没有该工程任何标注时执行，避免反复覆盖用户后来的修改。
+ */
+export function importLegacyOverlay(store, projectId, legacy) {
+  if (!legacy || typeof legacy !== 'object') return { imported: false, reason: 'empty' };
+  const hasData =
+    Object.keys(legacy.nodes || {}).length ||
+    Object.keys(legacy.edges || {}).length ||
+    Object.keys((legacy.deleted || {}).nodes || {}).length ||
+    Object.keys((legacy.deleted || {}).edges || {}).length ||
+    Object.keys(legacy.layout || {}).length;
+  if (!hasData) return { imported: false, reason: 'nothing' };
+
+  const current = store.loadOverlay(projectId);
+  const already =
+    Object.keys(current.nodes).length ||
+    Object.keys(current.edges).length ||
+    Object.keys(current.deleted.nodes).length ||
+    Object.keys(current.deleted.edges).length ||
+    Object.keys(current.layout).length;
+  if (already) return { imported: false, reason: 'exists' };
+
+  let n = 0;
+  for (const [id, data] of Object.entries(legacy.nodes || {})) {
+    store.setAnnotation(projectId, 'node', id, data);
+    n++;
+  }
+  for (const [k, data] of Object.entries(legacy.edges || {})) {
+    store.setAnnotation(projectId, 'edge', k, data);
+    n++;
+  }
+  const delNodes = Object.keys((legacy.deleted || {}).nodes || {});
+  const delEdges = Object.keys((legacy.deleted || {}).edges || {});
+  if (delNodes.length || delEdges.length) store.setDeleted(projectId, { nodes: delNodes, edges: delEdges });
+  for (const [key, slot] of Object.entries(legacy.layout || {})) {
+    const idx = key.lastIndexOf('::');
+    if (idx < 0) continue;
+    store.saveLayout(projectId, key.slice(0, idx), key.slice(idx + 2), {
+      nodes: slot.nodes || {},
+      edges: slot.edges || {},
+      manual: slot.manual || [],
+    });
+  }
+  // 事件里带上全量状态：时间轴回放要靠它确定「可信起点」，
+  // 只记「导入了 2 条」是无法重建当时画面的
+  store.appendEvent(projectId, {
+    op: 'import',
+    target: 'out/overlay.json',
+    after: store.loadOverlay(projectId),
+    actor: 'system',
+  });
+  return { imported: true, annotations: n, deletedNodes: delNodes.length, deletedEdges: delEdges.length };
+}

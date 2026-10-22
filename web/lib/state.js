@@ -37,6 +37,8 @@ const state = {
   vars: new Set(),
   /** 手动取消勾选（即使视图里有函数引用它也不显示） */
   hiddenVars: new Set(),
+  /** 时间轴回看：0 表示看当前状态，>0 表示看这个事件之后的历史状态 */
+  at: 0,
   selected: null,
   hover: null,
   down: 3,

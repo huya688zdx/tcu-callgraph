@@ -217,12 +217,108 @@
     border: 1px solid rgba(0, 0, 0, 0.16);
     flex: 0 0 auto;
   }
+
+  /* ---- 弹层（工程选择 / 时间轴） ---- */
+  .mask {
+    position: absolute; inset: 0; background: rgba(20, 20, 18, 0.28);
+    display: none; z-index: 40;
+  }
+  .mask.show { display: block; }
+  .modal {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 560px; max-height: 74vh; display: none; flex-direction: column;
+    background: #fff; border-radius: 14px; z-index: 41;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); overflow: hidden;
+  }
+  .modal.show { display: flex; }
+  .modal-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 13px 16px; border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  }
+  .modal-head h2 { margin: 0; font-size: 14px; font-weight: 500; }
+  .modal-close {
+    border: 0; background: transparent; font-size: 18px; line-height: 1;
+    color: #888780; cursor: pointer; padding: 0 4px;
+  }
+  .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  .modal-foot {
+    display: flex; gap: 8px; padding: 10px 12px;
+    border-top: 1px solid rgba(0, 0, 0, 0.08); background: #FBFAF7;
+  }
+  .modal-foot input {
+    flex: 1; height: 30px; padding: 0 10px; font-size: 12.5px; font-family: inherit;
+    border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none;
+  }
+
+  .proj {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 10px; border-radius: 9px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .proj:hover { background: #F5F4EF; }
+  .proj.current { background: #E6F1FB; border-color: #B5D4F4; }
+  .proj .nm { font-weight: 500; font-size: 13px; }
+  .proj .pt { color: #888780; font-size: 11.5px; word-break: break-all; margin-top: 1px; }
+  .proj .tm { color: #B4B2A9; font-size: 11px; white-space: nowrap; }
+  .proj .badge {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 20px;
+    background: #EAF3DE; color: #3B6D11; white-space: nowrap;
+  }
+
+  .ev {
+    display: flex; gap: 9px; padding: 7px 9px; border-radius: 8px; cursor: pointer;
+  }
+  .ev:hover { background: #F5F4EF; }
+  .ev.on { background: #E6F1FB; }
+  .ev .dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; flex: 0 0 auto; background: #B4B2A9; }
+  .ev.k-annotate .dot { background: #378ADD; }
+  .ev.k-layout .dot { background: #97C459; }
+  .ev.k-delete .dot { background: #E24B4A; }
+  .ev.k-anchor .dot { background: #888780; }
+  .ev .txt { font-size: 12.5px; line-height: 1.5; }
+  .ev .sub { color: #888780; font-size: 11px; margin-top: 1px; }
+  .ev-day {
+    font-size: 11px; color: #888780; padding: 10px 9px 4px; font-weight: 500;
+  }
+
+  /* 失效标注提示：贴在工程面板底部，有内容才出现 */
+  .orphan-box { display: none; }
+  .orphan-box.show {
+    display: block; padding: 9px 12px; background: #FAEEDA;
+    border-top: 1px solid #FAC775;
+  }
+  .orphan-head { display: flex; align-items: flex-start; gap: 10px; }
+  .orphan-head .nm { font-size: 12.5px; font-weight: 500; color: #633806; }
+  .orphan-head .pt { font-size: 11.5px; color: #854F0B; margin-top: 2px; }
+  .orphan-head .ids {
+    font-family: ui-monospace, "Cascadia Mono", monospace;
+    font-size: 11px; color: #854F0B; margin-top: 5px; word-break: break-all; opacity: 0.85;
+  }
+  .orphan-head button { flex: 0 0 auto; }
+
+  /* 回看横幅：贴在画布顶部（图例下方），提示当前不是最新状态 */
+  .review-bar {
+    position: absolute; top: 48px; left: 50%; transform: translateX(-50%);
+    display: none; align-items: center; gap: 8px; z-index: 20;
+    background: #FAEEDA; border: 1px solid #EF9F27; color: #633806;
+    padding: 5px 8px 5px 12px; border-radius: 20px; font-size: 12px;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.08); white-space: nowrap;
+  }
+  .review-bar.show { display: flex; }
+  .review-bar button { height: 24px; font-size: 11.5px; border-radius: 12px; }
+  .review-bar.blocked { animation: shake 0.3s; }
+  @keyframes shake {
+    0%, 100% { transform: translateX(-50%); }
+    25% { transform: translateX(calc(-50% - 4px)); }
+    75% { transform: translateX(calc(-50% + 4px)); }
+  }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
     <div class="brand"><span data-i18n="app.title">TCU 调用关系图</span><small id="rootName"></small></div>
+    <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
     <input id="search" type="search" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
     <select id="depth" data-i18n-title="depth.down1">
       <option value="1" data-i18n="depth.down1">向下 1 层</option>
@@ -243,6 +339,7 @@
     <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
     <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
     <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
+    <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
     <div class="spacer"></div>
     <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击函数下钻 · Ctrl+Z 回退视图 · 拖节点自动重布线 · 双击连线恢复自动</span>
     <button id="exportSvg" data-i18n="btn.svg">导出 SVG</button>
@@ -275,7 +372,36 @@
     </div>
     <div id="tooltip"></div>
     <div id="ctxMenu" class="ctx-menu"></div>
+
+    <div id="reviewBar" class="review-bar">
+      <span id="reviewText"></span>
+      <button id="reviewRestore" class="primary">恢复到此</button>
+      <button id="reviewExit">回到最新</button>
+    </div>
   </main>
+
+  <div id="overlayMask" class="mask"></div>
+
+  <div id="projectModal" class="modal">
+    <div class="modal-head">
+      <h2 data-i18n="project.title">选择工程</h2>
+      <button class="modal-close" data-close="projectModal">&times;</button>
+    </div>
+    <div class="modal-body" id="projectList"></div>
+    <div id="orphanBox" class="orphan-box"></div>
+    <div class="modal-foot">
+      <input id="projectPath" type="text" placeholder="或输入工程目录的绝对路径…" data-i18n-ph="project.pathPlaceholder">
+      <button id="projectOpen" class="primary" data-i18n="project.open">打开</button>
+    </div>
+  </div>
+
+  <div id="timelineModal" class="modal">
+    <div class="modal-head">
+      <h2 data-i18n="timeline.title">操作时间轴</h2>
+      <button class="modal-close" data-close="timelineModal">&times;</button>
+    </div>
+    <div class="modal-body" id="timelineList"></div>
+  </div>
 
   <aside id="right">
     <div class="sec" id="secDetail">

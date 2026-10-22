@@ -15,6 +15,9 @@ import { buildSVG, download } from './lib/svg.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
 import { clearDataflow } from './lib/df.js';
+// 工程切换与时间轴面板同样自带事件注册
+import './lib/projects.js';
+import './lib/timeline.js';
 
 /**
  * 加载视图
@@ -34,8 +37,9 @@ async function loadView(rootId, opts = {}) {
     if (navStack.length > NAV_MAX) navStack.shift();
   }
   const seq = ++viewSeq;
-  // 固定布局：先把当前所有节点坐标落盘，服务端据此把已有节点钉在原位
-  if (state.fixed && state.view) await savePositionsOnly();
+  // 固定布局：先把当前所有节点坐标落盘，服务端据此把已有节点钉在原位。
+  // 回看历史时不能落盘，否则会把历史画面里的坐标写进当前状态
+  if (state.fixed && state.view && !state.at) await savePositionsOnly();
   clearDataflow(false); // 换视图时旧的叠加层不再适用
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const data = await api.view({
@@ -47,6 +51,7 @@ async function loadView(rootId, opts = {}) {
     fixed: state.fixed,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
+    at: state.at,
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   state.view = data;
@@ -74,6 +79,24 @@ async function loadView(rootId, opts = {}) {
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
 hooks.renderDetail = renderDetail;
+
+/** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
+hooks.reloadAll = async () => {
+  state.view = null;
+  state.selected = null;
+  state.selectedEdge = null;
+  state.roots = [];
+  state.root = null;
+  state.at = 0;
+  state.vars.clear();
+  state.hiddenVars.clear();
+  navStack.length = 0;
+  deleteStack.length = 0;
+  await loadStats();
+  await loadTree();
+  await loadVars();
+  await loadView(null);
+};
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
 hooks.toggleVar = (id, on) => {
@@ -294,6 +317,10 @@ window.__cg = {
   },
   get root() {
     return state.root;
+  },
+  /** 时间轴回看位置：0 = 看当前状态，>0 = 正在看该事件之后的历史 */
+  get at() {
+    return state.at;
   },
   /** 当前高亮的框 id（点击标题后短暂存在） */
   get flash() {
