@@ -147,6 +147,53 @@ openBtn?.addEventListener('click', () => {
   const p = pathInput?.value.trim();
   if (p) switchTo({ path: p });
 });
+
+// ---- 会话导出 / 导入 ----
+const exportBtn = document.getElementById('sessionExport');
+const importBtn = document.getElementById('sessionImport');
+const fileInput = document.getElementById('sessionFile');
+const hintEl = document.getElementById('sessionHint');
+
+function hint(msg) {
+  if (!hintEl) return;
+  hintEl.textContent = msg;
+  clearTimeout(hint.timer);
+  hint.timer = setTimeout(() => (hintEl.textContent = ''), 4000);
+}
+
+exportBtn?.addEventListener('click', () => {
+  hint(t('session.exporting'));
+  // 直接走下载，不用 fetch——大文件交给浏览器流式处理更稳
+  window.location.href = '/api/session/export';
+});
+
+importBtn?.addEventListener('click', () => fileInput?.click());
+
+fileInput?.addEventListener('change', async () => {
+  const file = fileInput.files && fileInput.files[0];
+  fileInput.value = '';
+  if (!file) return;
+  let payload;
+  try {
+    payload = JSON.parse(await file.text());
+  } catch {
+    hint(`${t('session.importFailed')}：文件不是合法 JSON`);
+    return;
+  }
+  const r = await api.importSession(payload);
+  if (!r || !r.ok) {
+    hint(`${t('session.importFailed')}：${r?.error || ''}`);
+    return;
+  }
+  const i = r.imported || {};
+  hint(
+    t('session.imported').replace('{a}', i.annotations || 0).replace('{l}', i.layout || 0).replace('{b}', i.bookmarks || 0) +
+      (r.sameCode ? '' : t('session.codeMismatch'))
+  );
+  // 导入后标注 / 布局全变了，整体重载一次
+  await hooks.reloadAll();
+});
+
 pathInput?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     const p = pathInput.value.trim();

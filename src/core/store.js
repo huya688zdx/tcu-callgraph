@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS project (
@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS event (
   ctx        TEXT
 );
 CREATE INDEX IF NOT EXISTS event_by_project ON event(project_id, ts, seq);
+CREATE INDEX IF NOT EXISTS event_by_project_id ON event(project_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS snapshot (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,7 +230,8 @@ const toBookmark = (r) => ({
   updatedAt: r.updated_at,
 });
 
-const toEvent = (r) => ({  id: r.id,
+const toEvent = (r) => ({
+  id: r.id,
   ts: r.ts,
   seq: r.seq,
   actor: r.actor,
@@ -239,6 +241,37 @@ const toEvent = (r) => ({  id: r.id,
   after: parse(r.after, null),
   ctx: parse(r.ctx, null),
 });
+
+const cnt = (v) => (Array.isArray(v) ? v.length : v && typeof v === 'object' ? Object.keys(v).length : 0);
+
+/**
+ * 时间轴一行的轻量摘要。
+ * 前端拿它渲染「main.c::main → 追加 · 备注「…」」这种文案，
+ * 不需要完整的 before/after——那才是列表卡顿的来源。
+ */
+function briefOf(e) {
+  const a = e.after || {};
+  const brief = {};
+  if (a.change !== undefined) brief.change = a.change;
+  if (a.note !== undefined) brief.note = String(a.note).slice(0, 80);
+  if (a.tag !== undefined) brief.tag = String(a.tag).slice(0, 40);
+  if (a.color !== undefined) brief.color = 1;
+  const n = cnt(a.nodes);
+  const m = cnt(a.edges);
+  if (n) brief.nodes = n;
+  if (m) brief.edges = m;
+  if (Array.isArray(a.manual) && a.manual.length) brief.manual = a.manual.length;
+  if (a.clear) brief.clear = 1;
+  if (e.op === 'orphan.purge') {
+    brief.total =
+      cnt(a.annotations) +
+      cnt(a.deleted) +
+      cnt(a.layoutSlots) +
+      (a.layoutNodes || []).reduce((s, x) => s + cnt(x.ids), 0);
+  }
+  if (e.op === 'bookmark.save' && Array.isArray(a.roots)) brief.roots = a.roots.length;
+  return brief;
+}
 
 /** 把一条事件应用到 overlay 上（时间轴回放的唯一入口，必须和写接口一一对应） */
 function applyEvent(ov, e) {
@@ -347,6 +380,12 @@ function migrate(db) {
         CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
       `);
     }
+    // v2 → v3：时间轴按 id 倒序翻页的索引。
+    // 原来的 (project_id, ts, seq) 对「id < ? ORDER BY id DESC」帮不上忙，
+    // 多工程共用一库时会退化成扫全表。
+    if (cur < 3) {
+      db.exec('CREATE INDEX IF NOT EXISTS event_by_project_id ON event(project_id, id DESC);');
+    }
   }
 
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -378,6 +417,44 @@ export function openStore({ dbPath, userData } = {}) {
       }
       throw err;
     }
+  };
+
+  // 动态 SQL（时间轴过滤条件组合太多，没法全写成固定语句），按 SQL 文本缓存 prepare 结果
+  const stmtCache = new Map();
+  const prep = (sql) => {
+    let stmt = stmtCache.get(sql);
+    if (!stmt) {
+      stmt = db.prepare(sql);
+      stmtCache.set(sql, stmt);
+    }
+    return stmt;
+  };
+
+  const buildEventQuery = (kind, projectId, { beforeId = 0, ops = [], q: query = '', limit = 50 } = {}) => {
+    const where = ['project_id = ?'];
+    const params = [projectId];
+    if (kind === 'select' && beforeId) {
+      where.push('id < ?');
+      params.push(Number(beforeId));
+    }
+    if (ops.length) {
+      where.push(`op IN (${ops.map(() => '?').join(',')})`);
+      params.push(...ops);
+    }
+    if (query) {
+      // target 是函数 id / 视图 key，after 是 JSON 文本：两个 LIKE 够用了，
+      // 真要做全文检索再上 FTS，现在没必要
+      where.push('(target LIKE ? OR after LIKE ?)');
+      params.push(`%${query}%`, `%${query}%`);
+    }
+    const body = where.join(' AND ');
+    if (kind === 'count') {
+      return { sql: `SELECT COUNT(*) AS c FROM event WHERE ${body}`, params };
+    }
+    return {
+      sql: `SELECT * FROM event WHERE ${body} ORDER BY id DESC LIMIT ?`,
+      params: [...params, Number(limit)],
+    };
   };
 
   const q = {
@@ -427,6 +504,7 @@ export function openStore({ dbPath, userData } = {}) {
     eventUpTo: db.prepare('SELECT * FROM event WHERE project_id = ? AND id <= ? ORDER BY id ASC'),
     eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
     eventAnchor: db.prepare("SELECT id FROM event WHERE project_id = ? AND op = 'baseline' LIMIT 1"),
+    eventDump: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY id ASC LIMIT ?'),
 
     settingGet: db.prepare('SELECT value FROM setting WHERE key = ?'),
     settingPut: db.prepare(
@@ -611,6 +689,44 @@ export function openStore({ dbPath, userData } = {}) {
 
     listEvents(projectId, limit = 200) {
       return q.eventList.all(projectId, limit).map(toEvent);
+    },
+
+    /**
+     * 时间轴列表：分页 + 按类型/关键词过滤，默认**不返回 before/after**。
+     *
+     * 之前一次性返回 300 条完整事件，每条都带布局坐标这种几 KB 的载荷，
+     * 服务端要 JSON.parse 全部再序列化发出去，操作一多面板就卡。
+     * 现在只回一个 brief（变更分类、备注、条数这类几十字节的摘要），
+     * 需要完整载荷时（回放）走 eventsUpTo。
+     */
+    listEventsPage(projectId, { limit = 50, beforeId = 0, ops = [], q: query = '', withPayload = false } = {}) {
+      const { sql, params } = buildEventQuery('select', projectId, { beforeId, ops, q: query, limit });
+      return prep(sql)
+        .all(...params)
+        .map((r) => {
+          const e = toEvent(r);
+          return {
+            id: e.id,
+            ts: e.ts,
+            seq: e.seq,
+            actor: e.actor,
+            op: e.op,
+            target: e.target,
+            brief: briefOf(e),
+            ...(withPayload ? { before: e.before, after: e.after } : {}),
+          };
+        });
+    },
+
+    countEvents(projectId, { ops = [], q: query = '' } = {}) {
+      const { sql, params } = buildEventQuery('count', projectId, { ops, q: query });
+      const r = prep(sql).get(...params);
+      return Number(r?.c || 0);
+    },
+
+    /** 导出会话用：按 id 升序取全部事件（含完整载荷） */
+    dumpEvents(projectId, limit = 5000) {
+      return q.eventDump.all(projectId, limit).map(toEvent);
     },
 
     /** 时间轴回放用：按 id 升序取到某个事件为止 */

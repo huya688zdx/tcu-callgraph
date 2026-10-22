@@ -1,5 +1,10 @@
 /**
- * 操作时间轴：列出事件、回看历史某一刻、恢复到此
+ * 操作时间轴：分页浏览、按类型/关键词过滤、回看历史某一刻、恢复到此
+ *
+ * 性能上的两个关键点：
+ * 1. 列表接口只回 brief（几十字节），不回 before/after。以前一次拿 300 条完整事件，
+ *    每条带几 KB 的布局坐标，操作一多面板就卡。
+ * 2. 分页加载，一次 50 条，底部「加载更多」。DOM 只渲染已经加载的部分。
  *
  * 回看是只读的：state.at > 0 时 api.js 会拦掉所有写接口，
  * 想编辑必须先点「回到最新」。这样历史状态永远不会被就地改脏。
@@ -12,11 +17,15 @@ import { openModal, closeModal, wireModals, esc } from './modal.js';
 
 const btn = document.getElementById('timelineBtn');
 const listEl = document.getElementById('timelineList');
+const searchEl = document.getElementById('tlSearch');
+const chipsEl = document.getElementById('tlChips');
+const countEl = document.getElementById('tlCount');
 const bar = document.getElementById('reviewBar');
 const barText = document.getElementById('reviewText');
 const restoreBtn = document.getElementById('reviewRestore');
 const exitBtn = document.getElementById('reviewExit');
 
+const PAGE = 50;
 const CHANGE_LABEL = { existing: '既存', added: '追加', deleted: '删除', changed: '变更' };
 
 const OP_KIND = {
@@ -30,7 +39,13 @@ const OP_KIND = {
   baseline: 'k-anchor',
   import: 'k-anchor',
   restore_point: 'k-anchor',
+  'orphan.purge': 'k-delete',
+  'bookmark.save': 'k-anchor',
+  'bookmark.delete': 'k-anchor',
 };
+
+/** 面板状态：已加载的事件、过滤条件、翻页游标 */
+const tl = { events: [], ops: [], q: '', hasMore: false, total: 0, loading: false, seq: 0 };
 
 const pad = (n) => String(n).padStart(2, '0');
 const hhmm = (ts) => {
@@ -44,38 +59,37 @@ const dayKey = (ts) => {
 const dayLabel = (ts) => {
   const d = new Date(ts);
   const today = new Date();
-  const same = d.toDateString() === today.toDateString();
-  return same ? '今天' : `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
+  return d.toDateString() === today.toDateString()
+    ? '今天'
+    : `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
 };
+
+const pair = (a, b, sep) => (a && b ? sep : '');
 
 /** 把一条事件翻译成人话：用户看时间轴时不该看到 op 名 */
 function describe(e) {
-  const after = e.after || {};
+  const b = e.brief || {};
   const target = e.target || '';
   switch (e.op) {
     case 'node.annotate':
     case 'edge.annotate': {
       const bits = [];
-      if (after.change) bits.push(CHANGE_LABEL[after.change] || after.change);
-      if (after.note) bits.push(`备注「${after.note}」`);
-      if (after.tag) bits.push(`标签 ${after.tag}`);
-      if (after.color) bits.push('标记颜色');
+      if (b.change) bits.push(CHANGE_LABEL[b.change] || b.change);
+      if (b.note) bits.push(`备注「${b.note}」`);
+      if (b.tag) bits.push(`标签 ${b.tag}`);
+      if (b.color) bits.push('标记颜色');
       return `${target} → ${bits.join(' · ') || '清空标注'}`;
     }
-    case 'delete': {
-      const n = (after.nodes || []).length;
-      const m = (after.edges || []).length;
-      return `${n ? `${n} 个函数` : ''}${n && m ? ' / ' : ''}${m ? `${m} 条连线` : ''} 被删除`;
-    }
-    case 'delete.restore': {
-      const n = (after.nodes || []).length;
-      const m = (after.edges || []).length;
-      return `恢复 ${n ? `${n} 个函数` : ''}${n && m ? ' / ' : ''}${m ? `${m} 条连线` : ''}`;
-    }
+    case 'delete':
+      return `${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${b.edges ? `${b.edges} 条连线` : ''} 被删除`;
+    case 'delete.restore':
+      return `恢复 ${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${
+        b.edges ? `${b.edges} 条连线` : ''
+      }`;
     case 'delete.clear':
       return '清空全部删除记录';
     case 'layout.save':
-      return `${target || '视图'} 调整布局`;
+      return `${target || '视图'} 调整布局${b.nodes ? `（${b.nodes} 个节点）` : ''}`;
     case 'layout.clear':
       return `${target || '视图'} 重置布局`;
     case 'baseline':
@@ -85,29 +99,26 @@ function describe(e) {
     case 'restore_point':
       return `恢复到 ${target || '历史时刻'}`;
     case 'bookmark.save':
-      return `保存书签「${target}」`;
+      return `保存书签「${target}」${b.roots ? ` · ${b.roots} 个入口` : ''}`;
     case 'bookmark.delete':
       return `删除书签「${target}」`;
+    case 'orphan.purge':
+      return `清理 ${b.total || 0} 条失效标注`;
     default:
       return t(`op.${e.op}`) || e.op;
   }
 }
 
-async function render() {
+function renderAll() {
   if (!listEl) return;
-  listEl.innerHTML = `<div class="empty">${t('timeline.empty')}</div>`;
-  let data;
-  try {
-    data = await api.events(300);
-  } catch {
+  if (!tl.events.length) {
+    listEl.innerHTML = `<div class="empty">${tl.q || tl.ops.length ? t('timeline.none') : t('timeline.empty')}</div>`;
     return;
   }
-  const events = data.events || [];
-  if (!events.length) return;
 
-  let html = `<div class="hint" style="padding:0 9px 6px">${t('timeline.hint')}</div>`;
+  let html = '';
   let lastDay = '';
-  for (const e of events) {
+  for (const e of tl.events) {
     const dk = dayKey(e.ts);
     if (dk !== lastDay) {
       lastDay = dk;
@@ -123,11 +134,47 @@ async function render() {
       </div>
     </div>`;
   }
+  if (tl.hasMore) {
+    html += `<button class="tl-more" id="tlMore">${t('timeline.more').replace(
+      '{n}',
+      Math.max(0, tl.total - tl.events.length)
+    )}</button>`;
+  }
   listEl.innerHTML = html;
 
   listEl.querySelectorAll('.ev').forEach((row) => {
     row.addEventListener('click', () => reviewAt(Number(row.dataset.id), Number(row.dataset.ts)));
   });
+  listEl.querySelector('#tlMore')?.addEventListener('click', () => load({ append: true }));
+}
+
+function setCount() {
+  if (countEl) countEl.textContent = tl.total ? t('timeline.count').replace('{n}', tl.total) : '';
+}
+
+/** 拉一页。append=true 时接着上一页往后取（游标 = 已加载的最后一条 id） */
+async function load({ append = false } = {}) {
+  if (tl.loading) return;
+  tl.loading = true;
+  const seq = ++tl.seq;
+  const before = append && tl.events.length ? tl.events[tl.events.length - 1].id : 0;
+  try {
+    const r = await api.events({ limit: PAGE, before, ops: tl.ops, q: tl.q });
+    if (seq !== tl.seq) return; // 过滤条件变了，丢弃过期响应
+    const list = r.events || [];
+    tl.events = append ? [...tl.events, ...list] : list;
+    tl.hasMore = !!r.hasMore;
+    tl.total = Number(r.total || 0);
+  } catch {
+    if (seq !== tl.seq) return;
+    tl.events = [];
+    tl.hasMore = false;
+    tl.total = 0;
+  } finally {
+    if (seq === tl.seq) tl.loading = false;
+  }
+  setCount();
+  renderAll();
 }
 
 function showBar(ts) {
@@ -146,7 +193,9 @@ async function reviewAt(eventId, ts) {
   showBar(ts || Date.now());
   closeModal();
   await hooks.loadView(state.roots.length ? state.roots : state.root, { nav: false });
-  if (listEl) listEl.querySelectorAll('.ev').forEach((r) => r.classList.toggle('on', Number(r.dataset.id) === eventId));
+  if (listEl) {
+    listEl.querySelectorAll('.ev').forEach((r) => r.classList.toggle('on', Number(r.dataset.id) === eventId));
+  }
 }
 
 async function exitReview() {
@@ -175,7 +224,25 @@ exitBtn?.addEventListener('click', exitReview);
 
 btn?.addEventListener('click', () => {
   openModal('timelineModal');
-  render();
+  load();
+});
+
+// 搜索：输入 220ms 后触发，避免每敲一个字都打一次库
+let searchTimer = null;
+searchEl?.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    tl.q = searchEl.value.trim();
+    load();
+  }, 220);
+});
+
+chipsEl?.querySelectorAll('button').forEach((chip) => {
+  chip.addEventListener('click', () => {
+    chipsEl.querySelectorAll('button').forEach((c) => c.classList.toggle('on', c === chip));
+    tl.ops = chip.dataset.ops ? chip.dataset.ops.split(',').filter(Boolean) : [];
+    load();
+  });
 });
 
 // 回看模式下试图编辑：横幅抖一下提示，不做静默失败
@@ -193,4 +260,4 @@ document.addEventListener('cg:review-blocked', () => {
 
 wireModals();
 
-export { exitReview, reviewAt, hideBar };
+export { exitReview, reviewAt, hideBar, load as reloadTimeline };

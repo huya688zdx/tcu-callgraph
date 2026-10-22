@@ -247,6 +247,41 @@ try {
   check('书签可删除', afterDel === 0);
   await evaluate(`document.querySelector('.modal-close[data-close=bookmarkModal]')?.click()`);
 
+  // ---- 测试9：时间轴的过滤与搜索 ----
+  console.log('\n[测试9] 时间轴按类型过滤 + 关键词搜索');
+  await post('/api/overlay', { nodeId: 'adc.c::Adc_Read', data: { note: '过滤用例ABC' } });
+  await post('/api/overlay', { nodeId: 'gear.c::Gear_Apply', data: { note: '另一条' } });
+
+  await evaluate("document.getElementById('timelineBtn').click()");
+  await sleep(800);
+  const allRows = await evaluate(`document.querySelectorAll('#timelineList .ev').length`);
+  const countText = await evaluate(`document.getElementById('tlCount').textContent`);
+  check('时间轴有数据且显示总数', allRows > 0 && /共 \d+ 条/.test(countText), `${allRows} 行 / ${countText}`);
+
+  // 只看标注
+  await evaluate(`[...document.querySelectorAll('#tlChips button')].find(b => b.textContent === '标注').click()`);
+  await sleep(700);
+  const annOnly = await evaluate(`[...document.querySelectorAll('#timelineList .ev .txt')].map(t => t.textContent)`);
+  check(
+    '按「标注」过滤后只剩标注事件',
+    annOnly.length > 0 && annOnly.every((t) => t.includes('→')),
+    `${annOnly.length} 行`
+  );
+
+  // 关键词搜索
+  await evaluate(`(() => {
+    const s = document.getElementById('tlSearch');
+    s.value = '过滤用例ABC';
+    s.dispatchEvent(new Event('input'));
+  })()`);
+  await sleep(800);
+  const searched = await evaluate(`[...document.querySelectorAll('#timelineList .ev .txt')].map(t => t.textContent)`);
+  console.log('  搜索结果:', JSON.stringify(searched));
+  check('搜索命中唯一一条', searched.length === 1 && searched[0].includes('过滤用例ABC'), `${searched.length} 行`);
+  await screenshot('out/session-timeline-filter.png');
+  await evaluate(`document.querySelector('.modal-close[data-close=timelineModal]')?.click()`);
+
+
 
 } catch (err) {
   console.log('❌ 异常:', err.message);

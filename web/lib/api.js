@@ -17,7 +17,7 @@ const post = (url, body) =>
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session']);
 const guardWrite = (name) => {
   if (state.at > 0 && WRITE_OPS.has(name)) {
     document.dispatchEvent(new CustomEvent('cg:review-blocked'));
@@ -48,8 +48,14 @@ export const api = {
   projects: () => get('/api/projects'),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
-  /** 时间轴事件列表（倒序） */
-  events: (limit = 200) => get('/api/events?limit=' + limit),
+  /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */
+  events: ({ limit = 50, before = 0, ops = [], q = '' } = {}) => {
+    const p = new URLSearchParams({ limit: String(limit) });
+    if (before) p.set('before', String(before));
+    if (ops && ops.length) p.set('ops', ops.join(','));
+    if (q) p.set('q', q);
+    return get('/api/events?' + p);
+  },
   /** 恢复到历史某一刻（会追加一条 restore_point 事件） */
   restore: (eventId) => post('/api/restore', { eventId }),
   /** 失效标注：库里指向已不存在的函数 / 连线的条目 */
@@ -59,6 +65,8 @@ export const api = {
   bookmarks: () => get('/api/bookmarks'),
   saveBookmark: (body) => guardWrite('bookmarks') || post('/api/bookmarks', body),
   deleteBookmark: (id) => guardWrite('bookmarks') || post('/api/bookmarks/delete', { id }),
+  /** 导入 .cgx 会话（导出走浏览器直接下载，不需要接口封装） */
+  importSession: (body) => guardWrite('session') || post('/api/session/import', body),
   /** 全工程全局变量 / 常量清单 */
   vars: () => get('/api/vars'),
   tree: () => get('/api/tree'),

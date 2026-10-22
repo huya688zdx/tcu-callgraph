@@ -320,3 +320,72 @@ test('store：v1 老库能自动补出 bookmark 表且数据不丢', (t) => {
   assert.equal(second.loadOverlay(p.id).nodes['x.c::f'].note, '老数据');
   assert.deepEqual(second.listBookmarks(p.id), []);
 });
+
+test('store：时间轴分页不重不漏，游标按 id 往回翻', (t) => {
+  const store = tmpStore(t);
+  const p = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  for (let i = 0; i < 25; i++) {
+    store.appendEvent(p.id, { op: 'node.annotate', target: `x.c::f${i}`, after: { note: `第 ${i} 条` } });
+  }
+  store.appendEvent(p.id, { op: 'layout.save', target: 'x.c::f::group', after: { nodes: { a: 1 } } });
+
+  const page1 = store.listEventsPage(p.id, { limit: 10 });
+  assert.equal(page1.length, 10);
+  assert.equal(store.countEvents(p.id), 26);
+
+  const cursor = page1[page1.length - 1].id;
+  const page2 = store.listEventsPage(p.id, { limit: 10, beforeId: cursor });
+  assert.equal(page2.length, 10);
+  assert.ok(page2.every((e) => e.id < cursor), '第二页必须全在游标之前');
+  const ids = [...page1, ...page2].map((e) => e.id);
+  assert.equal(new Set(ids).size, ids.length, '两页不能有重复');
+
+  const all = store.listEventsPage(p.id, { limit: 100 });
+  assert.equal(all.length, 26);
+});
+
+test('store：时间轴列表只给 brief，不给完整载荷', (t) => {
+  const store = tmpStore(t);
+  const p = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  store.appendEvent(p.id, { op: 'node.annotate', target: 'x.c::f', after: { change: 'added', note: '备注内容' } });
+
+  const [e] = store.listEventsPage(p.id, { limit: 10 });
+  assert.equal(e.after, undefined, '默认不该带完整载荷');
+  assert.equal(e.before, undefined);
+  assert.equal(e.brief.change, 'added');
+  assert.equal(e.brief.note, '备注内容');
+
+  const [full] = store.listEventsPage(p.id, { limit: 10, withPayload: true });
+  assert.deepEqual(full.after, { change: 'added', note: '备注内容' });
+});
+
+test('store：时间轴按类型和关键词过滤', (t) => {
+  const store = tmpStore(t);
+  const p = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  store.appendEvent(p.id, { op: 'node.annotate', target: 'gear.c::Gear_Apply', after: { note: '换挡' } });
+  store.appendEvent(p.id, { op: 'node.annotate', target: 'adc.c::Adc_Read', after: { note: '采集' } });
+  store.appendEvent(p.id, { op: 'layout.save', target: 'gear.c::Gear_Apply::group', after: { nodes: { a: 1 } } });
+
+  const onlyLayout = store.listEventsPage(p.id, { ops: ['layout.save', 'layout.clear'] });
+  assert.equal(onlyLayout.length, 1);
+  assert.equal(store.countEvents(p.id, { ops: ['layout.save'] }), 1);
+
+  const byTarget = store.listEventsPage(p.id, { q: 'Gear_Apply' });
+  assert.equal(byTarget.length, 2, 'target 命中两条');
+  assert.equal(store.countEvents(p.id, { q: 'Gear_Apply' }), 2);
+
+  const byNote = store.listEventsPage(p.id, { q: '换挡' });
+  assert.equal(byNote.length, 1, 'after 里的备注也能搜到');
+});
+
+test('store：导出的事件按 id 升序且带完整载荷', (t) => {
+  const store = tmpStore(t);
+  const p = store.upsertProject({ path: PROJ_A, name: 'alpha' });
+  store.appendEvent(p.id, { op: 'node.annotate', target: 'a', after: { change: 'added' } });
+  store.appendEvent(p.id, { op: 'node.annotate', target: 'b', after: { change: 'deleted' } });
+
+  const dump = store.dumpEvents(p.id);
+  assert.equal(dump.length, 2);
+  assert.ok(dump[0].id < dump[1].id, '导出必须按 id 升序，导入方才能按序重放');
+  assert.deepEqual(dump[0].after, { change: 'added' });
+});

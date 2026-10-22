@@ -992,12 +992,120 @@ const server = http.createServer((req, res) => {
       return;
     }
 
-    // 时间轴：操作事件列表（倒序，最新在前）
+    // 导出会话：标注 + 删除记录 + 手工布局 + 书签 + 操作历史，打成单个 .cgx
+    if (u.pathname === '/api/session/export') {
+      const withEvents = u.searchParams.get('events') !== '0';
+      const payload = {
+        format: 'tcu-callgraph-session',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        project: {
+          name: PROJECT.name,
+          path: root,
+          fingerprint: fingerprintFiles(MODEL.files),
+          functions: S.functions,
+          edges: S.edges,
+        },
+        overlay: store.loadOverlay(PROJECT.id),
+        bookmarks: store.listBookmarks(PROJECT.id),
+        events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
+      };
+      const safe = String(PROJECT.name || 'session').replace(/[^\w.\-\u4e00-\u9fa5]+/g, '_');
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${safe}.cgx"`,
+        'Cache-Control': 'no-store',
+      });
+      return res.end(JSON.stringify(payload, null, 1));
+    }
+
+    // 导入会话：合并标注 / 删除记录 / 布局 / 书签。
+    // 事件不导入——历史是每台机器自己的，混进来会打乱回放的先后顺序
+    if (u.pathname === '/api/session/import' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res, 32 * 1024 * 1024)
+        .then((p) => {
+          if (!p || p.format !== 'tcu-callgraph-session') return bad(res, '不是 .cgx 会话文件');
+          if (Number(p.version) > 1) return bad(res, `会话文件版本 ${p.version} 高于当前支持的 1`);
+
+          const ov = p.overlay || {};
+          let annotations = 0;
+          for (const [id, data] of Object.entries(ov.nodes || {})) {
+            store.setAnnotation(PROJECT.id, 'node', id, data);
+            annotations++;
+          }
+          for (const [k, data] of Object.entries(ov.edges || {})) {
+            store.setAnnotation(PROJECT.id, 'edge', k, data);
+            annotations++;
+          }
+
+          const delNodes = Object.keys((ov.deleted || {}).nodes || {});
+          const delEdges = Object.keys((ov.deleted || {}).edges || {});
+          if (delNodes.length || delEdges.length) {
+            store.setDeleted(PROJECT.id, { nodes: delNodes, edges: delEdges });
+          }
+
+          let layout = 0;
+          for (const [key, slot] of Object.entries(ov.layout || {})) {
+            const idx = key.lastIndexOf('::');
+            if (idx < 0) continue;
+            store.saveLayout(PROJECT.id, key.slice(0, idx), key.slice(idx + 2), {
+              nodes: slot.nodes || {},
+              edges: slot.edges || {},
+              manual: slot.manual || [],
+            });
+            layout++;
+          }
+
+          let bookmarks = 0;
+          for (const b of p.bookmarks || []) {
+            try {
+              store.saveBookmark(PROJECT.id, b);
+              bookmarks++;
+            } catch {
+              /* 单条书签不合法不影响整体导入 */
+            }
+          }
+
+          // 代码版本对不上时标注可能挂不到节点上，返回给前端提示
+          const fp = fingerprintFiles(MODEL.files);
+          const sameCode = !p.project?.fingerprint || p.project.fingerprint === fp;
+
+          store.appendEvent(PROJECT.id, {
+            op: 'session.import',
+            target: p.project?.name || 'session',
+            after: { annotations, layout, bookmarks, sameCode },
+          });
+          reloadOverlay();
+
+          json(res, {
+            ok: true,
+            sameCode,
+            from: p.project?.name || '',
+            imported: { annotations, layout, bookmarks, deleted: delNodes.length + delEdges.length },
+          });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
+    // 时间轴：分页 + 过滤。默认只回 brief，不回完整载荷
     if (u.pathname === '/api/events') {
-      const limit = Math.min(1000, Math.max(1, Number(u.searchParams.get('limit') || 200)));
+      const limit = Math.min(200, Math.max(1, Number(u.searchParams.get('limit') || 50)));
+      const beforeId = Number(u.searchParams.get('before') || 0) || 0;
+      const ops = (u.searchParams.get('ops') || '').split(',').filter(Boolean);
+      const query = (u.searchParams.get('q') || '').trim();
+      const withPayload = u.searchParams.get('detail') === '1';
+      // 多取一条用来判断还有没有下一页，避免 count 和分页对不上
+      const rows = store.listEventsPage(PROJECT.id, { limit: limit + 1, beforeId, ops, q: query, withPayload });
+      const hasMore = rows.length > limit;
       return json(res, {
         latest: store.latestEventId(PROJECT.id),
-        events: store.listEvents(PROJECT.id, limit),
+        total: store.countEvents(PROJECT.id, { ops, q: query }),
+        hasMore,
+        events: hasMore ? rows.slice(0, limit) : rows,
       });
     }
 
