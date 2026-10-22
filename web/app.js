@@ -19,6 +19,7 @@ import { clearDataflow } from './lib/df.js';
 import './lib/projects.js';
 import './lib/timeline.js';
 import './lib/bookmarks.js';
+import './lib/ai-settings.js';
 
 /**
  * 加载视图

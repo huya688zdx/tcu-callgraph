@@ -9,6 +9,8 @@ import { routeEdges } from './core/routing.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
+import { exportSvg } from './core/export-svg.js';
+import { createMcpServer } from './mcp.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 
@@ -39,6 +41,16 @@ let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {}
 
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
+
+// ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
+const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
+function mcpAccess() {
+  const env = String(process.env.CALLGRAPH_MCP || '').toLowerCase();
+  if (MCP_LEVELS.includes(env)) return env;
+  const saved = store.getSetting('mcp.access', null);
+  if (MCP_LEVELS.includes(saved)) return saved;
+  return 'readonly';
+}
 
 // 旧版 out/overlay.json 一次性导入：成功后改名留底，不删原文件。
 // 只在用「默认库」时执行——CALLGRAPH_DB 显式指定的多半是测试/E2E 的临时库，
@@ -819,7 +831,41 @@ function buildView(
   return { ...laid, root: g.root, roots };
 }
 
-const server = http.createServer((req, res) => {
+// ---- MCP（AI 访问）----
+// 工具桥接到进程内 HTTP（打自己的 127.0.0.1），与 UI 走同一路径：
+// 校验、事件记录、持久化全部复用，时间轴里 actor=ai 可区分 AI 改动。
+const mcp = createMcpServer({
+  // 端口传 0 时由系统分配，listen 之后才知道真实端口，这里必须惰性取
+  baseUrl: () => `http://127.0.0.1:${server.address().port}`,
+  getAccess: mcpAccess,
+  writeOut: async (name, buf) => {
+    fs.mkdirSync(OUT, { recursive: true });
+    const file = path.join(OUT, name);
+    fs.writeFileSync(file, buf);
+    return file;
+  },
+});
+
+/** /mcp 专用 body 读取：JSON-RPC 允许顶层数组（批量），不能复用只认对象的 readJson */
+function readRawBody(req, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        req.destroy();
+        return reject(new Error('请求体过大'));
+      }
+      chunks.push(c);
+    });
+    req.on('error', () => reject(new Error('读取请求体失败')));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+  });
+}
+
+// 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
+const server = http.createServer(async (req, res) => {
   // 畸形请求目标（如 "//["）会让 new URL 抛异常，必须挡在 try 内，
   // 否则异常冒泡成未捕获异常，整个进程退出
   let u;
@@ -831,6 +877,95 @@ const server = http.createServer((req, res) => {
   }
 
   try {
+    // MCP Streamable HTTP 端点。无会话模式：不返回 Mcp-Session-Id，
+    // 客户端每次 POST 都独立处理；GET/DELETE 没有对应的流 / 会话，统一 405。
+    if (u.pathname === '/mcp') {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'POST' });
+        return res.end(JSON.stringify({ error: '只支持 POST' }));
+      }
+      let raw;
+      try {
+        raw = await readRawBody(req);
+      } catch (err) {
+        return json(res, { jsonrpc: '2.0', id: null, error: { code: -32700, message: String(err.message || err) } }, 400);
+      }
+      const r = await mcp.handlePost(raw);
+      if (r.body === null) {
+        res.writeHead(202);
+        return res.end();
+      }
+      return json(res, r.body, r.status);
+    }
+
+    // MCP / AI 权限设置：UI 的「AI 访问」面板读写这里
+    if (u.pathname === '/api/mcp-config') {
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        return readJson(req, res)
+          .then((p) => {
+            if (!MCP_LEVELS.includes(p.level)) return bad(res, 'level 必须是 off / readonly / readwrite');
+            // 环境变量锁定时库里照写，但运行权限不跟——让调用方能拿到明确反馈
+            const env = String(process.env.CALLGRAPH_MCP || '').toLowerCase();
+            if (MCP_LEVELS.includes(env)) {
+              return json(res, {
+                ok: false,
+                error: `环境变量 CALLGRAPH_MCP=${env} 优先于界面设置，如需从界面控制请清掉该变量`,
+                level: env,
+                source: 'env',
+              });
+            }
+            store.setSetting('mcp.access', p.level);
+            json(res, { ok: true, level: p.level, source: 'setting' });
+          })
+          .catch(() => {});
+      }
+      const env = String(process.env.CALLGRAPH_MCP || '').toLowerCase();
+      const level = mcpAccess();
+      const source = MCP_LEVELS.includes(env) ? 'env' : store.getSetting('mcp.access', null) ? 'setting' : 'default';
+      return json(res, { level, source });
+    }
+
+    // 自动挑入口函数（/api/view 与 /api/export/svg 共用）：优先入度为 0 的函数
+    function pickEntryId() {
+      if (!MODEL.functions.length) return null;
+      const pool = MODEL.focusFile ? MODEL.functions.filter((f) => f.file === MODEL.focusFile) : MODEL.functions;
+      const deg = (id) => (MODEL._index.outAdj.get(id) || []).length;
+      const entries = pool
+        .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
+        .sort((a, b) => deg(b.id) - deg(a.id));
+      return (entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0]).id;
+    }
+
+    // 服务端 SVG 导出：与界面「导出 SVG」同款样式，但由后端按当前视图数据直接生成，
+    // MCP 与脚本都可调用（前端导出仍走浏览器侧，那条路能带上交互时的最新分组）
+    if (u.pathname === '/api/export/svg' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const rootId = typeof p.root === 'string' && p.root ? p.root : pickEntryId();
+          if (!rootId) return bad(res, '工程里没有函数，无从导出');
+          const up = Math.max(0, Number(p.up ?? 0) || 0);
+          const down = Math.max(0, Number(p.down ?? 3) || 3);
+          const group = p.group !== false;
+          const view = buildView([rootId], up, down, group, null, false, {}, false, overlay);
+          if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
+          const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
+          let name = typeof p.out === 'string' ? p.out.trim() : '';
+          if (!name) name = `view-${randomUUID()}.svg`;
+          if (/[\\/]|\.\./.test(name)) return bad(res, 'out 只能是 out/ 下的文件名');
+          if (!/\.svg$/i.test(name)) name += '.svg';
+          fs.mkdirSync(OUT, { recursive: true });
+          const file = path.join(OUT, name);
+          fs.writeFileSync(file, svg, 'utf8');
+          json(res, { ok: true, path: file, bytes: Buffer.byteLength(svg), nodes: view.nodes.length, edges: view.edges.length });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
     if (u.pathname === '/api/stats') {
       return json(res, {
         stats: S,
@@ -934,7 +1069,12 @@ const server = http.createServer((req, res) => {
           // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
           if (p.dry) return json(res, { ok: true, removed: 0, wouldRemove: total, detail: o });
           const removed = store.purgeTargets(PROJECT.id, o);
-          store.appendEvent(PROJECT.id, { op: 'orphan.purge', target: 'orphans', after: o });
+          store.appendEvent(PROJECT.id, {
+            op: 'orphan.purge',
+            target: 'orphans',
+            after: o,
+            actor: p.actor === 'ai' ? 'ai' : 'user',
+          });
           reloadOverlay();
           json(res, { ok: true, removed: total, detail: removed });
         })
@@ -1124,6 +1264,7 @@ const server = http.createServer((req, res) => {
             op: 'restore_point',
             target: `event#${at}`,
             after: restored,
+            actor: p.actor === 'ai' ? 'ai' : 'user',
           });
           // 同步内存镜像，后续请求直接读到恢复后的状态
           overlay.nodes = restored.nodes;
@@ -1313,6 +1454,7 @@ const server = http.createServer((req, res) => {
               manual: patch.manual ? before.manual : undefined,
             },
             after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual },
+            actor: patch.actor === 'ai' ? 'ai' : 'user',
           });
           json(res, { ok: true });
         })
@@ -1343,6 +1485,7 @@ const server = http.createServer((req, res) => {
             target: targetId,
             before,
             after: patch.data,
+            actor: patch.actor === 'ai' ? 'ai' : 'user',
           });
           json(res, { ok: true });
         })
@@ -1370,7 +1513,7 @@ const server = http.createServer((req, res) => {
             // 一次性恢复所有被删除的函数与连线
             store.clearDeleted(PROJECT.id);
             overlay.deleted = { nodes: {}, edges: {} };
-            store.appendEvent(PROJECT.id, { op: 'delete.clear' });
+            store.appendEvent(PROJECT.id, { op: 'delete.clear', actor: p.actor === 'ai' ? 'ai' : 'user' });
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
@@ -1388,6 +1531,7 @@ const server = http.createServer((req, res) => {
             target: nodeIds.length === 1 && !edgeKeys.length ? nodeIds[0] : null,
             // 回放要区分节点和边，不能只留一个拼接字符串
             after: { nodes: nodeIds, edges: edgeKeys },
+            actor: p.actor === 'ai' ? 'ai' : 'user',
           });
           json(res, { ok: true, nodes: counts.nodes, edges: counts.edges });
         })

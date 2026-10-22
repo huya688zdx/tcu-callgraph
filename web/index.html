@@ -252,6 +252,17 @@
 
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
+  .ai-hint { margin: 2px 0 10px; color: #888780; font-size: 12px; }
+  .ai-level {
+    display: flex; align-items: flex-start; gap: 9px;
+    padding: 9px 10px; border-radius: 9px; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .ai-level:hover { background: #F5F4EF; }
+  .ai-level input { margin-top: 3px; }
+  .ai-level-text strong { display: block; font-size: 13px; font-weight: 500; }
+  .ai-level-text small { display: block; color: #888780; font-size: 11.5px; margin-top: 2px; }
+  .ai-locked { margin: 10px 0 0; color: #B3541E; font-size: 12px; }
 
   .proj {
     display: flex; align-items: center; gap: 10px;
@@ -385,6 +396,7 @@
     <button id="exportPng" data-i18n="btn.png">PNG</button>
     <button id="exportHtml" data-i18n="btn.html">HTML</button>
     <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
+    <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
   </header>
 
   <aside id="left">
@@ -468,6 +480,21 @@
     <div class="modal-foot">
       <input id="bookmarkName" type="text" placeholder="给当前视图起个名字，如「换挡链路」" data-i18n-ph="bookmark.placeholder">
       <button id="bookmarkSave" class="primary" data-i18n="bookmark.save">保存当前视图</button>
+    </div>
+  </div>
+
+  <div id="aiModal" class="modal">
+    <div class="modal-head">
+      <h2 data-i18n="ai.title">AI 访问（MCP）</h2>
+      <button class="modal-close" data-close="aiModal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <p class="ai-hint" data-i18n="ai.hint"></p>
+      <div id="aiLevels"></div>
+      <p id="aiLocked" class="ai-locked" hidden data-i18n="ai.locked"></p>
+    </div>
+    <div class="modal-foot">
+      <button id="aiSave" class="primary" data-i18n="ai.save">保存</button>
     </div>
   </div>
 
