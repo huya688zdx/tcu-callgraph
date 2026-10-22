@@ -11,6 +11,7 @@ import { draw, resize } from './lib/render.js';
 import { fullReroute } from './lib/geometry.js';
 import { history, pushHistory, undo, redo, savePositionsOnly } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG, download } from './lib/svg.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
@@ -61,6 +62,7 @@ async function loadView(rootId, opts = {}) {
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
   state.selected = null;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   modifiedNodes.clear(); // 新视图的节点都是自动布局位置，尚未被拖动
   if (data.edges && data.edges.some((e) => !e.points || e.points.length < 2)) {
     fullReroute(); // 兜底：服务端数据缺折线时本地补算
@@ -73,6 +75,7 @@ async function loadView(rootId, opts = {}) {
   renderVars();
   fit();
   renderDetail(null);
+  renderLabelPanel();
   history.stack = [];
   history.idx = -1;
   pushHistory();
@@ -107,6 +110,7 @@ hooks.reloadAll = async () => {
   state.view = null;
   state.selected = null;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   state.roots = [];
   state.root = null;
   state.at = 0;
@@ -161,6 +165,8 @@ async function reloadKeepCam() {
 async function deleteSelection() {
   const v = state.view;
   if (!v) return;
+  // 选中标签时 Delete 只删标签，不删整条连线
+  if (state.selectedLabel && (await deleteSelectedLabel())) return;
   let body = null;
 
   if (state.selectedEdge) {
@@ -187,9 +193,11 @@ async function deleteSelection() {
 
   state.selected = null;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   state.hover = null;
   await reloadKeepCam();
   renderDetail(null);
+  renderLabelPanel();
   pushHistory();
   loadStats();
 }
@@ -240,7 +248,7 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selected || state.selectedEdge) {
+    if (state.selected || state.selectedEdge || state.selectedLabel) {
       e.preventDefault();
       deleteSelection();
     }
@@ -353,7 +361,23 @@ window.__cg = {
     return {
       node: state.selected,
       edge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
+      label: state.selectedLabel,
     };
+  },
+  /** 连线标签：位置由画布算出，测试用它检查避让与「贴线」约束 */
+  labels() {
+    const v = state.view;
+    if (!v) return [];
+    return v.edges
+      .filter((e) => e.label)
+      .map((e) => ({
+        edge: edgeKey(e),
+        text: e.label.text,
+        preset: e.label.preset,
+        border: e.label.border,
+        color: e.label.color,
+        rect: e._lb ? { ...e._lb } : null,
+      }));
   },
   /** 当前视图内是否存在节点互相重叠 */
   overlaps(pad = 0) {

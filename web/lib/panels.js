@@ -2,10 +2,8 @@
  * 侧栏面板：统计 / 文件树 / 搜索结果 / 节点详情
  */
 import { t } from '../i18n.js';
-import { els, state, nodeById, esc, shortFile } from './state.js';
+import { els, state, esc, shortFile } from './state.js';
 import { api } from './api.js';
-import { draw } from './render.js';
-import { pushHistory } from './history.js';
 import { hooks } from './hooks.js';
 import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
@@ -487,58 +485,13 @@ async function renderDetail(id) {
   if (my !== detailSeq) return; // 已经切到别的节点，丢弃这次的结果
   if (d.error) return;
   const n = d.node;
-  const ov = d.overlay || {};
-  const colorList = ['', '#FCEBEB', '#FAEEDA', '#EAF3DE', '#E6F1FB', '#EEEDFE', '#FBEAF0'];
 
+  // 节点只展示身份信息：标注已经改成「连线标签」，挂在连线上而不是函数上
   els.detail.innerHTML = `
     <div class="detail-title">${esc(n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
-    <div class="field">
-      <label>${t('detail.note')}</label>
-      <textarea id="note" rows="3" placeholder="${t('detail.notePlaceholder')}">${esc(ov.note || '')}</textarea>
-    </div>
-    <div class="field">
-      <label>${t('detail.color')}</label>
-      <div class="swatches" id="swatches">
-        ${colorList
-          .map(
-            (c) =>
-              `<div class="sw ${(ov.color || '') === c ? 'on' : ''}" data-color="${c}" style="background:${c || '#fff'};border-color:${c ? 'transparent' : '#D3D1C7'}"></div>`
-          )
-          .join('')}
-      </div>
-    </div>
-    <div class="field">
-      <label>${t('detail.tag')}</label>
-      <input id="tag" type="text" placeholder="${t('detail.tagPlaceholder')}" value="${esc(ov.tag || '')}">
-    </div>
-    <button class="primary" id="saveNote" style="width:100%">${t('detail.save')}</button>
+    <div class="detail-hint">${t('detail.hint')}</div>
   `;
-
-  let pickedColor = ov.color || '';
-  els.detail.querySelector('#swatches').addEventListener('click', (e) => {
-    const sw = e.target.closest('.sw');
-    if (!sw) return;
-    pickedColor = sw.dataset.color;
-    els.detail.querySelectorAll('.sw').forEach((s) => s.classList.toggle('on', s === sw));
-  });
-
-  els.detail.querySelector('#saveNote').addEventListener('click', async () => {
-    const note = els.detail.querySelector('#note').value;
-    const tag = els.detail.querySelector('#tag').value;
-    await api.overlay({ nodeId: id, data: { note, tag, color: pickedColor } });
-    const target = nodeById(id);
-    if (target) {
-      target.note = note;
-      target.tag = tag;
-      target.color = pickedColor;
-    }
-    draw();
-    pushHistory();
-    const btn = els.detail.querySelector('#saveNote');
-    btn.textContent = t('detail.saved');
-    setTimeout(() => (btn.textContent = t('detail.save')), 1200);
-  });
 
   const inE = d.inEdges || [];
   const outE = d.outEdges || [];

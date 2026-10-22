@@ -1,0 +1,134 @@
+/**
+ * 连线标签的纯几何 / 数据规整
+ * 这些规则服务端（读库校验）和前端（画布定位）共用，所以单独测
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  CONN_PREFIX,
+  LABEL_MAX_DIST,
+  clampLabelCenter,
+  labelSize,
+  labelText,
+  midAnchor,
+  nearestOnPolyline,
+  nextConnNumber,
+  normalizeLabel,
+  placeLabel,
+  rectsOverlap,
+} from '../src/core/labels.js';
+
+/** 固定的文字测量桩：等宽字体，结果可预测 */
+const measure = (s) => String(s).length * 7;
+
+test('normalizeLabel：结合点的文字由编号推导，不接受手填', () => {
+  const l = normalizeLabel({ preset: 'conn', num: 3, text: '乱写' });
+  assert.equal(l.preset, 'conn');
+  assert.equal(l.num, 3);
+  assert.equal(l.text, CONN_PREFIX + '3');
+  assert.equal(labelText(l), CONN_PREFIX + '3');
+});
+
+test('normalizeLabel：非法颜色降级、空文字等于没有标签', () => {
+  const l = normalizeLabel({ preset: 'task', text: 'TASK:2ms', border: 'red;}', color: 'javascript:1' });
+  assert.equal(l.border, null);
+  assert.equal(l.color, '#2C2C2A');
+  assert.equal(normalizeLabel({ preset: 'task', text: '   ' }), null);
+  assert.equal(normalizeLabel(null), null);
+  assert.equal(normalizeLabel('x'), null);
+});
+
+test('normalizeLabel：无边框预设保留 null 边框，偏移取整并夹紧', () => {
+  const l = normalizeLabel({ preset: 'call', text: 'コール順', border: null, dx: 9999, dy: -3.4 });
+  assert.equal(l.border, null);
+  assert.equal(l.dx, 600);
+  assert.equal(l.dy, -3);
+});
+
+test('nextConnNumber：同一画面内取最小未占用编号', () => {
+  const used = [
+    { preset: 'conn', num: 1 },
+    { preset: 'conn', num: 3 },
+    { preset: 'task', text: 'TASK:2ms' },
+  ];
+  assert.equal(nextConnNumber(used), 2);
+  assert.equal(nextConnNumber([]), 1);
+  assert.equal(nextConnNumber([{ preset: 'conn', num: 1 }, { preset: 'conn', num: 2 }]), 3);
+});
+
+test('midAnchor：正交折线按弧长取中点', () => {
+  const pts = [
+    [0, 0],
+    [100, 0],
+    [100, 100],
+  ];
+  const a = midAnchor(pts);
+  assert.equal(Math.round(a.x), 100);
+  assert.equal(Math.round(a.y), 0);
+  // 中点正好落在折点上：方向取相邻两段之一，但必须是单位轴向
+  assert.equal(Math.abs(a.ux) + Math.abs(a.uy), 1);
+  assert.equal(midAnchor([[0, 0]]), null);
+});
+
+test('placeLabel：没有障碍时贴在线的中央', () => {
+  const pts = [
+    [0, 100],
+    [200, 100],
+  ];
+  const size = labelSize('TASK:2ms', measure);
+  const rect = placeLabel({ label: { dx: 0, dy: 0 }, size, pts, nodes: [], others: [] });
+  assert.equal(Math.round(rect.x + rect.w / 2), 100);
+  assert.equal(Math.round(rect.y + rect.h / 2), 100);
+});
+
+test('placeLabel：线中央被函数框占住时自动让开，且不离开线太远', () => {
+  const pts = [
+    [0, 100],
+    [200, 100],
+  ];
+  const size = labelSize('TASK:2ms', measure);
+  const nodes = [{ id: 'n', x: 60, y: 88, w: 80, h: 24 }];
+  const rect = placeLabel({ label: { dx: 0, dy: 0 }, size, pts, nodes, others: [] });
+  assert.equal(rectsOverlap(rect, nodes[0], 0), false, '标签不能压住函数框');
+  const center = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+  assert.ok(nearestOnPolyline(center, pts).d <= LABEL_MAX_DIST + 0.001, '标签不能离开连线太远');
+});
+
+test('placeLabel：标签之间互相避让', () => {
+  const pts = [
+    [0, 100],
+    [200, 100],
+  ];
+  const size = labelSize('TASK:2ms', measure);
+  const first = placeLabel({ label: { dx: 0, dy: 0 }, size, pts, nodes: [], others: [] });
+  const second = placeLabel({ label: { dx: 0, dy: 0 }, size, pts, nodes: [], others: [first] });
+  assert.equal(rectsOverlap(first, second, 0), false);
+});
+
+test('placeLabel：手动偏移优先，但超出范围仍被拉回', () => {
+  const pts = [
+    [0, 100],
+    [200, 100],
+  ];
+  const size = labelSize('コール順', measure);
+  const near = placeLabel({ label: { dx: 20, dy: 10 }, size, pts, nodes: [], others: [] });
+  assert.equal(Math.round(near.x + near.w / 2), 120);
+  assert.equal(Math.round(near.y + near.h / 2), 110);
+
+  const far = placeLabel({ label: { dx: 0, dy: 400 }, size, pts, nodes: [], others: [] });
+  const c = { x: far.x + far.w / 2, y: far.y + far.h / 2 };
+  assert.ok(nearestOnPolyline(c, pts).d <= LABEL_MAX_DIST + 0.001);
+});
+
+test('clampLabelCenter：拖太远会被拉回，压住节点则拒绝移动', () => {
+  const pts = [
+    [0, 100],
+    [200, 100],
+  ];
+  const size = labelSize('TASK:2ms', measure);
+  const c = clampLabelCenter({ x: 100, y: 300 }, { size, pts });
+  assert.ok(c && nearestOnPolyline(c, pts).d <= LABEL_MAX_DIST + 0.001);
+
+  const nodes = [{ id: 'n', x: 40, y: 60, w: 120, h: 80 }];
+  assert.equal(clampLabelCenter({ x: 100, y: 100 }, { size, pts, nodes }), null);
+});

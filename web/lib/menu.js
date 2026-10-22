@@ -7,6 +7,7 @@ import { api } from './api.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
+import { renderLabelPanel } from './label-panel.js';
 import { df, expandDataflow, clearDataflow } from './df.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
@@ -67,6 +68,8 @@ async function setEdgeChange(edge, change) {
 
 function selectNode(id) {
   state.selected = id;
+  // 选中节点就不再是「选标签」状态，右侧面板跟着切换
+  state.selectedLabel = null;
   if (id) {
     const n = state.view ? state.view.nodes.find((x) => x.id === id) : null;
     if (n && n.group) state.ctxBox = { kind: 'file', id: n.group };
@@ -76,6 +79,7 @@ function selectNode(id) {
   draw();
   renderDetail(id);
   renderVars(); // 变量面板跟着当前点选的框走
+  renderLabelPanel();
 }
 
 export {

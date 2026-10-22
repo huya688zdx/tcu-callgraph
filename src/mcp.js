@@ -231,7 +231,8 @@ const TOOLS = [
     name: 'cg_annotate',
     description:
       '给函数节点或连线写标注。data 支持的键：note(备注文字)、color(#RRGGBB 自定义底色)、tag(分类标签)、' +
-      'change(既存 existing / 変更 modified / 追加 added / 削除 deleted)。传 null 清除该键。' +
+      'change(既存 existing / 変更 modified / 追加 added / 削除 deleted)、' +
+      'label(连线标签：{preset:"task"|"conn"|"call", text, border, color, num, dx, dy}，传 null 删除)。传 null 清除该键。' +
       '标注会实时反映到界面与导出图上（刷新即可见），并记入时间轴。',
     access: 'write',
     inputSchema: {

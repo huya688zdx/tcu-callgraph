@@ -56,6 +56,8 @@ function snapshotView() {
       points: e.points,
       change: e.change,
       df: e.df,
+      // 连线标签挂在边上：撤销时连标签一起回退，画布才不会和存档打架
+      label: e.label || null,
     })),
     groups: v.groups || null,
   });

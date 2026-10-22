@@ -5,6 +5,8 @@
 import { t } from '../i18n.js';
 import { state, COLORS, CHANGE_FILL, esc, shortFile } from './state.js';
 import { updateGroups } from './render.js';
+import { labelLayout } from './edge-labels.js';
+import { labelSvg } from '/core/labels.js';
 import { roundedPathD } from '/core/routing.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
@@ -94,6 +96,9 @@ function buildSVG() {
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
+
+  // 连线标签：位置沿用画布算好的矩形，标记片段与 MCP 导出共用 core/labels.js
+  for (const { label, rect } of labelLayout(v)) out.push(labelSvg(label, rect));
 
   for (const n of v.nodes) {
     out.push(`<g data-id="${esc(n.id)}">`);

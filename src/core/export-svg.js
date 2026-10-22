@@ -10,6 +10,7 @@
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
+import { labelSize, labelText, placeLabel, estimateTextWidth, labelSvg } from './labels.js';
 
 const COLORS = {
   direct: '#9A9890',
@@ -76,6 +77,29 @@ export function exportSvg(view, { title = '' } = {}) {
       maxY = Math.max(maxY, p[1]);
     }
   }
+  // 连线标签：先算位置（与画布同一套规则），再把它们计入画布范围
+  const labelRects = [];
+  {
+    const placed = [];
+    for (const e of v.edges || []) {
+      if (!e.label) continue;
+      const size = labelSize(labelText(e.label), estimateTextWidth);
+      const rect = placeLabel({
+        label: e.label,
+        size,
+        pts: e.points || [],
+        nodes: v.nodes || [],
+        others: placed,
+      });
+      if (!rect) continue;
+      placed.push(rect);
+      labelRects.push({ label: e.label, rect });
+      minX = Math.min(minX, rect.x);
+      minY = Math.min(minY, rect.y);
+      maxX = Math.max(maxX, rect.x + rect.w);
+      maxY = Math.max(maxY, rect.y + rect.h);
+    }
+  }
   const ox = -pad - Math.min(0, minX);
   const oy = -pad - Math.min(0, minY);
   const W = maxX - minX + pad * 2;
@@ -132,6 +156,8 @@ export function exportSvg(view, { title = '' } = {}) {
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
+
+  for (const { label, rect } of labelRects) out.push(labelSvg(label, rect));
 
   for (const n of v.nodes || []) {
     out.push(`<g data-id="${esc(n.id)}">`);

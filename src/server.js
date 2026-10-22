@@ -13,6 +13,7 @@ import { exportSvg } from './core/export-svg.js';
 import { createMcpServer } from './mcp.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
+import { normalizeLabel } from './core/labels.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.resolve(__dirname, '../web');
@@ -844,6 +845,9 @@ function buildView(
     const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = (ov && ov.change) || 'existing';
+    // 连线标签：统一在这里规整，前端与导出拿到的都是干净数据
+    const label = normalizeLabel(ov && ov.label);
+    if (label) e.label = label;
   }
   return { ...laid, root: g.root, roots };
 }
@@ -1558,6 +1562,10 @@ const server = http.createServer(async (req, res) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
+          // 连线标签：写入前先按同一套规则规整，脏数据不落库
+          if (patch.data.label !== undefined) {
+            patch.data.label = patch.data.label === null ? null : normalizeLabel(patch.data.label);
+          }
           overlay.nodes = overlay.nodes || {};
           overlay.edges = overlay.edges || {};
           const kind = patch.nodeId ? 'node' : patch.edgeKey ? 'edge' : null;
@@ -1641,6 +1649,14 @@ const server = http.createServer(async (req, res) => {
     // 共享路由模块（浏览器端动态重路由用）
     if (u.pathname === '/core/routing.js') {
       return sendFile(res, path.join(__dirname, 'core', 'routing.js'), {
+        'Content-Type': 'text/javascript; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+    }
+
+    // 连线标签的纯数据/几何：前后端共用一份，避免两套规则漂移
+    if (u.pathname === '/core/labels.js') {
+      return sendFile(res, path.join(__dirname, 'core', 'labels.js'), {
         'Content-Type': 'text/javascript; charset=utf-8',
         'Cache-Control': 'no-store',
       });

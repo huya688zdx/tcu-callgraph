@@ -5,6 +5,7 @@
 import { t } from '../i18n.js';
 import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile } from './state.js';
 import { edgePoints } from './geometry.js';
+import { drawEdgeLabels } from './edge-labels.js';
 
 /**
  * 下一帧重绘（去重）。
@@ -159,6 +160,9 @@ function draw() {
 
   const nb = neighborSet();
   for (const n of v.nodes) drawNode(ctx, n, nb);
+
+  // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
+  drawEdgeLabels(ctx, v);
 
   // 点击标题后的短暂高亮：框住刚点中的那个层级，避免「点了没反应」的错觉
   if (state.flash) {
@@ -404,6 +408,7 @@ function drawNode(ctx, n, nb = null) {
   ctx.setLineDash([]);
 
   if (n.note) {
+    // 旧数据里还留着备注的节点：只保留一个小圆点做提示（备注面板已下线）
     ctx.beginPath();
     ctx.arc(x + 8, y + 8, 3.2, 0, Math.PI * 2);
     ctx.fillStyle = '#EF9F27';

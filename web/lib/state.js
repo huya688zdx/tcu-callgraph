@@ -23,6 +23,8 @@ const els = {
   vars: document.getElementById('vars'),
   secDetail: document.getElementById('secDetail'),
   secEdges: document.getElementById('secEdges'),
+  secLabel: document.getElementById('secLabel'),
+  labelPanel: document.getElementById('labelPanel'),
 };
 
 const state = {
@@ -48,9 +50,12 @@ const state = {
   /** 固定布局：增删节点时保持现有位置，只有溢出才调整 */
   fixed: true,
   selectedEdge: null,
+  /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
+  selectedLabel: null,
   dragSeg: null,
   dragEnd: null,
   dragNode: null,
+  dragLabel: null,
   dragStart: null,
   dragMoved: false,
   panning: false,

@@ -26,6 +26,8 @@ import {
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
+import { hitLabel, dragLabelTo, labelAnchor, saveLabel } from './edge-labels.js';
+import { renderLabelPanel } from './label-panel.js';
 import { hooks } from './hooks.js';
 import { nearestSide } from '/core/routing.js';
 function worldPos(e) {
@@ -161,6 +163,7 @@ function resetDragState() {
   state.dragNode = null;
   state.dragEnd = null;
   state.dragSeg = null;
+  state.dragLabel = null;
   state.dragStart = null;
   state.panning = false;
   state.dragMoved = false;
@@ -171,7 +174,8 @@ function resetDragState() {
 
 /** pointercancel / lostpointercapture：直接丢弃这次手势，不提交任何变更 */
 function cancelDrag() {
-  const active = state.dragNode || state.dragEnd || state.dragSeg || state.panning || state.linkFrom;
+  const active =
+    state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
   resetDragState();
   state.linkFrom = null;
   state.linkPos = null;
@@ -223,7 +227,10 @@ els.cv.addEventListener('contextmenu', (e) => {
   if (edge) {
     state.selected = null;
     state.selectedEdge = edge;
+    state.selectedLabel = null;
     draw();
+    renderDetail(null);
+    renderLabelPanel();
     showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
@@ -264,6 +271,26 @@ els.cv.addEventListener('pointerdown', (e) => {
   hideMenu();
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
+
+  // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
+  const lb = hitLabel(worldPos(e));
+  if (lb) {
+    state.selected = null;
+    state.selectedEdge = lb.edge;
+    state.selectedLabel = edgeKey(lb.edge);
+    state.dragLabel = {
+      edge: lb.edge,
+      start: worldPos(e),
+      dx: lb.edge.label?.dx || 0,
+      dy: lb.edge.label?.dy || 0,
+      moved: false,
+    };
+    els.cv.setPointerCapture(e.pointerId);
+    draw();
+    renderDetail(null);
+    renderLabelPanel();
+    return;
+  }
 
   const end = hitEnd(e);
   if (end) {
@@ -325,6 +352,21 @@ els.cv.addEventListener('pointerdown', (e) => {
 });
 
 els.cv.addEventListener('pointermove', (e) => {
+  if (state.dragLabel) {
+    const { edge, start, dx, dy } = state.dragLabel;
+    const anchor = labelAnchor(edge);
+    if (anchor) {
+      const p = worldPos(e);
+      // 偏移是相对「线中央锚点」存的：节点挪动后标签会跟着线走
+      const center = { x: anchor.x + dx + (p.x - start.x), y: anchor.y + dy + (p.y - start.y) };
+      if (dragLabelTo(edge, center)) {
+        state.dragLabel.moved = true;
+        draw();
+      }
+    }
+    return;
+  }
+
   if (state.dragEnd) {
     state.dragEnd.pos = worldPos(e);
     const n = hitTest(e);
@@ -394,6 +436,9 @@ els.cv.addEventListener('pointermove', (e) => {
     els.cv.style.cursor = '';
   }
 
+  // 标签可以拖：悬停时给个抓手光标，比默认箭头好认
+  if (hitLabel(worldPos(e))) els.cv.style.cursor = 'move';
+
   if (n) {
     const rect = els.cv.getBoundingClientRect();
     els.tooltip.style.opacity = '1';
@@ -411,11 +456,21 @@ els.cv.addEventListener('pointerup', (e) => {
   const dragEnd = state.dragEnd;
   const dragSeg = state.dragSeg;
   const dragNode = state.dragNode;
+  const dragLabel = state.dragLabel;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
   const panning = state.panning;
   const panMoved = state.panMoved;
   resetDragState();
+
+  if (dragLabel) {
+    // 位置已经在拖动过程中写进 label.dx/dy，松手才落库，避免每帧一次请求
+    if (dragLabel.moved && dragLabel.edge.label) {
+      saveLabel(dragLabel.edge).then(() => pushHistory());
+    }
+    draw();
+    return;
+  }
 
   if (dragEnd) {
     const { edge, which, hover, pos } = dragEnd;
@@ -476,11 +531,14 @@ els.cv.addEventListener('pointerup', (e) => {
       if (edge) {
         state.selectedEdge = edge;
         state.selected = null;
+        state.selectedLabel = null;
         draw();
         renderDetail(null);
+        renderLabelPanel();
       } else {
         state.selectedEdge = null;
-        selectNode(null);
+        state.selectedLabel = null;
+        selectNode(null); // 内部会收起节点详情并刷新标签面板
       }
     }
     return;
