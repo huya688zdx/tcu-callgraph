@@ -346,18 +346,119 @@ function layoutBase(nodes, edges, opts = {}) {
     return Math.max(gapY, STUB * 2 + (bands - 1) * SPACING + 14 + SPACING);
   });
 
-  // ---- 7. y 坐标 ----
-  let y = padding;
-  for (let li = 0; li < layers.length; li++) {
-    const arr = layers[li];
-    for (const id of arr) {
-      const g = geo.get(id);
-      g.y = y + (layerH[li] - g.h) / 2;
+  // ---- 7. y 坐标（超宽层拆行 + 层带折行，整体长宽比贴近 1:1）----
+  // 单文件大图（扁平布局 / 文件框内部）没有分区式布局的列数优化可用，
+  // 这里做两级装填：超宽的层先拆成多行（同层无前向边，安全），
+  // 再把层栈按累计高度均衡切成几段并排摆放；跨列连线由后面的统一路由绕行。
+  // 列内保持全局 x（父子对齐不被破坏），整列只做平移
+  const bandGap = Math.max(gapX * 2, 90); // 列间走廊：跨列连线绕行走这里
+  const splitRowGap = gapY; // 同层拆行后的行距：上一层连到第二行的线要穿行间通道
+  const maxRowWidth = opts.maxRowWidth ?? 900;
+  const gapAfter = layers.map((_, li) => (li < layers.length - 1 ? gapHeights[li] ?? gapY : 0));
+
+  // 7a. 超宽层拆行：按 x 序贪心装行，行内从左重排（对齐信息在几十个节点的宽层里本就不可读）
+  const rowsOf = layers.map((arr, li) => {
+    const g = layerGap[li];
+    const sorted = arr.slice().sort((a, b) => xFinal.get(a) - xFinal.get(b));
+    const totalW = sorted.reduce((s, id) => s + nodeW.get(id), 0) + g * (arr.length - 1);
+    if (arr.length < 4 || totalW <= maxRowWidth) {
+      return [{ ids: sorted, x0: Math.min(...sorted.map((id) => xFinal.get(id))) }];
     }
-    y += layerH[li];
-    if (li < layers.length - 1) y += gapHeights[li] ?? gapY;
+    const rows = [];
+    let row = [];
+    let rowW = 0;
+    let x = 0;
+    for (const id of sorted) {
+      const w = nodeW.get(id);
+      if (row.length && rowW + g + w > maxRowWidth) {
+        rows.push({ ids: row, x0: 0 });
+        row = [];
+        rowW = 0;
+        x = 0;
+      }
+      xFinal.set(id, x); // 行内从左重排
+      row.push(id);
+      rowW += (row.length > 1 ? g : 0) + w;
+      x += w + g;
+    }
+    if (row.length) rows.push({ ids: row, x0: 0 });
+    return rows;
+  });
+  const layerExt = rowsOf.map((rows) => {
+    let x0 = Infinity;
+    let x1 = -Infinity;
+    for (const row of rows) {
+      for (const id of row.ids) {
+        const x = xFinal.get(id);
+        if (x < x0) x0 = x;
+        if (x + nodeW.get(id) > x1) x1 = x + nodeW.get(id);
+      }
+    }
+    return { x0, x1 };
+  });
+  // 拆行后的层高
+  const effH = rowsOf.map((rows, li) =>
+    rows.reduce(
+      (s, row, k) =>
+        s + (k ? splitRowGap : 0) + Math.max(...row.ids.map((id) => heightOf(nodeMap.get(id)))),
+      0
+    )
+  );
+
+  // 7b. 层带折行：各层按累计高度均衡分配到 C 列
+  const prefix = [0];
+  for (let li = 0; li < layers.length; li++) prefix.push(prefix[li] + effH[li] + gapAfter[li]);
+  const totalStack = prefix[layers.length];
+  const planFor = (C) => {
+    // 第 li 层按累计高度落进 floor(P/(总高/C)) 列；某层跨过多个切点时空列直接并掉
+    const remap = new Map();
+    const cols = [];
+    layers.forEach((_, li) => {
+      const raw = Math.min(C - 1, Math.floor((prefix[li] / (totalStack / C)) * (1 - 1e-9)));
+      if (!remap.has(raw)) {
+        remap.set(raw, cols.length);
+        cols.push([]);
+      }
+      cols[remap.get(raw)].push(li);
+    });
+    const colBox = cols.map((lis) => ({
+      x0: Math.min(...lis.map((li) => layerExt[li].x0)),
+      x1: Math.max(...lis.map((li) => layerExt[li].x1)),
+      h: lis.reduce((s, li, k) => s + effH[li] + (k < lis.length - 1 ? gapAfter[li] : 0), 0),
+    }));
+    const W = padding * 2 + colBox.reduce((s, b) => s + (b.x1 - b.x0), 0) + bandGap * (cols.length - 1);
+    const H = padding * 2 + Math.max(...colBox.map((b) => b.h));
+    return { cols, colBox, W, H, score: Math.abs(Math.log(W / Math.max(1, H))) + (cols.length - 1) * 0.02 };
+  };
+  let plan = planFor(1);
+  for (let C = 2; C <= Math.min(8, layers.length); C++) {
+    const p = planFor(C);
+    // 折行要有明显收益（0.08 log）才动：小图保持单列
+    if (p.score < plan.score - 0.08) plan = p;
   }
-  const totalH = y + padding;
+  let colX = padding;
+  let maxY = 0;
+  for (let c = 0; c < plan.cols.length; c++) {
+    let y = padding;
+    const shift = colX - plan.colBox[c].x0;
+    for (let k = 0; k < plan.cols[c].length; k++) {
+      const li = plan.cols[c][k];
+      for (const row of rowsOf[li]) {
+        const rowH = Math.max(...row.ids.map((id) => heightOf(nodeMap.get(id))));
+        for (const id of row.ids) {
+          const g = geo.get(id);
+          g.x = xFinal.get(id) + shift;
+          g.y = y + (rowH - g.h) / 2;
+        }
+        y += rowH + splitRowGap;
+      }
+      y -= splitRowGap; // 最后一行不加行距
+      y += k < plan.cols[c].length - 1 ? gapAfter[li] : 0;
+    }
+    maxY = Math.max(maxY, y);
+    colX += plan.colBox[c].x1 - plan.colBox[c].x0 + bandGap;
+  }
+  const totalH = maxY + padding;
 
   // ---- 8. 正交路由（共享路由器） ----
   const geoNodes = nodes.map((n) => {
@@ -557,7 +658,10 @@ function candidateScore(candidate) {
   }
   const area = width * height;
   const bundleCredit = Math.min(length * 0.65, sharedLength * 1.1);
-  return length - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008;
+  // 长宽比软约束：横向/纵向两个候选连线质量相近时，选更接近 1:1 的那个，
+  // 避免长链图排出 1:N 的细长条（权重远小于线长，只在接近时起作用）
+  const aspectPenalty = Math.abs(Math.log(Math.max(1e-3, width) / Math.max(1, height))) * 60;
+  return length - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008 + aspectPenalty;
 }
 
 function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
@@ -776,7 +880,7 @@ export function layout(nodes, edges, opts = {}) {
  * 分区式紧凑布局：把一组矩形（文件框 / 目录框）按调用方向分级，
  * 级内按重心排序，再按「每列 R 级」列优先蛇形折行成多列二维分区
  * （第 0 级→左上、第 1 级→左下、第 2 级→右上……），
- * R 由整体宽高比最优化自动选择，避免所有模块排成一列。
+ * R 由整体宽高比最优化自动选择（目标接近 1:1），避免所有模块排成一列。
  * 超宽的级自动拆成多行（同级之间没有前向边，拆行安全）。
  * 相邻级之间的行距按边的水平通道需求自适应撑高。
  */
@@ -787,7 +891,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
     rowGap = 56, // 相邻两级（上下）的基础行距
     colGap = 72, // 列间距（跨列连线走这里）
     maxRowWidth = 780, // 单行最大宽度，超过拆行
-    targetAspect = 1.8, // 期望的整体宽高比（横向分区构图，参考草图）
+    targetAspect = 1, // 期望的整体宽高比：接近 1:1 最利于阅读
     scorePlacement = null,
   } = opts;
 
@@ -1012,7 +1116,8 @@ export function layoutPartitioned(items, edges, opts = {}) {
     const wireScore = scorePlacement
       ? scorePlacement(candidate.pos, candidate.width, candidate.height)
       : (metrics.length - bundleCredit) / Math.max(1, W + H) + metrics.crossings * 2 + metrics.bends * 0.12;
-    const score = aspectScore * 0.25 + wireScore;
+    // 长宽比是首要目标（用户明确要求接近 1:1），连线质量只在长宽比相近的候选里起决定作用
+    const score = aspectScore * 4 + wireScore * 0.3;
     if (!best || score < best.score - 0.001) best = { ...candidate, score };
   }
 
