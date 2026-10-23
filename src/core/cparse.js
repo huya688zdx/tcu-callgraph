@@ -195,9 +195,9 @@ function baseIdentifier(n) {
  * 返回值：{ writes, reads }，都是 Map<变量名, { lines:Set, fields:Set, indirect:bool }>
  *
  * 判定口径：
- *   write      赋值左值 / 复合赋值 / ++ -- / 经指针别名间接写
- *   read       其余引用（含作为实参按值传递）
- *   escape     &g 取地址、g 作为实参传出去 —— 无法确定对方读写，按「可能被写」保守处理
+ *   write      赋值左值（= 为纯写；+= 之类与 ++ -- 先读旧值，算读写）
+ *   read       其余引用（裸标识符 x = g / g % n、成员链 g.a.b、下标 g[i]）
+ *   escape     &g 取地址、g 作为实参传出去 —— 对方读写不可知，按「读 + 可能被写」保守处理
  */
 export function collectAccesses(fnNode, isGlobal) {
   const writes = new Map();
@@ -255,7 +255,9 @@ export function collectAccesses(fnNode, isGlobal) {
     if (!n) return;
     switch (n.type) {
       case 'assignment_expression': {
-        classify(n.childForFieldName('left'), 'write');
+        // 复合赋值（+= 之类）先读旧值再写，左值按读写；= 才是纯写
+        const op = n.childForFieldName('operator')?.text;
+        classify(n.childForFieldName('left'), op === '=' ? 'write' : 'rw');
         visit(n.childForFieldName('right'), 'read');
         return;
       }
@@ -281,6 +283,12 @@ export function collectAccesses(fnNode, isGlobal) {
       case 'field_expression':
       case 'subscript_expression': {
         // 整个访问链只记一次，避免 g.a.b 重复计数
+        classify(n, mode);
+        return;
+      }
+      case 'identifier': {
+        // 裸标识符引用：x = g、g % 100u、按值实参。
+        // 此前 classify 只挂在成员/下标/取地址链上，裸读整条漏掉（demo 的 g_tick 链路断在读侧）
         classify(n, mode);
         return;
       }
