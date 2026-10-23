@@ -890,8 +890,6 @@ function buildView(
     }
   }
 
-  const laid = group ? layoutGrouped(clean, viewEdges, { rootLabel: ROOT_LABEL }) : layout(clean, viewEdges);
-
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
   const mode = group ? 'group' : 'flat';
   // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
@@ -901,6 +899,14 @@ function buildView(
   // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
   // 出框的坐标只可能是跨视图/跨深度的陈旧存档，直接丢弃并回落自动布局
   const savedNodes = slot.nodes || {};
+
+  // 存档坐标作重心初值（seeded barycenter，加节点不跳变）：
+  // 扁平模式且非 fixed 时，把该视图上次布局的存档坐标作为重心排序的初始次序传入
+  // layout()——旧节点保持相对次序，新加入的节点只引起局部挪动；
+  // group 模式的稳定性由下面的存档回填机制承担，fixed 模式直接钉存档坐标，均不传
+  const laid = group
+    ? layoutGrouped(clean, viewEdges, { rootLabel: ROOT_LABEL })
+    : layout(clean, viewEdges, fixed ? {} : { seed: savedNodes });
   const groupBox = new Map((laid.groups || []).map((bg) => [bg.id, bg]));
   const savedApplied = [];
   for (const n of laid.nodes) {
