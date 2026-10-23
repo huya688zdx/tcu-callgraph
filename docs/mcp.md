@@ -97,7 +97,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 | 工具 | 说明 |
 | --- | --- |
 | `cg_switch` | 切换工程（按 id 或路径） |
-| `cg_annotate` | 节点/连线标注：note、color(#RRGGBB)、tag、change(既存/変更/追加/削除) |
+| `cg_annotate` | 节点/连线标注：note、color（**固定四色** #CCFFCC/#FFFF99/#FFCCFF/#BFBFBF，即既存/変更/追加/削除，非法值拒收）、tag、change(既存/変更/追加/削除) |
 | `cg_delete` | 隐藏/恢复函数与连线（不动源码）；clear=true 全部恢复 |
 | `cg_save_layout` | 保存手动布局（坐标表 / 连线折线 / 手工连线） |
 

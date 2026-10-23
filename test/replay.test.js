@@ -46,9 +46,10 @@ test('回放一致性：写满一圈后 at=最新 的视图与当前状态逐字
   const target = view0.nodes.find((n) => n.id !== 'main.c::main') || view0.nodes[0];
   const doomed = view0.nodes.find((n) => n.id !== target.id && n.id !== 'main.c::main');
 
-  // 1) 标注：写 note + color，再单独改一次（两次事件要能叠加）
+  // 1) 标注：写 note + color，再单独改一次（两次事件要能叠加）。
+  //    color 用固定四色内的值——规则外颜色会被 /api/overlay 拒收（见 mcp.test.js）
   assert.equal((await jsonPost(base, '/api/overlay', { nodeId: target.id, data: { note: '回放用' } })).ok, true);
-  assert.equal((await jsonPost(base, '/api/overlay', { nodeId: target.id, data: { color: '#112233' } })).ok, true);
+  assert.equal((await jsonPost(base, '/api/overlay', { nodeId: target.id, data: { color: '#FFFF99' } })).ok, true);
 
   // 2) 删除一个节点（回放要能还原 deleted）
   if (doomed) {
@@ -73,7 +74,7 @@ test('回放一致性：写满一圈后 at=最新 的视图与当前状态逐字
   // 顺带确认标注真的生效了（否则上面的对比可能是在比两份空状态）
   const hit = cur.nodes.find((n) => n.id === target.id);
   assert.equal(hit.note, '回放用');
-  assert.equal(hit.color, '#112233');
+  assert.equal(hit.color, '#FFFF99');
 });
 
 test('回放一致性：恢复历史点后，重放该点等于恢复出来的状态', async (t) => {

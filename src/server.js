@@ -228,6 +228,19 @@ const pickKeys = (obj, keys) => {
 /** 与前端 edgeKey 保持一致 */
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
 
+/**
+ * 函数/变量框自定义底色的白名单：就是 CHANGE_FILL 的四个值
+ * （既存/変更/追加/削除；渲染副本在 web/lib/state.js 与 src/core/export-svg.js，改这里时同步）。
+ * 框色是既定的颜色规则，外部写入（MCP / 脚本）不允许引入规则外的颜色。
+ */
+const NODE_COLORS = ['#CCFFCC', '#FFFF99', '#FFCCFF', '#BFBFBF'];
+
+/** 命中白名单则归一成大写返回，否则 null */
+function matchNodeColor(v) {
+  if (typeof v !== 'string') return null;
+  return NODE_COLORS.find((x) => x.toLowerCase() === v.trim().toLowerCase()) || null;
+}
+
 function buildFileTree(model) {
   const root = { name: ROOT_LABEL, type: 'dir', path: '', children: new Map() };
   for (const fn of model.functions) {
@@ -1335,6 +1348,10 @@ const server = http.createServer(async (req, res) => {
             for (const [id, data] of Object.entries(nodes)) {
               // 值必须是对象：字符串/数字会变成 {...'abc'} 这种垃圾写进库
               if (!isPlainObject(data)) continue;
+              // 会话文件是外部来源：框色不在固定四色内就丢弃，与标签规整同一思路
+              if (data.color !== undefined && data.color !== null && !matchNodeColor(data.color)) {
+                delete data.color;
+              }
               store.setAnnotation(PROJECT.id, 'node', id, data);
               annotations++;
             }
@@ -1343,6 +1360,9 @@ const server = http.createServer(async (req, res) => {
               // 会话文件是外部来源：标签同样要过一遍规整，别把别人手改的颜色 / 超长文字写进库
               if (data.label !== undefined) {
                 data.label = data.label === null ? null : normalizeLabel(data.label);
+              }
+              if (data.color !== undefined && data.color !== null && !matchNodeColor(data.color)) {
+                delete data.color;
               }
               store.setAnnotation(PROJECT.id, 'edge', k, data);
               annotations++;
@@ -1679,6 +1699,20 @@ const server = http.createServer(async (req, res) => {
               patch.data.label.num = num;
               patch.data.label.text = CONN_PREFIX + num;
             }
+          }
+          // 框底色只收固定四色（与 CHANGE_FILL 一致，大小写不敏感），
+          // 传 null 清除自定义色、回落 change 分类的颜色。界面没有自由取色入口，
+          // 这条主要约束 MCP / 脚本——AI 不能往既定配色规则里塞任意颜色。
+          if (patch.data.color !== undefined && patch.data.color !== null) {
+            const hit = matchNodeColor(patch.data.color);
+            if (!hit) {
+              return bad(
+                res,
+                `color 只能是固定四色：${NODE_COLORS.join(' / ')}（既存/変更/追加/削除），` +
+                  '传 null 清除。按规则改框色建议直接用 change 分类'
+              );
+            }
+            patch.data.color = hit;
           }
           overlay.nodes = overlay.nodes || {};
           overlay.edges = overlay.edges || {};

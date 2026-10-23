@@ -266,6 +266,64 @@ test('e2e：initialize → tools/call 全链路，写操作带 actor=ai，SVG �
   }
 });
 
+test('e2e：cg_annotate 框色受固定四色约束（非法拒、大小写归一、null 清除、导入清洗）', async () => {
+  const prevEnv = process.env.CALLGRAPH_MCP;
+  process.env.CALLGRAPH_MCP = 'readwrite';
+  const srv = await launchServer({ target: 'samples/tcu' });
+  try {
+    const base = srv.baseUrl;
+    const call = async (name, args, id) =>
+      await (
+        await fetch(base + '/mcp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: rpc('tools/call', { name, arguments: args }, id),
+        })
+      ).json();
+    const nodeColor = async () => {
+      const v = await (await fetch(base + '/api/view?root=main.c::main')).json();
+      const n = v.nodes.find((x) => x.id === 'main.c::main');
+      return n ? n.color ?? null : 'missing';
+    };
+
+    // 1) 规则外的颜色被拒，报错里给出四色清单
+    const denied = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: '#FF0000' } }, 1);
+    assert.equal(denied.result.isError, true, '非法颜色应返回错误');
+    assert.match(denied.result.content[0].text, /#CCFFCC/);
+    assert.equal(await nodeColor(), null, '被拒的写入不该落库');
+
+    // 2) 合法颜色（小写）归一成白名单大写
+    const ok = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: '#ffff99' } }, 2);
+    assert.equal(ok.result.isError, undefined);
+    assert.equal(await nodeColor(), '#FFFF99');
+
+    // 3) null 清除，回落 change 分类色
+    const clear = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: null } }, 3);
+    assert.equal(clear.result.isError, undefined);
+    assert.equal(await nodeColor(), null);
+
+    // 4) .cgx 会话导入：规则外的颜色丢弃，合法的保留
+    const imp = await (
+      await fetch(base + '/api/session/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          format: 'tcu-callgraph-session',
+          version: 1,
+          overlay: { nodes: { 'main.c::main': { color: 'rebeccapurple', note: 'x' } } },
+          bookmarks: [],
+        }),
+      })
+    ).json();
+    assert.equal(imp.ok, true, '单条脏色不该让整个导入失败');
+    assert.equal(await nodeColor(), null, '导入的非法颜色应被丢弃');
+  } finally {
+    if (prevEnv === undefined) delete process.env.CALLGRAPH_MCP;
+    else process.env.CALLGRAPH_MCP = prevEnv;
+    await srv.close();
+  }
+});
+
 test('e2e：默认权限 readonly——写工具被拒、读与导出可用', async () => {
   const prevEnv = process.env.CALLGRAPH_MCP;
   delete process.env.CALLGRAPH_MCP;

@@ -240,17 +240,31 @@ const TOOLS = [
   {
     name: 'cg_annotate',
     description:
-      '给函数节点或连线写标注。data 支持的键：note(备注文字)、color(#RRGGBB 自定义底色)、tag(分类标签)、' +
-      'change(既存 existing / 変更 modified / 追加 added / 削除 deleted)、' +
+      '给函数节点或连线写标注。data 支持的键：note(备注文字)、' +
+      'color(底色，只能是固定四色：#CCFFCC=既存绿 / #FFFF99=変更黄 / #FFCCFF=追加粉 / #BFBFBF=削除灰，传 null 清除，别的值会被拒绝)、' +
+      'tag(分类标签)、change(既存 existing / 変更 modified / 追加 added / 削除 deleted——底色规则由它驱动，按规则改框色优先用它)、' +
       'label(连线标签：{preset:"task"|"conn"|"call", text, border, color, num, dx, dy}，传 null 删除)。传 null 清除该键。' +
-      '标注会实时反映到界面与导出图上（刷新即可见），并记入时间轴。',
+      '标注会实时推送到用户打开的页面上（无需刷新），并记入时间轴。',
     access: 'write',
     inputSchema: {
       type: 'object',
       properties: {
         nodeId: { type: 'string', description: '函数 / 变量节点 id（与 edgeKey 二选一）' },
         edgeKey: { type: 'string', description: '连线 key，格式 "from->to:行号"' },
-        data: { type: 'object', description: '标注内容' },
+        data: {
+          type: 'object',
+          description: '标注内容',
+          properties: {
+            color: {
+              enum: ['#CCFFCC', '#FFFF99', '#FFCCFF', '#BFBFBF', null],
+              description: '底色固定四色（既存/変更/追加/削除），null=清除回落 change 分类色',
+            },
+            change: {
+              enum: ['existing', 'modified', 'added', 'deleted', null],
+              description: '变更分类：既存/変更/追加/削除',
+            },
+          },
+        },
       },
       required: ['data'],
     },
