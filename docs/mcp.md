@@ -2,6 +2,7 @@
 
 项目内置了一个 MCP（Model Context Protocol）服务器，AI 客户端可以直接获取调用图数据、
 自主绘制调整（标注 / 删除 / 布局）并导出 SVG / Excel / HTML。
+写操作通过 SSE 推送通道实时反映到用户打开的页面上——跟 AI 说一句，画面跟着变，不用手动刷新。
 
 ## 形态与连接
 
@@ -57,15 +58,32 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 
 服务本身只监听 `127.0.0.1`，不对局域网开放。
 
-## 工具清单（19 个）
+## 实时同步（页面即时刷新）
 
-前缀 `cg_`。所有写操作在时间轴里以 `actor=ai` 记录，与人工改动可区分、可恢复。
+用户通常开着一个页面看图。AI 的写操作落库后，服务端通过 `GET /api/stream`（SSE）广播
+`change` 事件（`{ op, actor, ts }`），页面（`web/lib/live.js`）收到后自动重拉视图并保留视角：
+
+- 只响应 `actor=ai` 的广播。用户自己的写操作界面已就地处理，若也跟着刷新，
+  固定布局的坐标落盘会再触发广播，两个页面之间会形成无限刷新循环；
+- AI 连续多个写操作合并成一次刷新（400ms 防抖）；用户正在拖拽时推迟到松手后；
+- 回看历史（时间轴 `at>0`）时不刷新画面，只提示「回到最新后可见」；
+- `project.switch`（AI 切工程）触发页面整体重载，并带工程名提示。
+
+配套的 `cg_page` 工具读取「用户正在看什么」：入口函数、展开深度、布局模式、选中的节点/连线、
+是否在回看历史。页面每 800ms 检查一次视图状态，有变化才上报 `POST /api/page`（内存态，
+不落库、不进时间轴）。AI 想让改动直接出现在用户眼前时，先 `cg_page` 对齐上下文再动手。
+
+## 工具清单（20 个）
+
+前缀 `cg_`。所有写操作在时间轴里以 `actor=ai` 记录，与人工改动可区分、可恢复；
+时间轴界面上 AI 的事件带紫色「AI」徽标。
 
 ### 读
 | 工具 | 说明 |
 | --- | --- |
 | `cg_stats` | 工程统计：函数 / 调用 / 宏 / 函数指针表 / 环 / 已删除数量 |
 | `cg_project` / `cg_projects` | 当前工程身份 / 最近工程列表 |
+| `cg_page` | 用户页面当前视图：入口、深度、模式、选中项、是否回看历史 |
 | `cg_tree` | 文件树（目录层级 + 每文件函数清单） |
 | `cg_search` | 按函数名搜索，拿函数 id |
 | `cg_view` | 取视图：带坐标的节点 + 路由后的连线 + 分组框（与界面同一份数据） |
@@ -104,6 +122,12 @@ AI 客户端 ──Streamable HTTP──▶ /mcp (src/mcp.js)
                           现有 /api/* 路由（src/server.js）
                                  │
                     校验 / 事件(actor=ai) / SQLite 持久化
+                                 │
+                                 ▼ broadcastChange (SSE)
+                          打开着的页面 (web/lib/live.js)
+                                 │  actor=ai → 保留视角刷新画面 + 提示
+                                 ▼
+                          /api/view 重拉（与手动刷新同一份数据）
 ```
 
 工具实现不绕开 HTTP 层：MCP 工具桥接到与浏览器 UI 完全相同的 `/api/*` 端点，
@@ -114,7 +138,9 @@ AI 客户端 ──Streamable HTTP──▶ /mcp (src/mcp.js)
 ## 相关文件
 
 - `src/mcp.js` —— MCP 协议层 + 工具定义 + 权限
+- `src/server.js` —— `/mcp`、`/api/mcp-config`、`/api/export/svg`、`/api/stream`（SSE 广播）、`/api/page` 路由；写端点透传 actor
 - `src/core/export-svg.js` —— 服务端 SVG 生成
-- `src/server.js` —— `/mcp`、`/api/mcp-config`、`/api/export/svg` 路由；写端点透传 actor
+- `web/lib/live.js` —— 页面侧：SSE 监听、AI 改动自动刷新、视图状态上报
 - `web/lib/ai-settings.js` —— 界面「AI 访问」设置面板
 - `test/mcp.test.js` —— 协议单元测试 + 端到端链路测试
+- `test/live.test.js` —— SSE 广播 / cg_page / 实时同步链路测试

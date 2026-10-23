@@ -21,6 +21,8 @@ import './lib/projects.js';
 import './lib/timeline.js';
 import './lib/bookmarks.js';
 import './lib/ai-settings.js';
+// AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
+import './lib/live.js';
 
 /**
  * 加载视图
@@ -84,6 +86,8 @@ async function loadView(rootId, opts = {}) {
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
 hooks.renderDetail = renderDetail;
+// live.js 收到 AI 改动推送后用它刷新画面（保留视角）；函数声明有提升，这里可以先引用
+hooks.reloadKeepCam = reloadKeepCam;
 
 /** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
 hooks.applyBookmark = async (b) => {

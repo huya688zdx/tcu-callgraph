@@ -84,4 +84,6 @@ export const api = {
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
+  /** 上报当前页面视图状态（入口/深度/选中），AI 经 cg_page 工具读取。失败静默 */
+  reportPage: (body) => post('/api/page', body).catch(() => {}),
 };

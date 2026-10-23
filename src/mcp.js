@@ -102,6 +102,16 @@ const TOOLS = [
     run: (_a, ctx) => get(ctx, '/api/project'),
   },
   {
+    name: 'cg_page',
+    description:
+      '用户页面当前正在看的视图：入口函数、展开深度、布局模式、选中的节点/连线、是否在回看历史。' +
+      '想让改动直接出现在用户眼前时，先用它对齐上下文（比如按用户正在看的入口去 cg_view），' +
+      '写操作会通过推送通道实时反映到打开的页面上。',
+    access: 'read',
+    inputSchema: { type: 'object', properties: {} },
+    run: (_a, ctx) => get(ctx, '/api/page'),
+  },
+  {
     name: 'cg_projects',
     description: '最近打开过的工程列表（含 id、名字、路径、是否固定、是否当前）。',
     access: 'read',
@@ -410,8 +420,9 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          'TCU Callgraph：C 语言调用关系图工具。先用 cg_search 找函数 id，cg_view 取视图，' +
-          'cg_annotate/cg_delete/cg_save_layout 调整（需要 readwrite），cg_export_* 导出 SVG/Excel/HTML。' +
+          'TCU Callgraph：C 语言调用关系图工具。用户通常开着一个页面实时看图——先用 cg_page 看「用户正在看什么」，' +
+          '再用 cg_search 找函数 id、cg_view 取视图，cg_annotate/cg_delete/cg_save_layout 调整（需要 readwrite），' +
+          'cg_export_* 导出 SVG/Excel/HTML。你的写操作会实时推送到用户打开的页面上。' +
           '当前权限：' + level + (level !== 'readwrite' ? '。' + accessHint(level) : '。'),
       });
     }

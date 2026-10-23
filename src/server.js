@@ -42,6 +42,10 @@ let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {}
 // 工程切换互斥：openTarget 里有 await，不挡的话两个切换请求会交错改写上面这批变量
 let switching = false;
 
+// 页面当前视图状态（入口 / 深度 / 选中）：前端上报，AI 通过 cg_page 工具读取，
+// 用来对齐「用户正在看什么」。内存态、不落库、不进时间轴。
+let pageState = null;
+
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
 
@@ -53,6 +57,36 @@ function mcpAccess() {
   const saved = store.getSetting('mcp.access', null);
   if (MCP_LEVELS.includes(saved)) return saved;
   return 'readonly';
+}
+
+// ---- 改动推送（SSE）----
+// 写操作落库后广播给所有打开的页面（web/lib/live.js 监听），
+// 让 AI 通过 MCP 改的标注 / 删除 / 布局即时反映到界面上，不用手动刷新。
+const sseClients = new Set();
+
+// 心跳：SSE 连接长时间无数据时可能被中间层掐掉，定时发注释行保活，也顺便探活死连接
+const sseHeartbeat = setInterval(() => {
+  for (const res of sseClients) {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}, 25000);
+sseHeartbeat.unref?.();
+
+/** 广播一条 change 事件；单个连接写失败只摘掉它，不影响其他页面 */
+function broadcastChange(op, actor, extra = {}) {
+  if (!sseClients.size) return;
+  const payload = `event: change\ndata: ${JSON.stringify({ op, actor, ts: Date.now(), ...extra })}\n\n`;
+  for (const res of sseClients) {
+    try {
+      res.write(payload);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
 }
 
 // 旧版 out/overlay.json 一次性导入：成功后改名留底，不删原文件。
@@ -144,6 +178,7 @@ async function openTarget(targetPath, { first = false } = {}) {
   S = st;
   PROJECT = project;
   overlay = ov;
+  pageState = null; // 旧工程的页面状态作废，前端重载后会重新上报
 
   // 已有数据但还没钉过起点时，补一条 baseline：
   // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
@@ -951,6 +986,64 @@ const server = http.createServer(async (req, res) => {
       return json(res, { level, source });
     }
 
+    // SSE 推送通道：页面（web/lib/live.js）连上后接收写操作广播。
+    // 只 GET；跨站页面虽然读不到无 CORS 头的流，还是显式拒掉，不白占连接。
+    if (u.pathname === '/api/stream') {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: 'GET' });
+        return res.end(JSON.stringify({ ok: false, error: '只支持 GET' }));
+      }
+      const origin = req.headers.origin;
+      if (origin && !LOCAL_ORIGIN.test(origin)) {
+        return json(res, { ok: false, error: 'forbidden origin' }, 403);
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+      });
+      res.write('retry: 2000\n\n'); // 断开后浏览器自动重连的间隔
+      sseClients.add(res);
+      req.on('close', () => sseClients.delete(res));
+      return;
+    }
+
+    // 页面当前视图状态：前端上报（POST）/ AI 经 cg_page 读取（GET）。
+    // 内存态，不广播、不进时间轴——它不是数据变更，只是「用户在看什么」。
+    if (u.pathname === '/api/page') {
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        return readJson(req, res)
+          .then((p) => {
+            const str = (v) => (typeof v === 'string' ? v : null);
+            const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
+            pageState = {
+              roots: strArr(p.roots),
+              up: Math.max(0, Number(p.up) || 0),
+              down: Math.max(0, Number(p.down) || 0),
+              group: !!p.group,
+              fixed: !!p.fixed,
+              vars: strArr(p.vars),
+              selected: str(p.selected),
+              selectedEdge: str(p.selectedEdge),
+              // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
+              reviewing: Number(p.at) > 0,
+              at: Math.max(0, Number(p.at) || 0),
+              ts: Date.now(),
+            };
+            json(res, { ok: true });
+          })
+          .catch(() => {});
+      }
+      return json(res, {
+        page: pageState,
+        project: PROJECT ? { id: PROJECT.id, name: PROJECT.name, path: root } : null,
+        hint: pageState
+          ? undefined
+          : '还没有页面连上来过：打开应用页面后，这里会返回用户当前正在看的视图',
+      });
+    }
+
     // 自动挑入口函数（/api/view 与 /api/export/svg 共用）：优先入度为 0 的函数
     function pickEntryId() {
       if (!MODEL.functions.length) return null;
@@ -1068,6 +1161,8 @@ const server = http.createServer(async (req, res) => {
           switching = true;
           try {
             const { project, stats: st } = await openTarget(targetPath);
+            // 打开着的页面整体重载：跨工程没有任何状态可保留
+            broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name });
             json(res, {
               ok: true,
               project: { id: project.id, name: project.name, path: root },
@@ -1112,6 +1207,7 @@ const server = http.createServer(async (req, res) => {
             return removed;
           });
           reloadOverlay();
+          broadcastChange('orphan.purge', p.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true, removed: total, detail: removed });
         })
         .catch((err) => {
@@ -1298,7 +1394,7 @@ const server = http.createServer(async (req, res) => {
           });
 
           reloadOverlay();
-
+          broadcastChange('session.import', 'user');
           json(res, {
             ok: true,
             sameCode: result.sameCode,
@@ -1364,6 +1460,7 @@ const server = http.createServer(async (req, res) => {
           overlay.edges = restored.edges;
           overlay.deleted = restored.deleted;
           overlay.layout = restored.layout;
+          broadcastChange('restore_point', p.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true, eventId: store.latestEventId(PROJECT.id) });
         })
         .catch((err) => {
@@ -1551,6 +1648,7 @@ const server = http.createServer(async (req, res) => {
           });
           overlay.layout = overlay.layout || {};
           overlay.layout[key] = slot;
+          broadcastChange(patch.clear ? 'layout.clear' : 'layout.save', patch.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -1603,6 +1701,9 @@ const server = http.createServer(async (req, res) => {
             return merged;
           });
           bucket[targetId] = merged;
+          broadcastChange(kind === 'node' ? 'node.annotate' : 'edge.annotate', patch.actor === 'ai' ? 'ai' : 'user', {
+            target: targetId,
+          });
           json(res, { ok: true });
         })
         .catch((err) => {
@@ -1632,6 +1733,7 @@ const server = http.createServer(async (req, res) => {
               store.appendEvent(PROJECT.id, { op: 'delete.clear', actor: p.actor === 'ai' ? 'ai' : 'user' });
             });
             overlay.deleted = { nodes: {}, edges: {} };
+            broadcastChange('delete.clear', p.actor === 'ai' ? 'ai' : 'user');
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
@@ -1654,6 +1756,7 @@ const server = http.createServer(async (req, res) => {
             if (restore) delete overlay.deleted.edges[k];
             else overlay.deleted.edges[k] = 1;
           }
+          broadcastChange(restore ? 'delete.restore' : 'delete', p.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true, nodes: counts.nodes, edges: counts.edges });
         })
         .catch((err) => {

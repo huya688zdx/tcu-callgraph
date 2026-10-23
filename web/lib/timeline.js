@@ -137,7 +137,9 @@ function renderAll() {
       <span class="dot"></span>
       <div style="flex:1;min-width:0">
         <div class="txt">${esc(describe(e))}</div>
-        <div class="sub">${hhmm(e.ts)}${e.actor === 'system' ? ' · 系统' : ''}</div>
+        <div class="sub">${hhmm(e.ts)}${e.actor === 'system' ? ' · 系统' : ''}${
+          e.actor === 'ai' ? ' <span class="ai-badge">AI</span>' : ''
+        }</div>
       </div>
     </div>`;
   }
