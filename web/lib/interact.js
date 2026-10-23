@@ -26,7 +26,7 @@ import {
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
-import { hitLabel, dragLabelTo, labelAnchor, saveLabel } from './edge-labels.js';
+import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
 import { renderLabelPanel } from './label-panel.js';
 import { hooks } from './hooks.js';
 import { nearestSide } from '/core/routing.js';
@@ -277,12 +277,13 @@ els.cv.addEventListener('pointerdown', (e) => {
   if (lb) {
     state.selected = null;
     state.selectedEdge = lb.edge;
-    state.selectedLabel = edgeKey(lb.edge);
+    state.selectedLabel = `${edgeKey(lb.edge)}#${lb.label.id}`;
     state.dragLabel = {
       edge: lb.edge,
+      label: lb.label,
       start: worldPos(e),
-      dx: lb.edge.label?.dx || 0,
-      dy: lb.edge.label?.dy || 0,
+      dx: lb.label.dx || 0,
+      dy: lb.label.dy || 0,
       moved: false,
     };
     els.cv.setPointerCapture(e.pointerId);
@@ -353,13 +354,13 @@ els.cv.addEventListener('pointerdown', (e) => {
 
 els.cv.addEventListener('pointermove', (e) => {
   if (state.dragLabel) {
-    const { edge, start, dx, dy } = state.dragLabel;
+    const { edge, label, start, dx, dy } = state.dragLabel;
     const anchor = labelAnchor(edge);
     if (anchor) {
       const p = worldPos(e);
       // 偏移是相对「线中央锚点」存的：节点挪动后标签会跟着线走
       const center = { x: anchor.x + dx + (p.x - start.x), y: anchor.y + dy + (p.y - start.y) };
-      if (dragLabelTo(edge, center)) {
+      if (dragLabelTo(edge, label, center)) {
         state.dragLabel.moved = true;
         draw();
       }
@@ -465,8 +466,8 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (dragLabel) {
     // 位置已经在拖动过程中写进 label.dx/dy，松手才落库，避免每帧一次请求
-    if (dragLabel.moved && dragLabel.edge.label) {
-      saveLabel(dragLabel.edge).then(() => pushHistory());
+    if (dragLabel.moved && edgeLabels(dragLabel.edge).some((l) => l.id === dragLabel.label.id)) {
+      saveLabels(dragLabel.edge).then(() => pushHistory());
     }
     draw();
     return;

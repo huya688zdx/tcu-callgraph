@@ -23,6 +23,7 @@ const els = {
   vars: document.getElementById('vars'),
   secDetail: document.getElementById('secDetail'),
   secEdges: document.getElementById('secEdges'),
+  secVars: document.getElementById('secVars'),
   secLabel: document.getElementById('secLabel'),
   labelPanel: document.getElementById('labelPanel'),
 };

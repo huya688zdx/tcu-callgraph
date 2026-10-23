@@ -73,7 +73,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 是否在回看历史。页面每 800ms 检查一次视图状态，有变化才上报 `POST /api/page`（内存态，
 不落库、不进时间轴）。AI 想让改动直接出现在用户眼前时，先 `cg_page` 对齐上下文再动手。
 
-## 工具清单（20 个）
+## 工具清单（21 个）
 
 前缀 `cg_`。所有写操作在时间轴里以 `actor=ai` 记录，与人工改动可区分、可恢复；
 时间轴界面上 AI 的事件带紫色「AI」徽标。
@@ -86,6 +86,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 | `cg_page` | 用户页面当前视图：入口、深度、模式、选中项、是否回看历史 |
 | `cg_tree` | 文件树（目录层级 + 每文件函数清单） |
 | `cg_search` | 按函数名搜索，拿函数 id |
+| `cg_detect_tasks` | 服务端扫源码找 TASK 周期 / コール順 建议（带证据，不落库） |
 | `cg_view` | 取视图：带坐标的节点 + 路由后的连线 + 分组框（与界面同一份数据） |
 | `cg_node` | 单函数详情：签名、入出边、已有标注 |
 | `cg_vars` / `cg_shared_vars` | 全局变量清单 / 多函数共享的变量 |
@@ -97,7 +98,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 | 工具 | 说明 |
 | --- | --- |
 | `cg_switch` | 切换工程（按 id 或路径） |
-| `cg_annotate` | 节点/连线标注：note、color（**固定四色** #CCFFCC/#FFFF99/#FFCCFF/#BFBFBF，即既存/変更/追加/削除，非法值拒收）、tag、change(既存/変更/追加/削除) |
+| `cg_annotate` | 节点/连线标注：note、color（**固定四色** #CCFFCC/#FFFF99/#FFCCFF/#BFBFBF，即既存/変更/追加/削除，非法值拒收）、tag、change(既存/変更/追加/削除)、labels（**一线多条**连线标签数组，整组替换；结合点编号不给自动分配，note=第二行说明小字） |
 | `cg_delete` | 隐藏/恢复函数与连线（不动源码）；clear=true 全部恢复 |
 | `cg_save_layout` | 保存手动布局（坐标表 / 连线折线 / 手工连线） |
 

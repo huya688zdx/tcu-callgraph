@@ -31,6 +31,7 @@ const CHANGE_LABEL = { existing: '既存', added: '追加', deleted: '删除', c
 const OP_KIND = {
   'node.annotate': 'k-annotate',
   'edge.annotate': 'k-annotate',
+  'labels.renumber': 'k-annotate',
   'delete': 'k-delete',
   'delete.restore': 'k-delete',
   'delete.clear': 'k-delete',
@@ -80,6 +81,8 @@ function describe(e) {
       if (b.color) bits.push('标记颜色');
       return `${target} → ${bits.join(' · ') || '清空标注'}`;
     }
+    case 'labels.renumber':
+      return '结合点编号重排（删除后自动紧凑）';
     case 'delete':
       return `${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${b.edges ? `${b.edges} 条连线` : ''} 被删除`;
     case 'delete.restore':

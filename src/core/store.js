@@ -326,6 +326,17 @@ function applyEvent(ov, e) {
       else delete bucket[e.target];
       return;
     }
+    case 'labels.renumber': {
+      // after = { edgeKey: 重排后的整组 labels }，与 edge.annotate 同一套键级合并
+      for (const [k, labels] of Object.entries(after)) {
+        if (!Array.isArray(labels)) continue;
+        const merged = { ...(ov.edges[k] || {}), labels, label: null };
+        for (const key of Object.keys(merged)) if (merged[key] === null) delete merged[key];
+        if (Object.keys(merged).length) ov.edges[k] = merged;
+        else delete ov.edges[k];
+      }
+      return;
+    }
     case 'delete': {
       for (const id of after.nodes || []) ov.deleted.nodes[id] = 1;
       for (const k of after.edges || []) ov.deleted.edges[k] = 1;

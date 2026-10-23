@@ -238,12 +238,24 @@ const TOOLS = [
     run: (a, ctx) => post(ctx, '/api/switch', { id: a.id, path: a.path }),
   },
   {
+    name: 'cg_detect_tasks',
+    description:
+      '服务端扫源码自动找 TASK / コール順 线索：函数名带周期（Task_10ms 等）的任务、ISR 调度边、' +
+      '任务调用链的先后顺序。返回建议清单（含 edgeKey 与证据），不落库——' +
+      '选中哪些由你判断，再用 cg_annotate 的 labels 挂到对应连线上。',
+    access: 'read',
+    inputSchema: { type: 'object', properties: {} },
+    run: (_a, ctx) => get(ctx, '/api/detect-tasks'),
+  },
+  {
     name: 'cg_annotate',
     description:
       '给函数节点或连线写标注。data 支持的键：note(备注文字)、' +
       'color(底色，只能是固定四色：#CCFFCC=既存绿 / #FFFF99=変更黄 / #FFCCFF=追加粉 / #BFBFBF=削除灰，传 null 清除，别的值会被拒绝)、' +
       'tag(分类标签)、change(既存 existing / 変更 modified / 追加 added / 削除 deleted——底色规则由它驱动，按规则改框色优先用它)、' +
-      'label(连线标签：{preset:"task"|"conn"|"call", text, border, color, num, dx, dy}，传 null 删除)。传 null 清除该键。' +
+      'labels(连线标签数组，一条线可挂多条，整组替换——先 cg_view 读现有再合并提交；' +
+      '每条 {preset:"task"|"conn"|"call", text, note(第二行说明小字), border, color, num(结合点编号，不给则自动分配), dx, dy}，传 null 清空全部；' +
+      '旧字段 label=单条仍兼容=整组替换成这一条)。' +
       '标注会实时推送到用户打开的页面上（无需刷新），并记入时间轴。',
     access: 'write',
     inputSchema: {
@@ -262,6 +274,10 @@ const TOOLS = [
             change: {
               enum: ['existing', 'modified', 'added', 'deleted', null],
               description: '变更分类：既存/変更/追加/削除',
+            },
+            labels: {
+              type: 'array',
+              description: '连线标签整组替换（一线多条）；元素 {preset, text, note, border, color, num, dx, dy}',
             },
           },
         },

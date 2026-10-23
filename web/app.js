@@ -368,20 +368,29 @@ window.__cg = {
       label: state.selectedLabel,
     };
   },
-  /** 连线标签：位置由画布算出，测试用它检查避让与「贴线」约束 */
+  /** 连线标签：位置由画布算出，测试用它检查避让与「贴线」约束（一线可多条） */
   labels() {
     const v = state.view;
     if (!v) return [];
-    return v.edges
-      .filter((e) => e.label)
-      .map((e) => ({
-        edge: edgeKey(e),
-        text: e.label.text,
-        preset: e.label.preset,
-        border: e.label.border,
-        color: e.label.color,
-        rect: e._lb ? { ...e._lb } : null,
-      }));
+    const out = [];
+    for (const e of v.edges) {
+      const labels = e.labels || [];
+      const rects = new Map((e._lbs || []).map((x) => [x.id, x.rect]));
+      labels.forEach((l) =>
+        out.push({
+          edge: edgeKey(e),
+          id: l.id,
+          text: l.text,
+          preset: l.preset,
+          num: l.num ?? null,
+          note: l.note || null,
+          border: l.border,
+          color: l.color,
+          rect: rects.get(l.id) ? { ...rects.get(l.id) } : null,
+        })
+      );
+    }
+    return out;
   },
   /** 当前视图内是否存在节点互相重叠 */
   overlaps(pad = 0) {

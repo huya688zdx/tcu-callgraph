@@ -2,17 +2,24 @@
  * 连线标签：纯数据 + 纯几何，不碰 DOM。
  *
  * 为什么放在 core 而不是 web/lib：
- * - 服务端读库时要用同一套规则做校验（避免脏数据直接进画布 / 导出）；
+ * - 服务端读库时要用同一套规则做校验（避免脏数据直接进画布 / 导出的 SVG）；
  * - 前端要用同一套规则算位置（标签必须贴着线、又不能压住函数框）；
  * - 两边共用一份，规则只有一处，纯函数也好写单测。
  *
- * 标签挂在连线上（overlay.edges[edgeKey].label），连线没了标签自然就没了。
+ * 标签挂在连线上（overlay.edges[edgeKey].labels，旧数据是单条 label），
+ * 连线没了标签自然就没了，不需要单独清理。
  */
 
 /** 世界坐标下的字号与内边距：画布缩放时标签跟着一起缩，和函数框观感一致 */
 export const LABEL_FONT = 12;
 export const LABEL_PAD_X = 7;
 export const LABEL_PAD_Y = 4;
+/** 说明行（结合点等的第二行小字） */
+export const LABEL_NOTE_FONT = 10;
+export const LABEL_NOTE_MAX = 80;
+/** 一条连线上的标签数上限：多标签是让一条线能同时挂任务/结合点/顺序，
+ *  不是无限涂鸦位——超了直接拒绝，免得避让算法和画布被极端数据拖垮 */
+export const LABELS_MAX = 8;
 /** 标签中心离折线的最大距离（世界坐标）：允许手动挪一点，但不能离开线太远 */
 export const LABEL_MAX_DIST = 64;
 export const LABEL_MAX_TEXT = 40;
@@ -72,14 +79,49 @@ export function normalizeLabel(raw) {
   const color = HEX.test(raw.color || '') ? raw.color : (presetDef && presetDef.color) || '#2C2C2A';
   const dx = Number.isFinite(Number(raw.dx)) ? clamp(Number(raw.dx), -600, 600) : 0;
   const dy = Number.isFinite(Number(raw.dy)) ? clamp(Number(raw.dy), -600, 600) : 0;
+  // 文字：给了但为空/全空白 = 删除这条标签（与旧语义一致）；
+  // 完全没给（null/undefined）时 task/call 套预设默认文字，custom 没有默认
+  const rawText =
+    raw.text == null ? (presetDef && presetDef.text) || '' : String(raw.text);
   const text =
-    preset === 'conn'
-      ? CONN_PREFIX + num
-      : String(raw.text == null ? '' : raw.text).replace(/[\r\n\t]/g, ' ').slice(0, LABEL_MAX_TEXT).trim();
+    preset === 'conn' ? CONN_PREFIX + num : rawText.replace(/[\r\n\t]/g, ' ').slice(0, LABEL_MAX_TEXT).trim();
   if (!text) return null;
   const label = { preset, text, border, color, dx: Math.round(dx), dy: Math.round(dy) };
   if (preset === 'conn') label.num = num;
+  // 说明行：控制字符拍平、限长，任何预设都可以带（结合点挂解释说明是主场景）
+  const note =
+    typeof raw.note === 'string' && raw.note.trim()
+      ? raw.note.replace(/[\r\n\t]/g, ' ').slice(0, LABEL_NOTE_MAX).trim()
+      : '';
+  if (note) label.note = note;
+  // 稳定 id：多标签时代「选中/拖动/改编号」都指名道姓地操作某一条，
+  // 没有就用位置补一个（a0/a1…），落库后就是持久标识
+  if (typeof raw.id === 'string' && /^[a-z][a-z0-9]{0,7}$/i.test(raw.id)) label.id = raw.id;
   return label;
+}
+
+/**
+ * 规整一组标签（一条连线可以挂多条）：接受数组 / 旧版单条对象 / null。
+ * id 缺失的按位置补 a0/a1…；与已有 id 冲突时跳过补齐（保留传入的）。
+ */
+export function normalizeLabels(raw) {
+  const arr = Array.isArray(raw) ? raw : raw ? [raw] : [];
+  const out = [];
+  for (const item of arr) {
+    if (out.length >= LABELS_MAX) break;
+    const label = normalizeLabel(item);
+    if (label) out.push(label);
+  }
+  const used = new Set(out.map((l) => l.id).filter(Boolean));
+  for (let i = 0; i < out.length; i++) {
+    if (out[i].id) continue;
+    let n = i;
+    let id = 'a' + n;
+    while (used.has(id)) id = 'a' + ++n;
+    out[i].id = id;
+    used.add(id);
+  }
+  return out;
 }
 
 /** 下一张结合点的编号：同一画面内取最小未占用值 */
@@ -95,10 +137,56 @@ export function nextConnNumber(labels = []) {
   return n;
 }
 
+/** 结合点的空缺号 + 下一个号（固定排序模式下新增时供用户挑选） */
+export function freeConnNumbers(labels = [], count = 4) {
+  const used = new Set(
+    labels
+      .filter((l) => l && l.preset === 'conn' && Number.isFinite(Number(l.num)))
+      .map((l) => Math.trunc(Number(l.num)))
+  );
+  const out = [];
+  let n = 1;
+  while (out.length < count) {
+    if (!used.has(n)) out.push(n);
+    n++;
+    if (n > 999) break;
+  }
+  return out;
+}
+
+/**
+ * 重排（紧凑化）：entries = [{key, id, num}]（当前画面里全部结合点），
+ * 按编号升序重新编成 1..n，只返回编号发生变化的条目。
+ */
+export function compactConnEntries(entries = []) {
+  const sorted = entries
+    .filter((x) => Number.isFinite(Number(x.num)))
+    .sort((a, b) => a.num - b.num);
+  const out = [];
+  sorted.forEach((x, i) => {
+    if (x.num !== i + 1) out.push({ key: x.key, id: x.id, num: i + 1 });
+  });
+  return out;
+}
+
 /** 标签盒子尺寸；measure 由调用方注入（浏览器传 ctx.measureText，测试传桩） */
 export function labelSize(text, measure) {
   const tw = measure ? measure(String(text || '')) : String(text || '').length * 7;
   return { w: Math.max(20, tw) + LABEL_PAD_X * 2, h: LABEL_FONT + LABEL_PAD_Y * 2 };
+}
+
+/**
+ * 带说明行的标签盒子：主行 LABEL_FONT，说明行 LABEL_NOTE_FONT，
+ * note 由调用方注入宽度测量（measure(text, font)），没有时退回主行尺寸。
+ */
+export function labelBoxSize(label, measure) {
+  const main = labelSize(labelText(label), (t) => measure(t, LABEL_FONT));
+  if (!label || !label.note) return main;
+  const nw = measure(label.note, LABEL_NOTE_FONT);
+  return {
+    w: Math.max(main.w, nw + LABEL_PAD_X * 2),
+    h: main.h + LABEL_NOTE_FONT + LABEL_PAD_Y,
+  };
 }
 
 /** 折线按弧长取中点，同时给出所在段的方向（用于确定「贴近线」的法线方向） */
@@ -238,6 +326,38 @@ export function placeLabel({ label, size, pts = [], nodes = [], others = [], max
 }
 
 /**
+ * 一条连线的成组摆放：多条标签默认交替放线的两侧（第 1 条上侧、第 2 条下侧……），
+ * 手动拖过的（dx/dy 非零）保持用户位置。逐条避让，先放的矩形参与后者的避让。
+ * items = [{label, size}]；返回同序矩形数组（null = 这条放不下）。
+ */
+export function placeEdgeLabels({ items = [], pts = [], nodes = [], maxDist = LABEL_MAX_DIST } = {}) {
+  const anchor = midAnchor(pts);
+  if (!anchor) return items.map(() => null);
+  const nx = -anchor.uy;
+  const ny = anchor.ux;
+  const placed = [];
+  const out = [];
+  items.forEach(({ label, size }, i) => {
+    if (!label || !size) {
+      out.push(null);
+      return;
+    }
+    const manual = (label.dx || 0) !== 0 || (label.dy || 0) !== 0;
+    let probe = label;
+    if (!manual) {
+      // 两侧交替：沿法线偏出半个标签高 + 间隙，默认不压在线上
+      const side = i % 2 === 0 ? -1 : 1;
+      const off = Math.round((size.h / 2 + 5) * side);
+      probe = { ...label, dx: Math.round(nx * off), dy: Math.round(ny * off) };
+    }
+    const rect = placeLabel({ label: probe, size, pts, nodes, others: placed, maxDist });
+    out.push(rect);
+    if (rect) placed.push(rect);
+  });
+  return out;
+}
+
+/**
  * 拖动中的约束：中心点离折线不超过 maxDist，且不能压住节点 / 别的标签。
  * 返回合法中心点；完全放不下时返回 null，由调用方保持原位（宁可不跟手也不重叠）。
  */
@@ -283,7 +403,11 @@ const svgEsc = (s) =>
 /** 一个标签的 SVG 片段（服务端导出用；颜色已在 normalizeLabel 里限定为 #RRGGBB） */
 export function labelSvg(label, rect) {
   const cx = (rect.x + rect.w / 2).toFixed(1);
-  const cy = (rect.y + rect.h / 2 + 0.5).toFixed(1);
+  // 有说明行时主行上移，说明行垫在下面（尺寸由 labelBoxSize 算好，这里只管对位）
+  const mainCy = (label.note
+    ? rect.y + LABEL_PAD_Y + LABEL_FONT / 2
+    : rect.y + rect.h / 2 + 0.5
+  ).toFixed(1);
   const text = svgEsc(labelText(label));
   const parts = [];
   if (label.border) {
@@ -294,9 +418,17 @@ export function labelSvg(label, rect) {
     );
   }
   parts.push(
-    `<text x="${cx}" y="${cy}" text-anchor="middle" dominant-baseline="middle" font-size="${LABEL_FONT}" font-weight="600" fill="${svgEsc(
+    `<text x="${cx}" y="${mainCy}" text-anchor="middle" dominant-baseline="middle" font-size="${LABEL_FONT}" font-weight="600" fill="${svgEsc(
       label.color
     )}"${label.border ? '' : ' paint-order="stroke" stroke="#F7F6F2" stroke-width="3"'}>${text}</text>`
   );
+  if (label.note) {
+    const noteCy = (rect.y + LABEL_PAD_Y * 2 + LABEL_FONT + LABEL_NOTE_FONT / 2).toFixed(1);
+    parts.push(
+      `<text x="${cx}" y="${noteCy}" text-anchor="middle" dominant-baseline="middle" font-size="${LABEL_NOTE_FONT}" fill="#6B6963">${svgEsc(
+        label.note
+      )}</text>`
+    );
+  }
   return parts.join('\n');
 }

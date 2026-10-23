@@ -10,10 +10,17 @@ import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from '.
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
+import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
-import { normalizeLabel, nextConnNumber, CONN_PREFIX } from './core/labels.js';
+import {
+  normalizeLabel,
+  normalizeLabels,
+  nextConnNumber,
+  LABELS_MAX,
+  CONN_PREFIX,
+} from './core/labels.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB = path.resolve(__dirname, '../web');
@@ -1054,9 +1061,13 @@ function buildView(
     const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = (ov && ov.change) || 'existing';
-    // 连线标签：统一在这里规整，前端与导出拿到的都是干净数据
-    const label = normalizeLabel(ov && ov.label);
-    if (label) e.label = label;
+    // 连线标签（一线可多条）：统一在这里规整，前端与导出拿到的都是干净数据。
+    // 旧库存的是单条 label，读出来同样归成数组；e.label 保留为首条做兼容
+    const labels = normalizeLabels(ov ? ov.labels ?? ov.label : null);
+    if (labels.length) {
+      e.labels = labels;
+      e.label = labels[0];
+    }
   }
   return { ...laid, root: g.root, roots };
 }
@@ -1518,9 +1529,15 @@ const server = http.createServer(async (req, res) => {
             }
             for (const [k, data] of Object.entries(edges)) {
               if (!isPlainObject(data)) continue;
-              // 会话文件是外部来源：标签同样要过一遍规整，别把别人手改的颜色 / 超长文字写进库
-              if (data.label !== undefined) {
-                data.label = data.label === null ? null : normalizeLabel(data.label);
+              // 会话文件是外部来源：标签同样要过一遍规整，
+              // 别把别人手改的颜色 / 超长文字写进库（多标签数组与旧版单条都收，落库统一成 labels）
+              if (data.labels !== undefined) {
+                data.labels = data.labels === null ? null : normalizeLabels(data.labels);
+                data.label = null;
+              } else if (data.label !== undefined) {
+                const one = data.label === null ? null : normalizeLabel(data.label);
+                data.label = null;
+                data.labels = one ? [one] : null;
               }
               if (data.color !== undefined && data.color !== null && !matchNodeColor(data.color)) {
                 delete data.color;
@@ -1845,21 +1862,45 @@ const server = http.createServer(async (req, res) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
-          // 连线标签：写入前先按同一套规则规整，脏数据不落库
-          if (patch.data.label !== undefined) {
-            const raw = patch.data.label;
-            patch.data.label = raw === null ? null : normalizeLabel(raw);
-            // 结合点编号本该由系统分配。界面会自己算好 num 传上来，
-            // 但 MCP / 脚本调 cg_annotate 时通常只给 preset，规整后大家都会变成
-            // 「結合点：1」——同一画面里全重号。这里替外部写入补一次最小未占用值。
-            if (patch.data.label && patch.data.label.preset === 'conn' && !Number.isFinite(Number(raw?.num))) {
-              const used = Object.values(overlay.edges || {})
-                .map((o) => normalizeLabel(o && o.label))
-                .filter(Boolean);
-              const num = nextConnNumber(used);
-              patch.data.label.num = num;
-              patch.data.label.text = CONN_PREFIX + num;
+          // 连线标签（一线可多条）：
+          //   data.labels = 数组 → 整组替换（先读现有再合并提交，空数组=清空）
+          //   data.label  = 旧版单条 → null 清空全部 / 对象则整组替换成这一条
+          // 写入时同步把旧字段 label 清掉，回放（键级合并）才不会残留两份。
+          if (patch.data.labels !== undefined || patch.data.label !== undefined) {
+            let incoming = null; // 最终的整组标签；undefined 表示不动
+            if (patch.data.labels !== undefined) {
+              if (patch.data.labels !== null) {
+                if (!Array.isArray(patch.data.labels)) return bad(res, 'labels 必须是数组或 null');
+                if (patch.data.labels.length > LABELS_MAX) {
+                  return bad(res, `一条连线最多 ${LABELS_MAX} 条标签`);
+                }
+                incoming = patch.data.labels;
+              }
+            } else if (patch.data.label !== null) {
+              incoming = [patch.data.label];
             }
+            if (incoming) {
+              // 结合点缺编号时替外部写入补全库最小未占用值
+              //（界面会算好 num 传上来；MCP / 脚本通常只给 preset，
+              //  不补的话每条都归一成 1，同一画面里全重号）。
+              // 必须在 normalizeLabels 之前做：归一后 num 永远有值，分不清「没给」
+              const used = Object.values(overlay.edges || {})
+                .flatMap((o) => normalizeLabels(o ? o.labels ?? o.label : null));
+              for (let i = 0; i < incoming.length; i++) {
+                const rawItem = incoming[i];
+                if (rawItem && rawItem.preset === 'conn' && !Number.isFinite(Number(rawItem.num))) {
+                  const num = nextConnNumber(used);
+                  incoming[i] = { ...rawItem, num };
+                  used.push(incoming[i]);
+                }
+              }
+              const given = incoming.length;
+              incoming = normalizeLabels(incoming);
+              if (given > 0 && !incoming.length) return bad(res, 'labels 里没有可用的标签');
+              if (incoming && !incoming.length) incoming = null; // 空组等同清空
+            }
+            patch.data.labels = incoming; // null=清空；数组=新的一组
+            patch.data.label = null; // 旧字段永远不再单独存在
           }
           // 框底色只收固定四色（与 CHANGE_FILL 一致，大小写不敏感），
           // 传 null 清除自定义色、回落 change 分类的颜色。界面没有自由取色入口，
@@ -1900,6 +1941,84 @@ const server = http.createServer(async (req, res) => {
             target: targetId,
           });
           json(res, { ok: true });
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
+    }
+
+    // 自动检测 TASK / コール順：扫当前工程模型出建议清单（不落库），
+    // 界面面板勾选应用 / AI 经 cg_detect_tasks 读取后自己 cg_annotate
+    if (u.pathname === '/api/detect-tasks') {
+      return json(res, detectTasks(MODEL));
+    }
+
+    // 结合点编号模式：fixed=固定（删除不前移，新增从空缺号+下一号里挑）
+    // / renumber=重排（删除后当前画面的结合点自动紧凑成 1..n）。存 setting 表。
+    if (u.pathname === '/api/labels/config') {      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        return readJson(req, res)
+          .then((p) => {
+            if (p.mode !== 'fixed' && p.mode !== 'renumber') return bad(res, 'mode 必须是 fixed / renumber');
+            store.setSetting('labels.conn.mode', p.mode);
+            json(res, { ok: true, mode: p.mode });
+          })
+          .catch(() => {});
+      }
+      const mode = store.getSetting('labels.conn.mode', 'fixed');
+      return json(res, { mode: mode === 'renumber' ? 'renumber' : 'fixed' });
+    }
+
+    // 结合点重排：items = [{edgeKey, id, num}]。前端在删除结合点后按
+    // 「当前画面全部结合点升序 → 1..n」算出差异项提交，这里一个事务 + 一条事件写回，
+    // 回放走 store.applyEvent 的 labels.renumber 分支。
+    if (u.pathname === '/api/labels/renumber' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          if (!Array.isArray(p.items)) return bad(res, 'items 必须是数组');
+          const items = [];
+          for (const it of p.items) {
+            if (!isPlainObject(it) || typeof it.edgeKey !== 'string' || typeof it.id !== 'string') {
+              return bad(res, 'items 每项要带 edgeKey 与 id');
+            }
+            const num = Number(it.num);
+            if (!Number.isInteger(num) || num < 1 || num > 999) return bad(res, 'num 必须是 1..999 的整数');
+            items.push({ edgeKey: it.edgeKey, id: it.id, num });
+          }
+          if (!items.length) return json(res, { ok: true, changed: 0 });
+          let applied = 0;
+          store.transaction(() => {
+            const before = {};
+            const after = {};
+            for (const it of items) {
+              const ov = store.getAnnotation(PROJECT.id, 'edge', it.edgeKey);
+              const labels = normalizeLabels(ov ? ov.labels ?? ov.label : null);
+              const target = labels.find((l) => l.id === it.id && l.preset === 'conn');
+              if (!target) continue; // 目标已不存在：跳过这一项，别让整次重排失败
+              before[it.edgeKey] = labels;
+              target.num = it.num;
+              target.text = CONN_PREFIX + it.num;
+              after[it.edgeKey] = labels;
+              store.setAnnotation(PROJECT.id, 'edge', it.edgeKey, { labels, label: null });
+              const live = { ...(overlay.edges[it.edgeKey] || {}), labels, label: null };
+              for (const k of Object.keys(live)) if (live[k] === null) delete live[k];
+              overlay.edges[it.edgeKey] = live;
+              applied++;
+            }
+            if (Object.keys(after).length) {
+              store.appendEvent(PROJECT.id, {
+                op: 'labels.renumber',
+                target: null,
+                before,
+                after,
+                actor: p.actor === 'ai' ? 'ai' : 'user',
+              });
+            }
+          });
+          if (applied) broadcastChange('labels.renumber', p.actor === 'ai' ? 'ai' : 'user');
+          json(res, { ok: true, changed: applied });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);

@@ -57,7 +57,8 @@ function snapshotView() {
       change: e.change,
       df: e.df,
       // 连线标签挂在边上：撤销时连标签一起回退，画布才不会和存档打架
-      label: e.label || null,
+      //（一线多条，整组快照）
+      labels: e.labels || null,
     })),
     groups: v.groups || null,
   });
@@ -82,7 +83,7 @@ function applySnapshot(str) {
   // 标签是「改了就落库」的（不像坐标要等 savePositionsOnly），
   // 所以撤销时必须把标签差异也写回服务端，否则画布回退了、库里还是新值，
   // 刷新一下又变回来——看起来像撤销没生效。
-  const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.label || null)]));
+  const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.labels || null)]));
   v.nodes = s.nodes;
   v.edges = s.edges.map((e) => ({ ...e }));
   if (s.groups) v.groups = s.groups;
@@ -98,19 +99,19 @@ function applySnapshot(str) {
   updateHistoryButtons();
 }
 
-/** 把快照恢复后与恢复前的标签差异逐条写回；失败只打日志，不打断撤销流程 */
+/** 把快照恢复后与恢复前的标签差异逐边写回；失败只打日志，不打断撤销流程 */
 function persistLabelDiff(before) {
   const v = state.view;
   if (!v) return;
   const changed = v.edges.filter((e) => {
     const key = edgeKey(e);
-    return before.has(key) && before.get(key) !== JSON.stringify(e.label || null);
+    return before.has(key) && before.get(key) !== JSON.stringify(e.labels || null);
   });
   if (!changed.length) return;
   (async () => {
     for (const e of changed) {
       try {
-        const r = await api.overlay({ edgeKey: edgeKey(e), data: { label: e.label || null } });
+        const r = await api.overlay({ edgeKey: edgeKey(e), data: { labels: e.labels || null } });
         // 回看模式（state.at > 0）会拦写操作，这不是错误，安静跳过
         if (r && r.ok === false && r.error !== 'review-mode') console.warn('[撤销] 标签写回被拒：', r.error);
       } catch (err) {

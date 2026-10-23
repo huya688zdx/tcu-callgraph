@@ -10,7 +10,7 @@
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
-import { labelSize, labelText, placeLabel, estimateTextWidth, labelSvg } from './labels.js';
+import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
 
 const COLORS = {
   direct: '#9A9890',
@@ -77,27 +77,26 @@ export function exportSvg(view, { title = '' } = {}) {
       maxY = Math.max(maxY, p[1]);
     }
   }
-  // 连线标签：先算位置（与画布同一套规则），再把它们计入画布范围
+  // 连线标签：先算位置（与画布同一套规则，一线多条交替放两侧），再把它们计入画布范围
   const labelRects = [];
   {
-    const placed = [];
     for (const e of v.edges || []) {
-      if (!e.label) continue;
-      const size = labelSize(labelText(e.label), estimateTextWidth);
-      const rect = placeLabel({
-        label: e.label,
-        size,
+      const labels = e.labels && e.labels.length ? e.labels : e.label ? [e.label] : [];
+      if (!labels.length) continue;
+      const rects = placeEdgeLabels({
+        items: labels.map((label) => ({ label, size: labelBoxSize(label, (t, font) => estimateTextWidth(t, font)) })),
         pts: e.points || [],
         nodes: v.nodes || [],
-        others: placed,
       });
-      if (!rect) continue;
-      placed.push(rect);
-      labelRects.push({ label: e.label, rect });
-      minX = Math.min(minX, rect.x);
-      minY = Math.min(minY, rect.y);
-      maxX = Math.max(maxX, rect.x + rect.w);
-      maxY = Math.max(maxY, rect.y + rect.h);
+      labels.forEach((label, i) => {
+        const rect = rects[i];
+        if (!rect) return;
+        labelRects.push({ label, rect });
+        minX = Math.min(minX, rect.x);
+        minY = Math.min(minY, rect.y);
+        maxX = Math.max(maxX, rect.x + rect.w);
+        maxY = Math.max(maxY, rect.y + rect.h);
+      });
     }
   }
   const ox = -pad - Math.min(0, minX);

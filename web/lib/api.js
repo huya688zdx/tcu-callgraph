@@ -86,4 +86,11 @@ export const api = {
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
   /** 上报当前页面视图状态（入口/深度/选中），AI 经 cg_page 工具读取。失败静默 */
   reportPage: (body) => post('/api/page', body).catch(() => {}),
+  /** 结合点编号模式：fixed=固定（新增挑空缺号）/ renumber=重排（删除后自动紧凑） */
+  labelConfig: () => get('/api/labels/config'),
+  setLabelConfig: (mode) => post('/api/labels/config', { mode }),
+  /** 结合点重排：把算好的新编号整体写回 */
+  renumberConns: (items) => post('/api/labels/renumber', { items }),
+  /** 自动检测 task/コール順 候选（服务端扫源码，返回建议清单，应用走 overlay） */
+  detectTasks: () => get('/api/detect-tasks'),
 };

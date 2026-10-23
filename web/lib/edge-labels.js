@@ -5,32 +5,39 @@
  *   render.js → edge-labels.js → state.js / api.js / core/labels.js
  * 所以这里不 import draw()，需要重绘由调用方负责，避免和 render 形成环。
  *
- * 标签存在连线标注里（overlay.edges[edgeKey].label），
- * 因此连线被删 / 被过滤掉时标签自然一起消失，不需要单独清理。
+ * 一条连线可以挂多条标签（overlay.edges[edgeKey].labels 数组，旧数据单条 label
+ * 由服务端读出来时归成数组）。选中/拖动/删除都指名道姓地操作某一条（label.id），
+ * state.selectedLabel 的编码是 `${edgeKey}#${id}`。
+ * 连线被删 / 被过滤掉时标签自然一起消失，不需要单独清理。
  */
 import { els, state, edgeKey, FONT } from './state.js';
 import { api } from './api.js';
 import {
   LABEL_FONT,
+  LABEL_NOTE_FONT,
+  LABEL_PAD_Y,
   LABEL_MAX_DIST,
   LABEL_PRESETS,
   CONN_PREFIX,
   labelText,
-  labelSize,
   normalizeLabel,
-  placeLabel,
+  normalizeLabels,
+  labelBoxSize,
+  placeEdgeLabels,
   clampLabelCenter,
   midAnchor,
   nextConnNumber,
+  freeConnNumbers,
 } from '/core/labels.js';
 
-const FONT_SPEC = `600 ${LABEL_FONT}px ${FONT}`;
+const FONT_SPEC = (size) => `600 ${size}px ${FONT}`;
+const NOTE_SPEC = `400 ${LABEL_NOTE_FONT}px ${FONT}`;
 
 /** 文字宽度：用画布测量，和真正绘制时的字体保持一致 */
-function measure(text) {
+function measure(text, font = LABEL_FONT) {
   const ctx = els.ctx;
   ctx.save();
-  ctx.font = FONT_SPEC;
+  ctx.font = FONT_SPEC(font);
   const w = ctx.measureText(String(text || '')).width;
   ctx.restore();
   return w;
@@ -47,7 +54,7 @@ function roundRectPath(ctx, x, y, w, h, r) {
 }
 
 export function labelSizeOf(label) {
-  return labelSize(labelText(label), measure);
+  return labelBoxSize(label, measure);
 }
 
 /** 连线的「线中央」锚点（拖动时把指针位移换算成相对锚点的偏移） */
@@ -55,47 +62,60 @@ export function labelAnchor(edge) {
   return midAnchor(edge?.points || []);
 }
 
+/** 这条线当前的整组标签（视图数据里服务端已归一，这里再兜一层） */
+export function edgeLabels(edge) {
+  if (!edge) return [];
+  if (!edge.labels) edge.labels = normalizeLabels(edge.label);
+  else if (!Array.isArray(edge.labels)) edge.labels = normalizeLabels(edge.labels);
+  return edge.labels;
+}
+
 /**
- * 算出当前视图里所有标签的矩形，顺带写回 edge._lb 供命中测试复用。
- * 顺序遍历 + 已放置矩形参与避让，保证标签之间不叠在一起。
+ * 算出当前视图里所有标签的矩形，写回 edge._lbs 供命中测试复用。
+ * 同一条线的多条标签由 placeEdgeLabels 交替放线的两侧并互相避让；
+ * 不同线之间先放的矩形参与后者的避让。
  */
 export function labelLayout(view = state.view) {
   if (!view) return [];
   const placed = [];
   const out = [];
   for (const e of view.edges) {
-    e._lb = null;
-    if (!e.label) continue;
-    const label = normalizeLabel(e.label);
-    if (!label) continue;
-    const size = labelSizeOf(label);
-    const rect = placeLabel({
-      label,
-      size,
+    e._lbs = null;
+    const labels = edgeLabels(e);
+    if (!labels.length) continue;
+    const items = labels.map((label) => ({ label, size: labelSizeOf(label) }));
+    const rects = placeEdgeLabels({
+      items,
       pts: e.points || [],
       nodes: view.nodes,
-      others: placed,
       maxDist: LABEL_MAX_DIST,
     });
-    if (!rect) continue;
-    e._lb = rect;
-    placed.push(rect);
-    out.push({ edge: e, label, rect });
+    const own = [];
+    labels.forEach((label, i) => {
+      if (!rects[i]) return;
+      e._lbs = own;
+      own.push({ id: label.id, rect: rects[i] });
+      placed.push(rects[i]);
+      out.push({ edge: e, label, rect: rects[i] });
+    });
+    if (!own.length) e._lbs = null;
   }
   return out;
 }
 
-/** 命中最上层标签（标签画在节点之上，所以倒序找） */
+/** 命中最上层的标签（标签画在节点之上，所以倒序找）；返回具体命中了哪一条 */
 export function hitLabel(p, view = state.view) {
   if (!view) return null;
-  const need = view.edges.some((e) => e.label && !e._lb);
-  if (need) labelLayout(view);
+  if (view.edges.some((e) => e.labels?.length && !e._lbs)) labelLayout(view);
   for (let i = view.edges.length - 1; i >= 0; i--) {
     const e = view.edges[i];
-    const r = e._lb;
-    if (!r) continue;
-    if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
-      return { edge: e, rect: r };
+    if (!e._lbs) continue;
+    for (let j = e._lbs.length - 1; j >= 0; j--) {
+      const { id, rect: r } = e._lbs[j];
+      if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
+        const label = edgeLabels(e).find((l) => l.id === id) || null;
+        return label ? { edge: e, label, rect: r } : null;
+      }
     }
   }
   return null;
@@ -106,13 +126,14 @@ export function drawEdgeLabels(ctx, view = state.view) {
   const items = labelLayout(view);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
-    const selected = state.selectedLabel === edgeKey(edge);
+    const selected = state.selectedLabel === `${edgeKey(edge)}#${label.id}`;
     ctx.save();
-    ctx.font = FONT_SPEC;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const cx = rect.x + rect.w / 2;
-    const cy = rect.y + rect.h / 2;
+    const mainCy = label.note
+      ? rect.y + 4 + LABEL_FONT / 2
+      : rect.y + rect.h / 2;
 
     if (label.border) {
       roundRectPath(ctx, rect.x, rect.y, rect.w, rect.h, 4);
@@ -126,11 +147,19 @@ export function drawEdgeLabels(ctx, view = state.view) {
       ctx.lineJoin = 'round';
       ctx.lineWidth = 3;
       ctx.strokeStyle = 'rgba(247, 246, 242, 0.95)';
-      ctx.strokeText(labelText(label), cx, cy + 0.5);
+      ctx.font = FONT_SPEC(LABEL_FONT);
+      ctx.strokeText(labelText(label), cx, mainCy + 0.5);
     }
 
+    ctx.font = FONT_SPEC(LABEL_FONT);
     ctx.fillStyle = label.color || '#2C2C2A';
-    ctx.fillText(labelText(label), cx, cy + 0.5);
+    ctx.fillText(labelText(label), cx, mainCy + 0.5);
+    if (label.note) {
+      ctx.font = NOTE_SPEC;
+      ctx.fillStyle = '#6B6963';
+      // 说明行中心：主行（PAD+FONT/2）之下，与 labelBoxSize 的两行布局一致
+      ctx.fillText(label.note, cx, rect.y + LABEL_PAD_Y * 2 + LABEL_FONT + LABEL_NOTE_FONT / 2);
+    }
 
     if (selected) {
       roundRectPath(ctx, rect.x - 2.5, rect.y - 2.5, rect.w + 5, rect.h + 5, 6);
@@ -143,22 +172,39 @@ export function drawEdgeLabels(ctx, view = state.view) {
   }
 }
 
-/** 按预设造一条新标签；结合点的编号取当前画面里最小未占用值 */
-export function makeLabel(preset, edge) {
+/** 给新标签分配一个组内不冲突的 id */
+function freshId(labels) {
+  const used = new Set(labels.map((l) => l.id).filter(Boolean));
+  let n = labels.length;
+  let id = 'a' + n;
+  while (used.has(id)) id = 'a' + ++n;
+  return id;
+}
+
+/**
+ * 按预设造一条新标签。
+ * 结合点编号：给了 num 用 num（固定排序模式下面板让用户挑），
+ * 没给则取当前画面最小未占用值（重排模式 / AI 自动路径）。
+ */
+export function makeLabel(preset, edge, { num } = {}) {
+  const labels = edgeLabels(edge);
+  const id = freshId(labels);
   if (preset === 'conn') {
-    const used = (state.view?.edges || [])
-      .filter((e) => e !== edge && e.label)
-      .map((e) => normalizeLabel(e.label))
-      .filter(Boolean);
+    const used = (state.view?.edges || []).flatMap((e) => edgeLabels(e));
+    const n = Number.isFinite(Number(num)) && Number(num) > 0
+      ? Math.trunc(Number(num))
+      : nextConnNumber(used.filter((l) => l !== null));
     return normalizeLabel({
+      id,
       preset: 'conn',
-      num: nextConnNumber(used),
+      num: n,
       border: LABEL_PRESETS.conn.border,
       color: LABEL_PRESETS.conn.color,
     });
   }
   if (preset === 'call') {
     return normalizeLabel({
+      id,
       preset: 'call',
       text: LABEL_PRESETS.call.text,
       border: null,
@@ -166,6 +212,7 @@ export function makeLabel(preset, edge) {
     });
   }
   return normalizeLabel({
+    id,
     preset: 'task',
     text: LABEL_PRESETS.task.text,
     border: LABEL_PRESETS.task.border,
@@ -173,58 +220,101 @@ export function makeLabel(preset, edge) {
   });
 }
 
-/** 换预设：保留手动位置；结合点重新分配编号（原来的编号不重复用） */
-export function switchPreset(edge, preset) {
-  const prev = normalizeLabel(edge.label) || {};
+/** 固定排序模式下新增结合点可选的编号：空缺号 + 下一个号 */
+export function connChoices(view = state.view, edge = null) {
+  const used = (view?.edges || [])
+    .filter((e) => e !== edge)
+    .flatMap((e) => edgeLabels(e))
+    .filter(Boolean);
+  return freeConnNumbers(used, 6);
+}
+
+/** 换预设：保留手动位置与说明；结合点重新分配编号（原编号不重复用） */
+export function switchPreset(label, preset, edge) {
+  if (!label) return null;
   const next = makeLabel(preset, edge);
   if (!next) return null;
-  next.dx = prev.dx || 0;
-  next.dy = prev.dy || 0;
-  // 同类型切换（比如只是改颜色后再点回来）保留用户填的文字
-  if (preset === 'task' && prev.preset === 'task' && prev.text) next.text = prev.text;
-  if (preset === 'conn' && prev.preset === 'conn' && prev.num) {
-    next.num = prev.num;
-    next.text = CONN_PREFIX + prev.num;
+  next.id = label.id; // 就地换型：id 不变，选中状态与面板定位都不丢
+  next.dx = label.dx || 0;
+  next.dy = label.dy || 0;
+  if (label.note) next.note = label.note;
+  // 同预设来回切保留用户填的文字
+  if (preset === 'task' && label.preset === 'task' && label.text) next.text = label.text;
+  if (preset === 'call' && label.preset === 'call' && label.text) next.text = label.text;
+  if (preset === 'conn' && label.preset === 'conn' && label.num) {
+    next.num = label.num;
+    next.text = CONN_PREFIX + label.num;
   }
   return next;
 }
 
 /**
- * 立即把标签挂到连线上（规整后写回 edge.label），不发请求。
- * 面板 / 拖动先调它 + draw()，再调 persistLabel()，避免等一次往返才看到效果。
+ * 立即把整组标签挂到连线上（规整后写回 edge.labels），不发请求。
+ * 面板 / 拖动先调它 + draw()，再调 persistLabels()，避免等一次往返才看到效果。
  */
-export function applyLabel(edge, label) {
-  const clean = label ? normalizeLabel(label) : null;
-  edge.label = clean;
-  edge._lb = null;
-  return clean;
+export function applyLabels(edge, labels) {
+  edge.labels = normalizeLabels(labels);
+  edge.label = edge.labels[0] || null;
+  edge._lbs = null;
+  return edge.labels;
 }
 
-/** 落库：label 为 null 时服务端会删掉这个键 */
-export async function persistLabel(edge) {
-  await api.overlay({ edgeKey: edgeKey(edge), data: { label: edge.label || null } });
-  return edge.label || null;
+/** 落库：labels 为 null / 空组时服务端会删掉这个键（整组清除） */
+export async function persistLabels(edge) {
+  await api.overlay({ edgeKey: edgeKey(edge), data: { labels: edge.labels || null } });
+  return edge.labels || null;
 }
 
 /** 一步到位：先生效再落库 */
-export async function saveLabel(edge, label = edge.label) {
-  applyLabel(edge, label);
-  return persistLabel(edge);
+export async function saveLabels(edge, labels = edge.labels) {
+  applyLabels(edge, labels);
+  return persistLabels(edge);
+}
+
+/** 当前画面里全部结合点（重排与编号选择都要用） */
+export function connEntries(view = state.view) {
+  const out = [];
+  for (const e of view?.edges || []) {
+    for (const l of edgeLabels(e)) {
+      if (l.preset === 'conn') out.push({ key: edgeKey(e), edge: e, id: l.id, num: l.num });
+    }
+  }
+  return out;
+}
+
+/**
+ * 删除一个结合点后按当前模式收尾：
+ * renumber → 剩余结合点升序紧凑成 1..n（返回重排差异项，由调用方提交 /api/labels/renumber）
+ * fixed → 什么都不动（编号保留，空位留给以后手动挑）
+ */
+export async function afterConnDelete(view = state.view) {
+  const cfg = await api.labelConfig().catch(() => ({ mode: 'fixed' }));
+  if (cfg.mode !== 'renumber') return [];
+  const entries = connEntries(view)
+    .map(({ key, id, num }) => ({ key, id, num }))
+    .sort((a, b) => a.num - b.num);
+  const changes = entries
+    .map((x, i) => (x.num !== i + 1 ? { key: x.key, id: x.id, num: i + 1 } : null))
+    .filter(Boolean);
+  return changes;
 }
 
 /**
  * 拖动标签：把目标中心点夹在「线附近 + 不压节点」的合法范围里。
  * 返回是否真的移动了（放不下就不动，宁可跟手差一点也不要叠在函数框上）。
  */
-export function dragLabelTo(edge, center) {
-  const label = normalizeLabel(edge.label);
+export function dragLabelTo(edge, label, center) {
   if (!label) return false;
   const anchor = labelAnchor(edge);
   if (!anchor) return false;
   const view = state.view;
   const others = [];
   for (const e of view.edges) {
-    if (e !== edge && e._lb) others.push(e._lb);
+    if (e === edge || !e._lbs) continue;
+    for (const { rect } of e._lbs) others.push(rect);
+  }
+  for (const { id, rect } of edge._lbs || []) {
+    if (id !== label.id) others.push(rect);
   }
   const c = clampLabelCenter(center, {
     size: labelSizeOf(label),
@@ -236,7 +326,6 @@ export function dragLabelTo(edge, center) {
   if (!c) return false;
   label.dx = Math.round(c.x - anchor.x);
   label.dy = Math.round(c.y - anchor.y);
-  edge.label = label;
-  edge._lb = null;
+  edge._lbs = null;
   return true;
 }

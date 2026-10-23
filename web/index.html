@@ -121,6 +121,46 @@
   .lbl-actions button { flex: 1; }
   .lbl-note { color: #888780; font-size: 11px; line-height: 1.55; margin-top: 8px; }
 
+  /* 多标签列表：一行一条，点击选中（画布上同一条出虚线框） */
+  .lbl-rows { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  .lbl-row {
+    display: flex; align-items: center; gap: 7px; padding: 4px 6px;
+    border: 1px solid transparent; border-radius: 7px; cursor: pointer;
+  }
+  .lbl-row:hover { background: #F7F6F2; }
+  .lbl-row.on { border-color: #185FA5; background: #E6F1FB; }
+  .lbl-row-txt { flex: 1; min-width: 0; font-size: 11.5px; color: #5F5E5A;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lbl-row-del { border: 0; background: none; color: #B4B2A9; cursor: pointer;
+    font-size: 12px; padding: 2px 4px; border-radius: 4px; }
+  .lbl-row-del:hover { color: #C0392B; background: #FAECE7; }
+
+  .lbl-editor { border-top: 1px solid #E8E7E1; padding-top: 8px; margin-top: 2px; }
+  .lbl-segs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .lbl-seg {
+    flex: 1; padding: 4px 6px; font-size: 11.5px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 6px; background: #fff;
+  }
+  .lbl-seg.on { border-color: #185FA5; background: #E6F1FB; }
+
+  .lbl-adds { display: flex; gap: 5px; margin-top: 8px; }
+  .lbl-add {
+    flex: 1; padding: 5px 6px; font-size: 11.5px; cursor: pointer;
+    border: 1px dashed rgba(0,0,0,.25); border-radius: 7px; background: none;
+  }
+  .lbl-add:hover, .lbl-add.on { border-color: #185FA5; border-style: solid; background: #E6F1FB; }
+  .lbl-detect { margin-top: 6px; }
+  .lbl-picknum { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+  .lbl-num {
+    min-width: 30px; padding: 4px 6px; font-size: 12px; cursor: pointer;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 6px; background: #fff;
+  }
+  .lbl-num:hover { border-color: #185FA5; background: #E6F1FB; }
+  .lbl-mode { margin-top: 10px; border-top: 1px solid #E8E7E1; padding-top: 8px; }
+  .dt-list { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; max-height: 180px; overflow: auto; }
+  .dt-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; cursor: pointer; }
+  .dt-ev { color: #888780; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   #tooltip {
     position: absolute; pointer-events: none; background: #2C2C2A; color: #fff;
     padding: 6px 9px; border-radius: 7px; font-size: 12px; opacity: 0;
@@ -546,7 +586,7 @@
       <h3 data-i18n="panel.detail">节点详情</h3>
       <div id="detail"><div class="empty" data-i18n="empty.detail">点击图中节点查看详情</div></div>
     </div>
-    <div class="sec">
+    <div class="sec" id="secVars">
       <h3 data-i18n="panel.vars">全局变量 / 常量</h3>
       <div id="vars"><div class="empty" data-i18n="empty.vars">当前视图里没有全局变量</div></div>
     </div>

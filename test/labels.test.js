@@ -8,6 +8,10 @@ import {
   CONN_PREFIX,
   LABEL_MAX_DIST,
   LABEL_PRESETS,
+  compactConnEntries,
+  freeConnNumbers,
+  normalizeLabels,
+  placeEdgeLabels,
   clampLabelCenter,
   labelSize,
   labelText,
@@ -154,4 +158,80 @@ test('normalizeLabel：custom 预设没有默认样式，颜色退回默认黑',
   assert.equal(l.preset, 'custom');
   assert.equal(l.border, null);
   assert.equal(l.color, '#2C2C2A');
+});
+
+// ---------------------------------------------------------------------------
+// 多标签模型（labels 数组 / note / id / 编号模式 / 两侧排布）
+// ---------------------------------------------------------------------------
+
+test('normalizeLabels：数组与旧版单条都收，id 缺失按位置补齐', () => {
+  const arr = normalizeLabels([{ preset: 'conn' }, { preset: 'task', text: 'TASK:2ms' }]);
+  assert.equal(arr.length, 2);
+  assert.equal(arr[0].id, 'a0');
+  assert.equal(arr[1].id, 'a1');
+
+  // 旧版单条 → 单元素数组
+  const single = normalizeLabels({ preset: 'call', text: 'コール順' });
+  assert.equal(single.length, 1);
+  assert.equal(single[0].id, 'a0');
+
+  // 脏条目被丢掉，好条目保留；null / 空数组安全
+  assert.equal(normalizeLabels([{ preset: 'task', text: '  ' }, null, { preset: 'call' }]).length, 1);
+  assert.deepEqual(normalizeLabels(null), []);
+});
+
+test('normalizeLabel：note 限长并拍平控制字符，结合点编号改字随 num 走', () => {
+  const l = normalizeLabel({ preset: 'conn', num: 3, note: '换挡\n请求\t入口' + 'x'.repeat(100) });
+  assert.equal(l.text, CONN_PREFIX + 3);
+  assert.ok(!/[\r\n\t]/.test(l.note));
+  assert.ok(l.note.length <= 80);
+});
+
+test('freeConnNumbers：空缺号 + 下一号（固定排序模式的候选）', () => {
+  const used = [
+    { preset: 'conn', num: 2 },
+    { preset: 'conn', num: 3 },
+    { preset: 'conn', num: 5 },
+    { preset: 'task', text: 'x' },
+  ];
+  assert.deepEqual(freeConnNumbers(used, 4), [1, 4, 6, 7]);
+});
+
+test('compactConnEntries：升序紧凑成 1..n，只返回变化项（重排模式）', () => {
+  const entries = [
+    { key: 'a->b:1', id: 'x', num: 2 },
+    { key: 'a->c:2', id: 'y', num: 3 },
+    { key: 'a->d:3', id: 'z', num: 5 },
+  ];
+  assert.deepEqual(compactConnEntries(entries), [
+    { key: 'a->b:1', id: 'x', num: 1 },
+    { key: 'a->c:2', id: 'y', num: 2 },
+    { key: 'a->d:3', id: 'z', num: 3 },
+  ]);
+  // 已经连续的不动
+  assert.deepEqual(
+    compactConnEntries([
+      { key: 'k', id: 'x', num: 1 },
+      { key: 'k2', id: 'y', num: 2 },
+    ]),
+    []
+  );
+});
+
+test('placeEdgeLabels：多条标签交替放线的两侧，默认不压中线', () => {
+  const pts = [
+    [0, 0],
+    [200, 0],
+  ];
+  const items = [
+    { label: { preset: 'task', text: 'TASK:2ms', dx: 0, dy: 0 }, size: { w: 60, h: 20 } },
+    { label: { preset: 'conn', num: 1, dx: 0, dy: 0 }, size: { w: 60, h: 20 } },
+  ];
+  const [r1, r2] = placeEdgeLabels({ items, pts, nodes: [] });
+  assert.ok(r1 && r2);
+  // 线在 y=0：第一条整体在上方（rect 底边不越线），第二条在下方（rect 顶边不越线）
+  assert.ok(r1.y + r1.h <= 1, `第一条应在线上方，got y=${r1.y}`);
+  assert.ok(r2.y >= -1, `第二条应在线下方，got y=${r2.y}`);
+  // 两条不能叠住
+  assert.ok(!rectsOverlap(r1, r2, 0));
 });
