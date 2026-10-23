@@ -40,7 +40,7 @@ test('同源同类型的右侧扇出共用出口，同时保留各自的目标�
   assert.equal(new Set(edges.map((edge) => edge.points.at(-1).join(','))).size, edges.length);
 });
 
-test('目标入边方向不同时不合并源出口', () => {
+test('每面一口制：目标入边方向不同也共用同一个源出口', () => {
   const nodes = [
     { id: 'source', x: 40, y: 120, w: 150, h: 60 },
     { id: 'target-left', x: 330, y: 124, w: 140, h: 52 },
@@ -53,11 +53,33 @@ test('目标入边方向不同时不合并源出口', () => {
 
   routeEdges(nodes, edges);
 
-  assert.notDeepEqual(
+  assert.deepEqual(
     edges[0].points[0],
     edges[1].points[0],
-    '目标箭头方向不同时应保留独立源出口'
+    '同源同类型即使目标入面不同也应共用一个源出口'
   );
   assert.equal(edges[0].points.at(-1)[0], nodes[1].x, '左向箭头应从目标左侧进入');
   assert.equal(edges[1].points.at(-1)[1], nodes[2].y, '上向箭头应从目标顶部进入');
+});
+
+test('每面一口制：同一目标的多个入口共用一个入端口，与出口错开', () => {
+  const nodes = [
+    { id: 't1', x: 40, y: 40, w: 150, h: 60 },
+    { id: 't2', x: 40, y: 200, w: 150, h: 60 },
+    { id: 'hub', x: 400, y: 120, w: 160, h: 60 },
+  ];
+  const edges = [
+    { from: 't1', to: 'hub', kind: 'direct' },
+    { from: 't2', to: 'hub', kind: 'direct' },
+  ];
+
+  routeEdges(nodes, edges);
+
+  const ends = edges.map((edge) => edge.points.at(-1));
+  assert.deepEqual(ends[0], ends[1], '同目标同类型的入边应共用一个入端口');
+  assert.equal(ends[0][0], nodes[2].x, '入端口应落在 hub 左侧边界');
+  const ys = ends.map((p) => p[1]);
+  for (const y of ys) {
+    assert.ok(y > nodes[2].y && y < nodes[2].y + nodes[2].h, `入端口须在边界上：${y}`);
+  }
 });

@@ -353,7 +353,11 @@ function layoutBase(nodes, edges, opts = {}) {
   // 列内保持全局 x（父子对齐不被破坏），整列只做平移
   const bandGap = Math.max(gapX * 2, 90); // 列间走廊：跨列连线绕行走这里
   const splitRowGap = gapY; // 同层拆行后的行距：上一层连到第二行的线要穿行间通道
-  const maxRowWidth = opts.maxRowWidth ?? 900;
+  // 拆行宽度上限自适应：行宽贴着「不拆时的层栈高度」走，直接瞄准方形；
+  // 固定 900 会让 600-800px 宽的层不拆，文件框被压成扁条（整体怎么排都不方）
+  const unsplitH =
+    padding * 2 + layerH.reduce((s, h) => s + h, 0) + (gapHeights || []).reduce((s, g) => s + (g ?? gapY), 0);
+  const maxRowWidth = opts.maxRowWidth ?? Math.max(220, Math.min(900, Math.round(unsplitH * 1.05)));
   const gapAfter = layers.map((_, li) => (li < layers.length - 1 ? gapHeights[li] ?? gapY : 0));
 
   // 7a. 超宽层拆行：按 x 序贪心装行，行内从左重排（对齐信息在几十个节点的宽层里本就不可读）
@@ -361,7 +365,7 @@ function layoutBase(nodes, edges, opts = {}) {
     const g = layerGap[li];
     const sorted = arr.slice().sort((a, b) => xFinal.get(a) - xFinal.get(b));
     const totalW = sorted.reduce((s, id) => s + nodeW.get(id), 0) + g * (arr.length - 1);
-    if (arr.length < 4 || totalW <= maxRowWidth) {
+    if (arr.length < 2 || totalW <= maxRowWidth) {
       return [{ ids: sorted, x0: Math.min(...sorted.map((id) => xFinal.get(id))) }];
     }
     const rows = [];

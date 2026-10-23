@@ -21,3 +21,6 @@ Thumbs.db
 
 # 验证脚手架（会话内调试用的补丁/导出/日志）
 .verify-tmp/
+
+# ZCode 工作流草稿
+.zcode/

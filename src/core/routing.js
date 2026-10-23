@@ -479,6 +479,12 @@ function classify(e, a, b) {
 
 // ---------------- 端口分配 ----------------
 
+/**
+ * 每面一口制：同一节点同一面的所有出边共用一个出口（面中心），所有入边共用一个入口。
+ * 不区分线类型——不同类型的边共用首段，后画的盖住先画的，视觉上是一根线从口里分叉。
+ * 入口与出口在同一面共存时入口整体错开，避免出/入锚点同点对穿。
+ * 用户显式钉过出/入面的边同样并入该面的口——用户钉的是面，不是点位。
+ */
 function assignPorts(autos, nodeMap) {
   const pools = new Map();
   const add = (id, side, it, isOut) => {
@@ -495,52 +501,20 @@ function assignPorts(autos, nodeMap) {
     const n = nodeMap.get(id);
     if (!n) continue;
     const horiz = side === 'top' || side === 'bottom';
-    for (const item of list) {
-      const other = nodeMap.get(item.isOut ? item.it.e.to : item.it.e.from);
-      item.pos = other ? (horiz ? other.x + other.w / 2 : other.y + other.h / 2) : 0;
-    }
-    list.sort((u, v) => u.pos - v.pos || (u.it.e.line || 0) - (v.it.e.line || 0));
-    for (let i = 0; i < list.length; i++) {
-      const item = list[i];
-      const p = portAt(n, side, (i + 1) / (list.length + 1));
-      if (item.isOut) item.it.e._p0 = p;
-      else item.it.e._p1 = p;
-    }
-  }
-}
-
-/** 同侧同色自动出边共用一个源端口，后续母线再从公共出口处分叉。 */
-function shareSourcePorts(items, edges) {
-  const bySourceSide = new Map();
-  const sideUsers = new Map();
-  const addUser = (id, side, item, isSource) => {
-    const key = `${id}\u0000${side}`;
-    if (!sideUsers.has(key)) sideUsers.set(key, []);
-    sideUsers.get(key).push({ item, isSource });
-  };
-
-  for (const item of items) {
-    addUser(item.e.from, item.sa, item, true);
-    addUser(item.e.to, item.sb, item, false);
-    const key = `${item.e.from}\u0000${item.sa}\u0000${item.sb}\u0000${item.e.kind || 'direct'}`;
-    if (!bySourceSide.has(key)) bySourceSide.set(key, []);
-    bySourceSide.get(key).push(item);
-  }
-
-  for (const list of bySourceSide.values()) {
-    if (list.length < 2) continue;
-    const source = list[0].a;
-    const side = list[0].sa;
-    // 用户显式指定的端口或手工折线优先，避免挪动其锚点。
-    if (
-      list.some((item) => item.e.custom || item.e.fromSide) ||
-      edges.some((e) => e.from === source.id && e.custom && (!SIDES.has(e.fromSide) || e.fromSide === side))
-    ) continue;
-    const users = sideUsers.get(`${source.id}\u0000${side}`) || [];
-    if (users.length !== list.length || users.some((user) => !user.isSource || !list.includes(user.item))) continue;
-
-    const sharedPort = portAt(source, side, 0.5);
-    for (const item of list) item.e._p0 = sharedPort;
+    const len = Math.max(60, horiz ? n.w : n.h);
+    const outs = list.filter((x) => x.isOut);
+    const ins = list.filter((x) => !x.isOut);
+    const place = (arr, basePx) => {
+      if (!arr.length) return;
+      const frac = Math.min(0.92, Math.max(0.08, (len / 2 + basePx) / len));
+      const p = portAt(n, side, frac);
+      for (const x of arr) {
+        if (x.isOut) x.it.e._p0 = p;
+        else x.it.e._p1 = p;
+      }
+    };
+    place(outs, 0);
+    place(ins, outs.length ? 22 : 0);
   }
 }
 
@@ -715,15 +689,11 @@ function routeBusH(list, ctx, dir) {
   return true;
 }
 
-/** 同一调用者的横向多目标边共用节点簇外的水平干线。 */
+/** 同一调用者的横向多目标边共用节点簇外的水平干线。目标可以在源的两侧，
+ *  分支的几何守卫（逐条 vLineBlocked）会挡住穿不过去的组合并整组回退。 */
 function routeFanoutBus(list, ctx) {
   if (list.length < 2 || list.some((it) => it.e.fromSide || it.e.toSide || it.e.custom)) return false;
   const source = list[0].a;
-  const sourceCx = source.x + source.w / 2;
-  const targetCxs = list.map((it) => it.b.x + it.b.w / 2);
-  const xDir = targetCxs.every((x) => x > sourceCx + 8) ? 1
-    : targetCxs.every((x) => x < sourceCx - 8) ? -1 : 0;
-  if (!xDir) return false;
   const minY = Math.min(source.y, ...list.map((it) => it.b.y));
   const maxY = Math.max(source.y + source.h, ...list.map((it) => it.b.y + it.b.h));
 
@@ -1163,7 +1133,6 @@ export function routeEdges(nodes, edges, opts = {}) {
   const items = [...pairFirst.values()];
 
   assignPorts(items, nodeMap);
-  shareSourcePorts(items, edges);
 
   // 稳定排序：直连 → 混合 → 长边；同类型按端口 y 再 x
   const rank = { direct: 0, side: 0, mixed: 1, long: 2 };
@@ -1175,15 +1144,15 @@ export function routeEdges(nodes, edges, opts = {}) {
       (x.e.line || 0) - (y.e.line || 0)
   );
 
-  // ---- 公用母线：同源（再同目标）、同类型且方向一致的直连边共享通道 ----
+  // ---- 公用母线：同源、同类型且方向一致的直连边共享通道 ----
   // 上下连接共用水平母线，左右连接共用竖直母线。
   // 母线成员必须同类型同色，不同颜色的线不得互相借用通道
   const bused = new Set();
-  // 先尝试完整的高扇出组合，避免简单母线先吃掉其中一部分后破坏整体汇流。
+  // 先尝试完整的高扇出组合（不分目标文件——跨文件扇出共用一根干线是主要减线手段），
+  // 避免简单母线先吃掉其中一部分后破坏整体汇流。
   const fanouts = new Map();
   for (const it of items) {
-    const targetRegion = it.b.group ?? 'all';
-    const key = it.e.from + '\u0000' + (it.e.kind || 'direct') + '\u0000' + targetRegion;
+    const key = it.e.from + '\u0000' + (it.e.kind || 'direct');
     if (!fanouts.has(key)) fanouts.set(key, []);
     fanouts.get(key).push(it);
   }
