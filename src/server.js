@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
-import { layout, layoutGrouped } from './core/layout.js';
+import { layout, layoutGrouped, textWidth } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
@@ -438,8 +438,8 @@ function fitGroups(groups, nodes) {
   }
 }
 
-/** 固定布局用：按节点实际位置精确重算文件框与目录容器（可扩可缩） */
-function refitBoxes(groups, containers, nodes) {
+/** 固定布局用：按节点实际位置精确重算文件框（可扩可缩） */
+function refitGroupBoxes(groups, nodes) {
   const byGroup = new Map();
   for (const n of nodes) {
     if (!n.group) continue;
@@ -466,7 +466,14 @@ function refitBoxes(groups, containers, nodes) {
     g.w = x1 - x0 + 28;
     g.h = y1 - y0 + 44;
   }
+  return bounds;
+}
 
+/**
+ * 固定布局用：文件框分开之后，目录容器跟着包住最终矩形（可扩可缩）。
+ * 根容器保持 layoutGrouped 的外扩规格（RING），子目录沿用 14/30 + 深度外扩
+ */
+function refitDirContainers(containers, groups, bounds) {
   if (!containers || !containers.length) return;
   const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
   // 深的先算：父容器用子容器的最终矩形求并集
@@ -477,10 +484,18 @@ function refitBoxes(groups, containers, nodes) {
     );
     if (!kids.length) continue;
     const { x0, y0, x1, y1 } = bounds(kids);
+    if (c.root) {
+      // 根容器：与 layoutGrouped 的 RING 保持一致，标题行更高
+      c.x = x0 - 22;
+      c.y = y0 - 38;
+      c.w = Math.max(x1 - x0 + 44, textWidth(c.label) + 24);
+      c.h = y1 - y0 + 64;
+      continue;
+    }
     const extra = (maxDepth - c.depth) * 10;
     c.x = x0 - 14 - extra;
     c.y = y0 - 30 - extra;
-    c.w = x1 - x0 + 28 + extra * 2;
+    c.w = Math.max(x1 - x0 + 28 + extra * 2, textWidth(c.label) + 24);
     c.h = y1 - y0 + 44 + extra * 2;
   }
 }
@@ -513,23 +528,60 @@ function relocateNewNode(n, laid) {
   return false;
 }
 
-/** 固定布局下把互相压住的兄弟文件框整体推开（连带其中的节点与折线） */
-function pushApartGroups(groups, nodes, edges) {
+/**
+ * 固定布局下把互相压住的兄弟文件框整体推开（连带其中的节点与折线）。
+ * 推开的间距必须容下两框之间所有目录容器的环（标题栏 + 逐级外扩），
+ * 否则文件框分开了，外层目录容器贴合后还是会压在一起。
+ * 沿重叠较小的轴推：竖向按「上方链的底环 + 下方链的顶环」，
+ * 横向按「两侧链的侧环」；环只累计到最近公共祖先为止（再往上就包住双方了）。
+ */
+function pushApartGroups(groups, containers, nodes, edges) {
   if (!groups || groups.length < 2) return;
-  const shift = (g, dy) => {
+  const maxDepth = (containers || []).reduce((m, c) => Math.max(m, c.depth), 1);
+  const ring = new Map(); // id -> { top, bottom, side }
+  for (const c of containers || []) {
+    if (c.root) {
+      ring.set(c.id, { top: 38, bottom: 26, side: 22 });
+      continue;
+    }
+    const extra = (maxDepth - c.depth) * 10;
+    ring.set(c.id, { top: 30 + extra, bottom: 14 + extra, side: 14 + extra });
+  }
+  const chainOf = new Map(); // 文件框 id -> 祖先容器链（浅→深，不含根）
+  for (const g of groups) {
+    chainOf.set(
+      g.id,
+      (containers || [])
+        .filter((c) => !c.root && g.id.startsWith(c.id + '/'))
+        .sort((a, b) => a.depth - b.depth)
+    );
+  }
+  const marginBetween = (upper, lower, axis) => {
+    const cu = chainOf.get(upper.id) || [];
+    const cl = chainOf.get(lower.id) || [];
+    let i = 0;
+    while (i < cu.length && i < cl.length && cu[i] === cl[i]) i++;
+    let m = 0;
+    for (let k = i; k < cu.length; k++) m += ring.get(cu[k].id)?.[axis === 'y' ? 'bottom' : 'side'] || 0;
+    for (let k = i; k < cl.length; k++) m += ring.get(cl[k].id)?.[axis === 'y' ? 'top' : 'side'] || 0;
+    return m;
+  };
+  const shift = (g, dx, dy) => {
+    g.x += dx;
     g.y += dy;
     const ids = new Set();
     for (const n of nodes) {
       if (n.group !== g.id) continue;
+      n.x += dx;
       n.y += dy;
       ids.add(n.id);
     }
     for (const e of edges) {
       if (!ids.has(e.from) && !ids.has(e.to)) continue;
-      if (e.points) for (const p of e.points) p[1] += dy;
+      if (e.points) for (const p of e.points) { p[0] += dx; p[1] += dy; }
     }
   };
-  for (let iter = 0; iter < 12; iter++) {
+  for (let iter = 0; iter < 24; iter++) {
     let moved = false;
     for (let i = 0; i < groups.length; i++) {
       for (let j = i + 1; j < groups.length; j++) {
@@ -538,12 +590,108 @@ function pushApartGroups(groups, nodes, edges) {
         const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
         const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
         if (ox <= 1 || oy <= 1) continue;
-        shift(a.y >= b.y ? a : b, oy + 20);
+        // 彻底分离所需的位移（不是相交量）：包含型重叠时按相交量推永远推不出去。
+        // 竖向 = 下框顶推到上框底之下再留出容器环；横向同理
+        const lower = a.y >= b.y ? a : b;
+        const upper = lower === a ? b : a;
+        const dy = upper.y + upper.h - lower.y + marginBetween(upper, lower, 'y') + 8;
+        const right = a.x >= b.x ? a : b;
+        const left = right === a ? b : a;
+        const dx = left.x + left.w - right.x + marginBetween(left, right, 'x') + 8;
+        if (dy <= dx) shift(lower, 0, dy);
+        else shift(right, dx, 0);
         moved = true;
       }
     }
     if (!moved) break;
   }
+}
+
+/**
+ * 固定布局兜底第二层：容器级分离。
+ * 文件框两两分开仍不够 —— 目录容器的包围盒会伸进兄弟文件框之间的
+ * 「L 形空隙」（框与框不交，但容器的包围盒横跨多个框把别人罩进去）。
+ * 这里把参与占位的「范围框」（目录容器 + 顶层文件框）两两分离，
+ * 位移时整棵子树（容器、文件框、节点、折线）一起平移，嵌套关系不被破坏。
+ * 容器矩形本身已含各级环，因此不需要再算环间距。
+ */
+function pushApartContainers(containers, groups, nodes, edges) {
+  if (!containers || !containers.length || !groups) return false;
+  const dirs = containers.filter((c) => !c.root && c.w > 0 && c.h > 0);
+  const inDir = (id) => dirs.some((c) => id.startsWith(c.id + '/'));
+  // 顶层文件框 = 不在任何目录容器里的文件框（它自己就是占位单位）
+  const extents = [
+    ...dirs.map((c) => ({ box: c, isGroup: false })),
+    ...groups.filter((g) => g.w > 0 && g.h > 0 && !inDir(g.id)).map((g) => ({ box: g, isGroup: true })),
+  ];
+  if (extents.length < 2) return false;
+
+  const shiftSubtree = (item, dx, dy) => {
+    const { box, isGroup } = item;
+    box.x += dx;
+    box.y += dy;
+    const gIds = new Set();
+    if (isGroup) {
+      gIds.add(box.id);
+    } else {
+      for (const g of groups) {
+        if (!g.id.startsWith(box.id + '/')) continue;
+        g.x += dx;
+        g.y += dy;
+        gIds.add(g.id);
+      }
+      for (const c of containers) {
+        if (c !== box && !c.root && c.id.startsWith(box.id + '/')) {
+          c.x += dx;
+          c.y += dy;
+        }
+      }
+    }
+    const ids = new Set();
+    for (const n of nodes) {
+      if (!gIds.has(n.group)) continue;
+      n.x += dx;
+      n.y += dy;
+      ids.add(n.id);
+    }
+    for (const e of edges) {
+      if (!ids.has(e.from) && !ids.has(e.to)) continue;
+      if (e.points) for (const p of e.points) { p[0] += dx; p[1] += dy; }
+    }
+  };
+
+  let moved = false;
+  for (let round = 0; round < 8; round++) {
+    let roundMoved = false;
+    for (let i = 0; i < extents.length; i++) {
+      for (let j = i + 1; j < extents.length; j++) {
+        const A = extents[i];
+        const B = extents[j];
+        // 祖先-后代关系的容器（嵌套）不分离
+        if (!A.isGroup && !B.isGroup) {
+          if (A.box.id.startsWith(B.box.id + '/') || B.box.id.startsWith(A.box.id + '/')) continue;
+        }
+        const a = A.box;
+        const b = B.box;
+        const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+        const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+        if (ox <= 1 || oy <= 1) continue;
+        // 与文件框级同理：按彻底分离所需位移算，取较小的轴
+        const lower = a.y >= b.y ? A : B;
+        const upper = lower === A ? B : A;
+        const dy = upper.box.y + upper.box.h - lower.box.y + 8;
+        const right = a.x >= b.x ? A : B;
+        const left = right === A ? B : A;
+        const dx = left.box.x + left.box.w - right.box.x + 8;
+        if (dy <= dx) shiftSubtree(lower, 0, dy);
+        else shiftSubtree(right, dx, 0);
+        roundMoved = true;
+      }
+    }
+    moved = moved || roundMoved;
+    if (!roundMoved) break;
+  }
+  return moved;
 }
 
 /**
@@ -775,8 +923,9 @@ function buildView(
     savedApplied.push(n);
   }
 
-  // 固定布局：已有节点钉在原位，新加入的节点（变量/函数）自己找空位，
-  // 只有在框里放不下时才撑大框，并把压到的兄弟框整体推开
+  // 固定布局：已有节点钉在原位，新加入的节点（变量/函数）自己找空位。
+  // 框的分离放到下面贴合之后统一做——这里文件框还是自动布局的旧矩形，
+  // 钉到别处的节点不在旧框里，先推开推了个寂寞，贴合后又会压回去
   if (fixed) {
     const savedSet = new Set(savedApplied.map((n) => n.id));
     for (const n of laid.nodes) {
@@ -786,7 +935,6 @@ function buildView(
       );
       if (clash) relocateNewNode(n, laid);
     }
-    pushApartGroups(laid.groups, laid.nodes, laid.edges);
   }
 
   // 存档坐标防叠压：旧存档 / 跨深度的坐标可能压在其他节点上，
@@ -852,9 +1000,22 @@ function buildView(
   // 避免函数节点看起来脱离了所属文件的层级
   if (laid.groups) {
     if (fixed) {
-      // 固定布局：框跟着节点「精确贴合」——加变量时撑大，撤销时也能缩回去，
-      // 不会留下大片空白
-      refitBoxes(laid.groups, laid.containers, laid.nodes);
+      // 固定布局的层级分离，顺序不能换：
+      //   1. 文件框按节点实际位置「精确贴合」（可扩可缩）
+      //   2. 文件框级分离（间距含祖先容器的环）
+      //   3. 容器贴合 → 容器级分离，迭代到稳定（子树整体平移）
+      // 陈旧坐标把节点钉进别的层级时，靠 2/3 两层把它彻底分开
+      const bounds = refitGroupBoxes(laid.groups, laid.nodes);
+      pushApartGroups(laid.groups, laid.containers, laid.nodes, laid.edges);
+      let settled = false;
+      for (let i = 0; i < 10; i++) {
+        refitDirContainers(laid.containers, laid.groups, bounds);
+        if (!pushApartContainers(laid.containers, laid.groups, laid.nodes, laid.edges)) {
+          settled = true;
+          break;
+        }
+      }
+      if (!settled) refitDirContainers(laid.containers, laid.groups, bounds);
     } else {
       fitGroups(laid.groups, laid.nodes);
       fitContainers(laid.containers, laid.groups);
