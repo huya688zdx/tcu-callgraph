@@ -2,7 +2,7 @@
  * 分层布局（Sugiyama 简化版）
  * 找回边 → Kahn 分层（压缩空层）→ 重心法减少交叉 →
  * 优先级对齐分配 x（子随父 / 父就子两遍取平均，空间随结构展开）→
- * 通道需求估算层间高度 → 坐标分配
+ * 通道需求估算层间高度 → 坐标分配 → 正交路由后按实测占用压实层间隙
  * 边路由统一交给 ./routing.js（前后端共享的正交路由器）
  */
 
@@ -436,29 +436,43 @@ function layoutBase(nodes, edges, opts = {}) {
     // 折行要有明显收益（0.08 log）才动：小图保持单列
     if (p.score < plan.score - 0.08) plan = p;
   }
-  let colX = padding;
-  let maxY = 0;
-  for (let c = 0; c < plan.cols.length; c++) {
-    let y = padding;
-    const shift = colX - plan.colBox[c].x0;
-    for (let k = 0; k < plan.cols[c].length; k++) {
-      const li = plan.cols[c][k];
-      for (const row of rowsOf[li]) {
-        const rowH = Math.max(...row.ids.map((id) => heightOf(nodeMap.get(id))));
-        for (const id of row.ids) {
-          const g = geo.get(id);
-          g.x = xFinal.get(id) + shift;
-          g.y = y + (rowH - g.h) / 2;
+
+  /**
+   * 按列堆叠落位：行距 splitRowGap，列内相邻层之间用 gapOf(li) 的间隙。
+   * x 落位是幂等的，压实前后各调用一次；同时记录每个层间隙的 [本层底, 下层顶] 区间，
+   * 供路由后按实测占用收紧间隙。
+   */
+  const stackY = (gapOf) => {
+    let colX = padding;
+    let maxY = 0;
+    const gaps = [];
+    for (let c = 0; c < plan.cols.length; c++) {
+      let y = padding;
+      const shift = colX - plan.colBox[c].x0;
+      for (let k = 0; k < plan.cols[c].length; k++) {
+        const li = plan.cols[c][k];
+        for (const row of rowsOf[li]) {
+          const rowH = Math.max(...row.ids.map((id) => heightOf(nodeMap.get(id))));
+          for (const id of row.ids) {
+            const g = geo.get(id);
+            g.x = xFinal.get(id) + shift;
+            g.y = y + (rowH - g.h) / 2;
+          }
+          y += rowH + splitRowGap;
         }
-        y += rowH + splitRowGap;
+        y -= splitRowGap; // 最后一行不加行距
+        if (k < plan.cols[c].length - 1) {
+          const gap = gapOf(li);
+          gaps.push({ li, y0: y, y1: y + gap, gap });
+          y += gap;
+        }
       }
-      y -= splitRowGap; // 最后一行不加行距
-      y += k < plan.cols[c].length - 1 ? gapAfter[li] : 0;
+      maxY = Math.max(maxY, y);
+      colX += plan.colBox[c].x1 - plan.colBox[c].x0 + bandGap;
     }
-    maxY = Math.max(maxY, y);
-    colX += plan.colBox[c].x1 - plan.colBox[c].x0 + bandGap;
-  }
-  const totalH = maxY + padding;
+    return { maxY, gaps };
+  };
+  const firstStack = stackY((li) => gapAfter[li]);
 
   // ---- 8. 正交路由（共享路由器） ----
   const geoNodes = nodes.map((n) => {
@@ -466,6 +480,51 @@ function layoutBase(nodes, edges, opts = {}) {
     return { ...n, ...g };
   });
   routeEdges(geoNodes, es);
+
+  // ---- 8b. 层间隙按实际走线压实：第 6 步的「区间最大重叠」是上界估算，实际路由
+  // 往往用不满，层间会留大片空置。这里统计每个间隙区间内实际落下的水平段，
+  // 按与估算同式的通道需求只缩不扩：newGap = min(原间隙, max(needed, gapY))。
+  let gapTotalBefore = 0;
+  let gapTotalAfter = 0;
+  const newGapOf = new Map(); // 层号 li → 压实后的间隙高（只记真正收紧的）
+  for (const gp of firstStack.gaps) {
+    gapTotalBefore += gp.gap;
+    // 完全落在本间隙区间内的水平段（两端 y 均在区间内，容差 0.5 吸收浮点误差）
+    const ys = [];
+    for (const e of es) {
+      const pts = e.points || [];
+      for (let i = 0; i + 1 < pts.length; i++) {
+        const ya = pts[i][1];
+        const yb = pts[i + 1][1];
+        if (Math.abs(ya - yb) >= 0.5) continue; // 只看水平段
+        if (ya < gp.y0 - 0.5 || ya > gp.y1 + 0.5) continue;
+        if (yb < gp.y0 - 0.5 || yb > gp.y1 + 0.5) continue;
+        ys.push((ya + yb) / 2);
+      }
+    }
+    // 按 SPACING 归并：相邻 y 差 < SPACING 记同一通道
+    ys.sort((a, b) => a - b);
+    let bands = 0;
+    let prev = null;
+    for (const y of ys) {
+      if (prev === null || y - prev >= SPACING) {
+        bands++;
+        prev = y;
+      }
+    }
+    const needed = STUB * 2 + Math.max(0, bands - 1) * SPACING + 14 + SPACING;
+    const newGap = Math.min(gp.gap, Math.max(needed, gapY));
+    gapTotalAfter += newGap;
+    if (newGap < gp.gap - 1) newGapOf.set(gp.li, newGap);
+  }
+
+  let totalH = firstStack.maxY + padding;
+  if (newGapOf.size) {
+    // 存在收紧的间隙：重建各层 y（各列内层起点不变、层间换用压实后的间隙），
+    // 再完整重路由一次让折线按新节点位置重算；一轮即可，不做第二次压实
+    totalH = stackY((li) => newGapOf.get(li) ?? gapAfter[li]).maxY + padding;
+    routeEdges(geoNodes, es);
+  }
 
   // 侧边车道可能越界：整体平移 + 扩画布
   let maxRight = 0;
@@ -501,6 +560,8 @@ function layoutBase(nodes, edges, opts = {}) {
     height: totalH,
     layers: layers.length,
     backEdges: backSet.size,
+    // 压实诊断：所有层间隙高度之和（压实前 / 压实后）
+    stats: { gapTotalBefore, gapTotalAfter },
   };
 }
 
