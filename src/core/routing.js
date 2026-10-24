@@ -697,16 +697,24 @@ function routeBusH(list, ctx, dir) {
   return true;
 }
 
-/** 同一调用者的横向多目标边共用节点簇外的水平干线。目标可以在源的两侧，
- *  分支的几何守卫（逐条 vLineBlocked）会挡住穿不过去的组合并整组回退。 */
+/** 同一调用者的多目标边共用节点簇外的水平干线。只接管纵向出口（top/bottom）的组：
+ *  横向出口（left/right）的扇出由 routeBusH 的竖干线承接（共用统一后的面端口）。
+ *  干线侧向必须与出线面同侧——翻到对侧母线等于出线口背对目标绕一大圈，
+ *  还会把源节点的出线面从一个撕成两个（用户拖动后尤其明显）。 */
 function routeFanoutBus(list, ctx) {
   if (list.length < 2 || list.some((it) => it.e.fromSide || it.e.toSide || it.e.custom)) return false;
+  // 出线面取组内多数（并面之后通常全组一致）；只有纵向面才走横母线
+  const saCount = new Map();
+  for (const it of list) saCount.set(it.sa, (saCount.get(it.sa) || 0) + 1);
+  let sa = null;
+  for (const [s, c] of saCount) if (!sa || c > saCount.get(sa)) sa = s;
+  if (sa !== 'top' && sa !== 'bottom') return false;
   const source = list[0].a;
   const minY = Math.min(source.y, ...list.map((it) => it.b.y));
   const maxY = Math.max(source.y + source.h, ...list.map((it) => it.b.y + it.b.h));
 
   let best = null;
-  for (const yDir of [-1, 1]) {
+  for (const yDir of [sa === 'bottom' ? 1 : -1]) {
     const sourceSide = yDir < 0 ? 'top' : 'bottom';
     const targetSide = yDir < 0 ? 'top' : 'bottom';
     const p0 = portAt(source, sourceSide, 0.5);
