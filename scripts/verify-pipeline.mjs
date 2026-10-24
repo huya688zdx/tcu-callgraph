@@ -1,5 +1,5 @@
 // 复现「层级之间重叠」：走真实服务端管线（含手动布局存档），检查文件框/目录容器碰撞
-// 用法: node scripts/verify-pipeline.mjs [样本目录] [--scenario drag|fixed|vars]
+// 用法: node scripts/verify-pipeline.mjs [样本目录] [--scenario drag|stale|vars]
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -121,7 +121,7 @@ const run = async (scenario) => {
     }
 
     if (scenario === 'depth') {
-      // 固定布局（默认开启）下切深度：down=2 的坐标存档被 down=5 的新视图复用
+      // 切换深度：旧视图的坐标存档不能覆盖新 ELK 布局
       const v2 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=2`);
       if (v2.empty || !v2.groups?.length) continue;
       const nodes = {};
@@ -129,10 +129,10 @@ const run = async (scenario) => {
         nodes[n.id] = { x: n.x, y: n.y }; // 合法位置：当前自动布局坐标原样保存
       }
       await post('/api/layout', { root, mode: 'group', nodes });
-      const v5 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=5&optimal=1&fixed=1`);
-      totalBad += checkView(v5, `[fixed 切深度 2→5] ${root}`);
-      const v3 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3&optimal=1&fixed=1`);
-      totalBad += checkView(v3, `[fixed 切深度 2→3] ${root}`);
+      const v5 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=5`);
+      totalBad += checkView(v5, `[ELK 切深度 2→5] ${root}`);
+      const v3 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3`);
+      totalBad += checkView(v3, `[ELK 切深度 2→3] ${root}`);
       await post('/api/layout', { root, mode: 'group', clear: true });
     }
 
@@ -146,14 +146,14 @@ const run = async (scenario) => {
         nodes[n.id] = { x: g.x + 8, y: g.y + 32 };
       }
       await post('/api/layout', { root, mode: 'group', nodes });
-      const v1 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3&optimal=1`);
+      const v1 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3`);
       totalBad += checkView(v1, `[drag 后] ${root}`);
       // 清掉存档，避免影响后续入口
       await post('/api/layout', { root, mode: 'group', clear: true });
     }
 
-    if (scenario === 'fixed') {
-      // 3) 固定布局：把一个节点钉到别的文件框区域（陈旧/跨深度存档），再开 fixed
+    if (scenario === 'stale') {
+      // 3) 旧存档：把节点坐标写到别的文件框区域，仍应采用 ELK 排版
       const nodes = {};
       const ns = v0.nodes;
       if (ns.length >= 2) {
@@ -165,8 +165,8 @@ const run = async (scenario) => {
         }
       }
       await post('/api/layout', { root, mode: 'group', nodes });
-      const v1 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3&optimal=1&fixed=1`);
-      totalBad += checkView(v1, `[fixed 钉到别框] ${root}`);
+      const v1 = await get(`/api/view?root=${encodeURIComponent(root)}&group=1&down=3`);
+      totalBad += checkView(v1, `[忽略旧坐标] ${root}`);
       await post('/api/layout', { root, mode: 'group', clear: true });
     }
 
@@ -182,7 +182,7 @@ const run = async (scenario) => {
       }
       await post('/api/layout', { root, mode: 'group', nodes });
       const v1 = await get(
-        `/api/view?root=${encodeURIComponent(root)}&group=1&down=3&optimal=1&vars=${pick.map(encodeURIComponent).join(',')}`
+        `/api/view?root=${encodeURIComponent(root)}&group=1&down=3&vars=${pick.map(encodeURIComponent).join(',')}`
       );
       totalBad += checkView(v1, `[drag 后加变量] ${root}`);
       await post('/api/layout', { root, mode: 'group', clear: true });
@@ -190,7 +190,7 @@ const run = async (scenario) => {
   }
 };
 
-const scenarios = SCENARIO === 'all' ? ['clean', 'drag', 'fixed', 'vars', 'depth'] : [SCENARIO];
+const scenarios = SCENARIO === 'all' ? ['clean', 'drag', 'stale', 'vars', 'depth'] : [SCENARIO];
 for (const s of scenarios) {
   console.log(`\n===== 场景 ${s} =====`);
   await run(s);

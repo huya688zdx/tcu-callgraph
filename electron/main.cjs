@@ -4,16 +4,6 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
-const elkTrial = process.env.CALLGRAPH_LAYOUT_ENGINE === 'elk';
-if (elkTrial) {
-  // 试用窗口使用独立存档和实例锁，可以与原版同时打开。
-  app.setName('tcu-callgraph-elk-trial');
-  const trialData = path.join(ROOT, 'out', 'elk-trial', 'user-data');
-  fs.mkdirSync(trialData, { recursive: true });
-  app.setPath('userData', trialData);
-  process.env.CALLGRAPH_DB = path.join(trialData, 'callgraph.db');
-}
-
 /**
  * 单实例锁：两个实例会各起一个 server 子进程写同一个 SQLite 库，
  * 写锁冲突下轻则报错、重则界面白屏（子进程被 SQLITE_BUSY 打死）。
@@ -72,7 +62,9 @@ function stopServer() {
     const c = child;
     child = null;
     stopping = true;
+    let timer;
     const done = () => {
+      clearTimeout(timer);
       stopping = false;
       resolve();
     };
@@ -84,8 +76,8 @@ function stopServer() {
       return;
     }
     // 兜底：万一 exit 事件没来，2s 后继续，不让切工程卡死
-    const t = setTimeout(done, 2000);
-    if (t.unref) t.unref();
+    timer = setTimeout(done, 2000);
+    if (timer.unref) timer.unref();
   });
 }
 
@@ -101,7 +93,15 @@ function reportStartupFailure(code) {
   }
 }
 
-async function startTarget(target) {
+let startQueue = Promise.resolve();
+function startTarget(target) {
+  // 整个“停止旧服务 → 启动新服务”串行执行，避免 child 被并发覆盖。
+  const pending = startQueue.then(() => startTargetNow(target));
+  startQueue = pending.catch((err) => console.error('[启动] ' + err.message));
+  return pending;
+}
+
+async function startTargetNow(target) {
   await stopServer();
   currentTarget = target;
   serverLog = '';
@@ -181,7 +181,7 @@ function createWindow(url) {
     height: 960,
     minWidth: 1080,
     minHeight: 680,
-    title: elkTrial ? 'ELK 调用关系图（试用）' : 'TCU 调用关系图',
+    title: 'TCU 调用关系图 · ELK',
     backgroundColor: '#F7F6F2',
     webPreferences: {
       contextIsolation: true,

@@ -16,16 +16,51 @@
   }
   #app {
     display: grid; height: 100vh;
-    grid-template-columns: 250px 1fr 310px;
-    grid-template-rows: 48px 1fr;
+    grid-template-columns: 250px minmax(0, 1fr) 310px;
+    grid-template-rows: auto minmax(0, 1fr);
     grid-template-areas: "top top top" "left main right";
   }
   header {
-    grid-area: top; display: flex; align-items: center; gap: 8px;
-    padding: 0 12px; background: #fff; border-bottom: 1px solid rgba(0,0,0,.1);
+    grid-area: top; min-width: 0; position: relative; z-index: 30;
+    background: #fff; border-bottom: 1px solid rgba(0,0,0,.1);
   }
-  .brand { font-weight: 500; font-size: 14px; margin-right: 4px; white-space: nowrap; }
-  .brand small { color: #888780; font-weight: 400; margin-left: 6px; }
+  .top-row, .view-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 14px; }
+  .top-row { min-height: 58px; }
+  .view-row { gap: 12px; padding-top: 7px; padding-bottom: 7px; background: #FAFAF8; border-top: 1px solid #EFEEE9; }
+  .brand { flex: 0 1 250px; min-width: 150px; font-weight: 600; font-size: 14px; }
+  .brand small { display: block; margin-top: 3px; color: #888780; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #projectBtn { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+  .top-row #search { flex: 1 1 180px; width: auto; min-width: 160px; max-width: 340px; }
+  .top-actions, .tool-group { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+  .top-actions { margin-left: auto; }
+  .tool-group + .tool-group { padding-left: 12px; border-left: 1px solid #DEDDD6; }
+  .tool-label { margin-right: 2px; font-size: 11px; color: #888780; }
+  .edit-tools { margin-left: auto; }
+  #undoBtn, #redoBtn { width: 30px; padding: 0; font-size: 16px; }
+  header button:disabled { opacity: .4; cursor: default; }
+  .tool-menu { position: relative; }
+  .tool-menu summary {
+    display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 8px; cursor: pointer; list-style: none; font-size: 12.5px;
+  }
+  .tool-menu summary::-webkit-details-marker { display: none; }
+  .tool-menu summary::after { content: '⌄'; color: #888780; }
+  .tool-menu summary:hover, .tool-menu[open] summary { background: #E6F1FB; border-color: #B5D4F4; }
+  header :focus-visible { outline: 2px solid #185FA5; outline-offset: 2px; }
+  .tool-popover {
+    position: absolute; top: calc(100% + 7px); right: 0; min-width: 160px; padding: 5px;
+    background: #fff; border: 1px solid #DEDDD6; border-radius: 10px; box-shadow: 0 8px 24px #0000001A;
+  }
+  .tool-popover button { display: block; width: 100%; height: 34px; border: 0; text-align: left; }
+  .help-popover { width: 290px; max-width: calc(100vw - 28px); padding: 12px 14px; }
+  .help-popover p { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; padding: 6px 0; font-size: 12px; }
+  .help-popover p + p { border-top: 1px solid #F1EFE8; }
+  .help-popover kbd { font: inherit; color: #5F5E5A; white-space: nowrap; }
+  @media (max-width: 1100px) {
+    .brand { flex-basis: 185px; }
+    .top-row, .view-row { gap: 8px; padding-left: 10px; padding-right: 10px; }
+    .tool-group + .tool-group { padding-left: 8px; }
+  }
   input[type=search] {
     width: 220px; height: 30px; padding: 0 10px; font-size: 13px;
     border: 1px solid rgba(0,0,0,.16); border-radius: 8px; background: #fff; outline: none;
@@ -39,7 +74,6 @@
   button:hover { background: #F1EFE8; }
   button.primary { background: #185FA5; color: #fff; border-color: #185FA5; }
   button.primary:hover { background: #0C447C; }
-  .spacer { flex: 1; }
   .hint { color: #888780; font-size: 11.5px; white-space: nowrap; }
   .chk { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: #5F5E5A; cursor: pointer; user-select: none; white-space: nowrap; }
   .chk input { width: 14px; height: 14px; cursor: pointer; margin: 0; }
@@ -445,37 +479,65 @@
 <body>
 <div id="app">
   <header>
-    <div class="brand"><span data-i18n="app.title">TCU 调用关系图</span><small id="rootName"></small></div>
-    <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
-    <input id="search" type="search" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
-    <select id="depth" data-i18n-title="depth.down1">
-      <option value="1" data-i18n="depth.down1">向下 1 层</option>
-      <option value="2" data-i18n="depth.down2">向下 2 层</option>
-      <option value="3" selected data-i18n="depth.down3">向下 3 层</option>
-      <option value="5" data-i18n="depth.down5">向下 5 层</option>
-      <option value="9" data-i18n="depth.downAll">向下全部</option>
-    </select>
-    <select id="updepth">
-      <option value="0" selected data-i18n="depth.up0">向上 0 层</option>
-      <option value="1" data-i18n="depth.up1">向上 1 层</option>
-      <option value="2" data-i18n="depth.up2">向上 2 层</option>
-    </select>
-    <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
-    <button id="optimalLayout" class="primary" title="默认使用 ELK 自动排版；点击重新排版" data-i18n="btn.elk" data-i18n-title="btn.elkTitle">ELK 自动布局</button>
-    <button id="fit" data-i18n="btn.fit">适应</button>
-    <button id="undoBtn" title="撤回 (Ctrl+Z)" data-i18n-title="btn.undo" disabled>&#8630;</button>
-    <button id="redoBtn" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
-    <button id="resetLayout" data-i18n="btn.reset">重置布局</button>
-    <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
-    <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
-    <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
-    <div class="spacer"></div>
-    <span class="hint" data-i18n="hint.zoom">滚轮缩放 · 拖拽平移 · 双击函数下钻 · Ctrl+Z 回退视图 · 拖节点自动重布线 · 双击连线恢复自动</span>
-    <button id="exportSvg" data-i18n="btn.svg">导出 SVG</button>
-    <button id="exportPng" data-i18n="btn.png">PNG</button>
-    <button id="exportHtml" data-i18n="btn.html">HTML</button>
-    <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
-    <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
+    <div class="top-row">
+      <div class="brand"><span data-i18n="app.title">TCU 调用关系图 · ELK</span><small id="rootName"></small></div>
+      <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
+      <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
+      <div class="top-actions" aria-label="工程工具">
+        <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
+        <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
+        <details class="tool-menu" id="exportMenu">
+          <summary data-i18n="toolbar.export">导出</summary>
+          <div class="tool-popover">
+            <button id="exportSvg" data-i18n="btn.svg">导出 SVG</button>
+            <button id="exportPng" data-i18n="btn.png">PNG</button>
+            <button id="exportHtml" data-i18n="btn.html">HTML</button>
+            <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
+          </div>
+        </details>
+        <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
+        <details class="tool-menu" id="helpMenu">
+          <summary data-i18n="toolbar.help">操作说明</summary>
+          <div class="tool-popover help-popover">
+            <p><span>缩放画布</span><kbd>鼠标滚轮</kbd></p>
+            <p><span>平移画布</span><kbd>拖拽空白处</kbd></p>
+            <p><span>展开函数调用</span><kbd>双击函数</kbd></p>
+            <p><span>调整节点与连线</span><kbd>拖拽节点 / 线段</kbd></p>
+            <p><span>撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
+            <p><span>重做修改</span><kbd>Ctrl+Shift+Z</kbd></p>
+            <p><span>适应画布</span><kbd>F</kbd></p>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="view-row" aria-label="视图与编辑工具">
+      <div class="tool-group">
+        <span class="tool-label" data-i18n="toolbar.scope">范围</span>
+        <select id="depth" aria-label="向下展开层数">
+          <option value="1" data-i18n="depth.down1">向下 1 层</option>
+          <option value="2" data-i18n="depth.down2">向下 2 层</option>
+          <option value="3" selected data-i18n="depth.down3">向下 3 层</option>
+          <option value="5" data-i18n="depth.down5">向下 5 层</option>
+          <option value="9" data-i18n="depth.downAll">向下全部</option>
+        </select>
+        <select id="updepth" aria-label="向上展开层数">
+          <option value="0" selected data-i18n="depth.up0">向上 0 层</option>
+          <option value="1" data-i18n="depth.up1">向上 1 层</option>
+          <option value="2" data-i18n="depth.up2">向上 2 层</option>
+        </select>
+        <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
+      </div>
+      <div class="tool-group">
+        <button id="fit" title="调整缩放，让整张图显示在画布内（F）" data-i18n="btn.fit">适应画布</button>
+        <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n="btn.reset">重新排版</button>
+      </div>
+      <div class="tool-group edit-tools">
+        <span class="tool-label" data-i18n="toolbar.edit">编辑</span>
+        <button id="undoBtn" aria-label="撤销修改" title="撤回 (Ctrl+Z)" data-i18n-title="btn.undo" disabled>&#8630;</button>
+        <button id="redoBtn" aria-label="重做修改" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
+        <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
+      </div>
+    </div>
   </header>
 
   <aside id="left">

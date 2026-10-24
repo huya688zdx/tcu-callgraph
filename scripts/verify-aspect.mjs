@@ -1,6 +1,6 @@
 // 分组视图长宽比测量：全入口 × 深度，报告画布 aspect 分布（>1 为扁宽，<1 为瘦高）
 import { loadModel, subgraph } from '../src/core/index.js';
-import { layoutGrouped } from '../src/core/layout.js';
+import { layoutElk } from '../src/core/layout-elk.js';
 import path from 'node:path';
 
 const targets = process.argv.slice(2).length ? process.argv.slice(2) : ['samples/deep', 'samples/demo', 'samples/tcu', 'samples/large'];
@@ -13,7 +13,7 @@ for (const t of targets) {
     for (const down of [2, 3, 5]) {
       const g = subgraph(MODEL, fn.id, { up: 0, down, maxNodes: 600 });
       if (!g.nodes.length) continue;
-      const laid = layoutGrouped(
+      const laid = await layoutElk(
         g.nodes.map(({ bodyTokens, ...r }) => r),
         g.edges,
         { rootLabel: ROOT_LABEL }

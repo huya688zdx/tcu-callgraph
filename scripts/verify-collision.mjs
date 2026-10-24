@@ -2,7 +2,7 @@
 // 用法: node scripts/verify-collision.mjs [样本目录]
 import path from 'node:path';
 import { loadModel, subgraph } from '../src/core/index.js';
-import { layoutGrouped } from '../src/core/layout.js';
+import { layoutElk } from '../src/core/layout-elk.js';
 
 const TARGET = process.argv[2] || 'samples/deep';
 const MODEL = loadModel(TARGET);
@@ -16,9 +16,9 @@ const overlapBox = (a, b) => {
 };
 const isAncestor = (a, b) => b.id.startsWith(a.id + '/');
 
-function checkView(rootId, down) {
+async function checkView(rootId, down) {
   const g = subgraph(MODEL, rootId, { up: 0, down, maxNodes: 600 });
-  const laid = layoutGrouped(
+  const laid = await layoutElk(
     g.nodes.map(({ bodyTokens, ...r }) => r),
     g.edges,
     { rootLabel: ROOT_LABEL }
@@ -76,7 +76,7 @@ const maxBoxes = { files: 0, conts: 0 };
 
 for (const fn of MODEL.functions) {
   for (const down of [1, 2, 3, 4]) {
-    const r = checkView(fn.id, down);
+    const r = await checkView(fn.id, down);
     views++;
     maxBoxes.files = Math.max(maxBoxes.files, r.files);
     maxBoxes.conts = Math.max(maxBoxes.conts, r.conts);

@@ -69,8 +69,9 @@ test('解析缓存：往返后统计与子图完全一致', (t) => {
   }
 
   // 子图依赖 _index 的邻接表，重建后必须和原始模型等价
-  const a = subgraph(model, 'main.c::main', { up: 1, down: 2 });
-  const b = subgraph(cached, 'main.c::main', { up: 1, down: 2 });
+  const a = subgraph(model, 'main.c::SysTick_Handler', { up: 1, down: 2 });
+  const b = subgraph(cached, 'main.c::SysTick_Handler', { up: 1, down: 2 });
+  assert.ok(a.nodes.some((n) => n.kind === 'var'), '缓存往返必须覆盖真实的变量节点');
   assert.deepEqual(
     b.nodes.map((n) => n.id).sort(),
     a.nodes.map((n) => n.id).sort()

@@ -1,5 +1,5 @@
 /**
- * 视图书签：把「入口集合 + 上下深度 + 分组/固定模式 + 勾选的变量」存成名字。
+ * 视图书签：把「入口集合 + 上下深度 + 分组 + 勾选的变量」存成名字。
  *
  * TCU 这种图每次找入口要点好几下文件树，存成「换挡链路」「ADC 采集」这种书签，
  * 下次一键跳回。书签按工程隔离，换工程看不到别的工程的书签。
@@ -17,9 +17,9 @@ const saveBtn = document.getElementById('bookmarkSave');
 
 const meta = (b) => {
   const base = t('bookmark.meta').replace('{n}', b.roots.length).replace('{down}', b.down);
-  // 分组 / 平铺 / 固定 也要走 t()：写死中文的话，切到别的语言会中英混排
+  // 分组 / 平铺 也要走 t()：写死中文的话，切到别的语言会中英混排
   const mode = b.group ? t('bookmark.grouped') : t('bookmark.flat');
-  return `${base} · ${mode}${b.fixed ? ' · ' + t('bookmark.fixed') : ''}`;
+  return `${base} · ${mode}`;
 };
 
 /** 按钮上短暂显示一句提示，不弹 toast（这个界面没有 toast 系统） */
@@ -102,7 +102,6 @@ async function save() {
       up: state.up,
       down: state.down,
       group: state.group,
-      fixed: state.fixed,
       vars: [...state.vars],
     });
   } catch (err) {

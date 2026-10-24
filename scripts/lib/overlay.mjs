@@ -1,14 +1,4 @@
-/**
- * 布局存档（out/overlay.json 里的 layout 段）的快照与还原
- *
- * E2E 里 Ctrl+Z、拖节点这些动作会让前端把当前视图的坐标写进存档
- * （web/lib/history.js 的 applySnapshot → savePositionsOnly）。
- * 跑完必须还原，否则用户的存档里会多出一批「自动布局坐标」条目，
- * 换个深度再看就会把节点钉在旧布局上。
- *
- * 还原只逐条写回自己动过的那几个节点，不使用 clear:true
- * （那会把该入口下用户手工拖的其它布局一起清掉）。
- */
+/** 旧 JSON 存档的快照与还原工具；当前界面不再持久化固定坐标。 */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';

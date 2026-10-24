@@ -8,7 +8,9 @@ const get = (url) => fetch(url).then((r) => r.json());
 const post = (url, body) =>
   fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json',
+      ...((body.projectId ?? state.view?.projectId) == null ? {} :
+        { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }) },
     body: JSON.stringify(body),
   }).then((r) => r.json());
 
@@ -17,7 +19,7 @@ const post = (url, body) =>
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels']);
 const guardWrite = (name) => {
   if (state.at > 0 && WRITE_OPS.has(name)) {
     document.dispatchEvent(new CustomEvent('cg:review-blocked'));
@@ -28,14 +30,12 @@ const guardWrite = (name) => {
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
-  view({ root, roots, up = 0, down = 3, group = true, optimal = false, vars, hiddenVars, fixed = false, at = 0 }) {
+  view({ root, roots, up = 0, down = 3, group = true, vars, hiddenVars, at = 0 }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
     // 支持多入口：勾选多个函数时一起入图
     const list = (roots && roots.length ? roots : root ? [root] : []).filter(Boolean);
     if (list.length === 1) q.set('root', list[0]);
     else if (list.length > 1) q.set('roots', list.join(','));
-    if (optimal) q.set('optimal', '1');
-    if (fixed) q.set('fixed', '1');
     if (vars && vars.length) q.set('vars', vars.join(','));
     if (hiddenVars && hiddenVars.length) q.set('novars', hiddenVars.join(','));
     if (at > 0) q.set('at', String(at));
@@ -88,9 +88,9 @@ export const api = {
   reportPage: (body) => post('/api/page', body).catch(() => {}),
   /** 结合点编号模式：fixed=固定（新增挑空缺号）/ renumber=重排（删除后自动紧凑） */
   labelConfig: () => get('/api/labels/config'),
-  setLabelConfig: (mode) => post('/api/labels/config', { mode }),
+  setLabelConfig: (mode) => guardWrite('labels') || post('/api/labels/config', { mode }),
   /** 结合点重排：把算好的新编号整体写回 */
-  renumberConns: (items) => post('/api/labels/renumber', { items }),
+  renumberConns: (items) => guardWrite('labels') || post('/api/labels/renumber', { items }),
   /** 自动检测 task/コール順 候选（服务端扫源码，返回建议清单，应用走 overlay） */
   detectTasks: () => get('/api/detect-tasks'),
 };

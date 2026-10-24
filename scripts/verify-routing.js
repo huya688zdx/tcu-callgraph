@@ -6,7 +6,7 @@
  *  4. 大样本性能测试
  */
 import { loadModel, stats, subgraph } from '../src/core/index.js';
-import { layout, layoutGrouped } from '../src/core/layout.js';
+import { layoutElk } from '../src/core/layout-elk.js';
 import { routeEdges } from '../src/core/routing.js';
 
 const EPS = 0.51;
@@ -80,15 +80,15 @@ for (const fn of model.functions) {
   const g = subgraph(model, fn.id, { up: 1, down: 3 });
   if (g.edges.length < 3) continue;
   const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
-  allOk = validate(layout(clean, g.edges), `flat ${fn.name}`) && allOk;
-  allOk = validate(layoutGrouped(clean, g.edges), `group ${fn.name}`) && allOk;
+  allOk = validate(await layoutElk(clean, g.edges, { group: false }), `flat ${fn.name}`) && allOk;
+  allOk = validate(await layoutElk(clean, g.edges), `group ${fn.name}`) && allOk;
 }
 
 // ---- 2. 自定义边重锚定 + 线段拖拽正交性 ----
 {
   const g = subgraph(model, model.functions[0].id, { up: 1, down: 3 });
   const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
-  const laid = layout(clean, g.edges);
+  const laid = await layoutElk(clean, g.edges, { group: false });
   const e = laid.edges[0];
   e.custom = true;
   // 模拟把节点拖到很远处，再重路由（自定义边只重锚定）
@@ -120,7 +120,7 @@ for (const fn of model.functions) {
   console.log(`子图: 节点 ${g.nodes.length} / 边 ${g.edges.length}`);
   const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
   let t0 = Date.now();
-  const laid = layout(clean, g.edges);
+  const laid = await layoutElk(clean, g.edges, { group: false });
   const t1 = Date.now();
   console.log(`分层+路由耗时: ${t1 - t0} ms`);
   t0 = Date.now();
@@ -128,7 +128,7 @@ for (const fn of model.functions) {
   console.log(`全量重路由耗时: ${Date.now() - t0} ms`);
   allOk = validate(laid, 'large-flat') && allOk;
   t0 = Date.now();
-  const laid2 = layoutGrouped(clean, g.edges);
+  const laid2 = await layoutElk(clean, g.edges);
   console.log(`分组布局+路由耗时: ${Date.now() - t0} ms`);
   allOk = validate(laid2, 'large-group') && allOk;
 }

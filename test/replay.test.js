@@ -114,7 +114,6 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
     up: 1,
     down: 2,
     group: false,
-    fixed: false,
     vars: ['g_ops_4at'],
   });
   assert.equal(saved.ok, true);
@@ -133,7 +132,6 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
     up: 1,
     down: 2,
     group: false,
-    fixed: false,
     vars: ['g_ops_4at'],
   });
 });

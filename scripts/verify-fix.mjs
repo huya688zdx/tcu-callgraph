@@ -6,7 +6,7 @@
 //
 // 检查项：
 //   1. 在某视图拖动节点并保存后，切换到其它入口视图，节点仍被文件框包住
-//   2. 回到原视图，拖动位置被保留
+//   2. 回到原视图，恢复 ELK 自动位置
 //   3. 同一入口调整调用深度，节点仍被文件框包住
 //
 // 清理策略：改动前记下该节点的旧存档坐标，结束时逐个写回；
@@ -120,11 +120,11 @@ try {
   console.log(`\n切换视图检查 ${checked} 个，越界视图 ${bad} 个`);
   for (const s of samples) console.log(`  ❌ ${s.root}: ${s.count}/${s.total} 例:${s.ex}`);
 
-  // ---- 场景3：回到视图A，拖动位置应保留 ----
+  // ---- 场景3：回到视图A，旧坐标不覆盖 ELK 位置 ----
   const va2 = await j(`/api/view?group=1&down=3&root=${encodeURIComponent(A)}`);
   const back = va2.nodes.find((n) => n.id === dragged.id);
-  const kept = back && Math.abs(back.x - newPos.x) < 1.5 && Math.abs(back.y - newPos.y) < 1.5;
-  console.log(`\n回到视图A，拖动位置保留: ${kept ? '✓' : '✗'} (${back && back.x},${back && back.y})`);
+  const kept = back && Math.abs(back.x - dragged.x) < 1.5 && Math.abs(back.y - dragged.y) < 1.5;
+  console.log(`\n回到视图A，ELK 位置恢复: ${kept ? '✓' : '✗'} (${back && back.x},${back && back.y})`);
 
   // ---- 场景4：同一 root 改变深度，不应越界 ----
   let deepBad = 0;

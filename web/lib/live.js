@@ -4,7 +4,7 @@
  * 1. 监听 SSE（/api/stream）：AI 通过 MCP 写入（标注 / 删除 / 布局 / 切工程）后
  *    服务端广播 change 事件，页面立即刷新画面——用户不用手动刷新。
  *    只响应 actor=ai：用户自己的写操作界面已就地处理，若也跟着刷新，
- *    固定布局的坐标落盘会再次触发广播，两个页面之间形成无限刷新循环。
+ *    重复刷新会打断用户正在进行的拖拽。
  * 2. 上报页面视图状态（POST /api/page）：入口、深度、选中项。
  *    AI 用 cg_page 工具读取，对齐「用户正在看什么」再动手改。
  *
@@ -106,7 +106,6 @@ function pageSignature() {
     state.up,
     state.down,
     state.group,
-    state.fixed,
     state.at,
     [...state.vars].sort(),
     state.selected,
@@ -124,7 +123,6 @@ setInterval(() => {
     up: state.up,
     down: state.down,
     group: state.group,
-    fixed: state.fixed,
     vars: [...state.vars],
     selected: state.selected,
     selectedEdge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,

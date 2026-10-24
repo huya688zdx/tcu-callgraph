@@ -4,9 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
-import { textWidth } from './core/layout.js';
 import { layoutElk } from './core/layout-elk.js';
-import { routeEdges, collectSegments, pathBlockedByNodes } from './core/routing.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
@@ -304,7 +302,7 @@ const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
 /**
  * 书签事件的载荷：把一份书签摊平成「能完整重建它」的最小集合。
  * 时间轴的 before/after 都用它——漏字段的话事件就是有损的，
- * 以后想「恢复到删掉书签之前」会还原出一个缺 fixed / vars 的残本。
+ * 以后想「恢复到删掉书签之前」会还原出一个缺深度 / vars 的残本。
  */
 const bookmarkEventPayload = (b) => ({
   name: b.name,
@@ -312,7 +310,6 @@ const bookmarkEventPayload = (b) => ({
   up: b.up,
   down: b.down,
   group: !!b.group,
-  fixed: !!b.fixed,
   vars: b.vars || [],
 });
 
@@ -336,6 +333,11 @@ function guardWrite(req, res) {
     .toLowerCase();
   if (type !== 'application/json') {
     json(res, { ok: false, error: 'unsupported media type' }, 415);
+    return false;
+  }
+  if (switching || (req.headers['x-callgraph-project'] !== undefined &&
+      Number(req.headers['x-callgraph-project']) !== PROJECT.id)) {
+    json(res, { ok: false, error: '工程正在切换或请求所属工程已改变，请刷新后重试' }, 409);
     return false;
   }
   return true;
@@ -373,6 +375,7 @@ function readJson(req, res, limit = 4 * 1024 * 1024) {
       chunks.push(c);
     });
     req.on('error', () => fail(400, '读取请求体失败'));
+    req.on('aborted', () => fail(400, '请求已中断'));
     req.on('end', () => {
       if (done) return;
       let parsed;
@@ -382,6 +385,9 @@ function readJson(req, res, limit = 4 * 1024 * 1024) {
         return fail(400, 'body 不是合法 JSON');
       }
       if (!isPlainObject(parsed)) return fail(400, 'body 必须是 JSON 对象');
+      if (req.projectId !== PROJECT.id || (switching && !req.switchRequest)) {
+        return fail(409, '工程已切换，请刷新后重试');
+      }
       done = true;
       resolve(parsed);
     });
@@ -413,363 +419,17 @@ function sendFile(res, file, headers) {
  */
 const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
 
-/** 文件框兜底：节点被手动坐标移出框时扩展框，保证节点始终被框包住（只扩不缩） */
-function fitGroups(groups, nodes) {
-  if (!groups || !groups.length) return;
-  const byGroup = new Map();
-  for (const n of nodes) {
-    if (!n.group) continue;
-    if (!byGroup.has(n.group)) byGroup.set(n.group, []);
-    byGroup.get(n.group).push(n);
-  }
-  for (const g of groups) {
-    const list = byGroup.get(g.id);
-    if (!list || !list.length) continue;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const n of list) {
-      if (n.x < minX) minX = n.x;
-      if (n.y < minY) minY = n.y;
-      if (n.x + n.w > maxX) maxX = n.x + n.w;
-      if (n.y + n.h > maxY) maxY = n.y + n.h;
-    }
-    const nx = Math.min(g.x, minX - 14);
-    const ny = Math.min(g.y, minY - 34);
-    const nr = Math.max(g.x + g.w, maxX + 14);
-    const nb = Math.max(g.y + g.h, maxY + 14);
-    g.x = nx;
-    g.y = ny;
-    g.w = nr - nx;
-    g.h = nb - ny;
-  }
-}
-
-/** 固定布局用：按节点实际位置精确重算文件框（可扩可缩） */
-function refitGroupBoxes(groups, nodes) {
-  const byGroup = new Map();
-  for (const n of nodes) {
-    if (!n.group) continue;
-    if (!byGroup.has(n.group)) byGroup.set(n.group, []);
-    byGroup.get(n.group).push(n);
-  }
-  const bounds = (list) => {
-    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-    for (const n of list) {
-      if (n.x < x0) x0 = n.x;
-      if (n.y < y0) y0 = n.y;
-      if (n.x + n.w > x1) x1 = n.x + n.w;
-      if (n.y + n.h > y1) y1 = n.y + n.h;
-    }
-    return { x0, y0, x1, y1 };
-  };
-
-  for (const g of groups || []) {
-    const list = byGroup.get(g.id);
-    if (!list || !list.length) continue;
-    const { x0, y0, x1, y1 } = bounds(list);
-    g.x = x0 - 14;
-    g.y = y0 - 30;
-    g.w = x1 - x0 + 28;
-    g.h = y1 - y0 + 44;
-  }
-  return bounds;
-}
-
-/**
- * 固定布局用：文件框分开之后，目录容器跟着包住最终矩形（可扩可缩）。
- * 根容器保持 layoutGrouped 的外扩规格（RING），子目录沿用 14/30 + 深度外扩
- */
-function refitDirContainers(containers, groups, bounds) {
-  if (!containers || !containers.length) return;
-  const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
-  // 深的先算：父容器用子容器的最终矩形求并集
-  for (const c of containers.slice().sort((a, b) => b.depth - a.depth)) {
-    const prefix = c.id ? c.id + '/' : '';
-    const kids = [...(groups || []), ...containers].filter(
-      (b) => b !== c && String(b.id).startsWith(prefix) && b.w > 0 && b.h > 0
-    );
-    if (!kids.length) continue;
-    const { x0, y0, x1, y1 } = bounds(kids);
-    if (c.root) {
-      // 根容器：与 layoutGrouped 的 RING 保持一致，标题行更高
-      c.x = x0 - 22;
-      c.y = y0 - 38;
-      c.w = Math.max(x1 - x0 + 44, textWidth(c.label) + 24);
-      c.h = y1 - y0 + 64;
-      continue;
-    }
-    const extra = (maxDepth - c.depth) * 10;
-    c.x = x0 - 14 - extra;
-    c.y = y0 - 30 - extra;
-    c.w = Math.max(x1 - x0 + 28 + extra * 2, textWidth(c.label) + 24);
-    c.h = y1 - y0 + 44 + extra * 2;
-  }
-}
-
-/** 在所属文件框里找一个空位放新节点；框里放不下就贴着框底往下排（框随后被撑大） */
-function relocateNewNode(n, laid) {
-  const g = (laid.groups || []).find((x) => x.id === n.group);
-  const clash = (x, y) =>
-    laid.nodes.some(
-      (m) => m !== n && x < m.x + m.w + 6 && m.x < x + n.w + 6 && y < m.y + m.h + 6 && m.y < y + n.h + 6
-    );
-  const baseX = g ? g.x + 14 : n.x;
-  const baseY = g ? g.y + 34 : n.y;
-  const stepX = n.w + 16;
-  const stepY = n.h + 16;
-  const cols = g ? Math.max(1, Math.floor((g.w - 28) / stepX)) : 1;
-  for (let r = 0; r < 40; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x = baseX + c * stepX;
-      const y = baseY + r * stepY;
-      if (!clash(x, y)) {
-        n.x = x;
-        n.y = y;
-        return true;
-      }
-    }
-  }
-  n.x = baseX;
-  n.y = g ? g.y + g.h + 10 : n.y + n.h + 20;
-  return false;
-}
-
-/**
- * 固定布局下把互相压住的兄弟文件框整体推开（连带其中的节点与折线）。
- * 推开的间距必须容下两框之间所有目录容器的环（标题栏 + 逐级外扩），
- * 否则文件框分开了，外层目录容器贴合后还是会压在一起。
- * 沿重叠较小的轴推：竖向按「上方链的底环 + 下方链的顶环」，
- * 横向按「两侧链的侧环」；环只累计到最近公共祖先为止（再往上就包住双方了）。
- */
-function pushApartGroups(groups, containers, nodes, edges) {
-  if (!groups || groups.length < 2) return;
-  const maxDepth = (containers || []).reduce((m, c) => Math.max(m, c.depth), 1);
-  const ring = new Map(); // id -> { top, bottom, side }
-  for (const c of containers || []) {
-    if (c.root) {
-      ring.set(c.id, { top: 38, bottom: 26, side: 22 });
-      continue;
-    }
-    const extra = (maxDepth - c.depth) * 10;
-    ring.set(c.id, { top: 30 + extra, bottom: 14 + extra, side: 14 + extra });
-  }
-  const chainOf = new Map(); // 文件框 id -> 祖先容器链（浅→深，不含根）
-  for (const g of groups) {
-    chainOf.set(
-      g.id,
-      (containers || [])
-        .filter((c) => !c.root && g.id.startsWith(c.id + '/'))
-        .sort((a, b) => a.depth - b.depth)
-    );
-  }
-  const marginBetween = (upper, lower, axis) => {
-    const cu = chainOf.get(upper.id) || [];
-    const cl = chainOf.get(lower.id) || [];
-    let i = 0;
-    while (i < cu.length && i < cl.length && cu[i] === cl[i]) i++;
-    let m = 0;
-    for (let k = i; k < cu.length; k++) m += ring.get(cu[k].id)?.[axis === 'y' ? 'bottom' : 'side'] || 0;
-    for (let k = i; k < cl.length; k++) m += ring.get(cl[k].id)?.[axis === 'y' ? 'top' : 'side'] || 0;
-    return m;
-  };
-  const shift = (g, dx, dy) => {
-    g.x += dx;
-    g.y += dy;
-    const ids = new Set();
-    for (const n of nodes) {
-      if (n.group !== g.id) continue;
-      n.x += dx;
-      n.y += dy;
-      ids.add(n.id);
-    }
-    for (const e of edges) {
-      if (!ids.has(e.from) && !ids.has(e.to)) continue;
-      if (e.points) for (const p of e.points) { p[0] += dx; p[1] += dy; }
-    }
-  };
-  for (let iter = 0; iter < 24; iter++) {
-    let moved = false;
-    for (let i = 0; i < groups.length; i++) {
-      for (let j = i + 1; j < groups.length; j++) {
-        const a = groups[i];
-        const b = groups[j];
-        const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-        const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-        if (ox <= 1 || oy <= 1) continue;
-        // 彻底分离所需的位移（不是相交量）：包含型重叠时按相交量推永远推不出去。
-        // 竖向 = 下框顶推到上框底之下再留出容器环；横向同理
-        const lower = a.y >= b.y ? a : b;
-        const upper = lower === a ? b : a;
-        const dy = upper.y + upper.h - lower.y + marginBetween(upper, lower, 'y') + 8;
-        const right = a.x >= b.x ? a : b;
-        const left = right === a ? b : a;
-        const dx = left.x + left.w - right.x + marginBetween(left, right, 'x') + 8;
-        if (dy <= dx) shift(lower, 0, dy);
-        else shift(right, dx, 0);
-        moved = true;
-      }
-    }
-    if (!moved) break;
-  }
-}
-
-/**
- * 固定布局兜底第二层：容器级分离。
- * 文件框两两分开仍不够 —— 目录容器的包围盒会伸进兄弟文件框之间的
- * 「L 形空隙」（框与框不交，但容器的包围盒横跨多个框把别人罩进去）。
- * 这里把参与占位的「范围框」（目录容器 + 顶层文件框）两两分离，
- * 位移时整棵子树（容器、文件框、节点、折线）一起平移，嵌套关系不被破坏。
- * 容器矩形本身已含各级环，因此不需要再算环间距。
- */
-function pushApartContainers(containers, groups, nodes, edges) {
-  if (!containers || !containers.length || !groups) return false;
-  const dirs = containers.filter((c) => !c.root && c.w > 0 && c.h > 0);
-  const inDir = (id) => dirs.some((c) => id.startsWith(c.id + '/'));
-  // 顶层文件框 = 不在任何目录容器里的文件框（它自己就是占位单位）
-  const extents = [
-    ...dirs.map((c) => ({ box: c, isGroup: false })),
-    ...groups.filter((g) => g.w > 0 && g.h > 0 && !inDir(g.id)).map((g) => ({ box: g, isGroup: true })),
-  ];
-  if (extents.length < 2) return false;
-
-  const shiftSubtree = (item, dx, dy) => {
-    const { box, isGroup } = item;
-    box.x += dx;
-    box.y += dy;
-    const gIds = new Set();
-    if (isGroup) {
-      gIds.add(box.id);
-    } else {
-      for (const g of groups) {
-        if (!g.id.startsWith(box.id + '/')) continue;
-        g.x += dx;
-        g.y += dy;
-        gIds.add(g.id);
-      }
-      for (const c of containers) {
-        if (c !== box && !c.root && c.id.startsWith(box.id + '/')) {
-          c.x += dx;
-          c.y += dy;
-        }
-      }
-    }
-    const ids = new Set();
-    for (const n of nodes) {
-      if (!gIds.has(n.group)) continue;
-      n.x += dx;
-      n.y += dy;
-      ids.add(n.id);
-    }
-    for (const e of edges) {
-      if (!ids.has(e.from) && !ids.has(e.to)) continue;
-      if (e.points) for (const p of e.points) { p[0] += dx; p[1] += dy; }
-    }
-  };
-
-  let moved = false;
-  for (let round = 0; round < 8; round++) {
-    let roundMoved = false;
-    for (let i = 0; i < extents.length; i++) {
-      for (let j = i + 1; j < extents.length; j++) {
-        const A = extents[i];
-        const B = extents[j];
-        // 祖先-后代关系的容器（嵌套）不分离
-        if (!A.isGroup && !B.isGroup) {
-          if (A.box.id.startsWith(B.box.id + '/') || B.box.id.startsWith(A.box.id + '/')) continue;
-        }
-        const a = A.box;
-        const b = B.box;
-        const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
-        const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
-        if (ox <= 1 || oy <= 1) continue;
-        // 与文件框级同理：按彻底分离所需位移算，取较小的轴
-        const lower = a.y >= b.y ? A : B;
-        const upper = lower === A ? B : A;
-        const dy = upper.box.y + upper.box.h - lower.box.y + 8;
-        const right = a.x >= b.x ? A : B;
-        const left = right === A ? B : A;
-        const dx = left.box.x + left.box.w - right.box.x + 8;
-        if (dy <= dx) shiftSubtree(lower, 0, dy);
-        else shiftSubtree(right, dx, 0);
-        roundMoved = true;
-      }
-    }
-    moved = moved || roundMoved;
-    if (!roundMoved) break;
-  }
-  return moved;
-}
-
-/**
- * 目录容器 / 根容器兜底：文件框被 fitGroups 撑大后，上层框要跟着包住。
- * 只扩不缩 —— 嵌套几何已经在 layoutGrouped 里算好了（含每级外扩的一圈），
- * 这里若重新算一套坐标，手动布局存档的坐标系就会整体偏移。
- */
-function fitContainers(containers, fileGroups) {
-  if (!containers || !containers.length || !fileGroups || !fileGroups.length) return;
-
-  const grow = (c, x0, y0, x1, y1, left, top, right, bottom) => {
-    const nx = Math.min(c.x, x0 - left);
-    const ny = Math.min(c.y, y0 - top);
-    const nr = Math.max(c.x + c.w, x1 + right);
-    const nb = Math.max(c.y + c.h, y1 + bottom);
-    c.x = nx;
-    c.y = ny;
-    c.w = nr - nx;
-    c.h = nb - ny;
-  };
-
-  // 深的先算：子容器长大后再撑父容器
-  const dirs = containers.filter((c) => !c.root).sort((a, b) => b.depth - a.depth);
-  for (const c of dirs) {
-    const boxes = [
-      ...fileGroups.filter((g) => String(g.id).startsWith(c.id + '/')),
-      ...dirs.filter((k) => k !== c && String(k.id).startsWith(c.id + '/')),
-    ];
-    if (!boxes.length) continue;
-    let x0 = Infinity;
-    let y0 = Infinity;
-    let x1 = -Infinity;
-    let y1 = -Infinity;
-    for (const b of boxes) {
-      if (b.x < x0) x0 = b.x;
-      if (b.y < y0) y0 = b.y;
-      if (b.x + b.w > x1) x1 = b.x + b.w;
-      if (b.y + b.h > y1) y1 = b.y + b.h;
-    }
-    grow(c, x0, y0, x1, y1, 18, 34, 18, 18);
-  }
-
-  const rootC = containers.find((c) => c.root);
-  if (!rootC) return;
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  for (const b of [...fileGroups, ...dirs]) {
-    if (b.x < x0) x0 = b.x;
-    if (b.y < y0) y0 = b.y;
-    if (b.x + b.w > x1) x1 = b.x + b.w;
-    if (b.y + b.h > y1) y1 = b.y + b.h;
-  }
-  if (!Number.isFinite(x0)) return;
-  grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
-}
-
 async function buildView(
   rootIds,
   up,
   down,
-  group = false,
+  group = true,
   dfNode = null,
-  optimal = false,
   varSel = {},
-  fixed = false,
   // 时间轴回看时传历史 overlay：视图构建逻辑完全复用，只是输入换了一份
   viewOverlay = overlay
 ) {
+  const projectId = PROJECT.id;
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
   const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
@@ -898,172 +558,17 @@ async function buildView(
     }
   }
 
-  // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
-  viewEdges = viewEdges.map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  // 只恢复手工关系，旧固定坐标和折线不再参与排版。
   const mode = group ? 'group' : 'flat';
-  // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
-  const slot = optimal && !fixed ? {} : viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
-
-  // 手动拖拽的节点位置优先。
-  // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
-  // 出框的坐标只可能是跨视图/跨深度的陈旧存档，直接丢弃并回落自动布局
-  const savedNodes = slot.nodes || {};
-
-  // 自动排版和初始路径统一由 ELK 生成；下面只恢复用户实际保存的调整。
+  const slot = viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
+  const byId = new Map(clean.map((n) => [n.id, n]));
+  for (const m of slot.manual || []) {
+    if (!byId.has(m.from) || !byId.has(m.to) || viewOverlay.deleted.edges[edgeKeyOf({ ...m, line: 0 })]) continue;
+    viewEdges.push({ from: m.from, to: m.to, callee: byId.get(m.to).name,
+      kind: 'manual', line: 0, via: '手动', manual: true });
+  }
+  viewEdges = viewEdges.map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL });
-  const autoPositions = new Map(laid.nodes.map((n) => [n.id, { x: n.x, y: n.y }]));
-  const groupBox = new Map((laid.groups || []).map((bg) => [bg.id, bg]));
-  const savedApplied = [];
-  for (const n of laid.nodes) {
-    const p = savedNodes[n.id];
-    if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
-    const gb = groupBox.get(n.group);
-    if (gb && !fixed) {
-      const tol = 2;
-      const inside =
-        p.x >= gb.x - tol &&
-        p.y >= gb.y - tol &&
-        p.x + n.w <= gb.x + gb.w + tol &&
-        p.y + n.h <= gb.y + gb.h + tol;
-      if (!inside) continue;
-    }
-    n._autoX = n.x;
-    n._autoY = n.y;
-    n.x = p.x;
-    n.y = p.y;
-    savedApplied.push(n);
-  }
-
-  // 固定布局：已有节点钉在原位，新加入的节点（变量/函数）自己找空位。
-  // 框的分离放到下面贴合之后统一做——这里文件框还是自动布局的旧矩形，
-  // 钉到别处的节点不在旧框里，先推开推了个寂寞，贴合后又会压回去
-  if (fixed) {
-    const savedSet = new Set(savedApplied.map((n) => n.id));
-    for (const n of laid.nodes) {
-      if (savedSet.has(n.id)) continue;
-      const clash = laid.nodes.some(
-        (m) => m !== n && n.x < m.x + m.w + 6 && m.x < n.x + n.w + 6 && n.y < m.y + m.h + 6 && m.y < n.y + n.h + 6
-      );
-      if (clash) relocateNewNode(n, laid);
-    }
-  }
-
-  // 存档坐标防叠压：旧存档 / 跨深度的坐标可能压在其他节点上，
-  // 出现矩形相交时该节点回退自动布局位置（自动布局本身保证互不重叠）
-  for (const n of savedApplied) {
-    let clash = false;
-    for (const m of laid.nodes) {
-      if (m === n) continue;
-      if (
-        n.x < m.x + m.w - 4 &&
-        m.x < n.x + n.w - 4 &&
-        n.y < m.y + m.h - 4 &&
-        m.y < n.y + n.h - 4
-      ) {
-        clash = true;
-        break;
-      }
-    }
-    if (clash) {
-      n.x = n._autoX;
-      n.y = n._autoY;
-    }
-  }
-  for (const n of laid.nodes) {
-    delete n._autoX;
-    delete n._autoY;
-  }
-
-  // 手动画的连线（不预置折线，统一交给路由器）
-  const byId = new Map(laid.nodes.map((n) => [n.id, n]));
-  const manual = (slot.manual || []).filter((m) => byId.has(m.from) && byId.has(m.to));
-  for (const m of manual) {
-    const b = byId.get(m.to);
-    laid.edges.push({
-      from: m.from,
-      to: m.to,
-      callee: b.name,
-      kind: 'manual',
-      line: 0,
-      via: '手动',
-      manual: true,
-      change: viewOverlay.edges?.[edgeKeyOf({ ...m, line: 0 })]?.change || 'existing',
-    });
-  }
-
-  // 用户调整过的连线：恢复手动折线 / 端口方向覆盖
-  const savedEdges = slot.edges || {};
-  for (const e of laid.edges) {
-    const k = `${e.from}->${e.to}:${e.line}`;
-    const saved = savedEdges[k];
-    if (!saved) continue;
-    if (saved.fromSide) e.fromSide = saved.fromSide;
-    if (saved.toSide) e.toSide = saved.toSide;
-    if (saved.custom && Array.isArray(saved.points) && saved.points.length >= 2) {
-      e.custom = true;
-      e.points = saved.points.map((p) => p.slice());
-    }
-  }
-
-  // 兜底：坐标若与当前布局不匹配（旧存档 / 手动拖拽），把文件框扩到包住节点，
-  // 避免函数节点看起来脱离了所属文件的层级
-  if (laid.groups && savedApplied.length) {
-    if (fixed) {
-      // 固定布局的层级分离，顺序不能换：
-      //   1. 文件框按节点实际位置「精确贴合」（可扩可缩）
-      //   2. 文件框级分离（间距含祖先容器的环）
-      //   3. 容器贴合 → 容器级分离，迭代到稳定（子树整体平移）
-      // 陈旧坐标把节点钉进别的层级时，靠 2/3 两层把它彻底分开
-      const bounds = refitGroupBoxes(laid.groups, laid.nodes);
-      pushApartGroups(laid.groups, laid.containers, laid.nodes, laid.edges);
-      let settled = false;
-      for (let i = 0; i < 10; i++) {
-        refitDirContainers(laid.containers, laid.groups, bounds);
-        if (!pushApartContainers(laid.containers, laid.groups, laid.nodes, laid.edges)) {
-          settled = true;
-          break;
-        }
-      }
-      if (!settled) refitDirContainers(laid.containers, laid.groups, bounds);
-    } else {
-      fitGroups(laid.groups, laid.nodes);
-      fitContainers(laid.containers, laid.groups);
-    }
-  }
-
-  // 只处理移动、手工调整或被新位置挡住的连线，其余保留 ELK 的全局结果。
-  const movedNodes = laid.nodes.filter((n) => {
-    const p = autoPositions.get(n.id);
-    return Math.abs(n.x - p.x) > 0.01 || Math.abs(n.y - p.y) > 0.01;
-  });
-  const movedIds = new Set(movedNodes.map((n) => n.id));
-  const affected = laid.edges.filter((e) => e.manual || savedEdges[edgeKeyOf(e)] ||
-    movedIds.has(e.from) || movedIds.has(e.to) ||
-    pathBlockedByNodes(e.points, movedNodes, new Set([e.from, e.to])));
-  if (affected.length) {
-    const unaffected = laid.edges.filter((e) => !affected.includes(e));
-    routeEdges(laid.nodes, affected, { existing: collectSegments(unaffected), preservePaths: true });
-  }
-
-  // 侧边车道可能超出画布：扩一下尺寸
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const n of laid.nodes) {
-    if (n.x + n.w > maxX) maxX = n.x + n.w;
-    if (n.y + n.h > maxY) maxY = n.y + n.h;
-  }
-  for (const e of laid.edges) {
-    for (const p of e.points || []) {
-      if (p[0] > maxX) maxX = p[0];
-      if (p[1] > maxY) maxY = p[1];
-    }
-  }
-  for (const box of [...(laid.groups || []), ...(laid.containers || [])]) {
-    if (box.x + box.w > maxX) maxX = box.x + box.w;
-    if (box.y + box.h > maxY) maxY = box.y + box.h;
-  }
-  laid.width = Math.max(laid.width, maxX + 40);
-  laid.height = Math.max(laid.height, maxY + 40);
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -1085,7 +590,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, layoutEngine: 'elk' };
+  return { ...laid, root: g.root, roots, layoutEngine: 'elk', projectId };
 }
 
 // ---- MCP（AI 访问）----
@@ -1123,11 +628,14 @@ function readRawBody(req, limit = 4 * 1024 * 1024) {
 
 // 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
 const server = http.createServer(async (req, res) => {
+  // 请求体可能稍后才读完，工程身份必须在进入请求时固定。
+  req.projectId = PROJECT.id;
   // 畸形请求目标（如 "//["）会让 new URL 抛异常，必须挡在 try 内，
   // 否则异常冒泡成未捕获异常，整个进程退出
   let u;
   try {
     u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    req.switchRequest = u.pathname === '/api/switch';
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
@@ -1151,7 +659,10 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         return json(res, { jsonrpc: '2.0', id: null, error: { code: -32700, message: String(err.message || err) } }, 400);
       }
-      const r = await mcp.handlePost(raw);
+      if (req.projectId !== PROJECT.id || switching) {
+        return json(res, { ok: false, error: '工程已切换，请重新调用' }, 409);
+      }
+      const r = await mcp.handlePost(raw, req.projectId);
       if (r.body === null) {
         res.writeHead(202);
         return res.end();
@@ -1223,7 +734,6 @@ const server = http.createServer(async (req, res) => {
               up: Math.max(0, Number(p.up) || 0),
               down: Math.max(0, Number(p.down) || 0),
               group: !!p.group,
-              fixed: !!p.fixed,
               vars: strArr(p.vars),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
@@ -1267,8 +777,8 @@ const server = http.createServer(async (req, res) => {
           const up = Math.max(0, Number(p.up ?? 0) || 0);
           const down = Math.max(0, Number(p.down ?? 3) || 3);
           const group = p.group !== false;
-          // 界面默认 optimal=1：导出与屏幕同款最优路径，导出的图不比看到的差
-          const view = await buildView([rootId], up, down, group, null, true, {}, false, overlay);
+          // 导出与屏幕统一使用 ELK 排版。
+          const view = await buildView([rootId], up, down, group, null, {}, overlay);
           if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
           const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
           let name = typeof p.out === 'string' ? p.out.trim() : '';
@@ -1350,36 +860,29 @@ const server = http.createServer(async (req, res) => {
       // openTarget 里有 await（重建数据流索引），期间第二个切换请求会插进来
       // 交错改写 MODEL / PROJECT / overlay——A 工程的标注就可能写进 B 的 project_id。
       // 这里用一把简单的锁：切换期间再来的请求直接 409，让前端等上一次完成。
-      if (switching) return json(res, { ok: false, error: '正在切换工程，请稍候' }, 409);
-      readJson(req, res)
-        .then(async (p) => {
-          let targetPath = typeof p.path === 'string' ? p.path : '';
-          if (!targetPath && p.id !== undefined) {
-            const pr = store.getProject(Number(p.id));
-            if (!pr) return bad(res, '工程不存在');
-            targetPath = pr.path;
-          }
-          if (!targetPath) return bad(res, 'id 或 path 必须给一个');
-          switching = true;
-          try {
-            const { project, stats: st } = await openTarget(targetPath);
-            // 打开着的页面整体重载：跨工程没有任何状态可保留
-            broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name });
-            json(res, {
-              ok: true,
-              project: { id: project.id, name: project.name, path: root },
-              stats: st,
-            });
-          } catch (err) {
-            json(res, { ok: false, error: String(err.message || err) }, 400);
-          } finally {
-            switching = false;
-          }
-        })
-        .catch((err) => {
-          switching = false;
-          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+      switching = true;
+      try {
+        const p = await readJson(req, res);
+        let targetPath = typeof p.path === 'string' ? p.path : '';
+        if (!targetPath && p.id !== undefined) {
+          const pr = store.getProject(Number(p.id));
+          if (!pr) return bad(res, '工程不存在');
+          targetPath = pr.path;
+        }
+        if (!targetPath) return bad(res, 'id 或 path 必须给一个');
+        const { project, stats: st } = await openTarget(targetPath);
+        // 打开着的页面整体重载：跨工程没有任何状态可保留。
+        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name });
+        json(res, {
+          ok: true,
+          project: { id: project.id, name: project.name, path: root },
+          stats: st,
         });
+      } catch (err) {
+        if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 400);
+      } finally {
+        switching = false;
+      }
       return;
     }
 
@@ -1435,7 +938,7 @@ const server = http.createServer(async (req, res) => {
                 store.appendEvent(PROJECT.id, {
                   op: 'bookmark.save',
                   target: r.bookmark.name,
-                  // 整份视图参数都记下来：少存 fixed / vars 的话，
+                  // 整份视图参数都记下来：少存深度 / vars 的话，
                   // 以后想按事件重建书签就是有损的
                   before: prev ? bookmarkEventPayload(prev) : null,
                   after: bookmarkEventPayload(r.bookmark),
@@ -1710,13 +1213,11 @@ const server = http.createServer(async (req, res) => {
         ? [rootId]
         : [];
       const up = Number(u.searchParams.get('up') || 0);
-      const down = Number(u.searchParams.get('down') || 2);
-      const group = u.searchParams.get('group') === '1';
+      const down = Number(u.searchParams.get('down') || 3);
+      const group = u.searchParams.get('group') !== '0';
       const df = u.searchParams.get('df') || null;
-      const optimal = u.searchParams.get('optimal') === '1';
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: split('vars'), skip: split('novars') };
-      const fixed = u.searchParams.get('fixed') === '1';
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       const at = Number(u.searchParams.get('at') || 0);
       const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
@@ -1742,10 +1243,10 @@ const server = http.createServer(async (req, res) => {
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
         return json(
           res,
-          await buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed, viewOverlay)
+          await buildView([pick.id], up, Math.max(down, 3), group, df, varSel, viewOverlay)
         );
       }
-      return json(res, await buildView(roots, up, down, group, df, optimal, varSel, fixed, viewOverlay));
+      return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay));
     }
 
     if (u.pathname === '/api/node') {

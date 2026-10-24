@@ -1,6 +1,6 @@
 /** 生成 flat 布局 SVG（用于布局算法前后对比） */
 import { loadModel, subgraph } from '../src/core/index.js';
-import { layout } from '../src/core/layout.js';
+import { layoutElk } from '../src/core/layout-elk.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +8,7 @@ import path from 'node:path';
 const model = loadModel('samples/tcu');
 const g = subgraph(model, 'main.c::main', { up: 0, down: 3, maxNodes: 600 });
 const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
-const laid = layout(clean, g.edges);
+const laid = await layoutElk(clean, g.edges, { group: false });
 
 const pad = 30;
 let maxX = 0;

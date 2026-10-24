@@ -1,6 +1,6 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
-import { textWidth } from './layout.js';
+import { textWidth } from './layout-metrics.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
@@ -72,7 +72,8 @@ export function facesOf(view) {
   const nodes = new Map(view.nodes.map((n) => [n.id, n]));
   const sideOf = (n, p) => [['NORTH', Math.abs(p[1] - n.y)], ['SOUTH', Math.abs(p[1] - n.y - n.h)],
     ['WEST', Math.abs(p[0] - n.x)], ['EAST', Math.abs(p[0] - n.x - n.w)]].sort((a, b) => a[1] - b[1])[0][0];
-  return view.edges.map((e) => [sideOf(nodes.get(e.from), e.points[0]), sideOf(nodes.get(e.to), e.points.at(-1))]);
+  return view.edges.map((e) => e.from === e.to ? ['EAST', 'SOUTH'] :
+    [sideOf(nodes.get(e.from), e.points[0]), sideOf(nodes.get(e.to), e.points.at(-1))]);
 }
 
 export async function layoutElk(nodes, edges, { group = true, rootLabel = '' } = {}) {

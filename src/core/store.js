@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS bookmark (
   up         INTEGER NOT NULL DEFAULT 0,
   down       INTEGER NOT NULL DEFAULT 3,
   grouped    INTEGER NOT NULL DEFAULT 1,
-  fixed      INTEGER NOT NULL DEFAULT 1,
   vars       TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -234,7 +233,6 @@ const toBookmark = (r) => ({
   up: r.up,
   down: r.down,
   group: !!r.grouped,
-  fixed: !!r.fixed,
   vars: parse(r.vars, []),
   createdAt: r.created_at,
   updatedAt: r.updated_at,
@@ -576,11 +574,11 @@ export function openStore({ dbPath, userData } = {}) {
     bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),
     bmByName: db.prepare('SELECT * FROM bookmark WHERE project_id = ? AND name = ?'),
     bmUpsert: db.prepare(
-      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, fixed, vars, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, vars, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(project_id, name) DO UPDATE SET
          roots = excluded.roots, up = excluded.up, down = excluded.down,
-         grouped = excluded.grouped, fixed = excluded.fixed, vars = excluded.vars,
+         grouped = excluded.grouped, vars = excluded.vars,
          updated_at = excluded.updated_at`
     ),
     bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
@@ -877,7 +875,7 @@ export function openStore({ dbPath, userData } = {}) {
      * 保存书签。同名视为覆盖（UNIQUE(project_id,name) + upsert），
      * 用户不用先删再存；返回是否覆盖，前端据此提示。
      */
-    saveBookmark(projectId, { name, roots = [], up = 0, down = 3, group = true, fixed = true, vars = [] }) {
+    saveBookmark(projectId, { name, roots = [], up = 0, down = 3, group = true, vars = [] }) {
       const clean = String(name || '').trim();
       if (!clean) throw new Error('书签名称不能为空');
       if (!Array.isArray(roots)) throw new Error('roots 必须是数组');
@@ -890,7 +888,6 @@ export function openStore({ dbPath, userData } = {}) {
         Number(up) || 0,
         Number(down) || 0,
         group ? 1 : 0,
-        fixed ? 1 : 0,
         str(Array.isArray(vars) ? vars : []),
         ts,
         ts

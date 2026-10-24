@@ -53,23 +53,26 @@ async function ensureMode() {
 let saveTimer = null;
 // 待落库的那条边：面板重绘 / 换选中时要把这次保存**冲掉再换**，不能直接丢
 let pendingEdge = null;
+let pendingProjectId = null;
 
 function flushPendingSave() {
   if (!saveTimer) return;
   clearTimeout(saveTimer);
   saveTimer = null;
   const edge = pendingEdge;
+  const projectId = pendingProjectId;
   pendingEdge = null;
-  if (edge) commit(edge);
+  if (edge) commit(edge, projectId);
 }
 
 function scheduleCommit(edge, delay = 160) {
   flushPendingSave();
   pendingEdge = edge;
+  const projectId = pendingProjectId = state.view?.projectId;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     pendingEdge = null;
-    commit(edge);
+    commit(edge, projectId);
   }, delay);
 }
 
@@ -79,11 +82,11 @@ function nodeName(id) {
 }
 
 /** 保存后统一收尾：重绘 + 记一步撤销（标签不在布局存档里，但快照里带着） */
-async function commit(edge) {
+async function commit(edge, projectId = state.view?.projectId) {
   applyLabels(edge, edge.labels);
   draw();
-  await persistLabels(edge);
-  pushHistory();
+  await persistLabels(edge, projectId);
+  if (state.view?.projectId === projectId) pushHistory();
 }
 
 /** 删一条标签；结合点删除后按编号模式收尾（重排 → 紧凑） */
@@ -434,8 +437,10 @@ export function renderLabelPanel() {
   });
   box.querySelectorAll('[data-mode]').forEach((btn) => {
     btn.addEventListener('click', async () => {
-      connMode = btn.dataset.mode;
-      await api.setLabelConfig(connMode).catch(() => {});
+      const mode = btn.dataset.mode;
+      const result = await api.setLabelConfig(mode).catch(() => null);
+      if (!result?.ok) return;
+      connMode = mode;
       connPick = false;
       renderLabelPanel();
     });

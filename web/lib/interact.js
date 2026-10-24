@@ -3,7 +3,7 @@
  * 事件在模块加载时一次性绑定
  */
 import { t } from '../i18n.js';
-import { els, state, cam, FONT, esc, edgeKey, modifiedEdges, modifiedNodes } from './state.js';
+import { els, state, cam, FONT, esc, edgeKey } from './state.js';
 import {
   collidesWith,
   moveNodeNoOverlap,
@@ -485,7 +485,6 @@ els.cv.addEventListener('pointerup', (e) => {
         edge.toSide = nearestSide(hover, pos);
       }
       edge.custom = false; // 重连后恢复自动布线
-      modifiedEdges.add(edgeKey(edge));
       rerouteScope([edge]);
       saveLayout();
       pushHistory();
@@ -495,8 +494,6 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (dragSeg) {
-    modifiedEdges.add(edgeKey(dragSeg.edge));
-    saveLayout();
     pushHistory();
     draw();
     return;
@@ -506,12 +503,7 @@ els.cv.addEventListener('pointerup', (e) => {
     if (moved) {
       justDragged = true;
       setTimeout(() => (justDragged = false), 260);
-      modifiedNodes.add(dragNode.id);
       fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
-      for (const ed of state.view.edges) {
-        if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
-      }
-      saveLayout();
       pushHistory();
     } else {
       selectNode(dragNode.id);
@@ -568,9 +560,7 @@ els.cv.addEventListener('dblclick', (e) => {
   const edge = hitEdge(e);
   if (edge && edge.custom) {
     edge.custom = false;
-    modifiedEdges.add(edgeKey(edge));
     rerouteScope([edge]);
-    saveLayout();
     draw();
   }
 });

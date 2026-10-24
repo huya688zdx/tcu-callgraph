@@ -256,6 +256,7 @@ export function rebuildIndex(model) {
     byName.get(fn.name).push(fn);
   }
   for (const ex of externals) byId.set(ex.id, ex);
+  for (const v of model.variables || []) byId.set(v.id, v);
 
   const outAdj = new Map();
   const inAdj = new Map();

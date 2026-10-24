@@ -2,14 +2,13 @@
  * 入口：视图加载、删除、工具栏与快捷键、启动
  * 具体职责已拆到 lib/ 下的模块
  */
-import { t, applyI18n } from './i18n.js';
-import { els, state, cam, deleteStack, edgeKey, modifiedEdges, modifiedNodes } from './lib/state.js';
+import { applyI18n } from './i18n.js';
+import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
 import { fit } from './lib/camera.js';
 import { draw, resize } from './lib/render.js';
-import { fullReroute } from './lib/geometry.js';
-import { history, pushHistory, undo, redo, savePositionsOnly } from './lib/history.js';
+import { history, pushHistory, undo, redo } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG, download } from './lib/svg.js';
@@ -42,9 +41,6 @@ async function loadView(rootId, opts = {}) {
     if (navStack.length > NAV_MAX) navStack.shift();
   }
   const seq = ++viewSeq;
-  // 固定布局：先把当前所有节点坐标落盘，服务端据此把已有节点钉在原位。
-  // 回看历史时不能落盘，否则会把历史画面里的坐标写进当前状态
-  if (state.fixed && state.view && !state.at) await savePositionsOnly();
   clearDataflow(false); // 换视图时旧的叠加层不再适用
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const data = await api.view({
@@ -52,8 +48,6 @@ async function loadView(rootId, opts = {}) {
     up: state.up,
     down: state.down,
     group: state.group,
-    optimal: state.optimal,
-    fixed: state.fixed,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
     at: state.at,
@@ -65,14 +59,11 @@ async function loadView(rootId, opts = {}) {
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
-  modifiedNodes.clear(); // 新视图的节点都是自动布局位置，尚未被拖动
-  if (data.edges && data.edges.some((e) => !e.points || e.points.length < 2)) {
-    fullReroute(); // 兜底：服务端数据缺折线时本地补算
-  }
   const rootNode = data.nodes.find((n) => n.id === data.root);
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';
+  els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
   fit();
@@ -95,14 +86,12 @@ hooks.applyBookmark = async (b) => {
   state.up = Number(b.up) || 0;
   state.down = Number(b.down) || 3;
   state.group = !!b.group;
-  state.fixed = !!b.fixed;
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
 
   els.depth.value = String(state.down);
   els.updepth.value = String(state.up);
   els.groupMode.checked = state.group;
-  applyLayoutMode();
 
   const roots = (b.roots || []).filter(Boolean);
   await loadView(roots.length ? roots : null);
@@ -278,28 +267,10 @@ els.groupMode.addEventListener('change', () => {
   state.selectedEdge = null;
   loadView(state.root);
 });
-function applyLayoutMode() {
-  els.optimalLayout.textContent = t('btn.elk');
-  els.optimalLayout.title = t('btn.elkTitle');
-}
-
-els.optimalLayout.addEventListener('click', async () => {
-  state.fixed = false;
-  state.selectedEdge = null;
-  applyLayoutMode();
-  loadView(state.roots.length ? state.roots : state.root);
-});
 els.fit.addEventListener('click', fit);
 
-els.resetLayout.addEventListener('click', async () => {
-  await api.layout({
-    clear: true,
-    root: state.root,
-    mode: state.group ? 'group' : 'flat',
-  });
-  modifiedEdges.clear();
-  modifiedNodes.clear();
-  loadView(state.root);
+els.resetLayout.addEventListener('click', () => {
+  loadView(state.roots.length ? state.roots : state.root);
 });
 
 // 一次性恢复所有被删除的函数与连线
@@ -308,6 +279,27 @@ els.restoreDeleted.addEventListener('click', async () => {
   deleteStack.length = 0;
   await reloadKeepCam();
   await loadStats();
+});
+
+// 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
+const toolMenus = [...document.querySelectorAll('header .tool-menu')];
+document.addEventListener('click', (event) => {
+  for (const menu of toolMenus) {
+    if (!menu.contains(event.target) || event.target.closest('button')) menu.open = false;
+  }
+});
+for (const menu of toolMenus) {
+  menu.querySelector('summary').addEventListener('click', () => {
+    for (const other of toolMenus) if (other !== menu) other.open = false;
+  });
+}
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  for (const menu of toolMenus) {
+    if (!menu.open) continue;
+    menu.open = false;
+    menu.querySelector('summary').focus();
+  }
 });
 
 document.getElementById('exportSvg').addEventListener('click', () => {
@@ -331,7 +323,6 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
-applyLayoutMode();
 window.addEventListener('resize', resize);
 resize();
 loadStats();

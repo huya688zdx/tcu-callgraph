@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { loadModel, subgraph } from '../src/core/index.js';
-import { layoutGrouped } from '../src/core/layout.js';
+import { layoutElk } from '../src/core/layout-elk.js';
 
 const target = process.argv[2] || 'samples/deep';
 const model = loadModel(target);
@@ -129,7 +129,7 @@ for (const fn of model.functions) {
   if (g.edges.length < 4 || g.nodes.length < 6) continue;
   const clean = g.nodes.map(({ bodyTokens, ...rest }) => rest);
   const rootLabel = path.basename(target);
-  const laid = layoutGrouped(clean, g.edges, { rootLabel });
+  const laid = await layoutElk(clean, g.edges, { rootLabel });
   allOk = check(laid, `${fn.name}(${g.nodes.length}n/${g.edges.length}e)`) && allOk;
   break; // 每个样本只详细看一个代表视图
 }
@@ -138,7 +138,7 @@ for (const fn of model.functions) {
 {
   const all = { ...model, functions: model.functions };
   const clean = model.functions.map(({ bodyTokens, ...rest }) => rest);
-  const laid = layoutGrouped(clean, model.edges, { rootLabel: path.basename(target) });
+  const laid = await layoutElk(clean, model.edges, { rootLabel: path.basename(target) });
   allOk = check(laid, '全量视图') && allOk;
 }
 

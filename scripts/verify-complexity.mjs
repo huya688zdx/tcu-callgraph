@@ -8,9 +8,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadModel, subgraph } from '../src/core/index.js';
-import { layout, layoutGrouped, routeLengthAndCrossings } from '../src/core/layout.js';
-import { routeEdges } from '../src/core/routing.js';
-import { optimizeCrossings } from '../src/core/optimize.js';
+import { layoutElk } from '../src/core/layout-elk.js';
+import { routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -30,22 +29,11 @@ const modelOf = (sample) => {
   return modelCache.get(sample);
 };
 
-function measure(view) {
+async function measure(view) {
   const model = modelOf(view.sample);
   const g = subgraph(model, view.root, { up: view.up, down: view.down, maxNodes: 600 });
   const nodes = g.nodes.map(({ bodyTokens, ...rest }) => rest);
-  const laid = view.group
-    ? layoutGrouped(nodes, g.edges, { rootLabel: path.basename(view.sample) })
-    : layout(nodes, g.edges);
-
-  // 界面默认 optimal=1：路由 + 交叉优化器（与 buildView 同路径）。
-  // 预算给足到必收敛——度量要确定性，不受机器快慢影响
-  routeEdges(laid.nodes, laid.edges);
-  optimizeCrossings(laid.nodes, laid.edges, {
-    groupBoxes: laid.groups ? new Map(laid.groups.map((x) => [x.id, x])) : null,
-    maxEvals: 200000,
-    maxMs: 600000,
-  });
+  const laid = await layoutElk(nodes, g.edges, { group: view.group, rootLabel: path.basename(view.sample) });
 
   const m = routeLengthAndCrossings(laid.edges || g.edges);
 
@@ -109,7 +97,8 @@ function measure(view) {
   };
 }
 
-const results = VIEWS.map(measure);
+const results = [];
+for (const view of VIEWS) results.push(await measure(view));
 const total = Number(results.reduce((s, r) => s + r.score, 0).toFixed(1));
 const payload = { total, views: results };
 

@@ -11,7 +11,6 @@ const els = {
   fit: document.getElementById('fit'),
   resetLayout: document.getElementById('resetLayout'),
   groupMode: document.getElementById('groupMode'),
-  optimalLayout: document.getElementById('optimalLayout'),
   stats: document.getElementById('stats'),
   results: document.getElementById('results'),
   detail: document.getElementById('detail'),
@@ -47,9 +46,6 @@ const state = {
   down: 3,
   up: 0,
   group: true,
-  optimal: true,
-  /** 固定布局：增删节点时保持现有位置，只有溢出才调整 */
-  fixed: false,
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
   selectedLabel: null,
@@ -119,9 +115,6 @@ const esc = (s) =>
 const nodeById = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
 
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}`;
-const modifiedEdges = new Set();
-/** 被用户拖动过的节点：只有这些节点的坐标需要持久化 */
-const modifiedNodes = new Set();
 export {
   els,
   state,
@@ -135,6 +128,4 @@ export {
   esc,
   nodeById,
   edgeKey,
-  modifiedEdges,
-  modifiedNodes,
 };

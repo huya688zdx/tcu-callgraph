@@ -151,7 +151,6 @@ test('e2e：页面状态上报 → /api/page 与 cg_page 工具都能读到', as
       up: 0,
       down: 3,
       group: true,
-      fixed: true,
       vars: [],
       selected: 'a.c::main',
       selectedEdge: null,

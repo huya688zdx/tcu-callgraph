@@ -64,7 +64,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 `change` 事件（`{ op, actor, ts }`），页面（`web/lib/live.js`）收到后自动重拉视图并保留视角：
 
 - 只响应 `actor=ai` 的广播。用户自己的写操作界面已就地处理，若也跟着刷新，
-  固定布局的坐标落盘会再触发广播，两个页面之间会形成无限刷新循环；
+  重复刷新会打断用户正在进行的拖拽；
 - AI 连续多个写操作合并成一次刷新（400ms 防抖）；用户正在拖拽时推迟到松手后；
 - 回看历史（时间轴 `at>0`）时不刷新画面，只提示「回到最新后可见」；
 - `project.switch`（AI 切工程）触发页面整体重载，并带工程名提示。
@@ -100,7 +100,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 | `cg_switch` | 切换工程（按 id 或路径） |
 | `cg_annotate` | 节点/连线标注：note、color（**固定四色** #CCFFCC/#FFFF99/#FFCCFF/#BFBFBF，即既存/変更/追加/削除，非法值拒收）、tag、change(既存/変更/追加/削除)、labels（**一线多条**连线标签数组，整组替换；结合点编号不给自动分配，note=第二行说明小字） |
 | `cg_delete` | 隐藏/恢复函数与连线（不动源码）；clear=true 全部恢复 |
-| `cg_save_layout` | 保存手动布局（坐标表 / 连线折线 / 手工连线） |
+| `cg_save_layout` | 保存手工连线（节点与路径由 ELK 排版） |
 
 ### 导出（readonly 即可用）
 | 工具 | 说明 |

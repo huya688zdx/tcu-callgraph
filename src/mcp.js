@@ -52,7 +52,8 @@ async function get(ctx, pathAndQuery) {
 async function post(ctx, path, body) {
   const res = await ctx.fetchImpl(`${ctx.baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json',
+      ...(ctx.projectId === undefined ? {} : { 'X-Callgraph-Project': String(ctx.projectId) }) },
     body: JSON.stringify({ ...body, actor: 'ai' }),
   });
   return res.json();
@@ -308,16 +309,13 @@ const TOOLS = [
   {
     name: 'cg_save_layout',
     description:
-      '保存手动布局：nodes 是 {函数id:{x,y}} 坐标表，edges 是连线的手动折线/端口覆盖，manual 是手工连线列表。' +
-      '先 cg_view 拿到当前坐标，改完再整体存回。',
+      '保存手工连线列表 manual；节点与连线路径统一由 ELK 排版。',
     access: 'write',
     inputSchema: {
       type: 'object',
       properties: {
         root: { type: 'string', description: '该布局所属的入口函数 id（空字符串=自动布局视图）' },
         mode: { type: 'string', enum: ['group', 'flat'], description: '布局模式', default: 'group' },
-        nodes: { type: 'object', description: '{函数id: {x, y}}' },
-        edges: { type: 'object', description: '{连线key: {fromSide, toSide, custom, points}}' },
         manual: { type: 'array', items: { type: 'object' }, description: '手工连线 [{from, to}]' },
         clear: { type: 'boolean', description: 'true=清空该布局存档', default: false },
       },
@@ -326,8 +324,6 @@ const TOOLS = [
       post(ctx, '/api/layout', {
         root: a.root,
         mode: a.mode === 'flat' ? 'flat' : 'group',
-        nodes: a.nodes,
-        edges: a.edges,
         manual: a.manual,
         clear: !!a.clear,
       }),
@@ -436,7 +432,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
   };
 
   /** 处理单个 JSON-RPC 请求；通知（无 id）返回 null */
-  async function handleOne(msg) {
+  async function handleOne(msg, requestCtx = ctx) {
     const id = msg?.id ?? null;
     if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
       return rpcError(id, -32600, '请求不是合法的 JSON-RPC 2.0 消息');
@@ -486,7 +482,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
       }
       const args = msg.params?.arguments && typeof msg.params.arguments === 'object' ? msg.params.arguments : {};
       try {
-        const result = await tool.run(args, ctx);
+        const result = await tool.run(args, requestCtx);
         // HTTP 层的错误（400/500 等）也带 ok:false，作为 isError 标记透传
         const isError = !!(result && result.ok === false && (result.error || result.status));
         return rpcResult(id, {
@@ -506,7 +502,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
 
   return {
     /** 处理 POST /mcp 的 body（对象或数组）。返回 { status, body }；body 为 null 时只回 202 */
-    async handlePost(rawBody) {
+    async handlePost(rawBody, projectId) {
       let parsed;
       try {
         parsed = JSON.parse(rawBody);
@@ -518,8 +514,9 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
       if (!messages.length) return { status: 400, body: rpcError(null, -32600, '空批量请求' + '') };
 
       const replies = [];
+      const requestCtx = projectId === undefined ? ctx : { ...ctx, projectId };
       for (const m of messages) {
-        const r = await handleOne(m);
+        const r = await handleOne(m, requestCtx);
         if (r) replies.push(r);
       }
       if (!replies.length) return { status: 202, body: null }; // 全是通知
