@@ -3,7 +3,7 @@
 //   node scripts/verify-complexity.mjs                    度量并写 .verify-tmp/complexity.json
 //   node scripts/verify-complexity.mjs --save-baseline    写 .verify-tmp/complexity-baseline.json
 //   node scripts/verify-complexity.mjs --compare <file>   与基线比较：任一视图交叉 > 基线*1.15
-//                                                         或总分 > 基线*1.03 时 exit 1
+//                                                         或合计总分 > 基线*1.03 时 exit 1
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -115,10 +115,16 @@ if (args.includes('--save-baseline')) {
   const base = JSON.parse(fs.readFileSync(baseFile, 'utf8'));
   fs.writeFileSync(outFile, JSON.stringify(payload, null, 2));
   const baseById = new Map(base.views.map((v) => [v.id, v]));
+  // 基线视图集必须齐：少视图说明基线损坏或样本变了，对照无从谈起
+  const missing = base.views.filter((b) => !results.some((v) => v.id === b.id)).map((b) => b.id);
+  if (missing.length) {
+    console.error('FAIL: 基线里的视图本次没有度量出来：' + missing.join(', '));
+    process.exit(2);
+  }
   let bad = 0;
   for (const v of results) {
     const b = baseById.get(v.id);
-    if (!b) continue;
+    // crossings 允许 ±15% 噪声（score 里 crossings*10 会让小波动放大，故总分用合计口径）
     const mark = v.crossings > b.crossings * 1.15 ? ' ✗交叉升高' : '';
     console.log(`${v.id}: crossings ${b.crossings}→${v.crossings}  bands ${b.bands}→${v.bands}  len ${b.length}→${v.length}  aspect ${b.aspect}→${v.aspect}  score ${b.score}→${v.score}${mark}`);
     if (v.crossings > b.crossings * 1.15) bad++;

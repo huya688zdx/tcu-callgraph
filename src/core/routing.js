@@ -6,6 +6,8 @@
  *  2. 端口分配：同一节点同侧的多条边按对端位置排序后沿边均匀展开
  *  3. 共线合并：同一对节点的同类型调用边共用一条折线（不同调用行不再平行重复）
  *  4. 公用母线：同源（或同目标）的同类型同色直连边共享一条水平母线，只留竖直分支
+ *  4.5 出线面统一：同源/同目标的边由多数面吸收少数面（代理交叉 + 折弯段数代价把关），
+ *      使「每面一口」与母线覆盖率最大化
  *  5. 直连路由（相邻/同排）：单通道 Z 形，通道位置做「节点避障 + 已布通道避让」搜索
  *  6. 长边路由（跨多层 / 回边）：先尝试图内垂直走廊，失败则绕侧边车道
  *  7. 手动布线（e.custom）：保留用户折线，仅随节点移动重新锚定端点
@@ -637,6 +639,9 @@ function routeBus(list, ctx, dir) {
   }
 
   addH(ctx.placed, busY, x1, x2);
+  // 横干线：分支按落点 x 排序（扇出看目标口、扇入看源口），沿干线单调排开、互不交错
+  const sameP0X = list.every((x) => Math.abs(x.e._p0[0] - list[0].e._p0[0]) < 0.5);
+  list.sort((u, v) => (sameP0X ? u.e._p1[0] - v.e._p1[0] : u.e._p0[0] - v.e._p0[0]));
   for (const it of list) {
     const p0 = it.e._p0;
     const p1 = it.e._p1;
@@ -679,6 +684,9 @@ function routeBusH(list, ctx, dir) {
   }
 
   addV(ctx.placed, busX, y1, y2);
+  // 竖干线：分支按落点 y 排序（扇出看目标口、扇入看源口），沿干线单调排开、互不交错
+  const sameP0Y = list.every((x) => Math.abs(x.e._p0[1] - list[0].e._p0[1]) < 0.5);
+  list.sort((u, v) => (sameP0Y ? u.e._p1[1] - v.e._p1[1] : u.e._p0[1] - v.e._p0[1]));
   for (const it of list) {
     const p0 = it.e._p0;
     const p1 = it.e._p1;
@@ -730,10 +738,12 @@ function routeFanoutBus(list, ctx) {
 
   addV(ctx.placed, best.p0[0], best.p0[1], best.busY);
   addH(ctx.placed, best.busY, best.x1, best.x2);
-  for (let i = 0; i < list.length; i++) {
-    const it = list[i];
+  // 横干线：分支按目标口 x 排序落位，沿干线单调排开、互不交错
+  const branches = list
+    .map((it, i) => ({ it, p1: best.targetPorts[i] }))
+    .sort((u, v) => u.p1[0] - v.p1[0]);
+  for (const { it, p1 } of branches) {
     const p0 = best.p0;
-    const p1 = best.targetPorts[i];
     it.sa = best.sourceSide;
     it.sb = best.targetSide;
     it.e._p0 = p0;
@@ -1133,16 +1143,67 @@ export function routeEdges(nodes, edges, opts = {}) {
   const items = [...pairFirst.values()];
 
   // ---- 出线面统一：同源的边尽量并到同一出线面（多数面吸收少数面），同目标同理。
-  // 面统一后「每面一口」才真正合成一个口，fan-out/fan-in 母线覆盖率随之上升。
-  // 目标在多数面的正后方（对侧）时不硬拗——绕穿源节点比多一个口更难看。
+  // 面统一后「每面一口」才真正合成一个口，fan-out/fan-in 母线覆盖率随之上升（干线分组不含面键）。
+  // 评估标准：并入后「代理交叉 + 折弯段数」（direct=2 段、mixed=3 段）不高于不并才采纳；
+  // 另有硬守卫：目标在多数面的正后方（对侧）时不硬拗——绕穿源节点比多一个口更难看。
+  // 用户钉过出/入面的边不参与并面（钉的是面）；e.fromSide/e.toSide 缺省时 it.sa/sb 就是
+  // 默认面，改掉后端口分配与路由分派读的都是 it.sa/sb，默认行为自动跟随。
   {
     const isV = (s) => s === 'top' || s === 'bottom';
+    const BENDS = { direct: 2, mixed: 3, long: 2 }; // long 与 direct 同族（两端均垂直）
     const retype = (sa, sb, old) => {
       if (isV(sa) && isV(sb)) return old === 'long' ? 'long' : 'direct';
       if (!isV(sa) && !isV(sb)) return 'direct';
       return 'mixed';
     };
-    const unify = (groupKey, sideKey, nodeKeyOf, otherKey) => {
+    // 估计折线：镜像各路由器的首选通道形状（H-H 贴源侧干线、V-V 走中间通道、mixed 取中点肘弯），
+    // 只用于并面前后的交叉对比，不代表最终路由。
+    const estPts = (n0, sa, n1, sb) => {
+      const p0 = portAt(n0, sa, 0.5);
+      const p1 = portAt(n1, sb, 0.5);
+      if (isV(sa) && isV(sb)) {
+        const m = (p0[1] + DIR[sa][1] * STUB + (p1[1] + DIR[sb][1] * STUB)) / 2;
+        return collapse([p0, [p0[0], m], [p1[0], m], p1]);
+      }
+      if (!isV(sa) && !isV(sb)) {
+        const c = p0[0] + DIR[sa][0] * STUB; // 同源扇出优先走 routeBusH 的贴源干线
+        return collapse([p0, [c, p0[1]], [c, p1[1]], p1]);
+      }
+      if (isV(sa)) {
+        const my = (p0[1] + DIR[sa][1] * STUB + p1[1]) / 2;
+        const xq = p1[0] + DIR[sb][0] * STUB;
+        return collapse([p0, [p0[0], my], [xq, my], [xq, p1[1]], p1]);
+      }
+      const mx = (p0[0] + DIR[sa][0] * STUB + p1[0]) / 2;
+      const yq = p1[1] + DIR[sb][1] * STUB;
+      return collapse([p0, [mx, p0[1]], [mx, yq], [p1[0], yq], p1]);
+    };
+    // 两条正交折线的「真交叉」数：横×竖且交点在两段内部。
+    // 共线重叠与端点相触不算——共口、共干线是并面的收益，不是交叉。
+    const crossCount = (A, B) => {
+      let c = 0;
+      for (let i = 0; i + 1 < A.length; i++) {
+        const aH = Math.abs(A[i][1] - A[i + 1][1]) < 0.5;
+        for (let j = 0; j + 1 < B.length; j++) {
+          const bH = Math.abs(B[j][1] - B[j + 1][1]) < 0.5;
+          if (aH === bH) continue;
+          const h = aH ? [A[i], A[i + 1]] : [B[j], B[j + 1]];
+          const v = aH ? [B[j], B[j + 1]] : [A[i], A[i + 1]];
+          const x = v[0][0];
+          const y = h[0][1];
+          if (
+            x > Math.min(h[0][0], h[1][0]) + 0.5 &&
+            x < Math.max(h[0][0], h[1][0]) - 0.5 &&
+            y > Math.min(v[0][1], v[1][1]) + 0.5 &&
+            y < Math.max(v[0][1], v[1][1]) - 0.5
+          ) {
+            c++;
+          }
+        }
+      }
+      return c;
+    };
+    const unify = (groupKey, sideKey, nodeKeyOf, otherKey, pinnedKey) => {
       const by = new Map();
       for (const it of items) {
         const k = groupKey(it);
@@ -1158,6 +1219,7 @@ export function routeEdges(nodes, edges, opts = {}) {
         for (const [s, c] of count) if (!major || c > count.get(major)) major = s;
         for (const it of list) {
           if (it[sideKey] === major) continue;
+          if (SIDES.has(it.e[pinnedKey])) continue; // 用户钉过面，不并
           const n = it[nodeKeyOf];
           const o = it[otherKey];
           const oCx = o.x + o.w / 2;
@@ -1166,13 +1228,31 @@ export function routeEdges(nodes, edges, opts = {}) {
           if (major === 'left' && oCx > n.x + n.w) continue;
           if (major === 'bottom' && oCy < n.y) continue;
           if (major === 'top' && oCy > n.y + n.h) continue;
-          it[sideKey] = major;
-          it.type = retype(it.sa, it.sb, it.type);
+          // 代价评估：该边并入后与组内其它边（按各自当前面）的估计交叉 + 折弯段数，
+          // 与维持原面同口径对比；逐条顺序采纳，后面的少数面能看到前面已并的结果。
+          // 不并侧若因此多占一个出口面（该面只剩这一条边），按 1 个折弯当量记一口收益——
+          // 并面的目的正是把口合掉，没有这项则纯收敛型并入（交叉不增、折弯 +1）永远亏。
+          const credit = count.get(it[sideKey]) === 1 ? 1 : 0;
+          const cost = (sa, sb) => {
+            const mine = estPts(it.a, sa, it.b, sb);
+            let cross = 0;
+            for (const x of list) {
+              if (x === it) continue;
+              cross += crossCount(mine, estPts(x.a, x.sa, x.b, x.sb));
+            }
+            return cross + BENDS[retype(sa, sb, it.type)];
+          };
+          const cand = sideKey === 'sa' ? [major, it.sb] : [it.sa, major];
+          if (cost(cand[0], cand[1]) <= cost(it.sa, it.sb) + credit) {
+            it.sa = cand[0];
+            it.sb = cand[1];
+            it.type = retype(it.sa, it.sb, it.type);
+          }
         }
       }
     };
-    unify((it) => it.e.from, 'sa', 'a', 'b');
-    unify((it) => it.e.to, 'sb', 'b', 'a');
+    unify((it) => it.e.from, 'sa', 'a', 'b', 'fromSide');
+    unify((it) => it.e.to, 'sb', 'b', 'a', 'toSide');
   }
 
   assignPorts(items, nodeMap);

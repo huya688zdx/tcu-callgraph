@@ -75,6 +75,107 @@ function spreadX(n, i, total) {
   return n.x + inset + ((i + 1) / (total + 1)) * Math.max(1, n.w - 2 * inset);
 }
 
+/** 跨相邻层对的直连边（贪心交换与代理交叉共用口径）：回边 / 自环 / 跨多层长边不计 */
+function layerPairEdges(es, layerIdx, backSet) {
+  const adj = new Map(); // 层对 la -> 跨该层对的边
+  for (const e of es) {
+    if (backSet.has(e) || e.from === e.to) continue;
+    const la = layerIdx.get(e.from);
+    if (layerIdx.get(e.to) !== la + 1) continue;
+    if (!adj.has(la)) adj.set(la, []);
+    adj.get(la).push(e);
+  }
+  return adj;
+}
+
+/**
+ * 代理交叉总数：跨同一相邻层对的两条边，源端次序与目标端次序相反记 1 个
+ * （把每条边看作「层内次序对」的直线，只比较同跨层边）。
+ * 与 greedySwapOrder 同口径，供验证脚本 / 测试在交换前后对比。
+ */
+export function proxyCrossings(layers, es, backSet = new Set()) {
+  const layerIdx = new Map();
+  layers.forEach((arr, li) => arr.forEach((id) => layerIdx.set(id, li)));
+  const pos = new Map();
+  layers.forEach((arr) => arr.forEach((id, i) => pos.set(id, i)));
+  let total = 0;
+  for (const list of layerPairEdges(es, layerIdx, backSet).values()) {
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i];
+        const b = list[j];
+        if ((pos.get(a.from) - pos.get(b.from)) * (pos.get(a.to) - pos.get(b.to)) < 0) total++;
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * 层内贪心交换：重心迭代收不住的局部交错，用代理交叉判据换开。
+ * 自上而下、再自下而上各扫 2 遍；对每层每对相邻节点，交换后与上下相邻层之间的
+ * 代理交叉下降才采纳。只交换 layers 内的次序数组（坐标仍走后续管线）。
+ * 导出供验证脚本 / 测试复用。
+ */
+export function greedySwapOrder(layers, es, backSet = new Set()) {
+  const layerIdx = new Map();
+  layers.forEach((arr, li) => arr.forEach((id) => layerIdx.set(id, li)));
+  const pos = new Map();
+  layers.forEach((arr) => arr.forEach((id, i) => pos.set(id, i)));
+  const adj = layerPairEdges(es, layerIdx, backSet);
+  const pairOf = (e) => adj.get(layerIdx.get(e.from)) || [];
+  const crossWith = (e, list) => {
+    let c = 0;
+    const pf = pos.get(e.from);
+    const pt = pos.get(e.to);
+    for (const o of list) {
+      if (o === e) continue;
+      if ((pf - pos.get(o.from)) * (pt - pos.get(o.to)) < 0) c++;
+    }
+    return c;
+  };
+  const incident = new Map();
+  const incidentOf = (id) => {
+    if (!incident.has(id)) {
+      const out = [];
+      for (const list of adj.values()) {
+        for (const e of list) if (e.from === id || e.to === id) out.push(e);
+      }
+      incident.set(id, out);
+    }
+    return incident.get(id);
+  };
+  const swapIfBetter = (arr, i) => {
+    const a = arr[i];
+    const b = arr[i + 1];
+    if (a === undefined || b === undefined) return;
+    // 只有 a/b 的关联边参与的对会变，其余边对交叉数不变，增量评估即可
+    const mine = [...incidentOf(a), ...incidentOf(b)];
+    const before = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
+    arr[i] = b;
+    arr[i + 1] = a;
+    pos.set(a, i + 1);
+    pos.set(b, i);
+    const after = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
+    if (after < before) return; // 交换收益为正，保留
+    arr[i] = a;
+    arr[i + 1] = b;
+    pos.set(a, i);
+    pos.set(b, i + 1);
+  };
+  for (let sweep = 0; sweep < 4; sweep++) {
+    const down = sweep % 2 === 0;
+    const seq = [];
+    if (down) for (let i = 0; i < layers.length; i++) seq.push(i);
+    else for (let i = layers.length - 1; i >= 0; i--) seq.push(i);
+    for (const li of seq) {
+      const arr = layers[li];
+      if (down) for (let i = 0; i < arr.length - 1; i++) swapIfBetter(arr, i);
+      else for (let i = arr.length - 2; i >= 0; i--) swapIfBetter(arr, i);
+    }
+  }
+}
+
 function layoutBase(nodes, edges, opts = {}) {
   const {
     nodeH = 44,
@@ -182,69 +283,9 @@ function layoutBase(nodes, edges, opts = {}) {
     }
   }
 
-  // ---- 3b. 贪心交换：重心迭代收不住的局部交错，用相邻层直连边的代理交叉判据换开 ----
-  // 代理交叉：跨同一相邻层对 (i, i+1) 的两条边，源端次序与目标端次序相反记 1 个。
-  // 只交换层内次序（坐标仍走后续管线）；大图跳过，控制计算量。
-  if (nodes.length <= 800) {
-    const adj = new Map(); // 层对 la -> 跨该层对的边
-    for (const e of es) {
-      if (backSet.has(e) || e.from === e.to) continue;
-      const la = layerIdx.get(e.from);
-      if (layerIdx.get(e.to) !== la + 1) continue;
-      if (!adj.has(la)) adj.set(la, []);
-      adj.get(la).push(e);
-    }
-    const pairOf = (e) => adj.get(layerIdx.get(e.from)) || [];
-    const crossWith = (e, list) => {
-      let c = 0;
-      const pf = pos.get(e.from);
-      const pt = pos.get(e.to);
-      for (const o of list) {
-        if (o === e) continue;
-        if ((pf - pos.get(o.from)) * (pt - pos.get(o.to)) < 0) c++;
-      }
-      return c;
-    };
-    const incident = new Map();
-    const incidentOf = (id) => {
-      if (!incident.has(id)) {
-        const out = [];
-        for (const list of adj.values()) {
-          for (const e of list) if (e.from === id || e.to === id) out.push(e);
-        }
-        incident.set(id, out);
-      }
-      return incident.get(id);
-    };
-    const swapIfBetter = (arr, i) => {
-      const a = arr[i];
-      const b = arr[i + 1];
-      if (a === undefined || b === undefined) return;
-      const mine = [...incidentOf(a), ...incidentOf(b)];
-      const before = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
-      arr[i] = b;
-      arr[i + 1] = a;
-      pos.set(a, i + 1);
-      pos.set(b, i);
-      const after = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
-      if (after < before) return; // 交换收益为正，保留
-      arr[i] = a;
-      arr[i + 1] = b;
-      pos.set(a, i);
-      pos.set(b, i + 1);
-    };
-    for (let sweep = 0; sweep < 2; sweep++) {
-      const down = sweep % 2 === 0;
-      const seq = [];
-      if (down) for (let i = 0; i < layers.length; i++) seq.push(i);
-      else for (let i = layers.length - 1; i >= 0; i--) seq.push(i);
-      for (const li of seq) {
-        const arr = layers[li];
-        if (down) for (let i = 0; i < arr.length - 1; i++) swapIfBetter(arr, i);
-        else for (let i = arr.length - 2; i >= 0; i--) swapIfBetter(arr, i);
-      }
-    }
-  }
+  // ---- 3b. 贪心交换：重心迭代收不住的局部交错，用代理交叉判据换开 ----
+  // 大图跳过，控制计算量；只改 layers 内次序，后续坐标流程不变
+  if (nodes.length <= 800) greedySwapOrder(layers, es, backSet);
 
   // ---- 4. 尺寸 ----
   const widthOf = (n) => {
@@ -945,6 +986,29 @@ export function layout(nodes, edges, opts = {}) {
 }
 
 /**
+ * 实测一次分区落位的布线质量：按 positions 把各文件框内部的函数节点平移到位，
+ * 克隆跨文件函数边统一路由，返回 routeLengthAndCrossings 度量。
+ * scorePlacement 调分与文件框交换局部搜索共用这一口径，保证「调分」与「数交叉」看的是同一套布线。
+ */
+function measureGroupPlacement(positions, filesByChild, inner, crossEdges) {
+  const tempNodes = [];
+  for (const [childPath, files] of filesByChild) {
+    const base = positions.get(childPath);
+    if (!base) continue;
+    for (const f of files) {
+      const laidFile = inner.get(f.file);
+      if (!laidFile) continue;
+      for (const fn of laidFile.nodes) {
+        tempNodes.push({ ...fn, x: base.x + f.x + fn.x, y: base.y + f.y + fn.y, group: f.file });
+      }
+    }
+  }
+  const tempEdges = cloneEdges(crossEdges);
+  routeEdges(tempNodes, tempEdges);
+  return routeLengthAndCrossings(tempEdges);
+}
+
+/**
  * 分区式紧凑布局：把一组矩形（文件框 / 目录框）按调用方向分级，
  * 级内按重心排序，再按「每列 R 级」列优先蛇形折行成多列二维分区
  * （第 0 级→左上、第 1 级→左下、第 2 级→右上……），
@@ -969,7 +1033,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
   const wOf = (id) => byId.get(id).w;
   const hOf = (id) => byId.get(id).h;
 
-  if (!items.length) return { pos: new Map(), width: 0, height: 0, columns: 0, ranks: 0 };
+  if (!items.length) return { pos: new Map(), width: 0, height: 0, columns: 0, ranks: 0, rankOf: new Map() };
 
   // ---- 1. 分级（找环回边 → Kahn 最长路径）----
   const out = new Map();
@@ -1199,6 +1263,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
     ranks: best.ranks,
     R: best.R,
     score: best.score,
+    rankOf: rankIdx, // id -> 压缩级号：文件框交换局部搜索判断「同 rank 相邻」用
   };
 }
 
@@ -1350,6 +1415,13 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     return { side: 14 + extra, top: 30 + extra, bottom: 14 + extra };
   };
 
+  // 文件框交换局部搜索的全局预算：整个 layoutGrouped 递归共用（写法参考 refineGroupedNodes）。
+  // 一次评估 = 固定 R 重排一次分区落位 + measureGroupPlacement 实测 crossings，
+  // 总评估次数 ≤ 40 或累计评估耗时 ≤ 400ms，超了立刻停
+  const SEARCH_EVAL_BUDGET = 40;
+  const SEARCH_TIME_BUDGET = 400;
+  const searchBudget = { evals: 0, ms: 0 };
+
   const layoutDir = (node) => {
     if (node.type === 'file') return;
     const list = [...node.children.values()];
@@ -1397,21 +1469,7 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       sum + files.reduce((n, f) => n + (inner.get(f.file)?.nodes.length || 0), 0), 0);
     const scorePlacement = actualNodes <= 160 && crossingFunctionEdges.length <= 160
       ? (positions, width, height) => {
-          const tempNodes = [];
-          for (const [childPath, files] of filesByChild) {
-            const base = positions.get(childPath);
-            if (!base) continue;
-            for (const f of files) {
-              const laidFile = inner.get(f.file);
-              if (!laidFile) continue;
-              for (const fn of laidFile.nodes) {
-                tempNodes.push({ ...fn, x: base.x + f.x + fn.x, y: base.y + f.y + fn.y, group: f.file });
-              }
-            }
-          }
-          const tempEdges = cloneEdges(crossingFunctionEdges);
-          routeEdges(tempNodes, tempEdges);
-          const metrics = routeLengthAndCrossings(tempEdges);
+          const metrics = measureGroupPlacement(positions, filesByChild, inner, crossingFunctionEdges);
           const bundleCredit = Math.min(metrics.length * 0.75, metrics.sharedLength * 1.5);
           // 高扇出跨文件调用优先让文件并排；这样路由器能用一根纵向主干分发到多个目标。
           let fanoutAxisPenalty = 0;
@@ -1430,31 +1488,35 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       : null;
     let laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
 
-    // ---- 度量驱动微调：同 rank 相邻文件框交换，实测布线得分下降且长宽比不明显恶化才采纳 ----
-    // 只换同 rank（同级无前向边，交换安全）；固定 R 重排，评测成本 = 一次 placeUnits + 一次实测
+    // ---- 度量驱动微调：同 rank 相邻的文件框试交换，实测 crossings 下降且长宽比不明显恶化才采纳 ----
+    // 同 rank（同级）之间没有前向边，交换安全；固定 R 重排，评测成本 = 一次 placeUnits + 一次实测。
+    // 预算全局共享（searchBudget），超了立刻停
     if (scorePlacement && cn.length >= 2) {
-      const t0 = Date.now();
-      let evals = 0;
-      const wire = scorePlacement(laid.pos, laid.width, laid.height);
       const baseAspectErr = Math.abs(Math.log(laid.width / Math.max(1, laid.height)));
-      let bestWire = wire;
+      let bestCross = measureGroupPlacement(laid.pos, filesByChild, inner, crossingFunctionEdges).crossings;
       for (let i = 0; i + 1 < cn.length; i++) {
-        if (evals >= 16 || Date.now() - t0 > 400) break;
-        if (cn[i].rank !== cn[i + 1].rank) continue;
+        if (searchBudget.evals >= SEARCH_EVAL_BUDGET || searchBudget.ms >= SEARCH_TIME_BUDGET) break;
+        // rankOf 是初排的级号：只有同 rank 的相邻框才允许互换次序
+        if (laid.rankOf.get(cn[i].id) !== laid.rankOf.get(cn[i + 1].id)) continue;
         const swapped = cn.slice();
         [swapped[i], swapped[i + 1]] = [swapped[i + 1], swapped[i]];
+        const t0 = Date.now();
         const alt = layoutPartitioned(swapped, childEdgesOf(node), {
           ...BOX,
           scorePlacement,
           forceR: laid.R,
         });
-        evals++;
+        let altCross = Infinity;
         const altErr = Math.abs(Math.log(alt.width / Math.max(1, alt.height)));
-        if (altErr > baseAspectErr + 0.15) continue;
-        // 采纳判据与初值同口径：scorePlacement 的实测布线得分
-        const altWire = scorePlacement(alt.pos, alt.width, alt.height);
-        if (altWire < bestWire - 0.01) {
-          bestWire = altWire;
+        // 长宽比恶化超限的候选连实测都省了（恶化即否决）
+        if (altErr <= baseAspectErr + 0.15) {
+          altCross = measureGroupPlacement(alt.pos, filesByChild, inner, crossingFunctionEdges).crossings;
+        }
+        searchBudget.evals++;
+        searchBudget.ms += Date.now() - t0;
+        // 采纳判据：交换后实测 crossings 严格下降（基线随采纳链式更新）
+        if (altCross < bestCross) {
+          bestCross = altCross;
           cn.splice(0, cn.length, ...swapped);
           laid = alt;
         }
