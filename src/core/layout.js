@@ -115,9 +115,11 @@ export function proxyCrossings(layers, es, backSet = new Set()) {
  * 层内贪心交换：重心迭代收不住的局部交错，用代理交叉判据换开。
  * 自上而下、再自下而上各扫 2 遍；对每层每对相邻节点，交换后与上下相邻层之间的
  * 代理交叉下降才采纳。只交换 layers 内的次序数组（坐标仍走后续管线）。
- * 导出供验证脚本 / 测试复用。
+ * seeded（上次布局有坐标的节点集合）非空时不倒换两个旧节点的相对次序——
+ * 种子模式的稳定性优先于交叉微降；旧×新节点之间的换位不受限，
+ * 因为旧节点彼此的相对次序不会因此改变。导出供验证脚本 / 测试复用。
  */
-export function greedySwapOrder(layers, es, backSet = new Set()) {
+export function greedySwapOrder(layers, es, backSet = new Set(), seeded = null) {
   const layerIdx = new Map();
   layers.forEach((arr, li) => arr.forEach((id) => layerIdx.set(id, li)));
   const pos = new Map();
@@ -149,6 +151,7 @@ export function greedySwapOrder(layers, es, backSet = new Set()) {
     const a = arr[i];
     const b = arr[i + 1];
     if (a === undefined || b === undefined) return;
+    if (seeded && seeded.has(a) && seeded.has(b)) return; // 种子模式：旧节点相对次序不动
     // 只有 a/b 的关联边参与的对会变，其余边对交叉数不变，增量评估即可
     const mine = [...incidentOf(a), ...incidentOf(b)];
     const before = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
@@ -253,7 +256,9 @@ function layoutBase(nodes, edges, opts = {}) {
         (seed[id] && Number.isFinite(seed[id].x) ? withSeed : withoutSeed).push(id);
       }
       if (!withSeed.length) continue;
-      withSeed.sort((a, b) => seed[a].x - seed[b].x);
+      // 排序键 (y,x)：超宽层拆行是行主序（行内从左、行间从上到下），
+      // 按 (y,x) 行优先阅读序才能还原拆行前的层内数组序；只按 x 会把不同行搅在一起
+      withSeed.sort((a, b) => seed[a].y - seed[b].y || seed[a].x - seed[b].x);
       arr.length = 0;
       arr.push(...withSeed, ...withoutSeed);
     }
@@ -305,7 +310,22 @@ function layoutBase(nodes, edges, opts = {}) {
 
   // ---- 3b. 贪心交换：重心迭代收不住的局部交错，用代理交叉判据换开 ----
   // 大图跳过，控制计算量；只改 layers 内次序，后续坐标流程不变
-  if (nodes.length <= 800) greedySwapOrder(layers, es, backSet);
+  if (nodes.length <= 800) greedySwapOrder(layers, es, backSet, seed ? new Set(Object.keys(seed)) : null);
+
+  // ---- 3c. 种子收尾：重心迭代和贪心交换都可能把旧节点拗离存档次序（存档次序
+  // 本身未必是重心不动点），最终以存档 x 次序为准恢复——新节点留在优化出的槽位上，
+  // 旧节点相对次序与上次布局完全一致，加节点不跳变
+  if (seed) {
+    for (const arr of layers) {
+      const seededIds = arr.filter((id) => seed[id] && Number.isFinite(seed[id].x));
+      if (seededIds.length < 2) continue;
+      const want = seededIds.slice().sort((a, b) => seed[a].y - seed[b].y || seed[a].x - seed[b].x);
+      let k = 0;
+      for (let i = 0; i < arr.length; i++) {
+        if (seed[arr[i]] && Number.isFinite(seed[arr[i]].x)) arr[i] = want[k++];
+      }
+    }
+  }
 
   // ---- 4. 尺寸 ----
   const widthOf = (n) => {
@@ -488,7 +508,16 @@ function layoutBase(nodes, edges, opts = {}) {
   // 7a. 超宽层拆行：按 x 序贪心装行，行内从左重排（对齐信息在几十个节点的宽层里本就不可读）
   const rowsOf = layers.map((arr, li) => {
     const g = layerGap[li];
-    const sorted = arr.slice().sort((a, b) => xFinal.get(a) - xFinal.get(b));
+    // 种子模式：旧节点按存档 (y,x) 阅读序排前（拆行是行主序，(y,x) 即拆行前的行内序），
+    // 新节点排后——旧节点落回上次的行与行内位置，新节点只往后追加、不挤开旧节点
+    const seededAt = (id) => !!(seed && seed[id] && Number.isFinite(seed[id].x));
+    const sorted = arr.slice().sort((a, b) => {
+      const sa = seededAt(a);
+      const sb = seededAt(b);
+      if (sa && sb) return seed[a].y - seed[b].y || seed[a].x - seed[b].x;
+      if (sa !== sb) return sa ? -1 : 1;
+      return xFinal.get(a) - xFinal.get(b);
+    });
     const totalW = sorted.reduce((s, id) => s + nodeW.get(id), 0) + g * (arr.length - 1);
     if (arr.length < 2 || totalW <= maxRowWidth) {
       return [{ ids: sorted, x0: Math.min(...sorted.map((id) => xFinal.get(id))) }];
@@ -917,7 +946,13 @@ export function layout(nodes, edges, opts = {}) {
   const candidates = [vertical];
 
   // 手工折线的位置有明确含义，自动旋转不会改写这类用户布局。
-  if (!edges.some((e) => e.custom && Array.isArray(e.points) && e.points.length >= 2) && nodes.length > 1) {
+  // 种子坐标按竖直方向的语义记录（层=行、x=行内次序），横版候选拿它排序属于轴错位，
+  // 且换向本身就是全图跳变——种子模式只保留竖直候选。
+  if (
+    !opts.seed &&
+    !edges.some((e) => e.custom && Array.isArray(e.points) && e.points.length >= 2) &&
+    nodes.length > 1
+  ) {
     const widthOf = (n) => {
       if (n.w) return n.w;
       const label = n.label || n.name || n.id;
@@ -966,6 +1001,8 @@ export function layout(nodes, edges, opts = {}) {
     const nodeById = new Map(current.nodes.map((n) => [n.id, n]));
     const order = current.nodes.slice().sort((a, b) => (degree.get(b.id) || 0) - (degree.get(a.id) || 0) || a.id.localeCompare(b.id));
     for (const n0 of order) {
+      // 种子模式：旧节点不参与单点重定位（挪旧节点=加节点引起跳变），只让新节点找落位
+      if (opts.seed && opts.seed[n0.id]) continue;
       let n = nodeById.get(n0.id);
       const points = [];
       for (const id of neighbors.get(n.id) || []) {
