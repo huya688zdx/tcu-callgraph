@@ -1,10 +1,12 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
 import { textWidth } from './layout-metrics.js';
+import { routeEdges, collectSegments } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
 const styleKey = (e) => `${e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
+const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
 
 export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true) {
   const root = { id: 'root', children: [], layoutOptions: {
@@ -76,15 +78,97 @@ export function facesOf(view) {
     [sideOf(nodes.get(e.from), e.points[0]), sideOf(nodes.get(e.to), e.points.at(-1))]);
 }
 
-export async function layoutElk(nodes, edges, { group = true, rootLabel = '' } = {}) {
+/** 用当前画面的相对位置驱动 ELK 的交互式分层，不读取固定坐标存档。 */
+function seedInteractive(graph, previous, initial) {
+  const positions = (view) => new Map([
+    ...view.nodes, ...(view.groups || []).map((n) => ({ ...n, id: 'box:' + n.id })),
+    ...(view.containers || []).map((n) => ({ ...n, id: 'box:' + n.id })),
+  ].map((n) => [n.id, n]));
+  const old = positions(previous), fresh = positions(initial);
+  const anchors = new Map(previous.nodes.map((n) => [n.id, n]));
+  const bottoms = new Map((previous.groups || []).map((g) => [g.id, g.y + g.h + 26]));
+  // 新节点优先延续同文件邻居的层次，放在已有内容下方，避免挤入旧顺序中间。
+  for (const n of initial.nodes) {
+    if (anchors.has(n.id)) continue;
+    const box = old.get('box:' + n.file);
+    if (!box) continue;
+    const edge = initial.edges.find((e) => {
+      const peer = anchors.get(e.from === n.id ? e.to : e.to === n.id ? e.from : null);
+      return peer?.file === n.file;
+    });
+    const peer = edge && anchors.get(edge.from === n.id ? edge.to : edge.from);
+    const x = peer ? edge.from === n.id ? peer.x - n.w - 52 : peer.x + peer.w + 52 : box.x + 14;
+    const p = { ...n, x, y: bottoms.get(n.file) };
+    fresh.set(n.id, p);
+    anchors.set(n.id, p);
+    bottoms.set(n.file, p.y + n.h + 26);
+  }
+  const walk = (parent, ox = 0, oy = 0) => {
+    Object.assign(parent.layoutOptions, {
+      'elk.layered.cycleBreaking.strategy': 'INTERACTIVE',
+      'elk.layered.layering.strategy': 'INTERACTIVE',
+      'elk.layered.crossingMinimization.semiInteractive': 'true',
+      'elk.layered.nodePlacement.strategy': 'INTERACTIVE',
+      'elk.separateConnectedComponents': 'false',
+    });
+    for (const n of parent.children || []) {
+      const p = old.get(n.id) || fresh.get(n.id);
+      n.x = p.x - ox;
+      n.y = p.y - oy;
+      (n.layoutOptions ||= {})['elk.position'] = `(${n.x},${n.y})`;
+      if (n.children) walk(n, p.x, p.y);
+    }
+  };
+  walk(graph);
+}
+
+export async function layoutElk(nodes, edges, { group = true, rootLabel = '', previous = null } = {}) {
   const ids = new Set(nodes.map((n) => n.id));
   edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
   const sized = nodes.map((n) => ({ ...n,
     w: n.w || Math.min(190, Math.max(120, textWidth(n.label || n.name || n.id) + 28 + (n.kind === 'var' ? 0 : 16))),
     h: n.h || (n.sub ? 58 : 44),
   }));
+  const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
+  const oldEdges = new Map((previous?.edges || []).map((e) => [edgeKey(e), e]));
+  // 没有新增节点时不移动已有内容；新增关系只补连线，删除则留下原来的空位。
+  if (previous && sized.every((n) => {
+    const old = oldNodes.get(n.id);
+    return old && old.file === n.file && old.w === n.w && old.h === n.h;
+  })) {
+    const files = new Set(sized.map((n) => n.file || 'unknown'));
+    const view = { width: previous.width, height: previous.height,
+      nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
+        ...(group ? { group: n.file || 'unknown' } : {}) })),
+      edges: edges.map((e) => ({ ...e, points: oldEdges.get(edgeKey(e))?.points.map((p) => [...p]) })),
+      groups: group ? (previous.groups || []).filter((g) => files.has(g.id)).map((g) => ({ ...g })) : [],
+      containers: group ? (previous.containers || []).filter((c) => c.root ||
+        [...files].some((file) => file.startsWith(c.id + '/'))).map((c) => ({ ...c })) : [],
+    };
+    const addedEdges = view.edges.filter((e) => !e.points);
+    if (addedEdges.length) routeEdges(view.nodes, addedEdges, {
+      existing: collectSegments(view.edges.filter((e) => e.points)),
+    });
+    for (const e of addedEdges) for (const [x, y] of e.points) {
+      view.width = Math.max(view.width, x + 40);
+      view.height = Math.max(view.height, y + 40);
+    }
+    for (const c of view.containers) if (c.root) {
+      c.w = Math.max(c.w, view.width);
+      c.h = Math.max(c.h, view.height);
+    }
+    return view;
+  }
   const first = converted(await elk.layout(graphOf(sized, edges, 'RIGHT', null, false, group)), sized, edges);
-  const result = await elk.layout(graphOf(sized, edges, 'RIGHT', facesOf(first), true, group));
+  const faces = facesOf(first);
+  if (previous) {
+    const priorFaces = facesOf(previous);
+    const oldFaces = new Map(previous.edges.map((e, i) => [edgeKey(e), priorFaces[i]]));
+    edges.forEach((e, i) => { if (oldFaces.has(edgeKey(e))) faces[i] = oldFaces.get(edgeKey(e)); });
+  }
+  const graph = graphOf(sized, edges, 'RIGHT', faces, true, group);
+  if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
+  const result = await elk.layout(graph);
   const view = converted(result, sized, edges);
   if (!group) for (const n of view.nodes) delete n.group;
   if (group && rootLabel) {

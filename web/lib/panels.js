@@ -218,7 +218,7 @@ function applyTreeSelection() {
   // 连续勾选时合并成一次请求，避免连点几下就闪几次
   selectTimer = setTimeout(() => {
     const ids = checkedIds();
-    hooks.loadView(ids.length ? ids : null);
+    hooks.loadView(ids.length ? ids : null, { incremental: !!ids.length });
   }, 120);
 }
 
@@ -439,7 +439,7 @@ let pickTimer;
 function searchPick(id) {
   const inView = state.view && state.view.nodes.some((n) => n.id === id);
   if (inView) return locateNode(id);
-  hooks.loadView([...state.roots, id]);
+  hooks.loadView([...state.roots, id], { incremental: true });
 }
 
 els.results.addEventListener('click', (e) => {

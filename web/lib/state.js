@@ -62,6 +62,8 @@ const state = {
   linkPos: null,
   /** 点击标题后的短暂高亮：{ box, until, dur } */
   flash: null,
+  /** 本次新加入的节点和连线，呼吸提示到期后自动清除。 */
+  recent: null,
 };
 
 const cam = { x: 0, y: 0, k: 1 };

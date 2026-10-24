@@ -152,7 +152,7 @@ async function toggleSelectedRelation() {
       state.hiddenVars.delete(chosen.v.id);
       roots = [...new Set([...roots, res.fn.id, chosen.peer.id])];
     }
-    await hooks.loadView(roots);
+    await hooks.loadView(roots, { incremental: true });
     if (state.view?.projectId !== projectId || df.root) return;
     df.root = res.fn.id;
     df.result = res;

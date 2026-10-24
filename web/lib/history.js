@@ -3,7 +3,7 @@
  */
 import { state, nodeById, edgeKey } from './state.js';
 import { api } from './api.js';
-import { draw } from './render.js';
+import { draw, pulseAdded } from './render.js';
 import { rerouteScope } from './geometry.js';
 const history = { stack: [], idx: -1, limit: 60, frozen: false };
 let labelWrites = Promise.resolve();
@@ -155,7 +155,7 @@ async function addManualEdge(from, to) {
   };
   state.view.edges.push(e);
   rerouteScope([e]); // 由共享路由器布线
-  draw();
+  pulseAdded([], [e]);
   await api.layout({
     root: layoutRootKey(),
     manual: collectManual(),

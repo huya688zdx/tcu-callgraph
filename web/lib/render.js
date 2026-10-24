@@ -3,7 +3,7 @@
  * 只读 state，不修改数据（updateGroups 例外：文件框跟随节点）
  */
 import { t } from '../i18n.js';
-import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile } from './state.js';
+import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 
@@ -14,6 +14,15 @@ import { drawEdgeLabels } from './edge-labels.js';
  * 1.3s 的高亮期内能叠出上百条并发全量重绘。这里保证同一时刻只有一条链。
  */
 let rafPending = false;
+let recentAlpha = 0;
+
+export function pulseAdded(nodes, edges) {
+  state.recent = nodes.length || edges.length ? {
+    nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
+    started: performance.now(), until: performance.now() + 6000,
+  } : null;
+  draw();
+}
 function scheduleDraw() {
   if (rafPending) return;
   rafPending = true;
@@ -90,6 +99,10 @@ function draw() {
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
   const H = cv.height / dpr;
+  const now = performance.now();
+  if (state.recent && now >= state.recent.until) state.recent = null;
+  recentAlpha = state.recent ? (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
+    Math.min(1, (state.recent.until - now) / 700) : 0;
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
@@ -181,6 +194,7 @@ function draw() {
       scheduleDraw();
     }
   }
+  if (state.recent) scheduleDraw();
 
   ctx.restore();
 
@@ -261,6 +275,19 @@ function drawEdge(ctx, e, related, selected) {
 
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
   const color = EDGE_COLOR[e.change] || EDGE_COLOR.existing;
+  if (recentAlpha && state.recent.edges.has(edgeKey(e))) {
+    ctx.save();
+    ctx.beginPath();
+    strokeRounded(ctx, pts);
+    ctx.strokeStyle = '#E69A16';
+    ctx.globalAlpha = recentAlpha;
+    ctx.lineWidth = 7 / cam.k;
+    ctx.shadowColor = '#E69A16';
+    ctx.shadowBlur = 10;
+    if (e.kind === 'var') ctx.setLineDash([7, 4]);
+    ctx.stroke();
+    ctx.restore();
+  }
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
@@ -350,6 +377,19 @@ function drawNode(ctx, n, nb = null) {
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const dimmed =
     state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
+
+  if (recentAlpha && state.recent.nodes.has(n.id)) {
+    ctx.save();
+    const gap = 5 / cam.k;
+    roundRect(ctx, x - gap, y - gap, w + gap * 2, h + gap * 2, 10);
+    ctx.strokeStyle = '#E69A16';
+    ctx.globalAlpha = recentAlpha;
+    ctx.lineWidth = 3 / cam.k;
+    ctx.shadowColor = '#E69A16';
+    ctx.shadowBlur = 12;
+    ctx.stroke();
+    ctx.restore();
+  }
 
   ctx.save();
   ctx.globalAlpha = dimmed ? 0.3 : 1;

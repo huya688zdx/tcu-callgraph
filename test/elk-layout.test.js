@@ -53,6 +53,40 @@ test('ELK 自递归线保留可见回环和两个不同的居中端口', async (
     '不能退化为同一直线往返');
 });
 
+test('增量布局保留已有顺序，删除新增项后其余坐标和路径不变', async () => {
+  const srv = await launchServer();
+  try {
+    const before = await (await fetch(srv.baseUrl + '/api/view?root=main.c::main')).json();
+    const nodes = [...before.nodes, { id: 'v', name: 'global_var', kind: 'var', file: 'main.c', w: 120, h: 44 }];
+    const edges = [...before.edges, { from: before.root, to: 'v', kind: 'var', line: 0 }];
+    const added = await layoutElk(nodes, edges, { previous: before });
+    const byId = new Map(added.nodes.map((n) => [n.id, n]));
+    const main = before.nodes.find((n) => n.id === before.root);
+    assert.ok(Math.abs(byId.get(main.id).y - main.y) < 60, '加入变量不应让入口函数大幅跳动');
+    for (const a of before.nodes) for (const b of before.nodes) {
+      if (a.group === b.group && a.y < b.y - 1) {
+        assert.ok(byId.get(a.id).y < byId.get(b.id).y, '保留同一文件中已有节点的纵向顺序');
+      }
+    }
+    const removed = await layoutElk(before.nodes, before.edges, { previous: added });
+    for (const n of removed.nodes) {
+      assert.deepEqual([n.x, n.y], [byId.get(n.id).x, byId.get(n.id).y], '删除不挪动剩余节点');
+    }
+    assert.deepEqual(removed.edges.map((e) => e.points), added.edges.slice(0, -1).map((e) => e.points));
+  } finally { await srv.close(); }
+});
+
+test('增量布局拒绝其他工程的画面坐标', async (t) => {
+  const srv = await launchServer();
+  t.after(() => srv.close());
+  const url = srv.baseUrl + '/api/view?root=main.c::main';
+  const previous = await (await fetch(url)).json();
+  previous.projectId++;
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ previous }) });
+  assert.equal(response.status, 409);
+});
+
 test('变量关系可单独移出并恢复，不影响同一函数的其他变量引用', async (t) => {
   const srv = await launchServer({ target: 'samples/shared-state' });
   t.after(() => srv.close());

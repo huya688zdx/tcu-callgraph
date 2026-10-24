@@ -427,7 +427,8 @@ async function buildView(
   dfNode = null,
   varSel = {},
   // 时间轴回看时传历史 overlay：视图构建逻辑完全复用，只是输入换了一份
-  viewOverlay = overlay
+  viewOverlay = overlay,
+  previous = null
 ) {
   const projectId = PROJECT.id;
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
@@ -569,7 +570,7 @@ async function buildView(
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
-  const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL });
+  const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -1206,6 +1207,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/view') {
+      let previous = null;
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        let body;
+        try { body = await readJson(req, res); } catch { return; }
+        previous = body.previous;
+        const rect = (n) => n && typeof n.id === 'string' &&
+          [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
+        if (!previous || !Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
+            !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
+            ![previous.width, previous.height].every(Number.isFinite) ||
+            ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
+          return bad(res, '增量布局数据无效');
+        }
+        const ids = new Set(previous.nodes.map((n) => n.id));
+        if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
+            Array.isArray(e.points) && e.points.length >= 2 &&
+            e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
+          return bad(res, '增量布局连线无效');
+        }
+        if (previous.projectId !== PROJECT.id) return json(res, { error: '增量布局不属于当前工程' }, 409);
+      }
       const rootsParam = u.searchParams.get('roots');
       const rootId = u.searchParams.get('root');
       const roots = rootsParam
@@ -1216,6 +1239,7 @@ const server = http.createServer(async (req, res) => {
       const up = Number(u.searchParams.get('up') || 0);
       const down = Number(u.searchParams.get('down') || 3);
       const group = u.searchParams.get('group') !== '0';
+      if (previous && !!previous.groups.length !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: split('vars'), skip: split('novars') };
@@ -1244,10 +1268,10 @@ const server = http.createServer(async (req, res) => {
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
         return json(
           res,
-          await buildView([pick.id], up, Math.max(down, 3), group, df, varSel, viewOverlay)
+          await buildView([pick.id], up, Math.max(down, 3), group, df, varSel, viewOverlay, previous)
         );
       }
-      return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay));
+      return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay, previous));
     }
 
     if (u.pathname === '/api/node') {

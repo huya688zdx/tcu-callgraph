@@ -6,8 +6,8 @@ import { applyI18n } from './i18n.js';
 import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
-import { fit } from './lib/camera.js';
-import { draw, resize } from './lib/render.js';
+import { fit, revealAdded, stopCamAnim } from './lib/camera.js';
+import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
@@ -35,7 +35,9 @@ const navStack = [];
 const NAV_MAX = 30;
 
 async function loadView(rootId, opts = {}) {
-  const { nav = true } = opts;
+  const { nav = true, incremental = false } = opts;
+  const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
+  stopCamAnim();
   // 记录跳转前的入口与视角，供 Ctrl+Z 回退
   if (nav && state.view && state.roots.length) {
     navStack.push({ roots: [...state.roots], cam: { x: cam.x, y: cam.y, k: cam.k } });
@@ -52,6 +54,7 @@ async function loadView(rootId, opts = {}) {
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
     at: state.at,
+    previous,
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   state.view = data;
@@ -67,7 +70,19 @@ async function loadView(rootId, opts = {}) {
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
-  fit();
+  if (!previous) fit();
+  const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
+  const oldEdges = new Set((previous?.edges || []).map(edgeKey));
+  const common = data.nodes.filter((n) => oldNodes.has(n.id));
+  // ELK 扩展层间通道可能整体平移文件框，用共同节点的中位偏移稳住屏幕位置。
+  if (common.length) for (const axis of ['x', 'y']) {
+    const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
+    cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
+  }
+  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
+  pulseAdded(addedNodes, addedEdges);
+  if (previous) revealAdded(addedNodes, addedEdges);
   renderDetail(null);
   renderLabelPanel();
   history.stack = [];
@@ -148,12 +163,7 @@ async function navigateBack() {
 
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
 async function reloadKeepCam() {
-  const before = { x: cam.x, y: cam.y, k: cam.k };
-  await loadView(state.roots.length ? state.roots : state.root, { nav: false });
-  cam.x = before.x;
-  cam.y = before.y;
-  cam.k = before.k;
-  draw();
+  await loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true });
 }
 
 async function deleteSelection() {
@@ -257,11 +267,11 @@ upgradeSelect(els.updepth);
 
 els.depth.addEventListener('change', () => {
   state.down = Number(els.depth.value);
-  loadView(state.root);
+  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
 });
 els.updepth.addEventListener('change', () => {
   state.up = Number(els.updepth.value);
-  loadView(state.root);
+  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
 });
 
 els.groupMode.addEventListener('change', () => {
