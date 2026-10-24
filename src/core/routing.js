@@ -754,6 +754,70 @@ function routeFanoutBus(list, ctx) {
   return true;
 }
 
+/**
+ * 同一目标的横向多源入边共用目标侧竖直干线（routeFanoutBus 的镜像）：
+ * 各源端口 → 水平支线 → 目标侧干线 → 水平短支线 → 按源位置展开的目标端口。
+ * 干线距目标入侧边 SPACING 整数倍，逐条候选通道要求避开所有节点矩形、
+ * 已布线段，且全组两段水平支线都畅通；都不行则放弃（由调用方逐边兜底）。
+ */
+function routeFaninBus(list, ctx) {
+  if (list.length < 2 || list.some((it) => it.e.fromSide || it.e.custom)) return false;
+  const side = list[0].sb; // 分组键已保证入侧一致（含显式 toSide 的情形）
+  const target = list[0].b;
+  const targetCx = target.x + target.w / 2;
+  const sourceCxs = list.map((it) => it.a.x + it.a.w / 2);
+  // 所有源都落在入侧同一外侧才谈得上汇流，否则干线得绕过目标本体
+  const fromLeft = side === 'left';
+  const aligned = fromLeft
+    ? sourceCxs.every((cx) => cx < targetCx - 8)
+    : sourceCxs.every((cx) => cx > targetCx + 8);
+  if (!aligned) return false;
+  const edgeX = fromLeft ? target.x : target.x + target.w; // 目标入侧边
+  const sign = fromLeft ? -1 : 1; // 干线在入侧外侧
+  const near = fromLeft
+    ? Math.max(...list.map((it) => it.e._p0[0]))
+    : Math.min(...list.map((it) => it.e._p0[0])); // 源端口最靠近目标的一端
+  const y1 = Math.min(...list.map((it) => Math.min(it.e._p0[1], it.e._p1[1])));
+  const y2 = Math.max(...list.map((it) => Math.max(it.e._p0[1], it.e._p1[1])));
+
+  let busX = null;
+  for (let k = 1; k <= 32; k++) {
+    const x = edgeX + sign * k * SPACING;
+    if (fromLeft ? x <= near : x >= near) break; // 越过源端口只会让支线折回源节点本体
+    if (vLineBlocked({ x, y1, y2 }, ctx.nodes, new Set())) continue;
+    if (hitsV(ctx.placed, x, y1, y2)) continue;
+    let clear = true;
+    for (const it of list) {
+      const p0 = it.e._p0;
+      const p1 = it.e._p1;
+      const branchSkip = new Set([it.a.id, it.b.id]);
+      if (
+        hLineBlocked({ y: p0[1], x1: p0[0], x2: x }, ctx.nodes, branchSkip) ||
+        hLineBlocked({ y: p1[1], x1: x, x2: p1[0] }, ctx.nodes, branchSkip)
+      ) {
+        clear = false;
+        break;
+      }
+    }
+    if (clear) {
+      busX = x;
+      break;
+    }
+  }
+  if (busX === null) return false;
+
+  // 全组校验通过后才统一登记，避免半途失败留下脏通道
+  addV(ctx.placed, busX, y1, y2);
+  for (const it of list) {
+    const p0 = it.e._p0;
+    const p1 = it.e._p1;
+    addH(ctx.placed, p0[1], p0[0], busX);
+    addH(ctx.placed, p1[1], busX, p1[0]);
+    it.e.points = collapse([p0, [busX, p0[1]], [busX, p1[1]], p1]);
+  }
+  return true;
+}
+
 // ---------------- 路由：直连（水平出线，一条垂直通道） ----------------
 
 function routeDirectH(e, a, b, sa, sb, ctx) {
@@ -1281,6 +1345,22 @@ export function routeEdges(nodes, edges, opts = {}) {
   }
   for (const list of fanouts.values()) {
     if (routeFanoutBus(list, ctx)) for (const it of list) bused.add(it);
+  }
+
+  // ---- fan-in 汇流：同一目标的横向多源入边共用目标侧竖直干线（routeFanoutBus 的镜像） ----
+  // 与 fan-out 相同的优先级：先尝试完整的多入口汇流，避免简单母线先吃掉其中一部分后破坏整体。
+  // 已被 fan-out 占用的边（其源端已并入出口干线）不再重复汇流，两端各自保持正常。
+  const fanins = new Map();
+  for (const it of items) {
+    if (bused.has(it) || it.type !== 'direct') continue;
+    if (it.sb !== 'left' && it.sb !== 'right') continue;
+    const sourceRegion = it.a.group ?? 'all';
+    const key = it.e.to + '\u0000' + (it.e.kind || 'direct') + '\u0000' + sourceRegion + '\u0000' + it.sb;
+    if (!fanins.has(key)) fanins.set(key, []);
+    fanins.get(key).push(it);
+  }
+  for (const list of fanins.values()) {
+    if (routeFaninBus(list, ctx)) for (const it of list) bused.add(it);
   }
 
   for (const keyFn of [(it) => it.e.from + '\u0000' + it.e.kind, (it) => it.e.to + '\u0000' + it.e.kind]) {
