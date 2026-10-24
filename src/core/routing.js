@@ -1132,6 +1132,49 @@ export function routeEdges(nodes, edges, opts = {}) {
   }
   const items = [...pairFirst.values()];
 
+  // ---- 出线面统一：同源的边尽量并到同一出线面（多数面吸收少数面），同目标同理。
+  // 面统一后「每面一口」才真正合成一个口，fan-out/fan-in 母线覆盖率随之上升。
+  // 目标在多数面的正后方（对侧）时不硬拗——绕穿源节点比多一个口更难看。
+  {
+    const isV = (s) => s === 'top' || s === 'bottom';
+    const retype = (sa, sb, old) => {
+      if (isV(sa) && isV(sb)) return old === 'long' ? 'long' : 'direct';
+      if (!isV(sa) && !isV(sb)) return 'direct';
+      return 'mixed';
+    };
+    const unify = (groupKey, sideKey, nodeKeyOf, otherKey) => {
+      const by = new Map();
+      for (const it of items) {
+        const k = groupKey(it);
+        if (!by.has(k)) by.set(k, []);
+        by.get(k).push(it);
+      }
+      for (const list of by.values()) {
+        if (list.length < 2) continue;
+        const count = new Map();
+        for (const it of list) count.set(it[sideKey], (count.get(it[sideKey]) || 0) + 1);
+        if (count.size < 2) continue;
+        let major = null;
+        for (const [s, c] of count) if (!major || c > count.get(major)) major = s;
+        for (const it of list) {
+          if (it[sideKey] === major) continue;
+          const n = it[nodeKeyOf];
+          const o = it[otherKey];
+          const oCx = o.x + o.w / 2;
+          const oCy = o.y + o.h / 2;
+          if (major === 'right' && oCx < n.x) continue;
+          if (major === 'left' && oCx > n.x + n.w) continue;
+          if (major === 'bottom' && oCy < n.y) continue;
+          if (major === 'top' && oCy > n.y + n.h) continue;
+          it[sideKey] = major;
+          it.type = retype(it.sa, it.sb, it.type);
+        }
+      }
+    };
+    unify((it) => it.e.from, 'sa', 'a', 'b');
+    unify((it) => it.e.to, 'sb', 'b', 'a');
+  }
+
   assignPorts(items, nodeMap);
 
   // 稳定排序：直连 → 混合 → 长边；同类型按端口 y 再 x

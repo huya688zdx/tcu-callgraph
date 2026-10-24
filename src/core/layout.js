@@ -182,6 +182,70 @@ function layoutBase(nodes, edges, opts = {}) {
     }
   }
 
+  // ---- 3b. 贪心交换：重心迭代收不住的局部交错，用相邻层直连边的代理交叉判据换开 ----
+  // 代理交叉：跨同一相邻层对 (i, i+1) 的两条边，源端次序与目标端次序相反记 1 个。
+  // 只交换层内次序（坐标仍走后续管线）；大图跳过，控制计算量。
+  if (nodes.length <= 800) {
+    const adj = new Map(); // 层对 la -> 跨该层对的边
+    for (const e of es) {
+      if (backSet.has(e) || e.from === e.to) continue;
+      const la = layerIdx.get(e.from);
+      if (layerIdx.get(e.to) !== la + 1) continue;
+      if (!adj.has(la)) adj.set(la, []);
+      adj.get(la).push(e);
+    }
+    const pairOf = (e) => adj.get(layerIdx.get(e.from)) || [];
+    const crossWith = (e, list) => {
+      let c = 0;
+      const pf = pos.get(e.from);
+      const pt = pos.get(e.to);
+      for (const o of list) {
+        if (o === e) continue;
+        if ((pf - pos.get(o.from)) * (pt - pos.get(o.to)) < 0) c++;
+      }
+      return c;
+    };
+    const incident = new Map();
+    const incidentOf = (id) => {
+      if (!incident.has(id)) {
+        const out = [];
+        for (const list of adj.values()) {
+          for (const e of list) if (e.from === id || e.to === id) out.push(e);
+        }
+        incident.set(id, out);
+      }
+      return incident.get(id);
+    };
+    const swapIfBetter = (arr, i) => {
+      const a = arr[i];
+      const b = arr[i + 1];
+      if (a === undefined || b === undefined) return;
+      const mine = [...incidentOf(a), ...incidentOf(b)];
+      const before = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
+      arr[i] = b;
+      arr[i + 1] = a;
+      pos.set(a, i + 1);
+      pos.set(b, i);
+      const after = mine.reduce((s, e) => s + crossWith(e, pairOf(e)), 0);
+      if (after < before) return; // 交换收益为正，保留
+      arr[i] = a;
+      arr[i + 1] = b;
+      pos.set(a, i);
+      pos.set(b, i + 1);
+    };
+    for (let sweep = 0; sweep < 2; sweep++) {
+      const down = sweep % 2 === 0;
+      const seq = [];
+      if (down) for (let i = 0; i < layers.length; i++) seq.push(i);
+      else for (let i = layers.length - 1; i >= 0; i--) seq.push(i);
+      for (const li of seq) {
+        const arr = layers[li];
+        if (down) for (let i = 0; i < arr.length - 1; i++) swapIfBetter(arr, i);
+        else for (let i = arr.length - 2; i >= 0; i--) swapIfBetter(arr, i);
+      }
+    }
+  }
+
   // ---- 4. 尺寸 ----
   const widthOf = (n) => {
     if (n.w) return n.w;
@@ -547,7 +611,7 @@ function overlapsAny(nodes, idx) {
   return false;
 }
 
-function routeLengthAndCrossings(edges) {
+export function routeLengthAndCrossings(edges) {
   const horizontal = [];
   const vertical = [];
   const pathKeys = new Set();
@@ -1105,7 +1169,9 @@ export function layoutPartitioned(items, edges, opts = {}) {
       colH,
     };
   };
-  for (let R = 1; R <= m; R++) {
+  // forceR：固定列内单元数，只排这一种（局部搜索低成本重排评测用）
+  const rList = opts.forceR ? [Math.max(1, Math.min(m, opts.forceR))] : [];
+  for (const R of rList.length ? rList : Array.from({ length: m }, (_, i) => i + 1)) {
     const candidate = placeUnits(R);
     const W = candidate.width;
     const H = candidate.height;
@@ -1131,6 +1197,8 @@ export function layoutPartitioned(items, edges, opts = {}) {
     height: best.height,
     columns: best.columns,
     ranks: best.ranks,
+    R: best.R,
+    score: best.score,
   };
 }
 
@@ -1360,7 +1428,38 @@ export function layoutGrouped(nodes, edges, opts = {}) {
           return (metrics.length - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
         }
       : null;
-    const laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
+    let laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
+
+    // ---- 度量驱动微调：同 rank 相邻文件框交换，实测布线得分下降且长宽比不明显恶化才采纳 ----
+    // 只换同 rank（同级无前向边，交换安全）；固定 R 重排，评测成本 = 一次 placeUnits + 一次实测
+    if (scorePlacement && cn.length >= 2) {
+      const t0 = Date.now();
+      let evals = 0;
+      const wire = scorePlacement(laid.pos, laid.width, laid.height);
+      const baseAspectErr = Math.abs(Math.log(laid.width / Math.max(1, laid.height)));
+      let bestWire = wire;
+      for (let i = 0; i + 1 < cn.length; i++) {
+        if (evals >= 16 || Date.now() - t0 > 400) break;
+        if (cn[i].rank !== cn[i + 1].rank) continue;
+        const swapped = cn.slice();
+        [swapped[i], swapped[i + 1]] = [swapped[i + 1], swapped[i]];
+        const alt = layoutPartitioned(swapped, childEdgesOf(node), {
+          ...BOX,
+          scorePlacement,
+          forceR: laid.R,
+        });
+        evals++;
+        const altErr = Math.abs(Math.log(alt.width / Math.max(1, alt.height)));
+        if (altErr > baseAspectErr + 0.15) continue;
+        // 采纳判据与初值同口径：scorePlacement 的实测布线得分
+        const altWire = scorePlacement(alt.pos, alt.width, alt.height);
+        if (altWire < bestWire - 0.01) {
+          bestWire = altWire;
+          cn.splice(0, cn.length, ...swapped);
+          laid = alt;
+        }
+      }
+    }
     const byId = new Map(list.map((c) => [c.path, c]));
     for (const it of cn) {
       const c = byId.get(it.id);
