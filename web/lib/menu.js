@@ -6,6 +6,7 @@ import { hideMenu, showMenu, showMenuSections } from './ctxmenu.js';
 import { api } from './api.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
+import { fullReroute } from './geometry.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { renderLabelPanel } from './label-panel.js';
 import { df, expandDataflow, clearDataflow } from './df.js';
@@ -61,6 +62,7 @@ async function setNodeChange(n, change) {
 
 async function setEdgeChange(edge, change) {
   edge.change = change;
+  fullReroute(); // 颜色变化后立即分开原先共用的线路。
   draw();
   await api.overlay({ edgeKey: edgeKey(edge), data: { change } });
   pushHistory();

@@ -3,7 +3,7 @@
  * 不涉及 DOM 绘制，方便单独测试
  */
 import { state } from './state.js';
-import { routeEdges, collectSegments } from '/core/routing.js';
+import { routeEdges, collectSegments, pathBlockedByNodes } from '/core/routing.js';
 /** 节点只能在所属文件框内移动，避免跑出框外导致结构散架 */
 function clampToGroup(n) {
   const v = state.view;
@@ -47,6 +47,25 @@ function moveNodeNoOverlap(n, tx, ty) {
 
   n.x = tx;
   n.y = ty;
+  // 相连函数的中心相差很小时吸附对齐，消掉手拖产生的几像素台阶；不跨过碰撞约束。
+  const related = new Set();
+  for (const e of state.view?.edges || []) {
+    if (e.from === n.id) related.add(e.to);
+    if (e.to === n.id) related.add(e.from);
+  }
+  for (const [axis, size] of [['x', 'w'], ['y', 'h']]) {
+    let offset = 0;
+    let distance = 8;
+    for (const other of state.view?.nodes || []) {
+      if (!related.has(other.id)) continue;
+      const delta = other[axis] + other[size] / 2 - n[axis] - n[size] / 2;
+      if (Math.abs(delta) < distance) {
+        distance = Math.abs(delta);
+        offset = delta;
+      }
+    }
+    n[axis] += offset;
+  }
   clampToGroup(n);
   if (!collidesWith(n)) return;
 
@@ -70,11 +89,11 @@ function edgePoints(e) {
 }
 
 /** 对一组边做增量重路由（其余边的线段作为避让约束） */
-function rerouteScope(subset) {
+function rerouteScope(subset, preservePaths = false) {
   const v = state.view;
   if (!v || !subset.length) return;
   const others = v.edges.filter((e) => !subset.includes(e));
-  routeEdges(v.nodes, subset, { existing: collectSegments(others) });
+  routeEdges(v.nodes, subset, { existing: collectSegments(others), preservePaths });
 }
 
 /** 节点拖动过程中：只实时重路由与该节点相连的边 */
@@ -84,11 +103,17 @@ function liveReroute(nodeId) {
   rerouteScope(v.edges.filter((e) => e.from === nodeId || e.to === nodeId));
 }
 
-/** 全量重路由（拖拽结束等时机），并扩展画布尺寸 */
-function fullReroute() {
+/** 移动时仅重布受影响的线；颜色等全局变化时重布全部，并扩展画布尺寸。 */
+function fullReroute(movedIds = null) {
   const v = state.view;
   if (!v) return;
-  routeEdges(v.nodes, v.edges, { bounds: { minX: 40, maxX: Math.max(v.width, 600) } });
+  if (movedIds) {
+    const moved = v.nodes.filter((n) => movedIds.has(n.id));
+    rerouteScope(v.edges.filter((e) => movedIds.has(e.from) || movedIds.has(e.to) ||
+      pathBlockedByNodes(e.points, moved, new Set([e.from, e.to]))), true);
+  } else {
+    routeEdges(v.nodes, v.edges, { bounds: { minX: 40, maxX: Math.max(v.width, 600) } });
+  }
   let maxX = 0;
   let maxY = 0;
   for (const n of v.nodes) {

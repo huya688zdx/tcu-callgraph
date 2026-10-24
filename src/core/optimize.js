@@ -1,16 +1,16 @@
-// 交叉优化器：在最终布局上做实测驱动的局部搜索，唯一目标是折线交叉数。
+// 连线优化器：实测交叉与不允许合并的重叠，引导函数和变量摆位。
 //
 // 人工调图减少交叉的两招——挪函数位置、改出/入线面——各自对应搜索空间里的
 // 一类候选移动；每个候选都把完整路由管线（并面、母线、通道避让）重跑一遍，
-// 用真实的交叉计数裁决去留，而不是任何代理指标：
+// 用真实的交叉与重叠评分裁决去留，而不是任何代理指标：
 //   1. 面翻转：按（节点 × 出/入 × 线类型）整组换面，写成 faceHints 初值，
 //      不锁死——并面与母线照常运行，提示是否成立由实测交叉数决定
 //   2. 同组换位：交叉牵连的节点与同文件框伙伴（无分组则任意伙伴）交换坐标
 //   3. 就近移位：挪到每个邻居旁的四个空位（组模式下不得跨出所在文件框）
 // 硬约束：节点互不重叠；组模式节点留在本组框内；用户钉过的面、手动折线不动。
-// 预算：评估次数 / 耗时双上限，超了立刻停；交叉已为 0 时直接返回不进循环。
+// 预算：评估次数 / 耗时双上限，超了立刻停；没有交叉和重叠时直接返回。
 
-import { routeEdges } from './routing.js';
+import { routeEdges, edgeStyleKey, routeOverlapConflicts } from './routing.js';
 
 const FACES = ['top', 'bottom', 'left', 'right'];
 
@@ -58,7 +58,7 @@ function nodesOverlap(nodes) {
  * @param {object} opts
  *   - groupBoxes: Map<groupId, {x,y,w,h}> 有则启用组内约束（组模式）
  *   - maxEvals / maxMs: 评估预算
- * @returns {{crossings, gained, evals, ms}} 结束时 edges 里已是交叉最少的布线
+ * @returns {{crossings, gained, evals, ms}} 结束时 edges 里已是最终采纳的布线
  */
 export function optimizeCrossings(nodes, edges, opts = {}) {
   const maxEvals = opts.maxEvals ?? 1200;
@@ -92,12 +92,14 @@ export function optimizeCrossings(nodes, edges, opts = {}) {
         }
       }
     }
-    return { crossings: points.size, hits };
+    const overlaps = routeOverlapConflicts(edges);
+    for (const [id, length] of overlaps.hits) hits.set(id, (hits.get(id) || 0) + length / 40);
+    return { crossings: points.size, hits, score: points.size * 360 + overlaps.length * 4 };
   };
 
   let state = analyze();
-  let best = state.crossings;
-  const before0 = best;
+  let best = state.score;
+  const before0 = state.crossings;
   if (!best) return { crossings: 0, gained: 0, evals, ms: Date.now() - t0 };
 
   const hotNodes = () =>
@@ -118,7 +120,7 @@ export function optimizeCrossings(nodes, edges, opts = {}) {
     return true;
   };
 
-  // 试一次候选：apply() 改状态，返回 restore()；采纳与否由交叉数裁决
+  // 试一次候选：apply() 改状态，restore() 回退；采纳与否由交叉和重叠评分裁决
   const tryCandidate = (apply, restore) => {
     if (!budgetLeft()) return false;
     apply();
@@ -127,8 +129,8 @@ export function optimizeCrossings(nodes, edges, opts = {}) {
       return false;
     }
     const trial = analyze();
-    if (trial.crossings < best) {
-      best = trial.crossings;
+    if (trial.score < best) {
+      best = trial.score;
       state = trial;
       return true;
     }
@@ -149,7 +151,7 @@ export function optimizeCrossings(nodes, edges, opts = {}) {
           if (e.custom) continue;
           if (dir === 'from' ? e.from !== n.id : e.to !== n.id) continue;
           if (dir === 'from' ? pinnedFrom.has(e) : pinnedTo.has(e)) continue;
-          const k = e.kind || 'direct';
+          const k = edgeStyleKey(e);
           if (!groups.has(k)) groups.set(k, []);
           groups.get(k).push(e);
         }
@@ -260,5 +262,7 @@ export function optimizeCrossings(nodes, edges, opts = {}) {
     }
   }
 
-  return { crossings: best, gained: before0 - best, evals, ms: Date.now() - t0 };
+  // 被否决的候选只恢复了位置和面提示，折线仍属于该候选；按最终采纳状态恢复布线。
+  routeEdges(nodes, edges, { faceHints });
+  return { crossings: state.crossings, gained: before0 - state.crossings, evals, ms: Date.now() - t0 };
 }

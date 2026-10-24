@@ -279,16 +279,14 @@ els.groupMode.addEventListener('change', () => {
   loadView(state.root);
 });
 function applyLayoutMode() {
-  els.optimalLayout.textContent = t(state.fixed ? 'btn.fixed' : 'btn.auto');
-  els.optimalLayout.setAttribute('aria-pressed', String(state.fixed));
-  els.optimalLayout.classList.toggle('primary', state.fixed);
+  els.optimalLayout.textContent = t('btn.elk');
+  els.optimalLayout.title = t('btn.elkTitle');
 }
 
 els.optimalLayout.addEventListener('click', async () => {
-  state.fixed = !state.fixed;
+  state.fixed = false;
   state.selectedEdge = null;
   applyLayoutMode();
-  if (state.fixed) await savePositionsOnly(); // 切到固定：先把当前布局钉住
   loadView(state.roots.length ? state.roots : state.root);
 });
 els.fit.addEventListener('click', fit);

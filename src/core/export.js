@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { stats } from './index.js';
-import { layout } from './layout.js';
+import { layoutElk } from './layout-elk.js';
 import { roundedPathD } from './routing.js';
 
 export function buildSVGFromLayout(laid) {
@@ -74,8 +74,8 @@ function inlineJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
-export function exportSvg(model, outPath, opts = {}) {
-  const laid = layout(model.functions, model.edges, opts);
+export async function exportSvg(model, outPath, opts = {}) {
+  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
   const svg = buildSVGFromLayout(laid);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, svg, 'utf8');
@@ -83,8 +83,8 @@ export function exportSvg(model, outPath, opts = {}) {
 }
 
 /** 单文件 HTML：内嵌 SVG 与数据，双击即可离线查看 */
-export function exportHtml(model, outPath, opts = {}) {
-  const laid = layout(model.functions, model.edges, opts);
+export async function exportHtml(model, outPath, opts = {}) {
+  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
   const svg = buildSVGFromLayout(laid);
   const S = stats(model);
 

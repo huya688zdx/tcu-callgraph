@@ -4,9 +4,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
-import { layout, layoutGrouped, textWidth } from './core/layout.js';
-import { routeEdges } from './core/routing.js';
-import { optimizeCrossings } from './core/optimize.js';
+import { textWidth } from './core/layout.js';
+import { layoutElk } from './core/layout-elk.js';
+import { routeEdges, collectSegments, pathBlockedByNodes } from './core/routing.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
@@ -758,7 +758,7 @@ function fitContainers(containers, fileGroups) {
   grow(rootC, x0, y0, x1, y1, 22, 38, 22, 26);
 }
 
-function buildView(
+async function buildView(
   rootIds,
   up,
   down,
@@ -899,6 +899,7 @@ function buildView(
   }
 
   // 手动布局按「入口 + 模式」分开存：坐标只在生成它的那个视图里有效
+  viewEdges = viewEdges.map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
   const mode = group ? 'group' : 'flat';
   // 入口集合作为布局存档的 key：单入口时就是函数 id，与旧存档兼容
   const slot = optimal && !fixed ? {} : viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
@@ -908,13 +909,9 @@ function buildView(
   // 出框的坐标只可能是跨视图/跨深度的陈旧存档，直接丢弃并回落自动布局
   const savedNodes = slot.nodes || {};
 
-  // 存档坐标作重心初值（seeded barycenter，加节点不跳变）：
-  // 扁平模式且非 fixed 时，把该视图上次布局的存档坐标作为重心排序的初始次序传入
-  // layout()——旧节点保持相对次序，新加入的节点只引起局部挪动；
-  // group 模式的稳定性由下面的存档回填机制承担，fixed 模式直接钉存档坐标，均不传
-  const laid = group
-    ? layoutGrouped(clean, viewEdges, { rootLabel: ROOT_LABEL })
-    : layout(clean, viewEdges, fixed ? {} : { seed: savedNodes });
+  // 自动排版和初始路径统一由 ELK 生成；下面只恢复用户实际保存的调整。
+  const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL });
+  const autoPositions = new Map(laid.nodes.map((n) => [n.id, { x: n.x, y: n.y }]));
   const groupBox = new Map((laid.groups || []).map((bg) => [bg.id, bg]));
   const savedApplied = [];
   for (const n of laid.nodes) {
@@ -990,6 +987,7 @@ function buildView(
       line: 0,
       via: '手动',
       manual: true,
+      change: viewOverlay.edges?.[edgeKeyOf({ ...m, line: 0 })]?.change || 'existing',
     });
   }
 
@@ -1003,24 +1001,13 @@ function buildView(
     if (saved.toSide) e.toSide = saved.toSide;
     if (saved.custom && Array.isArray(saved.points) && saved.points.length >= 2) {
       e.custom = true;
-      e.points = saved.points;
+      e.points = saved.points.map((p) => p.slice());
     }
-  }
-
-  // 基于最终节点位置统一重路由（严格正交）。
-  // 最优布局（非固定）模式在路由基础上跑实测交叉局部搜索：挪同组节点位置、
-  // 整组换出/入线面——每个候选完整重路由后按真实交叉数裁决，人工调图的
-  // 两招由算法自动完成；固定模式不跑（钉住的位置是用户所有物）
-  if (optimal && !fixed) {
-    const groupBoxes = laid.groups ? new Map(laid.groups.map((g) => [g.id, g])) : null;
-    optimizeCrossings(laid.nodes, laid.edges, { groupBoxes });
-  } else {
-    routeEdges(laid.nodes, laid.edges);
   }
 
   // 兜底：坐标若与当前布局不匹配（旧存档 / 手动拖拽），把文件框扩到包住节点，
   // 避免函数节点看起来脱离了所属文件的层级
-  if (laid.groups) {
+  if (laid.groups && savedApplied.length) {
     if (fixed) {
       // 固定布局的层级分离，顺序不能换：
       //   1. 文件框按节点实际位置「精确贴合」（可扩可缩）
@@ -1042,6 +1029,20 @@ function buildView(
       fitGroups(laid.groups, laid.nodes);
       fitContainers(laid.containers, laid.groups);
     }
+  }
+
+  // 只处理移动、手工调整或被新位置挡住的连线，其余保留 ELK 的全局结果。
+  const movedNodes = laid.nodes.filter((n) => {
+    const p = autoPositions.get(n.id);
+    return Math.abs(n.x - p.x) > 0.01 || Math.abs(n.y - p.y) > 0.01;
+  });
+  const movedIds = new Set(movedNodes.map((n) => n.id));
+  const affected = laid.edges.filter((e) => e.manual || savedEdges[edgeKeyOf(e)] ||
+    movedIds.has(e.from) || movedIds.has(e.to) ||
+    pathBlockedByNodes(e.points, movedNodes, new Set([e.from, e.to])));
+  if (affected.length) {
+    const unaffected = laid.edges.filter((e) => !affected.includes(e));
+    routeEdges(laid.nodes, affected, { existing: collectSegments(unaffected), preservePaths: true });
   }
 
   // 侧边车道可能超出画布：扩一下尺寸
@@ -1084,7 +1085,7 @@ function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots };
+  return { ...laid, root: g.root, roots, layoutEngine: 'elk' };
 }
 
 // ---- MCP（AI 访问）----
@@ -1260,14 +1261,14 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/export/svg' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((p) => {
+        .then(async (p) => {
           const rootId = typeof p.root === 'string' && p.root ? p.root : pickEntryId();
           if (!rootId) return bad(res, '工程里没有函数，无从导出');
           const up = Math.max(0, Number(p.up ?? 0) || 0);
           const down = Math.max(0, Number(p.down ?? 3) || 3);
           const group = p.group !== false;
           // 界面默认 optimal=1：导出与屏幕同款最优路径，导出的图不比看到的差
-          const view = buildView([rootId], up, down, group, null, true, {}, false, overlay);
+          const view = await buildView([rootId], up, down, group, null, true, {}, false, overlay);
           if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
           const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
           let name = typeof p.out === 'string' ? p.out.trim() : '';
@@ -1741,10 +1742,10 @@ const server = http.createServer(async (req, res) => {
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
         return json(
           res,
-          buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed, viewOverlay)
+          await buildView([pick.id], up, Math.max(down, 3), group, df, optimal, varSel, fixed, viewOverlay)
         );
       }
-      return json(res, buildView(roots, up, down, group, df, optimal, varSel, fixed, viewOverlay));
+      return json(res, await buildView(roots, up, down, group, df, optimal, varSel, fixed, viewOverlay));
     }
 
     if (u.pathname === '/api/node') {
@@ -1820,7 +1821,7 @@ const server = http.createServer(async (req, res) => {
       };
       const out = path.join(OUT, `view-${randomUUID()}.html`);
       res.on('close', () => fs.unlink(out, () => {}));
-      exportHtml(tmp, out);
+      await exportHtml(tmp, out);
       return sendFile(res, out, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Disposition': 'attachment; filename="callgraph.html"',

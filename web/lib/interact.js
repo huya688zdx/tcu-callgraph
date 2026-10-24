@@ -340,7 +340,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     // 拖拽期间每帧都要重布这些边：相关边与其他边线段只在这里算一次
     const related = state.view.edges.filter((ed) => ed.from === n.id || ed.to === n.id);
     const others = state.view.edges.filter((ed) => ed.from !== n.id && ed.to !== n.id);
-    dragCache = { related, segments: collectSegments(others) };
+    dragCache = { related, segments: collectSegments(others), paths: related.map((ed) => ed.points.map((p) => p.slice())) };
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
@@ -389,9 +389,10 @@ els.cv.addEventListener('pointermove', (e) => {
     const rawDy = (e.clientY - state.dragStart.y) / cam.k;
     moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
     if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
-    // 相连的边实时避障重布：用 pointerdown 时缓存的边集合与避让线段，不再每帧扫全表
+    // 从本次按下时的 ELK 路径调整端部，避免逐帧重新选面和改走廊。
     if (dragCache) {
-      routeEdges(state.view.nodes, dragCache.related, { existing: dragCache.segments });
+      dragCache.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => p.slice()); });
+      routeEdges(state.view.nodes, dragCache.related, { existing: dragCache.segments, preservePaths: true });
     }
     draw();
     return;
@@ -506,7 +507,7 @@ els.cv.addEventListener('pointerup', (e) => {
       justDragged = true;
       setTimeout(() => (justDragged = false), 260);
       modifiedNodes.add(dragNode.id);
-      fullReroute(); // 松手后全量避障重布
+      fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
       for (const ed of state.view.edges) {
         if (ed.custom) modifiedEdges.add(edgeKey(ed)); // 自定义边折线已随重锚定更新
       }

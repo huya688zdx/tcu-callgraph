@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 import { layoutPartitioned, layoutGrouped, routeLengthAndCrossings } from '../src/core/layout.js';
 import { routeEdges } from '../src/core/routing.js';
+import { loadModel, subgraph } from '../src/core/index.js';
+import { optimizeCrossings } from '../src/core/optimize.js';
 
 // forceR：固定列内单元数时只排这一种结构，返回值带 R 与列数
 test('layoutPartitioned 支持 forceR 固定列结构', () => {
@@ -121,4 +124,22 @@ test('layoutGrouped 已是最优次序时不交换且交叉数一致', () => {
   assert.equal(cross, 0, '预排最优序应为 0 交叉');
   const byId = new Map(res.groups.map((g) => [g.id, g]));
   assert.ok(byId.get('m/b.c').x < byId.get('m/a.c').x, '最优序保持 b.c 在左');
+});
+
+test('TCU 多函数视图：压实空白、接近方形，最终折线保留已采纳的优化', () => {
+  const model = loadModel(fileURLToPath(new URL('../samples/tcu', import.meta.url)));
+  const graph = subgraph(model, 'main.c::main', { up: 0, down: 3 });
+  const laid = layoutGrouped(graph.nodes.map(({ bodyTokens, ...n }) => n), graph.edges, { rootLabel: 'tcu' });
+  const before = routeLengthAndCrossings(laid.edges);
+  const result = optimizeCrossings(laid.nodes, laid.edges, {
+    groupBoxes: new Map(laid.groups.map((g) => [g.id, g])),
+    maxMs: 5000,
+  });
+  const metrics = routeLengthAndCrossings(laid.edges);
+  assert.equal(metrics.crossings, result.crossings, '不能留下已被否决候选的折线');
+  assert.ok(metrics.crossings <= before.crossings, '分开无关连线后仍应减少实际交叉');
+  assert.equal(metrics.overlapLength, 0, '不能靠无关连线或不同样式的重叠降低交叉数');
+  assert.ok(laid.width / laid.height >= 0.8 && laid.width / laid.height <= 1.25, '整体比例接近 1:1');
+  assert.ok(laid.groups.find((g) => g.id === 'can.c').h <= 330, '文件内不能残留整条大空白带');
+  assert.ok(metrics.sharedLength > 0, '同源和同目标调用应保留共享线段');
 });

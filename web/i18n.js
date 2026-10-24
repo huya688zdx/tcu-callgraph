@@ -20,6 +20,8 @@ const dict = {
     'btn.fixed': '固定布局',
     'btn.fixedTitle': '固定布局：增删函数/变量时保持现有位置，只有放不下才调整',
     'btn.auto': '自动布局',
+    'btn.elk': 'ELK 自动布局',
+    'btn.elkTitle': '默认使用 ELK 自动排版；点击按当前函数和变量重新排版',
     'btn.undo': '撤回 (Ctrl+Z)',
     'btn.redo': '重做 (Ctrl+Shift+Z)',
     'btn.svg': '导出 SVG',

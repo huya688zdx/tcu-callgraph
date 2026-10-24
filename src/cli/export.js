@@ -21,10 +21,10 @@ const t0 = Date.now();
 const xlsx = await exportXlsx(model, path.join(outDir, 'callgraph.xlsx'));
 console.log(`[Excel] ${xlsx}`);
 
-const svg = exportSvg(model, path.join(outDir, 'callgraph.svg'));
+const svg = await exportSvg(model, path.join(outDir, 'callgraph.svg'));
 console.log(`[SVG]   ${svg}`);
 
-const html = exportHtml(model, path.join(outDir, 'callgraph.html'));
+const html = await exportHtml(model, path.join(outDir, 'callgraph.html'));
 console.log(`[HTML]  ${html}`);
 
 console.log(`[完成] ${Date.now() - t0} ms`);

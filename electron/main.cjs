@@ -4,6 +4,15 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const ROOT = path.resolve(__dirname, '..');
+const elkTrial = process.env.CALLGRAPH_LAYOUT_ENGINE === 'elk';
+if (elkTrial) {
+  // 试用窗口使用独立存档和实例锁，可以与原版同时打开。
+  app.setName('tcu-callgraph-elk-trial');
+  const trialData = path.join(ROOT, 'out', 'elk-trial', 'user-data');
+  fs.mkdirSync(trialData, { recursive: true });
+  app.setPath('userData', trialData);
+  process.env.CALLGRAPH_DB = path.join(trialData, 'callgraph.db');
+}
 
 /**
  * 单实例锁：两个实例会各起一个 server 子进程写同一个 SQLite 库，
@@ -172,7 +181,7 @@ function createWindow(url) {
     height: 960,
     minWidth: 1080,
     minHeight: 680,
-    title: 'TCU 调用关系图',
+    title: elkTrial ? 'ELK 调用关系图（试用）' : 'TCU 调用关系图',
     backgroundColor: '#F7F6F2',
     webPreferences: {
       contextIsolation: true,

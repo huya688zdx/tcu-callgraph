@@ -160,3 +160,20 @@ test('fan-out 与 fan-in 共存：同一目标的多入口汇流不破坏既有�
   for (const e of edges) assertOrthogonal(e.points, `${e.from}->${e.to}`);
   assertNoNodePenetration(edges, nodes);
 });
+
+test('跨层长边从上方汇入：合并最后的横段和居中入口', () => {
+  const nodes = [
+    { id: 'a', x: 40, y: 40, w: 120, h: 44 },
+    { id: 'b', x: 200, y: 140, w: 120, h: 44 },
+    { id: 'target', x: 400, y: 500, w: 120, h: 44 },
+  ];
+  const edges = ['a', 'b'].map((from) => ({
+    from, to: 'target', kind: 'direct', fromSide: 'bottom', toSide: 'top',
+  }));
+  routeEdges(nodes, edges);
+  assert.deepEqual(edges[0].points.slice(-2), edges[1].points.slice(-2), '目标前不能残留两层平行横线');
+  assert.deepEqual(edges[0].points.at(-1), [460, 500]);
+  assertSharedTrunk(edges, 2);
+  for (const e of edges) assertOrthogonal(e.points, `${e.from}->${e.to}`);
+  assertNoNodePenetration(edges, nodes);
+});

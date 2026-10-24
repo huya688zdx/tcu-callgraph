@@ -3,7 +3,7 @@
  *
  * 核心思路：
  *  1. 几何分类：按两端节点相对位置决定出/入边方向（可被 e.fromSide/e.toSide 覆盖）
- *  2. 端口分配：同一节点同侧的多条边按对端位置排序后沿边均匀展开
+ *  2. 端口分配：每个节点只使用上下左右四个边中点，同侧进出线共用
  *  3. 共线合并：同一对节点的同类型调用边共用一条折线（不同调用行不再平行重复）
  *  4. 公用母线：同源（或同目标）的同类型同色直连边共享一条水平母线，只留竖直分支
  *  4.5 出线面统一：同源/同目标的边由多数面吸收少数面（代理交叉 + 折弯段数代价把关），
@@ -18,7 +18,6 @@
 export const SPACING = 13; // 相邻通道最小间距
 export const STUB = 15; // 端口引出线长度
 export const CLEAR = 5; // 节点四周安全间隙
-export const PORT_INSET = 8; // 端口距节点角落的最小距离
 export const LANE_BASE = 30; // 侧边车道离最外节点的起始距离
 export const LOOP_THRESHOLD = 200; // 跨度超过该值的长边走走廊/车道
 
@@ -27,23 +26,56 @@ const SIDES = new Set(['top', 'bottom', 'left', 'right']);
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
+/** 不同线型或变更颜色不能共用干线；入口处不可避免的短引线除外。 */
+export const edgeStyleKey = (e) => `${e.kind || 'direct'}|${e.change || 'existing'}`;
+
+function incompatibleOverlap(a, b) {
+  if (edgeStyleKey(a) === edgeStyleKey(b) &&
+    (a.from === b.from || a.to === b.to || (a.from === b.to && a.to === b.from))) return 0;
+  const A = a.points || [];
+  const B = b.points || [];
+  let length = 0;
+  for (let i = 1; i < A.length; i++) {
+    const axis = Math.abs(A[i][1] - A[i - 1][1]) < 0.5 ? 0 : 1;
+    for (let j = 1; j < B.length; j++) {
+      const otherAxis = Math.abs(B[j][1] - B[j - 1][1]) < 0.5 ? 0 : 1;
+      if (axis !== otherAxis || Math.abs(A[i][1 - axis] - B[j][1 - axis]) >= 0.5) continue;
+      length += Math.max(0, Math.min(Math.max(A[i][axis], A[i - 1][axis]), Math.max(B[j][axis], B[j - 1][axis])) -
+        Math.max(Math.min(A[i][axis], A[i - 1][axis]), Math.min(B[j][axis], B[j - 1][axis])));
+    }
+  }
+  const common = Number(a.from === b.from || a.from === b.to) +
+    Number(a.to !== a.from && (a.to === b.from || a.to === b.to));
+  return Math.max(0, length - common * STUB);
+}
+
+/** 摆位和路由使用同一口径，避免把无关线或不同样式的重叠算作合并收益。 */
+export function routeOverlapConflicts(edges) {
+  let length = 0;
+  const hits = new Map();
+  for (let i = 0; i < edges.length; i++) for (let j = i + 1; j < edges.length; j++) {
+    const overlap = incompatibleOverlap(edges[i], edges[j]);
+    if (overlap < 0.5) continue;
+    length += overlap;
+    for (const e of [edges[i], edges[j]]) for (const id of [e.from, e.to])
+      hits.set(id, (hits.get(id) || 0) + overlap);
+  }
+  return { length, hits };
+}
+
 // ---------------- 基础几何 ----------------
 
-/** 侧向端口位置：frac ∈ [0,1] 沿边分布（两端留 inset） */
-export function portAt(n, side, frac = 0.5) {
-  const along = (len) => {
-    const inset = Math.min(PORT_INSET, len / 4);
-    return inset + clamp(frac, 0, 1) * (len - 2 * inset);
-  };
+/** 每个节点严格只有上下左右四个居中连接点。 */
+export function portAt(n, side) {
   switch (side) {
     case 'top':
-      return [n.x + along(n.w), n.y];
+      return [n.x + n.w / 2, n.y];
     case 'bottom':
-      return [n.x + along(n.w), n.y + n.h];
+      return [n.x + n.w / 2, n.y + n.h];
     case 'left':
-      return [n.x, n.y + along(n.h)];
+      return [n.x, n.y + n.h / 2];
     default:
-      return [n.x + n.w, n.y + along(n.h)];
+      return [n.x + n.w, n.y + n.h / 2];
   }
 }
 
@@ -307,7 +339,8 @@ export function pathBlockedByNodes(points, nodes, skip) {
  * 找一条避开所有节点、且不穿过两端节点本体的正交外绕路径。
  * 车道按端口法向过滤：朝右出线的端口不允许选左侧车道，否则横段会从节点里穿过去。
  */
-function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixedFromSide, fixedToSide) {
+function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSide) {
+  let fallback = null;
   const sideOrder = (fixed, preferred) => {
     if (SIDES.has(fixed)) return [fixed];
     return [preferred, ...[...SIDES].filter((side) => side !== preferred)];
@@ -330,8 +363,8 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixed
   const away = (lane, from, dir) => dir === 0 || (lane - from) * dir >= -0.5;
   for (const sa of fromSides) {
     for (const sb of toSides) {
-      const p0 = portAt(a, sa, sa === fromSide && fromPoint ? sideFrac(a, sa, fromPoint) : 0.5);
-      const p1 = portAt(b, sb, sb === toSide && toPoint ? sideFrac(b, sb, toPoint) : 0.5);
+      const p0 = portAt(a, sa);
+      const p1 = portAt(b, sb);
       const s0 = [p0[0] + DIR[sa][0] * STUB, p0[1] + DIR[sa][1] * STUB];
       const s1 = [p1[0] + DIR[sb][0] * STUB, p1[1] + DIR[sb][1] * STUB];
       // 引出线：贴边不算穿框，但拐进本体要拒绝；其它节点照常避让
@@ -353,14 +386,17 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fromPoint, toPoint, fixed
         if (crossesEndpoints(points, a, b)) continue;
         const length = points.slice(1).reduce((sum, p, i) =>
           sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
-        const score = length + points.length * 6;
-        if (!best || score < best.score) best = { points, score };
+        const conflicts = ctx.currentEdge ? (ctx.routed || []).reduce((sum, e) =>
+          sum + incompatibleOverlap({ ...ctx.currentEdge, points }, e), 0) : 0;
+        const score = length + points.length * 6 + conflicts * 20;
+        if (!best || score < best.score) best = { points, score, conflicts };
       }
       // 优先保留原端口方向；只在该方向完全无安全通道时尝试其他端口侧。
-      if (best) return best.points;
+      if (best && best.conflicts < 0.5) return best.points;
+      if (best && (!fallback || best.score < fallback.score)) fallback = best;
     }
   }
-  return null;
+  return fallback?.points || null;
 }
 
 /** 直连通道被占时，沿所有节点包络之外绕行，避免退回穿过函数框。 */
@@ -484,41 +520,14 @@ function classify(e, a, b, hint) {
 // ---------------- 端口分配 ----------------
 
 /**
- * 每面一口制：同一节点同一面的所有出边共用一个出口（面中心），所有入边共用一个入口。
+ * 每面一口制：同一节点同一面的所有进出边共用该面的中心。
  * 不区分线类型——不同类型的边共用首段，后画的盖住先画的，视觉上是一根线从口里分叉。
- * 入口与出口在同一面共存时入口整体错开，避免出/入锚点同点对穿。
  * 用户显式钉过出/入面的边同样并入该面的口——用户钉的是面，不是点位。
  */
 function assignPorts(autos, nodeMap) {
-  const pools = new Map();
-  const add = (id, side, it, isOut) => {
-    const k = id + '|' + side;
-    if (!pools.has(k)) pools.set(k, []);
-    pools.get(k).push({ it, isOut });
-  };
   for (const it of autos) {
-    add(it.e.from, it.sa, it, true);
-    add(it.e.to, it.sb, it, false);
-  }
-  for (const [k, list] of pools) {
-    const [id, side] = k.split('|');
-    const n = nodeMap.get(id);
-    if (!n) continue;
-    const horiz = side === 'top' || side === 'bottom';
-    const len = Math.max(60, horiz ? n.w : n.h);
-    const outs = list.filter((x) => x.isOut);
-    const ins = list.filter((x) => !x.isOut);
-    const place = (arr, basePx) => {
-      if (!arr.length) return;
-      const frac = Math.min(0.92, Math.max(0.08, (len / 2 + basePx) / len));
-      const p = portAt(n, side, frac);
-      for (const x of arr) {
-        if (x.isOut) x.it.e._p0 = p;
-        else x.it.e._p1 = p;
-      }
-    };
-    place(outs, 0);
-    place(ins, outs.length ? 22 : 0);
+    it.e._p0 = portAt(nodeMap.get(it.e.from), it.sa);
+    it.e._p1 = portAt(nodeMap.get(it.e.to), it.sb);
   }
 }
 
@@ -719,8 +728,8 @@ function routeFanoutBus(list, ctx) {
   for (const yDir of [sa === 'bottom' ? 1 : -1]) {
     const sourceSide = yDir < 0 ? 'top' : 'bottom';
     const targetSide = yDir < 0 ? 'top' : 'bottom';
-    const p0 = portAt(source, sourceSide, 0.5);
-    const targetPorts = list.map((it) => portAt(it.b, targetSide, 0.5));
+    const p0 = portAt(source, sourceSide);
+    const targetPorts = list.map((it) => portAt(it.b, targetSide));
     const x1 = Math.min(p0[0], ...targetPorts.map((p) => p[0]));
     const x2 = Math.max(p0[0], ...targetPorts.map((p) => p[0]));
     const prefer = yDir < 0 ? minY - STUB : maxY + STUB;
@@ -764,68 +773,44 @@ function routeFanoutBus(list, ctx) {
   return true;
 }
 
-/**
- * 同一目标的横向多源入边共用目标侧竖直干线（routeFanoutBus 的镜像）：
- * 各源端口 → 水平支线 → 目标侧干线 → 水平短支线 → 按源位置展开的目标端口。
- * 干线距目标入侧边 SPACING 整数倍，逐条候选通道要求避开所有节点矩形、
- * 已布线段，且全组两段水平支线都畅通；都不行则放弃（由调用方逐边兜底）。
- */
+/** 四面汇流：只调整到达目标前的末段，保留源端已有的分叉干线和手工走线。 */
 function routeFaninBus(list, ctx) {
-  if (list.length < 2 || list.some((it) => it.e.fromSide || it.e.custom)) return false;
-  const side = list[0].sb; // 分组键已保证入侧一致（含显式 toSide 的情形）
-  const target = list[0].b;
-  const targetCx = target.x + target.w / 2;
-  const sourceCxs = list.map((it) => it.a.x + it.a.w / 2);
-  // 所有源都落在入侧同一外侧才谈得上汇流，否则干线得绕过目标本体
-  const fromLeft = side === 'left';
-  const aligned = fromLeft
-    ? sourceCxs.every((cx) => cx < targetCx - 8)
-    : sourceCxs.every((cx) => cx > targetCx + 8);
-  if (!aligned) return false;
-  const edgeX = fromLeft ? target.x : target.x + target.w; // 目标入侧边
-  const sign = fromLeft ? -1 : 1; // 干线在入侧外侧
-  const near = fromLeft
-    ? Math.max(...list.map((it) => it.e._p0[0]))
-    : Math.min(...list.map((it) => it.e._p0[0])); // 源端口最靠近目标的一端
-  const y1 = Math.min(...list.map((it) => Math.min(it.e._p0[1], it.e._p1[1])));
-  const y2 = Math.max(...list.map((it) => Math.max(it.e._p0[1], it.e._p1[1])));
-
-  let busX = null;
+  if (list.length < 2) return false;
+  const side = list[0].sb;
+  const axis = side === 'top' || side === 'bottom' ? 1 : 0;
+  const sign = DIR[side][axis];
+  const p1 = portAt(list[0].b, side);
   for (let k = 1; k <= 32; k++) {
-    const x = edgeX + sign * k * SPACING;
-    if (fromLeft ? x <= near : x >= near) break; // 越过源端口只会让支线折回源节点本体
-    if (vLineBlocked({ x, y1, y2 }, ctx.nodes, new Set())) continue;
-    if (hitsV(ctx.placed, x, y1, y2)) continue;
-    let clear = true;
+    const bus = p1[axis] + sign * k * SPACING;
+    const paths = [];
     for (const it of list) {
-      const p0 = it.e._p0;
-      const p1 = it.e._p1;
-      const branchSkip = new Set([it.a.id, it.b.id]);
-      if (
-        hLineBlocked({ y: p0[1], x1: p0[0], x2: x }, ctx.nodes, branchSkip) ||
-        hLineBlocked({ y: p1[1], x1: x, x2: p1[0] }, ctx.nodes, branchSkip)
-      ) {
-        clear = false;
-        break;
+      const pts = it.e.points;
+      // 直线本身无需绕弯，其余入边可以接入这根直线。
+      if (pts.length === 2) {
+        paths.push(pts);
+        continue;
       }
+      const hub = p1.slice();
+      hub[axis] = bus;
+      let prefix = pts.slice(0, -3).map((p) => p.slice());
+      let branch = pts.at(-3).slice();
+      if (!prefix.length) {
+        const sa = deriveSideStart(pts[0], pts[1]);
+        const stub = [pts[0][0] + DIR[sa][0] * STUB, pts[0][1] + DIR[sa][1] * STUB];
+        prefix = [pts[0], stub];
+        branch = stub.slice();
+      }
+      branch[axis] = bus;
+      const points = collapse([...prefix, branch, hub, p1]);
+      const skip = new Set([it.a.id, it.b.id]);
+      if (pathBlockedByNodes(points, ctx.nodes, skip) || crossesEndpoints(points, it.a, it.b)) break;
+      paths.push(points);
     }
-    if (clear) {
-      busX = x;
-      break;
-    }
+    if (paths.length !== list.length) continue;
+    list.forEach((it, i) => { it.e.points = paths[i]; });
+    return true;
   }
-  if (busX === null) return false;
-
-  // 全组校验通过后才统一登记，避免半途失败留下脏通道
-  addV(ctx.placed, busX, y1, y2);
-  for (const it of list) {
-    const p0 = it.e._p0;
-    const p1 = it.e._p1;
-    addH(ctx.placed, p0[1], p0[0], busX);
-    addH(ctx.placed, p1[1], busX, p1[0]);
-    it.e.points = collapse([p0, [busX, p0[1]], [busX, p1[1]], p1]);
-  }
-  return true;
+  return false;
 }
 
 // ---------------- 路由：直连（水平出线，一条垂直通道） ----------------
@@ -1048,9 +1033,8 @@ function routeLong(e, a, b, sa, sb, ctx) {
 
 function routeSelf(e, a, ctx) {
   const k = ctx.selfLoops++;
-  const fx = 0.72;
   const off = STUB + 8 + k * SPACING;
-  const x = a.x + a.w * fx;
+  const x = a.x + a.w / 2;
   const yb = a.y + a.h + STUB + 6;
   const yt = a.y - STUB - 6;
   const rx = a.x + a.w + off;
@@ -1088,31 +1072,42 @@ function deriveSideEnd(q, p) {
     : 'bottom';
 }
 
-function sideFrac(n, side, p) {
-  if (side === 'top' || side === 'bottom') return clamp((p[0] - n.x) / Math.max(1, n.w), 0.05, 0.95);
-  return clamp((p[1] - n.y) / Math.max(1, n.h), 0.05, 0.95);
-}
-
 /** 自定义边：端点重新锚定到节点端口，第二/倒数第二点对齐保持严格正交 */
-function retargetCustom(e, a, b) {
+function retargetCustom(e, a, b, keepBends = false) {
   const pts = e.points;
   const p0 = pts[0];
   const p1 = pts[pts.length - 1];
   const q0 = pts[1] || p0;
   const q1 = pts[pts.length - 2] || p1;
-  const sa = deriveSideStart(p0, q0);
-  const sb = deriveSideEnd(q1, p1);
-  const np0 = portAt(a, sa, sideFrac(a, sa, p0));
-  const np1 = portAt(b, sb, sideFrac(b, sb, p1));
+  const sa = SIDES.has(e.fromSide) ? e.fromSide : deriveSideStart(p0, q0);
+  const sb = SIDES.has(e.toSide) ? e.toSide : deriveSideEnd(q1, p1);
+  const np0 = portAt(a, sa);
+  const np1 = portAt(b, sb);
+  if (keepBends && pts.length >= 3) {
+    // 端部平移会撞框时，接回原来的拐点，保留远处母线和走廊。
+    const join = (p, q, side) => {
+      const horizontal = DIR[side][0] !== 0;
+      const axis = horizontal ? 0 : 1;
+      if (Math.abs(p[1 - axis] - q[1 - axis]) < 0.01) return [p];
+      const k = p[axis] + DIR[side][axis] * Math.min(STUB, Math.abs(q[axis] - p[axis]) / 2);
+      return horizontal ? [p, [k, p[1]], [k, q[1]]] : [p, [p[0], k], [q[0], k]];
+    };
+    e.points = [...join(np0, q0, sa), ...pts.slice(1, -1), ...join(np1, q1, sb).reverse()];
+    return { sa, sb };
+  }
   pts[0] = np0;
   pts[pts.length - 1] = np1;
 
   if (pts.length === 2) {
-    // 只有两点时补一个肘弯，保证不出现斜线
-    if (DIR[sa][1] !== 0) {
-      pts.splice(1, 0, [np1[0], np0[1]]);
+    // 原来是直线时，两端错位只在中间补 Z 形，仍沿端口法向出入。
+    if (DIR[sa][1] === 0 && DIR[sb][1] === 0) {
+      const x = (np0[0] + np1[0]) / 2;
+      pts.splice(1, 0, [x, np0[1]], [x, np1[1]]);
+    } else if (DIR[sa][0] === 0 && DIR[sb][0] === 0) {
+      const y = (np0[1] + np1[1]) / 2;
+      pts.splice(1, 0, [np0[0], y], [np1[0], y]);
     } else {
-      pts.splice(1, 0, [np0[0], np1[1]]);
+      pts.splice(1, 0, DIR[sa][1] ? [np0[0], np1[1]] : [np1[0], np0[1]]);
     }
     return { sa, sb };
   }
@@ -1137,6 +1132,7 @@ function retargetCustom(e, a, b) {
  * @param {object} opts
  *   - existing: {h:[{y,x1,x2}], v:[{x,y1,y2}]} 其他已布边的线段（作为避让约束，增量路由用）
  *   - bounds: {minX, maxX} 侧边车道参考边界（缺省用节点包络）
+ *   - preservePaths: 拖动时优先保留已有走廊，仅调整端部；碰撞时才重新寻路
  * @returns {placed, lanes, laneLeftMin, laneRightMax}
  */
 export function routeEdges(nodes, edges, opts = {}) {
@@ -1171,6 +1167,7 @@ export function routeEdges(nodes, edges, opts = {}) {
   ctx.placed.v.sort((u, v) => u.k - v.k);
 
   const autos = [];
+  const preserved = new Set();
   const restoreCustom = new Set();
   for (const e of edges) {
     const a = nodeMap.get(e.from);
@@ -1180,21 +1177,41 @@ export function routeEdges(nodes, edges, opts = {}) {
     if (a === b) {
       e.points = routeSelf(e, a, ctx);
       if (pathBlockedByNodes(e.points, nodes, new Set([a.id])) || pathCrossesBody(e.points, a)) {
-        const alt = routeAroundNodes(a, b, 'bottom', 'top', ctx, e.points[0], e.points.at(-1));
+        const alt = routeAroundNodes(a, b, 'bottom', 'top', ctx);
         if (alt && !pathCrossesBody(alt, a)) e.points = alt;
         else e.blocked = true; // 找不到安全绕行就保留原折线并标记，别把边丢掉
       }
       e.back = true;
       continue;
     }
-    if (e.custom && Array.isArray(e.points) && e.points.length >= 2) {
+    if ((e.custom || opts.preservePaths) && Array.isArray(e.points) && e.points.length >= 2) {
+      const original = opts.preservePaths ? e.points.map((p) => p.slice()) : null;
       const { sa, sb } = retargetCustom(e, a, b);
+      e.points = collapse(e.points);
       e.back = false;
-      if (!pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id])) && !crossesEndpoints(e.points, a, b)) continue;
+      // ELK 的紧凑通道可能只有几像素余量；拖动时不能因安全间距而推翻整条路径。
+      let blocked = opts.preservePaths
+        ? nodes.some((n) => pathCrossesBody(e.points, n))
+        : pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id])) || crossesEndpoints(e.points, a, b);
+      if (blocked && opts.preservePaths) {
+        e.points = original;
+        retargetCustom(e, a, b, true);
+        e.points = collapse(e.points);
+        blocked = nodes.some((n) => pathCrossesBody(e.points, n));
+      }
+      if (!blocked) {
+        preserved.add(e);
+        const segments = collectSegments([e]);
+        for (const s of segments.h) addH(ctx.placed, s.y, s.x1, s.x2);
+        for (const s of segments.v) addV(ctx.placed, s.x, s.y1, s.y2);
+        continue;
+      }
 
       // 自定义折线与函数框冲突时改用安全自动路由；保留 custom 标记供用户继续编辑。
-      e.custom = false;
-      restoreCustom.add(e);
+      if (e.custom) {
+        e.custom = false;
+        restoreCustom.add(e);
+      }
       const c = classify({ ...e, fromSide: e.fromSide || sa, toSide: e.toSide || sb }, a, b, opts.faceHints?.get(e));
       autos.push({ e, a, b, ...c });
       continue;
@@ -1206,7 +1223,7 @@ export function routeEdges(nodes, edges, opts = {}) {
 
   // ---- 共线合并：同一对节点、相同类型的调用边（不同调用行）只布一条折线 ----
   // 类型决定颜色（direct/macro/fnptr/manual 各不同色），跨类型不合并，避免遮盖错色
-  const pairKey = (e) => e.from + '\u0000' + e.to + '\u0000' + (e.kind || 'direct');
+  const pairKey = (e) => e.from + '\u0000' + e.to + '\u0000' + edgeStyleKey(e);
   const pairFirst = new Map();
   const pairDups = [];
   for (const it of autos) {
@@ -1215,6 +1232,15 @@ export function routeEdges(nodes, edges, opts = {}) {
     else pairFirst.set(k, it);
   }
   const items = [...pairFirst.values()];
+  for (const it of items) {
+    const p0 = portAt(it.a, it.sa);
+    const p1 = portAt(it.b, it.sb);
+    const d = DIR[it.sa];
+    it.straight = d[0] === -DIR[it.sb][0] && d[1] === -DIR[it.sb][1] &&
+      (p0[0] === p1[0] || p0[1] === p1[1]) &&
+      (p1[0] - p0[0]) * d[0] + (p1[1] - p0[1]) * d[1] > 0 &&
+      !pathBlockedByNodes([p0, p1], nodes, new Set([it.a.id, it.b.id]));
+  }
 
   // ---- 出线面统一：同源的边尽量并到同一出线面（多数面吸收少数面），同目标同理。
   // 面统一后「每面一口」才真正合成一个口，fan-out/fan-in 母线覆盖率随之上升（干线分组不含面键）。
@@ -1233,8 +1259,8 @@ export function routeEdges(nodes, edges, opts = {}) {
     // 估计折线：镜像各路由器的首选通道形状（H-H 贴源侧干线、V-V 走中间通道、mixed 取中点肘弯），
     // 只用于并面前后的交叉对比，不代表最终路由。
     const estPts = (n0, sa, n1, sb) => {
-      const p0 = portAt(n0, sa, 0.5);
-      const p1 = portAt(n1, sb, 0.5);
+      const p0 = portAt(n0, sa);
+      const p1 = portAt(n1, sb);
       if (isV(sa) && isV(sb)) {
         const m = (p0[1] + DIR[sa][1] * STUB + (p1[1] + DIR[sb][1] * STUB)) / 2;
         return collapse([p0, [p0[0], m], [p1[0], m], p1]);
@@ -1292,6 +1318,7 @@ export function routeEdges(nodes, edges, opts = {}) {
         let major = null;
         for (const [s, c] of count) if (!major || c > count.get(major)) major = s;
         for (const it of list) {
+          if (it.straight) continue; // 能直接接通的线不为并面而绕弯。
           if (it[sideKey] === major) continue;
           if (SIDES.has(it.e[pinnedKey])) continue; // 用户钉过面，不并
           const n = it[nodeKeyOf];
@@ -1345,11 +1372,20 @@ export function routeEdges(nodes, edges, opts = {}) {
   // 上下连接共用水平母线，左右连接共用竖直母线。
   // 母线成员必须同类型同色，不同颜色的线不得互相借用通道
   const bused = new Set();
+  for (const it of items) {
+    if (!it.straight) continue;
+    it.e.points = [it.e._p0, it.e._p1];
+    bused.add(it);
+    const [p0, p1] = it.e.points;
+    if (p0[0] === p1[0]) addV(ctx.placed, p0[0], p0[1], p1[1]);
+    else addH(ctx.placed, p0[1], p0[0], p1[0]);
+  }
   // 先尝试完整的高扇出组合（不分目标文件——跨文件扇出共用一根干线是主要减线手段），
   // 避免简单母线先吃掉其中一部分后破坏整体汇流。
   const fanouts = new Map();
   for (const it of items) {
-    const key = it.e.from + '\u0000' + (it.e.kind || 'direct');
+    if (bused.has(it)) continue;
+    const key = it.e.from + '\u0000' + edgeStyleKey(it.e);
     if (!fanouts.has(key)) fanouts.set(key, []);
     fanouts.get(key).push(it);
   }
@@ -1357,23 +1393,7 @@ export function routeEdges(nodes, edges, opts = {}) {
     if (routeFanoutBus(list, ctx)) for (const it of list) bused.add(it);
   }
 
-  // ---- fan-in 汇流：同一目标的横向多源入边共用目标侧竖直干线（routeFanoutBus 的镜像） ----
-  // 与 fan-out 相同的优先级：先尝试完整的多入口汇流，避免简单母线先吃掉其中一部分后破坏整体。
-  // 已被 fan-out 占用的边（其源端已并入出口干线）不再重复汇流，两端各自保持正常。
-  const fanins = new Map();
-  for (const it of items) {
-    if (bused.has(it) || it.type !== 'direct') continue;
-    if (it.sb !== 'left' && it.sb !== 'right') continue;
-    const sourceRegion = it.a.group ?? 'all';
-    const key = it.e.to + '\u0000' + (it.e.kind || 'direct') + '\u0000' + sourceRegion + '\u0000' + it.sb;
-    if (!fanins.has(key)) fanins.set(key, []);
-    fanins.get(key).push(it);
-  }
-  for (const list of fanins.values()) {
-    if (routeFaninBus(list, ctx)) for (const it of list) bused.add(it);
-  }
-
-  for (const keyFn of [(it) => it.e.from + '\u0000' + it.e.kind, (it) => it.e.to + '\u0000' + it.e.kind]) {
+  for (const keyFn of [(it) => it.e.from + '\u0000' + edgeStyleKey(it.e), (it) => it.e.to + '\u0000' + edgeStyleKey(it.e)]) {
     for (const axis of ['vertical', 'horizontal']) {
       for (const dir of [1, -1]) {
       const groups = new Map();
@@ -1430,8 +1450,6 @@ export function routeEdges(nodes, edges, opts = {}) {
       it.sa,
       it.sb,
       ctx,
-      it.e._p0,
-      it.e._p1,
       SIDES.has(it.e.fromSide) ? it.e.fromSide : null,
       SIDES.has(it.e.toSide) ? it.e.toSide : null
     );
@@ -1440,6 +1458,31 @@ export function routeEdges(nodes, edges, opts = {}) {
     } else {
       it.e.blocked = true;
     }
+  }
+
+  // 统一末段汇流，包含已做源端分叉的边；不能因为共享了出口就放弃合并入口。
+  const fanins = new Map();
+  for (const e of [...items.map((it) => it.e), ...edges.filter((e) => e.custom && !restoreCustom.has(e) && !opts.preservePaths)]) {
+    if (!nodeMap.has(e.from) || !nodeMap.has(e.to)) continue;
+    if (e.blocked || e.from === e.to || !e.points || e.points.length < 2) continue;
+    const sb = deriveSideEnd(e.points.at(-2), e.points.at(-1));
+    const key = e.to + '\u0000' + edgeStyleKey(e) + '\u0000' + sb;
+    if (!fanins.has(key)) fanins.set(key, []);
+    fanins.get(key).push({ e, a: nodeMap.get(e.from), b: nodeMap.get(e.to), sb });
+  }
+  for (const list of fanins.values()) routeFaninBus(list, ctx);
+
+  // 先保留手工线和可直连的线，再把冲突的长线分开；四个边中点始终不变。
+  ctx.routed = [...(opts.existing?.edges || []), ...preserved];
+  for (const it of items.slice().sort((a, b) => Number(b.straight) - Number(a.straight))) {
+    const overlap = ctx.routed.reduce((sum, e) => sum + incompatibleOverlap(it.e, e), 0);
+    if (overlap > 0.5) {
+      ctx.currentEdge = it.e;
+      const alt = routeAroundNodes(it.a, it.b, it.sa, it.sb, ctx, it.e.fromSide, it.e.toSide);
+      if (alt && ctx.routed.reduce((sum, e) => sum + incompatibleOverlap({ ...it.e, points: alt }, e), 0) < overlap - 0.5)
+        it.e.points = alt;
+    }
+    ctx.routed.push(it.e);
   }
 
   // 重复边直接复用首条折线（展示上完全重合 = 合并为一条线）
@@ -1479,7 +1522,7 @@ export function collectSegments(edges) {
       }
     }
   }
-  return { h, v };
+  return { h, v, edges };
 }
 
 /** 生成带圆角的 SVG path d（折点用二次贝塞尔过渡） */

@@ -6,7 +6,7 @@
  * 边路由统一交给 ./routing.js（前后端共享的正交路由器）
  */
 
-import { routeEdges, collectSegments, STUB, SPACING, PORT_INSET } from './routing.js';
+import { routeEdges, collectSegments, edgeStyleKey, routeOverlapConflicts, STUB, SPACING } from './routing.js';
 
 export function textWidth(s) {
   let w = 0;
@@ -67,12 +67,6 @@ function maxOverlap(intervals) {
     if (cur > best) best = cur;
   }
   return best;
-}
-
-/** 与路由器 portAt 一致的近似端口 x（沿节点边展开） */
-function spreadX(n, i, total) {
-  const inset = Math.min(PORT_INSET, n.w / 4);
-  return n.x + inset + ((i + 1) / (total + 1)) * Math.max(1, n.w - 2 * inset);
 }
 
 /** 跨相邻层对的直连边（贪心交换与代理交叉共用口径）：回边 / 自环 / 跨多层长边不计 */
@@ -476,34 +470,12 @@ function layoutBase(nodes, edges, opts = {}) {
 
   const gapHeights = gapEdges.map((list, li) => {
     if (!list.length) return gapY;
-    // 近似端口 x：与路由器同款「按对端位置排序后沿边展开」
-    const outMap = new Map();
-    const inMap = new Map();
-    for (const e of list) {
-      pushTo(outMap, e.from, e);
-      pushTo(inMap, e.to, e);
-    }
-    const sx = new Map();
-    const tx = new Map();
-    for (const [id, l] of outMap) {
-      const n = geo.get(id);
-      l.sort(
-        (p, q) =>
-          geo.get(q.to).x + geo.get(q.to).w / 2 - (geo.get(p.to).x + geo.get(p.to).w / 2)
-      );
-      l.forEach((e, i) => sx.set(e, spreadX(n, i, l.length)));
-    }
-    for (const [id, l] of inMap) {
-      const n = geo.get(id);
-      l.sort(
-        (p, q) =>
-          geo.get(q.from).x + geo.get(q.from).w / 2 - (geo.get(p.from).x + geo.get(p.from).w / 2)
-      );
-      l.forEach((e, i) => tx.set(e, spreadX(n, i, l.length)));
-    }
+    // 通道估算也使用边中点，不能再按多入口展开的旧端口规则占位。
     const intervals = list.map((e) => {
-      const a = sx.get(e);
-      const b = tx.get(e);
+      const source = geo.get(e.from);
+      const target = geo.get(e.to);
+      const a = source.x + source.w / 2;
+      const b = target.x + target.w / 2;
       return [Math.min(a, b), Math.max(a, b)];
     });
     const bands = Math.max(1, maxOverlap(intervals));
@@ -790,7 +762,7 @@ export function routeLengthAndCrossings(edges) {
   let rawLength = 0;
   for (const e of edges) {
     const pts = e.points || [];
-    const signature = pts.map((p) => `${Math.round(p[0])},${Math.round(p[1])}`).join(';');
+    const signature = edgeStyleKey(e) + ':' + pts.map((p) => `${Math.round(p[0])},${Math.round(p[1])}`).join(';');
     if (signature && !pathKeys.has(signature)) {
       pathKeys.add(signature);
       bends += Math.max(0, pts.length - 2);
@@ -813,7 +785,7 @@ export function routeLengthAndCrossings(edges) {
   const unionLength = (segments, axis, coord) => {
     const byLine = new Map();
     for (const s of segments) {
-      const key = Math.round(s[axis] / 2) * 2;
+      const key = edgeStyleKey(s.edge) + ':' + Math.round(s[axis] / 2) * 2;
       if (!byLine.has(key)) byLine.set(key, []);
       byLine.get(key).push([s[coord[0]], s[coord[1]]]);
     }
@@ -844,10 +816,11 @@ export function routeLengthAndCrossings(edges) {
       if (!related) intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
     }
   }
-  return { length, rawLength, sharedLength: Math.max(0, rawLength - length), crossings: intersections.size, bends };
+  const overlapLength = routeOverlapConflicts(edges).length;
+  return { length, rawLength, sharedLength: Math.max(0, rawLength - length - overlapLength), overlapLength, crossings: intersections.size, bends };
 }
 
-function normalizeCandidate(nodes, edges, padding) {
+function normalizeCandidate(nodes, edges, padding, trim = false) {
   let minX = Infinity;
   let minY = Infinity;
   let maxX = 0;
@@ -865,8 +838,9 @@ function normalizeCandidate(nodes, edges, padding) {
   }
   for (const e of edges) for (const p of e.points || []) take(p[0], p[1]);
   if (!Number.isFinite(minX)) return { width: padding * 2, height: padding * 2 };
-  const dx = Math.max(0, padding - minX);
-  const dy = Math.max(0, padding - minY);
+  // 搜索过程中保持坐标系稳定；最终再收回换位后空出的左侧和顶部空间。
+  const dx = trim ? padding - minX : Math.max(0, padding - minX);
+  const dy = trim ? padding - minY : Math.max(0, padding - minY);
   if (dx || dy) {
     for (const n of nodes) { n.x += dx; n.y += dy; }
     for (const e of edges) for (const p of e.points || []) { p[0] += dx; p[1] += dy; }
@@ -878,7 +852,9 @@ function normalizeCandidate(nodes, edges, padding) {
 
 function candidateScore(candidate) {
   if (overlapNodes(candidate.nodes)) return Infinity;
-  const { length, sharedLength, crossings, bends } = routeLengthAndCrossings(candidate.edges);
+  // 四面居中后，贴在一起的函数可能把调用线压成一个点，不能把丢掉的线当成优化收益。
+  if (candidate.edges.some((e) => !e.points || e.points.length < 2)) return Infinity;
+  const { length, sharedLength, overlapLength, crossings, bends } = routeLengthAndCrossings(candidate.edges);
   let width = candidate.width;
   let height = candidate.height;
   if (!Number.isFinite(width) || !Number.isFinite(height)) {
@@ -900,7 +876,7 @@ function candidateScore(candidate) {
   // 长宽比软约束：横向/纵向两个候选连线质量相近时，选更接近 1:1 的那个，
   // 避免长链图排出 1:N 的细长条（权重远小于线长，只在接近时起作用）
   const aspectPenalty = Math.abs(Math.log(Math.max(1e-3, width) / Math.max(1, height))) * 60;
-  return length - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008 + aspectPenalty;
+  return length - bundleCredit + overlapLength * 4 + crossings * 360 + bends * 16 + area * 0.00008 + aspectPenalty;
 }
 
 function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
@@ -919,7 +895,6 @@ function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
   const neighbors = new Map(currentNodes.map((n) => [n.id, new Set()]));
   const extDegree = new Map(currentNodes.map((n) => [n.id, 0]));
   const degree = new Map(currentNodes.map((n) => [n.id, 0]));
-  const fanoutTargets = new Map();
   for (const e of currentEdges) {
     const a = byId.get(e.from);
     const b = byId.get(e.to);
@@ -931,19 +906,11 @@ function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
     if (a.group !== b.group) {
       extDegree.set(a.id, extDegree.get(a.id) + 1);
       extDegree.set(b.id, extDegree.get(b.id) + 1);
-      if (!fanoutTargets.has(a.id)) fanoutTargets.set(a.id, new Set());
-      fanoutTargets.get(a.id).add(b.id);
     }
-  }
-  // 保持调用者锚点稳定，让多个目标仍可在各自文件框内靠拢以形成共享干线。
-  const bundledSources = new Set();
-  for (const [sourceId, targetIds] of fanoutTargets) {
-    if (targetIds.size < 2) continue;
-    bundledSources.add(sourceId);
   }
   const order = currentNodes.slice().sort(
     (a, b) => extDegree.get(b.id) - extDegree.get(a.id) || degree.get(b.id) - degree.get(a.id) || a.id.localeCompare(b.id)
-  ).filter((n) => extDegree.get(n.id) > 0 && !bundledSources.has(n.id)).slice(0, 24);
+  ).filter((n) => extDegree.get(n.id) > 0).slice(0, 24);
   let score = candidateScore({ nodes: currentNodes, edges: currentEdges });
 
   for (const original of order) {
@@ -1309,8 +1276,8 @@ export function layoutPartitioned(items, edges, opts = {}) {
       if (r < ra || r >= rb) continue;
       const a = approxX.get(e.from);
       const b = approxX.get(e.to);
-      const weight = Math.max(1, e.weight || 1);
-      ev.push([Math.min(a, b), weight], [Math.max(a, b), -weight]);
+      // weight 是聚合的调用次数，用于排序；同一对文件之间可以共用通道，不能按调用次数撑高间距。
+      ev.push([Math.min(a, b), 1], [Math.max(a, b), -1]);
     }
     ev.sort((u, v) => u[0] - v[0] || v[1] - u[1]);
     let cur = 0;
@@ -1329,6 +1296,7 @@ export function layoutPartitioned(items, edges, opts = {}) {
   };
   const m = units.length;
   let best = null;
+  const contentArea = Math.max(1, items.reduce((sum, it) => sum + it.w * it.h, 0));
   const placeUnits = (R) => {
     const C = Math.ceil(m / R);
     const colW = [];
@@ -1387,9 +1355,10 @@ export function layoutPartitioned(items, edges, opts = {}) {
     const bundleCredit = Math.min(metrics.length * 0.65, metrics.sharedLength * 1.1);
     const wireScore = scorePlacement
       ? scorePlacement(candidate.pos, candidate.width, candidate.height)
-      : (metrics.length - bundleCredit) / Math.max(1, W + H) + metrics.crossings * 2 + metrics.bends * 0.12;
+      : (metrics.length - bundleCredit + metrics.overlapLength * 4) / Math.max(1, W + H) + metrics.crossings * 2 + metrics.bends * 0.12;
     // 长宽比是首要目标（用户明确要求接近 1:1），连线质量只在长宽比相近的候选里起决定作用
-    const score = aspectScore * 4 + wireScore * 0.3;
+    // 同时计入空白占比，避免靠空出整列来换取方形画布。
+    const score = aspectScore * 4 + wireScore * 0.3 + W * H / contentArea;
     if (!best || score < best.score - 0.001) best = { ...candidate, score };
   }
 
@@ -1448,6 +1417,23 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       maxLabelWidth: 190,
       minGapX: 12,
     });
+    // 层拆行及局部换位会留下整条空白带；按节点实际占位压实，再由路由器重排通道。
+    // 只平移空白带后面的节点，保留层次和相对顺序，不缩放函数框。
+    if (!innerEdges.some((e) => e.custom)) {
+      for (const [axis, size, gap] of [['x', 'w', 26], ['y', 'h', 52]]) {
+        const sorted = laid.nodes.slice().sort((a, b) => a[axis] - b[axis]);
+        let end = -Infinity;
+        let shift = 0;
+        for (const n of sorted) {
+          const start = n[axis];
+          if (Number.isFinite(end)) shift += Math.max(0, start - end - gap);
+          end = Math.max(end, start + n[size]);
+          n[axis] -= shift;
+        }
+      }
+      routeEdges(laid.nodes, laid.edges);
+      Object.assign(laid, normalizeCandidate(laid.nodes, laid.edges, 14, true));
+    }
     for (const n of laid.nodes) n.y += headerH;
     for (const e of laid.edges) {
       if (e.points) for (const p of e.points) p[1] += headerH;
@@ -1626,10 +1612,14 @@ export function layoutGrouped(nodes, edges, opts = {}) {
             const dy = Math.abs((b.y + db.h / 2) - (a.y + da.h / 2));
             if (dx < dy * 1.15) fanoutAxisPenalty += Math.min(2, bundle.targets.size - 1) * 1.5;
           }
-          return (metrics.length - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
+          return (metrics.length - bundleCredit + metrics.overlapLength * 4) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
         }
       : null;
-    let laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
+    // 行宽跟随本层平均占位，宽文件单独成行；后续列装填负责让整体接近正方形。
+    const maxRowWidth = Math.max(2 * ((rest.minWidth ?? 120) + BOX.padding * 2) + BOX.gapX, Math.sqrt(cn.reduce(
+      (sum, c) => sum + (c.w + BOX.gapX) * (c.h + BOX.rowGap), 0
+    ) / cn.length));
+    let laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, maxRowWidth, scorePlacement });
 
     // ---- 度量驱动微调：同 rank 相邻的文件框试交换，实测 crossings 下降且长宽比不明显恶化才采纳 ----
     // 同 rank（同级）之间没有前向边，交换安全；固定 R 重排，评测成本 = 一次 placeUnits + 一次实测。
@@ -1646,6 +1636,7 @@ export function layoutGrouped(nodes, edges, opts = {}) {
         const t0 = Date.now();
         const alt = layoutPartitioned(swapped, childEdgesOf(node), {
           ...BOX,
+          maxRowWidth,
           scorePlacement,
           forceR: laid.R,
         });

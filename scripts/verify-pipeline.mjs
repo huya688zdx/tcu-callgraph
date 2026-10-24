@@ -77,6 +77,17 @@ function checkView(view, label) {
     if (n.x < g.x - 1 || n.y < g.y - 1 || n.x + n.w > g.x + g.w + 1 || n.y + n.h > g.y + g.h + 1)
       bad.push(`节点出框 ${n.id} 出 ${g.id}`);
   }
+  const nodeById = new Map((view.nodes || []).map((n) => [n.id, n]));
+  for (const e of view.edges || []) {
+    for (const [id, point] of [[e.from, e.points?.[0]], [e.to, e.points?.at(-1)]]) {
+      const n = nodeById.get(id);
+      if (!n || !point) continue;
+      const ports = [[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h],
+        [n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2]];
+      if (!ports.some((p) => Math.abs(p[0] - point[0]) < 0.5 && Math.abs(p[1] - point[1]) < 0.5))
+        bad.push(`连线脱离函数 ${e.from} → ${e.to}，端点 ${id}`);
+    }
+  }
   if (bad.length) {
     console.log(`\n❌ ${label}`);
     for (const b of bad.slice(0, 20)) console.log('   ' + b);

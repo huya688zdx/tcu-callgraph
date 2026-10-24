@@ -49,7 +49,7 @@ const state = {
   group: true,
   optimal: true,
   /** 固定布局：增删节点时保持现有位置，只有溢出才调整 */
-  fixed: true,
+  fixed: false,
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
   selectedLabel: null,
