@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
 import { layout, layoutGrouped, textWidth } from './core/layout.js';
 import { routeEdges } from './core/routing.js';
+import { optimizeCrossings } from './core/optimize.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
@@ -1006,8 +1007,16 @@ function buildView(
     }
   }
 
-  // 基于最终节点位置统一重路由（严格正交）
-  routeEdges(laid.nodes, laid.edges);
+  // 基于最终节点位置统一重路由（严格正交）。
+  // 最优布局（非固定）模式在路由基础上跑实测交叉局部搜索：挪同组节点位置、
+  // 整组换出/入线面——每个候选完整重路由后按真实交叉数裁决，人工调图的
+  // 两招由算法自动完成；固定模式不跑（钉住的位置是用户所有物）
+  if (optimal && !fixed) {
+    const groupBoxes = laid.groups ? new Map(laid.groups.map((g) => [g.id, g])) : null;
+    optimizeCrossings(laid.nodes, laid.edges, { groupBoxes });
+  } else {
+    routeEdges(laid.nodes, laid.edges);
+  }
 
   // 兜底：坐标若与当前布局不匹配（旧存档 / 手动拖拽），把文件框扩到包住节点，
   // 避免函数节点看起来脱离了所属文件的层级
@@ -1257,7 +1266,8 @@ const server = http.createServer(async (req, res) => {
           const up = Math.max(0, Number(p.up ?? 0) || 0);
           const down = Math.max(0, Number(p.down ?? 3) || 3);
           const group = p.group !== false;
-          const view = buildView([rootId], up, down, group, null, false, {}, false, overlay);
+          // 界面默认 optimal=1：导出与屏幕同款最优路径，导出的图不比看到的差
+          const view = buildView([rootId], up, down, group, null, true, {}, false, overlay);
           if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
           const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
           let name = typeof p.out === 'string' ? p.out.trim() : '';

@@ -450,7 +450,7 @@ function collapse(pts) {
 
 // ---------------- 分类 ----------------
 
-function classify(e, a, b) {
+function classify(e, a, b, hint) {
   let sa = SIDES.has(e.fromSide) ? e.fromSide : null;
   let sb = SIDES.has(e.toSide) ? e.toSide : null;
   let g0;
@@ -469,8 +469,10 @@ function classify(e, a, b) {
     g0 = dy >= 0 ? 'bottom' : 'top';
     g1 = dy >= 0 ? 'top' : 'bottom';
   }
-  sa = sa || g0;
-  sb = sb || g1;
+  // 面提示（faceHints，交叉优化器给的初值）：优先级低于用户钉面，高于几何判定；
+  // 不锁死——并面/母线照常运行，提示的价值由优化器实测交叉数裁决
+  sa = sa || (hint && SIDES.has(hint.from) ? hint.from : g0);
+  sb = sb || (hint && SIDES.has(hint.to) ? hint.to : g1);
   if (DIR[sa][1] !== 0 && DIR[sb][1] !== 0) {
     const span = DIR[sa][1] > 0 ? b.y - (a.y + a.h) : a.y - (b.y + b.h);
     return { sa, sb, type: span > LOOP_THRESHOLD ? 'long' : 'direct' };
@@ -1193,11 +1195,11 @@ export function routeEdges(nodes, edges, opts = {}) {
       // 自定义折线与函数框冲突时改用安全自动路由；保留 custom 标记供用户继续编辑。
       e.custom = false;
       restoreCustom.add(e);
-      const c = classify({ ...e, fromSide: e.fromSide || sa, toSide: e.toSide || sb }, a, b);
+      const c = classify({ ...e, fromSide: e.fromSide || sa, toSide: e.toSide || sb }, a, b, opts.faceHints?.get(e));
       autos.push({ e, a, b, ...c });
       continue;
     }
-    const c = classify(e, a, b);
+    const c = classify(e, a, b, opts.faceHints?.get(e));
     e.back = c.sa === 'top';
     autos.push({ e, a, b, ...c });
   }
