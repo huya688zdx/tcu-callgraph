@@ -1,7 +1,7 @@
 /**
  * 分层布局（Sugiyama 简化版）
  * 找回边 → Kahn 分层（压缩空层）→ 重心法减少交叉 →
- * 优先级对齐分配 x（子随父 / 父就子两遍取平均，空间随结构展开）→
+ * Brandes-Köpf 中位对齐分配 x（子随父 / 父就子双向迭代 + 目标占用去重，长边拉直）→
  * 通道需求估算层间高度 → 坐标分配
  * 边路由统一交给 ./routing.js（前后端共享的正交路由器）
  */
@@ -347,9 +347,11 @@ function layoutBase(nodes, edges, opts = {}) {
     return Math.max(minGapX, Math.min(gapX, gapX * k));
   });
 
-  // ---- 5. x 坐标：优先级对齐（子随父 / 父就子，两遍取平均）----
-  // 逐层居中会让窄层全部挤向中线、两侧大片留白；改为按邻接关系对齐，
-  // 节点跟随其在图中的结构位置展开，空间随结构自然分配。
+  // ---- 5. x 坐标：Brandes-Köpf 中位对齐（简化实现，长边拉直）----
+  // 逐层居中会让窄层全部挤向中线、两侧大片留白；改为双向对齐，空间随结构自然展开：
+  // 方向 A 自顶向下「子对齐父」、方向 B 自底向上「父就齐子」，各迭代一~两遍让期望稳定；
+  // 每层维护「已占用的对齐目标集合」，一个父/子节点只被一个节点认领，
+  // 防止多个节点挤向同一目标；对齐结果即时写回 xCur 逐层传播，链式长边在一遍内拉直。
   const packCentered = (li) => {
     const arr = layers[li];
     const g = layerGap[li];
@@ -396,33 +398,51 @@ function layoutBase(nodes, edges, opts = {}) {
     for (const id of arr) out.set(id, x.get(id) + shift);
   };
 
-  const alignPass = (down, from) => {
-    const out = new Map(from);
+  // 单方向一遍对齐：down=true 取前驱（子对齐父），down=false 取后继（父就齐子）。
+  // xOut 记录该方向的期望（只对有邻接的节点赋值），xCur 始终保存各方向最新一轮的对齐结果，
+  // 下一层立刻读到上一层刚对齐的位置——这正是长边被逐层拉直的机制。
+  const alignOnce = (down, xCur, xOut) => {
     const seq = [];
     if (down) for (let i = 0; i < layers.length; i++) seq.push(i);
     else for (let i = layers.length - 1; i >= 0; i--) seq.push(i);
     for (const li of seq) {
-      const desired = new Map();
+      const used = new Set(); // 本层已被认领的对齐目标：一个父/子只拉直一条边
       for (const id of layers[li]) {
         const nb = down ? preds.get(id) || [] : succs.get(id) || [];
+        const free = nb.filter((t) => !used.has(t));
+        // 目标全被认领时退回全部邻居求均值，保住邻接牵引；全无邻接则保持 xInit 锚点
+        const use = free.length ? free : nb;
+        if (!use.length) continue;
         let s = 0;
-        let c = 0;
-        for (const t of nb) {
-          s += out.get(t) + nodeW.get(t) / 2;
-          c++;
-        }
-        desired.set(id, c ? s / c - nodeW.get(id) / 2 : xInit.get(id));
+        for (const t of use) s += xCur.get(t) + nodeW.get(t) / 2;
+        const want = s / use.length - nodeW.get(id) / 2;
+        xOut.set(id, want);
+        xCur.set(id, want);
+        for (const t of use) used.add(t);
       }
-      placeLayer(li, desired, out);
     }
-    return out;
   };
 
-  const xDown = alignPass(true, xInit); // 子对齐父
-  const xUp = alignPass(false, xInit); // 父对齐子
-  const xAvg = new Map(ids.map((id) => [id, (xDown.get(id) + xUp.get(id)) / 2]));
+  const xCur = new Map(xInit); // 迭代过程中的当前 x
+  const xA = new Map(); // 方向 A 期望：子对齐父（只有被前驱牵引到的节点有值）
+  const xB = new Map(); // 方向 B 期望：父就齐子（只有被后继牵引到的节点有值）
+  alignOnce(true, xCur, xA); // 先 A 一遍
+  alignOnce(false, xCur, xB); // 再 B 一遍
+  alignOnce(true, xCur, xA); // 再 A 一遍，让两个方向的期望互相看齐后稳定
+
+  // 期望 x = 两方向均值；只有单侧邻接的节点直接取该侧结果，全无邻接的用 xInit 锚点
+  const desired = new Map();
+  for (const id of ids) {
+    const da = xA.get(id);
+    const db = xB.get(id);
+    if (da !== undefined && db !== undefined) desired.set(id, (da + db) / 2);
+    else if (da !== undefined) desired.set(id, da);
+    else if (db !== undefined) desired.set(id, db);
+    else desired.set(id, xInit.get(id));
+  }
+
   const xFinal = new Map();
-  for (let li = 0; li < layers.length; li++) placeLayer(li, xAvg, xFinal);
+  for (let li = 0; li < layers.length; li++) placeLayer(li, desired, xFinal);
 
   // 平移到正区：左边贴 padding
   let minX = Infinity;
