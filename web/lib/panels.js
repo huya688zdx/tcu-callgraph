@@ -7,6 +7,7 @@ import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
+import { analyseDataflow, clearDataflow } from './df.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -305,6 +306,7 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
+    items.push({ value: 'dataflow', label: 'menu.dataflow' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
     items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
   } else if (kind === 'file') {
@@ -318,6 +320,7 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
+      if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'locate') {
         if (kind === 'fn') locateNode(payload.id);
         else locateBox(kind === 'file' ? 'file' : 'dir', payload.id, payload.fnIds || []);
@@ -467,6 +470,7 @@ function syncDetailSections(isFn) {
 let detailSeq = 0;
 
 async function renderDetail(id) {
+  clearDataflow();
   const my = ++detailSeq;
   const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
   const isFn = !!target && target.kind !== 'var';

@@ -62,8 +62,6 @@ const state = {
   last: null,
   linkFrom: null,
   linkPos: null,
-  /** 数据流叠加层的高亮范围（节点 id 集合），null 表示未开启 */
-  dfFocus: null,
   /** 点击标题后的短暂高亮：{ box, until, dur } */
   flash: null,
 };

@@ -1,270 +1,200 @@
-/**
- * 数据流叠加层
- *
- * 调用图是静态的、扫描时生成的；数据流是**按需**的：
- * 右键某个函数 → 选择方向 → 才去查它的全局变量读写，并把
- * 「写者 → 变量 → 读者」这条链叠加到当前画布上。
- *
- * 这样做的目的就是避免引用爆炸：全工程的共享变量关系不会一次性铺开。
- */
-
+/** 公共变量关系只在右侧查询和选择，正式加入时沿用服务端 ELK 排版。 */
 import { t } from '../i18n.js';
-import { state, esc } from './state.js';
+import { state, esc, edgeKey } from './state.js';
 import { api } from './api.js';
-import { draw } from './render.js';
-import { collidesWith, rerouteScope, fullReroute } from './geometry.js';
+import { hooks } from './hooks.js';
 
-const FN_W = 132;
-const FN_H = 44;
-const VAR_W = 128;
-const VAR_H = 36;
-const COL_GAP = 84;
-const ROW_GAP = 16;
+export const df = { root: null, result: null, selected: 0, query: '' };
+let querySeq = 0;
+let updating = false;
 
-export const df = {
-  active: false,
-  root: null,
-  dir: 'out',
-  nodes: [],
-  edges: [],
-  result: null,
-};
-
-/** 在 (x,y) 附近找一个不与现有节点重叠的位置 */
-function freeSlot(x, y, w, h) {
-  const v = state.view;
-  if (!v) return { x, y, w, h };
-  let yy = y;
-  for (let i = 0; i < 400; i++) {
-    if (!collidesWith({ x, y: yy, w, h })) return { x, y: yy, w, h };
-    yy += h + ROW_GAP;
-  }
-  return { x, y: yy, w, h };
-}
-
-let panel = null;
-
-function ensurePanel() {
-  if (panel) return panel;
-  panel = document.createElement('div');
-  panel.id = 'dfPanel';
-  panel.style.cssText = [
-    'position:absolute',
-    'left:16px',
-    'bottom:44px',
-    'max-width:420px',
-    'padding:10px 12px',
-    'background:#fff',
-    'border:1px solid #E8D5B7',
-    'border-left:3px solid #C2410C',
-    'border-radius:8px',
-    'box-shadow:0 6px 20px rgba(0,0,0,.12)',
-    'font-size:12px',
-    'line-height:1.55',
-    'color:#2C2C2A',
-    'display:none',
-    'z-index:20',
-  ].join(';');
-  const host = document.getElementById('cv').parentElement || document.body;
-  host.appendChild(panel);
-  return panel;
-}
+const relations = (res) => ['read', 'write'].flatMap((mode) =>
+  res.vars.filter((v) => v.mode === mode).flatMap((v) => v.peers.map((peer) => ({ v, peer }))));
 
 function showPanel(html) {
-  const el = ensurePanel();
-  el.innerHTML = html;
-  el.style.display = 'block';
+  document.getElementById('dataflow').innerHTML = html;
+  document.getElementById('secDataflow').hidden = false;
+  document.getElementById('right').dataset.mode = 'dataflow';
 }
 
-function hidePanel() {
-  if (panel) panel.style.display = 'none';
+function renderResults(error = '') {
+  const res = df.result;
+  if (!res) return;
+  const rows = relations(res);
+  const ids = new Set((state.view?.nodes || []).map((n) => n.id));
+  const links = new Set((state.view?.edges || []).filter((e) => e.kind === 'var').map((e) => `${e.from}|${e.to}`));
+  const added = ({ v, peer }) => [res.fn.id, v.id, peer.id].every((id) => ids.has(id)) &&
+    links.has(`${res.fn.id}|${v.id}`) && links.has(`${peer.id}|${v.id}`);
+  const group = (mode, title) => {
+    let count = 0;
+    const entries = rows.map((row, index) => {
+      const { v, peer } = row;
+      if (v.mode !== mode) return '';
+      count++;
+      const access = res.edges.find((e) => mode === 'read'
+        ? e.from === peer.id && e.to === v.id && e.kind === 'df-write'
+        : e.from === v.id && e.to === peer.id && e.kind === 'df-read');
+      const line = access?.line;
+      const present = added(row);
+      const hash = [...v.id].reduce((value, ch) => (value * 31 + ch.charCodeAt(0)) >>> 0, 0);
+      const hue = Math.round((hash * 137.508) % 360);
+      const search = `${v.name} ${v.file} ${peer.name} ${peer.file}`.toLowerCase();
+      return `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${t('df.toggleHint')}">
+        <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
+        <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>
+        ${line ? `<span class="df-access-line">:${line}</span>` : ''}
+        <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>
+        ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
+      </label>`;
+    }).join('');
+    const truncated = res.vars.some((v) => v.mode === mode && v.truncated);
+    return entries ? `<div class="df-group"><h4>${t(title)} (${count})</h4>${entries}
+      ${truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}</div>`
+      : '';
+  };
+  showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
+    <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
+    <div class="df-actions"><button class="primary" data-df="toggle">${t('df.add')}</button>
+      <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
+    ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
+    ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
+    <div class="empty" data-df-empty hidden>${t('df.noMatch')}</div>
+    ${res.truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}`);
+  filterResults();
 }
 
-function summaryHtml(res) {
-  const head = `${t('df.title')} · <b>${esc(res.fn?.name || '')}</b> · ${
-    res.dir === 'in' ? t('df.upstream') : t('df.downstream')
-  }`;
-  if (!res.vars || !res.vars.length) {
-    return `${head}<div style="color:#888780;margin-top:4px">${t('df.empty')}</div>
-      <div style="margin-top:6px"><button class="link" data-df="clear">${t('df.clearShort')}</button></div>`;
+/** 原地筛选，不改变输入焦点或画布。 */
+function filterResults() {
+  const query = df.query.trim().toLowerCase();
+  const panel = document.getElementById('dataflow');
+  const labels = [...panel.querySelectorAll('.df-relation')];
+  for (const label of labels) label.hidden = !label.dataset.search.includes(query);
+  for (const group of panel.querySelectorAll('.df-group')) {
+    group.hidden = ![...group.querySelectorAll('.df-relation')].some((label) => !label.hidden);
   }
-  const rows = res.vars
-    .map((v) => {
-      const arrow = v.mode === 'write' ? t('df.write') : t('df.read');
-      const peers = v.peers.map((p) => esc(p.name)).join('、');
-      const extra = v.indirect ? ` <span style="color:#B4B2A9">${t('df.viaPtr')}</span>` : '';
-      return `<div style="margin-top:5px"><code style="background:#FAF6EF;padding:1px 4px;border-radius:3px">${esc(
-        v.name
-      )}</code> ${arrow}${extra} → <span style="color:#0C447C">${peers}</span>${
-        v.truncated ? ' …' : ''
-      }</div>`;
-    })
-    .join('');
-  return `${head}${rows}
-    <div style="margin-top:8px;color:#888780">${t('df.summary', { n: res.vars.length })}</div>
-    <div style="margin-top:6px"><button class="link" data-df="clear">${t('df.clear')}</button></div>`;
+  const visible = labels.filter((label) => !label.hidden);
+  if (!visible.some((label) => Number(label.querySelector('input').value) === df.selected)) {
+    df.selected = visible.length ? Number(visible[0].querySelector('input').value) : -1;
+  }
+  for (const label of labels) {
+    const selected = Number(label.querySelector('input').value) === df.selected;
+    label.classList.toggle('selected', selected);
+    label.querySelector('input').checked = selected;
+  }
+  const chosen = visible.find((label) => label.querySelector('input').checked);
+  const present = chosen?.dataset.added === 'true';
+  const button = panel.querySelector('[data-df="toggle"]');
+  button.disabled = updating || !chosen;
+  button.textContent = t(present ? 'df.remove' : 'df.add');
+  panel.querySelector('[data-df-total]').textContent = query ? `${visible.length}/${labels.length}` : t('df.summary', { n: labels.length });
+  panel.querySelector('[data-df-empty]').hidden = !!visible.length;
 }
 
-/** 清除叠加：把这次加进来的节点/边从视图里摘掉 */
-export function clearDataflow(redraw = true) {
-  const v = state.view;
-  if (v && df.active) {
-    // 按标记删，不按对象身份：history.applySnapshot 会重建所有节点/边对象，
-    // 引用比对必然失配，会留下指向已删节点的幽灵边
-    v.nodes = v.nodes.filter((n) => !(n.dfVar || n.dfPeer));
-    v.edges = v.edges.filter((e) => e.df !== true);
-  }
-  df.active = false;
-  state.dfFocus = null;
+/** 清除查询结果，不改动画布节点、连线或坐标。 */
+export function clearDataflow() {
+  querySeq++;
   df.root = null;
-  df.nodes = [];
-  df.edges = [];
   df.result = null;
-  hidePanel();
-  if (redraw && v) {
-    fullReroute();
-    draw();
-  }
+  df.selected = 0;
+  df.query = '';
+  document.getElementById('secDataflow').hidden = true;
+  document.getElementById('dataflow').innerHTML = '';
+  delete document.getElementById('right').dataset.mode;
 }
 
-/**
- * 展开某个函数的数据流
- * @param {string} fnId
- * @param {'out'|'in'} dir
- */
-export async function expandDataflow(fnId, dir = 'out') {
-  const v = state.view;
-  if (!v) return;
-  const anchor = v.nodes.find((n) => n.id === fnId);
-  if (!anchor) return;
-
-  if (df.active && df.root === fnId && df.dir === dir) {
-    clearDataflow();
-    return;
-  }
-  clearDataflow(false);
-
-  showPanel(t('df.loading'));
-  let res;
-  try {
-    res = await api.dataflow(fnId, dir);
-  } catch (err) {
-    showPanel(
-      `<b style="color:#A32D2D">${t('df.failed')}</b><div style="margin-top:4px">${esc(String(err))}</div>`
-    );
-    return;
-  }
-  if (!res || res.ok === false) {
-    showPanel(
-      `<b style="color:#A32D2D">${t('df.failed')}</b><div style="margin-top:4px">${esc(
-        res?.error || t('df.unknownError')
-      )}</div>`
-    );
-    return;
-  }
-
-  df.active = true;
-  df.root = fnId;
-  df.dir = dir;
-  df.result = res;
-
-  const byId = new Map(v.nodes.map((n) => [n.id, n]));
-
-  // 摆放：优先放在入口函数右侧；右侧放不下（会超出当前内容很多）就翻到左侧，
-  // 避免节点被推到视野外看不见
-  const rightEdge = v.nodes.reduce((m, n) => Math.max(m, n.x + n.w), 0);
-  const clusterW = VAR_W + COL_GAP + FN_W;
-  let varCol = anchor.x + anchor.w + COL_GAP;
-  let peerCol = varCol + VAR_W + COL_GAP;
-  if (varCol + clusterW > rightEdge + 140) {
-    varCol = Math.max(40, anchor.x - COL_GAP - VAR_W);
-    peerCol = Math.max(40, varCol - COL_GAP - FN_W);
-  }
-  let varY = Math.max(30, anchor.y - 30);
-  let peerY = Math.max(30, anchor.y - 30);
-
-  // 1) 变量节点：已存在就复用（调用图里本来就有变量节点）
-  for (const item of res.vars) {
-    let node = byId.get(item.id);
-    if (!node) {
-      const slot = freeSlot(varCol, varY, VAR_W, VAR_H);
-      node = {
-        id: item.id,
-        name: item.name,
-        kind: 'var',
-        file: item.file,
-        line: item.line,
-        typeText: item.typeText,
-        w: VAR_W,
-        h: VAR_H,
-        x: slot.x,
-        y: slot.y,
-        group: null,
-        change: 'existing',
-        dfVar: true,
-        dfMode: item.mode,
-      };
-      v.nodes.push(node);
-      byId.set(node.id, node);
-      df.nodes.push(node);
-      varY = slot.y + VAR_H + ROW_GAP;
-    }
-  }
-
-  // 2) 对端函数节点
-  for (const n of res.nodes) {
-    if (n.id === fnId || byId.has(n.id)) continue;
-    const slot = freeSlot(peerCol, peerY, FN_W, FN_H);
-    const node = {
-      ...n,
-      w: FN_W,
-      h: FN_H,
-      group: null,
-      change: 'existing',
-      dfPeer: true,
-      x: slot.x,
-      y: slot.y,
-    };
-    v.nodes.push(node);
-    byId.set(node.id, node);
-    df.nodes.push(node);
-    peerY = slot.y + FN_H + ROW_GAP;
-  }
-
-  // 3) 连线
-  const fresh = [];
-  for (const e of res.edges) {
-    if (!byId.has(e.from) || !byId.has(e.to)) continue;
-    const edge = {
-      from: e.from,
-      to: e.to,
-      callee: e.via,
-      kind: e.kind,
-      line: e.line,
-      via: e.via,
-      df: true,
-      change: 'existing',
-    };
-    v.edges.push(edge);
-    fresh.push(edge);
-    df.edges.push(edge);
-  }
-  // 高亮范围：入口 + 变量 + 对端函数，其余节点淡出，避免叠加层被主图淹没
-  const focus = new Set([fnId]);
-  for (const e of res.edges) {
-    focus.add(e.from);
-    focus.add(e.to);
-  }
-  state.dfFocus = focus;
-
-  if (fresh.length) rerouteScope(fresh);
-  draw();
-  showPanel(summaryHtml(res));
-}
-
-/** 面板上的「清除」按钮 */
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest && e.target.closest('[data-df="clear"]');
-  if (!btn) return;
+/** 函数可以来自文件树，不要求它已经在画布中。 */
+export async function analyseDataflow(fnId) {
   clearDataflow();
+  const seq = querySeq;
+  const projectId = state.view?.projectId;
+  df.root = fnId;
+  showPanel(`<div class="empty">${t('df.loading')}</div>`);
+  document.getElementById('secDataflow').scrollIntoView({ block: 'start' });
+  try {
+    const res = await api.dataflow(fnId, 'both');
+    if (seq !== querySeq || projectId !== state.view?.projectId) return;
+    if (!res || res.error || res.ok === false) throw new Error(res?.error || t('df.unknownError'));
+    df.result = res;
+    renderResults();
+  } catch (err) {
+    if (seq !== querySeq || projectId !== state.view?.projectId) return;
+    showPanel(`<div class="df-error" role="alert">${t('df.failed')}：${esc(String(err))}</div>`);
+  }
+}
+
+async function toggleSelectedRelation() {
+  const res = df.result;
+  const selected = df.selected;
+  const query = df.query;
+  const chosen = res && relations(res)[selected];
+  if (updating || !chosen) return;
+  const removing = document.querySelector('#dataflow input:checked')?.closest('.df-relation').dataset.added === 'true';
+  updating = true;
+  const projectId = state.view?.projectId;
+  renderResults();
+  let roots = [...state.roots];
+  let error = '';
+  try {
+    // 只切换所选函数对该变量的引用，保留共用的函数、变量和其他引用。
+    const targets = removing ? [chosen.peer.id] : [res.fn.id, chosen.peer.id];
+    const records = await Promise.all(targets.map((id) => api.node(id)));
+    if (state.view?.projectId !== projectId) return;
+    const edges = [...new Set(targets.flatMap((id, index) => [
+      `${id}->${chosen.v.id}:0`,
+      ...(records[index].outEdges || []).filter((e) => e.kind === 'var' && e.to === chosen.v.id).map(edgeKey),
+      ...(state.view.edges || []).filter((e) => e.kind === 'var' && e.from === id && e.to === chosen.v.id).map(edgeKey),
+    ]))];
+    const result = await api.del({ edges, restore: !removing, projectId });
+    if (!result?.ok) throw new Error(result?.error || t('df.updateFailed'));
+    if (state.view?.projectId !== projectId) return;
+    if (!removing) {
+      state.vars.add(chosen.v.id);
+      state.hiddenVars.delete(chosen.v.id);
+      roots = [...new Set([...roots, res.fn.id, chosen.peer.id])];
+    }
+    await hooks.loadView(roots);
+    if (state.view?.projectId !== projectId || df.root) return;
+    df.root = res.fn.id;
+    df.result = res;
+    df.selected = selected;
+    df.query = query;
+  } catch (err) {
+    if (state.view?.projectId !== projectId) return;
+    df.root = res.fn.id;
+    df.result = res;
+    df.selected = selected;
+    df.query = query;
+    error = `${t('df.updateFailed')}：${String(err)}`;
+  } finally {
+    updating = false;
+    if (df.result === res) renderResults(error);
+  }
+}
+
+document.addEventListener('change', (e) => {
+  if (!e.target.matches('#dataflow input[name="dfRelation"]')) return;
+  df.selected = Number(e.target.value);
+  filterResults();
+});
+
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'dfFilter') return;
+  df.query = e.target.value;
+  filterResults();
+});
+
+document.addEventListener('dblclick', (e) => {
+  const row = e.target.closest?.('#dataflow .df-relation');
+  if (!row || row.hidden || updating) return;
+  e.preventDefault();
+  df.selected = Number(row.querySelector('input').value);
+  filterResults();
+  void toggleSelectedRelation();
+});
+
+document.addEventListener('click', (e) => {
+  const button = e.target.closest?.('#secDataflow [data-df]');
+  if (!button || button.disabled) return;
+  if (button.dataset.df === 'toggle') void toggleSelectedRelation();
+  if (button.dataset.df === 'close') clearDataflow();
 });

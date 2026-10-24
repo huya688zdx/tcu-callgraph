@@ -106,9 +106,7 @@ function buildSVG() {
     const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
     const fill =
       custom ||
-      (n.dfVar || n.dfPeer
-        ? '#FDF6EC'
-        : n.external
+      (n.external
         ? '#FAFAF7'
         : CHANGE_FILL[n.change] || CHANGE_FILL.existing);
     out.push(

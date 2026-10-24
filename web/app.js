@@ -41,7 +41,7 @@ async function loadView(rootId, opts = {}) {
     if (navStack.length > NAV_MAX) navStack.shift();
   }
   const seq = ++viewSeq;
-  clearDataflow(false); // 换视图时旧的叠加层不再适用
+  clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const data = await api.view({
     roots,

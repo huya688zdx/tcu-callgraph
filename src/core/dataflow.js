@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseFile, collectGlobals, collectFunctions, collectAccesses } from './cparse.js';
+import { rebuildIndex } from './index.js';
 
 const MAX_VARS = 16;
 const MAX_PEERS = 24;
@@ -50,6 +51,7 @@ export async function buildDataflowIndex(model) {
     };
 
     const fnsByFile = new Map();
+    const parsedFiles = [];
     for (const fn of model.functions) {
       if (!fnsByFile.has(fn.file)) fnsByFile.set(fn.file, []);
       fnsByFile.get(fn.file).push(fn);
@@ -65,6 +67,7 @@ export async function buildDataflowIndex(model) {
         console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);
         continue; // 单个文件解析失败不影响整体
       }
+      parsedFiles.push({ file: f.rel, root: rec.root });
 
       for (const g of collectGlobals(rec.root)) {
         const id = g.isStatic ? `var::${f.rel}::${g.name}` : `var::${g.name}`;
@@ -79,16 +82,19 @@ export async function buildDataflowIndex(model) {
         defs.push(def);
         defsByName.set(g.name, [...prev, def]);
       }
+    }
 
-      const fns = collectFunctions(rec.root);
+    // 先收齐声明再分析函数，避免读取者排在定义文件之前时漏掉关系。
+    for (const { file, root } of parsedFiles) {
+      const fns = collectFunctions(root);
       const resolve = (name) => {
         const list = defsByName.get(name);
         if (!list || !list.length) return null;
         // 本文件的 static 优先，其次同名全局
-        return list.find((d) => d.isStatic && d.file === f.rel) || list.find((d) => !d.isStatic) || list[0];
+        return list.find((d) => d.isStatic && d.file === file) || list.find((d) => !d.isStatic) || null;
       };
 
-      for (const fn of fnsByFile.get(f.rel) || []) {
+      for (const fn of fnsByFile.get(file) || []) {
         const node = fns.get(fn.name);
         if (!node) continue;
         const acc = collectAccesses(node, (name) => !!resolve(name));
@@ -118,6 +124,27 @@ export async function buildDataflowIndex(model) {
     if (failedFiles) {
       console.warn(`[数据流] 共跳过 ${failedFiles} 个文件，变量面板可能不完整`);
     }
+    // 普通变量图也使用这份 AST 结果，避免与右键数据流的读写口径不同。
+    model.variables = defs.map((d) => ({ ...d, kind: 'var', params: [] }));
+    model.edges = model.edges.filter((e) => e.kind !== 'var');
+    for (const fn of model.functions) {
+      const acc = fnAccess.get(fn.id);
+      fn.varAccess = [...new Set([...(acc?.writes.keys() || []), ...(acc?.reads.keys() || [])])].map((id) => {
+        const write = acc.writes.has(id);
+        const read = acc.reads.has(id);
+        return {
+          id, name: idx.byId.get(id).name, write, read,
+          line: Math.min(...(acc.writes.get(id)?.lines || []), ...(acc.reads.get(id)?.lines || [])),
+        };
+      });
+      for (const a of fn.varAccess) {
+        model.edges.push({
+          from: fn.id, to: a.id, callee: a.name, kind: 'var', line: a.line,
+          via: a.write ? (a.read ? '读写' : '写') : '读',
+        });
+      }
+    }
+    rebuildIndex(model);
     model._df = idx;
     return idx;
   })();
@@ -209,14 +236,14 @@ export async function dataflowFor(model, fnId, dir = 'out') {
       for (const peer of list) {
         const pn = fnNodeOf(model, peer);
         if (pn) addNode(pn);
-        pushEdge(def.id, peer, 'df-read', def.name, 0);
+        pushEdge(def.id, peer, 'df-read', def.name, firstLine(idx.fnAccess.get(peer)?.reads.get(varId)));
         entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '' });
       }
     } else {
       for (const peer of list) {
         const pn = fnNodeOf(model, peer);
         if (pn) addNode(pn);
-        pushEdge(peer, def.id, 'df-write', def.name, 0);
+        pushEdge(peer, def.id, 'df-write', def.name, firstLine(idx.fnAccess.get(peer)?.writes.get(varId)));
         entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '' });
       }
       pushEdge(def.id, fnId, 'df-read', def.name, firstLine(rec));

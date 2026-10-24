@@ -111,6 +111,14 @@ export function declaratorName(n) {
   return null;
 }
 
+/** 只穿过文件作用域的预处理节点，不进入函数体或结构体。 */
+function* fileDeclarations(root) {
+  for (const node of root.namedChildren) {
+    if (node.type.startsWith('preproc_')) yield* fileDeclarations(node);
+    else yield node;
+  }
+}
+
 /** 声明符是否为函数（原型/定义），用来把函数声明从变量里剔除 */
 function isFunctionDeclarator(n) {
   if (!n) return false;
@@ -130,7 +138,7 @@ function isFunctionDeclarator(n) {
  */
 export function collectGlobals(root) {
   const out = [];
-  for (const node of root.namedChildren) {
+  for (const node of fileDeclarations(root)) {
     if (node.type !== 'declaration') continue;
     const decls = node.namedChildren.filter((c) => DECL_NODES.has(c.type));
     if (!decls.length) continue;
@@ -162,7 +170,7 @@ export function collectGlobals(root) {
 /** 文件里所有函数定义：name -> function_definition 节点 */
 export function collectFunctions(root) {
   const map = new Map();
-  for (const node of root.namedChildren) {
+  for (const node of fileDeclarations(root)) {
     if (node.type !== 'function_definition') continue;
     const name = declaratorName(node.childForFieldName('declarator'));
     if (name && !map.has(name)) map.set(name, node);
@@ -197,7 +205,8 @@ function baseIdentifier(n) {
  * 判定口径：
  *   write      赋值左值（= 为纯写；+= 之类与 ++ -- 先读旧值，算读写）
  *   read       其余引用（裸标识符 x = g / g % n、成员链 g.a.b、下标 g[i]）
- *   escape     &g 取地址、g 作为实参传出去 —— 对方读写不可知，按「读 + 可能被写」保守处理
+ *   escape     &g 显式取地址 —— 对方读写不可知，按「读 + 可能被写」保守处理
+ *   按值实参只读，不会因传参而改写原变量。
  */
 export function collectAccesses(fnNode, isGlobal) {
   const writes = new Map();
@@ -212,7 +221,7 @@ export function collectAccesses(fnNode, isGlobal) {
   const params = fnNode.childForFieldName('declarator')?.childForFieldName('parameters');
   if (params) {
     for (const p of params.namedChildren) {
-      const nm = declaratorName(p);
+      const nm = declaratorName(p.childForFieldName('declarator'));
       if (nm) locals.add(nm);
     }
   }
@@ -257,12 +266,12 @@ export function collectAccesses(fnNode, isGlobal) {
       case 'assignment_expression': {
         // 复合赋值（+= 之类）先读旧值再写，左值按读写；= 才是纯写
         const op = n.childForFieldName('operator')?.text;
-        classify(n.childForFieldName('left'), op === '=' ? 'write' : 'rw');
+        visit(n.childForFieldName('left'), op === '=' ? 'write' : 'rw');
         visit(n.childForFieldName('right'), 'read');
         return;
       }
       case 'update_expression': {
-        classify(n.childForFieldName('argument'), 'rw');
+        visit(n.childForFieldName('argument'), 'rw');
         return;
       }
       case 'pointer_expression': {
@@ -276,7 +285,7 @@ export function collectAccesses(fnNode, isGlobal) {
       }
       case 'call_expression': {
         const args = n.childForFieldName('arguments');
-        for (const a of args ? args.namedChildren : []) visit(a, 'escape');
+        for (const a of args ? args.namedChildren : []) visit(a, 'read');
         visit(n.childForFieldName('function'), 'read');
         return;
       }
@@ -284,6 +293,15 @@ export function collectAccesses(fnNode, isGlobal) {
       case 'subscript_expression': {
         // 整个访问链只记一次，避免 g.a.b 重复计数
         classify(n, mode);
+        // 下标是独立的读取：g_buf[g_index] = x 也会读 g_index。
+        const visitIndices = (part) => {
+          if (!part) return;
+          if (part.type === 'subscript_expression') visit(part.childForFieldName('index'), 'read');
+          if (part.type === 'field_expression' || part.type === 'subscript_expression') {
+            visitIndices(part.childForFieldName('argument'));
+          }
+        };
+        visitIndices(n);
         return;
       }
       case 'identifier': {
@@ -298,7 +316,7 @@ export function collectAccesses(fnNode, isGlobal) {
           const nm = declaratorName(d);
           if (!nm) continue;
           locals.add(nm);
-          if (d.type === 'init_declarator') {
+          if (d.type === 'init_declarator' && d.childForFieldName('declarator')?.type === 'pointer_declarator') {
             const init = d.childForFieldName('value');
             if (init && init.type === 'pointer_expression' && init.text.trimStart().startsWith('&')) {
               const t = baseIdentifier(init.childForFieldName('argument'));

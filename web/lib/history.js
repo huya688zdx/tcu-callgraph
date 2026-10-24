@@ -34,8 +34,6 @@ function snapshotView() {
       change: n.change,
       typeText: n.typeText,
       tag: n.tag,
-      dfVar: n.dfVar,
-      dfPeer: n.dfPeer,
     })),
     edges: v.edges.map((e) => ({
       from: e.from,
@@ -51,7 +49,6 @@ function snapshotView() {
       custom: e.custom,
       points: e.points,
       change: e.change,
-      df: e.df,
       // 连线标签挂在边上：撤销时连标签一起回退，画布才不会和存档打架
       //（一线多条，整组快照）
       labels: e.labels || null,

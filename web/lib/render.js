@@ -259,26 +259,17 @@ function drawEdge(ctx, e, related, selected) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  // 数据流叠加层：写=琥珀、读=青，与调用边的黑白灰区分开
-  const isDf = e.kind === 'df-write' || e.kind === 'df-read';
-  const dfColor = e.kind === 'df-write' ? '#C2410C' : '#0E7490';
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = isDf ? dfColor : EDGE_COLOR[e.change] || EDGE_COLOR.existing;
+  const color = EDGE_COLOR[e.change] || EDGE_COLOR.existing;
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
   ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
-  const dfFocus = state.dfFocus;
-  const dimByDf = dfFocus && !isDf && !dfFocus.has(e.from) && !dfFocus.has(e.to);
-  ctx.globalAlpha = dimByDf ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
-  // 变量访问=虚线，数据流=点线，函数调用=实线
+  ctx.globalAlpha = state.selected && !related && !selected ? 0.26 : 1;
+  // 变量访问=虚线，函数调用=实线
   if (e.kind === 'var') ctx.setLineDash([7, 4]);
-  else if (isDf) {
-    ctx.setLineDash([4, 3]);
-    ctx.lineWidth = selected ? 2.8 : related ? 2.4 : 2;
-  }
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -297,23 +288,6 @@ function drawEdge(ctx, e, related, selected) {
   ctx.closePath();
   ctx.fillStyle = color;
   ctx.fill();
-
-  // 数据流边在中间标注变量名，避免多条线分不清走的是哪个状态
-  if (isDf && cam.k >= 0.45 && e.via) {
-    const mi = Math.max(1, Math.floor(pts.length / 2));
-    const p0 = pts[mi - 1];
-    const p1 = pts[Math.min(pts.length - 1, mi)];
-    const mx = (p0[0] + p1[0]) / 2;
-    const my = (p0[1] + p1[1]) / 2;
-    ctx.font = `10px ${FONT}`;
-    const tw = ctx.measureText(e.via).width;
-    ctx.fillStyle = 'rgba(255,255,255,0.92)';
-    ctx.fillRect(mx - tw / 2 - 3, my - 7, tw + 6, 14);
-    ctx.fillStyle = dfColor;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(e.via, mx, my);
-  }
 
   if (selected) {
     // 中间线段手柄（拖动可调整该段的走向，保持正交）
@@ -374,19 +348,15 @@ function drawNode(ctx, n, nb = null) {
   const selected = state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
-  const dimByDf = state.dfFocus && !state.dfFocus.has(n.id);
   const dimmed =
-    dimByDf || (state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id)));
+    state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
 
   ctx.save();
   ctx.globalAlpha = dimmed ? 0.3 : 1;
 
   roundRect(ctx, x, y, w, h, 8);
-  // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除），
-  // 只在数据流叠加时换成淡琥珀，提示它属于本次分析
-  const baseFill = n.dfVar || n.dfPeer
-    ? '#FDF6EC'
-    : n.external
+  // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除）。
+  const baseFill = n.external
     ? '#FAFAF7'
     : CHANGE_FILL[n.change] || CHANGE_FILL.existing;
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;

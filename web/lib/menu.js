@@ -9,7 +9,7 @@ import { pushHistory } from './history.js';
 import { fullReroute } from './geometry.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { renderLabelPanel } from './label-panel.js';
-import { df, expandDataflow, clearDataflow } from './df.js';
+import { analyseDataflow } from './df.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 const CHANGE_ITEMS = [
@@ -35,20 +35,13 @@ export function showNodeMenu(x, y, n) {
     },
     {
       id: 'df',
-      label: 'menu.dataflow',
-      items: [
-        { value: 'df:out', label: 'df.out', active: df.active && df.root === n.id && df.dir === 'out' },
-        { value: 'df:in', label: 'df.in', active: df.active && df.root === n.id && df.dir === 'in' },
-        ...(df.active ? [{ value: 'df:clear', label: 'df.clear' }] : []),
-      ],
+      items: [{ value: 'df', label: 'menu.dataflow' }],
     },
     { id: 'change', label: 'menu.change', items: CHANGE_ITEMS },
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
     if (v === 'tree:fn') return revealInTree('fn', n.id);
-    if (v === 'df:out') return expandDataflow(n.id, 'out');
-    if (v === 'df:in') return expandDataflow(n.id, 'in');
-    if (v === 'df:clear') return clearDataflow();
+    if (v === 'df') return analyseDataflow(n.id);
     return setNodeChange(n, v);
   });
 }

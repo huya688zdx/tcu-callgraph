@@ -52,3 +52,31 @@ test('ELK 自递归线保留可见回环和两个不同的居中端口', async (
   assert.ok(new Set(points.map((p) => p[0])).size > 1 && new Set(points.map((p) => p[1])).size > 1,
     '不能退化为同一直线往返');
 });
+
+test('变量关系可单独移出并恢复，不影响同一函数的其他变量引用', async (t) => {
+  const srv = await launchServer({ target: 'samples/shared-state' });
+  t.after(() => srv.close());
+  const query = new URLSearchParams({
+    roots: 'producer.c::Sensor_Update,consumer.c::Control_Read', down: '0',
+    vars: 'var::g_rpm,var::g_index',
+  });
+  const view = () => fetch(`${srv.baseUrl}/api/view?${query}`).then((r) => r.json());
+  const edge = 'consumer.c::Control_Read->var::g_rpm:0';
+  const toggle = async (restore) => {
+    const response = await fetch(`${srv.baseUrl}/api/delete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ edges: [edge], restore }),
+    });
+    assert.equal(response.status, 200);
+  };
+  assert.equal((await view()).edges.length, 4);
+  await toggle(false);
+  const removed = await view();
+  assert.equal(removed.edges.length, 3);
+  assert.ok(!removed.edges.some((e) => `${e.from}->${e.to}:${e.line}` === edge));
+  assert.ok(removed.edges.some((e) => e.from === 'consumer.c::Control_Read' && e.to === 'var::g_index'));
+  await toggle(true);
+  const restored = await view();
+  assert.equal(restored.edges.length, 4);
+  assert.equal(restored.layoutEngine, 'elk');
+});

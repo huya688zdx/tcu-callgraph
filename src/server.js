@@ -494,11 +494,11 @@ async function buildView(
       ids.add(id);
     }
     // 引用关系：视图内的函数 → 该变量（AST 索引里记着每个变量的写者/读者）
-    const seen = new Set(viewEdges.map((e) => `${e.from}|${e.to}|${e.line}`));
+    const seen = new Set(viewEdges.filter((e) => e.kind === 'var').map((e) => `${e.from}|${e.to}`));
     const varEdgeOf = new Map(); // fnId|varId → edge，读写合并成一条
     const pushVarEdge = (fnId, varId, via) => {
       if (!ids.has(fnId) || !ids.has(varId)) return;
-      const k = `${fnId}|${varId}|0`;
+      const k = `${fnId}|${varId}`;
       const prev = varEdgeOf.get(k);
       if (prev) {
         if (prev.via !== via) prev.via = '读写';
@@ -567,7 +567,8 @@ async function buildView(
     viewEdges.push({ from: m.from, to: m.to, callee: byId.get(m.to).name,
       kind: 'manual', line: 0, via: '手动', manual: true });
   }
-  viewEdges = viewEdges.map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
+    .map((e) => ({ ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL });
 
   // 合并标注 + 变更状态
