@@ -12,6 +12,7 @@ import { history, pushHistory, undo, redo } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG, download } from './lib/svg.js';
+import { upgradeSelect } from './lib/ui-select.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
 import { clearDataflow } from './lib/df.js';
@@ -249,6 +250,10 @@ window.addEventListener('keydown', (e) => {
   if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
   if (e.key === 'f' || e.key === 'F') fit();
 });
+
+// 范围下拉换成自定义样式（原 select 展开列表是系统绘制，无法定制）；change 仍派发在原 select 上
+upgradeSelect(els.depth);
+upgradeSelect(els.updepth);
 
 els.depth.addEventListener('change', () => {
   state.down = Number(els.depth.value);
