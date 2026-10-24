@@ -201,7 +201,7 @@ async function restoreLastDelete() {
   await postDelete({ nodes: rec.nodes || [], edges: rec.edges || [], restore: true });
   await reloadKeepCam();
   pushHistory();
-  loadStats(); // 同步「恢复删除 (N)」上的计数
+  loadStats();
   return true;
 }
 
@@ -216,9 +216,6 @@ function canRestoreDelete() {
   if (rec.roots !== state.roots.join('+')) return false;
   return Date.now() - rec.at < 20000;
 }
-
-document.getElementById('undoBtn')?.addEventListener('click', undo);
-document.getElementById('redoBtn')?.addEventListener('click', redo);
 
 window.addEventListener('keydown', (e) => {
   const tag = document.activeElement && document.activeElement.tagName;
@@ -267,18 +264,8 @@ els.groupMode.addEventListener('change', () => {
   state.selectedEdge = null;
   loadView(state.root);
 });
-els.fit.addEventListener('click', fit);
-
 els.resetLayout.addEventListener('click', () => {
   loadView(state.roots.length ? state.roots : state.root);
-});
-
-// 一次性恢复所有被删除的函数与连线
-els.restoreDeleted.addEventListener('click', async () => {
-  await api.del({ clear: true });
-  deleteStack.length = 0;
-  await reloadKeepCam();
-  await loadStats();
 });
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。

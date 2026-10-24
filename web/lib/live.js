@@ -62,7 +62,7 @@ async function flushReload() {
   try {
     await hooks.reloadKeepCam();
     failures = 0;
-    loadStats(); // 删除计数、「恢复删除 (N)」跟着 AI 的删除/恢复走
+    loadStats();
     reloadTimeline(); // 时间轴面板开着时同步新事件
     toast(n > 1 ? `AI 更新了视图（${n} 处改动）` : 'AI 更新了视图');
   } catch {

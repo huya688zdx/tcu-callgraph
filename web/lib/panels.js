@@ -28,16 +28,6 @@ async function loadStats() {
     (s.files > 1500
       ? `<div class="stat-row" style="color:#993C1D"><span>${t('stat.hintTitle')}</span><span>${t('stat.hintSlow')}</span></div>`
       : '');
-
-  // 有删除记录时才让「恢复删除」可点，并在按钮上显示数量
-  const del = d.deleted || { nodes: 0, edges: 0 };
-  const delTotal = (del.nodes || 0) + (del.edges || 0);
-  if (els.restoreDeleted) {
-    els.restoreDeleted.disabled = delTotal === 0;
-    els.restoreDeleted.textContent = delTotal
-      ? `${t('btn.restoreDeleted')} (${delTotal})`
-      : t('btn.restoreDeleted');
-  }
 }
 
 // ---------------- 全局变量 / 常量 ----------------
@@ -433,7 +423,7 @@ async function runSearch() {
   }
   els.results.innerHTML = list
     .map(
-      (f) => `<li data-id="${esc(f.id)}">
+      (f) => `<li data-id="${esc(f.id)}" title="${esc(t('search.itemHint'))}">
         <div class="fn">${esc(f.name)}</div>
         <div class="meta">${esc(shortFile(f.file))}:${f.line} · ↑${f.inCount} ↓${f.outCount}</div>
       </li>`
@@ -441,16 +431,35 @@ async function runSearch() {
     .join('');
 }
 
+/**
+ * 搜索结果的去向：单击只往画布里加入（已在画布就高亮定位），绝不整幅替换；
+ * 想单独看某个函数用双击。单击延迟 250ms 是为了等双击事件，避免先加载两次。
+ */
+let pickTimer;
+function searchPick(id) {
+  const inView = state.view && state.view.nodes.some((n) => n.id === id);
+  if (inView) return locateNode(id);
+  hooks.loadView([...state.roots, id]);
+}
+
 els.results.addEventListener('click', (e) => {
   const li = e.target.closest('li[data-id]');
   if (!li) return;
+  clearTimeout(pickTimer);
+  pickTimer = setTimeout(() => searchPick(li.dataset.id), 250);
+});
+
+els.results.addEventListener('dblclick', (e) => {
+  const li = e.target.closest('li[data-id]');
+  if (!li) return;
+  clearTimeout(pickTimer);
   hooks.loadView(li.dataset.id);
 });
 
 els.search.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     const first = els.results.querySelector('li[data-id]');
-    if (first) hooks.loadView(first.dataset.id);
+    if (first) searchPick(first.dataset.id);
   }
 });
 

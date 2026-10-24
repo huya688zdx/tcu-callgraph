@@ -30,13 +30,11 @@
   .brand { flex: 0 1 250px; min-width: 150px; font-weight: 600; font-size: 14px; }
   .brand small { display: block; margin-top: 3px; color: #888780; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #projectBtn { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
-  .top-row #search { flex: 1 1 180px; width: auto; min-width: 160px; max-width: 340px; }
+  .sec-search #search { display: block; width: 100%; }
   .top-actions, .tool-group { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
   .top-actions { margin-left: auto; }
   .tool-group + .tool-group { padding-left: 12px; border-left: 1px solid #DEDDD6; }
   .tool-label { margin-right: 2px; font-size: 11px; color: #888780; }
-  .edit-tools { margin-left: auto; }
-  #undoBtn, #redoBtn { width: 30px; padding: 0; font-size: 16px; }
   header button:disabled { opacity: .4; cursor: default; }
   .tool-menu { position: relative; }
   .tool-menu summary {
@@ -295,6 +293,8 @@
   .results-list li:hover { background: #E6F1FB; }
   .results-list li .fn { font-weight: 500; }
   .results-list li .meta { color: #888780; font-size: 11px; }
+  /* 空态提示不能长成输入框的样子，否则会被当成可以输入的搜索框 */
+  .results-list li.empty, .results-list li.empty:hover { background: none; cursor: default; }
 
   /* 右键菜单：标记函数变更分类 / 连线状态 */
   .ctx-menu {
@@ -504,7 +504,6 @@
     <div class="top-row">
       <div class="brand"><span data-i18n="app.title">TCU 调用关系图 · ELK</span><small id="rootName"></small></div>
       <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
-      <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
       <div class="top-actions" aria-label="工程工具">
         <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
@@ -524,6 +523,7 @@
             <p><span>缩放画布</span><kbd>鼠标滚轮</kbd></p>
             <p><span>平移画布</span><kbd>拖拽空白处</kbd></p>
             <p><span>展开函数调用</span><kbd>双击函数</kbd></p>
+            <p><span>搜索结果加入画布</span><kbd>单击 · 双击单独打开</kbd></p>
             <p><span>调整节点与连线</span><kbd>拖拽节点 / 线段</kbd></p>
             <p><span>撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
             <p><span>重做修改</span><kbd>Ctrl+Shift+Z</kbd></p>
@@ -550,19 +550,15 @@
         <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
       </div>
       <div class="tool-group">
-        <button id="fit" title="调整缩放，让整张图显示在画布内（F）" data-i18n="btn.fit">适应画布</button>
         <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n="btn.reset">重新排版</button>
-      </div>
-      <div class="tool-group edit-tools">
-        <span class="tool-label" data-i18n="toolbar.edit">编辑</span>
-        <button id="undoBtn" aria-label="撤销修改" title="撤回 (Ctrl+Z)" data-i18n-title="btn.undo" disabled>&#8630;</button>
-        <button id="redoBtn" aria-label="重做修改" title="重做 (Ctrl+Shift+Z)" data-i18n-title="btn.redo" disabled>&#8631;</button>
-        <button id="restoreDeleted" data-i18n="btn.restoreDeleted" disabled>恢复删除</button>
       </div>
     </div>
   </header>
 
   <aside id="left">
+    <div class="sec sec-search">
+      <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
+    </div>
     <div class="sec tree-sec">
       <h3 data-i18n="panel.files">文件</h3>
       <ul id="results" class="results-list"></ul>

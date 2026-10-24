@@ -66,7 +66,6 @@ function pushHistory() {
   history.stack.push(snap);
   if (history.stack.length > history.limit) history.stack.shift();
   history.idx = history.stack.length - 1;
-  updateHistoryButtons();
 }
 
 function applySnapshot(str) {
@@ -87,7 +86,6 @@ function applySnapshot(str) {
   draw();
   persistLabelDiff(before);
   saveLayout();
-  updateHistoryButtons();
 }
 
 /** 把快照恢复后与恢复前的标签差异逐边写回；失败只打日志，不打断撤销流程 */
@@ -128,13 +126,6 @@ function redo() {
   history.frozen = true;
   applySnapshot(history.stack[history.idx]);
   history.frozen = false;
-}
-
-function updateHistoryButtons() {
-  const u = document.getElementById('undoBtn');
-  const r = document.getElementById('redoBtn');
-  if (u) u.disabled = history.idx <= 0;
-  if (r) r.disabled = history.idx >= history.stack.length - 1;
 }
 
 async function saveLayout() {
@@ -179,7 +170,6 @@ export {
   applySnapshot,
   undo,
   redo,
-  updateHistoryButtons,
   saveLayout,
   collectManual,
   addManualEdge,
