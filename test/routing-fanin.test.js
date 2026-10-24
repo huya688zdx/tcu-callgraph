@@ -120,18 +120,12 @@ test('多源汇入同一目标：入边汇成目标侧干线，端口按源位�
   // 断言 C：不穿节点
   assertNoNodePenetration(edges, nodes);
 
-  // 端口展开与 portAt 一致：5 个接入点都落在目标左边界上、互不重合、按源位置次序排列
+  // 每面一口制：多源汇入只并中段干线，箭头共用目标左面的同一个入口（不摊开多个口）
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
   const ends = edges.map((e) => ({ from: e.from, end: e.points.at(-1) }));
-  assert.equal(new Set(ends.map((u) => u.end.join(','))).size, edges.length, '目标侧端口应各自展开');
+  assert.equal(new Set(ends.map((u) => u.end.join(','))).size, 1, '目标侧入口应合为一个（每面一口制）');
   for (const { from, end } of ends) {
     assert.equal(end[0], nodeById.get('target').x, `${from} 的箭头应从目标左侧接入`);
-  }
-  const bySource = ends
-    .map((u) => ({ sy: nodeById.get(u.from).y, ey: u.end[1] }))
-    .sort((a, b) => a.sy - b.sy);
-  for (let i = 1; i < bySource.length; i++) {
-    assert.ok(bySource[i].ey > bySource[i - 1].ey, '目标侧端口应按源位置次序自上而下展开');
   }
 });
 
