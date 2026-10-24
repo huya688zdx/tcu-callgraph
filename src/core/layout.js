@@ -239,6 +239,26 @@ function layoutBase(nodes, edges, opts = {}) {
   const layerIdx = new Map();
   layers.forEach((arr, li) => arr.forEach((id) => layerIdx.set(id, li)));
 
+  // 存档坐标作重心初值（seeded barycenter，ELK INTERACTIVE 策略的思想）：
+  // 同一视图上次布局的 x 次序作为各层初始排列——旧节点保持相对次序，
+  // 新节点（没有 seed 坐标）保持原相对次序排在该层有坐标的节点之后，
+  // 加节点时旧节点不跳变、只引起局部挪动。
+  // 只影响初始次序，后面的 8 轮重心迭代逻辑完全不变；分层与回边检测也不受影响
+  const seed = opts.seed || null;
+  if (seed) {
+    for (const arr of layers) {
+      const withSeed = [];
+      const withoutSeed = [];
+      for (const id of arr) {
+        (seed[id] && Number.isFinite(seed[id].x) ? withSeed : withoutSeed).push(id);
+      }
+      if (!withSeed.length) continue;
+      withSeed.sort((a, b) => seed[a].x - seed[b].x);
+      arr.length = 0;
+      arr.push(...withSeed, ...withoutSeed);
+    }
+  }
+
   const pos = new Map();
   const reindex = () => layers.forEach((arr) => arr.forEach((id, i) => pos.set(id, i)));
   reindex();
@@ -1273,6 +1293,9 @@ export function layoutPartitioned(items, edges, opts = {}) {
  * 排成分区式紧凑二维布局（列优先蛇形 + 宽高比最优），
  * 兄弟之间互不重叠；目录容器直接取节点自身的矩形，因此层级之间不会交叉
  * 组内边随内部布局平移，跨组边用共享路由器统一布线
+ * seed（存档坐标作重心初值）在这里被剔除，不传给内部文件级 layout()：
+ * group 模式的稳定性由存档回填机制承担（buildView 把存档坐标回填到 laid.nodes），
+ * seed 只用于扁平模式——文件框内部是组内相对布局，视图级绝对坐标会污染组内排序
  */
 export function layoutGrouped(nodes, edges, opts = {}) {
   const {
@@ -1282,6 +1305,8 @@ export function layoutGrouped(nodes, edges, opts = {}) {
     // 以 src 为根打开时，文件路径是相对 src 的（tcu/xxx/xx.c），
     // 不补这一层就看不出这些代码属于 src
     rootLabel = '',
+    // 显式丢弃 seed，避免它混进 rest 传给内部 layout()（理由见上方函数注释）
+    seed: _seedOmitted,
     ...rest
   } = opts;
 
