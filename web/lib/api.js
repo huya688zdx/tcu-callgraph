@@ -42,7 +42,7 @@ export const api = {
     if (!previous) return get('/api/view?' + q);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
     return post('/api/view?' + q, { projectId: previous.projectId, previous: {
-      projectId: previous.projectId, width: previous.width, height: previous.height,
+      projectId: previous.projectId, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points }) => ({ from, to, kind, line, change, points })),
       groups: previous.groups || [], containers: previous.containers || [],

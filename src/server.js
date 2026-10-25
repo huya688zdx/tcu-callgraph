@@ -1623,8 +1623,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 共享路由模块（浏览器端动态重路由用）
-    if (u.pathname === '/core/routing.js') {
-      return sendFile(res, path.join(__dirname, 'core', 'routing.js'), {
+    if (u.pathname === '/core/routing.js' || u.pathname === '/core/layout-metrics.js') {
+      return sendFile(res, path.join(__dirname, 'core', path.basename(u.pathname)), {
         'Content-Type': 'text/javascript; charset=utf-8',
         'Cache-Control': 'no-store',
       });

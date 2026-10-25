@@ -53,6 +53,29 @@ test('ELK 自递归线保留可见回环和两个不同的居中端口', async (
     '不能退化为同一直线往返');
 });
 
+test('完整布局将细长调用链折成接近正方形，仍使用四中点端口', async () => {
+  const nodes = Array.from({ length: 16 }, (_, i) => ({ id: 'n' + i, name: 'Task_' + i, file: 'chain.c' }));
+  const edges = nodes.slice(1).map((n, i) => ({ from: nodes[i].id, to: n.id, kind: 'direct', line: i }));
+  const view = await layoutElk(nodes, edges);
+  assert.ok(view.width / view.height > 0.75 && view.width / view.height < 1.34, '不能仍是一条细长横排或竖排');
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  for (const e of view.edges) for (const [id, p] of [[e.from, e.points[0]], [e.to, e.points.at(-1)]]) {
+    const n = byId.get(id);
+    assert.ok([[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h], [n.x, n.y + n.h / 2],
+      [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.5));
+  }
+});
+
+test('跨文件变量布局减少向右绕行的台阶', async () => {
+  const nodes = [['f', 'bsw/can.c'], ['buf', 'bsw/can.c'], ['len', 'bsw/can.c'],
+    ['state', 'bsw/can.c'], ['fail', 'bsw/can.c'], ['gear', 'app/control.c'],
+    ['tick', 'main.c'], ['rpm', 'main.c'], ['speed', 'main.c']]
+    .map(([id, file]) => ({ id, file, name: id, w: id === 'f' ? 180.8 : 120, h: 44 }));
+  const edges = nodes.slice(1).filter((n) => n.id !== 'len').map((n, line) => ({ from: 'f', to: n.id, kind: 'var', line }));
+  const view = await layoutElk(nodes, edges);
+  assert.ok(view.edges.find((e) => e.to === 'gear').points.length < 6, '比原先向右绕行的六点路径更简洁');
+});
+
 test('增量布局保留已有顺序，删除新增项后其余坐标和路径不变', async () => {
   const srv = await launchServer();
   try {

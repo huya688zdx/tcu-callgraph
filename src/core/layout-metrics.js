@@ -1,5 +1,5 @@
 // ELK 节点尺寸与连线度量工具。
-import { edgeStyleKey, routeOverlapConflicts } from './routing.js';
+import { edgeStyleKey, routeOverlapConflicts, routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
 
 export function textWidth(s) {
   let w = 0;
@@ -73,4 +73,40 @@ export function routeLengthAndCrossings(edges) {
   }
   const overlapLength = routeOverlapConflicts(edges).length;
   return { length, rawLength, sharedLength: Math.max(0, rawLength - length - overlapLength), overlapLength, crossings: intersections.size, bends };
+}
+
+export function routeScore(edges) {
+  const m = routeLengthAndCrossings(edges);
+  return m.crossings * 40 + m.overlapLength / 20 + m.bends * 2 + m.rawLength / 200;
+}
+
+/** 只试最绕的少数边，不动节点，也不覆盖手工折线或指定端口。 */
+export function improveEdgeRoutes(view, subset) {
+  const detour = (e) => {
+    const p = e.points;
+    let length = 0;
+    for (let i = 1; i < p.length; i++) length += Math.abs(p[i][0] - p[i - 1][0]) + Math.abs(p[i][1] - p[i - 1][1]);
+    return length - Math.abs(p.at(-1)[0] - p[0][0]) - Math.abs(p.at(-1)[1] - p[0][1]);
+  };
+  const edges = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.points.length > 2)
+    .sort((a, b) => detour(b) - detour(a)).slice(0, 6);
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  let metrics = routeLengthAndCrossings(view.edges), best = routeScore(view.edges);
+  for (const edge of edges) {
+    const a = byId.get(edge.from), b = byId.get(edge.to);
+    if (a === b) continue;
+    const right = b.x + b.w / 2 >= a.x + a.w / 2, below = b.y + b.h / 2 >= a.y + a.h / 2;
+    const horizontal = [right ? 'right' : 'left', right ? 'left' : 'right'];
+    const vertical = [below ? 'bottom' : 'top', below ? 'top' : 'bottom'];
+    const others = view.edges.filter((e) => e !== edge);
+    for (const [fromSide, toSide] of [[vertical[0], horizontal[1]], [horizontal[0], vertical[1]], vertical, horizontal]) {
+      const candidate = { ...edge, fromSide, toSide, points: edge.points.map((p) => [...p]) };
+      routeEdges(view.nodes, [candidate], { existing: collectSegments(others) });
+      if (candidate.blocked || pathBlockedByNodes(candidate.points, view.nodes, new Set([edge.from, edge.to]))) continue;
+      const trial = [...others, candidate], next = routeLengthAndCrossings(trial);
+      if (next.crossings > metrics.crossings || next.overlapLength > metrics.overlapLength + 0.5) continue;
+      const score = routeScore(trial);
+      if (score < best) { edge.points = candidate.points; best = score; metrics = next; }
+    }
+  }
 }

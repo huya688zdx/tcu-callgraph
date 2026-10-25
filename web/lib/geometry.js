@@ -4,6 +4,7 @@
  */
 import { state } from './state.js';
 import { routeEdges, collectSegments, pathBlockedByNodes } from '/core/routing.js';
+import { improveEdgeRoutes } from '/core/layout-metrics.js';
 /** 节点只能在所属文件框内移动，避免跑出框外导致结构散架 */
 function clampToGroup(n) {
   const v = state.view;
@@ -111,6 +112,8 @@ function fullReroute(movedIds = null) {
     const moved = v.nodes.filter((n) => movedIds.has(n.id));
     rerouteScope(v.edges.filter((e) => movedIds.has(e.from) || movedIds.has(e.to) ||
       pathBlockedByNodes(e.points, moved, new Set([e.from, e.to]))), true);
+    // 松手后尝试重新选面，只替换确实更好的边界连线；手工折线和指定端口不改。
+    improveEdgeRoutes(v, v.edges.filter((e) => movedIds.has(e.from) !== movedIds.has(e.to)));
   } else {
     routeEdges(v.nodes, v.edges, { bounds: { minX: 40, maxX: Math.max(v.width, 600) } });
   }
@@ -128,6 +131,10 @@ function fullReroute(movedIds = null) {
   }
   v.width = Math.max(v.width, maxX + 40);
   v.height = Math.max(v.height, maxY + 40);
+  for (const c of v.containers || []) if (c.root) {
+    c.w = Math.max(c.w, v.width);
+    c.h = Math.max(c.h, v.height);
+  }
 }
 
 function distToSegment(p, a, b) {

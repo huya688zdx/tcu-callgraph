@@ -1,7 +1,7 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
-import { textWidth } from './layout-metrics.js';
-import { routeEdges, collectSegments } from './routing.js';
+import { textWidth, routeScore, improveEdgeRoutes } from './layout-metrics.js';
+import { routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
@@ -9,7 +9,7 @@ const TOP_PADDING = 40;
 const styleKey = (e) => `${e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
 
-export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true) {
+export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true, wrap = false) {
   const root = { id: 'root', children: [], layoutOptions: {
     'elk.algorithm': 'layered', 'elk.direction': direction, 'elk.edgeRouting': 'ORTHOGONAL',
     'elk.hierarchyHandling': 'INCLUDE_CHILDREN', 'elk.json.edgeCoords': 'ROOT',
@@ -17,6 +17,7 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
     'elk.spacing.nodeNode': '26', 'elk.layered.spacing.nodeNodeBetweenLayers': '52',
     'elk.layered.mergeEdges': 'false', 'elk.layered.mergeHierarchyEdges': 'false',
     'elk.randomSeed': '1',
+    'elk.layered.wrapping.strategy': wrap ? 'MULTI_EDGE' : 'OFF',
   } };
   const boxes = new Map([['', root]]);
   for (const n of nodes) {
@@ -26,7 +27,8 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
       const key = parts.slice(0, i + 1).join('/');
       if (!boxes.has(key)) {
         const box = { id: 'box:' + key, label: parts[i], fileGroup: i === parts.length - 1,
-          children: [], layoutOptions: { 'elk.padding': `[top=${TOP_PADDING},left=14,bottom=14,right=14]` } };
+          children: [], layoutOptions: { 'elk.padding': `[top=${TOP_PADDING},left=14,bottom=14,right=14]`,
+            ...(wrap ? { 'elk.layered.wrapping.strategy': 'MULTI_EDGE', 'elk.aspectRatio': '1' } : {}) } };
         parent.children.push(box);
         boxes.set(key, box);
       }
@@ -81,6 +83,7 @@ export function facesOf(view) {
 
 /** 用当前画面的相对位置驱动 ELK 的交互式分层，不读取固定坐标存档。 */
 function seedInteractive(graph, previous, initial) {
+  const vertical = graph.layoutOptions['elk.direction'] === 'DOWN';
   const positions = (view) => new Map([
     ...view.nodes, ...(view.groups || []).map((n) => ({ ...n, id: 'box:' + n.id })),
     ...(view.containers || []).map((n) => ({ ...n, id: 'box:' + n.id })),
@@ -97,12 +100,16 @@ function seedInteractive(graph, previous, initial) {
       return peer?.file === n.file;
     });
     const peer = edge && anchors.get(edge.from === n.id ? edge.to : edge.from);
-    const x = peer ? edge.from === n.id ? peer.x - n.w - 52 : peer.x + peer.w + 52 : box.x + 14;
     const occupied = [...anchors.values()].filter((a) => a.file === n.file);
-    const rows = [Math.min(...occupied.map((a) => a.y)), ...occupied.map((a) => a.y + a.h + 26)].sort((a, b) => a - b);
-    const y = rows.find((top) => occupied.every((a) => x + n.w + 26 <= a.x || a.x + a.w + 26 <= x ||
-      top + n.h + 26 <= a.y || a.y + a.h + 26 <= top));
-    const p = { ...n, x, y };
+    const [flow, flowSize, across, acrossSize] = vertical ? ['y', 'h', 'x', 'w'] : ['x', 'w', 'y', 'h'];
+    const at = peer ? edge.from === n.id ? peer[flow] - n[flowSize] - 52 : peer[flow] + peer[flowSize] + 52 :
+      vertical ? Math.min(...occupied.map((a) => a.y)) : box.x + 14;
+    const slots = [Math.min(...occupied.map((a) => a[across])),
+      ...occupied.map((a) => a[across] + a[acrossSize] + 26)].sort((a, b) => a - b);
+    const free = slots.find((slot) => occupied.every((a) => at + n[flowSize] + 26 <= a[flow] ||
+      a[flow] + a[flowSize] + 26 <= at || slot + n[acrossSize] + 26 <= a[across] ||
+      a[across] + a[acrossSize] + 26 <= slot));
+    const p = { ...n, [flow]: at, [across]: free };
     fresh.set(n.id, p);
     anchors.set(n.id, p);
   }
@@ -116,7 +123,7 @@ function seedInteractive(graph, previous, initial) {
     });
     for (const n of parent.children || []) {
       const p = old.get(n.id) || fresh.get(n.id);
-      n.x = p.x - ox;
+      n.x = p.x - ox - (vertical ? parent === graph ? 40 : 14 : 0);
       // 输出坐标已含标题留白；参考坐标要扣掉，避免每次增量排版再累加一次。
       n.y = p.y - oy - TOP_PADDING;
       (n.layoutOptions ||= {})['elk.position'] = `(${n.x},${n.y})`;
@@ -124,6 +131,26 @@ function seedInteractive(graph, previous, initial) {
     }
   };
   walk(graph);
+}
+
+/** 同时衡量走线与真实画布比例，不靠加空白凑正方形。 */
+function quality(view) {
+  return routeScore(view.edges) +
+    160 * Math.log(view.width / view.height) ** 2 + Math.sqrt(view.width * view.height) / 200;
+}
+
+function validLayout(view) {
+  const overlap = (a, b) => Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 0.5 &&
+    Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0.5;
+  for (let i = 0; i < view.nodes.length; i++) for (let j = i + 1; j < view.nodes.length; j++) {
+    if (overlap(view.nodes[i], view.nodes[j])) return false;
+  }
+  const boxes = [...view.groups, ...view.containers];
+  for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+    if (!boxes[i].id.startsWith(boxes[j].id + '/') && !boxes[j].id.startsWith(boxes[i].id + '/') &&
+        overlap(boxes[i], boxes[j])) return false;
+  }
+  return view.edges.every((e) => !pathBlockedByNodes(e.points, view.nodes, new Set([e.from, e.to])));
 }
 
 export async function layoutElk(nodes, edges, { group = true, rootLabel = '', previous = null } = {}) {
@@ -135,13 +162,14 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
   }));
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
   const oldEdges = new Map((previous?.edges || []).map((e) => [edgeKey(e), e]));
+  const direction = previous?.layoutDirection === 'DOWN' ? 'DOWN' : 'RIGHT';
   // 没有新增节点时不移动已有内容；新增关系只补连线，删除则留下原来的空位。
   if (previous && sized.every((n) => {
     const old = oldNodes.get(n.id);
     return old && old.file === n.file && old.w === n.w && old.h === n.h;
   })) {
     const files = new Set(sized.map((n) => n.file || 'unknown'));
-    const view = { width: previous.width, height: previous.height,
+    const view = { width: previous.width, height: previous.height, layoutDirection: direction,
       nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
         ...(group ? { group: n.file || 'unknown' } : {}) })),
       edges: edges.map((e) => ({ ...e, points: oldEdges.get(edgeKey(e))?.points.map((p) => [...p]) })),
@@ -163,17 +191,37 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     }
     return view;
   }
-  const first = converted(await elk.layout(graphOf(sized, edges, 'RIGHT', null, false, group)), sized, edges);
-  const faces = facesOf(first);
-  if (previous) {
-    const priorFaces = facesOf(previous);
-    const oldFaces = new Map(previous.edges.map((e, i) => [edgeKey(e), priorFaces[i]]));
-    edges.forEach((e, i) => { if (oldFaces.has(edgeKey(e))) faces[i] = oldFaces.get(edgeKey(e)); });
+  const generate = async (dir, wrap = false) => {
+    const first = converted(await elk.layout(graphOf(sized, edges, dir, null, false, group, wrap)), sized, edges);
+    const faces = facesOf(first);
+    if (previous) {
+      const priorFaces = facesOf(previous);
+      const oldFaces = new Map(previous.edges.map((e, i) => [edgeKey(e), priorFaces[i]]));
+      edges.forEach((e, i) => { if (oldFaces.has(edgeKey(e))) faces[i] = oldFaces.get(edgeKey(e)); });
+    }
+    const graph = graphOf(sized, edges, dir, faces, true, group, wrap);
+    if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
+    const result = { ...converted(await elk.layout(graph), sized, edges), layoutDirection: dir };
+    if (!previous) {
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      improveEdgeRoutes(result, result.edges.filter((e) => byId.get(e.from).file !== byId.get(e.to).file));
+    }
+    return result;
+  };
+  let view = await generate(direction), score = previous ? 0 : quality(view);
+  if (!previous) {
+    const consider = (candidate) => {
+      if (!validLayout(candidate)) return;
+      const next = quality(candidate);
+      if (next < score) { view = candidate; score = next; }
+    };
+    // 比较完整横向、纵向布局，保留综合质量更好的结果。
+    consider(await generate('DOWN'));
+    // 只有比例仍明显失衡才额外尝试折行；复杂图不支持折行时保留已验证的候选。
+    if (Math.abs(Math.log(view.width / view.height)) > Math.log(1.8)) {
+      try { consider(await generate('DOWN', true)); } catch { /* 当前图不适用 ELK 折行。 */ }
+    }
   }
-  const graph = graphOf(sized, edges, 'RIGHT', faces, true, group);
-  if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
-  const result = await elk.layout(graph);
-  const view = converted(result, sized, edges);
   if (!group) for (const n of view.nodes) delete n.group;
   if (group && rootLabel) {
     for (const box of [...view.containers, ...view.groups]) box.depth++;
