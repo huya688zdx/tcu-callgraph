@@ -7,7 +7,7 @@ export function exportName(extension, project) {
   const roots = view.roots?.length ? view.roots : [view.root];
   const root = view.nodes.find((n) => n.id === roots[0]);
   const label = (root?.name || '调用关系') + (roots.length > 1 ? `等${roots.length}个入口` : '');
-  return `${project.name}_${label}_调用关系图`.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 150) + '.' + extension;
+  return `${project.name}_${label}_间构成图`.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 150) + '.' + extension;
 }
 
 export async function saveExport(extension, blob) {

@@ -5,6 +5,9 @@
 import { t } from '../i18n.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
+import { state } from './state.js';
+import { draw } from './render.js';
+import { loadTree, syncTreeSelection } from './panels.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
 
 const btn = document.getElementById('projectBtn');
@@ -75,13 +78,69 @@ async function render() {
         }</div>
         <div class="pt">${esc(p.path)}</div>
       </div>
-      <div class="tm">${fmtTime(p.openedAt)}</div>
+      <div class="proj-tools"><div class="tm">${fmtTime(p.openedAt)}</div>
+        <div class="proj-actions">
+          <button data-action="rename">重命名</button>
+          <button data-action="folder">所在文件夹</button>
+          <button data-action="remove" title="从最近列表移除，保留源码与存档；重新打开原路径即可恢复">移出列表</button>
+        </div>
+      </div>
     </div>`
     )
     .join('');
   listEl.querySelectorAll('.proj').forEach((row) => {
-    row.addEventListener('click', () => switchTo({ id: Number(row.dataset.id) }));
+    const project = rows.find((p) => p.id === Number(row.dataset.id));
+    row.addEventListener('click', async (event) => {
+      const button = event.target.closest('button');
+      if (!button) {
+        if (!event.target.closest('input') && !row.querySelector('.proj-rename')) switchTo({ id: project.id });
+        return;
+      }
+      try {
+        if (button.dataset.action === 'rename') return rename(row, project);
+        if (button.dataset.action === 'folder') {
+          if (!window.callgraph?.openProjectFolder) return hint('请在桌面版中打开工程所在文件夹');
+          await window.callgraph.openProjectFolder(project.id);
+        } else if (button.dataset.action === 'remove') {
+          button.disabled = true;
+          const result = await api.removeProject(project.id);
+          if (!result.ok) throw new Error(result.error);
+          await render();
+          hint('已移出最近列表，源码和存档保留；打开原路径即可恢复');
+        }
+      } catch (error) { hint(error.message); button.disabled = false; }
+    });
   });
+}
+
+/** 在列表内编辑，避免 Electron 不支持浏览器 prompt，也避免误触工程切换。 */
+function rename(row, project) {
+  const name = row.querySelector('.nm');
+  name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button data-save>保存</button><button data-cancel>取消</button></div>`;
+  const input = name.querySelector('input'), save = name.querySelector('[data-save]');
+  const commit = async () => {
+    if (save.disabled) return;
+    save.disabled = true;
+    try {
+      const result = await api.renameProject(project.id, input.value);
+      if (!result.ok) throw new Error(result.error);
+      if (state.view?.projectId === project.id) {
+        const root = state.view.containers?.find((c) => c.root);
+        if (root) root.label = result.project.name;
+        draw();
+        await syncProjectLabel();
+        await loadTree(); syncTreeSelection(state.roots);
+      }
+      await render();
+    } catch (error) { hint(error.message); save.disabled = false; input.focus(); }
+  };
+  save.addEventListener('click', (event) => { event.stopPropagation(); commit(); });
+  name.querySelector('[data-cancel]').addEventListener('click', (event) => { event.stopPropagation(); render(); });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); commit(); }
+    else if (event.key === 'Escape') { event.stopPropagation(); render(); }
+  });
+  input.focus(); input.select();
 }
 
 /** 失效标注：源码删了函数之后，标注还留在库里，必须给用户一个清理入口 */

@@ -433,6 +433,11 @@
   .proj .nm { font-weight: 500; font-size: 13px; }
   .proj .pt { color: #888780; font-size: 11.5px; word-break: break-all; margin-top: 1px; }
   .proj .tm { color: #B4B2A9; font-size: 11px; white-space: nowrap; }
+  .proj { flex-wrap: wrap; }
+  .proj-tools { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .proj-actions, .proj-rename { display: flex; gap: 6px; flex-wrap: wrap; }
+  .proj-actions button { padding: 4px 7px; font-size: 11.5px; }
+  .proj-rename input { min-width: 100px; width: 160px; }
   .proj .badge {
     font-size: 10.5px; padding: 1px 6px; border-radius: 20px;
     background: #EAF3DE; color: #3B6D11; white-space: nowrap;

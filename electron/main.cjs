@@ -47,7 +47,7 @@ function readProjects(limit = 20) {
     if (!fs.existsSync(file)) return [];
     const db = new DatabaseSync(file, { readOnly: true });
     try {
-      return db.prepare('SELECT id, path, name FROM project ORDER BY opened_at DESC LIMIT ?').all(limit);
+      return db.prepare('SELECT id, path, name FROM project WHERE opened_at > 0 ORDER BY opened_at DESC LIMIT ?').all(limit);
     } finally {
       db.close();
     }
@@ -234,6 +234,18 @@ async function pickFolder() {
   });
   if (!r.canceled && r.filePaths[0]) startTarget(r.filePaths[0]);
 }
+
+ipcMain.handle('cg:open-project-folder', async (event, id) => {
+  if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
+      new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的工程来源');
+  const project = readProjects(50).find((p) => p.id === id);
+  if (!project) throw new Error('工程不在最近列表中');
+  if (fs.statSync(project.path).isFile()) shell.showItemInFolder(project.path);
+  else {
+    const error = await shell.openPath(project.path);
+    if (error) throw new Error(error);
+  }
+});
 
 async function pickFile() {
   const r = await dialog.showOpenDialog(win || undefined, {

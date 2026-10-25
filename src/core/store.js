@@ -516,7 +516,9 @@ export function openStore({ dbPath, userData } = {}) {
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     ),
     projectTouch: db.prepare('UPDATE project SET opened_at = ?, fingerprint = COALESCE(?, fingerprint) WHERE id = ?'),
-    projectList: db.prepare('SELECT * FROM project ORDER BY pinned DESC, opened_at DESC LIMIT ?'),
+    projectList: db.prepare('SELECT * FROM project WHERE opened_at > 0 ORDER BY pinned DESC, opened_at DESC LIMIT ?'),
+    projectRename: db.prepare('UPDATE project SET name = ? WHERE id = ?'),
+    projectRemove: db.prepare('UPDATE project SET opened_at = 0 WHERE id = ?'),
 
     annList: db.prepare('SELECT target_id, data FROM annotation WHERE project_id = ? AND target_kind = ?'),
     annAll: db.prepare('SELECT target_kind, target_id, data FROM annotation WHERE project_id = ?'),
@@ -647,6 +649,18 @@ export function openStore({ dbPath, userData } = {}) {
 
     listProjects(limit = 50) {
       return q.projectList.all(limit);
+    },
+
+    renameProject(id, name) {
+      const clean = typeof name === 'string' ? name.trim() : '';
+      if (!clean || clean.length > 80 || /[\x00-\x1f\x7f]/.test(clean)) throw new Error('工程名需为 1～80 个字符，不能含控制字符');
+      q.projectRename.run(clean, id);
+      return api.getProject(id);
+    },
+
+    /** opened_at 为 0 表示移出最近列表；再次打开路径时恢复，标注和历史全部保留。 */
+    removeProject(id) {
+      q.projectRemove.run(id);
     },
 
     loadOverlay(projectId) {

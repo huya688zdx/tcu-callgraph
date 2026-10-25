@@ -179,7 +179,7 @@ async function openTarget(targetPath, { first = false } = {}) {
   ov.deleted.edges = ov.deleted.edges || {};
 
   root = abs;
-  ROOT_LABEL = label;
+  ROOT_LABEL = project.name;
   MODEL = model;
   S = st;
   PROJECT = project;
@@ -854,6 +854,25 @@ const server = http.createServer(async (req, res) => {
           current: p.id === PROJECT.id,
         }))
       );
+    }
+
+    // 管理最近工程：重命名仅改显示名，移出列表不删除源码或存档。
+    if (['/api/projects/rename', '/api/projects/remove'].includes(u.pathname) && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      try {
+        const p = await readJson(req, res);
+        if (!Number.isSafeInteger(p.id) || !store.getProject(p.id)) return bad(res, '工程不存在');
+        if (u.pathname.endsWith('/rename')) {
+          const project = store.renameProject(p.id, p.name);
+          if (p.id === PROJECT.id) { PROJECT.name = project.name; ROOT_LABEL = project.name; }
+          return json(res, { ok: true, project: { id: project.id, name: project.name } });
+        }
+        store.removeProject(p.id);
+        return json(res, { ok: true });
+      } catch (err) {
+        if (!res.headersSent) return bad(res, String(err.message || err));
+      }
+      return;
     }
 
     // 切换工程：重新解析目标并整体替换会话状态，前端拿到新统计后重载数据即可

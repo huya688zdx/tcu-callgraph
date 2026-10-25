@@ -34,3 +34,26 @@ test('工程切换拒绝旧请求和并发切换，不向新工程串写', async
   assert.equal((await post('/api/switch', { path: path.resolve('samples/demo') })).status, 409);
   assert.equal(await switching.finish(), 200);
 });
+
+test('工程显示名持久化，移出列表后按路径恢复且保留原存档', async (t) => {
+  const srv = await launchServer(); t.after(() => srv.close());
+  const get = (url) => fetch(srv.baseUrl + url).then((r) => r.json());
+  const post = (url, body) => fetch(srv.baseUrl + url, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+  const project = await get('/api/project');
+  await post('/api/overlay', { nodeId:'main.c::main', data:{note:'保留的标注'} });
+  const renamed = await post('/api/projects/rename', { id:project.id, name:'我的变速箱工程' });
+  assert.equal(renamed.project.name, '我的变速箱工程');
+  assert.equal((await get('/api/project')).name, '我的变速箱工程');
+  assert.equal((await get('/api/tree')).name, '我的变速箱工程');
+  assert.equal((await get('/api/view')).containers.find((c) => c.root).label, '我的变速箱工程');
+  assert.equal((await post('/api/projects/rename', { id:project.id, name:' ' })).ok, false);
+  assert.equal((await get('/api/project')).name, '我的变速箱工程');
+  await post('/api/projects/remove', { id:project.id });
+  assert.equal((await get('/api/projects')).some((p) => p.id === project.id), false);
+  const reopened = await post('/api/switch', { path:project.path });
+  assert.equal(reopened.project.id, project.id);
+  assert.equal(reopened.project.name, '我的变速箱工程');
+  assert.equal((await get('/api/projects')).some((p) => p.id === project.id), true);
+  assert.equal((await get('/api/session/export')).overlay.nodes['main.c::main'].note, '保留的标注');
+});

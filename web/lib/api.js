@@ -53,6 +53,8 @@ export const api = {
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */
   projects: () => get('/api/projects'),
+  renameProject: (id, name) => post('/api/projects/rename', { id, name }),
+  removeProject: (id) => post('/api/projects/remove', { id }),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */

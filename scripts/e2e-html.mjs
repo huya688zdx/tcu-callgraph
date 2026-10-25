@@ -36,8 +36,8 @@ async function exportsFrom(page, offline = false) {
   assert.equal(await page.evaluate(`new DOMParser().parseFromString(__files[1].content,'image/svg+xml').querySelectorAll('parsererror').length`), 0,
     '导出的 SVG 是有效矢量文件');
   const files = await page.evaluate('__files');
-  assert.equal(files[0].name, 'tcu_main_调用关系图.png');
-  assert.equal(files[1].name, 'tcu_main_调用关系图.svg');
+  assert.equal(files[0].name, 'tcu_main_间构成图.png');
+  assert.equal(files[1].name, 'tcu_main_间构成图.svg');
   assert.deepEqual(files[0].content, [247,246,242,255], 'PNG 底色不透明且与 GUI 一致');
   assert.match(files[1].content, /rgba\(133,183,235,0.32\)/, 'SVG 含目录标题胶囊');
   assert.match(files[1].content, /rgba\(181,212,244,0.5\)/, 'SVG 含文件标题底色');
@@ -98,7 +98,7 @@ try {
   await offline.send('Browser.setDownloadBehavior', { behavior:'allow', downloadPath:temp });
   await offline.evaluate(`delete window.callgraph;window.showSaveFilePicker=undefined;
     document.getElementById('offlinePng').click();document.getElementById('offlineSvg').click();`);
-  const pngFile = path.join(temp, 'tcu_main_调用关系图.png'), svgFile = path.join(temp, 'tcu_main_调用关系图.svg');
+  const pngFile = path.join(temp, 'tcu_main_间构成图.png'), svgFile = path.join(temp, 'tcu_main_间构成图.svg');
   const deadline = Date.now() + 5000;
   while ((!fs.existsSync(pngFile) || !fs.existsSync(svgFile)) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
