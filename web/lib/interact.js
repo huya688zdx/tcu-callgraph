@@ -1,5 +1,5 @@
 /**
- * 画布交互：命中测试、拖拽移动、连线、折线手柄、滚轮缩放
+ * 画布交互：命中测试、拖拽移动、连线、折线手柄、滚轮平移与缩放
  * 事件在模块加载时一次性绑定
  */
 import { t } from '../i18n.js';
@@ -680,6 +680,16 @@ els.cv.addEventListener(
     if (state.dragBox) return;
     stopCamAnim();
     const rect = els.cv.getBoundingClientRect();
+    if (!e.ctrlKey) {
+      const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? (e.shiftKey ? rect.width : rect.height) : 1;
+      if (e.shiftKey) cam.x -= (e.deltaY || e.deltaX) * unit;
+      else {
+        cam.x -= e.deltaX * unit;
+        cam.y -= e.deltaY * unit;
+      }
+      draw();
+      return;
+    }
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const wx = (sx - cam.x) / cam.k;

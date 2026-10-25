@@ -8,7 +8,7 @@ import { hooks } from './hooks.js';
 import { state } from './state.js';
 import { draw } from './render.js';
 import { loadTree, syncTreeSelection } from './panels.js';
-import { openModal, closeModal, wireModals, esc } from './modal.js';
+import { openModal, closeModal, wireModals, esc, confirmDialog } from './modal.js';
 
 const btn = document.getElementById('projectBtn');
 const listEl = document.getElementById('projectList');
@@ -24,6 +24,19 @@ const fmtTime = (ts) => {
   const mm = String(d.getMinutes()).padStart(2, '0');
   if (sameDay) return `今天 ${hh}:${mm}`;
   return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+};
+
+/** 行内操作的小图标（与文字按钮相比更省宽度），颜色跟随按钮 currentColor */
+const ICON = (paths) =>
+  `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
+const ICONS = {
+  rename: ICON('<path d="M11.1 2.7a1.6 1.6 0 0 1 2.3 2.3L5.6 12.8l-3.1.9.9-3.1z"/>'),
+  folder: ICON(
+    '<path d="M1.8 13.2V4.2a1 1 0 0 1 1-1h3.5l1.5 1.8h5.4a1 1 0 0 1 1 1v7.2a1 1 0 0 1-1 1H2.8a1 1 0 0 1-1-1z"/>'
+  ),
+  remove: ICON('<path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>'),
+  save: ICON('<path d="M3 8.5l3.2 3.2L13 5"/>'),
+  cancel: ICON('<path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>'),
 };
 
 /** 顶栏按钮显示当前工程名，让用户始终知道自己在看哪个工程 */
@@ -80,9 +93,9 @@ async function render() {
       </div>
       <div class="proj-tools"><div class="tm">${fmtTime(p.openedAt)}</div>
         <div class="proj-actions">
-          <button data-action="rename">重命名</button>
-          <button data-action="folder">所在文件夹</button>
-          <button data-action="remove" title="从最近列表移除，保留源码与存档；重新打开原路径即可恢复">移出列表</button>
+          <button class="icon-btn" data-action="rename" title="重命名" aria-label="重命名">${ICONS.rename}</button>
+          <button class="icon-btn" data-action="folder" title="打开工程所在文件夹" aria-label="所在文件夹">${ICONS.folder}</button>
+          <button class="icon-btn danger" data-action="remove" title="从最近列表移除，保留源码与存档；重新打开原路径即可恢复" aria-label="移出列表">${ICONS.remove}</button>
         </div>
       </div>
     </div>`
@@ -102,8 +115,12 @@ async function render() {
           if (!window.callgraph?.openProjectFolder) return hint('请在桌面版中打开工程所在文件夹');
           await window.callgraph.openProjectFolder(project.id);
         } else if (button.dataset.action === 'remove') {
-          if (!window.confirm(`确定将工程“${project.name}”移出最近列表吗？\n${project.path}`)) return;
-          if (!window.confirm(`请再次确认移出“${project.name}”。\n源码和存档都会保留，重新打开原路径即可恢复。`)) return;
+          const ok = await confirmDialog({
+            title: '移出最近列表',
+            message: `确定将工程“${project.name}”移出最近列表吗？\n${project.path}\n源码和存档都会保留，重新打开原路径即可恢复。`,
+            danger: true,
+          });
+          if (!ok) return;
           button.disabled = true;
           const result = await api.removeProject(project.id);
           if (!result.ok) throw new Error(result.error);
@@ -120,12 +137,13 @@ function rename(row, project) {
   if (row.querySelector('.proj-rename')) return;
   const name = row.querySelector('.nm');
   const original = name.innerHTML;
-  name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button data-save>保存</button><button data-cancel>取消</button></div>`;
+  row.classList.add('renaming'); // 编辑期间收起右侧操作图标，少一层干扰
+  name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button class="icon-btn ok" data-save title="保存" aria-label="保存">${ICONS.save}</button><button class="icon-btn" data-cancel title="取消" aria-label="取消">${ICONS.cancel}</button></div>`;
   const input = name.querySelector('input'), save = name.querySelector('[data-save]');
   const cancel = () => {
     if (save.disabled) return;
+    row.classList.remove('renaming');
     name.innerHTML = original;
-    row.querySelector('[data-action="rename"]').focus();
   };
   const commit = async () => {
     if (save.disabled) return;
@@ -213,7 +231,10 @@ function open() {
 btn?.addEventListener('click', open);
 openBtn?.addEventListener('click', () => {
   const p = pathInput?.value.trim();
-  if (p) switchTo({ path: p });
+  // 填了路径直接切；空着则调起系统文件夹选择框（Electron 经 preload 暴露的能力）
+  if (p) return switchTo({ path: p });
+  if (window.callgraph?.pickFolder) window.callgraph.pickFolder();
+  else pathInput?.focus();
 });
 
 // ---- 会话导出 / 导入 ----
