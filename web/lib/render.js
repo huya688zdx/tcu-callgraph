@@ -5,7 +5,7 @@
 import { t } from '../i18n.js';
 import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
-import { drawEdgeLabels, edgeLabels } from './edge-labels.js';
+import { drawEdgeLabels } from './edge-labels.js';
 
 /**
  * 下一帧重绘（去重）。
@@ -147,12 +147,10 @@ function draw() {
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
   const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
-  const kind = state.multiSelection?.kind;
-  const focusedEdges = new Set(kind === 'edge' ? v.edges : kind === 'label'
-    ? v.edges.filter((e) => edgeLabels(e).length) : focusedEdge ? [focusedEdge] : []);
+  const focusedEdges = new Set(state.multiSelection?.edges
+    ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
-  const selectedNodes = kind === 'function' || kind === 'var'
-    ? new Set(v.nodes.filter((n) => (n.kind === 'var') === (kind === 'var')).map((n) => n.id)) : null;
+  const selectedNodes = state.multiSelection?.nodes || null;
   for (const e of v.edges) {
     if (focusedEdges.has(e)) continue;
     const related = selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
@@ -439,9 +437,8 @@ function drawEdge(ctx, e, related, selected, focused = false) {
 function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
-  const kind = state.multiSelection?.kind;
-  const allNodes = kind === 'function' || kind === 'var';
-  const selected = allNodes ? isVar === (kind === 'var') : state.selected === n.id;
+  const allNodes = !!state.multiSelection?.nodes;
+  const selected = allNodes ? state.multiSelection.nodes.has(n.id) : state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const edgeRelated = focusedNodes?.has(n.id);

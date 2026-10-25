@@ -128,7 +128,8 @@ export function drawEdgeLabels(ctx, view = state.view) {
   const items = labelLayout(view);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
-    const selected = state.multiSelection?.kind === 'label' || state.selectedLabel === `${edgeKey(edge)}#${label.id}`;
+    const key = `${edgeKey(edge)}#${label.id}`;
+    const selected = state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key;
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';

@@ -3,7 +3,7 @@
  * 事件在模块加载时一次性绑定
  */
 import { t } from '../i18n.js';
-import { els, state, cam, FONT, esc, edgeKey } from './state.js';
+import { els, state, cam, FONT, esc, edgeKey, CHANGE_FILL, EDGE_COLOR } from './state.js';
 import {
   collidesWith,
   moveNodeNoOverlap,
@@ -586,6 +586,20 @@ els.cv.addEventListener('pointerup', (e) => {
 // 不处理的话 state.dragNode 等会永久留着，回页面后鼠标一动节点就跟着跑。
 els.cv.addEventListener('pointercancel', cancelDrag);
 els.cv.addEventListener('lostpointercapture', cancelDrag);
+
+// 按原始样式分组，不把选中时临时覆盖的蓝色算作组件颜色。
+const nodeSelectionType = (n) => JSON.stringify([
+  n.kind === 'var' ? 'var' : 'function', !!n.external,
+  (n.color || (n.external ? '#FAFAF7' : CHANGE_FILL[n.change] || CHANGE_FILL.existing)).toLowerCase(),
+]);
+const edgeSelectionType = (e) => JSON.stringify([
+  e.kind, e.kind === 'var' ? 'dashed' : 'solid',
+  EDGE_COLOR[e.change] || EDGE_COLOR.existing, e.change === 'deleted',
+]);
+const labelSelectionType = (l) => JSON.stringify([
+  l.preset, (l.border || '').toLowerCase(), (l.color || '#2C2C2A').toLowerCase(),
+]);
+
 document.addEventListener('keydown', (e) => {
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'a') {
@@ -597,7 +611,27 @@ document.addEventListener('keydown', (e) => {
     const node = state.view.nodes.find((n) => n.id === state.selected);
     const kind = state.selectedLabel ? 'label' : state.selectedEdge ? 'edge' : node ? (node.kind === 'var' ? 'var' : 'function') : null;
     if (kind) {
-      state.multiSelection = { kind, anchor, view: state.view };
+      const selection = { kind, anchor, view: state.view };
+      if (kind === 'function' || kind === 'var') {
+        const type = nodeSelectionType(node);
+        selection.nodes = new Set(state.view.nodes.filter((n) => nodeSelectionType(n) === type).map((n) => n.id));
+      } else if (kind === 'edge') {
+        const type = edgeSelectionType(state.selectedEdge);
+        selection.edges = new Set(state.view.edges.filter((ed) => edgeSelectionType(ed) === type).map(edgeKey));
+      } else {
+        const id = state.selectedLabel.slice(state.selectedLabel.lastIndexOf('#') + 1);
+        const label = edgeLabels(state.selectedEdge).find((l) => l.id === id);
+        if (!label) return;
+        const type = labelSelectionType(label);
+        selection.labels = new Set();
+        selection.edges = new Set();
+        for (const ed of state.view.edges) for (const l of edgeLabels(ed)) {
+          if (labelSelectionType(l) !== type) continue;
+          selection.labels.add(`${edgeKey(ed)}#${l.id}`);
+          selection.edges.add(edgeKey(ed));
+        }
+      }
+      state.multiSelection = selection;
       draw();
     }
     return;
