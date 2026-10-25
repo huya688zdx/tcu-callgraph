@@ -102,6 +102,8 @@ async function render() {
           if (!window.callgraph?.openProjectFolder) return hint('请在桌面版中打开工程所在文件夹');
           await window.callgraph.openProjectFolder(project.id);
         } else if (button.dataset.action === 'remove') {
+          if (!window.confirm(`确定将工程“${project.name}”移出最近列表吗？\n${project.path}`)) return;
+          if (!window.confirm(`请再次确认移出“${project.name}”。\n源码和存档都会保留，重新打开原路径即可恢复。`)) return;
           button.disabled = true;
           const result = await api.removeProject(project.id);
           if (!result.ok) throw new Error(result.error);
@@ -115,9 +117,16 @@ async function render() {
 
 /** 在列表内编辑，避免 Electron 不支持浏览器 prompt，也避免误触工程切换。 */
 function rename(row, project) {
+  if (row.querySelector('.proj-rename')) return;
   const name = row.querySelector('.nm');
+  const original = name.innerHTML;
   name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button data-save>保存</button><button data-cancel>取消</button></div>`;
   const input = name.querySelector('input'), save = name.querySelector('[data-save]');
+  const cancel = () => {
+    if (save.disabled) return;
+    name.innerHTML = original;
+    row.querySelector('[data-action="rename"]').focus();
+  };
   const commit = async () => {
     if (save.disabled) return;
     save.disabled = true;
@@ -135,10 +144,10 @@ function rename(row, project) {
     } catch (error) { hint(error.message); save.disabled = false; input.focus(); }
   };
   save.addEventListener('click', (event) => { event.stopPropagation(); commit(); });
-  name.querySelector('[data-cancel]').addEventListener('click', (event) => { event.stopPropagation(); render(); });
+  name.querySelector('[data-cancel]').addEventListener('click', (event) => { event.stopPropagation(); cancel(); });
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') { event.preventDefault(); commit(); }
-    else if (event.key === 'Escape') { event.stopPropagation(); render(); }
+    else if (event.key === 'Escape') { event.stopPropagation(); cancel(); }
   });
   input.focus(); input.select();
 }
