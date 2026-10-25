@@ -11,10 +11,12 @@
  * 回看历史（state.at > 0）时不刷新画面——历史是重放出来的，就地刷新会把
  * 「过去」和「现在」搅在一起；只弹提示，让用户自己决定何时回到最新。
  */
-import { state, edgeKey } from './state.js';
+import { state, cam, els, edgeKey } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
-import { loadStats } from './panels.js';
+import { loadStats, renderVars, renderDetail } from './panels.js';
+import { draw } from './render.js';
+import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
 
 // ---------------- SSE 监听 ----------------
@@ -100,35 +102,67 @@ if (es) {
 // ---------------- 页面状态上报（cg_page 的数据源）----------------
 
 /** 视图状态的指纹：变化才上报，避免空转打接口 */
-function pageSignature() {
-  return JSON.stringify([
-    state.roots,
-    state.up,
-    state.down,
-    state.group,
-    state.at,
-    [...state.vars].sort(),
-    state.selected,
-    state.selectedEdge ? edgeKey(state.selectedEdge) : null,
-  ]);
-}
-
 let lastSig = '';
-setInterval(() => {
-  const sig = pageSignature();
-  if (sig === lastSig) return;
-  lastSig = sig;
-  api.reportPage({
+let restoring = true;
+let pendingSave = Promise.resolve();
+
+/** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */
+export function savePage(force = false) {
+  if (restoring || !state.view?.projectId || !state.roots.length || (!force && isInteracting())) return pendingSave;
+  const page = {
+    projectId: state.view.projectId,
     roots: state.roots,
     up: state.up,
     down: state.down,
     group: state.group,
     vars: [...state.vars],
+    hiddenVars: [...state.hiddenVars],
     selected: state.selected,
     selectedEdge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
+    ctxBox: state.ctxBox,
+    cam: { ...cam },
     at: state.at,
+  };
+  const sig = JSON.stringify(page);
+  pendingSave = pendingSave.catch(() => {}).then(async () => {
+    if (sig === lastSig) return;
+    const result = await api.reportPage(page);
+    if (!result?.ok) throw new Error(result?.error || '保存当前视图失败');
+    lastSig = sig;
   });
-}, 800);
+  return pendingSave;
+}
+setInterval(() => savePage().catch(() => {}), 800);
+
+/** 显式链接优先；没有入口参数时恢复当前工程上次关闭前的选择。 */
+export async function restorePage(root = null) {
+  restoring = true;
+  try {
+    let saved = null;
+    if (!root) {
+      try { saved = (await api.savedPage()).page; } catch { /* 首次打开或服务暂不可用，走默认入口。 */ }
+    }
+    if (saved) {
+      Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
+      state.vars = new Set(saved.vars || []);
+      state.hiddenVars = new Set(saved.hiddenVars || []);
+      els.depth.value = String(state.down);
+      els.updepth.value = String(state.up);
+      els.groupMode.checked = state.group;
+    }
+    await hooks.loadView(root || saved?.roots || null, { nav: false });
+    if (saved) {
+      state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
+      state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;
+      state.ctxBox = saved.ctxBox;
+      if (saved.cam) Object.assign(cam, saved.cam);
+      renderVars();
+      await renderDetail(state.selected);
+      renderLabelPanel();
+      draw();
+    }
+  } finally { restoring = false; }
+}
 
 // ---------------- 轻量提示条 ----------------
 // 这个界面没有 toast 系统（见 bookmarks.js 的先例），临时提示就地造一个

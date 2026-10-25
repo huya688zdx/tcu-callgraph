@@ -222,6 +222,20 @@ function createWindow(url) {
     // 只允许停留在本机 server，避免被源码内容或外链把窗口带出应用
     if (!serverOrigin || origin !== serverOrigin) event.preventDefault();
   });
+  let savingClose = false, allowClose = false;
+  win.on('close', (event) => {
+    if (allowClose) return;
+    event.preventDefault();
+    if (savingClose) return;
+    savingClose = true;
+    const closingWindow = win;
+    closingWindow.webContents.executeJavaScript("import('/lib/live.js').then(m => m.savePage(true))")
+      .then(() => { allowClose = true; closingWindow.close(); })
+      .catch((err) => {
+        savingClose = false;
+        dialog.showErrorBox('当前视图未能保存', '窗口暂未关闭，请稍后重试。\n' + err.message);
+      });
+  });
   win.on('closed', () => {
     win = null;
   });
@@ -367,4 +381,7 @@ app.on('activate', () => {
   else pickFolder();
 });
 
-app.on('before-quit', stopServer);
+// 菜单“退出”也先走窗口保存流程，服务在窗口关闭后再停止。
+app.on('before-quit', (event) => {
+  if (win && !win.isDestroyed()) { event.preventDefault(); win.close(); }
+});

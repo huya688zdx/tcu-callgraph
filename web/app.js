@@ -24,7 +24,7 @@ import './lib/timeline.js';
 import './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
-import './lib/live.js';
+import { restorePage } from './lib/live.js';
 
 /**
  * 加载视图
@@ -132,7 +132,7 @@ hooks.reloadAll = async () => {
   await loadStats();
   await loadTree();
   await loadVars();
-  await loadView(null);
+  await restorePage();
 };
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
@@ -335,10 +335,8 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 window.addEventListener('resize', resize);
 resize();
-loadStats();
-loadTree();
-loadVars();
-loadView(new URLSearchParams(location.search).get('root'));
+Promise.all([loadStats(), loadTree(), loadVars()])
+  .then(() => restorePage(new URLSearchParams(location.search).get('root')));
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
 window.__cg = {

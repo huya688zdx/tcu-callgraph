@@ -723,12 +723,13 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 页面当前视图状态：前端上报（POST）/ AI 经 cg_page 读取（GET）。
-    // 内存态，不广播、不进时间轴——它不是数据变更，只是「用户在看什么」。
+    // 当前页供 MCP 读取；最近的正常视图按工程保存，不广播、不进时间轴。
     if (u.pathname === '/api/page') {
       if (req.method === 'POST') {
         if (!guardWrite(req, res)) return;
         return readJson(req, res)
           .then((p) => {
+            if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
             const str = (v) => (typeof v === 'string' ? v : null);
             const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
             pageState = {
@@ -744,12 +745,17 @@ const server = http.createServer(async (req, res) => {
               at: Math.max(0, Number(p.at) || 0),
               ts: Date.now(),
             };
+            if (pageState.roots.length && !pageState.reviewing) {
+              const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
+              const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
+              store.setSetting('ui.last-view.' + PROJECT.id, { ...pageState, hiddenVars: strArr(p.hiddenVars), cam, ctxBox });
+            }
             json(res, { ok: true });
           })
           .catch(() => {});
       }
       return json(res, {
-        page: pageState,
+        page: u.searchParams.has('saved') ? store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
         project: PROJECT ? { id: PROJECT.id, name: PROJECT.name, path: root } : null,
         hint: pageState
           ? undefined
