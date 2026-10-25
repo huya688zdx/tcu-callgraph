@@ -104,7 +104,7 @@ function buildSVG() {
   for (const n of v.nodes) {
     const isVar = n.kind === 'var';
     out.push(`<g data-id="${esc(n.id)}">`);
-    // 与画布保持一致：按变更分类上色，变量/函数都用虚线框
+    // 与画布保持一致：按变更分类上色，变量实线框、函数虚线框。
     const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
     const fill =
       custom ||
@@ -112,7 +112,7 @@ function buildSVG() {
         ? '#FAFAF7'
         : CHANGE_FILL[n.change] || CHANGE_FILL.existing);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="${n.external ? '#D3D1C7' : '#3A3A36'}" stroke-width="1" stroke-dasharray="5 3"/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="${n.external ? '#D3D1C7' : '#3A3A36'}" stroke-width="1"${isVar ? '' : ' stroke-dasharray="5 3"'}/>`
     );
     if (n.note) {
       out.push(`<circle cx="${(n.x + 8).toFixed(1)}" cy="${(n.y + 8).toFixed(1)}" r="3.2" fill="#EF9F27"/>`);

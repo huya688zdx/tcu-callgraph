@@ -235,7 +235,8 @@ function draw() {
       scheduleDraw();
     }
   }
-  if (state.recent || focusedEdges.size || state.multiSelection) scheduleDraw();
+  if (state.recent || focusedEdges.size || state.multiSelection ||
+      v.nodes.some((n) => n.id === state.selected && n.kind === 'var')) scheduleDraw();
 
   ctx.restore();
 
@@ -345,13 +346,23 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     ctx.save();
     ctx.beginPath();
     strokeRounded(ctx, pts);
-    ctx.strokeStyle = '#8BD8FF';
-    ctx.lineWidth = 3 / cam.k;
-    ctx.setLineDash([12 / cam.k, 30 / cam.k]);
-    // 负偏移让亮段沿 from → to 移动，与箭头保持同向。
-    ctx.lineDashOffset = -performance.now() * 0.08 / cam.k;
     ctx.shadowColor = '#378ADD';
-    ctx.shadowBlur = 5;
+    if (state.multiSelection) {
+      // 多选用整条线的呼吸光晕，与单选的方向脉冲区分。
+      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 320);
+      ctx.strokeStyle = '#378ADD';
+      ctx.lineWidth = (5 + 2 * pulse) / cam.k;
+      ctx.globalAlpha = 0.18 + 0.22 * pulse;
+      ctx.shadowBlur = 3 + 3 * pulse;
+      if (e.kind === 'var') ctx.setLineDash([7, 4]);
+    } else {
+      ctx.strokeStyle = '#8BD8FF';
+      ctx.lineWidth = 3 / cam.k;
+      ctx.setLineDash([12 / cam.k, 30 / cam.k]);
+      // 负偏移让亮段沿 from → to 移动，与箭头保持同向。
+      ctx.lineDashOffset = -performance.now() * 0.08 / cam.k;
+      ctx.shadowBlur = 5;
+    }
     ctx.stroke();
     ctx.restore();
   }
@@ -471,10 +482,16 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     : n.external
     ? '#D3D1C7'
     : '#3A3A36';
-  // 变量与函数统一用虚线框，靠名字（变量不带括号）区分
-  ctx.setLineDash([5, 3]);
-  if (selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
+  // 变量用实线框，选中时呼吸发光；函数保留流动虚线框。
+  ctx.setLineDash(isVar ? [] : [5, 3]);
+  if (!isVar && selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
+  ctx.save();
+  if (isVar && selected) {
+    ctx.shadowColor = '#378ADD';
+    ctx.shadowBlur = 3 + 8 * (0.5 + 0.5 * Math.sin(performance.now() / 320));
+  }
   ctx.stroke();
+  ctx.restore();
   ctx.setLineDash([]);
 
   if (n.note) {
