@@ -73,6 +73,15 @@ test('增量布局保留已有顺序，删除新增项后其余坐标和路径�
       assert.deepEqual([n.x, n.y], [byId.get(n.id).x, byId.get(n.id).y], '删除不挪动剩余节点');
     }
     assert.deepEqual(removed.edges.map((e) => e.points), added.edges.slice(0, -1).map((e) => e.points));
+    let cycled = removed;
+    for (let round = 0; round < 4; round++) {
+      cycled = await layoutElk(nodes, edges, { previous: cycled });
+      assert.deepEqual(cycled.nodes.map((n) => [n.id, n.x, n.y]), added.nodes.map((n) => [n.id, n.x, n.y]),
+        '反复取消、加入同一变量，函数不能逐轮下移');
+      assert.deepEqual(cycled.groups, added.groups, '文件框不能逐轮增高');
+      assert.equal(cycled.height, added.height, '画布不能逐轮增高');
+      cycled = await layoutElk(before.nodes, before.edges, { previous: cycled });
+    }
   } finally { await srv.close(); }
 });
 

@@ -5,6 +5,7 @@ import { routeEdges, collectSegments } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
+const TOP_PADDING = 40;
 const styleKey = (e) => `${e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
 
@@ -12,7 +13,7 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
   const root = { id: 'root', children: [], layoutOptions: {
     'elk.algorithm': 'layered', 'elk.direction': direction, 'elk.edgeRouting': 'ORTHOGONAL',
     'elk.hierarchyHandling': 'INCLUDE_CHILDREN', 'elk.json.edgeCoords': 'ROOT',
-    'elk.padding': '[top=40,left=40,bottom=40,right=40]', 'elk.aspectRatio': '1',
+    'elk.padding': `[top=${TOP_PADDING},left=40,bottom=40,right=40]`, 'elk.aspectRatio': '1',
     'elk.spacing.nodeNode': '26', 'elk.layered.spacing.nodeNodeBetweenLayers': '52',
     'elk.layered.mergeEdges': 'false', 'elk.layered.mergeHierarchyEdges': 'false',
     'elk.randomSeed': '1',
@@ -25,7 +26,7 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
       const key = parts.slice(0, i + 1).join('/');
       if (!boxes.has(key)) {
         const box = { id: 'box:' + key, label: parts[i], fileGroup: i === parts.length - 1,
-          children: [], layoutOptions: { 'elk.padding': '[top=40,left=14,bottom=14,right=14]' } };
+          children: [], layoutOptions: { 'elk.padding': `[top=${TOP_PADDING},left=14,bottom=14,right=14]` } };
         parent.children.push(box);
         boxes.set(key, box);
       }
@@ -86,8 +87,7 @@ function seedInteractive(graph, previous, initial) {
   ].map((n) => [n.id, n]));
   const old = positions(previous), fresh = positions(initial);
   const anchors = new Map(previous.nodes.map((n) => [n.id, n]));
-  const bottoms = new Map((previous.groups || []).map((g) => [g.id, g.y + g.h + 26]));
-  // 新节点优先延续同文件邻居的层次，放在已有内容下方，避免挤入旧顺序中间。
+  // 新节点沿用同文件邻居的层次，优先复用空位，不追加到保留的旧框底部。
   for (const n of initial.nodes) {
     if (anchors.has(n.id)) continue;
     const box = old.get('box:' + n.file);
@@ -98,10 +98,13 @@ function seedInteractive(graph, previous, initial) {
     });
     const peer = edge && anchors.get(edge.from === n.id ? edge.to : edge.from);
     const x = peer ? edge.from === n.id ? peer.x - n.w - 52 : peer.x + peer.w + 52 : box.x + 14;
-    const p = { ...n, x, y: bottoms.get(n.file) };
+    const occupied = [...anchors.values()].filter((a) => a.file === n.file);
+    const rows = [Math.min(...occupied.map((a) => a.y)), ...occupied.map((a) => a.y + a.h + 26)].sort((a, b) => a - b);
+    const y = rows.find((top) => occupied.every((a) => x + n.w + 26 <= a.x || a.x + a.w + 26 <= x ||
+      top + n.h + 26 <= a.y || a.y + a.h + 26 <= top));
+    const p = { ...n, x, y };
     fresh.set(n.id, p);
     anchors.set(n.id, p);
-    bottoms.set(n.file, p.y + n.h + 26);
   }
   const walk = (parent, ox = 0, oy = 0) => {
     Object.assign(parent.layoutOptions, {
@@ -114,7 +117,8 @@ function seedInteractive(graph, previous, initial) {
     for (const n of parent.children || []) {
       const p = old.get(n.id) || fresh.get(n.id);
       n.x = p.x - ox;
-      n.y = p.y - oy;
+      // 输出坐标已含标题留白；参考坐标要扣掉，避免每次增量排版再累加一次。
+      n.y = p.y - oy - TOP_PADDING;
       (n.layoutOptions ||= {})['elk.position'] = `(${n.x},${n.y})`;
       if (n.children) walk(n, p.x, p.y);
     }
