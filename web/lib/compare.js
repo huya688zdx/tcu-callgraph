@@ -8,6 +8,7 @@ const normalMode = document.getElementById('projectModeNormal');
 const compareMode = document.getElementById('projectModeCompare');
 const normalPane = document.getElementById('projectNormalPane');
 const comparePane = document.getElementById('projectComparePane');
+const projectPath = document.getElementById('compareProjectPath');
 const beforePath = document.getElementById('compareBeforePath');
 const afterPath = document.getElementById('compareAfterPath');
 const errorEl = document.getElementById('compareError');
@@ -17,12 +18,20 @@ const exitBtn = document.getElementById('compareExit');
 const browseButtons = document.querySelectorAll('[data-compare-browse]');
 let activeComparison = null;
 
-function showMode(comparing) {
+async function showMode(comparing) {
   normalMode?.setAttribute('aria-pressed', String(!comparing));
   compareMode?.setAttribute('aria-pressed', String(comparing));
   if (normalPane) normalPane.hidden = comparing;
   if (comparePane) comparePane.hidden = !comparing;
   if (errorEl) errorEl.textContent = '';
+  if (comparing) {
+    try {
+      const project = await api.project();
+      if (projectPath) projectPath.value = project.comparison?.projectPath || project.path;
+    } catch (error) {
+      if (errorEl) errorEl.textContent = `${t('compare.failed')}：${error.message || error}`;
+    }
+  }
 }
 
 normalMode?.addEventListener('click', () => showMode(false));
@@ -92,10 +101,11 @@ export function syncComparison(comparison) {
   }
   if (enabled) {
     const name = (p) => p?.replace(/\\/g, '/').split('/').pop() || '';
+    if (projectPath) projectPath.value = activeComparison.projectPath;
     const button = document.getElementById('projectBtn');
     if (button) {
-      button.textContent = `${name(activeComparison.beforePath)} → ${name(activeComparison.afterPath)}`;
-      button.title = `${activeComparison.beforePath}\n→ ${activeComparison.afterPath}`;
+      button.textContent = activeComparison.projectName || name(activeComparison.projectPath);
+      button.title = `${activeComparison.projectPath}\n${activeComparison.beforePath} → ${activeComparison.afterPath}`;
     }
   }
   if (summaryEl) {
@@ -109,7 +119,7 @@ export function syncComparison(comparison) {
         shown: activeComparison.shownNodes ?? activeComparison.totalNodes ?? 0,
         total: activeComparison.totalNodes ?? 0,
       });
-      summaryEl.title = [activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
+      summaryEl.title = [activeComparison.projectPath, activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
       if (activeComparison.warnings?.length) summaryEl.textContent += ' · ' + t('compare.warningCount', { n: activeComparison.warnings.length });
       if (activeComparison.truncated) summaryEl.textContent += ' · ' + t('compare.truncated');
     }

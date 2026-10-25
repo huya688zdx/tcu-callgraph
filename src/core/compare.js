@@ -1,8 +1,8 @@
-/** 两份 C 工程的定义差分与潜在影响；位置只作证据，不作对象身份。 */
+/** 在总代码工程上应用局部 before/after 对照，分析定义差分与潜在影响。 */
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { loadModel, rebuildIndex } from './index.js';
+import { buildIndex, listSourceFiles, rebuildIndex } from './index.js';
 import { getParser, collectDefinitions } from './cparse.js';
 import { analysisSources, buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { lex } from './lexer.js';
@@ -44,18 +44,33 @@ function groupedEdges(model) {
   return result;
 }
 
-export async function compareProjects(beforePath, afterPath) {
+export async function compareProjects(projectPath, beforePath, afterPath) {
   const realDirectory = (value) => {
-    if (typeof value !== 'string' || !value.trim()) throw new Error('请选择修改前和修改后目录');
+    if (typeof value !== 'string' || !value.trim()) throw new Error('请打开总代码目录，并选择修改前和修改后对照目录');
     const abs = fs.realpathSync(path.resolve(value));
     if (!fs.statSync(abs).isDirectory()) throw new Error(`比较对象必须是目录：${abs}`);
     return abs;
   };
-  beforePath = realDirectory(beforePath); afterPath = realDirectory(afterPath);
-  if ((process.platform === 'win32' ? beforePath.toLowerCase() === afterPath.toLowerCase() : beforePath === afterPath)) {
-    throw new Error('修改前和修改后不能是同一个目录');
+  projectPath = realDirectory(projectPath); beforePath = realDirectory(beforePath); afterPath = realDirectory(afterPath);
+  const identities = [projectPath, beforePath, afterPath].map((p) => process.platform === 'win32' ? p.toLowerCase() : p);
+  if (new Set(identities).size !== 3) {
+    throw new Error('总代码、修改前对照、修改后对照必须是三个不同的目录');
   }
-  const beforeModel = loadModel(beforePath), afterModel = loadModel(afterPath);
+  const filesOf = (root) => new Map(listSourceFiles(root).map((abs) => [path.relative(root, abs).replace(/\\/g, '/'), abs]));
+  const baseFiles = filesOf(projectPath), beforeFiles = filesOf(beforePath), afterFiles = filesOf(afterPath);
+  const scope = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
+  if (!scope.size) throw new Error('对照目录中没有可解析的 C 文件');
+  if (!baseFiles.size) throw new Error('请先打开包含完整 C 源码的总代码目录');
+  const withOverrides = (overrides) => {
+    const files = new Map(baseFiles);
+    for (const rel of scope) {
+      if (overrides.has(rel)) files.set(rel, overrides.get(rel));
+      else files.delete(rel); // 已进入对照范围但某侧缺失，表示该文件在该版本不存在。
+    }
+    return new Map([...files].sort(([a], [b]) => a.localeCompare(b)));
+  };
+  const beforeModel = buildIndex(projectPath, withOverrides(beforeFiles));
+  const afterModel = buildIndex(projectPath, withOverrides(afterFiles));
   for (const m of [beforeModel, afterModel]) {
     if (!m.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${m.root}`);
     if (m.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
@@ -152,7 +167,7 @@ export async function compareProjects(beforePath, afterPath) {
   const macroChanges = [...new Set([...oldMacros.keys(), ...newMacros.keys()])].filter((key) =>
     fingerprint(JSON.stringify(oldMacros.get(key)?.params) + (oldMacros.get(key)?.raw || '')) !==
     fingerprint(JSON.stringify(newMacros.get(key)?.params) + (newMacros.get(key)?.raw || '')));
-  return { beforePath, afterPath, beforeModel, afterModel, model, summary, roots: [...visible], warnings,
+  return { projectPath, beforePath, afterPath, beforeModel, afterModel, model, summary, roots: [...visible], warnings,
     macroChanges, totalNodes: visible.size };
 }
 

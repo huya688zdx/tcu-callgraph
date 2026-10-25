@@ -700,6 +700,11 @@
     </div>
     <div id="projectComparePane" class="compare-panel" hidden>
       <div class="compare-row">
+        <label for="compareProjectPath" data-i18n="compare.project">总代码目录</label>
+        <input id="compareProjectPath" type="text" readonly aria-readonly="true">
+      </div>
+      <div class="detail-meta" data-i18n="compare.scopeHint">以当前工程为总代码目录；before/after 只放对照文件，并保留相同的相对路径。</div>
+      <div class="compare-row">
         <label for="compareBeforePath" data-i18n="compare.before">修改前 before</label>
         <input id="compareBeforePath" type="text" data-i18n-ph="compare.pathPlaceholder">
         <button type="button" data-compare-browse="before" data-i18n="compare.browse">浏览</button>

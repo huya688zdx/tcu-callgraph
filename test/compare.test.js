@@ -6,15 +6,16 @@ import { launchServer } from '../scripts/lib/server.mjs';
 
 const beforePath = path.resolve('samples/diff/before');
 const afterPath = path.resolve('samples/diff/after');
+const projectPath = path.resolve('samples/diff/project');
 const requests = (srv) => ({
   get: (url) => fetch(srv.baseUrl + url).then((r) => r.json()),
   post: (url, body) => fetch(srv.baseUrl + url, { method: 'POST',
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json()),
 });
 
-test('双目录比较：完整定义、宏、旧关系与共享变量影响进入只读视图，退出恢复普通标注', async (t) => {
-  const result = await compareProjects(beforePath, afterPath);
-  assert.deepEqual(result.summary.functions, { existing: 3, modified: 2, added: 1, deleted: 1 });
+test('总代码加局部差分：保留对照外的调用者和读取者，退出仍回总代码工程', async (t) => {
+  const result = await compareProjects(projectPath, beforePath, afterPath);
+  assert.deepEqual(result.summary.functions, { existing: 4, modified: 2, added: 1, deleted: 1 });
   assert.deepEqual(result.summary.variables, { existing: 1, modified: 1, added: 1, deleted: 1 });
   const fn = (name) => result.model.functions.find((f) => f.name === name);
   assert.equal(fn('Sensor_Update').change, 'modified');
@@ -22,18 +23,24 @@ test('双目录比较：完整定义、宏、旧关系与共享变量影响进�
   assert.equal(fn('Legacy_Log').change, 'deleted');
   assert.equal(fn('Monitor_Read').change, 'existing');
   assert.ok(fn('Monitor_Read').impact);
+  assert.ok(fn('Supervisor_Read').impact, '不在 before/after 中的读取者也要从总代码工程找到');
+  assert.equal(fn('Supervisor_Read').change, 'existing');
+  assert.ok(fn('main').impact, '对照外的主工程调用者不能丢失');
   assert.ok(fn('Normalize').context);
   assert.ok(result.model.edges.some((e) => e.to === 'control.c::Legacy_Log' && e.change === 'deleted'));
   assert.ok(result.model.edges.some((e) => e.to === 'control.c::Diagnostics' && e.change === 'added'));
 
-  const srv = await launchServer({ target: afterPath }); t.after(() => srv.close());
+  const srv = await launchServer({ target: projectPath }); t.after(() => srv.close());
   const { get, post } = requests(srv);
   await post('/api/overlay', { nodeId: 'var::g_limit', data: { change: 'existing' } });
   const project = await get('/api/project');
   await post('/api/page', { roots: ['main.c::main'], projectId: project.id, down: 2, group: true });
   assert.equal((await post('/api/compare', { beforePath, afterPath })).ok, true);
   const view = await get('/api/view');
-  assert.equal(view.nodes.length, 11);
+  assert.equal(view.nodes.length, 12);
+  assert.equal((await get('/api/project')).path, projectPath);
+  assert.equal((await get('/api/compare')).comparison.projectPath, projectPath);
+  assert.ok(view.nodes.some((n) => n.id === 'observer.c::Supervisor_Read'));
   assert.equal(view.nodes.find((n) => n.id === 'var::g_limit').change, 'modified', '普通人工标注不覆盖比较分类');
   assert.ok(view.nodes.some((n) => n.id === 'control.c::Legacy_Log' && n.change === 'deleted'));
   assert.ok(view.edges.some((e) => e.change === 'added') && view.edges.some((e) => e.change === 'deleted'));
@@ -49,6 +56,7 @@ test('双目录比较：完整定义、宏、旧关系与共享变量影响进�
   assert.ok(flow.vars.some((v) => v.version === 'after' && v.peers.some((p) => p.name === 'Monitor_Read')));
   assert.equal((await post('/api/compare/exit', {})).ok, true);
   assert.equal((await get('/api/project')).comparison, null);
+  assert.equal((await get('/api/project')).path, projectPath);
   assert.equal((await get('/api/node?id=var::g_limit')).overlay.change, 'existing');
   assert.deepEqual((await get('/api/page?saved=1')).page.roots, ['main.c::main']);
   assert.equal((await get('/api/node?id=control.c::Legacy_Log')).error, 'not found');

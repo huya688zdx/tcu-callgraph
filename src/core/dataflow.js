@@ -29,7 +29,7 @@ export function analysisSources(model) {
   let failedFiles = 0;
   for (const f of model.files) {
     try {
-      sources.push({ ...f, src: decodeSource(fs.readFileSync(path.join(model.root, f.rel))) });
+      sources.push({ ...f, src: decodeSource(fs.readFileSync(model._sourceFiles?.get(f.rel) || path.join(model.root, f.rel))) });
     } catch (err) {
       failedFiles++;
       console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);

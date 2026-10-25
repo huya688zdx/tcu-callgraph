@@ -290,11 +290,12 @@ export function rebuildIndex(model) {
  * @param {string} root 工程根目录
  * @returns {object} model
  */
-export function buildIndex(root) {
+export function buildIndex(root, sourceFiles = null) {
   const t0 = Date.now();
-  const absFiles = listSourceFiles(root);
-  const headers = absFiles.filter((f) => HDR_EXT.test(f));
-  const sources = absFiles.filter((f) => !HDR_EXT.test(f));
+  // 比较时仅替换文件来源，符号身份和层级仍相对于总代码目录。
+  const files = sourceFiles ? [...sourceFiles] : listSourceFiles(root).map((abs) => [path.relative(root, abs).replace(/\\/g, '/'), abs]);
+  const headers = files.filter(([rel]) => HDR_EXT.test(rel));
+  const sources = files.filter(([rel]) => !HDR_EXT.test(rel));
 
   const macros = new Map();
   const parsed = [];
@@ -310,8 +311,7 @@ export function buildIndex(root) {
     for (const [name, def] of snap) target.set(name, def);
   };
 
-  const parseFile = (abs, isHeader) => {
-    const rel = path.relative(root, abs).replace(/\\/g, '/');
+  const parseFile = (rel, abs, isHeader) => {
     let buf;
     try {
       const size = fs.statSync(abs).size;
@@ -348,8 +348,8 @@ export function buildIndex(root) {
   };
 
   // 先头文件（宏定义先入表），再源文件
-  for (const f of headers) parseFile(f, true);
-  for (const f of sources) parseFile(f, false);
+  for (const [rel, abs] of headers) parseFile(rel, abs, true);
+  for (const [rel, abs] of sources) parseFile(rel, abs, false);
 
   const functions = [];
   const fnptrTables = new Map();
@@ -506,6 +506,7 @@ export function buildIndex(root) {
 
   const model = {
     root,
+    ...(sourceFiles ? { _sourceFiles: sourceFiles } : {}),
     generatedAt: new Date().toISOString(),
     elapsedMs: Date.now() - t0,
     files: parsed.map((p) => ({ rel: p.rel, isHeader: p.isHeader, bytes: p.bytes })),

@@ -50,7 +50,8 @@ let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {}
 let switching = false;
 let COMPARISON = null;
 const comparisonInfo = () => COMPARISON ? {
-  id: COMPARISON.id, beforePath: COMPARISON.beforePath, afterPath: COMPARISON.afterPath,
+  id: COMPARISON.id, projectPath: COMPARISON.projectPath, projectName: PROJECT.name,
+  beforePath: COMPARISON.beforePath, afterPath: COMPARISON.afterPath,
   summary: COMPARISON.summary, warnings: COMPARISON.warnings, macroChanges: COMPARISON.macroChanges,
   totalNodes: COMPARISON.totalNodes,
 } : null;
@@ -913,15 +914,13 @@ const server = http.createServer(async (req, res) => {
       try {
         const p = await readJson(req, res);
         if (u.pathname.endsWith('/exit')) {
-          if (COMPARISON) await openTarget(COMPARISON.afterPath);
+          if (COMPARISON) await openTarget(COMPARISON.projectPath);
         } else {
-          const comparison = await compareProjects(p.beforePath, p.afterPath);
+          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath);
           // 计算全部成功后才发布，失败不会留下半份工程。
-          const project = store.upsertProject({ path: comparison.afterPath, name: path.basename(comparison.afterPath),
-            fingerprint: fingerprintFiles(comparison.afterModel.files) });
           COMPARISON = { ...comparison, id: randomUUID() };
-          MODEL = comparison.model; PROJECT = project; root = comparison.afterPath;
-          ROOT_LABEL = `${path.basename(comparison.beforePath)} → ${path.basename(comparison.afterPath)}`;
+          MODEL = comparison.model;
+          ROOT_LABEL = PROJECT.name;
           S = stats(MODEL); pageState = null;
           overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {} }, layout: {} };
         }

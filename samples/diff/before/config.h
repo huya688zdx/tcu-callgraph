@@ -11,6 +11,7 @@ int Normalize(int value);
 void Sensor_Update(void);
 int Control_Read(void);
 int Monitor_Read(void);
+int Supervisor_Read(void);
 void Legacy_Log(void);
 
 #endif
