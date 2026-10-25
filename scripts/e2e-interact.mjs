@@ -204,6 +204,26 @@ if (nodesInfo) {
   console.log('\n[测试2] 跳过：视野内没有同组的两个节点');
 }
 
+// 3) 连线也必须双击解锁；直线拖出折弯后端点不动，仍保持正交。
+console.log('\n[测试3] 连线双击解锁与直线调形');
+const edgeFixture = await evaluate(`(async()=>{
+  const {state,cam}=await import('/lib/state.js');window.__edgeBackup={view:state.view,cam:{...cam}};
+  const nodes=state.view.nodes.filter(n=>n.kind!=='var').slice(0,2).map((n,i)=>({...n,x:100+i*300,y:100,w:120,h:44}));
+  const edge={from:nodes[0].id,to:nodes[1].id,kind:'direct',line:1,points:[[220,122],[400,122]],custom:false};
+  state.view={...state.view,nodes,edges:[edge],groups:[],containers:[]};state.selected=null;state.selectedEdge=null;state.moveTarget=null;
+  state.recent=null;state.flash=null;Object.assign(cam,{x:20,y:60,k:1});(await import('/lib/render.js')).draw();
+  const r=cv.getBoundingClientRect();return{x:r.left+330,y:r.top+182};
+})()`);
+await drag(edgeFixture.x,edgeFixture.y,edgeFixture.x,edgeFixture.y+35,{steps:4});
+const lockedEdge = await evaluate(`__cg.view.edges[0].points.length===2&&!__cg.view.edges[0].custom`);
+await doubleClick(edgeFixture.x,edgeFixture.y);
+const editingEdge = await evaluate(`(async()=>{const {state}=await import('/lib/state.js');return state.moveTarget?.kind==='edge'})()`);
+await drag(edgeFixture.x,edgeFixture.y,edgeFixture.x,edgeFixture.y+35,{steps:4});
+const shapedEdge = await evaluate(`(()=>{const e=__cg.view.edges[0],p=e.points;return e.custom&&p.length===6&&p[0][0]===220&&p[0][1]===122&&p.at(-1)[0]===400&&p.at(-1)[1]===122&&p.some(q=>q[1]===157)&&p.every((q,i)=>!i||q[0]===p[i-1][0]||q[1]===p[i-1][1])})()`);
+console.log(`  单击不能误拖: ${lockedEdge}；双击已解锁: ${editingEdge}；直线调形成功且保持正交: ${shapedEdge}`);
+if (!lockedEdge || !editingEdge || !shapedEdge) ok=false;
+await evaluate(`(async()=>{const {state,cam}=await import('/lib/state.js');state.view=__edgeBackup.view;state.selectedEdge=null;state.selectedLabel=null;state.moveTarget=null;Object.assign(cam,__edgeBackup.cam);delete window.__edgeBackup;(await import('/lib/render.js')).draw()})()`);
+
 try {
   const shot = await cdp.screenshot(path.join(ROOT, 'out', 'interact.png'));
   console.log('\n截图已保存: out/interact.png', shot.size, '字节');

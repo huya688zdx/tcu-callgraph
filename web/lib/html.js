@@ -56,7 +56,7 @@ export async function buildStandaloneHtml() {
 <div id="app">
 <header class="offline-bar"><b>TCU 调用关系图</b><span>${esc(title)}</span><button id="offlineFit">适应</button>
 <button id="offlinePng">导出 PNG</button><button id="offlineSvg">导出 SVG</button>
-<span class="hint">离线快照 · 滚轮上下移动 · Shift+滚轮左右移动 · Ctrl+滚轮缩放 · 双击节点或层级标题选中后拖动 · 空白处 / Esc 退出移动 · Ctrl+Z 撤销 · 变量勾选表示导出时的入图状态</span></header>
+<span class="hint">离线快照 · 滚轮上下移动 · Shift+滚轮左右移动 · Ctrl+滚轮缩放 · 双击节点 / 层级标题 / 连线后调整 · 空白处 / Esc 退出移动 · Ctrl+Z 撤销 · 变量勾选表示导出时的入图状态</span></header>
 <main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu"></div></main>
 ${right.outerHTML}
 </div><div hidden><input id="search"><ul id="results"></ul></div>

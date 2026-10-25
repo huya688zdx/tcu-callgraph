@@ -56,7 +56,7 @@
   }
   .tool-menu[open] .tool-popover { animation: popIn .16s ease; }
   .tool-popover button { display: block; width: 100%; height: 34px; border: 0; text-align: left; }
-  .help-popover { width: 290px; max-width: calc(100vw - 28px); padding: 12px 14px; }
+  .help-popover { width: 290px; max-width: calc(100vw - 28px); max-height: calc(100vh - 80px); overflow-y: auto; padding: 12px 14px; }
   .help-popover p { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; padding: 6px 0; font-size: 12px; }
   .help-popover p + p { border-top: 1px solid #F1EFE8; }
   .help-popover kbd { font: inherit; color: #5F5E5A; white-space: nowrap; }
@@ -619,7 +619,9 @@
             <p><span>整体移动文件 / 目录</span><kbd>双击标题选中后拖动</kbd></p>
             <p><span>移动状态</span><kbd>实线高亮 · 空白处 / Esc 退出</kbd></p>
             <p><span>层级拖动</span><kbd>Shift 暂停吸附 · Esc 撤回</kbd></p>
-            <p><span>调整连线 / 标签位置</span><kbd>拖动线段 / 标签</kbd></p>
+            <p><span>调整连线</span><kbd>双击选中后拖动线段</kbd></p>
+            <p><span>重新连接端点</span><kbd>双击连线后拖动圆点</kbd></p>
+            <p><span>移动标签</span><kbd>直接拖动标签</kbd></p>
             <p><span>手动连接节点</span><kbd>Shift+拖动节点到目标</kbd></p>
             <p><span>撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
             <p><span>全选同类组件 / 退出全选</span><kbd>Ctrl+A / Esc</kbd></p>

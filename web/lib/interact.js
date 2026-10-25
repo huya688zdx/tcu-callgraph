@@ -90,7 +90,7 @@ function hitEdge(e) {
     const pts = edgePoints(edge);
     for (let i = 0; i < pts.length - 1; i++) {
       const d = distToSegment(p, pts[i], pts[i + 1]);
-      if (d < bestD) {
+      if (d < bestD || d === bestD && edge === state.selectedEdge) {
         bestD = d;
         best = edge;
       }
@@ -99,28 +99,30 @@ function hitEdge(e) {
   return best;
 }
 
-/** 命中选中边的中间线段手柄（水平段/垂直段，拖动可调整走向） */
+/** 双击解锁后，整段连线都可拖动，不局限于控制点附近。 */
 function hitSegment(e) {
-  if (!state.selectedEdge) return null;
+  if (!state.selectedEdge || !moveReady('edge', state.selectedEdge) || state.view?.comparison || hitEdge(e) !== state.selectedEdge) return null;
   const p = worldPos(e);
   const pts = edgePoints(state.selectedEdge);
-  const r = 8 / cam.k;
-  for (let i = 1; i <= pts.length - 3; i++) {
-    const mx = (pts[i][0] + pts[i + 1][0]) / 2;
-    const my = (pts[i][1] + pts[i + 1][1]) / 2;
-    if (Math.hypot(p.x - mx, p.y - my) <= r) {
+  let distance = 8 / cam.k, best = null;
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) < 0.01) continue;
+    const d = distToSegment(p, pts[i], pts[i + 1]);
+    if (d <= distance) {
       const orient = Math.abs(pts[i + 1][0] - pts[i][0]) < 0.5 ? 'v' : 'h';
-      return { edge: state.selectedEdge, index: i, orient };
+      best = { edge: state.selectedEdge, index: i, orient };
+      distance = d;
     }
   }
-  return null;
+  return best;
 }
 
 function hitEnd(e) {
-  if (!state.selectedEdge) return null;
+  if (!state.selectedEdge || !moveReady('edge', state.selectedEdge) || state.view?.comparison) return null;
   const p = worldPos(e);
   const pts = edgePoints(state.selectedEdge);
-  const r = 10 / cam.k;
+  const length = pts.slice(1).reduce((sum, p, i) => sum + Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]), 0);
+  const r = Math.min(5 / cam.k, length / 4);
   if (Math.hypot(p.x - pts[0][0], p.y - pts[0][1]) <= r) return 'from';
   const last = pts[pts.length - 1];
   if (Math.hypot(p.x - last[0], p.y - last[1]) <= r) return 'to';
@@ -129,6 +131,17 @@ function hitEnd(e) {
 
 function moveSeg(seg, x, y) {
   const pts = seg.edge.points;
+  if (!seg.prepared) {
+    seg.prepared = true;
+    if (seg.index === 0 || seg.index === pts.length - 2) {
+      // 首尾线段保留引出方向，给直线和单拐角线补出可移动的中段。
+      const a = pts[seg.index], b = pts[seg.index + 1];
+      const p = [a[0] + (b[0] - a[0]) / 4, a[1] + (b[1] - a[1]) / 4];
+      const q = [a[0] + (b[0] - a[0]) * 3 / 4, a[1] + (b[1] - a[1]) * 3 / 4];
+      pts.splice(seg.index + 1, 0, [...p], p, q, [...q]);
+      seg.index += 2;
+    }
+  }
   const i = seg.index;
   const axis = seg.orient === 'h' ? 1 : 0;
   const oldA = pts[i][axis];
@@ -143,10 +156,10 @@ function moveSeg(seg, x, y) {
   if (pathBlockedByNodes(pts, state.view.nodes, new Set([seg.edge.from, seg.edge.to]))) {
     pts[i][axis] = oldA;
     pts[i + 1][axis] = oldB;
+    return false;
   }
+  return pts[i][axis] !== oldA || pts[i + 1][axis] !== oldB;
 }
-
-let justDragged = false;
 
 /**
  * 拖拽节点时的重路由缓存。
@@ -159,6 +172,17 @@ let justDragged = false;
 let dragCache = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
+
+function selectEdge(edge) {
+  state.moveTarget = null;
+  state.multiSelection = null;
+  state.selected = null;
+  state.selectedEdge = edge;
+  state.selectedLabel = null;
+  draw();
+  renderDetail(null);
+  renderLabelPanel();
+}
 
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
 function resetDragState() {
@@ -180,6 +204,10 @@ function cancelDrag() {
   const active =
     state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
   if (state.dragBox) cancelHierarchyMove(state.dragBox);
+  if (state.dragSeg) {
+    state.dragSeg.edge.points = state.dragSeg.original;
+    state.dragSeg.edge.custom = state.dragSeg.custom;
+  }
   if (state.dragNode && state.dragStart) {
     state.dragNode.x = state.dragStart.nx;
     state.dragNode.y = state.dragStart.ny;
@@ -237,12 +265,7 @@ els.cv.addEventListener('contextmenu', (e) => {
 
   const edge = hitEdge(e);
   if (edge) {
-    state.selected = null;
-    state.selectedEdge = edge;
-    state.selectedLabel = null;
-    draw();
-    renderDetail(null);
-    renderLabelPanel();
+    selectEdge(edge);
     if (state.view?.comparison) return;
     showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
@@ -319,8 +342,9 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   const seg = hitSegment(e);
   if (seg && !comparing) {
-    seg.edge.custom = true; // 从此该边折线由用户接管
-    state.dragSeg = seg;
+    state.dragSeg = { ...seg, original: seg.edge.points.map((p) => [...p]), custom: seg.edge.custom,
+      start: worldPos(e), origin: [...seg.edge.points[seg.index]] };
+    state.dragStart = { x: e.clientX, y: e.clientY };
     els.cv.style.cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
     els.cv.setPointerCapture(e.pointerId);
     return;
@@ -376,6 +400,8 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  const edge = hitEdge(e);
+  if (edge) { selectEdge(edge); return; }
   state.moveTarget = null;
   state.panning = true;
   state.panMoved = false;
@@ -424,8 +450,13 @@ els.cv.addEventListener('pointermove', (e) => {
   }
 
   if (state.dragSeg) {
+    if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) <= 3 && !state.dragMoved) return;
     const p = worldPos(e);
-    moveSeg(state.dragSeg, p.x, p.y);
+    const seg = state.dragSeg;
+    if (moveSeg(seg, seg.origin[0] + p.x - seg.start.x, seg.origin[1] + p.y - seg.start.y)) {
+      state.dragMoved = true;
+      state.dragSeg.edge.custom = true;
+    }
     draw();
     return;
   }
@@ -470,8 +501,9 @@ els.cv.addEventListener('pointermove', (e) => {
     draw();
   }
   const title = next ? null : hitTitle(e);
+  const hoveredEdge = !n && !title ? hitEdge(e) : null;
   let cursor = title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
-    : n ? (moveReady('node', n) ? 'move' : 'pointer') : '';
+    : n ? (moveReady('node', n) ? 'move' : 'pointer') : hoveredEdge ? 'pointer' : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
   if (state.selectedEdge) {
@@ -486,14 +518,15 @@ els.cv.addEventListener('pointermove', (e) => {
   // 标签可以拖：悬停时给个抓手光标，比默认箭头好认
   if (hitLabel(worldPos(e))) els.cv.style.cursor = 'move';
 
-  if (n || title) {
+  if (n || title || hoveredEdge) {
     const rect = els.cv.getBoundingClientRect();
     els.tooltip.style.opacity = '1';
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
-      : `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`;
+      : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
+      : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '对比连线（只读）' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -515,8 +548,6 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (dragBox) {
     if (moved) {
-      justDragged = true;
-      setTimeout(() => (justDragged = false), 260);
       fullReroute(dragBox.ids);
       pushHistory();
     }
@@ -547,21 +578,21 @@ els.cv.addEventListener('pointerup', (e) => {
       rerouteScope([edge]);
       saveLayout();
       pushHistory();
+      renderLabelPanel();
     }
     draw();
     return;
   }
 
   if (dragSeg) {
-    pushHistory();
+    if (moved) pushHistory();
+    else { dragSeg.edge.points = dragSeg.original; dragSeg.edge.custom = dragSeg.custom; }
     draw();
     return;
   }
 
   if (dragNode) {
     if (moved) {
-      justDragged = true;
-      setTimeout(() => (justDragged = false), 260);
       fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
       pushHistory();
     }
@@ -580,12 +611,7 @@ els.cv.addEventListener('pointerup', (e) => {
     if (!panMoved) {
       const edge = hitEdge(e);
       if (edge) {
-        state.selectedEdge = edge;
-        state.selected = null;
-        state.selectedLabel = null;
-        draw();
-        renderDetail(null);
-        renderLabelPanel();
+        selectEdge(edge);
       } else {
         state.selectedEdge = null;
         state.selectedLabel = null;
@@ -687,12 +713,10 @@ els.cv.addEventListener('dblclick', (e) => {
     draw();
     return;
   }
-  // 双击手动布线的边：恢复自动布线
-  if (justDragged) return;
   const edge = hitEdge(e);
-  if (edge && edge.custom) {
-    edge.custom = false;
-    rerouteScope([edge]);
+  if (edge) {
+    selectEdge(edge);
+    if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };
     draw();
   }
 });

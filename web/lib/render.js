@@ -110,8 +110,9 @@ function draw() {
   const v = state.view;
   const moving = state.moveTarget;
   if (moving && (moving.view !== v ||
-      !(moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
-      (moving.kind === 'node' ? state.selected !== moving.item.id
+      !(moving.kind === 'edge' ? v.edges : moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
+      (moving.kind === 'edge' ? state.selectedEdge !== moving.item || state.selectedLabel
+        : moving.kind === 'node' ? state.selected !== moving.item.id
         : state.selected || state.selectedEdge || state.ctxBox?.kind !== moving.kind || state.ctxBox?.id !== moving.item.id))) state.moveTarget = null;
   if (state.multiSelection && (state.multiSelection.view !== v ||
       state.multiSelection.anchor !== (state.selectedLabel || state.selectedEdge || state.selected))) {
@@ -199,7 +200,7 @@ function draw() {
   drawEdgeLabels(ctx, v);
 
   // 双击解锁的对象用持续的实线光圈标明，区别于普通单击选择。
-  if (state.moveTarget) {
+  if (state.moveTarget && state.moveTarget.kind !== 'edge') {
     const b = state.moveTarget.item, gap = 4 / cam.k;
     ctx.save();
     ctx.setLineDash([]);
@@ -406,10 +407,13 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.fillStyle = color;
   ctx.fill();
 
-  if (selected && !state.multiSelection) {
-    // 中间线段手柄（拖动可调整该段的走向，保持正交）
-    const hs = 4.5 / cam.k;
-    for (let i = 1; i <= pts.length - 3; i++) {
+  if (selected && !state.multiSelection && !state.view?.comparison &&
+      state.moveTarget?.kind === 'edge' && state.moveTarget.item === e) {
+    // 所有非零线段都有控制点，直线和单拐角线也可直接调形。
+    for (let i = 0; i < pts.length - 1; i++) {
+      const length = Math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]);
+      if (length < 0.01) continue;
+      const hs = Math.min(4.5 / cam.k, length / 6);
       const mx = (pts[i][0] + pts[i + 1][0]) / 2;
       const my = (pts[i][1] + pts[i + 1][1]) / 2;
       ctx.beginPath();
@@ -422,7 +426,8 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     }
 
     // 两端圆形手柄（可拖到其他节点上重连）
-    const r = 5 / cam.k;
+    const length = pts.slice(1).reduce((sum, p, i) => sum + Math.hypot(p[0] - pts[i][0], p[1] - pts[i][1]), 0);
+    const r = Math.min(5 / cam.k, length / 4);
     for (const p of [pts[0], pts[pts.length - 1]]) {
       ctx.beginPath();
       ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
