@@ -8,7 +8,7 @@
  * 1. 任务函数：名字自带周期 —— Task_10ms / xxx_100ms_Task / cyclic_5ms；
  * 2. 调度入口：ISR / Handler / main 主循环调用任务函数；
  *    「入口 → 任务」这条边挂 TASK:xx 标签；
- * 3. コール順：只在同一个调用者内按源码调用点编号，不进入被调函数。
+ * 3. コール順：按同一调用者内各被调函数首次出现的位置编号，重复调用不占序号。
  *    宏间接调用（CALL(Task_10ms)）与函数指针在解析期已还原成普通边，这里不用管。
  */
 
@@ -123,24 +123,23 @@ export function detectTasks(model, from = null) {
       skipped.push({ from: fn.id, reason: '当前函数含嵌套实参调用，コール順 请手动标注' });
       continue;
     }
-    // 画布合并同一对函数的重复调用，序号也合并到同一条边上。
+    // 每个被调函数只记录首次调用，后续重复调用不占序号。
     const byTarget = new Map();
-    for (const [index, e] of calls.entries()) {
+    for (const e of calls) {
       let group = byTarget.get(e.to);
       if (!group) {
-        group = { edge: e, orders: [] };
+        group = { edge: e, order: byTarget.size + 1, firstLine: e.line };
         byTarget.set(e.to, group);
       }
-      group.orders.push(index + 1);
       // 与 subgraph 的代表边规则一致，保证建议能匹配当前画布。
       if (CALL_RANK[e.kind] > CALL_RANK[group.edge.kind]) group.edge = e;
     }
-    for (const { edge: e, orders } of byTarget.values()) {
+    for (const { edge: e, order, firstLine } of byTarget.values()) {
       push({
         kind: 'call', preset: 'call', edgeKey: edgeKeyOf(e),
         from: e.from, to: e.to, line: e.line,
-        text: `コール順${orders.join(',')}`, note: '',
-        evidence: `${fn.file}:${e.line} · ${fn.name} 内第 ${orders.join('、')} 个调用点（源码顺序，分支按条件执行）`,
+        text: `コール順${order}`, note: '',
+        evidence: `${fn.file}:${firstLine} · ${fn.name} 内首次调用顺序 ${order}（源码顺序，分支按条件执行）`,
       });
     }
   }

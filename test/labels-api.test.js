@@ -200,8 +200,9 @@ async function callOrderSample(t) {
   fs.writeFileSync(path.join(root, 'order.c'), `
 int g_state = 0;
 int Leaf(void) { return 1; }
+int Last(void) { return 2; }
 int Child(int value) { Leaf(); Leaf(); return value; }
-int Plain(void) { Child(1); g_state = 1; Leaf(); Child(2); return 0; }
+int Plain(void) { Child(1); g_state = 1; Leaf(); Child(2); Last(); return 0; }
 void Task_10ms(void) { Plain(); Leaf(); }
 void Nested(void) { Child(Leaf()); Plain(); }
 `);
@@ -214,11 +215,11 @@ void Nested(void) { Child(Leaf()); Plain(); }
   return (name) => fetch(`${srv.baseUrl}/api/detect-tasks?from=order.c::${name}`).then((r) => r.json());
 }
 
-test('コール順：只编号当前函数内的调用点，同一行及重复调用不丢失，子函数单独编号', async (t) => {
+test('コール順：同一函数按首次调用连续编号，重复调用不占号，子函数单独编号', async (t) => {
   const detect = await callOrderSample(t);
   const plain = (await detect('Plain')).suggestions.filter((s) => s.kind === 'call');
   assert.deepEqual(plain.map((s) => [s.to, s.text]), [
-    ['order.c::Child', 'コール順1,3'], ['order.c::Leaf', 'コール順2'],
+    ['order.c::Child', 'コール順1'], ['order.c::Leaf', 'コール順2'], ['order.c::Last', 'コール順3'],
   ]);
   assert.ok(plain.every((s) => s.from === 'order.c::Plain'));
   const task = (await detect('Task_10ms')).suggestions.filter((s) => s.kind === 'call');
@@ -226,7 +227,7 @@ test('コール順：只编号当前函数内的调用点，同一行及重复�
     ['order.c::Plain', 'コール順1'], ['order.c::Leaf', 'コール順2'],
   ]);
   const child = (await detect('Child')).suggestions.filter((s) => s.kind === 'call');
-  assert.deepEqual(child.map((s) => s.text), ['コール順1,2']);
+  assert.deepEqual(child.map((s) => s.text), ['コール順1']);
 });
 
 test('コール順：嵌套实参调用不强行给出线性执行顺序', async (t) => {
