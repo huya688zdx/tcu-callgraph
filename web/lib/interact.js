@@ -13,7 +13,7 @@ import {
   distToSegment,
 } from './geometry.js';
 import { draw } from './render.js';
-import { stopCamAnim, focusBox } from './camera.js';
+import { stopCamAnim, focusBox, panCam } from './camera.js';
 import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
@@ -682,18 +682,14 @@ els.cv.addEventListener(
   (e) => {
     e.preventDefault();
     if (state.dragBox) return;
-    stopCamAnim();
     const rect = els.cv.getBoundingClientRect();
     if (!e.ctrlKey) {
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? (e.shiftKey ? rect.width : rect.height) : 1;
-      if (e.shiftKey) cam.x -= (e.deltaY || e.deltaX) * unit;
-      else {
-        cam.x -= e.deltaX * unit;
-        cam.y -= e.deltaY * unit;
-      }
-      draw();
+      if (e.shiftKey) panCam(-(e.deltaY || e.deltaX) * unit, 0);
+      else panCam(-e.deltaX * unit, -e.deltaY * unit);
       return;
     }
+    stopCamAnim();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const wx = (sx - cam.x) / cam.k;

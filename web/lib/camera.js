@@ -4,6 +4,7 @@
 import { els, state, cam } from './state.js';
 import { draw } from './render.js';
 function fit() {
+  stopCamAnim();
   const v = state.view;
   if (!v) return;
   const W = els.cv.clientWidth;
@@ -17,33 +18,65 @@ function fit() {
 
 // ---------------- 视角动画 ----------------
 
-const camAnim = { on: false, t0: 0, dur: 420, from: null, to: null };
+const camAnim = { on: false, pan: false, raf: 0, last: 0, t0: 0, dur: 420, from: null, to: null };
 
 function stopCamAnim() {
   camAnim.on = false;
+  cancelAnimationFrame(camAnim.raf);
+  camAnim.raf = 0;
 }
 
 function stepCam(now) {
+  camAnim.raf = 0;
   if (!camAnim.on) return;
-  const t = Math.min(1, (now - camAnim.t0) / camAnim.dur);
-  const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // easeInOutQuad
-  const f = camAnim.from;
   const to = camAnim.to;
-  cam.x = f.x + (to.x - f.x) * e;
-  cam.y = f.y + (to.y - f.y) * e;
-  cam.k = f.k + (to.k - f.k) * e;
+  if (camAnim.pan) {
+    // 按经过时间衰减，保持不同刷新率下的阻尼手感一致。
+    const alpha = 1 - Math.exp(-Math.max(0, now - camAnim.last) / 65);
+    camAnim.last = Math.max(now, camAnim.last);
+    cam.x += (to.x - cam.x) * alpha;
+    cam.y += (to.y - cam.y) * alpha;
+    if (Math.hypot(to.x - cam.x, to.y - cam.y) < 0.1) {
+      cam.x = to.x;
+      cam.y = to.y;
+      camAnim.on = false;
+    }
+  } else {
+    const t = Math.min(1, (now - camAnim.t0) / camAnim.dur);
+    const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // 平滑聚焦
+    const f = camAnim.from;
+    cam.x = f.x + (to.x - f.x) * e;
+    cam.y = f.y + (to.y - f.y) * e;
+    cam.k = f.k + (to.k - f.k) * e;
+    camAnim.on = t < 1;
+  }
   draw();
-  if (t < 1) requestAnimationFrame(stepCam);
-  else camAnim.on = false;
+  if (camAnim.on) camAnim.raf = requestAnimationFrame(stepCam);
 }
 
 function animateCam(to, dur = 420) {
+  stopCamAnim();
   camAnim.on = true;
+  camAnim.pan = false;
   camAnim.t0 = performance.now();
   camAnim.dur = dur;
   camAnim.from = { x: cam.x, y: cam.y, k: cam.k };
   camAnim.to = to;
-  requestAnimationFrame(stepCam);
+  camAnim.raf = requestAnimationFrame(stepCam);
+}
+
+/** 累积滚轮位移，放大后移动更快，缩小后移动更慢。 */
+function panCam(dx, dy) {
+  if (!camAnim.on || !camAnim.pan) {
+    stopCamAnim();
+    camAnim.on = true;
+    camAnim.pan = true;
+    camAnim.last = performance.now();
+    camAnim.to = { x: cam.x, y: cam.y };
+  }
+  camAnim.to.x += dx * cam.k;
+  camAnim.to.y += dy * cam.k;
+  if (!camAnim.raf) camAnim.raf = requestAnimationFrame(stepCam);
 }
 
 /** 把文件框 / 目录容器整体居中并适配到视野 */
@@ -74,4 +107,4 @@ function revealAdded(nodes, edges) {
     hi * k + origin > size - pad ? size - pad - hi * k : origin;
   animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k });
 }
-export { fit, stopCamAnim, stepCam, animateCam, focusBox, revealAdded };
+export { fit, stopCamAnim, stepCam, animateCam, panCam, focusBox, revealAdded };
