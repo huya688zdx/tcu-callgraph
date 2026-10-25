@@ -6,6 +6,8 @@ import { resize } from './render.js';
 import { fit, focusBox } from './camera.js';
 import { loadVars, renderVars, renderDetail } from './panels.js';
 import { pushHistory, undo, redo } from './history.js';
+import { buildSVG } from './svg.js';
+import { buildPNG, saveExport } from './export.js';
 import './interact.js';
 
 const saved = window.__EXPORT.snapshot;
@@ -21,6 +23,7 @@ Object.assign(cam, saved.cam);
 // 面板查询从导出时的完整数据读取，不用图中的局部边反推调用与变量数据。
 api.node = async (id) => saved.details[id] || { error: '该节点未包含在快照中' };
 api.vars = async () => ({ list: saved.variables });
+api.project = async () => saved.project;
 // 拖线、撤销仅更新当前离线页面，不访问原工程。
 api.overlay = api.layout = async () => ({ ok: true });
 hooks.renderDetail = renderDetail;
@@ -40,6 +43,18 @@ new MutationObserver(disableVars).observe(els.vars, { childList: true, subtree: 
 els.cv.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopImmediatePropagation(); }, true);
 window.addEventListener('resize', resize);
 document.getElementById('offlineFit').addEventListener('click', fit);
+for (const [id, extension, build] of [
+  ['offlinePng', 'png', buildPNG],
+  ['offlineSvg', 'svg', () => new Blob([buildSVG()], { type: 'image/svg+xml' })],
+]) {
+  document.getElementById(id).addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try { await saveExport(extension, await build()); }
+    catch (error) { alert('导出失败：' + error.message); }
+    finally { button.disabled = false; }
+  });
+}
 document.addEventListener('keydown', (e) => {
   if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {

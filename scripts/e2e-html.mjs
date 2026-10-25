@@ -22,6 +22,28 @@ async function move(page, kind, dx, dy) {
   })()`);
   await page.drag(p.x, p.y, p.x + dx * p.k, p.y + dy * p.k, { steps: 5 });
 }
+async function exportsFrom(page, offline = false) {
+  await page.evaluate(`window.__files=[];window.callgraph={saveExport:async(p)=>{
+    const extension=p.name.split('.').pop();let content;
+    if(extension==='svg')content=new TextDecoder().decode(p.bytes);
+    else{const img=await createImageBitmap(new Blob([p.bytes]));const c=document.createElement('canvas');
+      c.width=img.width;c.height=img.height;const ctx=c.getContext('2d');ctx.drawImage(img,0,0);content=[...ctx.getImageData(0,0,1,1).data]}
+    __files.push({name:p.name,projectPath:p.projectPath,content});return{canceled:false};
+  }};document.getElementById('${offline ? 'offlinePng' : 'exportPng'}').click();`);
+  await page.waitFor('__files.length===1');
+  await page.evaluate(`document.getElementById('${offline ? 'offlineSvg' : 'exportSvg'}').click()`);
+  await page.waitFor('__files.length===2');
+  assert.equal(await page.evaluate(`new DOMParser().parseFromString(__files[1].content,'image/svg+xml').querySelectorAll('parsererror').length`), 0,
+    '导出的 SVG 是有效矢量文件');
+  const files = await page.evaluate('__files');
+  assert.equal(files[0].name, 'tcu_main_调用关系图.png');
+  assert.equal(files[1].name, 'tcu_main_调用关系图.svg');
+  assert.deepEqual(files[0].content, [247,246,242,255], 'PNG 底色不透明且与 GUI 一致');
+  assert.match(files[1].content, /rgba\(133,183,235,0.32\)/, 'SVG 含目录标题胶囊');
+  assert.match(files[1].content, /rgba\(181,212,244,0.5\)/, 'SVG 含文件标题底色');
+  assert.match(files[1].content, /fill="#D9303E"/, 'SVG 的新增箭头颜色正确');
+  return files;
+}
 try {
   gui = await launchCdp({ url: server.baseUrl, width: 1560, height: 1000 });
   await gui.waitFor('window.__cg?.view?.nodes?.length>0');
@@ -36,6 +58,8 @@ try {
   const baseline = await gui.evaluate(geometry);
   const canvas = await gui.evaluate(`({w:cv.clientWidth,h:cv.clientHeight,png:cv.toDataURL()})`);
   const panel = await gui.evaluate(`['detail','vars','edges'].map(id=>document.getElementById(id).textContent)`);
+  const guiExports = await exportsFrom(gui);
+  assert.equal(await gui.evaluate(geometry), baseline, '导出 SVG 不修改手动布局和分组框');
   const html = await gui.evaluate(`(async()=>{const {buildStandaloneHtml}=await import('/lib/html.js');return await buildStandaloneHtml()})()`);
   const file = path.join(temp, 'callgraph.html'); fs.writeFileSync(file, html);
   const expected = [];
@@ -60,6 +84,7 @@ try {
   assert.deepEqual(await offline.evaluate(`['detail','vars','edges'].map(id=>document.getElementById(id).textContent)`), panel,
     '右侧详情、未入图常量、类型及读写计数和调用关系一致');
   assert.equal(await offline.evaluate(`!![...document.querySelectorAll('.var-row')].find(r=>r.dataset.id==='var::g_ops_cvt')`), true);
+  assert.deepEqual(await exportsFrom(offline, true), guiExports, 'GUI 与离线 HTML 使用相同命名、PNG 底色和 SVG 样式');
   await offline.screenshot('out/html-export/initial.png');
   let i = 0;
   for (const [kind, dx, dy] of [['node',10,30], ['node',-5,20], ['group',0,80]]) {
@@ -68,6 +93,18 @@ try {
   }
   await offline.pressKey({ key:'z', code:'KeyZ', vk:90, modifiers:2 });
   assert.equal(await offline.evaluate(geometry), expected[1], '离线撤销恢复节点和折线');
+  assert.notEqual((await exportsFrom(offline, true))[1].content, guiExports[1].content, '离线再次导出反映调整后的布局');
+  // 普通浏览器没有 Electron 桥接时，也能实际下载这两种文件。
+  await offline.send('Browser.setDownloadBehavior', { behavior:'allow', downloadPath:temp });
+  await offline.evaluate(`delete window.callgraph;window.showSaveFilePicker=undefined;
+    document.getElementById('offlinePng').click();document.getElementById('offlineSvg').click();`);
+  const pngFile = path.join(temp, 'tcu_main_调用关系图.png'), svgFile = path.join(temp, 'tcu_main_调用关系图.svg');
+  const deadline = Date.now() + 5000;
+  while ((!fs.existsSync(pngFile) || !fs.existsSync(svgFile)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(fs.readFileSync(pngFile).subarray(1,4).toString(), 'PNG');
+  assert.match(fs.readFileSync(svgFile,'utf8'), /<svg/);
   assert.deepEqual(await offline.evaluate('__errors'), []);
   await offline.screenshot('out/html-export/after-drag.png');
   console.log('通过：离线运行、初始像素一致、完整侧栏、重复拖动/层级移动及撤销与 GUI 一致');

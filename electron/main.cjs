@@ -1,7 +1,8 @@
-const { app, BrowserWindow, dialog, Menu, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
 const { fork } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
+const { saveExport } = require('./export.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 /**
@@ -18,6 +19,11 @@ let win = null;
 let child = null;
 let currentTarget = null;
 let serverOrigin = null;
+ipcMain.handle('cg:save-export', (event, payload) => {
+  if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
+      new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的导出来源');
+  return saveExport({ dialog, window: win, userData: app.getPath('userData') }, payload);
+});
 // 启动后是否自动展开工程选择面板（有多个历史工程时才有意义）
 let openPickerOnLoad = false;
 // 子进程最近输出：启动失败时贴进错误框，否则用户只看到白屏、拿不到任何线索
@@ -187,6 +193,7 @@ function createWindow(url) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: path.join(__dirname, 'preload.cjs'),
     },
   });
 

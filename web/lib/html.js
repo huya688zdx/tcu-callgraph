@@ -34,11 +34,13 @@ export async function buildStandaloneHtml() {
     Promise.all(view.nodes.filter((n) => n.kind !== 'var').map(async (n) => [n.id, await api.node(n.id)])),
   ]);
   if (!variables.list) throw new Error(variables.error || '读取变量清单失败');
-  if (state.view?.projectId !== view.projectId || (await api.project()).id !== view.projectId) {
+  const project = await api.project();
+  if (state.view?.projectId !== view.projectId || project.id !== view.projectId) {
     throw new Error('导出过程中工程已切换，请重新导出');
   }
   snapshot.variables = variables.list;
   snapshot.details = Object.fromEntries(details);
+  snapshot.project = { id: project.id, name: project.name, path: project.path };
   const title = view.nodes.find((n) => n.id === view.root)?.name || view.root || 'callgraph';
   const json = JSON.stringify({ snapshot, sources }).replace(/</g, '\\u003c');
   return `<!doctype html>
@@ -52,6 +54,7 @@ export async function buildStandaloneHtml() {
 </style></head><body>
 <div id="app">
 <header class="offline-bar"><b>TCU 调用关系图</b><span>${esc(title)}</span><button id="offlineFit">适应</button>
+<button id="offlinePng">导出 PNG</button><button id="offlineSvg">导出 SVG</button>
 <span class="hint">离线快照 · 滚轮缩放 · 拖动节点或层级标题 · Ctrl+Z 撤销 · 变量勾选表示导出时的入图状态</span></header>
 <main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu"></div></main>
 ${right.outerHTML}
