@@ -20,6 +20,10 @@ async function move(page, kind, dx, dy) {
     return {x:r.left+c.x+(b.x+${kind === 'node' ? 'b.w/2' : '20'})*c.k,
       y:r.top+c.y+(b.y+${kind === 'node' ? 'b.h/2' : '12'})*c.k,k:c.k};
   })()`);
+  await page.click(p.x, p.y);
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await page.send('Input.dispatchMouseEvent', { type, x: p.x, y: p.y, button: 'left', clickCount: 2 });
+  }
   await page.drag(p.x, p.y, p.x + dx * p.k, p.y + dy * p.k, { steps: 5 });
 }
 async function exportsFrom(page, offline = false) {

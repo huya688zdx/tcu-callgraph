@@ -1,4 +1,4 @@
-// 端到端交互测试：点击标题聚焦 + 拖动节点不重叠
+// 端到端交互测试：双击解锁移动，单击/误拖保持布局，移动节点不重叠
 // 用法: node scripts/e2e-interact.mjs [url] [目标 id]
 // 不传 url 时自动拉起 src/server.js（端口由系统分配，跑完自动关掉）
 // 注意：拖动会把坐标写进布局存档，脚本结束时把动过的那一条还原
@@ -17,6 +17,12 @@ const server = argUrl ? null : await launchServer({ target: 'samples/tcu' });
 const baseUrl = (argUrl || server.baseUrl).replace(/\/+$/, '');
 const cdp = await launchCdp({ url: baseUrl + '/', width: 1400, height: 950 });
 const { evaluate, waitFor, click, drag } = cdp;
+const doubleClick = async (x, y) => {
+  await click(x, y);
+  for (const type of ['mousePressed', 'mouseReleased']) {
+    await cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 2 });
+  }
+};
 
 const tryWaitFor = async (expression, opts) => {
   try {
@@ -36,7 +42,7 @@ console.log('页面错误:', err || '无');
 // 任一项检查失败就返回非零退出码，方便 CI 判断
 let ok = true;
 
-// 1) 点击标题 -> 视角应放大聚焦（可用第 3 个参数指定目标 id）
+// 1) 标题默认锁定，双击后出现可移动选择，视角保持原样。
 const wantTarget = process.argv[3] || '';
 const info = await evaluate(`(() => {
   const v = window.__cg.view;
@@ -69,39 +75,20 @@ const info = await evaluate(`(() => {
   };
 })()`);
 
-console.log(`\n[测试1] 点击${info.kind === 'dir' ? '目录层级' : '文件'}标题聚焦 (${info.target})`);
-console.log(`  点击前缩放 ${Math.round(info.k * 100)}%  位置 (${info.tx.toFixed(0)}, ${info.ty.toFixed(0)})`);
+console.log(`\n[测试1] 双击${info.kind === 'dir' ? '目录层级' : '文件'}标题解锁移动 (${info.target})`);
+const positions = 'JSON.stringify(__cg.view.nodes.map(({id,x,y})=>({id,x,y})))';
+const beforePositions = await evaluate(positions);
 await click(info.tx, info.ty);
-const flashId = await evaluate('window.__cg.flash');
-// 视角动画约 420ms：等缩放连续两次读数不变即视为动画结束
-// （原来这里是固定 sleep(700)，慢机器上不够、快机器上白等）
+await drag(info.tx, info.ty, info.tx + 20, info.ty + 15);
+const locked = await evaluate(positions) === beforePositions;
+await doubleClick(info.tx, info.ty);
 const after = await evaluate(`(async () => {
-  const nap = (ms) => new Promise((r) => setTimeout(r, ms));
-  let last = null;
-  let stable = 0;
-  for (let i = 0; i < 60; i++) {
-    const s = { k: window.__cg.cam.k, err: document.body.getAttribute('data-err') };
-    if (last && Math.abs(s.k - last.k) < 1e-4) stable++;
-    else stable = 0;
-    last = s;
-    if (stable >= 2) return s;
-    await nap(80);
-  }
-  return last;
+  const {state}=await import('/lib/state.js');
+  return {k:__cg.cam.k,kind:state.moveTarget?.kind,id:state.moveTarget?.item.id};
 })()`);
-console.log(`  点击后缩放 ${Math.round(after.k * 100)}%  高亮框: ${flashId || '无'}`);
-const focused = after.k > info.k * 1.15;
-const flashed = flashId === info.target;
-if (focused) console.log('  结论: ✅ 已聚焦放大');
-else if (flashed) console.log('  结论: ✅ 目标已占满视野（缩放无需变化），高亮已触发');
-else {
-  console.log('  结论: ❌ 点击未生效');
-  ok = false;
-}
-if (after.err) {
-  console.log('  JS错误:', after.err);
-  ok = false;
-}
+const armed = after.kind === info.kind && after.id === info.target && after.k === info.k;
+console.log(`  未双击时不能移动: ${locked}；双击已选中且不跳转: ${armed}`);
+if (!locked || !armed) ok = false;
 
 // 2) 把一个节点拖到另一个节点身上 -> 应被挡住，不能重叠
 const nodesInfo = await evaluate(`(() => {
@@ -163,6 +150,9 @@ if (nodesInfo) {
   console.log(`  拖动前重叠对数: ${nodesInfo.before}`);
 
   const savedBefore = readSavedPos(a.id);
+  await drag(a.x, a.y, a.x + 20, a.y + 10);
+  if (await evaluate(positions) !== beforePositions) { console.log('  ❌ 未双击的节点被移动'); ok = false; }
+  await doubleClick(a.x, a.y);
   await drag(a.x, a.y, b.x, b.y);
   // 拖动是同步生效的：等位置真的变了再读结果
   await tryWaitFor(
@@ -182,6 +172,7 @@ if (nodesInfo) {
   })()`);
 
   const moved = res.pos && (Math.abs(res.pos.x - a.wx) > 1 || Math.abs(res.pos.y - a.wy) > 1);
+  if (!moved) ok = false;
   console.log(`  拖动后位置: (${res.pos?.x?.toFixed(0)}, ${res.pos?.y?.toFixed(0)})  移动过: ${moved ? '是' : '否'}`);
   console.log(`  拖动后重叠对数: ${res.overlaps}`);
   console.log(`  结论: ${res.overlaps === 0 ? '✅ 无重叠' : '❌ 出现重叠'}`);

@@ -13,7 +13,7 @@ import {
   distToSegment,
 } from './geometry.js';
 import { draw } from './render.js';
-import { stopCamAnim, focusBox, panCam, zoomCam } from './camera.js';
+import { stopCamAnim, panCam, zoomCam } from './camera.js';
 import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
@@ -28,7 +28,6 @@ import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
 import { renderLabelPanel } from './label-panel.js';
-import { hooks } from './hooks.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
 function worldPos(e) {
@@ -51,7 +50,7 @@ function hitTest(e) {
 }
 
 /**
- * 命中文件框 / 目录容器的标题：单击居中查看，拖动整体移动。
+ * 命中文件框 / 目录容器的标题：单击查看范围，双击选中后才允许整体移动。
  * 文件框有标题栏（整条可点），目录容器只有左上角一行文字，按实际文字宽度判定，
  * 避免大容器的标题命中区挡住内部的文件框
  */
@@ -158,6 +157,8 @@ let justDragged = false;
  * 等价于 geometry.js 的 liveReroute(nodeId)，只是把 O(E) 的准备工作挪到了拖拽开始。
  */
 let dragCache = null;
+const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
+  state.moveTarget.kind === kind && state.moveTarget.item === item;
 
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
 function resetDragState() {
@@ -179,6 +180,11 @@ function cancelDrag() {
   const active =
     state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
   if (state.dragBox) cancelHierarchyMove(state.dragBox);
+  if (state.dragNode && state.dragStart) {
+    state.dragNode.x = state.dragStart.nx;
+    state.dragNode.y = state.dragStart.ny;
+    dragCache?.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => [...p]); });
+  }
   resetDragState();
   state.linkFrom = null;
   state.linkPos = null;
@@ -211,6 +217,7 @@ function hitBox(e) {
 els.cv.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!state.view) return;
+  if (state.moveTarget) { state.moveTarget = null; draw(); }
   if (state.multiSelection) { state.multiSelection = null; draw(); }
 
   const n = hitTest(e);
@@ -283,6 +290,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
   if (lb && !comparing) {
+    state.moveTarget = null;
     const anchor = labelAnchor(lb.edge);
     state.selected = null;
     state.selectedEdge = lb.edge;
@@ -318,18 +326,20 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  // 标题先记录手势，松手后再区分单击与整体拖动。
+  // 只允许拖动已双击选中的层级；单击只切换右侧范围。
   const title = hitTitle(e);
   if (title) {
-    pushHistory();
-    state.dragBox = beginHierarchyMove(state.view, title);
-    state.dragBox.crossing = state.view.edges.filter((ed) =>
-      state.dragBox.ids.has(ed.from) !== state.dragBox.ids.has(ed.to));
-    state.dragStart = { x: e.clientX, y: e.clientY };
+    if (moveReady(title.kind, title.box)) {
+      pushHistory();
+      state.dragBox = beginHierarchyMove(state.view, title);
+      state.dragBox.crossing = state.view.edges.filter((ed) =>
+        state.dragBox.ids.has(ed.from) !== state.dragBox.ids.has(ed.to));
+      state.dragStart = { x: e.clientX, y: e.clientY };
+      els.cv.style.cursor = 'grabbing';
+      els.cv.setPointerCapture(e.pointerId);
+    } else state.moveTarget = null;
     state.flash = null;
     els.tooltip.style.opacity = '0';
-    els.cv.style.cursor = 'grabbing';
-    els.cv.setPointerCapture(e.pointerId);
     // 点层级/文件标题 = 切换右侧变量面板的范围
     state.ctxBox = { kind: title.kind === 'file' ? 'file' : 'dir', id: title.box.id };
     state.selected = null;
@@ -337,6 +347,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     state.selectedLabel = null;
     renderDetail(null); // 收起节点详情 / 调用关系
     renderVars();
+    renderLabelPanel();
     draw();
     return;
   }
@@ -344,6 +355,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   const n = hitTest(e);
 
   if (n && e.shiftKey && !comparing) {
+    state.moveTarget = null;
     state.linkFrom = n;
     state.linkPos = worldPos(e);
     els.cv.classList.add('linking');
@@ -352,6 +364,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   if (n) {
+    if (!moveReady('node', n)) { selectNode(n.id); return; }
     state.dragNode = n;
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
     state.dragMoved = false;
@@ -363,6 +376,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  state.moveTarget = null;
   state.panning = true;
   state.panMoved = false;
   state.last = { x: e.clientX, y: e.clientY };
@@ -419,8 +433,9 @@ els.cv.addEventListener('pointermove', (e) => {
   if (state.dragNode) {
     const rawDx = (e.clientX - state.dragStart.x) / cam.k;
     const rawDy = (e.clientY - state.dragStart.y) / cam.k;
+    if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) > 3) state.dragMoved = true;
+    if (!state.dragMoved) return;
     moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
-    if (Math.abs(rawDx) + Math.abs(rawDy) > 3) state.dragMoved = true;
     // 从本次按下时的 ELK 路径调整端部，避免逐帧重新选面和改走廊。
     if (dragCache) {
       dragCache.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => p.slice()); });
@@ -455,7 +470,8 @@ els.cv.addEventListener('pointermove', (e) => {
     draw();
   }
   const title = next ? null : hitTitle(e);
-  let cursor = title ? 'grab' : '';
+  let cursor = title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
+    : n ? (moveReady('node', n) ? 'move' : 'pointer') : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
   if (state.selectedEdge) {
@@ -476,8 +492,8 @@ els.cv.addEventListener('pointermove', (e) => {
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
-      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span>${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
-      : `<b>${esc(title.box.label || title.box.id)}</b><br>拖动标题整体移动 · 单击居中查看<br><span style="opacity:.7">自动吸附对齐 · Shift 关闭吸附 · Esc 取消</span>`;
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
+      : `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`;
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -503,9 +519,6 @@ els.cv.addEventListener('pointerup', (e) => {
       setTimeout(() => (justDragged = false), 260);
       fullReroute(dragBox.ids);
       pushHistory();
-    } else {
-      focusBox(dragBox.box);
-      state.flash = { box: dragBox.box, until: performance.now() + 1300, dur: 1300 };
     }
     draw();
     return;
@@ -551,8 +564,6 @@ els.cv.addEventListener('pointerup', (e) => {
       setTimeout(() => (justDragged = false), 260);
       fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
       pushHistory();
-    } else {
-      selectNode(dragNode.id);
     }
     draw();
     return;
@@ -615,6 +626,7 @@ document.addEventListener('keydown', (e) => {
     const node = state.view.nodes.find((n) => n.id === state.selected);
     const kind = state.selectedLabel ? 'label' : state.selectedEdge ? 'edge' : node ? (node.kind === 'var' ? 'var' : 'function') : null;
     if (kind) {
+      state.moveTarget = null;
       const selection = { kind, anchor, view: state.view };
       if (kind === 'function' || kind === 'var') {
         const type = nodeSelectionType(node);
@@ -640,10 +652,12 @@ document.addEventListener('keydown', (e) => {
     }
     return;
   }
-  if (e.key === 'Escape' && state.dragBox) {
+  if (e.key === 'Escape' && (state.dragBox || state.dragNode || state.moveTarget) && !document.querySelector('.modal.show')) {
     e.preventDefault();
     e.stopImmediatePropagation();
+    state.moveTarget = null;
     cancelDrag();
+    draw();
   } else if (state.multiSelection && !document.querySelector('.modal.show')) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -657,18 +671,24 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 els.cv.addEventListener('dblclick', (e) => {
-  if (justDragged) return;
   const n = hitTest(e);
   if (n) {
-    // 变量没有下游可下钻，双击只做选中，避免跳到一个空视图
-    if (n.kind === 'var') {
-      selectNode(n.id);
-      return;
-    }
-    hooks.loadView(n.id);
+    selectNode(n.id);
+    state.moveTarget = { kind: 'node', item: n, view: state.view };
+    els.cv.style.cursor = 'move';
+    draw();
+    return;
+  }
+  const title = hitTitle(e);
+  if (title) {
+    state.ctxBox = { kind: title.kind, id: title.box.id };
+    state.moveTarget = { kind: title.kind, item: title.box, view: state.view };
+    els.cv.style.cursor = 'grab';
+    draw();
     return;
   }
   // 双击手动布线的边：恢复自动布线
+  if (justDragged) return;
   const edge = hitEdge(e);
   if (edge && edge.custom) {
     edge.custom = false;

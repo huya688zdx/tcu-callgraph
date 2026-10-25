@@ -72,6 +72,7 @@ async function setEdgeChange(edge, change) {
 
 function selectNode(id) {
   state.multiSelection = null;
+  state.moveTarget = null;
   state.selected = id;
   // 选中节点就不再是「选连线 / 选标签」状态，右侧面板跟着切换。
   // selectedEdge 不清的话，点完连线再点节点，标签面板会一直挂着旧连线

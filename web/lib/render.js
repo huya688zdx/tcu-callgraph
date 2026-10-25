@@ -108,6 +108,11 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
+  const moving = state.moveTarget;
+  if (moving && (moving.view !== v ||
+      !(moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
+      (moving.kind === 'node' ? state.selected !== moving.item.id
+        : state.selected || state.selectedEdge || state.ctxBox?.kind !== moving.kind || state.ctxBox?.id !== moving.item.id))) state.moveTarget = null;
   if (state.multiSelection && (state.multiSelection.view !== v ||
       state.multiSelection.anchor !== (state.selectedLabel || state.selectedEdge || state.selected))) {
     state.multiSelection = null;
@@ -192,6 +197,20 @@ function draw() {
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
   drawEdgeLabels(ctx, v);
+
+  // 双击解锁的对象用持续的实线光圈标明，区别于普通单击选择。
+  if (state.moveTarget) {
+    const b = state.moveTarget.item, gap = 4 / cam.k;
+    ctx.save();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = THEME.node.selected;
+    ctx.lineWidth = 2 / cam.k;
+    ctx.shadowColor = THEME.node.selected;
+    ctx.shadowBlur = 6;
+    roundRect(ctx, b.x - gap, b.y - gap, b.w + gap * 2, b.h + gap * 2, 10);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   if (state.dragBox && state.dragMoved) {
     const { box, guides } = state.dragBox;
