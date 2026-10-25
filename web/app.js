@@ -12,6 +12,7 @@ import { history, pushHistory, undo, redo } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG, download } from './lib/svg.js';
+import { buildStandaloneHtml } from './lib/html.js';
 import { upgradeSelect } from './lib/ui-select.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
@@ -313,9 +314,18 @@ document.getElementById('exportPng').addEventListener('click', () => {
   els.cv.toBlob((b) => download('callgraph.png', b));
 });
 
-document.getElementById('exportHtml').addEventListener('click', () => {
-  if (!state.root) return;
-  window.location.href = `/api/export/html?root=${encodeURIComponent(state.root)}&up=${state.up}&down=${state.down}`;
+// 导出当前几何、完整详情及 GUI 模块，离线打开后继续使用同一套绘图和拖动逻辑。
+document.getElementById('exportHtml').addEventListener('click', async (event) => {
+  if (!state.view) return;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    download('callgraph.html', new Blob([await buildStandaloneHtml()], { type: 'text/html; charset=utf-8' }));
+  } catch (error) {
+    alert('HTML 导出失败：' + error.message);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 document.getElementById('exportXlsx').addEventListener('click', () => {
