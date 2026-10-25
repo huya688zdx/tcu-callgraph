@@ -6,7 +6,7 @@ import { applyI18n } from './i18n.js';
 import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
-import { fit, revealAdded, stopCamAnim } from './lib/camera.js';
+import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
 import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
 import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
@@ -90,6 +90,7 @@ async function loadView(rootId, opts = {}) {
     cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
   }
   const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  constrainCam();
   const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
   pulseAdded(addedNodes, addedEdges);
   if (previous) revealAdded(addedNodes, addedEdges);
@@ -169,6 +170,7 @@ async function navigateBack() {
   cam.x = prev.cam.x;
   cam.y = prev.cam.y;
   cam.k = prev.cam.k;
+  constrainCam();
   draw();
   return true;
 }
@@ -350,7 +352,7 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
 // 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。

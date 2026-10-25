@@ -16,6 +16,7 @@ import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { loadStats, renderVars, renderDetail } from './panels.js';
 import { draw } from './render.js';
+import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
 
@@ -158,6 +159,7 @@ export async function restorePage(root = null, isCurrent = () => true) {
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;
       state.ctxBox = saved.ctxBox;
       if (saved.cam) Object.assign(cam, saved.cam);
+      constrainCam();
       renderVars();
       await renderDetail(state.selected);
       renderLabelPanel();

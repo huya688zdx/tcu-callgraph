@@ -3,7 +3,7 @@ import { state, cam, els, applyTheme } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { resize } from './render.js';
-import { fit, focusBox } from './camera.js';
+import { fit, focusBox, constrainCam } from './camera.js';
 import { loadVars, renderVars, renderDetail } from './panels.js';
 import { pushHistory, undo, redo } from './history.js';
 import { buildSVG } from './svg.js';
@@ -43,7 +43,7 @@ const disableVars = () => {
 };
 new MutationObserver(disableVars).observe(els.vars, { childList: true, subtree: true });
 els.cv.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopImmediatePropagation(); }, true);
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => { constrainCam(); resize(); });
 document.getElementById('offlineFit').addEventListener('click', fit);
 for (const [id, extension, build] of [
   ['offlinePng', 'png', buildPNG],
@@ -71,6 +71,7 @@ await renderDetail(state.selected);
 // 画布尺寸不同时只补偿中心差，保留导出时的缩放和浏览位置。
 cam.x += (els.cv.clientWidth - saved.width) / 2;
 cam.y += (els.cv.clientHeight - saved.height) / 2;
+constrainCam();
 resize();
 pushHistory();
 window.__cg = { get view() { return state.view; }, cam };

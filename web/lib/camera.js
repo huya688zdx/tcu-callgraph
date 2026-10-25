@@ -3,16 +3,49 @@
  */
 import { els, state, cam } from './state.js';
 import { draw } from './render.js';
+
+/** 取当前内容的实际边界，包含拖出原布局范围的节点、折线和标签。 */
+function contentBounds() {
+  const v = state.view;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const include = (x, y) => { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); };
+  for (const b of [...(v?.nodes || []), ...(v?.groups || []), ...(v?.containers || [])]) {
+    include(b.x, b.y); include(b.x + b.w, b.y + b.h);
+  }
+  for (const e of v?.edges || []) {
+    for (const p of e.points || []) include(p[0], p[1]);
+    for (const { rect: r } of e._lbs || []) { include(r.x, r.y); include(r.x + r.w, r.y + r.h); }
+  }
+  return Number.isFinite(x0) ? { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }
+    : { x: 0, y: 0, w: 1, h: 1 };
+}
+
+const fittedZoom = (b) => Math.min(2, Math.max(1, els.cv.clientWidth - 64) / b.w, Math.max(1, els.cv.clientHeight - 64) / b.h);
+/** 通常 50%–200%；大图允许缩至整图适配比例，再往下就停止。 */
+function zoomLimits() { return { min: Math.min(0.5, fittedZoom(contentBounds())), max: 2 }; }
+function clampZoom(k) { const { min, max } = zoomLimits(); return Math.min(max, Math.max(min, k)); }
+
+/** 恢复旧视角或改变画布尺寸后，保持画布中心并纠正越界比例。 */
+function constrainCam() {
+  const k = clampZoom(cam.k);
+  if (k === cam.k) return;
+  stopCamAnim();
+  const x = els.cv.clientWidth / 2, y = els.cv.clientHeight / 2;
+  cam.x = x - (x - cam.x) * k / cam.k;
+  cam.y = y - (y - cam.y) * k / cam.k;
+  cam.k = k;
+}
+
 function fit() {
   stopCamAnim();
   const v = state.view;
   if (!v) return;
   const W = els.cv.clientWidth;
   const H = els.cv.clientHeight;
-  const k = Math.min(W / v.width, H / v.height, 1.8) * 0.93;
-  cam.k = Math.max(0.08, k);
-  cam.x = (W - v.width * cam.k) / 2;
-  cam.y = (H - v.height * cam.k) / 2;
+  const b = contentBounds();
+  cam.k = fittedZoom(b);
+  cam.x = W / 2 - (b.x + b.w / 2) * cam.k;
+  cam.y = H / 2 - (b.y + b.h / 2) * cam.k;
   draw();
 }
 
@@ -95,9 +128,13 @@ function panCam(dx, dy) {
 
 /** 每格约 10% 的平滑缩放，连续滚动累积倍率，以当前鼠标位置为锚点。 */
 function zoomCam(x, y, delta) {
+  let base = camAnim.on && camAnim.mode === 'zoom' ? camAnim.to.k : cam.k;
+  // 反向滚动直接从当前比例起步，不必先抵消尚未完成的缩放。
+  if ((base - cam.k) * delta > 0) base = cam.k;
+  const k = clampZoom(base * Math.exp(-Math.max(-160, Math.min(160, delta)) * 0.0008));
+  if (camAnim.on && camAnim.mode === 'zoom' && k === camAnim.to.k || !camAnim.on && k === cam.k) return;
   beginWheel('zoom');
   const a = { x, y, wx: (x - cam.x) / cam.k, wy: (y - cam.y) / cam.k };
-  const k = Math.min(4, Math.max(0.06, camAnim.to.k * Math.exp(-Math.max(-160, Math.min(160, delta)) * 0.0008)));
   camAnim.anchor = a;
   camAnim.to = { x: x - a.wx * k, y: y - a.wy * k, k };
 }
@@ -107,7 +144,7 @@ function focusBox(box, pad = 90) {
   const W = els.cv.clientWidth;
   const H = els.cv.clientHeight;
   if (!W || !H || !box.w || !box.h) return;
-  const k = Math.max(0.08, Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2), 1.6));
+  const k = clampZoom(Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2), 1.6));
   animateCam({
     x: W / 2 - (box.x + box.w / 2) * k,
     y: H / 2 - (box.y + box.h / 2) * k,
@@ -125,9 +162,9 @@ function revealAdded(nodes, edges) {
       y * cam.k + cam.y >= pad && y * cam.k + cam.y <= H - pad)) return;
   const x0 = Math.min(...points.map((p) => p[0])), x1 = Math.max(...points.map((p) => p[0]));
   const y0 = Math.min(...points.map((p) => p[1])), y1 = Math.max(...points.map((p) => p[1]));
-  const k = Math.max(0.08, Math.min(cam.k, (W - pad * 2) / Math.max(1, x1 - x0), (H - pad * 2) / Math.max(1, y1 - y0)));
+  const k = clampZoom(Math.min(cam.k, (W - pad * 2) / Math.max(1, x1 - x0), (H - pad * 2) / Math.max(1, y1 - y0)));
   const shift = (lo, hi, origin, size) => lo * k + origin < pad ? pad - lo * k :
     hi * k + origin > size - pad ? size - pad - hi * k : origin;
   animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k });
 }
-export { fit, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };
+export { fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };
