@@ -50,14 +50,14 @@ export function getParser() {
 const treeCache = new Map();
 
 export async function parseFile(abs, rel, src) {
-  const key = `${abs}:${src ? src.length : 'disk'}`;
-  const hit = treeCache.get(key);
-  if (hit) return hit;
-  const parser = await getParser();
   const text = src ?? fs.readFileSync(abs, 'utf8');
+  const hit = treeCache.get(abs);
+  if (hit?.src === text) return hit;
+  const parser = await getParser();
   const tree = parser.parse(text);
   const rec = { tree, root: tree.rootNode, src: text, rel };
-  treeCache.set(key, rec);
+  if (hit) hit.tree.delete();
+  treeCache.set(abs, rec);
   return rec;
 }
 
@@ -161,6 +161,7 @@ export function collectGlobals(root) {
         isExtern: words.includes('extern'),
         isConst: words.includes('const'),
         hasInit: d.type === 'init_declarator',
+        isArray: (d.type === 'init_declarator' ? d.childForFieldName('declarator') : d)?.type === 'array_declarator',
       });
     }
   }
@@ -176,6 +177,18 @@ export function collectFunctions(root) {
     if (name && !map.has(name)) map.set(name, node);
   }
   return map;
+}
+
+/** 参数位置与指针/数组属性，用于绑定调用处的实参。 */
+export function collectParameters(fnNode) {
+  let decl = fnNode.childForFieldName('declarator');
+  while (decl && decl.type !== 'function_declarator') decl = decl.childForFieldName('declarator');
+  return (decl?.childForFieldName('parameters')?.namedChildren || [])
+    .filter((p) => p.type === 'parameter_declaration')
+    .map((p) => {
+      const d = p.childForFieldName('declarator');
+      return { name: declaratorName(d), pointer: d?.type === 'pointer_declarator' || d?.type === 'array_declarator' };
+    });
 }
 
 /** 沿 field/subscript/pointer/paren 往下找到最底层的标识符 */
@@ -205,26 +218,44 @@ function baseIdentifier(n) {
  * 判定口径：
  *   write      赋值左值（= 为纯写；+= 之类与 ++ -- 先读旧值，算读写）
  *   read       其余引用（裸标识符 x = g / g % n、成员链 g.a.b、下标 g[i]）
- *   escape     &g 显式取地址 —— 对方读写不可知，按「读 + 可能被写」保守处理
+ *   escape     未解析的 &g 取地址按「读 + 可能被写」处理；已解析调用由形参访问决定
  *   按值实参只读，不会因传参而改写原变量。
  */
-export function collectAccesses(fnNode, isGlobal) {
+export function collectAccesses(fnNode, isGlobal, { bindings = new Map(), resolveCall, isArray } = {}) {
   const writes = new Map();
   const reads = new Map();
   const locals = new Set();
-  const aliases = new Map(); // 局部指针 -> 全局变量名
+  const aliases = new Map(bindings); // 局部指针/形参 -> 可能指向的全局变量
+  const pointers = new Set();
+  const calls = [];
 
   const body = fnNode.childForFieldName('body');
-  if (!body) return { writes, reads, locals };
+  if (!body) return { writes, reads, locals, calls };
 
   // 形参名
-  const params = fnNode.childForFieldName('declarator')?.childForFieldName('parameters');
-  if (params) {
-    for (const p of params.namedChildren) {
-      const nm = declaratorName(p.childForFieldName('declarator'));
-      if (nm) locals.add(nm);
-    }
+  for (const p of collectParameters(fnNode)) {
+    if (p.name) locals.add(p.name);
+    if (p.pointer) pointers.add(p.name);
   }
+
+  const pointerTargets = (n) => {
+    if (!n) return new Set();
+    if (n.type === 'parenthesized_expression' || n.type === 'cast_expression') {
+      return pointerTargets(n.namedChildren[n.namedChildren.length - 1]);
+    }
+    if (n.type === 'conditional_expression') {
+      return new Set([...pointerTargets(n.childForFieldName('consequence')), ...pointerTargets(n.childForFieldName('alternative'))]);
+    }
+    if (n.type === 'pointer_expression' && n.text.trimStart().startsWith('&')) {
+      const base = baseIdentifier(n.childForFieldName('argument'));
+      return base && !locals.has(base.text) && isGlobal(base.text) ? new Set([base.text]) : new Set();
+    }
+    if (n.type === 'identifier') {
+      if (locals.has(n.text)) return aliases.get(n.text) || new Set();
+      if (isGlobal(n.text) && isArray?.(n.text)) return new Set([n.text]);
+    }
+    return new Set();
+  };
 
   const touch = (map, name, node, extra = {}) => {
     let rec = map.get(name);
@@ -245,11 +276,12 @@ export function collectAccesses(fnNode, isGlobal) {
     const field = fieldNode ? fieldNode.text : null;
 
     if (locals.has(name)) {
-      const target = aliases.get(name);
-      if (!target) return; // 纯局部变量，与全局无关
-      // 通过指向全局的局部指针访问：*p = ... / p->f = ...
-      if (mode === 'write' || mode === 'rw') touch(writes, target, node, { field, indirect: true });
-      if (mode !== 'write') touch(reads, target, node, { field, indirect: true });
+      // 只把解引用算作目标访问；p = 0 或转传 p 不会读写 *p。
+      if (node.type === 'identifier') return;
+      for (const target of aliases.get(name) || []) {
+        if (mode === 'write' || mode === 'rw') touch(writes, target, node, { field, indirect: true });
+        if (mode !== 'write') touch(reads, target, node, { field, indirect: true });
+      }
       return;
     }
     if (!isGlobal(name)) return;
@@ -266,6 +298,10 @@ export function collectAccesses(fnNode, isGlobal) {
       case 'assignment_expression': {
         // 复合赋值（+= 之类）先读旧值再写，左值按读写；= 才是纯写
         const op = n.childForFieldName('operator')?.text;
+        const left = n.childForFieldName('left');
+        if (op === '=' && left?.type === 'identifier' && pointers.has(left.text)) {
+          aliases.set(left.text, pointerTargets(n.childForFieldName('right')));
+        }
         visit(n.childForFieldName('left'), op === '=' ? 'write' : 'rw');
         visit(n.childForFieldName('right'), 'read');
         return;
@@ -285,8 +321,40 @@ export function collectAccesses(fnNode, isGlobal) {
       }
       case 'call_expression': {
         const args = n.childForFieldName('arguments');
-        for (const a of args ? args.namedChildren : []) visit(a, 'read');
-        visit(n.childForFieldName('function'), 'read');
+        const callee = n.childForFieldName('function');
+        const target = callee?.type === 'identifier' && !locals.has(callee.text) ? resolveCall?.(callee.text) : null;
+        for (const [i, a] of (args?.namedChildren || []).entries()) {
+          const targets = pointerTargets(a);
+          // 取地址不访问目标值，但下标和条件表达式仍会被求值。
+          const visitAddress = (part) => {
+            if (!part) return;
+            if (part.type === 'conditional_expression') {
+              visit(part.childForFieldName('condition'), 'read');
+              visitAddress(part.childForFieldName('consequence'));
+              visitAddress(part.childForFieldName('alternative'));
+            } else if (part.type === 'parenthesized_expression' || part.type === 'cast_expression') {
+              visitAddress(part.namedChildren[part.namedChildren.length - 1]);
+            } else if (part.type === 'pointer_expression' && part.text.trimStart().startsWith('&')) {
+              const indices = (n) => {
+                if (n?.type === 'subscript_expression') visit(n.childForFieldName('index'), 'read');
+                if (n?.type === 'subscript_expression' || n?.type === 'field_expression') indices(n.childForFieldName('argument'));
+              };
+              indices(part.childForFieldName('argument'));
+            } else if (part.type !== 'identifier') visit(part, 'read');
+          };
+          if (target?.params[i]?.pointer && targets.size) {
+            calls.push({ to: target.id, param: target.params[i].name, targets });
+            visitAddress(a);
+          } else if (!target && targets.size) {
+            // 外部调用无法知道如何使用指针，保留可能读写的保守口径。
+            for (const name of targets) {
+              touch(reads, name, a, { indirect: true });
+              touch(writes, name, a, { indirect: true });
+            }
+            visitAddress(a);
+          } else visit(a, 'read');
+        }
+        visit(callee, 'read');
         return;
       }
       case 'field_expression':
@@ -318,13 +386,10 @@ export function collectAccesses(fnNode, isGlobal) {
           locals.add(nm);
           if (d.type === 'init_declarator' && d.childForFieldName('declarator')?.type === 'pointer_declarator') {
             const init = d.childForFieldName('value');
-            if (init && init.type === 'pointer_expression' && init.text.trimStart().startsWith('&')) {
-              const t = baseIdentifier(init.childForFieldName('argument'));
-              if (t && t.type === 'identifier' && isGlobal(t.text)) aliases.set(nm, t.text);
-            } else if (init && init.type === 'identifier' && isGlobal(init.text)) {
-              // 局部指针 = 全局数组名之类的退化情形
-              aliases.set(nm, init.text);
-            }
+            pointers.add(nm);
+            aliases.set(nm, pointerTargets(init));
+          } else if (d.type === 'pointer_declarator') {
+            pointers.add(nm);
           }
         }
         // 初始化表达式里仍可能引用全局
@@ -339,5 +404,5 @@ export function collectAccesses(fnNode, isGlobal) {
 
   // 先扫一遍局部声明，避免「先使用后声明」被误判（C 里声明都在块首，问题不大）
   visit(body, 'read');
-  return { writes, reads, locals };
+  return { writes, reads, locals, calls };
 }

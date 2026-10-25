@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { parseFile, collectGlobals, collectFunctions, collectAccesses } from '../src/core/cparse.js';
 import { loadModel } from '../src/core/index.js';
 import { dataflowFor } from '../src/core/dataflow.js';
@@ -106,7 +108,7 @@ test('数据流端到端：demo 的 App_Task10ms 写 g_tick 能连到跨函数�
   );
 });
 
-test('数据流边界：按值实参不产生跨函数读者（参数绑定未建模）', async () => {
+test('数据流边界：按值实参不产生跨函数读者', async () => {
   const model = loadModel(DEMO);
   const id = model.functions.find((f) => f.name === 'App_Task10ms').id;
   const r = await dataflowFor(model, id, 'out');
@@ -117,6 +119,69 @@ test('数据流边界：按值实参不产生跨函数读者（参数绑定未�
     assert.ok(peers?.includes('Can_SendGearStatus'), '应保留真实的跨文件读取者');
     assert.ok(!peers.includes('Shift_Check'), '按值传参不应凭空造出共享链');
   }
+});
+
+test('宏与指针参数：展开宏并经局部别名、转传找到实际读写函数', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-df-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'ops.h'), `
+#define READ() (g_rpm)
+#define WRITE(v) (g_rpm = (v))
+#define SET(p, v) forward((p), (v))
+`);
+  fs.writeFileSync(path.join(root, 'main.c'), `
+#include "ops.h"
+int g_rpm, g_result;
+#define TARGET g_rpm
+void tick(void) {
+    WRITE(READ() + 1);
+    SET(&g_rpm, 2);
+    g_result = read_value(&g_rpm);
+    TARGET++;
+}
+#undef TARGET
+#define TARGET g_result
+void next(void) { TARGET++; }
+`);
+  fs.writeFileSync(path.join(root, 'ops.c'), `
+void set_value(int *p, int v) { *p = v; }
+void forward(int *p, int v) { int *q = p; set_value(q, v); }
+int read_value(const int *p) { return *p; }
+`);
+  const model = loadModel(root);
+  await dataflowFor(model, 'main.c::tick', 'both');
+  const access = (id) => model.functions.find((f) => f.id === id).varAccess;
+  assert.deepEqual(access('main.c::tick').find((a) => a.id === 'var::g_rpm'),
+    { id: 'var::g_rpm', name: 'g_rpm', read: true, write: true, line: 6 });
+  assert.deepEqual(access('ops.c::set_value'),
+    [{ id: 'var::g_rpm', name: 'g_rpm', read: false, write: true, line: 2 }]);
+  assert.deepEqual(access('ops.c::read_value'),
+    [{ id: 'var::g_rpm', name: 'g_rpm', read: true, write: false, line: 4 }]);
+  assert.deepEqual(access('ops.c::forward'), []);
+  assert.deepEqual(access('main.c::next').map((a) => a.id), ['var::g_result']);
+  const flow = await dataflowFor(model, 'ops.c::set_value', 'out');
+  assert.ok(flow.vars.find((v) => v.id === 'var::g_rpm').peers.some((p) => p.id === 'ops.c::read_value'));
+});
+
+test('指针参数边界：保留实参的文件作用域，修改指针本身不算写入目标', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-df-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'a.c'), `
+static int s;
+void start(void) { int *q = &s; write_value(q); clear(q); }
+`);
+  fs.writeFileSync(path.join(root, 'b.c'), `
+static int s;
+void write_value(int *p) { *p = 7; }
+void clear(int *p) { p = 0; }
+int read_local(void) { return s; }
+`);
+  const model = loadModel(root);
+  const flow = await dataflowFor(model, 'b.c::write_value', 'out');
+  assert.deepEqual(model.functions.find((f) => f.name === 'write_value').varAccess.map((a) => a.id), ['var::a.c::s']);
+  assert.deepEqual(model.functions.find((f) => f.name === 'clear').varAccess, []);
+  assert.ok(flow.vars.every((v) => v.id === 'var::a.c::s' && v.peers.every((p) => p.id !== 'b.c::read_local')),
+    '另一文件的同名私有变量不能成为读取方');
 });
 
 test('公共变量样例：无相互调用的函数通过变量形成双向可查询的读写链，且不受文件顺序影响', async () => {

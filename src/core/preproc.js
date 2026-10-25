@@ -42,8 +42,14 @@ function parseDefineParams(text) {
  * @param {Map} macros  全局宏表（跨文件共享）
  * @param {string} file
  */
-export function preprocess(tokens, macros, file) {
+export function preprocess(tokens, macros, file, { expand = false } = {}) {
   const out = [];
+  let pending = [];
+  // 遇到指令前展开，保证 #define / #undef 只作用于后面的代码。
+  const flush = () => {
+    for (const tk of expandSeq(pending, macros)) out.push(tk);
+    pending = [];
+  };
   const includes = [];
   const frames = []; // {expr}
 
@@ -64,9 +70,11 @@ export function preprocess(tokens, macros, file) {
     const tk = tokens[k];
 
     if (tk.t !== 'preproc') {
-      out.push({ ...tk, cond: currentCond() });
+      (expand ? pending : out).push({ ...tk, cond: currentCond() });
       continue;
     }
+
+    if (expand) flush();
 
     const m = DIRECTIVE.exec(tk.v);
     if (!m) continue;
@@ -141,6 +149,7 @@ export function preprocess(tokens, macros, file) {
     }
   }
 
+  if (expand) flush();
   return { tokens: out, includes };
 }
 

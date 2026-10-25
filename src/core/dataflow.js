@@ -14,8 +14,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseFile, collectGlobals, collectFunctions, collectAccesses } from './cparse.js';
+import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from './cparse.js';
 import { rebuildIndex } from './index.js';
+import { lex } from './lexer.js';
+import { preprocess } from './preproc.js';
 
 const MAX_VARS = 16;
 const MAX_PEERS = 24;
@@ -57,11 +59,32 @@ export async function buildDataflowIndex(model) {
       fnsByFile.get(fn.file).push(fn);
     }
 
+    const sources = [];
     for (const f of model.files) {
-      const abs = path.join(model.root, f.rel);
+      try {
+        sources.push({ ...f, src: decode(fs.readFileSync(path.join(model.root, f.rel))) });
+      } catch (err) {
+        failedFiles += 1;
+        console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);
+      }
+    }
+    // 与调用分析相同：继承头文件宏，各源文件的局部宏互不泄漏。
+    const headerMacros = new Map();
+    for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
+
+    for (const f of sources) {
       let rec;
       try {
-        rec = await parseFile(abs, f.rel, decode(fs.readFileSync(abs)));
+        const { tokens } = preprocess(lex(f.src, f.rel), new Map(headerMacros), f.rel, { expand: true });
+        // 展开内容留在调用处的原始行，面板定位仍指向用户源码。
+        let expanded = '', line = 1;
+        for (const tk of tokens) {
+          if (tk.line > line) expanded += '\n'.repeat(tk.line - line);
+          line = Math.max(line, tk.line);
+          expanded += `${tk.v} `;
+          line += (tk.v.match(/\n/g) || []).length;
+        }
+        rec = await parseFile(path.join(model.root, f.rel), f.rel, expanded);
       } catch (err) {
         failedFiles += 1;
         console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);
@@ -84,7 +107,9 @@ export async function buildDataflowIndex(model) {
       }
     }
 
-    // 先收齐声明再分析函数，避免读取者排在定义文件之前时漏掉关系。
+    // 先收齐声明与函数，再沿明确的实参将目标绑定到指针形参。
+    const defsById = new Map(defs.map((d) => [d.id, d]));
+    const records = new Map();
     for (const { file, root } of parsedFiles) {
       const fns = collectFunctions(root);
       const resolve = (name) => {
@@ -97,21 +122,59 @@ export async function buildDataflowIndex(model) {
       for (const fn of fnsByFile.get(file) || []) {
         const node = fns.get(fn.name);
         if (!node) continue;
-        const acc = collectAccesses(node, (name) => !!resolve(name));
-        const w = new Map();
-        const r = new Map();
-        for (const [name, rec2] of acc.writes) {
-          const d = resolve(name);
-          if (d) w.set(d.id, rec2);
-        }
-        for (const [name, rec2] of acc.reads) {
-          const d = resolve(name);
-          if (d) r.set(d.id, rec2);
-        }
-        fnAccess.set(fn.id, { writes: w, reads: r });
-        for (const id of w.keys()) addTo(writers, id, fn.id);
-        for (const id of r.keys()) addTo(readers, id, fn.id);
+        records.set(fn.id, { id: fn.id, file, node, resolve, params: collectParameters(node), bindings: new Map() });
       }
+    }
+    const queue = [...records.keys()];
+    const queued = new Set(queue);
+    for (let i = 0; i < queue.length; i++) {
+      const id = queue[i];
+      queued.delete(id);
+      const rec = records.get(id);
+      const acc = collectAccesses(rec.node, (name) => !!rec.resolve(name), {
+        bindings: rec.bindings,
+        isArray: (name) => !!rec.resolve(name)?.isArray,
+        resolveCall: (name) => {
+          const all = model._index.byName.get(name) || [];
+          const local = all.find((f) => f.file === rec.file);
+          const fn = local || all.find((f) => !f.isStatic);
+          return fn ? records.get(fn.id) : null;
+        },
+      });
+      const normalize = (accesses) => {
+        const result = new Map();
+        for (const [name, access] of accesses) {
+          const d = defsById.get(name) || rec.resolve(name);
+          if (!d) continue;
+          const prev = result.get(d.id);
+          result.set(d.id, prev ? {
+            lines: new Set([...prev.lines, ...access.lines]),
+            fields: new Set([...prev.fields, ...access.fields]),
+            indirect: prev.indirect || access.indirect,
+          } : access);
+        }
+        return result;
+      };
+      fnAccess.set(id, { writes: normalize(acc.writes), reads: normalize(acc.reads) });
+      for (const call of acc.calls) {
+        const callee = records.get(call.to);
+        if (!callee.bindings.has(call.param)) callee.bindings.set(call.param, new Set());
+        const targets = callee.bindings.get(call.param);
+        const size = targets.size;
+        for (const name of call.targets) {
+          const d = defsById.get(name) || rec.resolve(name);
+          if (d) targets.add(d.id);
+        }
+        // 目标集合只增不减，递归调用也会在不再产生新绑定时结束。
+        if (targets.size > size && !queued.has(call.to)) {
+          queued.add(call.to);
+          queue.push(call.to);
+        }
+      }
+    }
+    for (const [id, acc] of fnAccess) {
+      for (const varId of acc.writes.keys()) addTo(writers, varId, id);
+      for (const varId of acc.reads.keys()) addTo(readers, varId, id);
     }
 
     const idx = {
