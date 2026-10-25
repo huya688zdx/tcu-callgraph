@@ -177,6 +177,29 @@ function draw() {
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
   drawEdgeLabels(ctx, v);
 
+  if (state.dragBox && state.dragMoved) {
+    const { box, guides } = state.dragBox;
+    ctx.save();
+    ctx.strokeStyle = '#185FA5';
+    ctx.lineWidth = 2 / cam.k;
+    roundRect(ctx, box.x - 2, box.y - 2, box.w + 4, box.h + 4, 14);
+    ctx.stroke();
+    ctx.lineWidth = 1 / cam.k;
+    ctx.setLineDash([4 / cam.k, 4 / cam.k]);
+    for (const g of guides) {
+      ctx.beginPath();
+      if (g.axis === 'x') {
+        ctx.moveTo(g.at, Math.min(box.y, g.peer.y) - 12);
+        ctx.lineTo(g.at, Math.max(box.y + box.h, g.peer.y + g.peer.h) + 12);
+      } else {
+        ctx.moveTo(Math.min(box.x, g.peer.x) - 12, g.at);
+        ctx.lineTo(Math.max(box.x + box.w, g.peer.x + g.peer.w) + 12, g.at);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // 点击标题后的短暂高亮：框住刚点中的那个层级，避免「点了没反应」的错觉
   if (state.flash) {
     const f = state.flash;

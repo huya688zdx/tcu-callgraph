@@ -33,7 +33,7 @@ let failures = 0; // 连续刷新失败次数：服务重启期间有限重试�
 
 /** 用户是否正在拖节点 / 拖连线 / 平移——此刻刷新会打断操作，稍后再试 */
 function isInteracting() {
-  return !!(state.dragNode || state.dragSeg || state.dragLabel || state.dragStart || state.panning);
+  return !!(state.dragBox || state.dragNode || state.dragSeg || state.dragLabel || state.dragStart || state.panning);
 }
 
 function scheduleReload() {

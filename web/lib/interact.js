@@ -30,6 +30,7 @@ import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './ed
 import { renderLabelPanel } from './label-panel.js';
 import { hooks } from './hooks.js';
 import { nearestSide } from '/core/routing.js';
+import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
 function worldPos(e) {
   const rect = els.cv.getBoundingClientRect();
   return {
@@ -50,7 +51,7 @@ function hitTest(e) {
 }
 
 /**
- * 命中文件框 / 目录容器的标题：点击标题把该区域整体居中放大。
+ * 命中文件框 / 目录容器的标题：单击居中查看，拖动整体移动。
  * 文件框有标题栏（整条可点），目录容器只有左上角一行文字，按实际文字宽度判定，
  * 避免大容器的标题命中区挡住内部的文件框
  */
@@ -161,6 +162,7 @@ let dragCache = null;
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
 function resetDragState() {
   state.dragNode = null;
+  state.dragBox = null;
   state.dragEnd = null;
   state.dragSeg = null;
   state.dragLabel = null;
@@ -175,7 +177,8 @@ function resetDragState() {
 /** pointercancel / lostpointercapture：直接丢弃这次手势，不提交任何变更 */
 function cancelDrag() {
   const active =
-    state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
+    state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
+  if (state.dragBox) cancelHierarchyMove(state.dragBox);
   resetDragState();
   state.linkFrom = null;
   state.linkPos = null;
@@ -309,14 +312,23 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  // 点标题：把该文件框 / 目录容器整体居中放大
+  // 标题先记录手势，松手后再区分单击与整体拖动。
   const title = hitTitle(e);
   if (title) {
-    focusBox(title.box);
-    state.flash = { box: title.box, until: performance.now() + 1300, dur: 1300 };
+    pushHistory();
+    state.dragBox = beginHierarchyMove(state.view, title);
+    state.dragBox.crossing = state.view.edges.filter((ed) =>
+      state.dragBox.ids.has(ed.from) !== state.dragBox.ids.has(ed.to));
+    state.dragStart = { x: e.clientX, y: e.clientY };
+    state.flash = null;
+    els.tooltip.style.opacity = '0';
+    els.cv.style.cursor = 'grabbing';
+    els.cv.setPointerCapture(e.pointerId);
     // 点层级/文件标题 = 切换右侧变量面板的范围
     state.ctxBox = { kind: title.kind === 'file' ? 'file' : 'dir', id: title.box.id };
     state.selected = null;
+    state.selectedEdge = null;
+    state.selectedLabel = null;
     renderDetail(null); // 收起节点详情 / 调用关系
     renderVars();
     draw();
@@ -353,6 +365,20 @@ els.cv.addEventListener('pointerdown', (e) => {
 });
 
 els.cv.addEventListener('pointermove', (e) => {
+  if (state.dragBox) {
+    const drag = state.dragBox;
+    if (drag.view !== state.view) { cancelDrag(); return; }
+    const dx = e.clientX - state.dragStart.x, dy = e.clientY - state.dragStart.y;
+    if (Math.abs(dx) + Math.abs(dy) > 3) state.dragMoved = true;
+    if (state.dragMoved) {
+      moveHierarchy(drag, dx / cam.k, dy / cam.k, e.shiftKey ? 0 : 8 / cam.k);
+      routeEdges(state.view.nodes, drag.crossing, {
+        existing: collectSegments(state.view.edges.filter((ed) => !drag.crossing.includes(ed))), preservePaths: true,
+      });
+      draw();
+    }
+    return;
+  }
   if (state.dragLabel) {
     const { edge, label, start, dx, dy } = state.dragLabel;
     const anchor = labelAnchor(edge);
@@ -422,31 +448,30 @@ els.cv.addEventListener('pointermove', (e) => {
     els.cv.classList.toggle('over-node', !!next);
     draw();
   }
-  // 标题上显示可点击
-  els.cv.style.cursor = next ? '' : hitTitle(e) ? 'pointer' : '';
+  const title = next ? null : hitTitle(e);
+  let cursor = title ? 'grab' : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
   if (state.selectedEdge) {
-    let cursor = '';
     if (hitEnd(e)) cursor = 'crosshair';
     else {
       const seg = hitSegment(e);
       if (seg) cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
     }
-    els.cv.style.cursor = cursor;
-  } else if (els.cv.style.cursor) {
-    els.cv.style.cursor = '';
   }
+  els.cv.style.cursor = cursor;
 
   // 标签可以拖：悬停时给个抓手光标，比默认箭头好认
   if (hitLabel(worldPos(e))) els.cv.style.cursor = 'move';
 
-  if (n) {
+  if (n || title) {
     const rect = els.cv.getBoundingClientRect();
     els.tooltip.style.opacity = '1';
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
-    els.tooltip.innerHTML = `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>`;
+    els.tooltip.innerHTML = n
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>`
+      : `<b>${esc(title.box.label || title.box.id)}</b><br>拖动标题整体移动 · 单击居中查看<br><span style="opacity:.7">自动吸附对齐 · Shift 关闭吸附 · Esc 取消</span>`;
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -458,12 +483,27 @@ els.cv.addEventListener('pointerup', (e) => {
   const dragEnd = state.dragEnd;
   const dragSeg = state.dragSeg;
   const dragNode = state.dragNode;
+  const dragBox = state.dragBox;
   const dragLabel = state.dragLabel;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
   const panning = state.panning;
   const panMoved = state.panMoved;
   resetDragState();
+
+  if (dragBox) {
+    if (moved) {
+      justDragged = true;
+      setTimeout(() => (justDragged = false), 260);
+      fullReroute(dragBox.ids);
+      pushHistory();
+    } else {
+      focusBox(dragBox.box);
+      state.flash = { box: dragBox.box, until: performance.now() + 1300, dur: 1300 };
+    }
+    draw();
+    return;
+  }
 
   if (dragLabel) {
     // 位置已经在拖动过程中写进 label.dx/dy，松手才落库，避免每帧一次请求
@@ -543,6 +583,13 @@ els.cv.addEventListener('pointerup', (e) => {
 // 不处理的话 state.dragNode 等会永久留着，回页面后鼠标一动节点就跟着跑。
 els.cv.addEventListener('pointercancel', cancelDrag);
 els.cv.addEventListener('lostpointercapture', cancelDrag);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && state.dragBox) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    cancelDrag();
+  }
+}, true);
 
 els.cv.addEventListener('dblclick', (e) => {
   if (justDragged) return;
@@ -569,6 +616,7 @@ els.cv.addEventListener(
   'wheel',
   (e) => {
     e.preventDefault();
+    if (state.dragBox) return;
     stopCamAnim();
     const rect = els.cv.getBoundingClientRect();
     const sx = e.clientX - rect.left;

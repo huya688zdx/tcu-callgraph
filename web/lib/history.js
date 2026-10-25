@@ -54,6 +54,9 @@ function snapshotView() {
       labels: e.labels || null,
     })),
     groups: v.groups || null,
+    containers: v.containers || null,
+    width: v.width,
+    height: v.height,
   });
 }
 
@@ -79,6 +82,10 @@ function applySnapshot(str) {
   v.nodes = s.nodes;
   v.edges = s.edges.map((e) => ({ ...e }));
   if (s.groups) v.groups = s.groups;
+  if (s.containers) v.containers = s.containers;
+  if (Number.isFinite(s.width)) v.width = s.width;
+  if (Number.isFinite(s.height)) v.height = s.height;
+  state.flash = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
