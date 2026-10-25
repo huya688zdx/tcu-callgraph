@@ -7,14 +7,14 @@ import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './s
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 
-/**
- * 下一帧重绘（去重）。
- * flash 高亮的动画尾巴不能直接 requestAnimationFrame(() => draw())：
- * draw() 在拖拽时每帧都会被调用，每次调用都新开一条 rAF 链，
- * 1.3s 的高亮期内能叠出上百条并发全量重绘。这里保证同一时刻只有一条链。
- */
-let rafPending = false;
+// 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
+let animationFrame = 0;
 let recentAlpha = 0;
+let collectingEffects = false;
+let effects = [];
+let effectCamera = null;
+const scene = document.createElement('canvas');
+const sceneCtx = scene.getContext('2d');
 
 export function pulseAdded(nodes, edges) {
   state.recent = nodes.length || edges.length ? {
@@ -24,12 +24,55 @@ export function pulseAdded(nodes, edges) {
   draw();
 }
 function scheduleDraw() {
-  if (rafPending) return;
-  rafPending = true;
-  requestAnimationFrame(() => {
-    rafPending = false;
-    draw();
+  if (animationFrame) return;
+  animationFrame = requestAnimationFrame((now) => {
+    animationFrame = 0;
+    if (state.recent || state.flash) { draw(); return; }
+    if (!effects.length || !effectCamera) return;
+    const { ctx, cv } = els;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(scene, 0, 0);
+    ctx.restore();
+    drawEffects(now);
+    scheduleDraw();
   });
+}
+
+function recordBoxEffect(box, dash, width, radius = 8, color = THEME.node.selected) {
+  effects.push({ kind: 'box', box: { x: box.x, y: box.y, w: box.w, h: box.h }, dash, width, radius, color });
+}
+
+function drawEffects(now) {
+  const { ctx } = els, c = effectCamera;
+  ctx.save();
+  ctx.setTransform(c.dpr, 0, 0, c.dpr, 0, 0);
+  ctx.translate(c.x, c.y);
+  ctx.scale(c.k, c.k);
+  for (const effect of effects) {
+    ctx.save();
+    if (effect.kind === 'box') {
+      const b = effect.box;
+      roundRect(ctx, b.x, b.y, b.w, b.h, effect.radius);
+      ctx.strokeStyle = effect.color;
+      ctx.lineWidth = effect.width;
+      ctx.setLineDash(effect.dash);
+      ctx.lineDashOffset = -now * 0.024 / c.k;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = '#86B9EC';
+      for (let i = 0; i < 3; i++) {
+        const p = pathPointAt(effect.points, now / 2400 - i / 3);
+        ctx.globalAlpha = 0.9 - i * 0.3;
+        ctx.beginPath();
+        ctx.arc(p[0], p[1], (2.2 - i * 0.4) / c.k, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+  ctx.restore();
 }
 
 function resize() {
@@ -95,6 +138,10 @@ function neighborSet() {
 }
 
 function draw() {
+  cancelAnimationFrame(animationFrame);
+  animationFrame = 0;
+  effects = [];
+  collectingEffects = false;
   const { ctx, cv } = els;
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
@@ -142,6 +189,7 @@ function draw() {
     ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
     return;
   }
+  collectingEffects = true;
 
   if (v.containers) for (const c of v.containers) drawContainer(ctx, c);
 
@@ -197,20 +245,13 @@ function draw() {
   for (const n of v.nodes) drawNode(ctx, n, nb, focusedNodes);
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
-  drawEdgeLabels(ctx, v);
+  drawEdgeLabels(ctx, v, recordBoxEffect);
 
-  // 双击解锁的对象用持续的实线光圈标明，区别于普通单击选择。
-  if (state.moveTarget && state.moveTarget.kind !== 'edge') {
+  // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
+  if (state.moveTarget && !['edge', 'node'].includes(state.moveTarget.kind)) {
     const b = state.moveTarget.item, gap = 4 / cam.k;
-    ctx.save();
-    ctx.setLineDash([]);
-    ctx.strokeStyle = THEME.node.selected;
-    ctx.lineWidth = 2 / cam.k;
-    ctx.shadowColor = THEME.node.selected;
-    ctx.shadowBlur = 6;
-    roundRect(ctx, b.x - gap, b.y - gap, b.w + gap * 2, b.h + gap * 2, 10);
-    ctx.stroke();
-    ctx.restore();
+    recordBoxEffect({ x: b.x - gap, y: b.y - gap, w: b.w + gap * 2, h: b.h + gap * 2 },
+      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, state.moveTarget.kind === 'dir' ? 14 : 12);
   }
 
   if (state.dragBox && state.dragMoved) {
@@ -250,18 +291,26 @@ function draw() {
       ctx.lineWidth = 3 / cam.k;
       ctx.stroke();
       ctx.restore();
-      scheduleDraw();
     }
   }
-  if (state.recent || focusedEdges.size || state.multiSelection ||
-      v.nodes.some((n) => n.id === state.selected && n.kind === 'var')) scheduleDraw();
-
   ctx.restore();
 
   ctx.fillStyle = '#B4B2A9';
   ctx.font = `11px ${FONT}`;
   ctx.textAlign = 'left';
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
+  collectingEffects = false;
+  if (effects.length) {
+    if (scene.width !== cv.width || scene.height !== cv.height) {
+      scene.width = cv.width;
+      scene.height = cv.height;
+    }
+    sceneCtx.clearRect(0, 0, scene.width, scene.height);
+    sceneCtx.drawImage(cv, 0, 0);
+    effectCamera = { ...cam, dpr };
+    drawEffects(now);
+  }
+  if (state.recent || state.flash || effects.length) scheduleDraw();
 }
 
 function drawContainer(ctx, c) {
@@ -329,6 +378,30 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
+/** 折线上按 0~1 的进度取点（选中线上的流动小圆点用） */
+function pathPointAt(pts, t) {
+  let total = 0;
+  const segs = [];
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    segs.push(d);
+    total += d;
+  }
+  let target = (t - Math.floor(t)) * total;
+  for (let i = 0; i < segs.length; i++) {
+    if (target > segs[i] && i < segs.length - 1) {
+      target -= segs[i];
+      continue;
+    }
+    const r = segs[i] ? target / segs[i] : 0;
+    return [
+      pts[i][0] + (pts[i + 1][0] - pts[i][0]) * r,
+      pts[i][1] + (pts[i + 1][1] - pts[i][1]) * r,
+    ];
+  }
+  return pts[pts.length - 1];
+}
+
 function drawEdge(ctx, e, related, selected, focused = false) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
@@ -366,29 +439,8 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (selected) {
-    ctx.save();
-    ctx.beginPath();
-    strokeRounded(ctx, pts);
-    ctx.shadowColor = THEME.node.hover;
-    if (state.multiSelection) {
-      // 多选用整条线的呼吸光晕，与单选的方向脉冲区分。
-      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 320);
-      ctx.strokeStyle = THEME.node.hover;
-      ctx.lineWidth = (5 + 2 * pulse) / cam.k;
-      ctx.globalAlpha = 0.18 + 0.22 * pulse;
-      ctx.shadowBlur = 3 + 3 * pulse;
-      if (e.kind === 'var') ctx.setLineDash([7, 4]);
-    } else {
-      ctx.strokeStyle = '#8BD8FF';
-      ctx.lineWidth = 3 / cam.k;
-      ctx.setLineDash([12 / cam.k, 30 / cam.k]);
-      // 负偏移让亮段沿 from → to 移动，与箭头保持同向。
-      ctx.lineDashOffset = -performance.now() * 0.08 / cam.k;
-      ctx.shadowBlur = 5;
-    }
-    ctx.stroke();
-    ctx.restore();
+  if (collectingEffects && selected) {
+    effects.push({ kind: 'edge', points: pts.map((p) => [...p]) });
   }
 
   const a = pts[pts.length - 2];
@@ -509,16 +561,18 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     : n.external
     ? THEME.node.externalBorder
     : THEME.node.border;
-  // 变量用实线框，选中时呼吸发光；函数保留流动虚线框。
+  // 虚线框直接流动本体，实线框保留本体并增加动态外圈。
   ctx.setLineDash(isVar ? [] : [5, 3]);
-  if (!isVar && selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
-  ctx.save();
-  if (isVar && selected) {
-    ctx.shadowColor = THEME.node.hover;
-    ctx.shadowBlur = 3 + 8 * (0.5 + 0.5 * Math.sin(performance.now() / 320));
+  const animated = collectingEffects && selected && (allNodes ||
+    state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
+  const dash = ctx.getLineDash();
+  if (animated && dash.length) recordBoxEffect(n, dash, ctx.lineWidth, 8, ctx.strokeStyle);
+  else ctx.stroke();
+  if (animated && !dash.length) {
+    const gap = 4 / cam.k;
+    recordBoxEffect({ x: x - gap, y: y - gap, w: w + gap * 2, h: h + gap * 2 },
+      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, 10);
   }
-  ctx.stroke();
-  ctx.restore();
   ctx.setLineDash([]);
 
   if (n.note) {
