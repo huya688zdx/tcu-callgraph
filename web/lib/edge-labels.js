@@ -88,6 +88,8 @@ export function labelLayout(view = state.view) {
       items,
       pts: e.points || [],
       nodes: view.nodes,
+      others: placed,
+      otherPaths: view.edges.filter((other) => other !== e).map((other) => other.points || []),
       maxDist: LABEL_MAX_DIST,
     });
     const own = [];

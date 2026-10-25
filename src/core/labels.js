@@ -330,12 +330,9 @@ export function placeLabel({ label, size, pts = [], nodes = [], others = [], max
  * 手动拖过的（dx/dy 非零）保持用户位置。逐条避让，先放的矩形参与后者的避让。
  * items = [{label, size}]；返回同序矩形数组（null = 这条放不下）。
  */
-export function placeEdgeLabels({ items = [], pts = [], nodes = [], maxDist = LABEL_MAX_DIST } = {}) {
-  const anchor = midAnchor(pts);
-  if (!anchor) return items.map(() => null);
-  const nx = -anchor.uy;
-  const ny = anchor.ux;
-  const placed = [];
+export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [], otherPaths = [], maxDist = LABEL_MAX_DIST } = {}) {
+  const paths = privateLabelPaths(pts, otherPaths);
+  const placed = [...others];
   const out = [];
   items.forEach(({ label, size }, i) => {
     if (!label || !size) {
@@ -343,18 +340,57 @@ export function placeEdgeLabels({ items = [], pts = [], nodes = [], maxDist = LA
       return;
     }
     const manual = (label.dx || 0) !== 0 || (label.dy || 0) !== 0;
+    const path = manual ? pts : paths[0];
+    const anchor = path && midAnchor(path);
+    if (!anchor) { out.push(null); return; }
+    const nx = -anchor.uy;
+    const ny = anchor.ux;
     let probe = label;
     if (!manual) {
       // 两侧交替：沿法线偏出半个标签高 + 间隙，默认不压在线上
       const side = i % 2 === 0 ? -1 : 1;
-      const off = Math.round((size.h / 2 + 5) * side);
+      const off = Math.round(((Math.abs(anchor.ux) > 0.5 ? size.h : size.w) / 2 + 5) * side);
       probe = { ...label, dx: Math.round(nx * off), dy: Math.round(ny * off) };
     }
-    const rect = placeLabel({ label: probe, size, pts, nodes, others: placed, maxDist });
+    const rect = placeLabel({ label: probe, size, pts: path, nodes, others: placed, maxDist });
     out.push(rect);
     if (rect) placed.push(rect);
   });
   return out;
+}
+
+/** 从正交线段中减去其他边共用的部分，优先使用最长的独立分支。 */
+function privateLabelPaths(pts, otherPaths) {
+  let shared = false;
+  const paths = [];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    const axis = Math.abs(b[0] - a[0]) > Math.abs(b[1] - a[1]) ? 0 : 1;
+    const cross = 1 - axis;
+    let parts = [[Math.min(a[axis], b[axis]), Math.max(a[axis], b[axis])]];
+    for (const other of otherPaths) {
+      for (let j = 1; j < other.length; j++) {
+        const c = other[j - 1], d = other[j];
+        if (Math.abs(c[cross] - d[cross]) > 0.5 || Math.abs(c[cross] - a[cross]) > 0.5) continue;
+        const lo = Math.min(c[axis], d[axis]), hi = Math.max(c[axis], d[axis]);
+        parts = parts.flatMap(([start, end]) => {
+          const left = Math.max(start, lo), right = Math.min(end, hi);
+          if (right - left <= 0.5) return [[start, end]];
+          shared = true;
+          return [...(left > start ? [[start, left]] : []), ...(right < end ? [[right, end]] : [])];
+        });
+      }
+    }
+    for (const [lo, hi] of parts) {
+      if (hi - lo <= 0.5) continue;
+      const start = [...a], end = [...b];
+      start[axis] = b[axis] >= a[axis] ? lo : hi;
+      end[axis] = b[axis] >= a[axis] ? hi : lo;
+      paths.push([start, end]);
+    }
+  }
+  return shared ? paths.sort((a, b) => Math.hypot(...b[1].map((n, i) => n - b[0][i])) -
+    Math.hypot(...a[1].map((n, i) => n - a[0][i]))) : [pts];
 }
 
 /**

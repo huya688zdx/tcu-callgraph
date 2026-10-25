@@ -139,10 +139,18 @@ function draw() {
     for (const g of v.groups) drawGroup(ctx, g);
   }
 
+  const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
+  const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
+    : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
+  const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
+  const focusedNodes = focusedEdge ? new Set([focusedEdge.from, focusedEdge.to]) : null;
   for (const e of v.edges) {
+    if (e === focusedEdge) continue;
     const related = state.selected && (e.from === state.selected || e.to === state.selected);
-    drawEdge(ctx, e, related, state.selectedEdge === e);
+    drawEdge(ctx, e, related, false, !!focusedEdge);
   }
+  // 高亮最后画，避免共用干线上的其他边盖住它。
+  if (focusedEdge) drawEdge(ctx, focusedEdge, false, true, true);
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -172,7 +180,7 @@ function draw() {
   }
 
   const nb = neighborSet();
-  for (const n of v.nodes) drawNode(ctx, n, nb);
+  for (const n of v.nodes) drawNode(ctx, n, nb, focusedNodes);
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
   drawEdgeLabels(ctx, v);
@@ -217,7 +225,7 @@ function draw() {
       scheduleDraw();
     }
   }
-  if (state.recent) scheduleDraw();
+  if (state.recent || focusedEdge) scheduleDraw();
 
   ctx.restore();
 
@@ -292,12 +300,12 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-function drawEdge(ctx, e, related, selected) {
+function drawEdge(ctx, e, related, selected, focused = false) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = EDGE_COLOR[e.change] || EDGE_COLOR.existing;
+  const color = selected ? '#185FA5' : EDGE_COLOR[e.change] || EDGE_COLOR.existing;
   if (recentAlpha && state.recent.edges.has(edgeKey(e))) {
     ctx.save();
     ctx.beginPath();
@@ -317,11 +325,26 @@ function drawEdge(ctx, e, related, selected) {
 
   ctx.strokeStyle = color;
   ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
-  ctx.globalAlpha = state.selected && !related && !selected ? 0.26 : 1;
+  ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
   // 变量访问=虚线，函数调用=实线
   if (e.kind === 'var') ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
+
+  if (selected) {
+    ctx.save();
+    ctx.beginPath();
+    strokeRounded(ctx, pts);
+    ctx.strokeStyle = '#8BD8FF';
+    ctx.lineWidth = 3 / cam.k;
+    ctx.setLineDash([12 / cam.k, 30 / cam.k]);
+    // 负偏移让亮段沿 from → to 移动，与箭头保持同向。
+    ctx.lineDashOffset = -performance.now() * 0.08 / cam.k;
+    ctx.shadowColor = '#378ADD';
+    ctx.shadowBlur = 5;
+    ctx.stroke();
+    ctx.restore();
+  }
 
   const a = pts[pts.length - 2];
   const b = pts[pts.length - 1];
@@ -392,14 +415,15 @@ function drawEdge(ctx, e, related, selected) {
 /**
  * @param {Set<string>|null} nb 选中节点的邻接集合（draw 时统一算好传进来；为空表示没有选中）
  */
-function drawNode(ctx, n, nb = null) {
+function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
   const selected = state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
+  const edgeRelated = focusedNodes?.has(n.id);
   const dimmed =
-    state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
+    focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
 
   if (recentAlpha && state.recent.nodes.has(n.id)) {
     ctx.save();
@@ -425,10 +449,10 @@ function drawNode(ctx, n, nb = null) {
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
-  ctx.lineWidth = dropTarget ? 2.6 : selected ? 2.2 : hover ? 1.6 : 1;
+  ctx.lineWidth = dropTarget ? 2.6 : selected || edgeRelated ? 2.4 : hover ? 1.6 : 1;
   ctx.strokeStyle = dropTarget
     ? '#639922'
-    : selected
+    : selected || edgeRelated
     ? '#185FA5'
     : hover
     ? '#378ADD'

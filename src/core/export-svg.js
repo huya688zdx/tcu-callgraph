@@ -87,6 +87,8 @@ export function exportSvg(view, { title = '' } = {}) {
         items: labels.map((label) => ({ label, size: labelBoxSize(label, (t, font) => estimateTextWidth(t, font)) })),
         pts: e.points || [],
         nodes: v.nodes || [],
+        others: labelRects.map((entry) => entry.rect),
+        otherPaths: (v.edges || []).filter((other) => other !== e).map((other) => other.points || []),
       });
       labels.forEach((label, i) => {
         const rect = rects[i];

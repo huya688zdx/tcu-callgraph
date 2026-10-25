@@ -278,6 +278,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
   if (lb) {
+    const anchor = labelAnchor(lb.edge);
     state.selected = null;
     state.selectedEdge = lb.edge;
     state.selectedLabel = `${edgeKey(lb.edge)}#${lb.label.id}`;
@@ -285,8 +286,8 @@ els.cv.addEventListener('pointerdown', (e) => {
       edge: lb.edge,
       label: lb.label,
       start: worldPos(e),
-      dx: lb.label.dx || 0,
-      dy: lb.label.dy || 0,
+      dx: lb.rect.x + lb.rect.w / 2 - anchor.x,
+      dy: lb.rect.y + lb.rect.h / 2 - anchor.y,
       moved: false,
     };
     els.cv.setPointerCapture(e.pointerId);

@@ -235,3 +235,34 @@ test('placeEdgeLabels：多条标签交替放线的两侧，默认不压中线',
   // 两条不能叠住
   assert.ok(!rectsOverlap(r1, r2, 0));
 });
+
+test('placeEdgeLabels：避开共用干线，将自动标签放到独立分支（含反向汇入）', () => {
+  const own = [[0, 0], [400, 0], [400, 80], [480, 80]];
+  const peer = [[0, 0], [400, 0], [400, -80], [480, -80]];
+  for (const reverse of [false, true]) {
+    const pts = reverse ? own.toReversed() : own;
+    const other = reverse ? peer.toReversed() : peer;
+    const [rect] = placeEdgeLabels({
+      items: [{ label: { preset: 'call', text: 'コール順1', dx: 0, dy: 0 }, size: { w: 60, h: 20 } }],
+      pts, otherPaths: [other], nodes: [],
+    });
+    assert.ok(rect);
+    const near = nearestOnPolyline({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 }, pts);
+    assert.ok(near.y > 0 && near.x >= 400, '标签应附着在独立分支，而不是共用的水平干线');
+    assert.ok(near.d <= LABEL_MAX_DIST);
+  }
+});
+
+test('placeEdgeLabels：没有独立线段时不自动挤入公共线，已有手动位置保留', () => {
+  const pts = [[0, 0], [300, 0]];
+  const size = { w: 60, h: 20 };
+  const rects = placeEdgeLabels({
+    items: [
+      { label: { preset: 'call', text: '自动', dx: 0, dy: 0 }, size },
+      { label: { preset: 'task', text: '手动', dx: 30, dy: 20 }, size },
+    ], pts, otherPaths: [pts], nodes: [],
+  });
+  assert.equal(rects[0], null);
+  assert.equal(rects[1].x + rects[1].w / 2, 180);
+  assert.equal(rects[1].y + rects[1].h / 2, 20);
+});
