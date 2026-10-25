@@ -178,7 +178,12 @@ export function renderLabelPanel() {
   const sec = els.secLabel;
   const box = els.labelPanel;
   if (!sec || !box) return;
-  flushPendingSave();
+  if (state.view?.comparison) {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    pendingEdge = null;
+    pendingProjectId = null;
+  } else flushPendingSave();
   connPick = connPick && connMode === 'fixed';
 
   const edge = state.selectedEdge;
@@ -201,6 +206,12 @@ export function renderLabelPanel() {
   if (sel && labels.length && !selLabel) state.selectedLabel = `${edgeKey(edge)}#${labels[0].id}`;
 
   const head = `<div class="lbl-head">${esc(nodeName(edge.from))} → ${esc(nodeName(edge.to))}</div>`;
+
+  if (state.view?.comparison) {
+    const rows = labels.map((l) => `<div class="lbl-row"><span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span><span class="lbl-row-txt">${esc(l.note || '')}</span></div>`).join('');
+    box.innerHTML = head + (rows ? `<div class="lbl-rows">${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
+    return;
+  }
 
   // ---- 标签列表：一行一条，点击选中 ----
   const rows = labels.length

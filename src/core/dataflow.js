@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from './cparse.js';
-import { rebuildIndex } from './index.js';
+import { rebuildIndex, decodeSource } from './index.js';
 import { lex } from './lexer.js';
 import { preprocess } from './preproc.js';
 
@@ -23,16 +23,32 @@ const MAX_VARS = 16;
 const MAX_PEERS = 24;
 const MAX_NODES = 90;
 
-function decode(buf) {
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
-  } catch {
+/** 比较与数据流复用同一份逐文件宏展开口径和原始行号。 */
+export function analysisSources(model) {
+  const sources = [];
+  let failedFiles = 0;
+  for (const f of model.files) {
     try {
-      return new TextDecoder('shift_jis').decode(buf);
-    } catch {
-      return buf.toString('latin1');
+      sources.push({ ...f, src: decodeSource(fs.readFileSync(path.join(model.root, f.rel))) });
+    } catch (err) {
+      failedFiles++;
+      console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);
     }
   }
+  const headerMacros = new Map();
+  for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
+  for (const f of sources) {
+    const { tokens } = preprocess(lex(f.src, f.rel), new Map(headerMacros), f.rel, { expand: true });
+    let expanded = '', line = 1;
+    for (const tk of tokens) {
+      if (tk.line > line) expanded += '\n'.repeat(tk.line - line);
+      line = Math.max(line, tk.line);
+      expanded += `${tk.v} `;
+      line += (tk.v.match(/\n/g) || []).length;
+    }
+    f.expanded = expanded;
+  }
+  return { sources, failedFiles };
 }
 
 /** 建立全工程的变量表 + 读写索引（带缓存） */
@@ -42,7 +58,7 @@ export async function buildDataflowIndex(model) {
 
   const pending = (async () => {
     const defs = [];
-    let failedFiles = 0;
+    let { sources, failedFiles } = analysisSources(model);
     const defsByName = new Map();
     const fnAccess = new Map(); // fnId -> { writes: Map, reads: Map }
     const readers = new Map(); // varId -> Set<fnId>
@@ -59,32 +75,10 @@ export async function buildDataflowIndex(model) {
       fnsByFile.get(fn.file).push(fn);
     }
 
-    const sources = [];
-    for (const f of model.files) {
-      try {
-        sources.push({ ...f, src: decode(fs.readFileSync(path.join(model.root, f.rel))) });
-      } catch (err) {
-        failedFiles += 1;
-        console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);
-      }
-    }
-    // 与调用分析相同：继承头文件宏，各源文件的局部宏互不泄漏。
-    const headerMacros = new Map();
-    for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
-
     for (const f of sources) {
       let rec;
       try {
-        const { tokens } = preprocess(lex(f.src, f.rel), new Map(headerMacros), f.rel, { expand: true });
-        // 展开内容留在调用处的原始行，面板定位仍指向用户源码。
-        let expanded = '', line = 1;
-        for (const tk of tokens) {
-          if (tk.line > line) expanded += '\n'.repeat(tk.line - line);
-          line = Math.max(line, tk.line);
-          expanded += `${tk.v} `;
-          line += (tk.v.match(/\n/g) || []).length;
-        }
-        rec = await parseFile(path.join(model.root, f.rel), f.rel, expanded);
+        rec = await parseFile(path.join(model.root, f.rel), f.rel, f.expanded);
       } catch (err) {
         failedFiles += 1;
         console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);

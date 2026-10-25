@@ -29,6 +29,7 @@ const EDGE_ITEMS = [
 
 /** 函数节点的右键菜单：数据流分析 + 变更分类 */
 export function showNodeMenu(x, y, n) {
+  const comparing = Boolean(state.view?.comparison);
   const sections = [
     {
       id: 'locate',
@@ -37,9 +38,12 @@ export function showNodeMenu(x, y, n) {
     },
     {
       id: 'df',
-      items: [{ value: 'df', label: 'menu.dataflow' }, { value: 'callOrder', label: 'callOrder.find' }],
+      items: [
+        { value: 'df', label: 'menu.dataflow' },
+        ...(!comparing ? [{ value: 'callOrder', label: 'callOrder.find' }] : []),
+      ],
     },
-    { id: 'change', label: 'menu.change', items: CHANGE_ITEMS },
+    ...(!comparing ? [{ id: 'change', label: 'menu.change', items: CHANGE_ITEMS }] : []),
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
     if (v === 'tree:fn') return revealInTree('fn', n.id);
@@ -50,6 +54,7 @@ export function showNodeMenu(x, y, n) {
 }
 
 async function setNodeChange(n, change) {
+  if (state.view?.comparison) return;
   n.change = change;
   draw();
   await api.overlay({ nodeId: n.id, data: { change } });
@@ -57,6 +62,7 @@ async function setNodeChange(n, change) {
 }
 
 async function setEdgeChange(edge, change) {
+  if (state.view?.comparison) return;
   edge.change = change;
   fullReroute(); // 颜色变化后立即分开原先共用的线路。
   draw();

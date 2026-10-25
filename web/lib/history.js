@@ -61,7 +61,7 @@ function snapshotView() {
 }
 
 function pushHistory() {
-  if (history.frozen || !state.view) return;
+  if (history.frozen || !state.view || state.view.comparison) return;
   const snap = snapshotView();
   if (!snap) return;
   if (history.idx >= 0 && history.stack[history.idx] === snap) return;
@@ -72,6 +72,7 @@ function pushHistory() {
 }
 
 function applySnapshot(str) {
+  if (state.view?.comparison) return;
   const s = JSON.parse(str);
   const v = state.view;
   if (!v) return;
@@ -120,6 +121,7 @@ function persistLabelDiff(before) {
 }
 
 function undo() {
+  if (state.view?.comparison) return;
   if (history.idx <= 0) return;
   history.idx--;
   history.frozen = true;
@@ -128,6 +130,7 @@ function undo() {
 }
 
 function redo() {
+  if (state.view?.comparison) return;
   if (history.idx >= history.stack.length - 1) return;
   history.idx++;
   history.frozen = true;
@@ -136,6 +139,7 @@ function redo() {
 }
 
 async function saveLayout() {
+  if (state.view?.comparison) return;
   await api.layout({
     root: layoutRootKey(),
     manual: collectManual(),
@@ -148,6 +152,7 @@ function collectManual() {
 }
 
 async function addManualEdge(from, to) {
+  if (state.view?.comparison) return;
   const a = nodeById(from);
   const b = nodeById(to);
   if (!a || !b) return;

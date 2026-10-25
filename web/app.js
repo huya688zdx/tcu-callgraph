@@ -27,6 +27,7 @@ import './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
 import { restorePage } from './lib/live.js';
+import { syncComparison } from './lib/compare.js';
 
 /**
  * 加载视图
@@ -61,7 +62,9 @@ async function loadView(rootId, opts = {}) {
     previous,
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
+  if (data.error || !Array.isArray(data.nodes)) throw new Error(data.error || '视图加载失败');
   state.view = data;
+  syncComparison(data.comparison);
   state.root = data.root;
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
   state.selected = null;
@@ -172,7 +175,7 @@ async function reloadKeepCam() {
 
 async function deleteSelection() {
   const v = state.view;
-  if (!v) return;
+  if (!v || v.comparison) return;
   // 选中标签时 Delete 只删标签，不删整条连线
   if (state.selectedLabel && (await deleteSelectedLabel())) return;
   let body = null;
@@ -237,6 +240,7 @@ window.addEventListener('keydown', (e) => {
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault();
+    if (state.view?.comparison) { navigateBack(); return; }
     if (e.shiftKey) {
       redo();
     } else if (canRestoreDelete()) {

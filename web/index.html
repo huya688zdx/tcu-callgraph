@@ -482,6 +482,16 @@
     font-size: 10.5px; padding: 1px 6px; border-radius: 20px;
     background: #EAF3DE; color: #3B6D11; white-space: nowrap;
   }
+  .project-modes { display: flex; gap: 6px; padding: 10px 12px 0; }
+  .project-modes button[aria-pressed="true"] { background: #185FA5; border-color: #185FA5; color: #fff; }
+  .compare-panel { display: grid; gap: 10px; padding: 14px 12px; }
+  .compare-panel[hidden], #sessionTools[hidden] { display: none; }
+  #compareEmpty { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); color: #888780; text-align: center; pointer-events: none; }
+  .compare-row { display: grid; grid-template-columns: 100px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+  .compare-row label { font-size: 12px; color: #5F5E5A; }
+  .compare-row input { min-width: 0; height: 30px; padding: 0 9px; font: inherit; font-size: 12px; border: 1px solid rgba(0,0,0,.16); border-radius: 7px; }
+  .compare-error { color: #A32D2D; font-size: 12px; white-space: pre-wrap; }
+  #compareSummary { font-size: 12px; color: #5F5E5A; padding: 0 8px; }
 
   .ev {
     display: flex; gap: 9px; padding: 7px 9px; border-radius: 8px; cursor: pointer;
@@ -579,6 +589,8 @@
     <div class="top-row">
       <div class="brand"><span data-i18n="app.title">TCU 调用关系图 · ELK</span><small id="rootName"></small></div>
       <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
+      <span id="compareSummary" hidden></span>
+      <button id="compareExit" hidden data-i18n="compare.exit">退出比较</button>
       <div class="top-actions" aria-label="工程工具">
         <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
@@ -650,6 +662,7 @@
 
   <main>
     <canvas id="cv"></canvas>
+    <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
       <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
@@ -673,13 +686,33 @@
       <h2 data-i18n="project.title">选择工程</h2>
       <button class="modal-close" data-close="projectModal">&times;</button>
     </div>
-    <div class="modal-body" id="projectList"></div>
-    <div id="orphanBox" class="orphan-box"></div>
-    <div class="modal-foot">
-      <input id="projectPath" type="text" placeholder="或输入工程目录的绝对路径…" data-i18n-ph="project.pathPlaceholder">
-      <button id="projectOpen" class="primary" data-i18n="project.open">打开</button>
+    <div class="project-modes">
+      <button id="projectModeNormal" aria-pressed="true" data-i18n="compare.normal">普通工程</button>
+      <button id="projectModeCompare" aria-pressed="false" data-i18n="compare.mode">工程比较</button>
     </div>
-    <div class="modal-foot session-foot">
+    <div id="projectNormalPane">
+      <div class="modal-body" id="projectList"></div>
+      <div id="orphanBox" class="orphan-box"></div>
+      <div class="modal-foot">
+        <input id="projectPath" type="text" placeholder="或输入工程目录的绝对路径…" data-i18n-ph="project.pathPlaceholder">
+        <button id="projectOpen" class="primary" data-i18n="project.open">打开</button>
+      </div>
+    </div>
+    <div id="projectComparePane" class="compare-panel" hidden>
+      <div class="compare-row">
+        <label for="compareBeforePath" data-i18n="compare.before">修改前 before</label>
+        <input id="compareBeforePath" type="text" data-i18n-ph="compare.pathPlaceholder">
+        <button type="button" data-compare-browse="before" data-i18n="compare.browse">浏览</button>
+      </div>
+      <div class="compare-row">
+        <label for="compareAfterPath" data-i18n="compare.after">修改后 after</label>
+        <input id="compareAfterPath" type="text" data-i18n-ph="compare.pathPlaceholder">
+        <button type="button" data-compare-browse="after" data-i18n="compare.browse">浏览</button>
+      </div>
+      <div id="compareError" class="compare-error" role="alert"></div>
+      <div><button id="compareStart" class="primary" data-i18n="compare.start">开始比较</button></div>
+    </div>
+    <div class="modal-foot session-foot" id="sessionTools">
       <button id="sessionExport" data-i18n="session.export">导出会话</button>
       <button id="sessionImport" data-i18n="session.import">导入会话</button>
       <input type="file" id="sessionFile" accept=".cgx,application/json" hidden>

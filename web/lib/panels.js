@@ -298,7 +298,7 @@ function openTreeMenu(ev, kind, payload) {
   const items = [];
   if (kind === 'fn') {
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
-    items.push({ value: 'callOrder', label: 'callOrder.find' });
+    if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
     items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
   } else if (kind === 'file') {
@@ -481,12 +481,44 @@ function syncDetailSections(isFn) {
  */
 let detailSeq = 0;
 
+function comparisonDetail(node) {
+  const location = (side) => {
+    const values = node.locations?.[side];
+    const rows = (Array.isArray(values) ? values : values ? [values] : []).map((v) =>
+      `${v.file || ''}${v.line ? `:${v.line}` : ''}`
+    ).filter(Boolean);
+    return rows.length ? rows.join(' · ') : '—';
+  };
+  const describe = (value) => {
+    const values = Array.isArray(value) ? value : value == null ? [] : [value];
+    return values.map((v) => {
+      if (typeof v === 'string' || typeof v === 'number') return String(v);
+      return v.reason || v.text || v.name || JSON.stringify(v);
+    }).map(esc).join(' · ') || '—';
+  };
+  return `<div class="detail-meta">${t('compare.change')}: ${esc(t(`change.${node.change || 'existing'}`))}</div>
+    <div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
+    <div class="detail-meta">${t('compare.locationAfter')}: ${esc(location('after'))}</div>
+    ${node.reasons ? `<div class="detail-meta">${t('compare.reasons')}: ${describe(node.reasons)}</div>` : ''}
+    ${node.impact ? `<div class="detail-meta">${t('compare.impact')}</div>` : ''}
+    ${node.context ? `<div class="detail-meta">${t('compare.context')}</div>` : ''}`;
+}
+
 async function renderDetail(id) {
   clearDataflow();
   const my = ++detailSeq;
   const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
   const isFn = !!target && target.kind !== 'var';
   syncDetailSections(isFn);
+  if (state.view?.comparison && target?.kind === 'var') {
+    if (els.secDetail) els.secDetail.style.display = '';
+    if (els.secEdges) els.secEdges.style.display = 'none';
+    els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
+      <div class="detail-meta">${esc(target.file || '')}:${target.line || ''}</div>
+      ${comparisonDetail(target)}`;
+    els.edges.innerHTML = '';
+    return;
+  }
   if (!isFn) {
     els.detail.innerHTML = '';
     els.edges.innerHTML = '';
@@ -500,13 +532,14 @@ async function renderDetail(id) {
   const d = await api.node(id);
   if (my !== detailSeq) return; // 已经切到别的节点，丢弃这次的结果
   if (d.error) return;
-  const n = d.node;
+  const n = state.view?.comparison ? { ...d.node, ...target } : d.node;
 
   // 节点只展示身份信息：标注已经改成「连线标签」，挂在连线上而不是函数上
   els.detail.innerHTML = `
     <div class="detail-title">${esc(n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
-    <div class="detail-hint">${t('detail.hint')}</div>
+    ${state.view?.comparison ? comparisonDetail(n) : ''}
+    <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
 
   const inE = d.inEdges || [];

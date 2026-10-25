@@ -179,6 +179,26 @@ export function collectFunctions(root) {
   return map;
 }
 
+/** 完整定义文本供差分使用；每个声明符携带共用类型，避免一行多变量互相牵连。 */
+export function collectDefinitions(root) {
+  const definitions = [];
+  const other = [];
+  for (const node of fileDeclarations(root)) {
+    if (node.type === 'function_definition') {
+      definitions.push({ name: declaratorName(node.childForFieldName('declarator')), kind: 'fn', text: node.text });
+    } else if (node.type === 'declaration') {
+      const decls = node.namedChildren.filter((c) => DECL_NODES.has(c.type));
+      if (decls.some(isFunctionDeclarator)) { other.push(node.text); continue; }
+      const common = node.namedChildren.filter((c) => TYPE_NODES.has(c.type)).map((c) => c.text).join(' ');
+      for (const d of decls) definitions.push({ name: declaratorName(d), kind: 'var', text: `${common} ${d.text}`,
+        isStatic: node.children.some((c) => c.text === 'static'), isExtern: node.children.some((c) => c.text === 'extern') });
+    } else if (['type_definition', 'struct_specifier', 'enum_specifier', 'union_specifier'].includes(node.type)) {
+      other.push(node.text);
+    }
+  }
+  return { definitions, other };
+}
+
 /** 参数位置与指针/数组属性，用于绑定调用处的实参。 */
 export function collectParameters(fnNode) {
   let decl = fnNode.childForFieldName('declarator');

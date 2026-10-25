@@ -217,6 +217,7 @@ els.cv.addEventListener('contextmenu', (e) => {
   if (n) {
     selectNode(n.id);
     if (n.kind === 'var') {
+      if (state.view?.comparison) return;
       // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
       showMenu(e.clientX, e.clientY, n.name || n.id, CHANGE_ITEMS, n.change || 'existing', (v) =>
         setNodeChange(n, v)
@@ -235,6 +236,7 @@ els.cv.addEventListener('contextmenu', (e) => {
     draw();
     renderDetail(null);
     renderLabelPanel();
+    if (state.view?.comparison) return;
     showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
@@ -276,10 +278,11 @@ els.cv.addEventListener('pointerdown', (e) => {
   hideMenu();
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
+  const comparing = Boolean(state.view?.comparison);
 
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
-  if (lb) {
+  if (lb && !comparing) {
     const anchor = labelAnchor(lb.edge);
     state.selected = null;
     state.selectedEdge = lb.edge;
@@ -300,14 +303,14 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   const end = hitEnd(e);
-  if (end) {
+  if (end && !comparing) {
     state.dragEnd = { edge: state.selectedEdge, which: end, pos: worldPos(e), hover: null };
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
 
   const seg = hitSegment(e);
-  if (seg) {
+  if (seg && !comparing) {
     seg.edge.custom = true; // 从此该边折线由用户接管
     state.dragSeg = seg;
     els.cv.style.cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
@@ -340,7 +343,7 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   const n = hitTest(e);
 
-  if (n && e.shiftKey) {
+  if (n && e.shiftKey && !comparing) {
     state.linkFrom = n;
     state.linkPos = worldPos(e);
     els.cv.classList.add('linking');
@@ -473,7 +476,7 @@ els.cv.addEventListener('pointermove', (e) => {
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
-      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>`
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span>${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : `<b>${esc(title.box.label || title.box.id)}</b><br>拖动标题整体移动 · 单击居中查看<br><span style="opacity:.7">自动吸附对齐 · Shift 关闭吸附 · Esc 取消</span>`;
   } else {
     els.tooltip.style.opacity = '0';

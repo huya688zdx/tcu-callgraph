@@ -19,7 +19,7 @@ const HDR_EXT = /\.(h|hh|hpp)$/i;
  * 直接按 UTF-8 读会把注释和字符串里的日文变成乱码。
  * 同时兼容 UTF-8 BOM / UTF-16 BOM。
  */
-function decodeSource(buf) {
+export function decodeSource(buf) {
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
     return new TextDecoder('utf-8').decode(buf.subarray(3));
   }
@@ -720,7 +720,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
     const callKey = `${e.from}|${e.to}|${e.line}|${e.kind}`;
     if (seenCall.has(callKey)) return;
     seenCall.add(callKey);
-    const pairKey = `${e.from}|${e.to}`;
+    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}`;
     let m = byPair.get(pairKey);
     if (!m) {
       m = { ...e, calls: [] };

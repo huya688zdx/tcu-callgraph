@@ -24,6 +24,15 @@ ipcMain.handle('cg:save-export', (event, payload) => {
       new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的导出来源');
   return saveExport({ dialog, window: win, userData: app.getPath('userData') }, payload);
 });
+ipcMain.handle('cg:choose-directory', async (event, options = {}) => {
+  if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
+      new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的目录选择来源');
+  const r = await dialog.showOpenDialog(win, {
+    title: typeof options.title === 'string' ? options.title : '选择 C 工程目录',
+    properties: ['openDirectory'],
+  });
+  return !r.canceled && r.filePaths[0] ? r.filePaths[0] : null;
+});
 // 启动后是否自动展开工程选择面板（有多个历史工程时才有意义）
 let openPickerOnLoad = false;
 // 子进程最近输出：启动失败时贴进错误框，否则用户只看到白屏、拿不到任何线索

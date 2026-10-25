@@ -10,6 +10,14 @@ let updating = false;
 
 const relations = (res) => ['read', 'write'].flatMap((mode) =>
   res.vars.filter((v) => v.mode === mode).flatMap((v) => v.peers.map((peer) => ({ v, peer }))));
+const versionLabel = (version) => version ? t(`compare.version.${version}`) : '';
+
+function relationInView({ v, peer }, res = df.result) {
+  const ids = new Set((state.view?.nodes || []).map((n) => n.id));
+  const links = new Set((state.view?.edges || []).filter((e) => e.kind === 'var' && (!v.version || e.versions?.includes(v.version))).map((e) => `${e.from}|${e.to}`));
+  return !!res && [res.fn.id, v.id, peer.id].every((id) => ids.has(id)) &&
+    links.has(`${res.fn.id}|${v.id}`) && links.has(`${peer.id}|${v.id}`);
+}
 
 function showPanel(html) {
   document.getElementById('dataflow').innerHTML = html;
@@ -21,29 +29,28 @@ function renderResults(error = '') {
   const res = df.result;
   if (!res) return;
   const rows = relations(res);
-  const ids = new Set((state.view?.nodes || []).map((n) => n.id));
-  const links = new Set((state.view?.edges || []).filter((e) => e.kind === 'var').map((e) => `${e.from}|${e.to}`));
-  const added = ({ v, peer }) => [res.fn.id, v.id, peer.id].every((id) => ids.has(id)) &&
-    links.has(`${res.fn.id}|${v.id}`) && links.has(`${peer.id}|${v.id}`);
   const group = (mode, title) => {
     let count = 0;
     const entries = rows.map((row, index) => {
       const { v, peer } = row;
       if (v.mode !== mode) return '';
       count++;
-      const access = res.edges.find((e) => mode === 'read'
+      const access = res.edges.filter((e) => !v.version || e.version === v.version).find((e) => mode === 'read'
         ? e.from === peer.id && e.to === v.id && e.kind === 'df-write'
         : e.from === v.id && e.to === peer.id && e.kind === 'df-read');
       const line = access?.line;
-      const present = added(row);
+      const present = relationInView(row, res);
       const hash = [...v.id].reduce((value, ch) => (value * 31 + ch.charCodeAt(0)) >>> 0, 0);
       const hue = Math.round((hash * 137.508) % 360);
       const search = `${v.name} ${v.file} ${peer.name} ${peer.file}`.toLowerCase();
-      return `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${t('df.toggleHint')}">
+      const variableVersion = versionLabel(v.version);
+      const peerVersion = versionLabel(peer.version);
+      const hint = state.view?.comparison ? t('compare.addToCanvas') : t('df.toggleHint');
+      return `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
         <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
-        <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>
+        <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
         ${line ? `<span class="df-access-line">:${line}</span>` : ''}
-        <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>
+        <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
         ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
       </label>`;
     }).join('');
@@ -54,7 +61,7 @@ function renderResults(error = '') {
   };
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
-    <div class="df-actions"><button class="primary" data-df="toggle">${t('df.add')}</button>
+    <div class="df-actions"><button class="primary" data-df="toggle">${state.view?.comparison ? t('compare.addToCanvas') : t('df.add')}</button>
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -84,8 +91,9 @@ function filterResults() {
   const chosen = visible.find((label) => label.querySelector('input').checked);
   const present = chosen?.dataset.added === 'true';
   const button = panel.querySelector('[data-df="toggle"]');
-  button.disabled = updating || !chosen;
-  button.textContent = t(present ? 'df.remove' : 'df.add');
+  const comparing = Boolean(state.view?.comparison);
+  button.disabled = updating || !chosen || (comparing && present);
+  button.textContent = comparing ? t(present ? 'compare.inCanvas' : 'compare.addToCanvas') : t(present ? 'df.remove' : 'df.add');
   panel.querySelector('[data-df-total]').textContent = query ? `${visible.length}/${labels.length}` : t('df.summary', { n: labels.length });
   panel.querySelector('[data-df-empty]').hidden = !!visible.length;
 }
@@ -128,6 +136,8 @@ async function toggleSelectedRelation() {
   const query = df.query;
   const chosen = res && relations(res)[selected];
   if (updating || !chosen) return;
+  const comparing = Boolean(state.view?.comparison);
+  if (comparing && relationInView(chosen, res)) return;
   const removing = document.querySelector('#dataflow input:checked')?.closest('.df-relation').dataset.added === 'true';
   updating = true;
   const projectId = state.view?.projectId;
@@ -135,6 +145,18 @@ async function toggleSelectedRelation() {
   let roots = [...state.roots];
   let error = '';
   try {
+    if (comparing) {
+      state.vars.add(chosen.v.id);
+      state.hiddenVars.delete(chosen.v.id);
+      roots = [...new Set([...roots, res.fn.id, chosen.peer.id])];
+      await hooks.loadView(roots, { incremental: true });
+      if (state.view?.projectId !== projectId) return;
+      df.root = res.fn.id;
+      df.result = res;
+      df.selected = selected;
+      df.query = query;
+      return;
+    }
     // 只切换所选函数对该变量的引用，保留共用的函数、变量和其他引用。
     const targets = removing ? [chosen.peer.id] : [res.fn.id, chosen.peer.id];
     const records = await Promise.all(targets.map((id) => api.node(id)));

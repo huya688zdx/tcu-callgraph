@@ -21,6 +21,7 @@ const post = (url, body) =>
  */
 const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels']);
 const guardWrite = (name) => {
+  if (state.view?.comparison && WRITE_OPS.has(name)) return Promise.resolve({ ok: false, error: '比较视图仅供查看' });
   if (state.at > 0 && WRITE_OPS.has(name)) {
     document.dispatchEvent(new CustomEvent('cg:review-blocked'));
     return Promise.resolve({ ok: false, error: 'review-mode' });
@@ -42,7 +43,7 @@ export const api = {
     if (!previous) return get('/api/view?' + q);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
     return post('/api/view?' + q, { projectId: previous.projectId, previous: {
-      projectId: previous.projectId, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
+      projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points }) => ({ from, to, kind, line, change, points })),
       groups: previous.groups || [], containers: previous.containers || [],
@@ -57,6 +58,8 @@ export const api = {
   removeProject: (id) => post('/api/projects/remove', { id }),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
+  compare: (body) => post('/api/compare', body),
+  exitComparison: () => post('/api/compare/exit', {}),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */
   events: ({ limit = 50, before = 0, ops = [], q = '' } = {}) => {
     const p = new URLSearchParams({ limit: String(limit) });
