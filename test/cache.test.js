@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadModel, stats, scanSources, rebuildIndex, subgraph } from '../src/core/index.js';
 import { openStore, cacheKey } from '../src/core/store.js';
+import { buildDataflowIndex, dataflowFor } from '../src/core/dataflow.js';
+import { detectTasks } from '../src/core/detect-tasks.js';
 
 const SAMPLE = path.resolve(import.meta.dirname, '../samples/tcu');
 
@@ -89,6 +91,20 @@ test('解析缓存：_index 重建后指向同一批函数对象（不是副本�
   assert.equal(cached._index.byId.get(fn.id), fn, 'byId 必须和 functions 数组共享同一对象');
 });
 
+test('完整分析缓存保留变量读写集合，命中后无需重做 AST 分析', async (t) => {
+  const store = tmpStore(t), model = loadModel(path.resolve(import.meta.dirname, '../samples/shared-state'));
+  await buildDataflowIndex(model);
+  const before = await dataflowFor(model, 'producer.c::Sensor_Update', 'both');
+  assert.equal(store.putCachedModel('analyzed', model).cached, true);
+  const cached = rebuildIndex(store.getCachedModel('analyzed'));
+  assert.deepEqual(cached.functions, model.functions);
+  assert.deepEqual(cached.edges, model.edges);
+  assert.deepEqual(cached._df, model._df, 'Map、Set 和读写行号不能在落盘时丢失');
+  assert.equal(await buildDataflowIndex(cached), cached._df);
+  assert.deepEqual(await dataflowFor(cached, 'producer.c::Sensor_Update', 'both'), before);
+  assert.deepEqual(detectTasks(cached), detectTasks(model), '缓存不能改变调用顺序建议');
+});
+
 test('解析缓存：损坏的 blob 当作未命中并删除', (t) => {
   const store = tmpStore(t);
   const key = cacheKey(scanSources(SAMPLE));
@@ -101,13 +117,16 @@ test('解析缓存：损坏的 blob 当作未命中并删除', (t) => {
   assert.equal(Number(left.c), 0, '坏记录应被清掉');
 });
 
-test('解析缓存：超出体积上限时不缓存', (t) => {
+test('解析缓存：按压缩后的体积限制缓存', (t) => {
   const store = tmpStore(t);
   const key = cacheKey(scanSources(SAMPLE));
   const r = store.putCachedModel(key, loadModel(SAMPLE), { maxBytes: 64 });
   assert.equal(r.cached, false);
   assert.equal(r.reason, 'too-large');
   assert.equal(store.getCachedModel(key), null);
+  const large = { text: 'x'.repeat(65536) };
+  assert.equal(store.putCachedModel('compressed', large, { maxBytes: 1024 }).cached, true);
+  assert.deepEqual(store.getCachedModel('compressed'), large, '原始数据超过上限但可高效压缩时仍应复用');
 });
 
 test('解析缓存：按 created_at 只保留最近 N 份', (t) => {

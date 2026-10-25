@@ -178,6 +178,7 @@ export function renderVars() {
 // ---------------- 文件树 ----------------
 
 let treeData = null;
+const populateTreeFiles = new Map();
 
 async function loadTree() {
   try {
@@ -192,6 +193,7 @@ function renderTree() {
   const el = document.getElementById('tree');
   if (!el) return;
   el.innerHTML = '';
+  populateTreeFiles.clear();
   if (!treeData) return;
   const frag = document.createDocumentFragment();
   // 根节点就是打开的目录本身（名字由服务端给出），
@@ -206,9 +208,13 @@ function renderTree() {
 
 /** 当前勾选的所有函数 id（文件树支持多选） */
 function checkedIds() {
-  return [...document.querySelectorAll('#tree input[type=checkbox]')]
-    .filter((c) => c.checked)
-    .map((c) => c.dataset.id);
+  // 尚未展开的文件没有函数行，仍保留它们的勾选，不能把懒加载误当成取消。
+  const ids = new Set(state.roots);
+  for (const cb of document.querySelectorAll('#tree input[type=checkbox]')) {
+    if (cb.checked) ids.add(cb.dataset.id);
+    else ids.delete(cb.dataset.id);
+  }
+  return [...ids];
 }
 
 let selectTimer = null;
@@ -265,6 +271,7 @@ function flashRow(row) {
  */
 export function revealInTree(kind, id) {
   let row = null;
+  populateTreeFiles.get(kind === 'fn' ? id.split('::')[0] : id)?.();
   if (kind === 'fn') {
     row = document.querySelector(`#tree .tn.fn[data-fnid="${CSS.escape(id)}"]`);
   } else {
@@ -354,8 +361,12 @@ function buildTreeNode(node, depth) {
   kids.style.display = openByDefault ? 'block' : 'none';
   if (openByDefault && hasKids) tw.textContent = '▾';
   if (node.children) for (const c of node.children) kids.appendChild(buildTreeNode(c, depth + 1));
-  if (node.functions) {
-    for (const f of node.functions) {
+  let populated = false;
+  const populateFunctions = () => {
+    if (populated) return;
+    populated = true;
+    const selected = new Set(state.roots);
+    for (const f of node.functions || []) {
       const fr = document.createElement('div');
       fr.className = 'tn fn';
       fr.dataset.fnid = f.id;
@@ -363,6 +374,7 @@ function buildTreeNode(node, depth) {
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.dataset.id = f.id;
+      cb.checked = selected.has(f.id);
       const lab = document.createElement('span');
       lab.className = 'nm';
       lab.textContent = f.name;
@@ -374,7 +386,8 @@ function buildTreeNode(node, depth) {
       );
       kids.appendChild(fr);
     }
-  }
+  };
+  if (node.functions?.length) populateTreeFiles.set(node.path, populateFunctions);
   wrap.appendChild(kids);
 
   // 文件 / 目录行右键：定位到该文件或该目录
@@ -389,6 +402,7 @@ function buildTreeNode(node, depth) {
   row.addEventListener('click', (ev) => {
     if (ev.target.tagName === 'INPUT' || !hasKids) return;
     const open = kids.style.display !== 'none';
+    if (!open) populateFunctions();
     kids.style.display = open ? 'none' : 'block';
     tw.textContent = open ? '▸' : '▾';
   });

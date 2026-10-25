@@ -17,6 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
+import { serialize, deserialize } from 'node:v8';
 import { DatabaseSync } from 'node:sqlite';
 
 const SCHEMA_VERSION = 3;
@@ -203,6 +204,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '') {
   const h = createHash('sha1');
+  h.update('analyzed-model-v2\0');
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
@@ -210,11 +212,6 @@ export function cacheKey(files = [], focus = '') {
   if (focus) h.update(`focus\u0000${focus}\n`);
   return h.digest('hex');
 }
-
-/** Map 在 JSON 里会变成 {}，fnptrTables 的 map 字段要靠这两个函数往返 */
-const mapReplacer = (k, v) => (v instanceof Map ? { __map: [...v] } : v);
-const mapReviver = (k, v) =>
-  v && typeof v === 'object' && !Array.isArray(v) && Array.isArray(v.__map) ? new Map(v.__map) : v;
 
 const parse = (s, fallback) => {
   try {
@@ -922,8 +919,7 @@ export function openStore({ dbPath, userData } = {}) {
       const r = q.cacheGet.get(key);
       if (!r || !r.model) return null;
       try {
-        const json = gunzipSync(Buffer.from(r.model)).toString('utf8');
-        return JSON.parse(json, mapReviver);
+        return deserialize(gunzipSync(Buffer.from(r.model)));
       } catch {
         q.cacheDel.run(key);
         return null;
@@ -931,23 +927,23 @@ export function openStore({ dbPath, userData } = {}) {
     },
 
     /**
-     * 写解析缓存。超过 maxBytes 的模型不缓存——大工程的 token 数组可能有几十 MB，
-     * 塞进库里会让备份和启动都变慢，还不如每次重解析。
+     * 缓存完整分析结果，原生保留 Map / Set。按压缩后的落盘大小限制，
+     * 避免大工程仅因展开后的 token 较大就永远无法命中缓存。
      */
     putCachedModel(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
       // _index 里全是对象引用，存下来只会变成两份互不相干的副本
-      const { _index, ...plain } = model;
-      let json;
+      const { _index, _dfPending, ...plain } = model;
+      let packed;
       try {
-        json = JSON.stringify(plain, mapReplacer);
+        packed = serialize(plain);
       } catch {
         return { cached: false, reason: 'serialize' };
       }
-      if (Buffer.byteLength(json) > maxBytes) return { cached: false, reason: 'too-large', bytes: json.length };
-      const gz = gzipSync(Buffer.from(json), { level: 6 });
+      const gz = gzipSync(packed, { level: 1 });
+      if (gz.length > maxBytes) return { cached: false, reason: 'too-large', bytes: gz.length };
       q.cachePut.run(key, nowMs(), null, gz);
       q.cachePrune.run(keep);
-      return { cached: true, rawBytes: json.length, gzBytes: gz.length };
+      return { cached: true, rawBytes: packed.length, gzBytes: gz.length };
     },
 
     pruneCache(keep = 12) {

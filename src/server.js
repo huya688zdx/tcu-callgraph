@@ -162,13 +162,7 @@ async function openTarget(targetPath, { first = false } = {}) {
     rebuildIndex(model);
   } else {
     model = loadModel(abs);
-    if (key) {
-      const r = store.putCachedModel(key, model);
-      if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
-    }
   }
-  const loadMs = Date.now() - t0;
-  model.elapsedMs = loadMs;
 
   // 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
   // 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
@@ -177,6 +171,12 @@ async function openTarget(targetPath, { first = false } = {}) {
   } catch (err) {
     console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
   }
+  if (key && !fromCache && model._df) {
+    const r = store.putCachedModel(key, model);
+    if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
+  }
+  const loadMs = Date.now() - t0;
+  model.elapsedMs = loadMs;
   const st = stats(model);
   const project = store.upsertProject({
     path: abs,
