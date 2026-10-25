@@ -23,7 +23,7 @@ const SECTIONS = [
       { path: 'fill.deleted', label: '删除底色', kind: 'box' },
       { path: 'node.external', label: '外部符号底色', kind: 'box' },
       { path: 'node.border', label: '函数框描边', kind: 'line' },
-      { path: 'node.selected', label: '选中 / 悬停高亮', kind: 'line' },
+      { path: 'node.selected', label: '选中描边', kind: 'line' },
     ],
   },
   {
@@ -32,7 +32,7 @@ const SECTIONS = [
       { path: 'edge.call', label: '函数调用', kind: 'line' },
       { path: 'edge.var', label: '变量访问', kind: 'dash' },
       { path: 'edge.added', label: '新增边', kind: 'line' },
-      { path: 'edge.manual', label: '手动连线 / 拖线目标', kind: 'dash' },
+      { path: 'edge.manual', label: '手动连线预览', kind: 'dash' },
     ],
   },
   {

@@ -3,7 +3,7 @@
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
  */
 import { t } from '../i18n.js';
-import { state, cam, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
+import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
 import { labelSvg } from '/core/labels.js';
 
@@ -45,9 +45,10 @@ function buildSVG() {
   );
   out.push(`<rect x="${ox}" y="${oy}" width="${W}" height="${H}" fill="${THEME.bg}"/>`);
   out.push('<defs>');
-  // 与画布一致：边的颜色只看变更分类（新增=红，其余深色），箭头跟着同色
+  // 与画布一致：箭头跟随调用、变量访问和新增边的颜色。
   for (const [name, c] of [
     ['dark', THEME.edge.call],
+    ['var', THEME.edge.var],
     ['red', THEME.edge.added],
   ]) {
     out.push(
@@ -62,7 +63,7 @@ function buildSVG() {
       out.push(
         `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="${hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04))}" stroke="${hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08))}" stroke-width="1.4"/>`
       );
-      const fs = Math.min(22, Math.max(12, 11 / cam.k)), bh = fs * 1.4;
+      const fs = 12, bh = fs * 1.4;
       els.ctx.save(); els.ctx.font = `600 ${fs}px ${FONT}`;
       const tw = els.ctx.measureText(String(c.label)).width; els.ctx.restore();
       out.push(`<rect x="${c.x + 6}" y="${c.y + 4}" width="${tw + fs}" height="${bh}" rx="${bh / 2}" fill="${hexToRgba(THEME.container.stroke, 0.32)}" stroke="${hexToRgba(THEME.container.stroke, 0.55)}"/>`);
@@ -79,7 +80,7 @@ function buildSVG() {
         `<clipPath id="group-${index}"><rect x="${g.x}" y="${g.y}" width="${g.w}" height="${g.h}" rx="12"/></clipPath><rect x="${g.x}" y="${g.y}" width="${g.w}" height="26" fill="${hexToRgba(THEME.container.stroke, 0.5)}" clip-path="url(#group-${index})"/>`
       );
       out.push(
-        `<text x="${(g.x + 12).toFixed(1)}" y="${(g.y + 14).toFixed(1)}" dominant-baseline="middle" font-size="${Math.min(26, Math.max(12, 11 / cam.k))}" font-weight="500" fill="#0C447C">${esc(g.label)}</text>`
+        `<text x="${(g.x + 12).toFixed(1)}" y="${(g.y + 14).toFixed(1)}" dominant-baseline="middle" font-size="12" font-weight="500" fill="#0C447C">${esc(g.label)}</text>`
       );
     }
   }
@@ -91,14 +92,14 @@ function buildSVG() {
     const c = e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call;
     // 变量访问=虚线，函数调用=实线（与画布 drawEdge 相同）
     const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
-    const mk = e.change === 'added' ? 'mk-red' : 'mk-dark';
+    const mk = e.change === 'added' ? 'mk-red' : e.kind === 'var' ? 'mk-var' : 'mk-dark';
     out.push(
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash} marker-end="url(#${mk})" data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
     if (e.change === 'deleted' && e.points?.length > 1) {
       const i = Math.max(1, Math.floor(e.points.length / 2));
-      const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5 / cam.k;
-      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="#2C2C2A" stroke-width="${2.2 / cam.k}"/>`);
+      const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5;
+      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="${c}" stroke-width="2.2"/>`);
     }
   }
 
@@ -135,7 +136,7 @@ function buildSVG() {
   }
 
   // 与画布相同：标签最后绘制，使用相同的测量、避让及颜色。
-  for (const { label, rect } of labels) out.push(labelSvg(label, rect));
+  for (const { label, rect } of labels) out.push(labelSvg(label, rect, THEME.bg));
 
   out.push('</svg>');
   return out.join('\n');

@@ -135,13 +135,15 @@ export function savePage(force = false) {
 setInterval(() => savePage().catch(() => {}), 800);
 
 /** 显式链接优先；没有入口参数时恢复当前工程上次关闭前的选择。 */
-export async function restorePage(root = null) {
+export async function restorePage(root = null, isCurrent = () => true) {
   restoring = true;
   try {
+    if (!isCurrent()) return;
     let saved = null;
     if (!root) {
       try { saved = (await api.savedPage()).page; } catch { /* 首次打开或服务暂不可用，走默认入口。 */ }
     }
+    if (!isCurrent()) return; // 旧设置等待期间已有新操作，不再回填旧选择。
     if (saved) {
       Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
       state.vars = new Set(saved.vars || []);
@@ -150,8 +152,8 @@ export async function restorePage(root = null) {
       els.updepth.value = String(state.up);
       els.groupMode.checked = state.group;
     }
-    await hooks.loadView(root || saved?.roots || null, { nav: false });
-    if (saved) {
+    const view = await hooks.loadView(root || saved?.roots || null, { nav: false });
+    if (saved && view && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;
       state.ctxBox = saved.ctxBox;

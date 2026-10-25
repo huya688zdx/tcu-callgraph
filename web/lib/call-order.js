@@ -83,7 +83,7 @@ async function applySelected() {
       if (previous) previous.text = s.text;
       else labels.push({ ...makeLabel('call', edge), text: s.text });
       const result = await api.overlay({ edgeKey: s.edgeKey, data: { labels }, projectId: session.projectId });
-      if (!result?.ok) throw new Error(result?.error || t('callOrder.failed'));
+      if (!result?.ok) throw new Error(result?.error === 'review-mode' ? t('timeline.blocked') : result?.error || t('callOrder.failed'));
       if (state.view?.projectId !== session.projectId) return;
       const target = current.get(s.edgeKey);
       if (state.view === view && target) applyLabels(target, labels);

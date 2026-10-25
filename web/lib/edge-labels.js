@@ -10,8 +10,9 @@
  * state.selectedLabel 的编码是 `${edgeKey}#${id}`。
  * 连线被删 / 被过滤掉时标签自然一起消失，不需要单独清理。
  */
-import { els, state, cam, edgeKey, FONT } from './state.js';
+import { els, state, cam, edgeKey, FONT, THEME, hexToRgba } from './state.js';
 import { api } from './api.js';
+import { t } from '../i18n.js';
 import {
   LABEL_FONT,
   LABEL_NOTE_FONT,
@@ -149,7 +150,7 @@ export function drawEdgeLabels(ctx, view = state.view) {
       // 无边框预设：只给文字垫一圈画布底色，保证压在线条上也看得清，但不画框
       ctx.lineJoin = 'round';
       ctx.lineWidth = 3;
-      ctx.strokeStyle = 'rgba(247, 246, 242, 0.95)';
+      ctx.strokeStyle = hexToRgba(THEME.bg, 0.95);
       ctx.font = FONT_SPEC(LABEL_FONT);
       ctx.strokeText(labelText(label), cx, mainCy + 0.5);
     }
@@ -265,7 +266,9 @@ export function applyLabels(edge, labels) {
 
 /** 落库：labels 为 null / 空组时服务端会删掉这个键（整组清除） */
 export async function persistLabels(edge, projectId = state.view?.projectId) {
-  await api.overlay({ edgeKey: edgeKey(edge), data: { labels: edge.labels || null }, projectId });
+  if (!projectId) throw new Error('工程已切换，请刷新后重试');
+  const result = await api.overlay({ edgeKey: edgeKey(edge), data: { labels: edge.labels || null }, projectId });
+  if (!result?.ok) throw new Error(result?.error === 'review-mode' ? t('timeline.blocked') : result?.error || '保存标签失败');
   return edge.labels || null;
 }
 

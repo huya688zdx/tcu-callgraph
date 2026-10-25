@@ -423,7 +423,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     const mx = (p0[0] + p1[0]) / 2;
     const my = (p0[1] + p1[1]) / 2;
     const xs = 5 / cam.k;
-    ctx.strokeStyle = '#2C2C2A';
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2.2 / cam.k;
     ctx.setLineDash([]);
     ctx.beginPath();

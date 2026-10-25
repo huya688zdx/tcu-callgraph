@@ -86,7 +86,7 @@ export const THEME = {
     call: '#2C2C2A', // 函数调用
     var: '#2C2C2A', // 变量访问（虚线）
     added: '#D9303E', // 新增边
-    manual: '#639922', // 手动连线预览 / 拖线目标提示
+    manual: '#639922', // 手动连线预览
   },
   node: {
     border: '#3A3A36', // 函数框描边
@@ -147,8 +147,12 @@ export function setThemeColor(path, value) {
 }
 
 /** 批量应用（启动恢复 / 离线快照）：只认合法的十六进制色，缺项保持默认 */
-export function applyTheme(saved = {}) {
-  for (const [path, value] of Object.entries(saved || {})) setThemeColor(path, value);
+export function applyTheme(saved = {}, prefix = '') {
+  for (const [key, value] of Object.entries(saved || {})) {
+    const path = prefix + key;
+    if (value && typeof value === 'object') applyTheme(value, path + '.');
+    else setThemeColor(path, value);
+  }
 }
 
 const FONT = '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';

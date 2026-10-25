@@ -127,6 +127,7 @@ async function addLabel(edge, preset, num) {
 
 // ---- 自动检测 ----
 let detectResult = null; // {suggestions, inView, offView} | null
+let applyingDetect = false;
 
 async function runDetect() {
   const from = state.selectedEdge?.from;
@@ -150,28 +151,47 @@ async function runDetect() {
 
 /** 应用勾选的检测建议：并进对应连线已有的标签（同预设不重复挂） */
 async function applyDetect() {
-  if (!detectResult) return;
-  const byKey = new Map((state.view?.edges || []).map((e) => [edgeKey(e), e]));
+  const result = detectResult;
+  const view = state.view;
+  if (applyingDetect || !result || !view?.projectId) return;
+  const projectId = view.projectId;
+  const byKey = new Map(view.edges.map((e) => [edgeKey(e), e]));
   const boxes = [...els.labelPanel.querySelectorAll('.dt-check:checked')];
   let applied = 0;
-  for (const cb of boxes) {
-    const idx = Number(cb.dataset.idx);
-    const s = detectResult.inView[idx];
-    const target = s && byKey.get(s.edgeKey);
-    if (!target) continue;
-    const labels = edgeLabels(target);
-    if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
-    const label = makeLabel(s.preset, target, { num: s.num });
-    if (s.text) label.text = s.text;
-    if (s.note) label.note = s.note;
-    applyLabels(target, [...labels, label]);
-    await persistLabels(target);
-    applied++;
+  applyingDetect = true;
+  try {
+    for (const cb of boxes) {
+      if (state.view !== view) return;
+      const s = result.inView[Number(cb.dataset.idx)];
+      const target = s && byKey.get(s.edgeKey);
+      if (!target) continue;
+      const labels = edgeLabels(target);
+      if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
+      const label = makeLabel(s.preset, target, { num: s.num });
+      if (s.text) label.text = s.text;
+      if (s.note) label.note = s.note;
+      applyLabels(target, [...labels, label]);
+      try { await persistLabels(target, projectId); }
+      catch (error) { applyLabels(target, labels); throw error; }
+      applied++;
+    }
+    if (state.view !== view) return;
+    detectResult = null;
+    if (applied && hooks.reloadKeepCam) await hooks.reloadKeepCam();
+    else renderLabelPanel();
+    if (state.view?.projectId === projectId && applied) pushHistory();
+  } catch (error) {
+    if (state.view === view) {
+      draw();
+      renderLabelPanel();
+      const message = document.createElement('div');
+      message.className = 'lbl-note';
+      message.textContent = error.message;
+      els.labelPanel.appendChild(message);
+    }
+  } finally {
+    applyingDetect = false;
   }
-  detectResult = null;
-  if (applied && hooks.reloadKeepCam) await hooks.reloadKeepCam();
-  else renderLabelPanel();
-  if (applied) pushHistory();
 }
 
 export function renderLabelPanel() {

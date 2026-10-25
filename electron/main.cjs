@@ -106,6 +106,7 @@ function reportStartupFailure(code) {
   } catch {
     /* 对话框本身失败就算了，控制台里还有一份 */
   }
+  if (!win) app.quit(); // 没有窗口可重试时退出，释放单实例锁。
 }
 
 let startQueue = Promise.resolve();
@@ -163,13 +164,12 @@ async function startTargetNow(target) {
     }
   });
 
-  child.on('exit', (code) => {
+  child.on('exit', (code, signal) => {
     // 主动停（切工程 / 退出）不算失败
     if (stopping) return;
-    if (code && code !== 0) {
+    if (!ready) reportStartupFailure(code ?? signal ?? '未知');
+    else if (code && code !== 0) {
       console.error('[server] exited with', code);
-      // 只有「还没就绪就退出」才打扰用户：跑起来之后的崩溃由页面自己报
-      if (!ready) reportStartupFailure(code);
     }
   });
 }
@@ -238,11 +238,25 @@ function createWindow(url) {
     if (savingClose) return;
     savingClose = true;
     const closingWindow = win;
-    closingWindow.webContents.executeJavaScript("import('/lib/live.js').then(m => m.savePage(true))")
+    let saveTimer;
+    Promise.race([
+      closingWindow.webContents.executeJavaScript("import('/lib/live.js').then(m => m.savePage(true))"),
+      new Promise((_, reject) => {
+        saveTimer = setTimeout(() => reject(new Error('保存视图超时，本地服务可能已停止')), 5000);
+      }),
+    ])
+      .finally(() => clearTimeout(saveTimer))
       .then(() => { allowClose = true; closingWindow.close(); })
-      .catch((err) => {
+      .catch(async (err) => {
+        const { response } = await dialog.showMessageBox(closingWindow, {
+          type: 'warning', title: '当前视图未能保存',
+          message: '是否重试保存当前视图？', detail: err.message,
+          buttons: ['重试', '暂不关闭', '不保存本次视图并关闭'],
+          defaultId: 1, cancelId: 1, noLink: true,
+        });
         savingClose = false;
-        dialog.showErrorBox('当前视图未能保存', '窗口暂未关闭，请稍后重试。\n' + err.message);
+        if (response === 2) allowClose = true;
+        if (response === 0 || response === 2) closingWindow.close();
       });
   });
   win.on('closed', () => {
@@ -250,20 +264,51 @@ function createWindow(url) {
   });
 }
 
-async function pickFolder() {
+/**
+ * 选择框的打开位置：用最近一次的工程目录，别让用户每次都从默认位置重新找。
+ * 优先当前目标（切工程前就在看它），没有再翻本地库的最近记录。
+ */
+function lastProjectDir() {
+  if (currentTarget) return currentTarget;
+  const recent = readProjects(1);
+  return recent.length ? recent[0].path : null;
+}
+
+async function showFolderDialog() {
   const r = await dialog.showOpenDialog(win || undefined, {
     title: '选择 TCU 工程文件夹',
+    defaultPath: lastProjectDir() || undefined,
     properties: ['openDirectory'],
   });
-  if (!r.canceled && r.filePaths[0]) startTarget(r.filePaths[0]);
+  return r.canceled ? null : r.filePaths[0] || null;
 }
+
+async function pickFolder() {
+  const dir = await showFolderDialog();
+  if (dir) startTarget(dir);
+}
+
+// 工程面板的「打开」按钮在输入框为空时也走这里：同一个选择框、同一个默认路径
+ipcMain.handle('cg:pick-folder', async (event) => {
+  if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
+      new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的工程来源');
+  const dir = await showFolderDialog();
+  if (dir) startTarget(dir);
+  return dir;
+});
 
 ipcMain.handle('cg:open-project-folder', async (event, id) => {
   if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
       new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的工程来源');
   const project = readProjects(50).find((p) => p.id === id);
   if (!project) throw new Error('工程不在最近列表中');
-  if (fs.statSync(project.path).isFile()) shell.showItemInFolder(project.path);
+  let stat;
+  try { stat = fs.statSync(project.path); }
+  catch (error) {
+    if (error.code === 'ENOENT') throw new Error('工程路径已不存在，可移出最近列表后重新打开');
+    throw error;
+  }
+  if (stat.isFile()) shell.showItemInFolder(project.path);
   else {
     const error = await shell.openPath(project.path);
     if (error) throw new Error(error);
@@ -273,6 +318,7 @@ ipcMain.handle('cg:open-project-folder', async (event, id) => {
 async function pickFile() {
   const r = await dialog.showOpenDialog(win || undefined, {
     title: '选择 .dot / .c 文件',
+    defaultPath: lastProjectDir() || undefined,
     properties: ['openFile'],
     filters: [
       { name: 'Graphviz DOT', extensions: ['dot', 'gv'] },

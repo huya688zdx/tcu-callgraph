@@ -102,6 +102,9 @@ export const api = {
   /** 结合点编号模式：fixed=固定（新增挑空缺号）/ renumber=重排（删除后自动紧凑） */
   labelConfig: () => get('/api/labels/config'),
   setLabelConfig: (mode) => guardWrite('labels') || post('/api/labels/config', { mode }),
+  /** 界面偏好：范围下拉的向下/向上层数（全局记忆，跨重启生效） */
+  uiPrefs: () => get('/api/ui-prefs'),
+  setUiPrefs: (body) => post('/api/ui-prefs', body),
   /** 结合点重排：把算好的新编号整体写回 */
   renumberConns: (items) => guardWrite('labels') || post('/api/labels/renumber', { items }),
   /** 自动检测 task/コール順 候选（服务端扫源码，返回建议清单，应用走 overlay） */

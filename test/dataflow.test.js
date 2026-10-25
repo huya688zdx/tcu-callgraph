@@ -86,6 +86,19 @@ test('数据流口径：函数名与局部变量不进读写集合', async () =>
   }
 });
 
+test('数据流口径：退出局部代码块后恢复同名全局变量的读写', async () => {
+  const src = `int g_mode;
+void probe(void) {
+  g_mode = 1;
+  { int g_mode = 0; g_mode = 2; }
+  g_mode += 1;
+}`;
+  const rec = await parseFile('test://df-block-scope', 'scope.c', src);
+  const acc = collectAccesses(collectFunctions(rec.root).get('probe'), (name) => name === 'g_mode');
+  assert.deepEqual([...(acc.reads.get('g_mode')?.lines || [])], [5]);
+  assert.deepEqual([...acc.writes.get('g_mode').lines], [3, 5]);
+});
+
 test('数据流端到端：demo 的 App_Task10ms 写 g_tick 能连到跨函数读者', async () => {
   const model = loadModel(DEMO);
   const id = model.functions.find((f) => f.name === 'App_Task10ms').id;
@@ -200,6 +213,9 @@ test('公共变量样例：无相互调用的函数通过变量形成双向可�
     assert.deepEqual(out.vars.map((v) => v.name).sort(), ['g_index', 'g_rpm', 'g_samples']);
     assert.deepEqual(input.vars.map((v) => v.name).sort(), ['g_index', 'g_rpm', 'g_samples']);
     for (const result of [out, input]) {
+      const ids = new Set(result.nodes.map((n) => n.id));
+      assert.ok(result.nodes.some((n) => n.id === result.fn.id), '节点列表必须包含被分析函数');
+      assert.ok(result.edges.every((e) => ids.has(e.from) && ids.has(e.to)), '每条边的端点必须存在于节点列表');
       for (const v of result.vars) {
         assert.ok(result.edges.some((e) => e.from === writer && e.to === v.id && e.kind === 'df-write' && e.line > 0));
         assert.ok(result.edges.some((e) => e.from === v.id && e.to === reader && e.kind === 'df-read' && e.line > 0));
