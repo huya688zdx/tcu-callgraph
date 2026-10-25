@@ -1,6 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { routeEdges, routeOverlapConflicts } from '../src/core/routing.js';
+import { improveEdgeRoutes } from '../src/core/layout-metrics.js';
+
+test('跨层级连线下方无遮挡时，从下方出线一次转弯进入目标', () => {
+  const nodes = [
+    { id: 'source', x: 260, y: 366, w: 126, h: 44 },
+    { id: 'target', x: 1384, y: 692, w: 190, h: 44 },
+    { id: 'middle', x: 968, y: 458, w: 126, h: 44 },
+  ];
+  const edge = { from: 'source', to: 'target', kind: 'direct',
+    points: [[386, 388], [608, 388], [608, 169], [1218, 169], [1218, 714], [1384, 714]] };
+  const positions = structuredClone(nodes);
+  improveEdgeRoutes({ nodes, edges: [edge] }, [edge]);
+  assert.deepEqual(edge.points, [[323, 410], [323, 714], [1384, 714]]);
+  assert.deepEqual(nodes, positions, '简化连线不能移动节点');
+});
 
 test('小幅移动保留已有走廊，直线仅在端部补折弯且不变成手工线', () => {
   const nodes = [

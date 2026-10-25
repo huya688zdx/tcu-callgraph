@@ -201,12 +201,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     }
     const graph = graphOf(sized, edges, dir, faces, true, group, wrap);
     if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
-    const result = { ...converted(await elk.layout(graph), sized, edges), layoutDirection: dir };
-    if (!previous) {
-      const byId = new Map(result.nodes.map((n) => [n.id, n]));
-      improveEdgeRoutes(result, result.edges.filter((e) => byId.get(e.from).file !== byId.get(e.to).file));
-    }
-    return result;
+    return { ...converted(await elk.layout(graph), sized, edges), layoutDirection: dir };
   };
   let view = await generate(direction), score = previous ? 0 : quality(view);
   if (!previous) {
@@ -221,6 +216,9 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     if (Math.abs(Math.log(view.width / view.height)) > Math.log(1.8)) {
       try { consider(await generate('DOWN', true)); } catch { /* 当前图不适用 ELK 折行。 */ }
     }
+    // 先确定区块位置，再简化连线，避免局部换线反过来改变整图的布局方向。
+    const byId = new Map(view.nodes.map((n) => [n.id, n]));
+    improveEdgeRoutes(view, view.edges.filter((e) => byId.get(e.from).file !== byId.get(e.to).file));
   }
   if (!group) for (const n of view.nodes) delete n.group;
   if (group && rootLabel) {

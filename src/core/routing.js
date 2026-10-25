@@ -890,6 +890,9 @@ function routeMixedVH(e, a, b, sa, sb, ctx) {
   const d0 = DIR[sa][1];
   const skip = new Set([a.id, b.id]);
   const nodes = ctx.nodes;
+  // 先试端口延长线的交点；无遮挡时不必额外插入中间通道。
+  const simple = collapse([p0, [p0[0], p1[1]], p1]);
+  if (!pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
   const y0s = p0[1] + d0 * STUB;
   const xq = p1[0] + DIR[sb][0] * STUB; // 目标进入线（目标外侧）
 
@@ -921,6 +924,8 @@ function routeMixedHV(e, a, b, sa, sb, ctx) {
   const d0 = DIR[sa][0];
   const skip = new Set([a.id, b.id]);
   const nodes = ctx.nodes;
+  const simple = collapse([p0, [p1[0], p0[1]], p1]);
+  if (!pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
   const x0s = p0[0] + d0 * STUB;
   const yq = p1[1] + DIR[sb][1] * STUB;
 
