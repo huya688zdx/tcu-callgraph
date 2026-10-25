@@ -36,17 +36,35 @@ async function exportsFrom(page, offline = false) {
   assert.equal(await page.evaluate(`new DOMParser().parseFromString(__files[1].content,'image/svg+xml').querySelectorAll('parsererror').length`), 0,
     '导出的 SVG 是有效矢量文件');
   const files = await page.evaluate('__files');
+  const theme = await page.evaluate(`(async()=>{
+    const {THEME}=await import('${offline ? 'https://callgraph.invalid' : ''}/lib/state.js');return THEME;
+  })()`);
+  const rgb = (hex) => hex.slice(1).match(/../g).map((part) => parseInt(part, 16));
   assert.equal(files[0].name, 'tcu_main_间构成图.png');
   assert.equal(files[1].name, 'tcu_main_间构成图.svg');
-  assert.deepEqual(files[0].content, [247,246,242,255], 'PNG 底色不透明且与 GUI 一致');
-  assert.match(files[1].content, /rgba\(133,183,235,0.32\)/, 'SVG 含目录标题胶囊');
-  assert.match(files[1].content, /rgba\(181,212,244,0.5\)/, 'SVG 含文件标题底色');
-  assert.match(files[1].content, /fill="#D9303E"/, 'SVG 的新增箭头颜色正确');
-  return files;
+  assert.deepEqual(files[0].content, [...rgb(theme.bg),255], 'PNG 底色不透明且与当前主题一致');
+  const svgColors = files[1].content.replace(/\s/g, '');
+  assert.ok(svgColors.includes(`rgba(${rgb(theme.container.stroke).join(',')},0.32)`), 'SVG 目录标题跟随主题');
+  assert.ok(svgColors.includes(`rgba(${rgb(theme.container.stroke).join(',')},0.5)`), 'SVG 文件标题跟随主题');
+  const colors = await page.evaluate(`(()=>{
+    const svg=new DOMParser().parseFromString(__files[1].content,'image/svg+xml');
+    const edge=svg.querySelector('path[data-from^="var::"],path[data-to^="var::"]');
+    const marker=edge.getAttribute('marker-end').slice(5,-1);
+    return {line:edge.getAttribute('stroke'),arrow:svg.getElementById(marker).querySelector('path').getAttribute('fill'),
+      added:svg.querySelector('#mk-red path').getAttribute('fill')};
+  })()`);
+  assert.deepEqual(colors, {line:theme.edge.var,arrow:theme.edge.var,added:theme.edge.added}, '变量及新增边箭头与主题线色一致');
+  // 恢复主题会规范十六进制大小写，比较颜色语义，避免把相同颜色误报为样式差异。
+  return files.map((file) => ({ ...file, content: typeof file.content === 'string'
+    ? file.content.replace(/\b(fill|stroke)="#[0-9a-f]{6}"/gi, (value) => value.toLowerCase()) : file.content }));
 }
 try {
   gui = await launchCdp({ url: server.baseUrl, width: 1560, height: 1000 });
   await gui.waitFor('window.__cg?.view?.nodes?.length>0');
+  await gui.evaluate(`(async()=>{
+    const {setThemeColor}=await import('/lib/state.js');
+    setThemeColor('bg','#E1E8F0');setThemeColor('edge.var','#447788');
+  })()`);
   await move(gui, 'group', 0, 60);
   await gui.evaluate(`(async()=>{
     const {state}=await import('/lib/state.js'); const {renderDetail,renderVars}=await import('/lib/panels.js');

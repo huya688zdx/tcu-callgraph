@@ -106,7 +106,8 @@ export function improveEdgeRoutes(view, subset) {
       const trial = [...others, candidate], next = routeLengthAndCrossings(trial);
       if (next.crossings > metrics.crossings || next.overlapLength > metrics.overlapLength + 0.5) continue;
       const score = routeScore(trial);
-      if (score < best) { edge.points = candidate.points; best = score; metrics = next; }
+      // 坐标变换会带来浮点尾差；等价路径保留原线，避免 GUI 与离线拖动选出不同连接面。
+      if (score < best - 1e-6) { edge.points = candidate.points; best = score; metrics = next; }
     }
   }
 }

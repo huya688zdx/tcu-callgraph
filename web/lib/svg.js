@@ -45,9 +45,10 @@ function buildSVG() {
   );
   out.push(`<rect x="${ox}" y="${oy}" width="${W}" height="${H}" fill="${THEME.bg}"/>`);
   out.push('<defs>');
-  // 与画布一致：边的颜色只看变更分类（新增=红，其余深色），箭头跟着同色
+  // 与画布一致：箭头跟随调用、变量访问和新增边的颜色。
   for (const [name, c] of [
     ['dark', THEME.edge.call],
+    ['var', THEME.edge.var],
     ['red', THEME.edge.added],
   ]) {
     out.push(
@@ -91,14 +92,14 @@ function buildSVG() {
     const c = e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call;
     // 变量访问=虚线，函数调用=实线（与画布 drawEdge 相同）
     const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
-    const mk = e.change === 'added' ? 'mk-red' : 'mk-dark';
+    const mk = e.change === 'added' ? 'mk-red' : e.kind === 'var' ? 'mk-var' : 'mk-dark';
     out.push(
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash} marker-end="url(#${mk})" data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
     if (e.change === 'deleted' && e.points?.length > 1) {
       const i = Math.max(1, Math.floor(e.points.length / 2));
       const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5 / cam.k;
-      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="#2C2C2A" stroke-width="${2.2 / cam.k}"/>`);
+      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="${c}" stroke-width="${2.2 / cam.k}"/>`);
     }
   }
 
@@ -135,7 +136,7 @@ function buildSVG() {
   }
 
   // 与画布相同：标签最后绘制，使用相同的测量、避让及颜色。
-  for (const { label, rect } of labels) out.push(labelSvg(label, rect));
+  for (const { label, rect } of labels) out.push(labelSvg(label, rect, THEME.bg));
 
   out.push('</svg>');
   return out.join('\n');

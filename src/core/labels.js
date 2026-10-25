@@ -437,7 +437,7 @@ const svgEsc = (s) =>
     .replace(/'/g, '&#39;');
 
 /** 一个标签的 SVG 片段（服务端导出用；颜色已在 normalizeLabel 里限定为 #RRGGBB） */
-export function labelSvg(label, rect) {
+export function labelSvg(label, rect, background = '#F7F6F2') {
   const cx = (rect.x + rect.w / 2).toFixed(1);
   // 有说明行时主行上移，说明行垫在下面（尺寸由 labelBoxSize 算好，这里只管对位）
   const mainCy = (label.note
@@ -456,7 +456,7 @@ export function labelSvg(label, rect) {
   parts.push(
     `<text x="${cx}" y="${mainCy}" text-anchor="middle" dominant-baseline="middle" font-size="${LABEL_FONT}" font-weight="600" fill="${svgEsc(
       label.color
-    )}"${label.border ? '' : ' paint-order="stroke" stroke="#F7F6F2" stroke-width="3"'}>${text}</text>`
+    )}"${label.border ? '' : ` paint-order="stroke" stroke="${svgEsc(background)}" stroke-width="3"`}>${text}</text>`
   );
   if (label.note) {
     const noteCy = (rect.y + LABEL_PAD_Y * 2 + LABEL_FONT + LABEL_NOTE_FONT / 2).toFixed(1);

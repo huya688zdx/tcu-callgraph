@@ -61,6 +61,10 @@ async function loadView(rootId, opts = {}) {
     previous,
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
+  if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
+    console.warn(data?.error || '读取视图失败，保留当前画面');
+    return;
+  }
   state.view = data;
   state.root = data.root;
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
@@ -233,6 +237,7 @@ function canRestoreDelete() {
 }
 
 window.addEventListener('keydown', (e) => {
+  if (document.querySelector('.modal.show')) return;
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
@@ -269,12 +274,17 @@ window.addEventListener('keydown', (e) => {
 upgradeSelect(els.depth);
 upgradeSelect(els.updepth);
 
+// 范围是界面习惯：记到服务端 setting 表，重启后从 /api/ui-prefs 恢复（见启动段）
+const saveUiPrefs = () => api.setUiPrefs({ down: state.down, up: state.up }).catch(() => {});
+
 els.depth.addEventListener('change', () => {
   state.down = Number(els.depth.value);
+  saveUiPrefs();
   loadView(state.roots.length ? state.roots : state.root, { incremental: true });
 });
 els.updepth.addEventListener('change', () => {
   state.up = Number(els.updepth.value);
+  saveUiPrefs();
   loadView(state.roots.length ? state.roots : state.root, { incremental: true });
 });
 
@@ -337,8 +347,26 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 window.addEventListener('resize', resize);
 resize();
-Promise.all([loadStats(), loadTree(), loadVars()])
-  .then(() => restorePage(new URLSearchParams(location.search).get('root')));
+const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
+// 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
+// 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 3 / 0，行为同以前。
+(async () => {
+  try {
+    const p = await api.uiPrefs();
+    if (Number.isInteger(p?.down)) {
+      state.down = p.down;
+      els.depth.value = String(p.down);
+    }
+    if (Number.isInteger(p?.up)) {
+      state.up = p.up;
+      els.updepth.value = String(p.up);
+    }
+  } catch {
+    /* 服务端没有该接口或暂时不可达：用默认值 */
+  }
+  await initialPanels;
+  await restorePage(new URLSearchParams(location.search).get('root'));
+})();
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
 window.__cg = {

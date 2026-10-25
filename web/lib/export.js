@@ -1,5 +1,5 @@
 /** GUI 与离线 HTML 共用的文件命名、保存和 PNG 底色。 */
-import { state, els } from './state.js';
+import { state, els, THEME } from './state.js';
 import { api } from './api.js';
 
 export function exportName(extension, project) {
@@ -42,7 +42,7 @@ export function buildPNG() {
   const canvas = document.createElement('canvas');
   canvas.width = els.cv.width; canvas.height = els.cv.height;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#F7F6F2'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = THEME.bg; ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(els.cv, 0, 0);
   return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
 }

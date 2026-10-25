@@ -24,7 +24,9 @@ export function isModalOpen() {
 export function wireModals() {
   if (!mask) return;
   // 点遮罩空白处关闭：面板内部的点击要 stopPropagation 由调用方处理
-  mask.addEventListener('click', closeModal);
+  mask.addEventListener('click', () => {
+    if (!document.querySelector('.confirm-modal.show')) closeModal();
+  });
   document.querySelectorAll('.modal-close').forEach((b) => {
     b.addEventListener('click', (e) => {
       e.stopPropagation();

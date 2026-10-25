@@ -55,6 +55,11 @@ let pageState = null;
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
 
+// ---- 界面偏好：范围下拉（向下 / 向上层数）----
+// 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
+const DEPTH_DOWN = [1, 2, 3, 5, 9];
+const DEPTH_UP = [0, 1, 2];
+
 // ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
 const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
 function mcpAccess() {
@@ -1536,6 +1541,29 @@ const server = http.createServer(async (req, res) => {
       }
       const mode = store.getSetting('labels.conn.mode', 'fixed');
       return json(res, { mode: mode === 'renumber' ? 'renumber' : 'fixed' });
+    }
+
+    // 界面偏好：范围下拉的向下 / 向上层数。不是工程数据、不进时间轴，
+    // 回看模式下也允许改（改的只是「下次打开时的默认范围」）。
+    if (u.pathname === '/api/ui-prefs') {
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        return readJson(req, res)
+          .then((p) => {
+            const down = Number(p.down);
+            const up = Number(p.up);
+            if (!DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
+            if (!DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
+            store.setSetting('ui.depth', { down, up });
+            json(res, { ok: true, down, up });
+          })
+          .catch(() => {});
+      }
+      const saved = store.getSetting('ui.depth', null) || {};
+      return json(res, {
+        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 3,
+        up: DEPTH_UP.includes(saved.up) ? saved.up : 0,
+      });
     }
 
     // 结合点重排：items = [{edgeKey, id, num}]。前端在删除结合点后按
