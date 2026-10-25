@@ -8,6 +8,7 @@ import { hooks } from './hooks.js';
 import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
+import { findCallOrder } from './call-order.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -297,6 +298,7 @@ function openTreeMenu(ev, kind, payload) {
   const items = [];
   if (kind === 'fn') {
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
+    items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
     items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
   } else if (kind === 'file') {
@@ -311,6 +313,7 @@ function openTreeMenu(ev, kind, payload) {
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
       if (v === 'dataflow') return analyseDataflow(payload.id);
+      if (v === 'callOrder') return findCallOrder(payload.id);
       if (v === 'locate') {
         if (kind === 'fn') locateNode(payload.id);
         else locateBox(kind === 'file' ? 'file' : 'dir', payload.id, payload.fnIds || []);

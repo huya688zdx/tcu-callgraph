@@ -6,7 +6,7 @@
  *   - 编辑区：只渲染选中那条（预设切换 / 文字 / 结合点编号 / 说明行 / 边框与文字色）；
  *   - 添加区：按预设添加；结合点在「固定编号」模式下先挑编号（空缺号 + 下一号）；
  *   - 编号模式：固定 / 自动重排，重排模式下删除结合点会自动紧凑成 1..n；
- *   - 自动检测：服务端扫源码给出 TASK / コール順 建议，勾选后应用。
+ *   - 自动检测：服务端扫源码给出 TASK 建议；コール順 从函数右键查找。
  *
  * 与画布的分工不变：这里只负责表单与落库（edge-labels 的 save 系）；
  * 位置、避让、命中都在 edge-labels / core/labels 里，面板不碰几何。
@@ -141,10 +141,10 @@ async function runDetect() {
   const byKey = new Map((state.view?.edges || []).map((e) => [edgeKey(e), e]));
   const inView = [];
   const offView = [];
-  for (const s of r.suggestions || []) {
+  for (const s of (r.suggestions || []).filter((s) => s.kind === 'task')) {
     (byKey.has(s.edgeKey) ? inView : offView).push(s);
   }
-  detectResult = { suggestions: r.suggestions || [], inView, offView, skipped: r.skipped || [] };
+  detectResult = { inView, offView };
   renderLabelPanel();
 }
 
@@ -161,14 +161,6 @@ async function applyDetect() {
     if (!target) continue;
     const labels = edgeLabels(target);
     if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
-    const previous = s.preset === 'call' && labels.find((l) => l.preset === 'call');
-    if (previous) {
-      if (previous.text === s.text) continue;
-      applyLabels(target, labels.map((l) => l.id === previous.id ? { ...l, text: s.text } : l));
-      await persistLabels(target);
-      applied++;
-      continue;
-    }
     const label = makeLabel(s.preset, target, { num: s.num });
     if (s.text) label.text = s.text;
     if (s.note) label.note = s.note;
@@ -291,9 +283,8 @@ export function renderLabelPanel() {
   // ---- 自动检测 ----
   let detectArea = `<button class="lbl-add lbl-detect" id="lblDetect">${t('label.detect')}</button>`;
   if (detectResult) {
-    const skipped = (detectResult.skipped || []).map((s) => `<div class="lbl-note">${esc(s.reason)}</div>`).join('');
     if (!detectResult.inView.length && !detectResult.offView.length) {
-      detectArea += skipped || `<div class="lbl-note">${t('label.detect.none')}</div>`;
+      detectArea += `<div class="lbl-note">${t('label.detect.none')}</div>`;
     } else {
       const items = detectResult.inView
         .map(
@@ -307,7 +298,7 @@ export function renderLabelPanel() {
         .join('');
       detectArea =
         `<div class="lbl-note">${t('label.detect.title')}</div>` +
-        `<div class="dt-list">${items}</div>` + skipped +
+        `<div class="dt-list">${items}</div>` +
         (detectResult.offView.length
           ? `<div class="lbl-note">${detectResult.offView.length} ${t('label.detect.offview')}</div>`
           : '') +

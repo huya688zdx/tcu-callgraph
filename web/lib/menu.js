@@ -10,6 +10,7 @@ import { fullReroute } from './geometry.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { renderLabelPanel } from './label-panel.js';
 import { analyseDataflow } from './df.js';
+import { findCallOrder } from './call-order.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 const CHANGE_ITEMS = [
@@ -35,13 +36,14 @@ export function showNodeMenu(x, y, n) {
     },
     {
       id: 'df',
-      items: [{ value: 'df', label: 'menu.dataflow' }],
+      items: [{ value: 'df', label: 'menu.dataflow' }, { value: 'callOrder', label: 'callOrder.find' }],
     },
     { id: 'change', label: 'menu.change', items: CHANGE_ITEMS },
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
     if (v === 'tree:fn') return revealInTree('fn', n.id);
     if (v === 'df') return analyseDataflow(n.id);
+    if (v === 'callOrder') return findCallOrder(n.id);
     return setNodeChange(n, v);
   });
 }

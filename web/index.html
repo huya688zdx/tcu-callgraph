@@ -400,6 +400,16 @@
     color: #888780; cursor: pointer; padding: 0 4px;
   }
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  .call-order-row { display: grid; grid-template-columns: 18px 90px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px dashed #E8E7E1; cursor: pointer; }
+  .call-order-row input { margin: 0; }
+  .call-order-number { font-size: 12px; }
+  .call-order-target { min-width: 0; overflow-wrap: anywhere; }
+  .call-order-target b { font-weight: 500; }
+  .call-order-target small { display: block; color: #888780; font-size: 11px; margin-top: 3px; }
+  .call-order-status { color: #888780; font-size: 11px; }
+  .call-order-row.unavailable { opacity: .55; cursor: default; }
+  #callOrderMessage { color: #A32D2D; font-size: 12px; margin-left: auto; overflow-wrap: anywhere; }
+  #callOrderApply:disabled { opacity: .5; cursor: default; }
   .modal-foot {
     display: flex; gap: 8px; padding: 10px 12px;
     border-top: 1px solid rgba(0, 0, 0, 0.08); background: #FBFAF7;
@@ -643,6 +653,19 @@
       <button id="sessionImport" data-i18n="session.import">导入会话</button>
       <input type="file" id="sessionFile" accept=".cgx,application/json" hidden>
       <span class="hint" id="sessionHint"></span>
+    </div>
+  </div>
+
+  <div id="callOrderModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="callOrderTitle">
+    <div class="modal-head">
+      <h2 id="callOrderTitle" data-i18n="callOrder.title">确认コール順</h2>
+      <button class="modal-close" data-close="callOrderModal">&times;</button>
+    </div>
+    <div class="modal-body" id="callOrderList"></div>
+    <div class="modal-foot">
+      <button class="primary" id="callOrderApply" data-i18n="callOrder.apply" disabled>确认添加</button>
+      <button id="callOrderCancel" data-i18n="callOrder.cancel">取消</button>
+      <span id="callOrderMessage" role="alert"></span>
     </div>
   </div>
 
