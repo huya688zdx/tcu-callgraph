@@ -128,7 +128,7 @@ const dict = {
     'label.mode.renumber': '自动重排',
     'label.mode.hint': '固定：删除后编号不动，新增时从空缺号里挑；重排：删除后自动紧凑成 1..n',
     'label.detect': '自动检测',
-    'label.detect.title': '源码里的 TASK / コール順 线索',
+    'label.detect.title': '当前函数的 TASK / コール順 建议',
     'label.detect.apply': '应用勾选',
     'label.detect.none': '没在源码里找到任务周期 / 调用顺序线索',
     'label.detect.offview': '不在当前画面，未应用',

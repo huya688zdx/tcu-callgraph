@@ -99,5 +99,5 @@ export const api = {
   /** 结合点重排：把算好的新编号整体写回 */
   renumberConns: (items) => guardWrite('labels') || post('/api/labels/renumber', { items }),
   /** 自动检测 task/コール順 候选（服务端扫源码，返回建议清单，应用走 overlay） */
-  detectTasks: () => get('/api/detect-tasks'),
+  detectTasks: (from) => get('/api/detect-tasks' + (from ? '?from=' + encodeURIComponent(from) : '')),
 };

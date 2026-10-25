@@ -8,7 +8,7 @@
  * 1. 任务函数：名字自带周期 —— Task_10ms / xxx_100ms_Task / cyclic_5ms；
  * 2. 调度入口：ISR / Handler / main 主循环调用任务函数；
  *    「入口 → 任务」这条边挂 TASK:xx 标签；
- * 3. コール順：从任务出发按调用链先序编号，链上每条边挂 コール順n。
+ * 3. コール順：只在同一个调用者内按源码调用点编号，不进入被调函数。
  *    宏间接调用（CALL(Task_10ms)）与函数指针在解析期已还原成普通边，这里不用管。
  */
 
@@ -20,8 +20,8 @@ const TASK_NAME = /(^|_)(task|cyclic|periodic)(_|$)/i;
 const ISR_NAME = /(^|_)(isr|handler|irq|interrupt)(_|$)/i;
 
 const MAX_TASKS = 8;
-const MAX_CHAIN_EDGES = 12;
 const MAX_SUGGESTIONS = 40;
+const CALL_RANK = { direct: 3, macro: 2, fnptr: 1 };
 
 const shortName = (id) => String(id).split('::').pop();
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
@@ -34,12 +34,30 @@ function taskPeriodOf(name) {
   return { text: `TASK:${m[1]}${unit === 'µs' ? 'us' : unit}`, why: `函数名带周期 ${m[0]}` };
 }
 
+/** 嵌套实参调用不按标识符出现顺序猜执行顺序，留给用户手动标注。 */
+function hasNestedCall(tokens, calls) {
+  const names = new Set(calls.flatMap((e) => [
+    e.callee || shortName(e.to), e.macroChain?.[0], e.via?.split(' > ')[0],
+    e.kind === 'fnptr' ? e.via?.split('.').pop() : null,
+  ]).filter(Boolean));
+  const stack = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].v === '(') {
+      const call = names.has(tokens[i - 1]?.v);
+      if (call && stack.includes(true)) return true;
+      stack.push(call);
+    } else if (tokens[i].v === ')') stack.pop();
+  }
+  return false;
+}
+
 /**
  * @param {object} model 解析模型（src/core/index.js loadModel 的产物）
- * @returns {{ok:true, suggestions:Array, tasks:Array}} suggestions 按先行后序排列
+ * @param {string|null} from 只检测该调用者；为空时扫描工程
+ * @returns {{ok:true, suggestions:Array, tasks:Array, skipped:Array}} 建议按调用者及源码顺序排列
  */
-export function detectTasks(model) {
-  if (!model || !model._index) return { ok: true, suggestions: [], tasks: [] };
+export function detectTasks(model, from = null) {
+  if (!model || !model._index) return { ok: true, suggestions: [], tasks: [], skipped: [] };
   const fns = model.functions || [];
   const out = (id) => model._index.outAdj.get(id) || [];
   const byId = model._index.byId;
@@ -77,6 +95,7 @@ export function detectTasks(model) {
       callers.find((c) => !TASK_NAME.test(shortName(c.from))) ||
       callers[0];
     if (!scheduler) continue;
+    if (from && scheduler.from !== from) continue;
     const key = edgeKeyOf(scheduler);
     if (seenEdges.has(key)) continue;
     seenEdges.add(key);
@@ -93,42 +112,43 @@ export function detectTasks(model) {
     });
   }
 
-  // ---- 3. 任务调用链先序编号挂 コール順 ----
-  for (const task of tasks.slice(0, MAX_TASKS)) {
-    let order = 0;
-    let walked = 0;
-    const visit = (id, depth) => {
-      if (depth > 4 || walked > MAX_CHAIN_EDGES) return;
-      for (const e of out(id)) {
-        if (walked > MAX_CHAIN_EDGES) return;
-        walked++;
-        order++;
-        const key = edgeKeyOf(e);
-        if (!seenEdges.has(key)) {
-          seenEdges.add(key);
-          push({
-            kind: 'call',
-            preset: 'call',
-            edgeKey: key,
-            from: e.from,
-            to: e.to,
-            line: e.line,
-            text: `コール順${order}`,
-            note: '',
-            evidence: `${fileLine(e.from)} · ${shortName(task.id)} 链上第 ${order} 步`,
-          });
-        } else {
-          order--; // 已挂过的边不占序号
-        }
-        visit(e.to, depth + 1);
+  // ---- 3. 每个调用者独立编号；变量引用不属于函数调用 ----
+  const skipped = [];
+  for (const fn of fns) {
+    if (from && fn.id !== from) continue;
+    const calls = out(fn.id).filter((e) => Object.hasOwn(CALL_RANK, e.kind))
+      .sort((a, b) => a.line - b.line);
+    if (calls.length < 2) continue;
+    if (hasNestedCall(fn.bodyTokens || [], calls)) {
+      skipped.push({ from: fn.id, reason: '当前函数含嵌套实参调用，コール順 请手动标注' });
+      continue;
+    }
+    // 画布合并同一对函数的重复调用，序号也合并到同一条边上。
+    const byTarget = new Map();
+    for (const [index, e] of calls.entries()) {
+      let group = byTarget.get(e.to);
+      if (!group) {
+        group = { edge: e, orders: [] };
+        byTarget.set(e.to, group);
       }
-    };
-    visit(task.id, 0);
+      group.orders.push(index + 1);
+      // 与 subgraph 的代表边规则一致，保证建议能匹配当前画布。
+      if (CALL_RANK[e.kind] > CALL_RANK[group.edge.kind]) group.edge = e;
+    }
+    for (const { edge: e, orders } of byTarget.values()) {
+      push({
+        kind: 'call', preset: 'call', edgeKey: edgeKeyOf(e),
+        from: e.from, to: e.to, line: e.line,
+        text: `コール順${orders.join(',')}`, note: '',
+        evidence: `${fn.file}:${e.line} · ${fn.name} 内第 ${orders.join('、')} 个调用点（源码顺序，分支按条件执行）`,
+      });
+    }
   }
 
   return {
     ok: true,
     suggestions,
+    skipped,
     tasks: [...tasks, ...isrs].slice(0, MAX_TASKS * 2).map((x) => ({
       id: x.id,
       name: shortName(x.id),

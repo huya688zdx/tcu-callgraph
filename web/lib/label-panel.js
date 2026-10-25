@@ -129,7 +129,10 @@ async function addLabel(edge, preset, num) {
 let detectResult = null; // {suggestions, inView, offView} | null
 
 async function runDetect() {
-  const r = await api.detectTasks().catch(() => null);
+  const from = state.selectedEdge?.from;
+  const projectId = state.view?.projectId;
+  const r = await api.detectTasks(from).catch(() => null);
+  if (state.selectedEdge?.from !== from || state.view?.projectId !== projectId) return;
   if (!r || !r.ok) {
     detectResult = { suggestions: [], inView: [], offView: [], error: true };
     renderLabelPanel();
@@ -141,7 +144,7 @@ async function runDetect() {
   for (const s of r.suggestions || []) {
     (byKey.has(s.edgeKey) ? inView : offView).push(s);
   }
-  detectResult = { suggestions: r.suggestions || [], inView, offView };
+  detectResult = { suggestions: r.suggestions || [], inView, offView, skipped: r.skipped || [] };
   renderLabelPanel();
 }
 
@@ -158,7 +161,14 @@ async function applyDetect() {
     if (!target) continue;
     const labels = edgeLabels(target);
     if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
-    if (s.preset === 'call' && labels.some((l) => l.preset === 'call')) continue;
+    const previous = s.preset === 'call' && labels.find((l) => l.preset === 'call');
+    if (previous) {
+      if (previous.text === s.text) continue;
+      applyLabels(target, labels.map((l) => l.id === previous.id ? { ...l, text: s.text } : l));
+      await persistLabels(target);
+      applied++;
+      continue;
+    }
     const label = makeLabel(s.preset, target, { num: s.num });
     if (s.text) label.text = s.text;
     if (s.note) label.note = s.note;
@@ -281,8 +291,9 @@ export function renderLabelPanel() {
   // ---- 自动检测 ----
   let detectArea = `<button class="lbl-add lbl-detect" id="lblDetect">${t('label.detect')}</button>`;
   if (detectResult) {
+    const skipped = (detectResult.skipped || []).map((s) => `<div class="lbl-note">${esc(s.reason)}</div>`).join('');
     if (!detectResult.inView.length && !detectResult.offView.length) {
-      detectArea += `<div class="lbl-note">${t('label.detect.none')}</div>`;
+      detectArea += skipped || `<div class="lbl-note">${t('label.detect.none')}</div>`;
     } else {
       const items = detectResult.inView
         .map(
@@ -296,7 +307,7 @@ export function renderLabelPanel() {
         .join('');
       detectArea =
         `<div class="lbl-note">${t('label.detect.title')}</div>` +
-        `<div class="dt-list">${items}</div>` +
+        `<div class="dt-list">${items}</div>` + skipped +
         (detectResult.offView.length
           ? `<div class="lbl-note">${detectResult.offView.length} ${t('label.detect.offview')}</div>`
           : '') +

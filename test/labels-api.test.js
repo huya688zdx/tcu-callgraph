@@ -7,6 +7,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { launchServer } from '../scripts/lib/server.mjs';
 
 const jsonPost = (base, p, body) =>
@@ -188,6 +191,47 @@ test('自动检测：samples/tcu 找出 TASK 周期与コール順 建议', asyn
   const calls = r.suggestions.filter((s) => s.kind === 'call');
   assert.ok(tasks.some((s) => /TASK:10ms/.test(s.text)), '应从函数名认出 Task_10ms');
   assert.ok(tasks.some((s) => /TASK:100ms/.test(s.text)), '应认出 Task_100ms');
-  assert.ok(calls.length > 0, '调用链上应给出コール順建议');
+  assert.ok(calls.length > 0, '同一函数内应给出コール順建议');
   assert.ok(r.suggestions.every((s) => s.edgeKey && s.preset && s.evidence), '每条建议都带 edgeKey 与证据');
+});
+
+async function callOrderSample(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-call-order-'));
+  fs.writeFileSync(path.join(root, 'order.c'), `
+int g_state = 0;
+int Leaf(void) { return 1; }
+int Child(int value) { Leaf(); Leaf(); return value; }
+int Plain(void) { Child(1); g_state = 1; Leaf(); Child(2); return 0; }
+void Task_10ms(void) { Plain(); Leaf(); }
+void Nested(void) { Child(Leaf()); Plain(); }
+`);
+  const srv = await launchServer({ target: root });
+  t.after(async () => {
+    await srv.close();
+    assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep + 'cg-call-order-'));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return (name) => fetch(`${srv.baseUrl}/api/detect-tasks?from=order.c::${name}`).then((r) => r.json());
+}
+
+test('コール順：只编号当前函数内的调用点，同一行及重复调用不丢失，子函数单独编号', async (t) => {
+  const detect = await callOrderSample(t);
+  const plain = (await detect('Plain')).suggestions.filter((s) => s.kind === 'call');
+  assert.deepEqual(plain.map((s) => [s.to, s.text]), [
+    ['order.c::Child', 'コール順1,3'], ['order.c::Leaf', 'コール順2'],
+  ]);
+  assert.ok(plain.every((s) => s.from === 'order.c::Plain'));
+  const task = (await detect('Task_10ms')).suggestions.filter((s) => s.kind === 'call');
+  assert.deepEqual(task.map((s) => [s.to, s.text]), [
+    ['order.c::Plain', 'コール順1'], ['order.c::Leaf', 'コール順2'],
+  ]);
+  const child = (await detect('Child')).suggestions.filter((s) => s.kind === 'call');
+  assert.deepEqual(child.map((s) => s.text), ['コール順1,2']);
+});
+
+test('コール順：嵌套实参调用不强行给出线性执行顺序', async (t) => {
+  const detect = await callOrderSample(t);
+  const result = await detect('Nested');
+  assert.equal(result.suggestions.filter((s) => s.kind === 'call').length, 0);
+  assert.ok(result.skipped.some((s) => s.from === 'order.c::Nested' && s.reason.includes('嵌套')));
 });

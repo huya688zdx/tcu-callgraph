@@ -1494,7 +1494,7 @@ const server = http.createServer(async (req, res) => {
     // 自动检测 TASK / コール順：扫当前工程模型出建议清单（不落库），
     // 界面面板勾选应用 / AI 经 cg_detect_tasks 读取后自己 cg_annotate
     if (u.pathname === '/api/detect-tasks') {
-      return json(res, detectTasks(MODEL));
+      return json(res, detectTasks(MODEL, u.searchParams.get('from')));
     }
 
     // 结合点编号模式：fixed=固定（删除不前移，新增从空缺号+下一号里挑）
