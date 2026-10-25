@@ -13,7 +13,7 @@ import {
   distToSegment,
 } from './geometry.js';
 import { draw } from './render.js';
-import { stopCamAnim, focusBox, panCam } from './camera.js';
+import { stopCamAnim, focusBox, panCam, zoomCam } from './camera.js';
 import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
@@ -689,15 +689,8 @@ els.cv.addEventListener(
       else panCam(-e.deltaX * unit, -e.deltaY * unit);
       return;
     }
-    stopCamAnim();
-    const sx = e.clientX - rect.left;
-    const sy = e.clientY - rect.top;
-    const wx = (sx - cam.x) / cam.k;
-    const wy = (sy - cam.y) / cam.k;
-    cam.k = Math.min(4, Math.max(0.06, cam.k * Math.exp(-e.deltaY * 0.0014)));
-    cam.x = sx - wx * cam.k;
-    cam.y = sy - wy * cam.k;
-    draw();
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? rect.height : 1;
+    zoomCam(e.clientX - rect.left, e.clientY - rect.top, e.deltaY * unit);
   },
   { passive: false }
 );

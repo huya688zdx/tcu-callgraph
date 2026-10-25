@@ -507,9 +507,9 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
 
   const cx = x + w / 2;
 
-  if (cam.k >= 0.32) {
+  if (cam.k >= 0.2) {
     ctx.fillStyle = '#2C2C2A';
-    ctx.font = `500 12.5px ${FONT}`;
+    ctx.font = `500 ${Math.max(12.5, 8 / cam.k)}px ${FONT}`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
@@ -517,7 +517,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     let label = isVar ? n.name || n.id : `${n.name || n.id}()`;
     const maxW = w - 18;
     if (ctx.measureText(label).width > maxW) {
-      while (label.length > 4 && ctx.measureText(label + '…').width > maxW) {
+      while (label.length > 1 && ctx.measureText(label + '…').width > maxW) {
         label = label.slice(0, -1);
       }
       label += '…';

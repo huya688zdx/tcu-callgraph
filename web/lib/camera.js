@@ -18,7 +18,7 @@ function fit() {
 
 // ---------------- 视角动画 ----------------
 
-const camAnim = { on: false, pan: false, raf: 0, last: 0, t0: 0, dur: 420, from: null, to: null };
+const camAnim = { on: false, mode: 'focus', anchor: null, raf: 0, last: 0, t0: 0, dur: 420, from: null, to: null };
 
 function stopCamAnim() {
   camAnim.on = false;
@@ -30,15 +30,24 @@ function stepCam(now) {
   camAnim.raf = 0;
   if (!camAnim.on) return;
   const to = camAnim.to;
-  if (camAnim.pan) {
+  if (camAnim.mode !== 'focus') {
     // 按经过时间衰减，保持不同刷新率下的阻尼手感一致。
-    const alpha = 1 - Math.exp(-Math.max(0, now - camAnim.last) / 65);
+    const alpha = 1 - Math.exp(-Math.max(0, now - camAnim.last) / (camAnim.mode === 'zoom' ? 120 : 150));
     camAnim.last = Math.max(now, camAnim.last);
-    cam.x += (to.x - cam.x) * alpha;
-    cam.y += (to.y - cam.y) * alpha;
-    if (Math.hypot(to.x - cam.x, to.y - cam.y) < 0.1) {
+    const a = camAnim.anchor;
+    if (a) {
+      cam.k += (to.k - cam.k) * alpha;
+      // 每一帧都锁定鼠标下的世界坐标，避免缩放时画面游移。
+      cam.x = a.x - a.wx * cam.k;
+      cam.y = a.y - a.wy * cam.k;
+    } else {
+      cam.x += (to.x - cam.x) * alpha;
+      cam.y += (to.y - cam.y) * alpha;
+    }
+    if (a ? Math.abs(Math.log(to.k / cam.k)) < 0.0005 : Math.hypot(to.x - cam.x, to.y - cam.y) < 0.1) {
       cam.x = to.x;
       cam.y = to.y;
+      cam.k = to.k;
       camAnim.on = false;
     }
   } else {
@@ -57,7 +66,7 @@ function stepCam(now) {
 function animateCam(to, dur = 420) {
   stopCamAnim();
   camAnim.on = true;
-  camAnim.pan = false;
+  camAnim.mode = 'focus';
   camAnim.t0 = performance.now();
   camAnim.dur = dur;
   camAnim.from = { x: cam.x, y: cam.y, k: cam.k };
@@ -65,18 +74,32 @@ function animateCam(to, dur = 420) {
   camAnim.raf = requestAnimationFrame(stepCam);
 }
 
-/** 累积滚轮位移，放大后移动更快，缩小后移动更慢。 */
-function panCam(dx, dy) {
-  if (!camAnim.on || !camAnim.pan) {
+function beginWheel(mode) {
+  if (!camAnim.on || camAnim.mode !== mode) {
     stopCamAnim();
     camAnim.on = true;
-    camAnim.pan = true;
+    camAnim.mode = mode;
+    camAnim.anchor = null;
     camAnim.last = performance.now();
-    camAnim.to = { x: cam.x, y: cam.y };
+    camAnim.to = { ...cam };
   }
-  camAnim.to.x += dx * cam.k;
-  camAnim.to.y += dy * cam.k;
   if (!camAnim.raf) camAnim.raf = requestAnimationFrame(stepCam);
+}
+
+/** 累积滚轮位移，温和地随缩放变速，避免缩小时过慢、放大时过快。 */
+function panCam(dx, dy) {
+  beginWheel('pan');
+  camAnim.to.x += dx * Math.sqrt(cam.k);
+  camAnim.to.y += dy * Math.sqrt(cam.k);
+}
+
+/** 每格约 10% 的平滑缩放，连续滚动累积倍率，以当前鼠标位置为锚点。 */
+function zoomCam(x, y, delta) {
+  beginWheel('zoom');
+  const a = { x, y, wx: (x - cam.x) / cam.k, wy: (y - cam.y) / cam.k };
+  const k = Math.min(4, Math.max(0.06, camAnim.to.k * Math.exp(-Math.max(-160, Math.min(160, delta)) * 0.0008)));
+  camAnim.anchor = a;
+  camAnim.to = { x: x - a.wx * k, y: y - a.wy * k, k };
 }
 
 /** 把文件框 / 目录容器整体居中并适配到视野 */
@@ -107,4 +130,4 @@ function revealAdded(nodes, edges) {
     hi * k + origin > size - pad ? size - pad - hi * k : origin;
   animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k });
 }
-export { fit, stopCamAnim, stepCam, animateCam, panCam, focusBox, revealAdded };
+export { fit, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };
