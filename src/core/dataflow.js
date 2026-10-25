@@ -188,6 +188,7 @@ export async function dataflowFor(model, fnId, dir = 'out') {
     if (!n || nodes.has(n.id)) return;
     nodes.set(n.id, n);
   };
+  addNode(fnNodeOf(model, fnId));
 
   const pushEdge = (from, to, kind, via, line) => {
     const k = `${from}|${to}|${kind}|${via}`;
@@ -277,7 +278,6 @@ export async function dataflowFor(model, fnId, dir = 'out') {
     truncated = true;
   }
   const keep = new Set(list.map((n) => n.id));
-  keep.add(fnId);
 
   return {
     ok: true,

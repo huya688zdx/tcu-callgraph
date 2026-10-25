@@ -73,6 +73,12 @@ try {
     state.view.edges[0].change='added'; state.hover=null; state.flash=null; state.recent=null;
     await renderDetail(state.selected); renderVars(); (await import('/lib/render.js')).draw();
   })()`);
+  assert.equal(await gui.evaluate(`(async()=>{
+    const {state,cam}=await import('/lib/state.js'),{buildSVG}=await import('/lib/svg.js');
+    const edge=state.view.edges[0],change=edge.change,k=cam.k;edge.change='deleted';
+    cam.k=0.25;const small=buildSVG();cam.k=4;const large=buildSVG();
+    cam.k=k;edge.change=change;return small===large;
+  })()`), true, 'SVG 标题和删除标记不随画布缩放变化');
   const baseline = await gui.evaluate(geometry);
   const canvas = await gui.evaluate(`({w:cv.clientWidth,h:cv.clientHeight,png:cv.toDataURL()})`);
   const panel = await gui.evaluate(`['detail','vars','edges'].map(id=>document.getElementById(id).textContent)`);

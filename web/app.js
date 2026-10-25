@@ -96,6 +96,7 @@ async function loadView(rootId, opts = {}) {
   history.stack = [];
   history.idx = -1;
   pushHistory();
+  return data;
 }
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
@@ -124,6 +125,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async () => {
+  const seq = ++viewSeq;
   state.view = null;
   state.selected = null;
   state.selectedEdge = null;
@@ -138,7 +140,7 @@ hooks.reloadAll = async () => {
   await loadStats();
   await loadTree();
   await loadVars();
-  await restorePage();
+  await restorePage(null, () => seq === viewSeq);
 };
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
@@ -351,13 +353,14 @@ const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
 // 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
 // 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 3 / 0，行为同以前。
 (async () => {
+  const seq = viewSeq;
   try {
     const p = await api.uiPrefs();
-    if (Number.isInteger(p?.down)) {
+    if (seq === viewSeq && Number.isInteger(p?.down)) {
       state.down = p.down;
       els.depth.value = String(p.down);
     }
-    if (Number.isInteger(p?.up)) {
+    if (seq === viewSeq && Number.isInteger(p?.up)) {
       state.up = p.up;
       els.updepth.value = String(p.up);
     }
@@ -365,7 +368,7 @@ const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
     /* 服务端没有该接口或暂时不可达：用默认值 */
   }
   await initialPanels;
-  await restorePage(new URLSearchParams(location.search).get('root'));
+  await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
 })();
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）

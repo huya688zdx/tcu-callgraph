@@ -211,8 +211,8 @@ function baseIdentifier(n) {
 export function collectAccesses(fnNode, isGlobal) {
   const writes = new Map();
   const reads = new Map();
-  const locals = new Set();
-  const aliases = new Map(); // 局部指针 -> 全局变量名
+  let locals = new Set();
+  let aliases = new Map(); // 局部指针 -> 全局变量名
 
   const body = fnNode.childForFieldName('body');
   if (!body) return { writes, reads, locals };
@@ -263,6 +263,17 @@ export function collectAccesses(fnNode, isGlobal) {
   const visit = (n, mode) => {
     if (!n) return;
     switch (n.type) {
+      case 'compound_statement':
+      case 'for_statement': {
+        // 局部声明和指针别名只在当前作用域内有效，退出后恢复外层绑定。
+        const outerLocals = locals, outerAliases = aliases;
+        locals = new Set(locals);
+        aliases = new Map(aliases);
+        for (const child of n.namedChildren) visit(child, mode);
+        locals = outerLocals;
+        aliases = outerAliases;
+        return;
+      }
       case 'assignment_expression': {
         // 复合赋值（+= 之类）先读旧值再写，左值按读写；= 才是纯写
         const op = n.childForFieldName('operator')?.text;
@@ -316,6 +327,7 @@ export function collectAccesses(fnNode, isGlobal) {
           const nm = declaratorName(d);
           if (!nm) continue;
           locals.add(nm);
+          aliases.delete(nm);
           if (d.type === 'init_declarator' && d.childForFieldName('declarator')?.type === 'pointer_declarator') {
             const init = d.childForFieldName('value');
             if (init && init.type === 'pointer_expression' && init.text.trimStart().startsWith('&')) {
@@ -337,7 +349,7 @@ export function collectAccesses(fnNode, isGlobal) {
     }
   };
 
-  // 先扫一遍局部声明，避免「先使用后声明」被误判（C 里声明都在块首，问题不大）
+  // 按源码顺序访问，声明从出现位置起遮蔽外层同名变量。
   visit(body, 'read');
   return { writes, reads, locals };
 }

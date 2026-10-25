@@ -3,7 +3,7 @@
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
  */
 import { t } from '../i18n.js';
-import { state, cam, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
+import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
 import { labelSvg } from '/core/labels.js';
 
@@ -63,7 +63,7 @@ function buildSVG() {
       out.push(
         `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="${hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04))}" stroke="${hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08))}" stroke-width="1.4"/>`
       );
-      const fs = Math.min(22, Math.max(12, 11 / cam.k)), bh = fs * 1.4;
+      const fs = 12, bh = fs * 1.4;
       els.ctx.save(); els.ctx.font = `600 ${fs}px ${FONT}`;
       const tw = els.ctx.measureText(String(c.label)).width; els.ctx.restore();
       out.push(`<rect x="${c.x + 6}" y="${c.y + 4}" width="${tw + fs}" height="${bh}" rx="${bh / 2}" fill="${hexToRgba(THEME.container.stroke, 0.32)}" stroke="${hexToRgba(THEME.container.stroke, 0.55)}"/>`);
@@ -80,7 +80,7 @@ function buildSVG() {
         `<clipPath id="group-${index}"><rect x="${g.x}" y="${g.y}" width="${g.w}" height="${g.h}" rx="12"/></clipPath><rect x="${g.x}" y="${g.y}" width="${g.w}" height="26" fill="${hexToRgba(THEME.container.stroke, 0.5)}" clip-path="url(#group-${index})"/>`
       );
       out.push(
-        `<text x="${(g.x + 12).toFixed(1)}" y="${(g.y + 14).toFixed(1)}" dominant-baseline="middle" font-size="${Math.min(26, Math.max(12, 11 / cam.k))}" font-weight="500" fill="#0C447C">${esc(g.label)}</text>`
+        `<text x="${(g.x + 12).toFixed(1)}" y="${(g.y + 14).toFixed(1)}" dominant-baseline="middle" font-size="12" font-weight="500" fill="#0C447C">${esc(g.label)}</text>`
       );
     }
   }
@@ -98,8 +98,8 @@ function buildSVG() {
     );
     if (e.change === 'deleted' && e.points?.length > 1) {
       const i = Math.max(1, Math.floor(e.points.length / 2));
-      const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5 / cam.k;
-      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="${c}" stroke-width="${2.2 / cam.k}"/>`);
+      const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5;
+      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="${c}" stroke-width="2.2"/>`);
     }
   }
 

@@ -97,6 +97,7 @@ function reportStartupFailure(code) {
   } catch {
     /* 对话框本身失败就算了，控制台里还有一份 */
   }
+  if (!win) app.quit(); // 没有窗口可重试时退出，释放单实例锁。
 }
 
 let startQueue = Promise.resolve();
@@ -154,13 +155,12 @@ async function startTargetNow(target) {
     }
   });
 
-  child.on('exit', (code) => {
+  child.on('exit', (code, signal) => {
     // 主动停（切工程 / 退出）不算失败
     if (stopping) return;
-    if (code && code !== 0) {
+    if (!ready) reportStartupFailure(code ?? signal ?? '未知');
+    else if (code && code !== 0) {
       console.error('[server] exited with', code);
-      // 只有「还没就绪就退出」才打扰用户：跑起来之后的崩溃由页面自己报
-      if (!ready) reportStartupFailure(code);
     }
   });
 }
