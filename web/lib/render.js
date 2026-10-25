@@ -3,7 +3,7 @@
  * 只读 state，不修改数据（updateGroups 例外：文件框跟随节点）
  */
 import { t } from '../i18n.js';
-import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile, edgeKey } from './state.js';
+import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 
@@ -166,7 +166,7 @@ function draw() {
     ctx.beginPath();
     ctx.moveTo(a.x + a.w / 2, a.y + a.h);
     ctx.lineTo(state.linkPos.x, state.linkPos.y);
-    ctx.strokeStyle = COLORS.manual;
+    ctx.strokeStyle = THEME.edge.manual;
     ctx.lineWidth = 1.8;
     ctx.setLineDash([5, 4]);
     ctx.stroke();
@@ -180,7 +180,7 @@ function draw() {
     ctx.beginPath();
     ctx.moveTo(from[0], from[1]);
     ctx.lineTo(state.dragEnd.pos.x, state.dragEnd.pos.y);
-    ctx.strokeStyle = '#185FA5';
+    ctx.strokeStyle = THEME.node.selected;
     ctx.lineWidth = 1.6;
     ctx.setLineDash([4, 4]);
     ctx.stroke();
@@ -196,7 +196,7 @@ function draw() {
   if (state.dragBox && state.dragMoved) {
     const { box, guides } = state.dragBox;
     ctx.save();
-    ctx.strokeStyle = '#185FA5';
+    ctx.strokeStyle = THEME.node.selected;
     ctx.lineWidth = 2 / cam.k;
     roundRect(ctx, box.x - 2, box.y - 2, box.w + 4, box.h + 4, 14);
     ctx.stroke();
@@ -226,7 +226,7 @@ function draw() {
       const a = Math.min(1, left / f.dur);
       ctx.save();
       roundRect(ctx, f.box.x - 2, f.box.y - 2, f.box.w + 4, f.box.h + 4, 16);
-      ctx.strokeStyle = `rgba(24, 95, 165, ${0.9 * a})`;
+      ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.9 * a);
       ctx.lineWidth = 3 / cam.k;
       ctx.stroke();
       ctx.restore();
@@ -247,9 +247,9 @@ function draw() {
 function drawContainer(ctx, c) {
   ctx.save();
   roundRect(ctx, c.x, c.y, c.w, c.h, 14);
-  ctx.fillStyle = `rgba(230, 241, 251, ${0.16 + Math.min(0.1, c.depth * 0.04)})`;
+  ctx.fillStyle = hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
   ctx.fill();
-  ctx.strokeStyle = `rgba(107, 163, 224, ${0.55 + Math.min(0.25, c.depth * 0.08)})`;
+  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08));
   ctx.lineWidth = 1.4;
   // 层级框用实线（函数才是虚线）
   ctx.stroke();
@@ -264,9 +264,9 @@ function drawContainer(ctx, c) {
   const bx = c.x + 6;
   const by = c.y + 4;
   roundRect(ctx, bx, by, tw + padX * 2, bh, bh / 2);
-  ctx.fillStyle = 'rgba(133, 183, 235, 0.32)';
+  ctx.fillStyle = hexToRgba(THEME.container.stroke, 0.32);
   ctx.fill();
-  ctx.strokeStyle = 'rgba(107, 163, 224, 0.55)';
+  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55);
   ctx.lineWidth = 1;
   ctx.stroke();
 
@@ -280,9 +280,9 @@ function drawContainer(ctx, c) {
 function drawGroup(ctx, g) {
   ctx.save();
   roundRect(ctx, g.x, g.y, g.w, g.h, 12);
-  ctx.fillStyle = 'rgba(230, 241, 251, 0.45)';
+  ctx.fillStyle = hexToRgba(THEME.container.fill, 0.45);
   ctx.fill();
-  ctx.strokeStyle = '#B5D4F4';
+  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.6);
   ctx.lineWidth = 1.2;
   ctx.stroke();
 
@@ -290,7 +290,7 @@ function drawGroup(ctx, g) {
   ctx.save();
   roundRect(ctx, g.x, g.y, g.w, g.h, 12);
   ctx.clip();
-  ctx.fillStyle = 'rgba(181, 212, 244, 0.5)';
+  ctx.fillStyle = hexToRgba(THEME.container.stroke, 0.5);
   ctx.fillRect(g.x, g.y, g.w, hh);
   ctx.restore();
 
@@ -314,7 +314,13 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   if (!pts || pts.length < 2) return;
 
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = selected ? '#185FA5' : EDGE_COLOR[e.change] || EDGE_COLOR.existing;
+  const color = selected
+    ? THEME.node.selected
+    : e.change === 'added'
+    ? THEME.edge.added
+    : e.kind === 'var'
+    ? THEME.edge.var
+    : THEME.edge.call;
   if (recentAlpha && state.recent.edges.has(edgeKey(e))) {
     ctx.save();
     ctx.beginPath();
@@ -344,11 +350,11 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     ctx.save();
     ctx.beginPath();
     strokeRounded(ctx, pts);
-    ctx.shadowColor = '#378ADD';
+    ctx.shadowColor = THEME.node.hover;
     if (state.multiSelection) {
       // 多选用整条线的呼吸光晕，与单选的方向脉冲区分。
       const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 320);
-      ctx.strokeStyle = '#378ADD';
+      ctx.strokeStyle = THEME.node.hover;
       ctx.lineWidth = (5 + 2 * pulse) / cam.k;
       ctx.globalAlpha = 0.18 + 0.22 * pulse;
       ctx.shadowBlur = 3 + 3 * pulse;
@@ -391,7 +397,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
       ctx.rect(mx - hs, my - hs, hs * 2, hs * 2);
       ctx.fillStyle = '#ffffff';
       ctx.fill();
-      ctx.strokeStyle = '#185FA5';
+      ctx.strokeStyle = THEME.node.selected;
       ctx.lineWidth = 1.5 / cam.k;
       ctx.stroke();
     }
@@ -403,7 +409,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
       ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
       ctx.fillStyle = '#ffffff';
       ctx.fill();
-      ctx.strokeStyle = '#185FA5';
+      ctx.strokeStyle = THEME.node.selected;
       ctx.lineWidth = 2 / cam.k;
       ctx.stroke();
     }
@@ -464,8 +470,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   roundRect(ctx, x, y, w, h, 8);
   // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除）。
   const baseFill = n.external
-    ? '#FAFAF7'
-    : CHANGE_FILL[n.change] || CHANGE_FILL.existing;
+    ? THEME.node.external
+    : THEME.fill[n.change] || THEME.fill.existing;
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
@@ -473,18 +479,18 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   ctx.strokeStyle = dropTarget
     ? '#639922'
     : selected || edgeRelated
-    ? '#185FA5'
+    ? THEME.node.selected
     : hover
-    ? '#378ADD'
+    ? THEME.node.hover
     : n.external
-    ? '#D3D1C7'
-    : '#3A3A36';
+    ? THEME.node.externalBorder
+    : THEME.node.border;
   // 变量用实线框，选中时呼吸发光；函数保留流动虚线框。
   ctx.setLineDash(isVar ? [] : [5, 3]);
   if (!isVar && selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
   ctx.save();
   if (isVar && selected) {
-    ctx.shadowColor = '#378ADD';
+    ctx.shadowColor = THEME.node.hover;
     ctx.shadowBlur = 3 + 8 * (0.5 + 0.5 * Math.sin(performance.now() / 320));
   }
   ctx.stroke();

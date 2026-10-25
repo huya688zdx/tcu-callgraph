@@ -3,7 +3,7 @@
  * 事件在模块加载时一次性绑定
  */
 import { t } from '../i18n.js';
-import { els, state, cam, FONT, esc, edgeKey, CHANGE_FILL, EDGE_COLOR } from './state.js';
+import { els, state, cam, FONT, esc, edgeKey, THEME } from './state.js';
 import {
   collidesWith,
   moveNodeNoOverlap,
@@ -590,11 +590,12 @@ els.cv.addEventListener('lostpointercapture', cancelDrag);
 // 按原始样式分组，不把选中时临时覆盖的蓝色算作组件颜色。
 const nodeSelectionType = (n) => JSON.stringify([
   n.kind === 'var' ? 'var' : 'function', !!n.external,
-  (n.color || (n.external ? '#FAFAF7' : CHANGE_FILL[n.change] || CHANGE_FILL.existing)).toLowerCase(),
+  (n.color || (n.external ? THEME.node.external : THEME.fill[n.change] || THEME.fill.existing)).toLowerCase(),
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
   e.kind, e.kind === 'var' ? 'dashed' : 'solid',
-  EDGE_COLOR[e.change] || EDGE_COLOR.existing, e.change === 'deleted',
+  e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
+  e.change === 'deleted',
 ]);
 const labelSelectionType = (l) => JSON.stringify([
   l.preset, (l.border || '').toLowerCase(), (l.color || '#2C2C2A').toLowerCase(),

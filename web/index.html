@@ -427,6 +427,19 @@
 
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
+  /* 样式设置：每行 = 名称 + 与画布同款的小预览 + 取色器 */
+  .style-sec + .style-sec { border-top: 1px solid #F1EFE8; margin-top: 10px; padding-top: 6px; }
+  .style-sec h3 { margin: 4px 0 2px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
+  .style-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; cursor: pointer; }
+  .style-row .sl { flex: 1; font-size: 12.5px; }
+  .sw { flex: 0 0 auto; }
+  .sw-line { width: 30px; border-top: 3px solid #000; }
+  .sw-line.dash { border-top-style: dashed; }
+  .sw-box { width: 30px; height: 18px; border-radius: 5px; border: 1px solid rgba(0,0,0,.25); display: inline-block; }
+  .style-row input[type=color] {
+    width: 40px; height: 26px; padding: 1px 2px; border: 1px solid rgba(0,0,0,.16);
+    border-radius: 6px; background: #fff; cursor: pointer;
+  }
   .ai-hint { margin: 2px 0 10px; color: #888780; font-size: 12px; }
   .ai-level {
     display: flex; align-items: flex-start; gap: 9px;
@@ -457,6 +470,9 @@
   .proj.renaming .proj-actions { display: none; }
   /* 通用小图标按钮：28px 方块，颜色跟 currentColor，危险操作悬停变红 */
   .icon-btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 0; color: #5F5E5A;
+  }
   .icon-btn svg { display: block; }
   .icon-btn:hover { background: #F1EFE8; color: #2C2C2A; }
   .icon-btn.ok { color: #639922; }
@@ -575,6 +591,7 @@
             <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
           </div>
         </details>
+        <button id="styleBtn" data-i18n="btn.style" title="调整画布、连线与函数框的颜色样式">样式</button>
         <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
         <details class="tool-menu" id="helpMenu">
           <summary data-i18n="toolbar.help">操作说明</summary>
@@ -634,6 +651,10 @@
   <main>
     <canvas id="cv"></canvas>
     <div id="legend">
+      <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
+      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
+      <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
+      <span><i id="lg-del" style="border-color:#2C2C2A"></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>
     <div id="ctxMenu" class="ctx-menu"></div>
@@ -663,6 +684,18 @@
       <button id="sessionImport" data-i18n="session.import">导入会话</button>
       <input type="file" id="sessionFile" accept=".cgx,application/json" hidden>
       <span class="hint" id="sessionHint"></span>
+    </div>
+  </div>
+
+  <div id="styleModal" class="modal">
+    <div class="modal-head">
+      <h2 data-i18n="style.title">样式设置</h2>
+      <button class="modal-close" data-close="styleModal">&times;</button>
+    </div>
+    <div class="modal-body" id="styleBody"></div>
+    <div class="modal-foot">
+      <span class="hint" data-i18n="style.hint">改动即时生效，自动保存到本机</span>
+      <button id="styleReset" data-i18n="style.reset">恢复默认</button>
     </div>
   </div>
 

@@ -15,6 +15,8 @@ import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
 import { buildStandaloneHtml } from './lib/html.js';
 import { upgradeSelect } from './lib/ui-select.js';
+// 样式设置面板：恢复已存主题并接好「样式」按钮，纯副作用导入
+import './lib/appearance.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
 import './lib/interact.js';
 import { clearDataflow } from './lib/df.js';

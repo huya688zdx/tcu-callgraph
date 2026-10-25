@@ -1,5 +1,5 @@
 /** 离线查看器：绘图、节点/层级拖动和折线路由直接使用 GUI 模块。 */
-import { state, cam, els } from './state.js';
+import { state, cam, els, applyTheme } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { resize } from './render.js';
@@ -11,6 +11,8 @@ import { buildPNG, saveExport } from './export.js';
 import './interact.js';
 
 const saved = window.__EXPORT.snapshot;
+// 导出时的主题色先落回 THEME，离线页与原界面所见一致（file:// 下没有原 localStorage）
+applyTheme(saved.theme);
 state.view = saved.view;
 state.root = saved.view.root;
 state.roots = saved.view.roots || [state.root];

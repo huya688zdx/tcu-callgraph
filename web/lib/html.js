@@ -1,12 +1,13 @@
 /** 独立 HTML 导出：携带当前几何、详情数据与 GUI 原有模块，离线复用同一套绘制和交互。 */
-import { state, cam, els, esc } from './state.js';
+import { state, cam, els, esc, THEME } from './state.js';
 import { api } from './api.js';
 
 export async function buildStandaloneHtml() {
   const view = structuredClone(state.view);
   const snapshot = { view, cam: { ...cam }, width: els.cv.clientWidth, height: els.cv.clientHeight,
     selected: state.selected, ctxBox: state.ctxBox && { ...state.ctxBox },
-    vars: [...state.vars], hiddenVars: [...state.hiddenVars] };
+    vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+    theme: structuredClone(THEME) };
   const right = document.getElementById('right').cloneNode(true);
   right.removeAttribute('data-mode');
   right.querySelector('#secLabel')?.remove();

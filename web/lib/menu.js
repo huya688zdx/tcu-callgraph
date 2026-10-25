@@ -1,7 +1,7 @@
 /**
  * 右键菜单：变更分类标记、连线状态、选中
  */
-import { state, edgeKey, CHANGE_FILL, EDGE_COLOR } from './state.js';
+import { state, edgeKey, THEME } from './state.js';
 import { hideMenu, showMenu, showMenuSections } from './ctxmenu.js';
 import { api } from './api.js';
 import { draw } from './render.js';
@@ -13,17 +13,18 @@ import { analyseDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
+// 色块用 getter 在菜单打开时现读 THEME：样式面板改色后菜单立即跟上
 const CHANGE_ITEMS = [
-  { value: 'existing', label: 'change.existing', color: CHANGE_FILL.existing },
-  { value: 'modified', label: 'change.modified', color: CHANGE_FILL.modified },
-  { value: 'added', label: 'change.added', color: CHANGE_FILL.added },
-  { value: 'deleted', label: 'change.deleted', color: CHANGE_FILL.deleted },
+  { value: 'existing', label: 'change.existing', get color() { return THEME.fill.existing; } },
+  { value: 'modified', label: 'change.modified', get color() { return THEME.fill.modified; } },
+  { value: 'added', label: 'change.added', get color() { return THEME.fill.added; } },
+  { value: 'deleted', label: 'change.deleted', get color() { return THEME.fill.deleted; } },
 ];
 
 const EDGE_ITEMS = [
-  { value: 'existing', label: 'edgeState.existing', color: EDGE_COLOR.existing },
-  { value: 'added', label: 'edgeState.added', color: EDGE_COLOR.added },
-  { value: 'deleted', label: 'edgeState.deleted', color: EDGE_COLOR.existing },
+  { value: 'existing', label: 'edgeState.existing', get color() { return THEME.edge.call; } },
+  { value: 'added', label: 'edgeState.added', get color() { return THEME.edge.added; } },
+  { value: 'deleted', label: 'edgeState.deleted', get color() { return THEME.edge.call; } },
 ];
 
 /** 函数节点的右键菜单：数据流分析 + 变更分类 */

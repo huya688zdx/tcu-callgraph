@@ -74,28 +74,82 @@ const cam = { x: 0, y: 0, k: 1 };
 /** 最近的删除记录栈，Ctrl+Z 可以逐次恢复 */
 const deleteStack = [];
 
-const COLORS = {
-  direct: '#9A9890',
-  macro: '#D85A30',
-  fnptr: '#7F77DD',
-  manual: '#639922',
-  unknown: '#C9C7BE',
+/**
+ * 主题色：样式设置面板（appearance.js）直接改这里的值，改完 draw() 即生效。
+ * 画布 render.js、图例、SVG 导出、离线导出全部读这一份，保证所见即所得。
+ * 新增可调颜色时：这里加默认值 + appearance.js 的 SECTIONS 加一行。
+ */
+export const THEME = {
+  /** 画布背景（body 背景 + 导出底色） */
+  bg: '#F7F6F2',
+  edge: {
+    call: '#2C2C2A', // 函数调用
+    var: '#2C2C2A', // 变量访问（虚线）
+    added: '#D9303E', // 新增边
+    manual: '#639922', // 手动连线预览 / 拖线目标提示
+  },
+  node: {
+    border: '#3A3A36', // 函数框描边
+    externalBorder: '#D3D1C7', // 外部符号描边
+    external: '#FAFAF7', // 外部符号底色
+    selected: '#185FA5', // 选中高亮
+    hover: '#378ADD', // 悬停高亮
+  },
+  /** 变更分类底色：既存 / 变更 / 追加 / 删除（画布右键分类菜单与图例同源） */
+  fill: {
+    existing: '#CCFFCC',
+    modified: '#FFFF99',
+    added: '#FFCCFF',
+    deleted: '#BFBFBF',
+  },
+  /** 分组容器 / 手动分组框的底色与描边（画布按深度加透明度） */
+  container: {
+    fill: '#E6F1FB',
+    stroke: '#6BA3E0',
+  },
 };
 
-/** 函数框背景色：既存 / 変更 / 追加 / 削除 */
-const CHANGE_FILL = {
-  existing: '#CCFFCC',
-  modified: '#FFFF99',
-  added: '#FFCCFF',
-  deleted: '#BFBFBF',
-};
+const isHexColor = (v) => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
 
-/** 连线颜色：原有黑、新增红（删除沿用原色，另加 X 标记） */
-const EDGE_COLOR = {
-  existing: '#2C2C2A',
-  added: '#D9303E',
-  deleted: '#2C2C2A',
-};
+/** #RRGGBB → rgba(r,g,b,a)（容器按深度叠透明度用） */
+export function hexToRgba(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+
+/** THEME 里的图例小色块与页面背景，改主题后同步一次 */
+function syncThemeSideEffects() {
+  document.body.style.background = THEME.bg;
+  const chip = (id, c) => {
+    const el = document.getElementById(id);
+    if (el) el.style.borderTopColor = c;
+  };
+  chip('lg-call', THEME.edge.call);
+  chip('lg-var', THEME.edge.var);
+  chip('lg-added', THEME.edge.added);
+  chip('lg-del', THEME.edge.call); // 删除边沿用调用色，只加 X 标记
+}
+
+/** 设置单个颜色（'fill.existing' 这类路径）。非法值拒绝，返回是否成功 */
+export function setThemeColor(path, value) {
+  if (!isHexColor(value)) return false;
+  const keys = path.split('.');
+  let obj = THEME;
+  for (let i = 0; i < keys.length - 1; i++) {
+    obj = obj[keys[i]];
+    if (!obj || typeof obj !== 'object') return false;
+  }
+  const last = keys[keys.length - 1];
+  if (typeof obj[last] !== 'string') return false;
+  obj[last] = value.toLowerCase();
+  syncThemeSideEffects();
+  return true;
+}
+
+/** 批量应用（启动恢复 / 离线快照）：只认合法的十六进制色，缺项保持默认 */
+export function applyTheme(saved = {}) {
+  for (const [path, value] of Object.entries(saved || {})) setThemeColor(path, value);
+}
 
 const FONT = '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
 
@@ -121,9 +175,6 @@ export {
   state,
   cam,
   deleteStack,
-  COLORS,
-  CHANGE_FILL,
-  EDGE_COLOR,
   FONT,
   shortFile,
   esc,
