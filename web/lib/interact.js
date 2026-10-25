@@ -211,6 +211,7 @@ function hitBox(e) {
 els.cv.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!state.view) return;
+  if (state.multiSelection) { state.multiSelection = null; draw(); }
 
   const n = hitTest(e);
   if (n) {
@@ -271,6 +272,7 @@ els.cv.addEventListener('contextmenu', (e) => {
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  if (state.multiSelection) { state.multiSelection = null; draw(); }
   hideMenu();
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
@@ -585,10 +587,34 @@ els.cv.addEventListener('pointerup', (e) => {
 els.cv.addEventListener('pointercancel', cancelDrag);
 els.cv.addEventListener('lostpointercapture', cancelDrag);
 document.addEventListener('keydown', (e) => {
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'a') {
+    e.preventDefault();
+    window.getSelection()?.removeAllRanges();
+    if (!state.view || document.querySelector('.modal.show') || state.dragBox || state.dragNode || state.dragLabel || state.dragSeg || state.dragEnd) return;
+    const anchor = state.selectedLabel || state.selectedEdge || state.selected;
+    if (!anchor) return;
+    const node = state.view.nodes.find((n) => n.id === state.selected);
+    const kind = state.selectedLabel ? 'label' : state.selectedEdge ? 'edge' : node ? (node.kind === 'var' ? 'var' : 'function') : null;
+    if (kind) {
+      state.multiSelection = { kind, anchor, view: state.view };
+      draw();
+    }
+    return;
+  }
   if (e.key === 'Escape' && state.dragBox) {
     e.preventDefault();
     e.stopImmediatePropagation();
     cancelDrag();
+  } else if (state.multiSelection && !document.querySelector('.modal.show')) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      selectNode(null);
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      // 全选只用于查看；避免旧的单选删除逻辑误删其中一个组件。
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
   }
 }, true);
 

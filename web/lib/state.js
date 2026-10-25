@@ -47,6 +47,8 @@ const state = {
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
   selectedLabel: null,
+  /** Ctrl+A 按当前组件类型全选；重新点选或换视图时清除。 */
+  multiSelection: null,
   dragSeg: null,
   dragEnd: null,
   dragNode: null,

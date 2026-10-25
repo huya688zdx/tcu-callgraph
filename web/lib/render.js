@@ -5,7 +5,7 @@
 import { t } from '../i18n.js';
 import { els, state, cam, COLORS, CHANGE_FILL, EDGE_COLOR, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
-import { drawEdgeLabels } from './edge-labels.js';
+import { drawEdgeLabels, edgeLabels } from './edge-labels.js';
 
 /**
  * 下一帧重绘（去重）。
@@ -108,6 +108,10 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
+  if (state.multiSelection && (state.multiSelection.view !== v ||
+      state.multiSelection.anchor !== (state.selectedLabel || state.selectedEdge || state.selected))) {
+    state.multiSelection = null;
+  }
   document.body.setAttribute(
     'data-draw',
     v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
@@ -143,14 +147,20 @@ function draw() {
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
   const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
-  const focusedNodes = focusedEdge ? new Set([focusedEdge.from, focusedEdge.to]) : null;
+  const kind = state.multiSelection?.kind;
+  const focusedEdges = new Set(kind === 'edge' ? v.edges : kind === 'label'
+    ? v.edges.filter((e) => edgeLabels(e).length) : focusedEdge ? [focusedEdge] : []);
+  const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
+  const selectedNodes = kind === 'function' || kind === 'var'
+    ? new Set(v.nodes.filter((n) => (n.kind === 'var') === (kind === 'var')).map((n) => n.id)) : null;
   for (const e of v.edges) {
-    if (e === focusedEdge) continue;
-    const related = state.selected && (e.from === state.selected || e.to === state.selected);
-    drawEdge(ctx, e, related, false, !!focusedEdge);
+    if (focusedEdges.has(e)) continue;
+    const related = selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
+      : state.selected && (e.from === state.selected || e.to === state.selected);
+    drawEdge(ctx, e, related, false, !!focusedEdges.size);
   }
   // 高亮最后画，避免共用干线上的其他边盖住它。
-  if (focusedEdge) drawEdge(ctx, focusedEdge, false, true, true);
+  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true);
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -225,7 +235,7 @@ function draw() {
       scheduleDraw();
     }
   }
-  if (state.recent || focusedEdge) scheduleDraw();
+  if (state.recent || focusedEdges.size || state.multiSelection) scheduleDraw();
 
   ctx.restore();
 
@@ -362,7 +372,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.fillStyle = color;
   ctx.fill();
 
-  if (selected) {
+  if (selected && !state.multiSelection) {
     // 中间线段手柄（拖动可调整该段的走向，保持正交）
     const hs = 4.5 / cam.k;
     for (let i = 1; i <= pts.length - 3; i++) {
@@ -418,12 +428,14 @@ function drawEdge(ctx, e, related, selected, focused = false) {
 function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
-  const selected = state.selected === n.id;
+  const kind = state.multiSelection?.kind;
+  const allNodes = kind === 'function' || kind === 'var';
+  const selected = allNodes ? isVar === (kind === 'var') : state.selected === n.id;
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const edgeRelated = focusedNodes?.has(n.id);
   const dimmed =
-    focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
+    allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
 
   if (recentAlpha && state.recent.nodes.has(n.id)) {
     ctx.save();
@@ -461,6 +473,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     : '#3A3A36';
   // 变量与函数统一用虚线框，靠名字（变量不带括号）区分
   ctx.setLineDash([5, 3]);
+  if (selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
   ctx.stroke();
   ctx.setLineDash([]);
 

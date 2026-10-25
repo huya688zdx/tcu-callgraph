@@ -10,7 +10,7 @@
  * state.selectedLabel 的编码是 `${edgeKey}#${id}`。
  * 连线被删 / 被过滤掉时标签自然一起消失，不需要单独清理。
  */
-import { els, state, edgeKey, FONT } from './state.js';
+import { els, state, cam, edgeKey, FONT } from './state.js';
 import { api } from './api.js';
 import {
   LABEL_FONT,
@@ -128,7 +128,7 @@ export function drawEdgeLabels(ctx, view = state.view) {
   const items = labelLayout(view);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
-    const selected = state.selectedLabel === `${edgeKey(edge)}#${label.id}`;
+    const selected = state.multiSelection?.kind === 'label' || state.selectedLabel === `${edgeKey(edge)}#${label.id}`;
     ctx.save();
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
@@ -166,6 +166,7 @@ export function drawEdgeLabels(ctx, view = state.view) {
     if (selected) {
       roundRectPath(ctx, rect.x - 2.5, rect.y - 2.5, rect.w + 5, rect.h + 5, 6);
       ctx.setLineDash([4, 3]);
+      if (state.multiSelection?.kind === 'label') ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
       ctx.lineWidth = 1.4;
       ctx.strokeStyle = '#185FA5';
       ctx.stroke();
