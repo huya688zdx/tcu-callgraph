@@ -66,7 +66,7 @@ const store = openStore();
 const modelCacheKeys = new WeakMap();
 const analysisPending = new WeakMap();
 
-/** 只有显式请求变量或数据流时才构建 AST；完成后升级磁盘缓存。 */
+/** 变量/数据流查询或失效标注检查需要 AST 时再构建；完成后升级磁盘缓存。 */
 async function ensureAnalysis(model) {
   if (model._df) return;
   if (analysisPending.has(model)) return analysisPending.get(model);
@@ -74,7 +74,7 @@ async function ensureAnalysis(model) {
     await buildDataflowIndex(model);
     if (model === MODEL) S = stats(model);
     const key = modelCacheKeys.get(model);
-    if (key) {
+    if (key && !model._df?.failedFiles) {
       try {
         const r = store.putCachedModel(key, model);
         if (!r.cached) console.log(`[缓存] 未缓存变量分析：${r.reason}`);
@@ -250,8 +250,18 @@ function reloadOverlay() {
  * 找出库里指向「已经不存在的函数 / 连线」的条目。
  * 判定规则在 core/orphans.js，那边能直接拿真实模型写单测。
  */
-function collectOrphans() {
-  return collectOrphansOf(MODEL, store.listAllTargets(PROJECT.id));
+async function collectOrphans() {
+  const model = MODEL;
+  const project = PROJECT;
+  const comparison = COMPARISON;
+  if (switching) return null;
+  // 冷缓存只有词法索引，不能把尚未分析到的 typedef 变量误判成已删除。
+  // 分析失败时直接拒绝检测/清理；等待期间切换了工程也不能使用旧结果。
+  // 比较模型已由两侧完整索引合并，不能重新扫描当前源码覆盖其差分节点。
+  if (!comparison) await ensureAnalysis(model);
+  if (switching || model !== MODEL || project !== PROJECT || comparison !== COMPARISON) return null;
+  if (model._df?.failedFiles) throw new Error('变量索引不完整，无法安全清理标注；请检查源码读取或解析错误，重新打开工程后重试');
+  return collectOrphansOf(model, store.listAllTargets(project.id));
 }
 
 /** 只取 patch 里涉及到的键，事件里存增量而不是全量，避免时间轴被坐标淹没 */
@@ -1001,15 +1011,17 @@ const server = http.createServer(async (req, res) => {
 
     // 孤儿标注：库里指向已不存在的函数 / 连线的条目
     if (u.pathname === '/api/orphans') {
-      const o = collectOrphans();
+      const o = await collectOrphans();
+      if (!o) return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
       return json(res, { ...o, total: countOrphans(o) });
     }
 
     if (u.pathname === '/api/orphans/purge' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((p) => {
-          const o = collectOrphans();
+        .then(async (p) => {
+          const o = await collectOrphans();
+          if (!o) return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
           const total = countOrphans(o);
           if (!total) return json(res, { ok: true, removed: 0 });
           // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
