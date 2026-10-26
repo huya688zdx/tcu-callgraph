@@ -45,14 +45,16 @@ async function loadView(rootId, opts = {}) {
   stopCamAnim();
   // 记录跳转前的入口与视角，供 Ctrl+Z 回退
   if (nav && state.view && state.roots.length) {
-    navStack.push({ roots: [...state.roots], cam: { x: cam.x, y: cam.y, k: cam.k } });
+    navStack.push({ roots: [...state.roots], expansions: structuredClone(state.expansions), cam: { x: cam.x, y: cam.y, k: cam.k } });
     if (navStack.length > NAV_MAX) navStack.shift();
   }
   const seq = ++viewSeq;
   clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
+  const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
   const data = await api.view({
     roots,
+    expansions,
     up: state.up,
     down: state.down,
     group: state.group,
@@ -67,6 +69,7 @@ async function loadView(rootId, opts = {}) {
     return;
   }
   state.view = data;
+  state.expansions = data.expansions || [];
   syncComparison(data.comparison);
   state.root = data.root;
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
@@ -104,6 +107,16 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
+hooks.expandFunction = async (root, direction, depth) => {
+  if (!['up', 'down'].includes(direction) || !Number.isInteger(depth) || depth < 1 || depth > 20) {
+    throw new Error('请选择方向及 1 到 20 的整数层数');
+  }
+  const expansions = structuredClone(state.expansions);
+  let scope = expansions.find((e) => e.root === root);
+  if (!scope) { scope = { root, up: 0, down: 0 }; expansions.push(scope); }
+  scope[direction] = Math.max(scope[direction], depth);
+  return loadView(state.roots, { incremental: true, expansions });
+};
 hooks.renderDetail = renderDetail;
 // live.js 收到 AI 改动推送后用它刷新画面（保留视角）；函数声明有提升，这里可以先引用
 hooks.reloadKeepCam = reloadKeepCam;
@@ -111,8 +124,8 @@ hooks.reloadKeepCam = reloadKeepCam;
 /** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
 hooks.applyBookmark = async (b) => {
   state.at = 0;
-  state.up = Number(b.up) || 0;
-  state.down = Number(b.down) || 3;
+  state.up = Number.isInteger(b.up) ? b.up : 1;
+  state.down = Number.isInteger(b.down) ? b.down : 1;
   state.group = !!b.group;
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
@@ -122,7 +135,7 @@ hooks.applyBookmark = async (b) => {
   els.groupMode.checked = state.group;
 
   const roots = (b.roots || []).filter(Boolean);
-  await loadView(roots.length ? roots : null);
+  await loadView(roots.length ? roots : null, { expansions: b.expansions || [] });
 };
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
@@ -133,6 +146,7 @@ hooks.reloadAll = async () => {
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.roots = [];
+  state.expansions = [];
   state.root = null;
   state.at = 0;
   state.vars.clear();
@@ -166,7 +180,7 @@ async function postDelete(body) {
 async function navigateBack() {
   const prev = navStack.pop();
   if (!prev) return false;
-  await loadView(prev.roots.length ? prev.roots : null, { nav: false });
+  await loadView(prev.roots.length ? prev.roots : null, { nav: false, expansions: prev.expansions || [] });
   cam.x = prev.cam.x;
   cam.y = prev.cam.y;
   cam.k = prev.cam.k;
@@ -298,10 +312,10 @@ els.updepth.addEventListener('change', () => {
 els.groupMode.addEventListener('change', () => {
   state.group = els.groupMode.checked;
   state.selectedEdge = null;
-  loadView(state.root);
+  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 els.resetLayout.addEventListener('click', () => {
-  loadView(state.roots.length ? state.roots : state.root);
+  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
@@ -356,7 +370,7 @@ window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 const initialPanels = Promise.all([loadStats(), loadTree()]);
 // 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
-// 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 3 / 0，行为同以前。
+// 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 1 / 1。
 (async () => {
   const seq = viewSeq;
   try {

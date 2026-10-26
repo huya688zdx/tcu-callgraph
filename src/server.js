@@ -12,6 +12,7 @@ import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
+import { normalizeExpansions } from './core/expansion.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import {
@@ -343,6 +344,7 @@ const bookmarkEventPayload = (b) => ({
   down: b.down,
   group: !!b.group,
   vars: b.vars || [],
+  expansions: b.expansions || [],
 });
 
 /** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
@@ -474,8 +476,12 @@ async function buildView(
   const nodeMap = new Map();
   const edgeList = [];
   const seenEdge = new Set();
-  for (const r of roots) {
-    const part = subgraph(MODEL, r, { up, down, maxNodes: perRoot, includeVariables: !!COMPARISON });
+  let truncated = false;
+  const scopes = [...roots.map((root) => ({ root, up, down })), ...(varSel.expansions || [])];
+  for (const scope of scopes) {
+    const part = subgraph(MODEL, scope.root, { up: scope.up, down: scope.down,
+      maxNodes: perRoot, includeVariables: !!COMPARISON });
+    truncated ||= part.truncated;
     for (const n of part.nodes) if (!nodeMap.has(n.id)) nodeMap.set(n.id, n);
     for (const e of part.edges) {
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
@@ -490,8 +496,8 @@ async function buildView(
     nodes: [...nodeMap.values()],
     edges: edgeList,
   };
-  const truncated = !!COMPARISON && g.nodes.length > 600;
-  if (COMPARISON) {
+  truncated ||= g.nodes.length > 600;
+  if (g.nodes.length > 600) {
     g.nodes = g.nodes.slice(0, 600);
   }
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
@@ -639,7 +645,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, layoutEngine: 'elk', projectId,
+  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId,
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -791,6 +797,7 @@ const server = http.createServer(async (req, res) => {
               down: Math.max(0, Number(p.down) || 0),
               group: !!p.group,
               vars: strArr(p.vars),
+              expansions: normalizeExpansions(p.expansions),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
@@ -805,7 +812,7 @@ const server = http.createServer(async (req, res) => {
             }
             json(res, { ok: true });
           })
-          .catch(() => {});
+          .catch((err) => { if (!res.headersSent) bad(res, err.message); });
       }
       return json(res, {
         page: u.searchParams.has('saved') ? COMPARISON ? null : store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
@@ -1312,26 +1319,33 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/view') {
       let previous = null;
+      let expansions = [];
       if (req.method === 'POST') {
         if (!guardWrite(req, res)) return;
         let body;
         try { body = await readJson(req, res); } catch { return; }
+        try { expansions = normalizeExpansions(body.expansions); } catch (err) { return bad(res, err.message); }
+        expansions = expansions.filter((e) => MODEL._index.byId.has(e.root) && MODEL._index.byId.get(e.root).kind !== 'var');
+        if (body.projectId != null && body.projectId !== PROJECT.id) return json(res, { error: '工程已切换，请重试' }, 409);
+        if (body.previous == null && !body.expansions?.length) return bad(res, '缺少增量布局或局部展开参数');
         previous = body.previous;
-        const rect = (n) => n && typeof n.id === 'string' &&
-          [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
-        if (!previous || !Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
-            !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
-            ![previous.width, previous.height].every(Number.isFinite) ||
-            ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
-          return bad(res, '增量布局数据无效');
+        if (previous != null) {
+          const rect = (n) => n && typeof n.id === 'string' &&
+            [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
+          if (!Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
+              !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
+              ![previous.width, previous.height].every(Number.isFinite) ||
+              ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
+            return bad(res, '增量布局数据无效');
+          }
+          const ids = new Set(previous.nodes.map((n) => n.id));
+          if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
+              Array.isArray(e.points) && e.points.length >= 2 &&
+              e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
+            return bad(res, '增量布局连线无效');
+          }
+          if (previous.projectId !== PROJECT.id || previous.comparisonId !== COMPARISON?.id) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
         }
-        const ids = new Set(previous.nodes.map((n) => n.id));
-        if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
-            Array.isArray(e.points) && e.points.length >= 2 &&
-            e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
-          return bad(res, '增量布局连线无效');
-        }
-        if (previous.projectId !== PROJECT.id || previous.comparisonId !== COMPARISON?.id) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
       }
       const rootsParam = u.searchParams.get('roots');
       const rootId = u.searchParams.get('root');
@@ -1340,13 +1354,13 @@ const server = http.createServer(async (req, res) => {
         : rootId
         ? [rootId]
         : [];
-      const up = Number(u.searchParams.get('up') || 0);
-      const down = Number(u.searchParams.get('down') || 3);
+      const up = Number(u.searchParams.get('up') ?? 1);
+      const down = Number(u.searchParams.get('down') ?? 1);
       const group = u.searchParams.get('group') !== '0';
       if (previous && !!previous.groups.length !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
-      const varSel = { want: split('vars'), skip: split('novars') };
+      const varSel = { want: split('vars'), skip: split('novars'), expansions };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       const at = Number(u.searchParams.get('at') || 0);
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
@@ -1374,7 +1388,7 @@ const server = http.createServer(async (req, res) => {
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
         return json(
           res,
-          await buildView([pick.id], up, Math.max(down, 3), group, df, varSel, viewOverlay, previous)
+          await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous)
         );
       }
       return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay, previous));
@@ -1451,8 +1465,8 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/export/html') {
       const rootId = u.searchParams.get('root');
-      const up = Number(u.searchParams.get('up') || 0);
-      const down = Number(u.searchParams.get('down') || 3);
+      const up = Number(u.searchParams.get('up') ?? 1);
+      const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
@@ -1656,8 +1670,8 @@ const server = http.createServer(async (req, res) => {
       }
       const saved = store.getSetting('ui.depth', null) || {};
       return json(res, {
-        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 3,
-        up: DEPTH_UP.includes(saved.up) ? saved.up : 0,
+        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 1,
+        up: DEPTH_UP.includes(saved.up) ? saved.up : 1,
       });
     }
 

@@ -9,6 +9,7 @@ import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
+import { showExpansion } from './expand.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -336,6 +337,7 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
+    items.push({ value: 'expand', label: 'expand.menu' });
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
     if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
@@ -351,6 +353,7 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
+      if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (v === 'locate') {

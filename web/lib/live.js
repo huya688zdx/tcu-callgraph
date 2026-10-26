@@ -113,6 +113,7 @@ export function savePage(force = false) {
   const page = {
     projectId: state.view.projectId,
     roots: state.roots,
+    expansions: state.expansions,
     up: state.up,
     down: state.down,
     group: state.group,
@@ -153,7 +154,7 @@ export async function restorePage(root = null, isCurrent = () => true) {
       els.updepth.value = String(state.up);
       els.groupMode.checked = state.group;
     }
-    const view = await hooks.loadView(root || saved?.roots || null, { nav: false });
+    const view = await hooks.loadView(root || saved?.roots || null, { nav: false, expansions: saved?.expansions || [] });
     if (saved && view && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;

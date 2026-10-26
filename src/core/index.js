@@ -700,6 +700,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
 
   const nodes = new Map();
   const edges = [];
+  let truncated = false;
   const seenCall = new Set();
   // 同一对节点之间的多次调用合并成一条边，调用次数与行号记在 calls 里，
   // 避免画出并排的多条平行边
@@ -748,7 +749,10 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
           if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
           addEdge(e);
-          if (nodes.size >= maxNodes) continue;
+          if (nodes.size >= maxNodes) {
+            if (!nodes.has(other) && byId.has(other)) truncated = true;
+            continue;
+          }
           if (addNode(other)) next.push(other);
         }
       }
@@ -762,6 +766,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
 
   return {
     root: rootId,
+    truncated,
     nodes: [...nodes.values()],
     edges: edges.filter((e) => nodes.has(e.from) && nodes.has(e.to)),
   };

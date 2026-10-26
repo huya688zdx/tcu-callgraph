@@ -6,7 +6,7 @@ import { layoutElk } from '../src/core/layout-elk.js';
 test('默认只使用 ELK：旧模式和坐标不覆盖布局，手工关系参与排版', async (t) => {
   const srv = await launchServer();
   t.after(() => srv.close());
-  const url = srv.baseUrl + '/api/view?root=main.c::main';
+  const url = srv.baseUrl + '/api/view?root=main.c::main&down=3&up=0';
   const before = await (await fetch(url)).json();
   assert.equal(before.layoutEngine, 'elk');
   assert.ok(before.groups.length, '默认打开带文件层级的 ELK 布局');
@@ -124,7 +124,7 @@ test('变量关系可单独移出并恢复，不影响同一函数的其他变�
   const srv = await launchServer({ target: 'samples/shared-state' });
   t.after(() => srv.close());
   const query = new URLSearchParams({
-    roots: 'producer.c::Sensor_Update,consumer.c::Control_Read', down: '0',
+    roots: 'producer.c::Sensor_Update,consumer.c::Control_Read', down: '0', up: '0',
     vars: 'var::g_rpm,var::g_index',
   });
   const view = () => fetch(`${srv.baseUrl}/api/view?${query}`).then((r) => r.json());

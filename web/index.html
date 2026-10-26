@@ -400,6 +400,13 @@
     color: #888780; cursor: pointer; padding: 0 4px;
   }
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  #expandForm { display: grid; gap: 14px; }
+  #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
+  #expandForm label { display: flex; align-items: center; gap: 12px; }
+  #expandForm select, #expandForm input { padding: 7px 10px; border: 1px solid #D3D1C8; border-radius: 6px; font: inherit; }
+  #expandForm input { width: 80px; }
+  #expandForm p { margin: 0; color: #888780; font-size: 12px; line-height: 1.6; }
+  #expandMessage { font-size: 12px; color: #A32D2D; margin-right: auto; align-self: center; }
   .call-order-row { display: grid; grid-template-columns: 18px 90px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px dashed #E8E7E1; cursor: pointer; }
   .call-order-row input { margin: 0; }
   .call-order-number { font-size: 12px; }
@@ -635,15 +642,15 @@
       <div class="tool-group">
         <span class="tool-label" data-i18n="toolbar.scope">范围</span>
         <select id="depth" aria-label="向下展开层数">
-          <option value="1" data-i18n="depth.down1">向下 1 层</option>
+          <option value="1" selected data-i18n="depth.down1">向下 1 层</option>
           <option value="2" data-i18n="depth.down2">向下 2 层</option>
-          <option value="3" selected data-i18n="depth.down3">向下 3 层</option>
+          <option value="3" data-i18n="depth.down3">向下 3 层</option>
           <option value="5" data-i18n="depth.down5">向下 5 层</option>
           <option value="9" data-i18n="depth.downAll">向下全部</option>
         </select>
         <select id="updepth" aria-label="向上展开层数">
-          <option value="0" selected data-i18n="depth.up0">向上 0 层</option>
-          <option value="1" data-i18n="depth.up1">向上 1 层</option>
+          <option value="0" data-i18n="depth.up0">向上 0 层</option>
+          <option value="1" selected data-i18n="depth.up1">向上 1 层</option>
           <option value="2" data-i18n="depth.up2">向上 2 层</option>
         </select>
         <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
@@ -743,6 +750,32 @@
     <div class="modal-foot">
       <span class="hint" data-i18n="style.hint">改动即时生效，自动保存到本机</span>
       <button id="styleReset" data-i18n="style.reset">恢复默认</button>
+    </div>
+  </div>
+
+  <div id="expandModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="expandTitle">
+    <div class="modal-head">
+      <h2 id="expandTitle" data-i18n="expand.title">函数层级查找</h2>
+      <button class="modal-close" data-close="expandModal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <form id="expandForm">
+        <strong id="expandFunction"></strong>
+        <label><span data-i18n="expand.direction">查找方向</span>
+          <select id="expandDirection">
+            <option value="down" data-i18n="expand.down">向下：查找被调用函数</option>
+            <option value="up" data-i18n="expand.up">向上：查找调用者</option>
+          </select>
+        </label>
+        <label><span data-i18n="expand.depth">查找层数</span>
+          <input id="expandDepth" type="number" min="1" max="20" step="1" value="1" required>
+        </label>
+        <p data-i18n="expand.hint">以这个函数为起点查找，层数可选 1–20。已显示的函数会保留，变量按需勾选。</p>
+      </form>
+    </div>
+    <div class="modal-foot">
+      <span id="expandMessage" role="status" aria-live="polite"></span>
+      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">查找并加入画布</button>
     </div>
   </div>
 
