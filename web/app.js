@@ -9,7 +9,7 @@ import { hooks } from './lib/hooks.js';
 import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
 import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { loadStats, loadTree, resetVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
@@ -123,7 +123,6 @@ hooks.applyBookmark = async (b) => {
 
   const roots = (b.roots || []).filter(Boolean);
   await loadView(roots.length ? roots : null);
-  await loadVars();
 };
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
@@ -138,11 +137,12 @@ hooks.reloadAll = async () => {
   state.at = 0;
   state.vars.clear();
   state.hiddenVars.clear();
+  state.ctxBox = null;
+  resetVars();
   navStack.length = 0;
   deleteStack.length = 0;
   await loadStats();
   await loadTree();
-  await loadVars();
   await restorePage(null, () => seq === viewSeq);
 };
 
@@ -354,7 +354,7 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
-const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
+const initialPanels = Promise.all([loadStats(), loadTree()]);
 // 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
 // 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 3 / 0，行为同以前。
 (async () => {

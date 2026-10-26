@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { loadModel, subgraph } from '../src/core/index.js';
+import { loadModel, subgraph, rebuildIndex } from '../src/core/index.js';
 
 // 手写最小 model：a -> b -> d，a -> c -> d，便于精确验证层数边界
 function chainModel() {
@@ -23,6 +23,18 @@ function chainModel() {
 }
 
 const idsOf = (res) => res.nodes.map((n) => n.id).sort();
+
+test('纯调用子图：变量不占节点限额，也不通过共享变量引入其他函数', () => {
+  const model = chainModel();
+  model.variables = Array.from({ length: 100 }, (_, i) => ({ id: `var::v${i}`, kind: 'var' }));
+  model.edges.unshift(...model.variables.map((v) => ({ from: 'a', to: v.id, kind: 'var', line: 0 })));
+  rebuildIndex(model);
+  const result = subgraph(model, 'a', { down: 2, maxNodes: 4, includeVariables: false });
+  assert.deepEqual(idsOf(result), ['a', 'b', 'c', 'd']);
+  assert.ok(result.edges.every((e) => e.kind !== 'var'));
+  const variable = subgraph(model, 'var::v0', { up: 1, includeVariables: false });
+  assert.ok(!variable.nodes.some((n) => n.id === 'a'));
+});
 
 test('subgraph：down:0 只返回 root，且不带任何边', () => {
   const res = subgraph(chainModel(), 'a', { down: 0 });

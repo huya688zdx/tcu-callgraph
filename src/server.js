@@ -62,6 +62,29 @@ let pageState = null;
 
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
+const modelCacheKeys = new WeakMap();
+const analysisPending = new WeakMap();
+
+/** 只有显式请求变量或数据流时才构建 AST；完成后升级磁盘缓存。 */
+async function ensureAnalysis(model) {
+  if (model._df) return;
+  if (analysisPending.has(model)) return analysisPending.get(model);
+  const pending = (async () => {
+    await buildDataflowIndex(model);
+    if (model === MODEL) S = stats(model);
+    const key = modelCacheKeys.get(model);
+    if (key) {
+      try {
+        const r = store.putCachedModel(key, model);
+        if (!r.cached) console.log(`[缓存] 未缓存变量分析：${r.reason}`);
+      } catch (err) {
+        console.warn('[缓存] 变量分析缓存写入失败：', err.message);
+      }
+    }
+  })();
+  analysisPending.set(model, pending);
+  try { await pending; } finally { analysisPending.delete(model); }
+}
 
 // ---- 界面偏好：范围下拉（向下 / 向上层数）----
 // 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
@@ -164,14 +187,9 @@ async function openTarget(targetPath, { first = false } = {}) {
     model = loadModel(abs);
   }
 
-  // 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
-  // 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
-  try {
-    await buildDataflowIndex(model);
-  } catch (err) {
-    console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
-  }
-  if (key && !fromCache && model._df) {
+  // 首屏只需要调用关系；变量清单/数据流由 ensureAnalysis 按需构建。
+  modelCacheKeys.set(model, key);
+  if (key && !fromCache) {
     const r = store.putCachedModel(key, model);
     if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
   }
@@ -445,6 +463,11 @@ async function buildView(
   previous = null
 ) {
   const projectId = PROJECT.id;
+  const model = MODEL;
+  if (!COMPARISON && (varSel.want?.length || dfNode)) {
+    await ensureAnalysis(model);
+    if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
+  }
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
   const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
@@ -452,7 +475,7 @@ async function buildView(
   const edgeList = [];
   const seenEdge = new Set();
   for (const r of roots) {
-    const part = subgraph(MODEL, r, { up, down, maxNodes: perRoot });
+    const part = subgraph(MODEL, r, { up, down, maxNodes: perRoot, includeVariables: !!COMPARISON });
     for (const n of part.nodes) if (!nodeMap.has(n.id)) nodeMap.set(n.id, n);
     for (const e of part.edges) {
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
@@ -1375,6 +1398,11 @@ const server = http.createServer(async (req, res) => {
       const dir = u.searchParams.get('dir') || 'out';
       if (!fnId) return json(res, { error: 'missing fn' }, 400);
       if (!MODEL._index) return json(res, { error: '该视图不支持数据流分析' }, 400);
+      if (!COMPARISON) {
+        const model = MODEL;
+        await ensureAnalysis(model);
+        if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
+      }
       return (COMPARISON ? comparisonDataflow(COMPARISON, fnId, dir) : dataflowFor(MODEL, fnId, dir))
         .then((r) => json(res, r))
         .catch((err) => {
@@ -1385,6 +1413,9 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/vars') {
       if (COMPARISON) return json(res, { list: comparisonGlobals(COMPARISON) });
+      const model = MODEL;
+      await ensureAnalysis(model);
+      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
       return listGlobals(MODEL)
         .then((list) => json(res, { list }))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
@@ -1398,6 +1429,9 @@ const server = http.createServer(async (req, res) => {
         }
         return json(res, { list: records });
       }
+      const model = MODEL;
+      await ensureAnalysis(model);
+      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
       return sharedVariables(MODEL)
         .then((list) => json(res, { list }))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));

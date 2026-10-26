@@ -694,7 +694,7 @@ export function tarjan(model) {
 /**
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {}) {
+export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true } = {}) {
   const { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
 
@@ -744,6 +744,8 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
       const next = [];
       for (const id of frontier) {
         for (const e of adj.get(id) || []) {
+          // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
+          if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
           addEdge(e);
           if (nodes.size >= maxNodes) continue;
