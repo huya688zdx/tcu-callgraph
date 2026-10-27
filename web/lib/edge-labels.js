@@ -10,7 +10,7 @@
  * state.selectedLabel 的编码是 `${edgeKey}#${id}`。
  * 连线被删 / 被过滤掉时标签自然一起消失，不需要单独清理。
  */
-import { els, state, cam, edgeKey, FONT, THEME, hexToRgba } from './state.js';
+import { els, state, edgeKey, FONT, THEME, hexToRgba } from './state.js';
 import { api } from './api.js';
 import { t } from '../i18n.js';
 import {
@@ -125,7 +125,7 @@ export function hitLabel(p, view = state.view) {
 }
 
 /** 画布上绘制全部标签（由 render.js 在节点之后调用，保证标签在最上层） */
-export function drawEdgeLabels(ctx, view = state.view) {
+export function drawEdgeLabels(ctx, view = state.view, onAnimatedBox = null) {
   const items = labelLayout(view);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
@@ -166,12 +166,16 @@ export function drawEdgeLabels(ctx, view = state.view) {
     }
 
     if (selected) {
-      roundRectPath(ctx, rect.x - 2.5, rect.y - 2.5, rect.w + 5, rect.h + 5, 6);
-      ctx.setLineDash([4, 3]);
-      if (state.multiSelection?.kind === 'label') ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
-      ctx.lineWidth = 1.4;
-      ctx.strokeStyle = '#185FA5';
-      ctx.stroke();
+      const box = { x: rect.x - 2.5, y: rect.y - 2.5, w: rect.w + 5, h: rect.h + 5 };
+      if (onAnimatedBox && state.multiSelection?.kind === 'label') {
+        onAnimatedBox(box, [4, 3], 1.4, 6, '#185FA5');
+      } else {
+        roundRectPath(ctx, box.x, box.y, box.w, box.h, 6);
+        ctx.setLineDash([4, 3]);
+        ctx.lineWidth = 1.4;
+        ctx.strokeStyle = '#185FA5';
+        ctx.stroke();
+      }
     }
     ctx.restore();
   }

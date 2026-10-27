@@ -91,8 +91,8 @@ function buildSVG() {
     const d = (e.points || []).map(([x, y], j) => `${j ? 'L' : 'M'}${x} ${y}`).join(' ');
     // 与画布 drawEdge 相同：新增=红，变量访问=自己的线色（虚线），其余=调用色
     const c = e.change === 'added' ? THEME.edge.added : e.change === 'modified' ? THEME.edge.modified : e.kind === 'var' ? THEME.edge.var : THEME.edge.call;
-    // 变量访问=虚线，函数调用=实线（与画布 drawEdge 相同）
-    const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
+    // 虚实与画布 drawEdge 相同：按类型走主题开关
+    const dash = (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash) ? ' stroke-dasharray="7 4"' : '';
     const mk = e.change === 'added' ? 'mk-red' : e.change === 'modified' ? 'mk-modified' : e.kind === 'var' ? 'mk-var' : 'mk-dark';
     out.push(
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash} marker-end="url(#${mk})" data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
@@ -115,7 +115,7 @@ function buildSVG() {
         ? THEME.node.external
         : THEME.fill[n.change] || THEME.fill.existing);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="${n.external ? THEME.node.externalBorder : THEME.node.border}" stroke-width="1"${isVar ? '' : ' stroke-dasharray="5 3"'}/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="${n.external ? THEME.node.externalBorder : isVar ? THEME.node.varBorder : THEME.node.border}" stroke-width="1"${(isVar ? THEME.node.varDash : THEME.node.fnDash) ? ' stroke-dasharray="5 3"' : ''}/>`
     );
     if (n.note) {
       out.push(`<circle cx="${(n.x + 8).toFixed(1)}" cy="${(n.y + 8).toFixed(1)}" r="3.2" fill="#EF9F27"/>`);
