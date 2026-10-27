@@ -13,6 +13,8 @@ export async function setNodeName(n, mode) {
   nameWrites = pending.catch(() => {});
   const result = await pending;
   if (!result?.ok || state.view !== view) return;
+  n = view.nodes.find((node) => node.id === n.id);
+  if (!n) return;
   n.nameModeOverride = override;
   n.nameMode = override || view.macroNameMode || 'alias';
   n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;

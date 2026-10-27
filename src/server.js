@@ -93,6 +93,14 @@ const DEPTH_DOWN = [1, 2, 3, 5, 9];
 const DEPTH_UP = [0, 1, 2];
 const NAME_MODES = ['alias', 'target'];
 const macroNameDefault = () => store.getSetting('ui.macroNameMode', 'alias') === 'target' ? 'target' : 'alias';
+function withMacroName(node, viewOverlay, defaultMode) {
+  if (!node.headerSymbol) return node;
+  const override = viewOverlay.nodes?.[node.id]?.nameMode;
+  const nameModeOverride = NAME_MODES.includes(override) ? override : null;
+  const nameMode = nameModeOverride || defaultMode;
+  return { ...node, nameModeOverride, nameMode,
+    displayName: nameMode === 'target' ? node.targetNames.join(' / ') : node.name };
+}
 
 // ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
 const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
@@ -644,14 +652,7 @@ async function buildView(
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
   const macroNameMode = macroNameDefault();
-  for (const n of clean) {
-    if (n.headerSymbol) {
-      const override = viewOverlay.nodes?.[n.id]?.nameMode;
-      n.nameModeOverride = NAME_MODES.includes(override) ? override : null;
-      n.nameMode = n.nameModeOverride || macroNameMode;
-      n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;
-    }
-  }
+  clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -1500,6 +1501,7 @@ const server = http.createServer(async (req, res) => {
       const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
+      g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();
       const inAdj = new Map();

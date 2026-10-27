@@ -8,15 +8,23 @@ export function headerSymbols(parsed, resolveCallee, callableNames) {
     if (!p.isHeader) continue;
     for (const m of p.macros.values()) {
       if (m.file !== p.rel) continue;
-      const expanded = expandSeq(m.body, p.macros);
-      let names;
+      let callable = m;
+      let expanded = expandSeq(m.body, p.macros);
       if (m.params === null && expanded.length === 1 && expanded[0].t === 'id') {
+        const wrapper = p.macros.get(expanded[0].v);
+        if (wrapper?.params !== null && wrapper?.params !== undefined) {
+          callable = wrapper;
+          expanded = expandSeq(wrapper.body, p.macros);
+        }
+      }
+      let names;
+      if (callable.params === null && expanded.length === 1 && expanded[0].t === 'id') {
         names = [expanded[0].v];
         if (!callableNames.has(names[0])) continue;
-      } else if (m.params !== null) {
+      } else if (callable.params !== null) {
         const calls = [];
         scanCalls(expanded, { macros: new Map(), fnptr: new Map() }, calls);
-        names = [...new Set(calls.map((c) => c.callee).filter((n) => n && !m.params.includes(n)))];
+        names = [...new Set(calls.map((c) => c.callee).filter((n) => n && !callable.params.includes(n)))];
       } else continue;
       if (!names.length || names.includes(m.name)) continue;
       symbols.push({ id: `header::${p.rel}::${m.name}`, name: m.name, file: p.rel,

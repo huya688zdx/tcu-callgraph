@@ -117,4 +117,35 @@ test('宏名称优先级：节点选择优先于默认，清除选择后继续�
   assert.equal((await get()).nameModeOverride, null);
   await post('/api/ui-prefs', { macroNameMode: 'alias' });
   assert.equal((await get()).displayName, 'ReadSpeed');
+  const html = () => fetch(srv.baseUrl + '/api/export/html?root=' + encodeURIComponent(id) + '&up=0&down=0').then((r) => r.text());
+  await post('/api/ui-prefs', { macroNameMode: 'target' });
+  assert.match(await html(), /data-name="Driver_ReadSpeed"/);
+  await post('/api/overlay', { nodeId: id, data: { nameMode: 'alias' } });
+  assert.match(await html(), /data-name="ReadSpeed"/);
+  await post('/api/ui-prefs', { macroNameMode: 'alias' });
+  await post('/api/overlay', { nodeId: id, data: { nameMode: 'target' } });
+  assert.match(await html(), /data-name="Driver_ReadSpeed"/);
+});
+
+test('宏来源：对象别名指向包装宏，嵌套实参保留各自的调用者', (t) => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, 'include/api.h'), `
+#define Wrapper(x) Driver_ReadSpeed(x)
+#define Alias Wrapper
+#define Outer Driver_ReadSpeed
+#define Inner Other
+`);
+  fs.writeFileSync(path.join(dir, 'main.c'), `
+int Driver_ReadSpeed(int x) { return x; }
+int Other(void) { return 1; }
+void main(void) { Outer(Inner()); Alias(Inner()); }
+`);
+  const m = buildIndex(dir);
+  assert.deepEqual(m.headerSymbols.find((n) => n.name === 'Alias').targetNames, ['Driver_ReadSpeed']);
+  const nested = m.edges.filter((e) => e.from === 'main.c::main' && e.to === 'main.c::Other');
+  assert.equal(nested.length, 2);
+  assert.ok(nested.every((e) => e.macroChain.includes('Inner') && !e.macroChain.includes('Outer')));
+  assert.ok(m.headerEdges.some((e) => e.from === 'main.c::main' && e.to === 'header::include/api.h::Inner'));
+  const caller = subgraph(m, 'header::include/api.h::Inner', { up: 1, down: 0 });
+  assert.ok(caller.nodes.some((n) => n.id === 'main.c::main'));
 });

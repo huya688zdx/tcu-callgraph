@@ -160,6 +160,7 @@ function stringifyTokens(tokens) {
 function substitute(m, args, siteTok) {
   const out = [];
   const body = m.body;
+  const macroOrigins = [...(siteTok.macroOrigins || []), m.name];
   for (let i = 0; i < body.length; i++) {
     const tk = body[i];
 
@@ -171,6 +172,7 @@ function substitute(m, args, siteTok) {
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
+        macroOrigins,
       });
       i++;
       continue;
@@ -188,6 +190,7 @@ function substitute(m, args, siteTok) {
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
+        macroOrigins,
       });
       i++;
       continue;
@@ -197,11 +200,12 @@ function substitute(m, args, siteTok) {
     if (pidx >= 0) {
       const a = args[pidx] || [];
       for (const t of a) {
-        out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond });
+        out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond,
+          macroOrigins: a.length === 1 && body[i + 1]?.v === '(' ? [...macroOrigins, ...(t.macroOrigins || [])] : t.macroOrigins || [] });
       }
       continue;
     }
-    out.push({ ...tk, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? tk.cond });
+    out.push({ ...tk, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? tk.cond, macroOrigins });
   }
   return out;
 }
@@ -223,6 +227,7 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
           line: tk.line,
           col: tk.col,
           cond: tk.cond ?? b.cond,
+          macroOrigins: [...(tk.macroOrigins || []), m.name],
         }));
         const nextSeen = new Set(seen);
         nextSeen.add(tk.v);
