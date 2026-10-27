@@ -645,7 +645,16 @@ async function buildView(
   const mode = group ? 'group' : 'flat';
   const slot = viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
   const byId = new Map(clean.map((n) => [n.id, n]));
-  for (const m of slot.manual || []) {
+  // 比较模式的 roots 是「保留+选中」的合集，和存手工关系时的原视图槽位键对不上；
+  // 改为从全部槽位按「两端都在当前图上」找回，按端点对去重，保证手工关系仍可见。
+  const manualPool = COMPARISON
+    ? Object.values(viewOverlay.layout || {}).flatMap((s) => s?.manual || [])
+    : slot.manual || [];
+  const seenManual = new Set();
+  for (const m of manualPool) {
+    const mk = `${m.from}\u0000${m.to}`;
+    if (seenManual.has(mk)) continue;
+    seenManual.add(mk);
     if (!byId.has(m.from) || !byId.has(m.to) || viewOverlay.deleted.edges[edgeKeyOf({ ...m, line: 0 })]) continue;
     viewEdges.push({ from: m.from, to: m.to, callee: byId.get(m.to).name,
       kind: 'manual', line: 0, via: '手动', manual: true });

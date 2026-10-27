@@ -145,6 +145,32 @@ test('比较预览可取消；只加入勾选对象并保留原图，退出恢�
   assert.equal((await get('/api/node?id=var::g_fault')).node.versions, undefined, '退出恢复原工程节点，不残留比较版本数据');
 });
 
+test('比较视图找回两端在图上的手工关系；普通模式仍只认当前视图槽位', async (t) => {
+  const srv = await launchServer({ target: projectPath }); t.after(() => srv.close());
+  const { get, post } = requests(srv);
+  // 手工关系画在 main 视图槽位里；比较模式的 roots 是「保留+选中」合集，键对不上
+  await post('/api/layout', { root: 'main.c::main', manual: [
+    { from: 'main.c::main', to: 'var::g_fault' },
+    { from: 'main.c::main', to: 'control.c::Monitor_Read' },
+  ] });
+  const normal = await get('/api/view?root=main.c::main&up=0&down=0&group=0&vars=var::g_fault');
+  assert.ok(normal.edges.some((e) => e.manual && e.to === 'var::g_fault'));
+  assert.ok(!normal.edges.some((e) => e.manual && e.to === 'control.c::Monitor_Read'), '端点不在图上的手工关系不显示');
+  // 换个入口的普通视图：手工关系不跨槽位泄漏
+  const other = await get('/api/view?root=control.c::Monitor_Read&up=1&down=0&group=0');
+  assert.ok(!other.edges.some((e) => e.manual));
+  const p = await post('/api/compare', { beforePath, afterPath });
+  assert.equal((await post('/api/compare/apply', {
+    previewId: p.preview.id, selectedIds: ['var::g_fault'],
+    retainIds: ['main.c::main', 'control.c::Monitor_Read'],
+  })).ok, true);
+  const view = await get('/api/view');
+  assert.ok(view.edges.some((e) => e.manual && e.from === 'main.c::main' && e.to === 'var::g_fault'),
+    '比较模式槽位键对不上，两端保留的手工关系也要找回显示');
+  assert.ok(view.edges.some((e) => e.manual && e.to === 'control.c::Monitor_Read'));
+  await post('/api/compare/exit', {});
+});
+
 test('预览绑定原工程，切换后不能把旧结果加入新工程', async (t) => {
   const srv = await launchServer({ target: projectPath }); t.after(() => srv.close());
   const { get, post } = requests(srv);

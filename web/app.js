@@ -135,6 +135,10 @@ hooks.applyComparison = async (roots) => {
   navStack.length = 0;
   await loadView(roots, { nav: false, incremental: true, exact: true, expansions: [] });
   if (!state.view?.comparison) throw new Error('比较结果已准备，画布加载失败，请重试');
+  // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
+  // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
+  state.up = 0; state.down = 0;
+  els.depth.value = '0'; els.updepth.value = '0';
   resetVars();
   await Promise.all([loadStats(), loadTree()]);
 };
