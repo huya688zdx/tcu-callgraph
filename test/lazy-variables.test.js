@@ -144,3 +144,59 @@ test('冷缓存失效标注检测与清理：保留 typedef 变量的标注、�
   assert.equal((await fetch(srv.baseUrl + '/api/node?id=var::g_keep')).status, 404, '不完整分析不能覆盖磁盘上的正常解析缓存');
   assert.equal((await get('/api/orphans')).total, 0, '源码恢复后重新打开即可重试');
 });
+
+for (const extension of ['dot', 'gv']) {
+  test(`${extension} 图的失效标注检查和清理使用导入索引，不依赖 C 分析`, async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-orphan-dot-'));
+    const target = path.join(dir, `graph.${extension}`);
+    fs.copyFileSync(path.resolve(import.meta.dirname, '../samples/tcu.dot'), target);
+    const srv = await launchServer({ target });
+    t.after(async () => { await srv.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+    const get = async (url) => {
+      const response = await fetch(srv.baseUrl + url);
+      assert.equal(response.status, 200, url);
+      return response.json();
+    };
+    const post = async (url, body) => {
+      const response = await fetch(srv.baseUrl + url, { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      assert.equal(response.status, 200, url);
+      return response.json();
+    };
+    const nodeId = 'dot::main';
+    const edgeKey = 'dot::main->dot::Task_10ms:0';
+    const missing = 'dot::Missing';
+    const missingEdge = 'dot::Missing->dot::Gone:0';
+    const layoutKey = `${nodeId}::group`;
+    const originalEdges = (await get('/api/node?id=' + nodeId)).outEdges;
+    assert.equal((await post('/api/session/import', {
+      format: 'tcu-callgraph-session', version: 1,
+      overlay: {
+        nodes: { [nodeId]: { note: '有效图节点' }, [missing]: { note: '失效节点' } },
+        edges: { [edgeKey]: { note: '有效图连线' }, [missingEdge]: { note: '失效连线' } },
+        deleted: { nodes: { [nodeId]: true }, edges: { [edgeKey]: true } },
+        layout: { [layoutKey]: { nodes: { [nodeId]: { x: 1, y: 2 }, [missing]: { x: 3, y: 4 } } } },
+      },
+    })).ok, true);
+    assert.equal((await get('/api/orphans')).total, 3);
+    const before = (await get('/api/session/export')).overlay;
+    const preview = await post('/api/orphans/purge', { dry: true });
+    assert.equal(preview.wouldRemove, 3);
+    assert.deepEqual((await get('/api/session/export')).overlay, before);
+
+    // 图模型即使先前收到过变量查询，也不能因该 C 分析结果拒绝清理。
+    await get('/api/vars');
+    assert.equal((await get('/api/orphans')).total, 3);
+    assert.deepEqual((await get('/api/node?id=' + nodeId)).outEdges, originalEdges);
+    assert.equal((await post('/api/orphans/purge', {})).removed, 3);
+    const saved = (await get('/api/session/export')).overlay;
+    assert.equal(saved.nodes[nodeId].note, '有效图节点');
+    assert.equal(saved.edges[edgeKey].note, '有效图连线');
+    assert.ok(saved.deleted.nodes[nodeId]);
+    assert.ok(saved.deleted.edges[edgeKey]);
+    assert.deepEqual(saved.layout[layoutKey].nodes, { [nodeId]: { x: 1, y: 2 } });
+    assert.equal(saved.nodes[missing], undefined);
+    assert.equal(saved.edges[missingEdge], undefined);
+    assert.equal((await get('/api/orphans')).total, 0);
+  });
+}

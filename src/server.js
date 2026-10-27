@@ -257,10 +257,12 @@ async function collectOrphans() {
   if (switching) return null;
   // 冷缓存只有词法索引，不能把尚未分析到的 typedef 变量误判成已删除。
   // 分析失败时直接拒绝检测/清理；等待期间切换了工程也不能使用旧结果。
-  // 比较模型已由两侧完整索引合并，不能重新扫描当前源码覆盖其差分节点。
-  if (!comparison) await ensureAnalysis(model);
+  // 比较模型已由两侧完整索引合并，DOT/GV 也自带完整的图索引；
+  // 两者都不能按 C 源码重新分析，完整性检查也只适用于 C 分析。
+  const needsCAnalysis = !comparison && model.source !== 'dot';
+  if (needsCAnalysis) await ensureAnalysis(model);
   if (switching || model !== MODEL || project !== PROJECT || comparison !== COMPARISON) return null;
-  if (model._df?.failedFiles) throw new Error('变量索引不完整，无法安全清理标注；请检查源码读取或解析错误，重新打开工程后重试');
+  if (needsCAnalysis && model._df?.failedFiles) throw new Error('变量索引不完整，无法安全清理标注；请检查源码读取或解析错误，重新打开工程后重试');
   return collectOrphansOf(model, store.listAllTargets(project.id));
 }
 
