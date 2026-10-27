@@ -509,23 +509,23 @@ export function buildIndex(root, sourceFiles = null) {
   }
 
   const allNodes = new Map([...byId, ...externals]);
-  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.map((e) => e.callee)]));
-  for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
-    const id = symbol.targetIds[i];
-    if (!allNodes.has(id) && id.startsWith('ext::')) {
-      const node = { id, name: symbol.targetNames[i], file: '<external>', line: 0, external: true, params: [] };
-      externals.set(id, node);
-      allNodes.set(id, node);
-    }
-  }
-  for (const symbol of symbols) allNodes.set(symbol.id, symbol);
   const callsByMacro = new Map();
   for (const e of edges) for (const id of e.macroDefinitions || []) {
     if (!callsByMacro.has(id)) callsByMacro.set(id, []);
     callsByMacro.get(id).push(e);
   }
+  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.map((e) => e.callee)]), macros, callsByMacro);
+  for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
+    const id = symbol.targetIds[i];
+    if (!allNodes.has(id) && id.startsWith('ext::')) {
+      const node = { id, name: id.slice(5), file: '<external>', line: 0, external: true, params: [] };
+      externals.set(id, node);
+      allNodes.set(id, node);
+    }
+  }
+  for (const symbol of symbols) allNodes.set(symbol.id, symbol);
   const headerEdges = symbols.flatMap((symbol) => [
-    ...symbol.targetIds.map((to, i) => ({ from: symbol.id, to, callee: symbol.targetNames[i],
+    ...symbol.targetIds.map((to) => ({ from: symbol.id, to, callee: allNodes.get(to)?.name || to,
       kind: 'macro', line: symbol.line, via: symbol.name, headerReference: true })),
     ...(callsByMacro.get(symbol.id) || []).map((e) => ({ ...e, to: symbol.id, callee: symbol.name, headerReference: true })),
   ]);

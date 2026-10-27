@@ -149,3 +149,19 @@ void main(void) { Outer(Inner()); Alias(Inner()); }
   const caller = subgraph(m, 'header::include/api.h::Inner', { up: 1, down: 0 });
   assert.ok(caller.nodes.some((n) => n.id === 'main.c::main'));
 });
+
+test('头文件宏上下文：后扫描的被包含头文件与不同源文件的 static 目标', (t) => {
+  const dir=fixture(t);
+  fs.writeFileSync(path.join(dir,'include/api.h'),'#include "z.h"\n#define Public(x) Private(x)\n#define Alias Private\n#define Run Step\n');
+  fs.writeFileSync(path.join(dir,'include/z.h'),'#define Private(x) Real(x)\n');
+  fs.writeFileSync(path.join(dir,'main.c'),'static int Step(void){return 1;} int Real(int x){return x;} void main(void){Public(1);Alias(1);Run();}');
+  fs.writeFileSync(path.join(dir,'other.c'),'static int Step(void){return 2;} void other(void){Run();}');
+  const m=buildIndex(dir);
+  for(const name of ['Public','Alias'])assert.deepEqual(m.headerSymbols.find(n=>n.name===name).targetIds,['main.c::Real']);
+  const run=m.headerSymbols.find(n=>n.name==='Run');
+  assert.deepEqual(run.targetIds.sort(),['main.c::Step','other.c::Step']);
+  assert.deepEqual(run.targetNames,['Step']);
+  assert.ok(!m.externals.some(n=>n.name==='Private'));
+  const g=subgraph(m,run.id,{up:1,down:1});
+  for(const id of ['main.c::Step','other.c::Step','main.c::main','other.c::other'])assert.ok(g.nodes.some(n=>n.id===id),id);
+});
