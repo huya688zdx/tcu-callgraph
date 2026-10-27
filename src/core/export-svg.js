@@ -13,6 +13,8 @@ import { roundedPathD } from './routing.js';
 import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
 
 const COLORS = {
+  added: '#D9303E',
+  modified: '#D89A00',
   direct: '#9A9890',
   macro: '#D85A30',
   fnptr: '#7F77DD',
@@ -151,10 +153,11 @@ export function exportSvg(view, { title = '' } = {}) {
   for (const e of v.edges || []) {
     if (!Array.isArray(e.points) || e.points.length < 2) continue;
     const d = roundedPathD(e.points, 7);
-    const c = COLORS[e.kind] || COLORS.direct;
+    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind in COLORS ? e.kind : 'direct';
+    const c = COLORS[style];
     const dash = e.kind === 'macro' || e.kind === 'fnptr' ? ' stroke-dasharray="5 3"' : '';
     out.push(
-      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${style})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 

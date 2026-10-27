@@ -51,6 +51,7 @@ const SECTIONS = [
       { path: 'edge.call', label: '函数调用', kind: 'line' },
       { path: 'edge.var', label: '变量访问', kind: 'dash' },
       { path: 'edge.added', label: '新增边', kind: 'line' },
+      { path: 'edge.modified', label: '修改边', kind: 'line' },
       { path: 'edge.manual', label: '手动连线预览', kind: 'dash' },
     ],
   },

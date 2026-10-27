@@ -114,7 +114,7 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
   const oldEdges = groupedEdges(beforeModel), newEdges = groupedEdges(afterModel), edges = [];
   for (const key of new Set([...oldEdges.keys(), ...newEdges.keys()])) {
     const a = oldEdges.get(key), b = newEdges.get(key);
-    edges.push({ ...(b || a), comparison: true, change: a ? b ? 'existing' : 'deleted' : 'added',
+    edges.push({ ...(b || a), comparison: true, comparisonKey: key, change: a ? b ? 'existing' : 'deleted' : 'added',
       beforeCalls: a?.calls || [], afterCalls: b?.calls || [],
       locations: { before: a ? { file: beforeModel._index.byId.get(a.from)?.file, line: a.line } : null,
         after: b ? { file: afterModel._index.byId.get(b.from)?.file, line: b.line } : null },

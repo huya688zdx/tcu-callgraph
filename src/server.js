@@ -7,6 +7,7 @@ import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildInd
 import { layoutElk } from './core/layout-elk.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { compareProjects, comparisonDataflow, comparisonGlobals } from './core/compare.js';
+import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from './core/comparison-status.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
@@ -58,6 +59,7 @@ const comparisonInfo = () => COMPARISON ? {
   summary: COMPARISON.summary, warnings: COMPARISON.warnings, macroChanges: COMPARISON.macroChanges,
   totalNodes: COMPARISON.totalNodes,
   mappings: COMPARISON.mappings,
+  manualStatusCount: COMPARISON.statusOverrides.nodes.size + COMPARISON.statusOverrides.edges.size,
 } : null;
 
 // 页面当前视图状态（入口 / 深度 / 选中）：前端上报，AI 通过 cg_page 工具读取，
@@ -650,10 +652,13 @@ async function buildView(
   }
   if (COMPARISON) {
     const ids = new Set(clean.map((n) => n.id));
-    viewEdges = [...MODEL.edges.filter((e) => ids.has(e.from) && ids.has(e.to)), ...viewEdges.filter((e) => e.manual)];
+    viewEdges = [...MODEL.edges, ...(MODEL.headerEdges || []).map((e) => ({ ...e, change: 'existing' })),
+      ...viewEdges.filter((e) => e.manual)].filter((e) => ids.has(e.from) && ids.has(e.to));
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
-    .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+    .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e))
+      : { ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' });
+  if (COMPARISON) clean = clean.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
   const macroNameMode = macroNameDefault();
   clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
@@ -976,6 +981,33 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/compare' && req.method !== 'POST') return json(res, { comparison: comparisonInfo() });
+    if (u.pathname === '/api/compare/status' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      const p = await readJson(req, res);
+      if (!COMPARISON || p.comparisonId !== COMPARISON.id) return json(res, { ok: false, error: '比较已切换，请刷新后重试' }, 409);
+      if (p.change !== null && !CHANGE_STATES.includes(p.change)) return bad(res, '状态必须是未修改、修改、新增、删除，或恢复自动判断');
+      const isNode = typeof p.nodeId === 'string';
+      const isEdge = typeof p.edgeId === 'string';
+      if (isNode === isEdge) return bad(res, '必须指定一个节点或连线');
+      let target = isNode ? MODEL._index.byId.get(p.nodeId) : MODEL.edges.find((e) => (e.comparisonKey || edgeKeyOf(e)) === p.edgeId);
+      if (!target && isEdge) {
+        const header = (MODEL.headerEdges || []).find((e) => edgeKeyOf(e) === p.edgeId);
+        if (header) target = { ...header, change: 'existing' };
+      }
+      if (!target && isEdge) {
+        for (const slot of Object.values(overlay.layout || {})) {
+          const manual = (slot.manual || []).find((e) => edgeKeyOf({ ...e, line: 0 }) === p.edgeId);
+          if (manual) { target = { ...manual, line: 0, kind: 'manual', change: 'existing' }; break; }
+        }
+      }
+      if (!target) return bad(res, '对象不在当前比较中');
+      const id = isNode ? p.nodeId : p.edgeId;
+      const overrides = COMPARISON.statusOverrides[isNode ? 'nodes' : 'edges'];
+      if (p.change === null) overrides.delete(id); else overrides.set(id, p.change);
+      COMPARISON.summary = statusSummary(COMPARISON);
+      broadcastChange('comparison.status', p.actor === 'ai' ? 'ai' : 'user', { comparisonId: COMPARISON.id });
+      return json(res, { ok: true, target: comparisonStatus(target, overrides, id), comparison: comparisonInfo() });
+    }
     if (u.pathname === '/api/compare/cancel' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       const p = await readJson(req, res);
@@ -1007,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
           if (!selected.length) throw new Error('请至少选择一个函数或变量');
           if (selected.some((id) => !preview.candidateIds.has(id))) throw new Error('选择项不在本次比较结果中');
           const comparison = preview.comparison;
+          const statuses = { nodes: statusOverrides(p.statusOverrides, preview.candidateIds), edges: new Map() };
           const retained = ids(p.retainIds || [], '保留项').filter((id) => MODEL._index.byId.has(id) && comparison.model._index.byId.has(id));
           const roots = [...new Set([...retained, ...selected])];
           if (roots.length > 600) throw new Error('保留与选择的节点合计超过 600 个，请减少选择');
@@ -1016,8 +1049,9 @@ const server = http.createServer(async (req, res) => {
           for (const id of selected) delete nextOverlay.deleted.nodes[id];
           for (const edge of comparison.model.edges) if (chosen.has(edge.from) || chosen.has(edge.to)) delete nextOverlay.deleted.edges[edgeKeyOf(edge)];
           if (!comparisonBase) comparisonBase = { MODEL, S, overlay, pageState };
-          COMPARISON = { ...comparison, roots, id: randomUUID(), previousComparisonId: COMPARISON?.id,
+          COMPARISON = { ...comparison, roots, statusOverrides: statuses, id: randomUUID(), previousComparisonId: COMPARISON?.id,
             totalNodes: comparison.model._index.byId.size };
+          COMPARISON.summary = statusSummary(COMPARISON);
           MODEL = comparison.model;
           ROOT_LABEL = PROJECT.name;
           S = nextStats; pageState = null;
@@ -1490,9 +1524,11 @@ const server = http.createServer(async (req, res) => {
       const fn = MODEL._index.byId.get(id);
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
-        node: { ...fn, bodyTokens: undefined },
-        inEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [],
-        outEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [],
+        node: { ...(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn), bodyTokens: undefined },
+        inEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [])
+          .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
+        outEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [])
+          .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
         overlay: overlay.nodes?.[id] || {},
       });
     }
@@ -1560,6 +1596,10 @@ const server = http.createServer(async (req, res) => {
       const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
+      if (COMPARISON) {
+        g.nodes = g.nodes.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
+        g.edges = g.edges.map((e) => comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)));
+      }
       g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();

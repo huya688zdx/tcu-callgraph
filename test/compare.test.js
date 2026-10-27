@@ -181,3 +181,21 @@ test('变更颜色只依据实际定义和关系差分；未改动的调用者�
   assert.equal(view.nodes.find(n=>n.id==='src/control.c::stable').color,undefined,'比较时不能沿用普通工程的人工变更色');
   assert.ok(view.edges.every(e=>e.change==='existing'));
 });
+
+test('比较视图保留头文件宏的调用者和实现映射', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compare-header-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const name of ['project', 'before', 'after']) {
+    fs.mkdirSync(path.join(dir, name));
+    fs.writeFileSync(path.join(dir, name, 'api.h'), '#define Run Real\n');
+    fs.writeFileSync(path.join(dir, name, 'main.c'), 'void Real(void) {}\nvoid main(void) { Run(); }\n');
+  }
+  const srv = await launchServer({ target: path.join(dir, 'project') }); t.after(() => srv.close());
+  const { get, post } = requests(srv);
+  const preview = await post('/api/compare', { beforePath: path.join(dir, 'before'), afterPath: path.join(dir, 'after') });
+  assert.equal((await post('/api/compare/apply', { previewId: preview.preview.id, selectedIds: ['main.c::main'] })).ok, true);
+  const id = 'header::api.h::Run';
+  const view = await get('/api/view?root=' + encodeURIComponent(id) + '&up=1&down=1');
+  assert.ok(view.edges.some((e) => e.from === 'main.c::main' && e.to === id));
+  assert.ok(view.edges.some((e) => e.from === id && e.to === 'main.c::Real'));
+});

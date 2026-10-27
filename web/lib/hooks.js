@@ -16,6 +16,7 @@ export const hooks = {
   /** 在原图中加入明确选中的比较结果。 */
   applyComparison: async () => {},
   restoreComparison: async () => {},
+  syncComparison: () => {},
   /** 应用一个书签：恢复入口集合、深度、模式并重新加载视图 */
   applyBookmark: async () => {},
 };

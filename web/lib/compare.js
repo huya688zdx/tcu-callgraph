@@ -4,6 +4,7 @@ import { t } from '../i18n.js';
 import { closeModal, openModal, esc } from './modal.js';
 import { syncProjectLabel } from './projects.js';
 import { state } from './state.js';
+import { statusOptions } from './change-status.js';
 
 const normalMode = document.getElementById('projectModeNormal');
 const compareMode = document.getElementById('projectModeCompare');
@@ -20,6 +21,8 @@ const browseButtons = document.querySelectorAll('[data-compare-browse]');
 let activeComparison = null;
 let preview = null;
 let selected = new Set();
+let statuses = new Map();
+const effectiveChange = (n) => statuses.get(n.id) || n.change;
 let selectionPage = 0;
 let applying = false;
 const pageSize = 100;
@@ -40,13 +43,14 @@ function renderSelection() {
   const q = pickSearch.value.trim().toLowerCase();
   const list = preview.candidates.filter((n) =>
     (pickType.value === 'all' || n.kind === pickType.value) &&
-    (pickChange.value === 'all' || (pickChange.value === 'changed' ? n.change !== 'existing' : n.change === pickChange.value)) &&
+    (pickChange.value === 'all' || (pickChange.value === 'changed' ? effectiveChange(n) !== 'existing' : effectiveChange(n) === pickChange.value)) &&
     (!q || `${n.name} ${n.file}`.toLowerCase().includes(q)));
   selectionPage = Math.min(selectionPage, Math.max(0, Math.ceil(list.length / pageSize) - 1));
   const loc = (n, version) => n.locations?.[version] ? `${n.locations[version].file}:${n.locations[version].line}` : '—';
   pickList.innerHTML = list.slice(selectionPage * pageSize, (selectionPage + 1) * pageSize).map((n) =>
     `<label class="compare-pick-row"><input type="checkbox" data-id="${esc(n.id)}" ${selected.has(n.id) ? 'checked' : ''}>
-      <span><b>${esc(n.name)}</b> · ${n.kind === 'var' ? '变量' : '函数'} · ${esc({ existing: '未修改', modified: '修改', added: '新增', deleted: '删除' }[n.change] || n.change)}
+      <span><b>${esc(n.name)}</b> · ${n.kind === 'var' ? '变量' : '函数'}
+      <select data-status-id="${esc(n.id)}" aria-label="${esc(n.name)} 状态">${statusOptions(statuses.get(n.id) || 'auto', n.change)}</select>
       <small>before：${esc(loc(n, 'before'))}<br>after：${esc(loc(n, 'after'))}</small>
       <small>${esc((n.reasons || []).join('；'))}${n.context ? ' · 调用上下文' : ''}</small></span></label>`
   ).join('') || '<div class="empty">没有符合筛选条件的对象</div>';
@@ -54,7 +58,7 @@ function renderSelection() {
   const total = new Set([...retained, ...selected]).size;
   const missing = (state.view?.nodes.length || 0) - retained.length;
   document.getElementById('comparePickRetainWarning').textContent = missing ? `原图有 ${missing} 个节点未在对照模型中找到，无法保留到比较图；取消可继续保留原画面。` : '';
-  document.getElementById('comparePickCount').textContent = `已选 ${selected.size} 项；保留原图 ${retained.length} 个节点；合计 ${total} / 600`;
+  document.getElementById('comparePickCount').textContent = `已选 ${selected.size} 项；保留原图 ${retained.length} 个节点；合计 ${total} / 600；手动状态 ${statuses.size} 项`;
   document.getElementById('comparePickPage').textContent = `${selectionPage + 1} / ${Math.max(1, Math.ceil(list.length / pageSize))} · ${list.length} 项`;
   document.getElementById('comparePickPrev').disabled = selectionPage === 0;
   document.getElementById('comparePickNext').disabled = (selectionPage + 1) * pageSize >= list.length;
@@ -66,10 +70,17 @@ function cancelSelection() {
   const id = preview?.id;
   preview = null;
   selected.clear();
+  statuses.clear();
   closeModal();
   if (id) api.cancelComparison(id).catch(() => {});
 }
 pickList?.addEventListener('change', (event) => {
+  if (event.target.dataset.statusId) {
+    const id = event.target.dataset.statusId;
+    if (event.target.value === 'auto') statuses.delete(id); else statuses.set(id, event.target.value);
+    renderSelection();
+    return;
+  }
   const id = event.target.dataset.id;
   if (!id) return;
   if (event.target.checked) selected.add(id); else selected.delete(id);
@@ -77,7 +88,7 @@ pickList?.addEventListener('change', (event) => {
 });
 for (const el of [pickSearch, pickType, pickChange]) el?.addEventListener('input', () => { selectionPage = 0; renderSelection(); });
 document.getElementById('comparePickChanged')?.addEventListener('click', () => {
-  selected = new Set(preview.candidates.filter((n) => n.change !== 'existing').map((n) => n.id)); renderSelection();
+  selected = new Set(preview.candidates.filter((n) => effectiveChange(n) !== 'existing').map((n) => n.id)); renderSelection();
 });
 document.getElementById('comparePickClear')?.addEventListener('click', () => { selected.clear(); renderSelection(); });
 document.getElementById('comparePickPrev')?.addEventListener('click', () => { selectionPage--; renderSelection(); });
@@ -100,7 +111,7 @@ pickApply?.addEventListener('click', async () => {
   picker.querySelector('.modal-close').disabled = true;
   pickError.textContent = '';
   try {
-    const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds: retainedIds() });
+    const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds: retainedIds(), statusOverrides: Object.fromEntries(statuses) });
     if (!result?.ok) throw new Error(result?.error || '加入失败');
     preview = null;
     activeComparison = result.comparison;
@@ -167,7 +178,7 @@ startBtn?.addEventListener('click', async () => {
       return;
     }
     preview = result.preview;
-    selected = new Set(); selectionPage = 0;
+    selected = new Set(); statuses = new Map(); selectionPage = 0;
     pickSearch.value = ''; pickType.value = 'all'; pickChange.value = 'changed';
     pickError.textContent = '';
     const warnings = preview.warnings || [];
@@ -230,6 +241,7 @@ export function syncComparison(comparison) {
       summaryEl.title = [activeComparison.projectPath, activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
       if (activeComparison.warnings?.length) summaryEl.textContent += ' · ' + t('compare.warningCount', { n: activeComparison.warnings.length });
       if (activeComparison.truncated) summaryEl.textContent += ' · ' + t('compare.truncated');
+      if (activeComparison.manualStatusCount) summaryEl.textContent += ` · 手动状态 ${activeComparison.manualStatusCount} 项`;
     }
   }
   if (exitBtn) exitBtn.hidden = !enabled;

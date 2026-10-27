@@ -338,6 +338,8 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     ? THEME.node.selected
     : e.change === 'added'
     ? THEME.edge.added
+    : e.change === 'modified'
+    ? THEME.edge.modified
     : e.kind === 'var'
     ? THEME.edge.var
     : THEME.edge.call;

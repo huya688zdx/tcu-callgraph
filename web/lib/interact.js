@@ -22,12 +22,14 @@ import {
   setEdgeChange,
   CHANGE_ITEMS,
   EDGE_ITEMS,
+  COMPARISON_ITEMS,
 } from './menu.js';
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
 import { renderLabelPanel } from './label-panel.js';
+import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
 function worldPos(e) {
@@ -252,9 +254,8 @@ els.cv.addEventListener('contextmenu', (e) => {
   if (n) {
     selectNode(n.id);
     if (n.kind === 'var') {
-      if (state.view?.comparison) return;
       // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
-      showMenu(e.clientX, e.clientY, n.name || n.id, CHANGE_ITEMS, n.change || 'existing', (v) =>
+      showMenu(e.clientX, e.clientY, n.name || n.id, state.view?.comparison ? COMPARISON_ITEMS : CHANGE_ITEMS, state.view?.comparison && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing', (v) =>
         setNodeChange(n, v)
       );
       return;
@@ -266,8 +267,7 @@ els.cv.addEventListener('contextmenu', (e) => {
   const edge = hitEdge(e);
   if (edge) {
     selectEdge(edge);
-    if (state.view?.comparison) return;
-    showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
+    showMenu(e.clientX, e.clientY, t('menu.edge'), state.view?.comparison ? [{ value: 'auto', label: 'status.auto' }, ...EDGE_ITEMS] : EDGE_ITEMS, state.view?.comparison && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
     return;
@@ -526,7 +526,11 @@ els.cv.addEventListener('pointermove', (e) => {
     els.tooltip.innerHTML = n
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
-      : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '对比连线（只读）' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+      : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+    if (n || hoveredEdge) {
+      const target = n || hoveredEdge;
+      els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
+    }
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -634,7 +638,7 @@ const nodeSelectionType = (n) => JSON.stringify([
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
   e.kind, e.kind === 'var' ? 'dashed' : 'solid',
-  e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
+  e.change === 'added' ? THEME.edge.added : e.change === 'modified' ? THEME.edge.modified : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
   e.change === 'deleted',
 ]);
 const labelSelectionType = (l) => JSON.stringify([

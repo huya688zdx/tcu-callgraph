@@ -63,6 +63,7 @@ export const api = {
   switchProject: (body) => post('/api/switch', body),
   compare: (body) => post('/api/compare', body),
   applyComparison: (body) => post('/api/compare/apply', body),
+  comparisonStatus: (body) => post('/api/compare/status', body),
   cancelComparison: (previewId) => post('/api/compare/cancel', { previewId }),
   exitComparison: () => post('/api/compare/exit', {}),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */

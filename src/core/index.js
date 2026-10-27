@@ -510,11 +510,11 @@ export function buildIndex(root, sourceFiles = null) {
 
   const allNodes = new Map([...byId, ...externals]);
   const callsByMacro = new Map();
-  for (const e of edges) for (const id of e.macroDefinitions || []) {
+  for (const e of edges.filter((edge) => edge.kind !== 'var')) for (const id of e.macroDefinitions || []) {
     if (!callsByMacro.has(id)) callsByMacro.set(id, []);
     callsByMacro.get(id).push(e);
   }
-  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.map((e) => e.callee)]), macros, callsByMacro);
+  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.filter((e) => e.kind !== 'var').map((e) => e.callee)]), macros, callsByMacro);
   for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
     const id = symbol.targetIds[i];
     if (!allNodes.has(id) && id.startsWith('ext::')) {

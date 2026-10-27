@@ -118,6 +118,7 @@ hooks.expandFunction = async (root, direction, depth) => {
   return loadView(state.roots, { incremental: true, expansions });
 };
 hooks.renderDetail = renderDetail;
+hooks.syncComparison = syncComparison;
 // live.js 收到 AI 改动推送后用它刷新画面（保留视角）；函数声明有提升，这里可以先引用
 hooks.reloadKeepCam = reloadKeepCam;
 let comparisonPage = null;

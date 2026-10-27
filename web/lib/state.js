@@ -90,6 +90,7 @@ export const THEME = {
     call: '#2C2C2A', // 函数调用
     var: '#2C2C2A', // 变量访问（虚线）
     added: '#D9303E', // 新增边
+    modified: '#D89A00', // 手动标记为修改的连线
     manual: '#639922', // 手动连线预览
   },
   node: {
@@ -131,6 +132,7 @@ function syncThemeSideEffects() {
   chip('lg-call', THEME.edge.call);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
+  chip('lg-modified', THEME.edge.modified);
   chip('lg-del', THEME.edge.call); // 删除边沿用调用色，只加 X 标记
 }
 
