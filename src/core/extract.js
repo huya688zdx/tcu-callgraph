@@ -304,7 +304,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
             line: member.line,
             cond: member.cond,
             via: `${recv}.${member.v}`,
-            macroChain: macroChain.slice(),
+            macroChain: (member.macroOrigins || macroChain).slice(),
           });
         } else {
           out.push({
@@ -314,7 +314,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
             line: member.line,
             cond: member.cond,
             via: recv ? `${recv}.${member.v}` : member.v,
-            macroChain: macroChain.slice(),
+            macroChain: (member.macroOrigins || macroChain).slice(),
           });
         }
         i += 2;
@@ -329,14 +329,19 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (ctx.macros.has(tk.v) && !macroChain.includes(tk.v)) {
       const m = ctx.macros.get(tk.v);
       if (m.params === null) {
-        const expanded = expandSeq([tk], ctx.macros);
+        // 对象宏也可能是函数别名：展开时必须带上调用括号和实参，
+        // 否则只剩一个裸函数名，递归扫描无法识别调用。
+        const call = tokens[i + 1]?.v === '(' ? collectArgs(tokens, i + 1) : null;
+        const next = call?.[0] ? call[1] : i + 1;
+        const expanded = expandSeq(tokens.slice(i, next).map((t) => ({ ...t, macroOrigins: t.macroOrigins || [] })), ctx.macros);
         scanCalls(expanded, ctx, out, [...macroChain, tk.v]);
+        i = next - 1;
         continue;
       }
       if (tokens[i + 1] && tokens[i + 1].v === '(') {
         const [args, next] = collectArgs(tokens, i + 1);
         if (args) {
-          const expanded = expandSeq(tokens.slice(i, next), ctx.macros);
+          const expanded = expandSeq(tokens.slice(i, next).map((t) => ({ ...t, macroOrigins: t.macroOrigins || [] })), ctx.macros);
           scanCalls(expanded, ctx, out, [...macroChain, tk.v]);
           i = next - 1;
           continue;
@@ -348,13 +353,14 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (tokens[i + 1] && tokens[i + 1].v === '(') {
       const prev = tokens[i - 1];
       if (prev && (prev.v === '.' || prev.v === '->')) continue;
+      const origins = tk.macroOrigins || macroChain;
       out.push({
         callee: tk.v,
-        kind: macroChain.length ? 'macro' : 'direct',
+        kind: origins.length ? 'macro' : 'direct',
         line: tk.line,
         cond: tk.cond,
-        via: macroChain.length ? macroChain.join(' > ') : undefined,
-        macroChain: macroChain.slice(),
+        via: origins.length ? origins.join(' > ') : undefined,
+        macroChain: origins.slice(),
       });
     }
   }

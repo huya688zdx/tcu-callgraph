@@ -38,12 +38,12 @@ export function buildSVGFromLayout(laid) {
   }
 
   for (const n of laid.nodes) {
-    out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.name)}">`);
+    out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.displayName || n.name)}">`);
     out.push(
       `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="#fff" stroke="#B5D4F4" stroke-width="1"/>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.name)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? '外部符号' : `${n.file}:${n.line}`)}</text>`
@@ -100,7 +100,7 @@ export async function exportHtml(model, outPath, opts = {}) {
     },
     nodes: laid.nodes.map((n) => ({
       id: n.id,
-      name: n.name,
+      name: n.displayName || n.name,
       file: n.file,
       line: n.line,
       fanIn: (model._index.inAdj.get(n.id) || []).length,

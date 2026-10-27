@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { compareProjects } from '../src/core/compare.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 
@@ -73,4 +75,21 @@ test('比较失败保留原工程：不存在的 after 不发布部分结果', a
   assert.equal((await get('/api/project')).path, original.path);
   assert.equal((await get('/api/project')).comparison, null);
   assert.ok((await get('/api/view')).nodes.some((n) => n.name === 'main'));
+});
+
+test('比较视图保留头文件宏的调用者和实现映射', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compare-header-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const name of ['project', 'before', 'after']) {
+    fs.mkdirSync(path.join(dir, name));
+    fs.writeFileSync(path.join(dir, name, 'api.h'), '#define Run Real\n');
+    fs.writeFileSync(path.join(dir, name, 'main.c'), 'void Real(void) {}\nvoid main(void) { Run(); }\n');
+  }
+  const srv = await launchServer({ target: path.join(dir, 'project') }); t.after(() => srv.close());
+  const { get, post } = requests(srv);
+  assert.equal((await post('/api/compare', { beforePath: path.join(dir, 'before'), afterPath: path.join(dir, 'after') })).ok, true);
+  const id = 'header::api.h::Run';
+  const view = await get('/api/view?root=' + encodeURIComponent(id) + '&up=1&down=1');
+  assert.ok(view.edges.some((e) => e.from === 'main.c::main' && e.to === id));
+  assert.ok(view.edges.some((e) => e.from === id && e.to === 'main.c::Real'));
 });

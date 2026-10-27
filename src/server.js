@@ -91,6 +91,16 @@ async function ensureAnalysis(model) {
 // 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
 const DEPTH_DOWN = [1, 2, 3, 5, 9];
 const DEPTH_UP = [0, 1, 2];
+const NAME_MODES = ['alias', 'target'];
+const macroNameDefault = () => store.getSetting('ui.macroNameMode', 'alias') === 'target' ? 'target' : 'alias';
+function withMacroName(node, viewOverlay, defaultMode) {
+  if (!node.headerSymbol) return node;
+  const override = viewOverlay.nodes?.[node.id]?.nameMode;
+  const nameModeOverride = NAME_MODES.includes(override) ? override : null;
+  const nameMode = nameModeOverride || defaultMode;
+  return { ...node, nameModeOverride, nameMode,
+    displayName: nameMode === 'target' ? node.targetNames.join(' / ') : node.name };
+}
 
 // ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
 const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
@@ -294,8 +304,11 @@ function matchNodeColor(v) {
 
 function buildFileTree(model) {
   const root = { name: ROOT_LABEL, type: 'dir', path: '', children: new Map() };
-  for (const fn of model.functions) {
-    const parts = String(fn.file).split('/');
+  const fileNodes = new Map();
+  const symbols = [...model.functions, ...(model.headerSymbols || [])];
+  const files = new Set([...model.files.map((f) => f.rel), ...symbols.map((n) => n.file)]);
+  for (const rel of files) {
+    const parts = String(rel).split('/');
     let cur = root;
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i];
@@ -310,8 +323,11 @@ function buildFileTree(model) {
         });
       }
       cur = cur.children.get(name);
-      if (isFile) cur.functions.push({ id: fn.id, name: fn.name, line: fn.line });
+      if (isFile) fileNodes.set(rel, cur);
     }
+  }
+  for (const fn of symbols) {
+    fileNodes.get(fn.file)?.functions.push({ id: fn.id, name: fn.name, line: fn.line });
   }
   const toObj = (n) => ({
     name: n.name,
@@ -631,10 +647,13 @@ async function buildView(
   }
   if (COMPARISON) {
     const ids = new Set(clean.map((n) => n.id));
-    viewEdges = MODEL.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    viewEdges = [...MODEL.edges, ...(MODEL.headerEdges || []).map((e) => ({ ...e, change: 'existing' }))]
+      .filter((e) => ids.has(e.from) && ids.has(e.to));
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  const macroNameMode = macroNameDefault();
+  clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -657,7 +676,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId,
+  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId, macroNameMode,
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -1381,7 +1400,7 @@ const server = http.createServer(async (req, res) => {
       const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
       if (!roots.length) {
         if (COMPARISON) return json(res, await buildView(COMPARISON.roots, 0, 0, group, null, varSel, viewOverlay, previous));
-        if (!MODEL.functions.length) {
+        if (!MODEL.functions.length && !MODEL.headerSymbols?.length) {
           return json(res, {
             nodes: [],
             edges: [],
@@ -1393,13 +1412,13 @@ const server = http.createServer(async (req, res) => {
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile
-          ? MODEL.functions.filter((f) => f.file === MODEL.focusFile)
-          : MODEL.functions;
+          ? [...MODEL.functions, ...(MODEL.headerSymbols || [])].filter((f) => f.file === MODEL.focusFile)
+          : MODEL.functions.length ? MODEL.functions : MODEL.headerSymbols;
         const deg = (id) => (MODEL._index.outAdj.get(id) || []).length;
         const entries = pool
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
-        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
+        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0] || MODEL.headerSymbols?.[0];
         return json(
           res,
           await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous)
@@ -1414,8 +1433,8 @@ const server = http.createServer(async (req, res) => {
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
         node: { ...fn, bodyTokens: undefined },
-        inEdges: MODEL._index.inAdj.get(id) || [],
-        outEdges: MODEL._index.outAdj.get(id) || [],
+        inEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [],
+        outEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [],
         overlay: overlay.nodes?.[id] || {},
       });
     }
@@ -1483,6 +1502,7 @@ const server = http.createServer(async (req, res) => {
       const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
+      g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();
       const inAdj = new Map();
@@ -1556,6 +1576,7 @@ const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then((patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
+          if (patch.data.nameMode !== undefined && patch.data.nameMode !== null && !NAME_MODES.includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias / target，或 null（跟随设置）');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           // 连线标签（一线可多条）：
@@ -1673,12 +1694,19 @@ const server = http.createServer(async (req, res) => {
         if (!guardWrite(req, res)) return;
         return readJson(req, res)
           .then((p) => {
+            const hasDepth = p.down !== undefined || p.up !== undefined;
+            const hasName = p.macroNameMode !== undefined;
+            if (!hasDepth && !hasName) return bad(res, '缺少界面偏好');
             const down = Number(p.down);
             const up = Number(p.up);
-            if (!DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
-            if (!DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
-            store.setSetting('ui.depth', { down, up });
-            json(res, { ok: true, down, up });
+            if (hasDepth && !DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
+            if (hasDepth && !DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
+            if (hasName && !NAME_MODES.includes(p.macroNameMode)) return bad(res, 'macroNameMode 必须是 alias / target');
+            store.transaction(() => {
+              if (hasDepth) store.setSetting('ui.depth', { down, up });
+              if (hasName) store.setSetting('ui.macroNameMode', p.macroNameMode);
+            });
+            json(res, { ok: true, ...(hasDepth ? { down, up } : {}), macroNameMode: macroNameDefault() });
           })
           .catch(() => {});
       }
@@ -1686,6 +1714,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         down: DEPTH_DOWN.includes(saved.down) ? saved.down : 1,
         up: DEPTH_UP.includes(saved.up) ? saved.up : 1,
+        macroNameMode: macroNameDefault(),
       });
     }
 

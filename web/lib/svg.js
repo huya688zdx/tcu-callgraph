@@ -120,7 +120,7 @@ function buildSVG() {
       out.push(`<circle cx="${(n.x + 8).toFixed(1)}" cy="${(n.y + 8).toFixed(1)}" r="3.2" fill="#EF9F27"/>`);
     }
     // 函数名带 ()、变量名不带；副标题：变量=类型，函数=文件:行号（与画布相同）
-    const label = isVar ? n.name || n.id : `${n.name || n.id}()`;
+    const label = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
     const sub = n.external
       ? t('node.external')
       : isVar
