@@ -93,3 +93,28 @@ test('头文件树、分组和名称切换：刷新、会话、AST 缓存保留�
   const invalid = await fetch(srv.baseUrl + '/api/overlay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nodeId: id, data: { nameMode: 'bad' } }) });
   assert.equal(invalid.status, 400);
 });
+
+test('宏名称优先级：节点选择优先于默认，清除选择后继续跟随设置', async (t) => {
+  const srv = await launchServer({ target: fixture(t) });
+  t.after(() => srv.close());
+  const id = 'header::include/api.h::ReadSpeed';
+  const get = async () => (await (await fetch(srv.baseUrl + '/api/view?root=' + encodeURIComponent(id))).json()).nodes.find((n) => n.id === id);
+  const post = async (url, body) => {
+    const r = await fetch(srv.baseUrl + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal(r.status, 200); return r.json();
+  };
+  assert.equal((await get()).nameModeOverride, null);
+  await post('/api/ui-prefs', { macroNameMode: 'target' });
+  assert.equal((await get()).displayName, 'Driver_ReadSpeed');
+  await post('/api/overlay', { nodeId: id, data: { nameMode: 'alias' } });
+  assert.equal((await get()).displayName, 'ReadSpeed');
+  assert.equal((await get()).nameModeOverride, 'alias');
+  await post('/api/ui-prefs', { macroNameMode: 'alias' });
+  await post('/api/ui-prefs', { macroNameMode: 'target' });
+  assert.equal((await get()).displayName, 'ReadSpeed');
+  await post('/api/overlay', { nodeId: id, data: { nameMode: null } });
+  assert.equal((await get()).displayName, 'Driver_ReadSpeed');
+  assert.equal((await get()).nameModeOverride, null);
+  await post('/api/ui-prefs', { macroNameMode: 'alias' });
+  assert.equal((await get()).displayName, 'ReadSpeed');
+});

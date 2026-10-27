@@ -8,12 +8,14 @@ let nameWrites = Promise.resolve();
 export async function setNodeName(n, mode) {
   if (!n?.headerSymbol || state.at > 0 || state.view?.comparison) return;
   const view = state.view;
-  const pending = nameWrites.then(() => api.overlay({ nodeId: n.id, data: { nameMode: mode }, projectId: view.projectId }));
+  const override = mode === 'default' ? null : mode;
+  const pending = nameWrites.then(() => api.overlay({ nodeId: n.id, data: { nameMode: override }, projectId: view.projectId }));
   nameWrites = pending.catch(() => {});
   const result = await pending;
   if (!result?.ok || state.view !== view) return;
-  n.nameMode = mode;
-  n.displayName = mode === 'target' ? n.targetNames.join(' / ') : n.name;
+  n.nameModeOverride = override;
+  n.nameMode = override || view.macroNameMode || 'alias';
+  n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;
   draw();
   pushHistory();
   if (state.selected === n.id) hooks.renderDetail(n.id);

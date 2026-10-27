@@ -34,8 +34,9 @@ export function showNodeMenu(x, y, n) {
   const comparing = Boolean(state.view?.comparison);
   const sections = [
     ...(n.headerSymbol ? [{ id: 'name', label: 'name.title', items: [
-      { value: 'name:alias', label: 'name.alias', active: n.nameMode !== 'target' },
-      { value: 'name:target', label: 'name.target', active: n.nameMode === 'target' },
+      { value: 'name:default', label: 'name.default', active: !n.nameModeOverride },
+      { value: 'name:alias', label: 'name.alias', active: n.nameModeOverride === 'alias' },
+      { value: 'name:target', label: 'name.target', active: n.nameModeOverride === 'target' },
     ] }] : []),
     {
       id: 'locate',

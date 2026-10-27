@@ -91,6 +91,8 @@ async function ensureAnalysis(model) {
 // 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
 const DEPTH_DOWN = [1, 2, 3, 5, 9];
 const DEPTH_UP = [0, 1, 2];
+const NAME_MODES = ['alias', 'target'];
+const macroNameDefault = () => store.getSetting('ui.macroNameMode', 'alias') === 'target' ? 'target' : 'alias';
 
 // ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
 const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
@@ -641,9 +643,12 @@ async function buildView(
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  const macroNameMode = macroNameDefault();
   for (const n of clean) {
     if (n.headerSymbol) {
-      n.nameMode = viewOverlay.nodes?.[n.id]?.nameMode === 'target' ? 'target' : 'alias';
+      const override = viewOverlay.nodes?.[n.id]?.nameMode;
+      n.nameModeOverride = NAME_MODES.includes(override) ? override : null;
+      n.nameMode = n.nameModeOverride || macroNameMode;
       n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;
     }
   }
@@ -669,7 +674,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId,
+  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId, macroNameMode,
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -1568,7 +1573,7 @@ const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then((patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
-          if (patch.data.nameMode !== undefined && !['alias', 'target'].includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias 或 target');
+          if (patch.data.nameMode !== undefined && patch.data.nameMode !== null && !NAME_MODES.includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias / target，或 null（跟随设置）');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           // 连线标签（一线可多条）：
@@ -1686,12 +1691,19 @@ const server = http.createServer(async (req, res) => {
         if (!guardWrite(req, res)) return;
         return readJson(req, res)
           .then((p) => {
+            const hasDepth = p.down !== undefined || p.up !== undefined;
+            const hasName = p.macroNameMode !== undefined;
+            if (!hasDepth && !hasName) return bad(res, '缺少界面偏好');
             const down = Number(p.down);
             const up = Number(p.up);
-            if (!DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
-            if (!DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
-            store.setSetting('ui.depth', { down, up });
-            json(res, { ok: true, down, up });
+            if (hasDepth && !DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
+            if (hasDepth && !DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
+            if (hasName && !NAME_MODES.includes(p.macroNameMode)) return bad(res, 'macroNameMode 必须是 alias / target');
+            store.transaction(() => {
+              if (hasDepth) store.setSetting('ui.depth', { down, up });
+              if (hasName) store.setSetting('ui.macroNameMode', p.macroNameMode);
+            });
+            json(res, { ok: true, ...(hasDepth ? { down, up } : {}), macroNameMode: macroNameDefault() });
           })
           .catch(() => {});
       }
@@ -1699,6 +1711,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, {
         down: DEPTH_DOWN.includes(saved.down) ? saved.down : 1,
         up: DEPTH_UP.includes(saved.up) ? saved.up : 1,
+        macroNameMode: macroNameDefault(),
       });
     }
 

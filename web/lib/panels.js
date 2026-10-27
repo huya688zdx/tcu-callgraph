@@ -590,8 +590,9 @@ async function renderDetail(id) {
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
       <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
-        <option value="alias" ${target.nameMode !== 'target' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
-        <option value="target" ${target.nameMode === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
+        <option value="default" ${!target.nameModeOverride ? 'selected' : ''}>${t('name.default')}（${t(target.nameMode === 'target' ? 'name.target' : 'name.alias')}）</option>
+        <option value="alias" ${target.nameModeOverride === 'alias' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
+        <option value="target" ${target.nameModeOverride === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
       </select></label>` : ''}
     ${state.view?.comparison ? comparisonDetail(n) : ''}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
