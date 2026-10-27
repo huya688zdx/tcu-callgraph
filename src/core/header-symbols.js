@@ -28,9 +28,9 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
         scanCalls(expanded, { macros: new Map(), fnptr: new Map() }, calls);
         names = [...new Set(calls.map((c) => c.callee).filter((n) => n && !callable.params.includes(n)))];
       } else continue;
-      if (!names.length || names.includes(m.name)) continue;
       const id = `header::${p.rel}::${m.name}`;
       const calls = invocations.get(id) || [];
+      if ((!names.length && !calls.length) || names.includes(m.name)) continue;
       const targetIds = calls.length ? [...new Set(calls.map((e) => e.to))] : names.map((n) => resolveCallee(n, p.rel));
       if (calls.length) names = [...new Set(calls.map((e) => e.callee))];
       symbols.push({ id, name: m.name, file: p.rel,
