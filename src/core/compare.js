@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { buildIndex, listSourceFiles, rebuildIndex } from './index.js';
+import { buildIndex, rebuildIndex } from './index.js';
+import { comparisonFiles } from './compare-files.js';
 import { getParser, collectDefinitions } from './cparse.js';
 import { analysisSources, buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { lex } from './lexer.js';
@@ -56,8 +57,7 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
   if (new Set(identities).size !== 3) {
     throw new Error('总代码、修改前对照、修改后对照必须是三个不同的目录');
   }
-  const filesOf = (root) => new Map(listSourceFiles(root).map((abs) => [path.relative(root, abs).replace(/\\/g, '/'), abs]));
-  const baseFiles = filesOf(projectPath), beforeFiles = filesOf(beforePath), afterFiles = filesOf(afterPath);
+  const { baseFiles, beforeFiles, afterFiles, mappings } = comparisonFiles(projectPath, beforePath, afterPath);
   const scope = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
   if (!scope.size) throw new Error('对照目录中没有可解析的 C 文件');
   if (!baseFiles.size) throw new Error('请先打开包含完整 C 源码的总代码目录');
@@ -72,18 +72,22 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
   const beforeModel = buildIndex(projectPath, withOverrides(beforeFiles));
   const afterModel = buildIndex(projectPath, withOverrides(afterFiles));
   for (const m of [beforeModel, afterModel]) {
+    if (m.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${m.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
     if (!m.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${m.root}`);
     if (m.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
-    await buildDataflowIndex(m);
+    const df = await buildDataflowIndex(m);
+    if (df.failedFiles) throw new Error('部分源码分析失败，无法发布不完整的比较结果');
   }
   const beforeDefs = await definitionsOf(beforeModel), afterDefs = await definitionsOf(afterModel);
   const warnings = [...beforeModel.warnings, ...afterModel.warnings].map((w) => `${w.file}：${w.error}`);
+  for (const mapping of mappings) if (mapping.source !== mapping.target) warnings.push(`${mapping.version}/${mapping.source} → ${mapping.target}`);
   for (const file of new Set([...beforeDefs.other.keys(), ...afterDefs.other.keys()])) {
     const a = beforeDefs.other.get(file) || fingerprint(''), b = afterDefs.other.get(file) || fingerprint('');
     if (a !== b) warnings.push(`${file} 存在类型或声明变更，请结合定义差分核对影响`);
   }
   const summary = { functions: blankCounts(), variables: blankCounts() };
   const merged = new Map();
+  const indirect = new Set();
   for (const [kind, listKey] of [['fn', 'functions'], ['var', 'variables'], ['external', 'externals']]) {
     const old = new Map((beforeModel[listKey] || []).map((n) => [n.id, n]));
     const now = new Map((afterModel[listKey] || []).map((n) => [n.id, n]));
@@ -91,19 +95,19 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
       const a = old.get(id), b = now.get(id), reasons = [];
       let change = a ? b ? 'existing' : 'deleted' : 'added';
       if (a && b && kind !== 'external') {
-        if (!beforeDefs.raw.has(id) || !afterDefs.raw.has(id) || !beforeDefs.expanded.has(id) || !afterDefs.expanded.has(id)) {
-          change = 'modified'; reasons.push('定义解析不完整，请核对源码');
-          warnings.push(`${id} 的完整定义未能解析`);
-        } else if (beforeDefs.raw.get(id).value !== afterDefs.raw.get(id).value) {
+        if (beforeDefs.raw.has(id) && afterDefs.raw.has(id) && beforeDefs.raw.get(id).value !== afterDefs.raw.get(id).value) {
           change = 'modified'; reasons.push('定义修改');
+        } else if (!beforeDefs.raw.has(id) || !afterDefs.raw.has(id) || !beforeDefs.expanded.has(id) || !afterDefs.expanded.has(id)) {
+          indirect.add(id); reasons.push('定义解析不完整，未判为代码修改，请核对源码');
+          warnings.push(`${id} 的完整定义未能解析`);
         } else if (beforeDefs.expanded.get(id).value !== afterDefs.expanded.get(id).value) {
-          change = 'modified'; reasons.push('宏展开变化');
+          indirect.add(id); reasons.push('宏展开变化（定义源码未修改）');
         }
       }
       if (change === 'added') reasons.push('仅修改后存在');
       if (change === 'deleted') reasons.push('仅修改前存在');
       if (summary[listKey]) summary[listKey][change]++;
-      merged.set(id, { ...(b || a), kind: kind === 'external' ? 'fn' : kind, change, reasons,
+      merged.set(id, { ...(b || a), kind: kind === 'external' ? 'fn' : kind, change, reasons, ...(indirect.has(id) ? { impact: true } : {}),
         locations: { before: location(a), after: location(b) }, versions: [a && 'before', b && 'after'].filter(Boolean) });
     }
   }
@@ -118,7 +122,7 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
   }
   const direct = new Set([...merged.values()].filter((n) => !n.external && n.change !== 'existing').map((n) => n.id));
   // 关系变动本身也必须入图，例如指针实参绑定改变而函数文本没变。
-  const visible = new Set(direct);
+  const visible = new Set([...direct, ...indirect]);
   for (const e of edges.filter((e) => e.change !== 'existing')) { visible.add(e.from); visible.add(e.to); }
   const starts = [...visible];
   for (const id of starts) if (!direct.has(id) && merged.has(id)) {
@@ -149,7 +153,7 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
       } else {
         for (const e of m._index.inAdj.get(id) || []) if (e.kind !== 'var') add(e.from, `调用 ${n.name}()`);
         for (const a of n.varAccess || []) if (a.write) add(a.id, `由 ${n.name}() 写入`);
-        if (direct.has(id)) for (const e of m._index.outAdj.get(id) || []) {
+        if (direct.has(id) || indirect.has(id)) for (const e of m._index.outAdj.get(id) || []) {
           const target = merged.get(e.to);
           if (target) { visible.add(e.to); target.context = true; }
         }
@@ -167,7 +171,7 @@ export async function compareProjects(projectPath, beforePath, afterPath) {
   const macroChanges = [...new Set([...oldMacros.keys(), ...newMacros.keys()])].filter((key) =>
     fingerprint(JSON.stringify(oldMacros.get(key)?.params) + (oldMacros.get(key)?.raw || '')) !==
     fingerprint(JSON.stringify(newMacros.get(key)?.params) + (newMacros.get(key)?.raw || '')));
-  return { projectPath, beforePath, afterPath, beforeModel, afterModel, model, summary, roots: [...visible], warnings,
+  return { projectPath, beforePath, afterPath, beforeModel, afterModel, model, summary, roots: [...visible], warnings, mappings,
     macroChanges, totalNodes: visible.size };
 }
 

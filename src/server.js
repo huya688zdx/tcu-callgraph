@@ -50,11 +50,14 @@ let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {}
 // 工程切换互斥：openTarget 里有 await，不挡的话两个切换请求会交错改写上面这批变量
 let switching = false;
 let COMPARISON = null;
+let comparisonPreview = null;
+let comparisonBase = null;
 const comparisonInfo = () => COMPARISON ? {
   id: COMPARISON.id, projectPath: COMPARISON.projectPath, projectName: PROJECT.name,
   beforePath: COMPARISON.beforePath, afterPath: COMPARISON.afterPath,
   summary: COMPARISON.summary, warnings: COMPARISON.warnings, macroChanges: COMPARISON.macroChanges,
   totalNodes: COMPARISON.totalNodes,
+  mappings: COMPARISON.mappings,
 } : null;
 
 // 页面当前视图状态（入口 / 深度 / 选中）：前端上报，AI 通过 cg_page 工具读取，
@@ -647,7 +650,7 @@ async function buildView(
   }
   if (COMPARISON) {
     const ids = new Set(clean.map((n) => n.id));
-    viewEdges = MODEL.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    viewEdges = [...MODEL.edges.filter((e) => ids.has(e.from) && ids.has(e.to)), ...viewEdges.filter((e) => e.manual)];
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
@@ -658,7 +661,7 @@ async function buildView(
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
     const ov = viewOverlay.nodes?.[n.id];
-    if (ov) Object.assign(n, { note: ov.note, color: ov.color, tag: ov.tag });
+    if (ov) Object.assign(n, { note: ov.note, color: COMPARISON ? undefined : ov.color, tag: ov.tag });
     // 既存 / 変更 / 追加 / 削除，前端据此决定背景色与线框样式
     n.change = COMPARISON ? n.change || 'existing' : (ov && ov.change) || 'existing';
     n.kind = n.kind === 'var' ? 'var' : 'fn';
@@ -722,7 +725,7 @@ const server = http.createServer(async (req, res) => {
   let u;
   try {
     u = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/exit'].includes(u.pathname);
+    req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/apply', '/api/compare/exit'].includes(u.pathname);
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
@@ -973,24 +976,66 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/compare' && req.method !== 'POST') return json(res, { comparison: comparisonInfo() });
-    if (['/api/compare', '/api/compare/exit'].includes(u.pathname) && req.method === 'POST') {
+    if (u.pathname === '/api/compare/cancel' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      const p = await readJson(req, res);
+      if (comparisonPreview?.id === p.previewId) comparisonPreview = null;
+      return json(res, { ok: true });
+    }
+    if (['/api/compare', '/api/compare/apply', '/api/compare/exit'].includes(u.pathname) && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       switching = true;
       try {
         const p = await readJson(req, res);
         if (u.pathname.endsWith('/exit')) {
-          if (COMPARISON) await openTarget(COMPARISON.projectPath);
-        } else {
-          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath);
-          // 计算全部成功后才发布，失败不会留下半份工程。
-          COMPARISON = { ...comparison, id: randomUUID() };
+          if (COMPARISON && comparisonBase) {
+            ({ MODEL, S, overlay, pageState } = comparisonBase);
+            COMPARISON = null;
+            comparisonBase = null;
+          }
+          comparisonPreview = null;
+        } else if (u.pathname.endsWith('/apply')) {
+          const preview = comparisonPreview;
+          if (!preview || p.previewId !== preview.id || preview.model !== MODEL || preview.projectId !== PROJECT.id) {
+            return json(res, { ok: false, error: '比较预览已失效，请重新解析' }, 409);
+          }
+          const ids = (value, name) => {
+            if (!Array.isArray(value) || value.length > 600 || value.some((id) => typeof id !== 'string')) throw new Error(`${name} 必须是最多 600 项的标识数组`);
+            return [...new Set(value)];
+          };
+          const selected = ids(p.selectedIds, '选择项');
+          if (!selected.length) throw new Error('请至少选择一个函数或变量');
+          if (selected.some((id) => !preview.candidateIds.has(id))) throw new Error('选择项不在本次比较结果中');
+          const comparison = preview.comparison;
+          const retained = ids(p.retainIds || [], '保留项').filter((id) => MODEL._index.byId.has(id) && comparison.model._index.byId.has(id));
+          const roots = [...new Set([...retained, ...selected])];
+          if (roots.length > 600) throw new Error('保留与选择的节点合计超过 600 个，请减少选择');
+          const nextStats = stats(comparison.model);
+          const nextOverlay = structuredClone(overlay);
+          const chosen = new Set(selected);
+          for (const id of selected) delete nextOverlay.deleted.nodes[id];
+          for (const edge of comparison.model.edges) if (chosen.has(edge.from) || chosen.has(edge.to)) delete nextOverlay.deleted.edges[edgeKeyOf(edge)];
+          if (!comparisonBase) comparisonBase = { MODEL, S, overlay, pageState };
+          COMPARISON = { ...comparison, roots, id: randomUUID(), previousComparisonId: COMPARISON?.id,
+            totalNodes: comparison.model._index.byId.size };
           MODEL = comparison.model;
           ROOT_LABEL = PROJECT.name;
-          S = stats(MODEL); pageState = null;
-          overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {} }, layout: {} };
+          S = nextStats; pageState = null;
+          // 原图的标注、手工关系仍可见；主动选择的对象允许重新入图。
+          overlay = nextOverlay;
+          comparisonPreview = null;
+        } else {
+          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath);
+          const candidates = [...comparison.model.functions, ...comparison.model.variables].filter((n) => !n.external)
+            .map(({ id, name, file, line, kind, change, reasons, locations, impact, context }) =>
+              ({ id, name, file, line, kind: kind === 'var' ? 'var' : 'fn', change, reasons, locations, impact, context }));
+          comparisonPreview = { id: randomUUID(), projectId: PROJECT.id, model: MODEL, comparison, candidateIds: new Set(candidates.map((n) => n.id)) };
+          return json(res, { ok: true, preview: { id: comparisonPreview.id, projectId: PROJECT.id,
+            summary: comparison.summary, warnings: comparison.warnings, mappings: comparison.mappings, candidates,
+            validRetainIds: [...comparison.model._index.byId.keys()] } });
         }
         broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL });
-        return json(res, { ok: true, comparison: comparisonInfo() });
+        return json(res, { ok: true, comparison: comparisonInfo(), roots: COMPARISON?.roots || [] });
       } catch (err) {
         if (!res.headersSent) return json(res, { ok: false, error: String(err.message || err) }, 400);
       } finally { switching = false; }
@@ -1014,6 +1059,8 @@ const server = http.createServer(async (req, res) => {
         }
         if (!targetPath) return bad(res, 'id 或 path 必须给一个');
         const { project, stats: st } = await openTarget(targetPath);
+        comparisonPreview = null;
+        comparisonBase = null;
         // 打开着的页面整体重载：跨工程没有任何状态可保留。
         broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name });
         json(res, {
@@ -1352,6 +1399,8 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/view') {
       let previous = null;
       let expansions = [];
+      let bodyRoots = null;
+      let bodyVars = null, bodyHiddenVars = null;
       if (req.method === 'POST') {
         if (!guardWrite(req, res)) return;
         let body;
@@ -1359,7 +1408,15 @@ const server = http.createServer(async (req, res) => {
         try { expansions = normalizeExpansions(body.expansions); } catch (err) { return bad(res, err.message); }
         expansions = expansions.filter((e) => MODEL._index.byId.has(e.root) && MODEL._index.byId.get(e.root).kind !== 'var');
         if (body.projectId != null && body.projectId !== PROJECT.id) return json(res, { error: '工程已切换，请重试' }, 409);
-        if (body.previous == null && !body.expansions?.length) return bad(res, '缺少增量布局或局部展开参数');
+        if (body.roots !== undefined) {
+          if (!Array.isArray(body.roots) || body.roots.length > 600 || body.roots.some((id) => typeof id !== 'string')) return bad(res, 'roots 必须是最多 600 项的标识数组');
+          bodyRoots = body.roots;
+        }
+        for (const key of ['vars', 'hiddenVars']) if (body[key] !== undefined &&
+          (!Array.isArray(body[key]) || body[key].length > 600 || body[key].some((id) => typeof id !== 'string'))) return bad(res, `${key} 必须是最多 600 项的标识数组`);
+        bodyVars = body.vars;
+        bodyHiddenVars = body.hiddenVars;
+        if (body.previous == null && !body.expansions?.length && !bodyRoots?.length) return bad(res, '缺少增量布局、局部展开或入口参数');
         previous = body.previous;
         if (previous != null) {
           const rect = (n) => n && typeof n.id === 'string' &&
@@ -1376,23 +1433,25 @@ const server = http.createServer(async (req, res) => {
               e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
             return bad(res, '增量布局连线无效');
           }
-          if (previous.projectId !== PROJECT.id || previous.comparisonId !== COMPARISON?.id) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
+          const sameComparison = previous.comparisonId === COMPARISON?.id ||
+            (COMPARISON && previous.comparisonId === COMPARISON.previousComparisonId);
+          if (previous.projectId !== PROJECT.id || !sameComparison) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
         }
       }
       const rootsParam = u.searchParams.get('roots');
       const rootId = u.searchParams.get('root');
-      const roots = rootsParam
+      const roots = bodyRoots || (rootsParam
         ? rootsParam.split(',').filter(Boolean)
         : rootId
         ? [rootId]
-        : [];
+        : []);
       const up = Number(u.searchParams.get('up') ?? 1);
       const down = Number(u.searchParams.get('down') ?? 1);
       const group = u.searchParams.get('group') !== '0';
       if (previous && !!previous.groups.length !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
-      const varSel = { want: split('vars'), skip: split('novars'), expansions };
+      const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       const at = Number(u.searchParams.get('at') || 0);
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
