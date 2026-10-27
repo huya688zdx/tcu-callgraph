@@ -159,6 +159,7 @@ function openPalette(item, anchor) {
     chip.addEventListener('click', () => {
       if (!setThemeColor(item.path, chip.dataset.c)) return;
       if (input) input.value = chip.dataset.c;
+      syncSwatches(); // input.value 赋值不触发 input 事件，面板色样要手动刷
       persist();
       draw();
       closePalette();
@@ -167,15 +168,22 @@ function openPalette(item, anchor) {
   palEl.querySelector('.pal-custom').addEventListener('click', () => {
     closePalette();
     // 新版 Chromium 禁止用 click() 程序化拉起取色器，必须走 showPicker()；
-    // showPicker 需要用户手势（这里在 click 回调里，满足），老内核没有该 API 再回退 click()
+    // showPicker 需要用户手势（这里在 click 回调里，满足），老内核没有该 API 再回退 click()。
+    // 回退的合成 click 会冒泡到 .sw-wrap 拦截器被 preventDefault 掉，先给 input 挂一次性
+    // stopPropagation 放行（label 文字点击的转发仍照常拦截，不会绕过应用内调色板）
+    const openNative = () => {
+      if (!input) return;
+      input.addEventListener('click', (e) => e.stopPropagation(), { once: true });
+      input.click();
+    };
     if (input && typeof input.showPicker === 'function') {
       try {
         input.showPicker();
       } catch {
-        input.click();
+        openNative();
       }
     } else {
-      input?.click();
+      openNative();
     }
   });
   document.body.appendChild(palEl);
