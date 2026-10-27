@@ -631,9 +631,10 @@ els.cv.addEventListener('lostpointercapture', cancelDrag);
 const nodeSelectionType = (n) => JSON.stringify([
   n.kind === 'var' ? 'var' : 'function', !!n.external,
   (n.color || (n.external ? THEME.node.external : THEME.fill[n.change] || THEME.fill.existing)).toLowerCase(),
+  n.kind === 'var' ? THEME.node.varDash : THEME.node.fnDash,
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
-  e.kind, e.kind === 'var' ? 'dashed' : 'solid',
+  e.kind, (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash) ? 'dashed' : 'solid',
   e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
   e.change === 'deleted',
 ]);

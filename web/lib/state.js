@@ -88,16 +88,22 @@ export const THEME = {
   bg: '#F7F6F2',
   edge: {
     call: '#2C2C2A', // 函数调用
-    var: '#2C2C2A', // 变量访问（虚线）
+    var: '#2C2C2A', // 变量访问
     added: '#D9303E', // 新增边
     manual: '#639922', // 手动连线预览
+    callDash: false, // 函数调用虚线（默认实线）
+    varDash: true, // 变量访问虚线（默认虚线）
+    selPulse: true, // 选中线柔光呼吸（样式面板可关）
   },
   node: {
     border: '#3A3A36', // 函数框描边
+    varBorder: '#3A3A36', // 变量框描边
     externalBorder: '#D3D1C7', // 外部符号描边
     external: '#FAFAF7', // 外部符号底色
     selected: '#185FA5', // 选中高亮
     hover: '#378ADD', // 悬停高亮
+    fnDash: true, // 函数框虚线（关 = 实线）
+    varDash: false, // 变量框虚线（开 = 虚线）
   },
   /** 变更分类底色：既存 / 变更 / 追加 / 删除（画布右键分类菜单与图例同源） */
   fill: {
@@ -131,7 +137,16 @@ function syncThemeSideEffects() {
   chip('lg-call', THEME.edge.call);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
-  chip('lg-del', THEME.edge.call); // 删除边沿用调用色，只加 X 标记
+  // 虚实开关只改线型不改色，图例也要跟着换，否则与画布不一致（离线导出复制图例 DOM 会带出去）
+  const chipDash = (id, dash) => {
+    const el = document.getElementById(id);
+    if (el) el.style.borderTopStyle = dash ? 'dashed' : 'solid';
+  };
+  chipDash('lg-call', THEME.edge.callDash);
+  chipDash('lg-var', THEME.edge.varDash);
+  // 删除边沿用调用色、中央带 X：图例里画的是 SVG，所以走 color 而不是 border
+  const delChip = document.getElementById('lg-del');
+  if (delChip) delChip.style.color = THEME.edge.call;
 }
 
 /** 设置单个颜色（'fill.existing' 这类路径）。非法值拒绝，返回是否成功 */
@@ -150,11 +165,27 @@ export function setThemeColor(path, value) {
   return true;
 }
 
-/** 批量应用（启动恢复 / 离线快照）：只认合法的十六进制色，缺项保持默认 */
+/** 设置布尔型主题项（框/线的虚实开关）。类型不符拒绝，返回是否成功 */
+export function setThemeFlag(path, value) {
+  const keys = path.split('.');
+  let obj = THEME;
+  for (let i = 0; i < keys.length - 1; i++) {
+    obj = obj[keys[i]];
+    if (!obj || typeof obj !== 'object') return false;
+  }
+  const last = keys[keys.length - 1];
+  if (typeof obj[last] !== 'boolean' || typeof value !== 'boolean') return false;
+  obj[last] = value;
+  syncThemeSideEffects();
+  return true;
+}
+
+/** 批量应用（启动恢复 / 离线快照）：颜色与布尔开关各走各的校验，缺项保持默认 */
 export function applyTheme(saved = {}, prefix = '') {
   for (const [key, value] of Object.entries(saved || {})) {
     const path = prefix + key;
     if (value && typeof value === 'object') applyTheme(value, path + '.');
+    else if (typeof value === 'boolean') setThemeFlag(path, value);
     else setThemeColor(path, value);
   }
 }

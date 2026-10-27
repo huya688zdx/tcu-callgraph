@@ -255,6 +255,8 @@
   }
   #legend span { display: inline-flex; align-items: center; white-space: nowrap; }
   #legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; margin-right: 5px; flex: 0 0 auto; }
+  /* 删除图例画的是「线 + 中央 X」的小 SVG，颜色由主题同步写到 color（currentColor） */
+  #legend #lg-del { border-top: 0; height: auto; color: #2C2C2A; display: inline-flex; align-items: center; }
   #legend em { font-style: normal; }
 
   /* 文件区自己滚：aside 固定占满一列，避免 aside 与 tree-sec 两条滚动条叠在一起 */
@@ -434,19 +436,49 @@
 
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
-  /* 样式设置：每行 = 名称 + 与画布同款的小预览 + 取色器 */
-  .style-sec + .style-sec { border-top: 1px solid #F1EFE8; margin-top: 10px; padding-top: 6px; }
-  .style-sec h3 { margin: 4px 0 2px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
-  .style-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; cursor: pointer; }
-  .style-row .sl { flex: 1; font-size: 12.5px; }
-  .sw { flex: 0 0 auto; }
-  .sw-line { width: 30px; border-top: 3px solid #000; }
-  .sw-line.dash { border-top-style: dashed; }
-  .sw-box { width: 30px; height: 18px; border-radius: 5px; border: 1px solid rgba(0,0,0,.25); display: inline-block; }
-  .style-row input[type=color] {
-    width: 40px; height: 26px; padding: 1px 2px; border: 1px solid rgba(0,0,0,.16);
-    border-radius: 6px; background: #fff; cursor: pointer;
+  /* 样式设置：两列紧凑网格；点色样弹应用内调色板（预设网格 + 自定义入口），不直接弹系统调色盘 */
+  #styleModal { width: 520px; }
+  .style-sec { padding: 6px 2px 2px; }
+  .style-sec + .style-sec { border-top: 1px solid #F1EFE8; margin-top: 4px; }
+  .style-sec h3 { margin: 0 0 4px; font-size: 11px; font-weight: 600; color: #A8A69C; letter-spacing: .05em; }
+  .style-rows { display: grid; grid-template-columns: 1fr 1fr; column-gap: 16px; }
+  .style-row {
+    display: flex; align-items: center; gap: 8px; height: 27px;
+    padding: 0 5px; border-radius: 6px; font-size: 12px;
   }
+  .style-row:hover { background: #F5F4EF; }
+  .style-row .sl { flex: 1; color: #2C2C2A; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sw-wrap { position: relative; width: 30px; height: 18px; flex: 0 0 auto; cursor: pointer; border-radius: 4px; }
+  .sw-wrap:hover { box-shadow: 0 0 0 2px #B5D4F4; }
+  .sw { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .sw-box { border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.18); }
+  .sw-picker { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; border: 0; padding: 0; }
+  /* 虚实线型开关：直接画成实线/虚线图形的小按钮 */
+  .seg { display: inline-flex; gap: 3px; flex: 0 0 auto; }
+  .seg button {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 18px; padding: 0; cursor: pointer;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 4px; background: #fff; color: #5F5E5A;
+  }
+  .seg button.on { border-color: #185FA5; background: #E6F1FB; color: #185FA5; }
+  .seg button:hover:not(.on) { background: #F1EFE8; }
+  .seg svg { display: block; }
+  /* 应用内调色板弹出层 */
+  .pal-pop {
+    position: fixed; z-index: 60; padding: 8px;
+    background: #fff; border: 1px solid #DEDDD6; border-radius: 10px;
+    box-shadow: 0 8px 24px #00000026;
+  }
+  .pal-grid { display: grid; grid-template-columns: repeat(6, 22px); gap: 5px; }
+  .pal-chip { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,.15); }
+  .pal-chip:hover { box-shadow: inset 0 0 0 1px rgba(0,0,0,.15), 0 0 0 2px #B5D4F4; }
+  .pal-chip.cur { box-shadow: inset 0 0 0 2px #fff; outline: 2px solid #185FA5; outline-offset: 1px; }
+  .pal-custom {
+    display: block; width: 100%; margin-top: 7px; padding: 5px 0 0;
+    border: 0; border-top: 1px solid #F1EFE8; background: none;
+    font-size: 11.5px; color: #5F5E5A; cursor: pointer; text-align: center;
+  }
+  .pal-custom:hover { color: #185FA5; }
   .ai-hint { margin: 2px 0 10px; color: #888780; font-size: 12px; }
   .ai-level {
     display: flex; align-items: flex-start; gap: 9px;
@@ -683,7 +715,7 @@
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
       <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
-      <span><i id="lg-del" style="border-color:#2C2C2A"></i><em data-i18n="legend.deleted">删除</em></span>
+      <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>
     <div id="ctxMenu" class="ctx-menu"></div>
