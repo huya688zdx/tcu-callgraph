@@ -16,12 +16,12 @@ const jsonPost = (base, p, body) =>
     body: JSON.stringify(body),
   }).then((r) => r.json());
 
-test('界面偏好：默认范围是向下 3 / 向上 0', async (t) => {
+test('界面偏好：默认范围是向下 1 / 向上 1', async (t) => {
   const srv = await launchServer({ target: 'samples/tcu' });
   t.after(() => srv.close());
 
   const r = await (await fetch(srv.baseUrl + '/api/ui-prefs')).json();
-  assert.deepEqual(r, { down: 3, up: 0 });
+  assert.deepEqual(r, { down: 1, up: 1 });
 });
 
 test('界面偏好：保存后读回，非法值拒绝且不覆盖旧值', async (t) => {

@@ -38,6 +38,8 @@ test('总代码加局部差分：保留对照外的调用者和读取者，退�
   assert.equal((await post('/api/compare', { beforePath, afterPath })).ok, true);
   const view = await get('/api/view');
   assert.equal(view.nodes.length, 12);
+  assert.equal(typeof (await get('/api/orphans')).total, 'number');
+  assert.equal((await get('/api/node?id=var::g_limit')).node.change, 'modified', '失效标注检查不能重建并覆盖比较模型');
   assert.equal((await get('/api/project')).path, projectPath);
   assert.equal((await get('/api/compare')).comparison.projectPath, projectPath);
   assert.ok(view.nodes.some((n) => n.id === 'observer.c::Supervisor_Read'));

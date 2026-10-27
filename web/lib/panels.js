@@ -9,6 +9,7 @@ import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
+import { showExpansion } from './expand.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -34,14 +35,40 @@ async function loadStats() {
 // ---------------- 全局变量 / 常量 ----------------
 
 let varList = null;
+let varsLoading = false;
+let varsError = '';
+let varsSeq = 0;
+
+export function resetVars() {
+  varsSeq++;
+  varList = null;
+  varsLoading = false;
+  varsError = '';
+  varQuery = '';
+  collapsedFiles.clear();
+  renderVars();
+}
 
 async function loadVars() {
-  try {
-    varList = (await api.vars()).list || [];
-  } catch {
-    varList = [];
-  }
+  if (varsLoading || varList) return;
+  const seq = ++varsSeq;
+  varsLoading = true;
+  varsError = '';
   renderVars();
+  try {
+    const result = await api.vars();
+    if (seq !== varsSeq) return;
+    if (!Array.isArray(result?.list)) throw new Error(result?.error || t('vars.failed'));
+    varList = result.list;
+  } catch (err) {
+    if (seq !== varsSeq) return;
+    varsError = String(err.message || err);
+  } finally {
+    if (seq === varsSeq) {
+      varsLoading = false;
+      renderVars();
+    }
+  }
 }
 
 /** 当前视图里出现过的文件（变量面板按它过滤） */
@@ -77,8 +104,14 @@ export function renderVars() {
   if (!el) return;
   const v = state.view;
   const ctx = state.ctxBox;
-  if (!varList || !v || !ctx) {
+  if (!v || !ctx) {
     el.innerHTML = `<div class="empty">${t('vars.hint')}</div>`;
+    return;
+  }
+  if (!varList) {
+    el.innerHTML = `<div class="empty">${esc(varsError || t('vars.onDemand'))}</div>
+      <button type="button" data-load-vars ${varsLoading ? 'disabled' : ''}>${t(varsLoading ? 'vars.loading' : 'vars.load')}</button>`;
+    el.querySelector('[data-load-vars]').addEventListener('click', () => loadVars());
     return;
   }
 
@@ -304,6 +337,7 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
+    items.push({ value: 'expand', label: 'expand.menu' });
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
     if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
@@ -319,6 +353,7 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
+      if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (v === 'locate') {

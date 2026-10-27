@@ -694,12 +694,13 @@ export function tarjan(model) {
 /**
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {}) {
+export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true } = {}) {
   const { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
 
   const nodes = new Map();
   const edges = [];
+  let truncated = false;
   const seenCall = new Set();
   // 同一对节点之间的多次调用合并成一条边，调用次数与行号记在 calls 里，
   // 避免画出并排的多条平行边
@@ -744,9 +745,14 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
       const next = [];
       for (const id of frontier) {
         for (const e of adj.get(id) || []) {
+          // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
+          if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
           addEdge(e);
-          if (nodes.size >= maxNodes) continue;
+          if (nodes.size >= maxNodes) {
+            if (!nodes.has(other) && byId.has(other)) truncated = true;
+            continue;
+          }
           if (addNode(other)) next.push(other);
         }
       }
@@ -760,6 +766,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   return {
     root: rootId,
+    truncated,
     nodes: [...nodes.values()],
     edges: edges.filter((e) => nodes.has(e.from) && nodes.has(e.to)),
   };
