@@ -10,6 +10,8 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
     for (const def of p.macros.values()) if (def.file === p.rel) context.set(def.name, def);
     for (const m of p.macros.values()) {
       if (m.file !== p.rel) continue;
+      const id = `header::${p.rel}::${m.name}`;
+      const calls = invocations.get(id) || [];
       let callable = m;
       let expanded = expandSeq(m.body, context);
       if (m.params === null && expanded.length === 1 && expanded[0].t === 'id') {
@@ -19,17 +21,15 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
           expanded = expandSeq(wrapper.body, context);
         }
       }
-      let names;
+      let names = [];
       if (callable.params === null && expanded.length === 1 && expanded[0].t === 'id') {
         names = [expanded[0].v];
-        if (!callableNames.has(names[0])) continue;
+        if (!callableNames.has(names[0]) && !calls.length) continue;
       } else if (callable.params !== null) {
-        const calls = [];
-        scanCalls(expanded, { macros: new Map(), fnptr: new Map() }, calls);
-        names = [...new Set(calls.map((c) => c.callee).filter((n) => n && !callable.params.includes(n)))];
-      } else continue;
-      const id = `header::${p.rel}::${m.name}`;
-      const calls = invocations.get(id) || [];
+        const scanned = [];
+        scanCalls(expanded, { macros: context, fnptr: new Map() }, scanned);
+        names = [...new Set(scanned.map((c) => c.callee).filter((n) => n && !callable.params.includes(n)))];
+      }
       if ((!names.length && !calls.length) || names.includes(m.name)) continue;
       const targetIds = calls.length ? [...new Set(calls.map((e) => e.to))] : names.map((n) => resolveCallee(n, p.rel));
       if (calls.length) names = [...new Set(calls.map((e) => e.callee))];

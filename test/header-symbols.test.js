@@ -186,3 +186,33 @@ void main(void) { Run(); }
   assert.ok(g.edges.some((e) => e.from === 'main.c::main' && e.to === run.id));
   assert.ok(g.edges.some((e) => e.from === run.id && e.to === 'main.c::Real'));
 });
+
+test('未调用的包装链和调用过的对象宏指针，排除变量别名', (t) => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, 'include/api.h'), `
+#define Wrapper(x) Real(x)
+#define Alias Wrapper
+#define Public(x) Alias(x)
+#define Run ops.step
+#define VALUE g_value
+`);
+  fs.writeFileSync(path.join(dir, 'main.c'), `
+typedef struct { void (*step)(void); } Ops;
+int g_value = 1;
+int Real(int x) { return x; }
+void Step(void) {}
+const Ops ops = { .step = Step };
+void main(void) { Run(); int n = g_value; }
+`);
+  const m = buildIndex(dir);
+  assert.ok(m.edges.some((e) => e.kind === 'var' && e.callee === 'g_value'));
+  assert.deepEqual(m.headerSymbols.find((n) => n.name === 'Public')?.targetIds, ['main.c::Real']);
+  const run = m.headerSymbols.find((n) => n.name === 'Run');
+  assert.deepEqual(run?.targetIds, ['main.c::Step']);
+  assert.ok(search(m, 'Run').some((n) => n.id === run.id));
+  const graph = subgraph(m, run.id, { up: 1, down: 1 });
+  assert.ok(graph.edges.some((e) => e.from === 'main.c::main' && e.to === run.id));
+  assert.ok(graph.edges.some((e) => e.from === run.id && e.to === 'main.c::Step'));
+  assert.ok(!m.headerSymbols.some((n) => n.name === 'VALUE'));
+  assert.ok(!m.externals.some((n) => ['Wrapper', 'g_value'].includes(n.name)));
+});

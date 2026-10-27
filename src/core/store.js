@@ -206,7 +206,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v6-macro-fnptr\0');
+  h.update('analyzed-model-v7-macro-fallback\0');
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
