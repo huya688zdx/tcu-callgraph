@@ -402,6 +402,9 @@ function pathPointAt(pts, t) {
   return pts[pts.length - 1];
 }
 
+/** 该连线是否画成虚线（变量访问默认虚线；虚实可在样式面板按类型调整） */
+const edgeDashed = (e) => (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash);
+
 function drawEdge(ctx, e, related, selected, focused = false) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
@@ -423,7 +426,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
     ctx.lineWidth = 7 / cam.k;
     ctx.shadowColor = '#E69A16';
     ctx.shadowBlur = 10;
-    if (e.kind === 'var') ctx.setLineDash([7, 4]);
+    if (edgeDashed(e)) ctx.setLineDash([7, 4]);
     ctx.stroke();
     ctx.restore();
   }
@@ -435,11 +438,11 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
   // 变量访问=虚线，函数调用=实线
-  if (e.kind === 'var') ctx.setLineDash([7, 4]);
+  if (edgeDashed(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (collectingEffects && selected) {
+  if (collectingEffects && selected && THEME.edge.selPulse) {
     effects.push({ kind: 'edge', points: pts.map((p) => [...p]) });
   }
 
@@ -560,9 +563,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     ? THEME.node.hover
     : n.external
     ? THEME.node.externalBorder
+    : isVar
+    ? THEME.node.varBorder
     : THEME.node.border;
-  // 虚线框直接流动本体，实线框保留本体并增加动态外圈。
-  ctx.setLineDash(isVar ? [] : [5, 3]);
+  // 函数框/变量框各自的虚实线型，样式面板可调；选中时的流动虚线只在虚线开启时有效
+  ctx.setLineDash((isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
   const animated = collectingEffects && selected && (allNodes ||
     state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
   const dash = ctx.getLineDash();
