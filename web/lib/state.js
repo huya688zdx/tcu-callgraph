@@ -137,6 +137,13 @@ function syncThemeSideEffects() {
   chip('lg-call', THEME.edge.call);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
+  // 虚实开关只改线型不改色，图例也要跟着换，否则与画布不一致（离线导出复制图例 DOM 会带出去）
+  const chipDash = (id, dash) => {
+    const el = document.getElementById(id);
+    if (el) el.style.borderTopStyle = dash ? 'dashed' : 'solid';
+  };
+  chipDash('lg-call', THEME.edge.callDash);
+  chipDash('lg-var', THEME.edge.varDash);
   // 删除边沿用调用色、中央带 X：图例里画的是 SVG，所以走 color 而不是 border
   const delChip = document.getElementById('lg-del');
   if (delChip) delChip.style.color = THEME.edge.call;
@@ -169,6 +176,7 @@ export function setThemeFlag(path, value) {
   const last = keys[keys.length - 1];
   if (typeof obj[last] !== 'boolean' || typeof value !== 'boolean') return false;
   obj[last] = value;
+  syncThemeSideEffects();
   return true;
 }
 
