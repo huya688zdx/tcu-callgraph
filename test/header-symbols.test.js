@@ -216,3 +216,30 @@ void main(void) { Run(); int n = g_value; }
   assert.ok(!m.headerSymbols.some((n) => n.name === 'VALUE'));
   assert.ok(!m.externals.some((n) => ['Wrapper', 'g_value'].includes(n.name)));
 });
+
+test('成员函数指针参数调用保留包装宏来源，同时区分实参内嵌套调用', (t) => {
+  const dir = fixture(t);
+  fs.writeFileSync(path.join(dir, 'include/api.h'), `
+#define Invoke(cb) (Prepare(), cb())
+#define Outer(x) Real(x)
+#define Inner Other
+`);
+  fs.writeFileSync(path.join(dir, 'main.c'), `
+typedef struct { void (*step)(void); } Ops;
+void Prepare(void) {}
+void Step(void) {}
+const Ops ops = { .step = Step };
+int Real(int x) { return x; }
+int Other(void) { return 1; }
+void main(void) { Invoke(ops.step); Outer(Inner()); }
+`);
+  const m = buildIndex(dir);
+  const invoke = m.headerSymbols.find((n) => n.name === 'Invoke');
+  assert.deepEqual([...invoke.targetIds].sort(), ['main.c::Prepare', 'main.c::Step']);
+  const step = m.edges.find((e) => e.from === 'main.c::main' && e.to === 'main.c::Step');
+  assert.ok(step.macroDefinitions.includes(invoke.id));
+  const inner = m.edges.find((e) => e.from === 'main.c::main' && e.to === 'main.c::Other');
+  assert.ok(inner.macroChain.includes('Inner') && !inner.macroChain.includes('Outer'));
+  const graph = subgraph(m, invoke.id, { up: 1, down: 1 });
+  assert.ok(graph.edges.some((e) => e.from === invoke.id && e.to === 'main.c::Step'));
+});
