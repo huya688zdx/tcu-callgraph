@@ -199,9 +199,12 @@ function substitute(m, args, siteTok) {
     const pidx = m.params ? m.params.indexOf(tk.v) : -1;
     if (pidx >= 0) {
       const a = args[pidx] || [];
-      for (const t of a) {
+      for (let j = 0; j < a.length; j++) {
+        const t = a[j];
+        const isCallee = body[i + 1]?.v === '(' && j === a.length - 1 && t.t === 'id' &&
+          (a.length === 1 || ['.', '->'].includes(a[j - 1]?.v));
         out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond,
-          macroOrigins: a.length === 1 && body[i + 1]?.v === '(' ? [...macroOrigins, ...(t.macroOrigins || [])] : t.macroOrigins || [] });
+          macroOrigins: isCallee ? [...macroOrigins, ...(t.macroOrigins || [])] : t.macroOrigins || [] });
       }
       continue;
     }
