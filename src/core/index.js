@@ -9,6 +9,7 @@ import { lex } from './lexer.js';
 import { preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
 import { parseDot, modelFromDot } from './dot.js';
+import { headerSymbols } from './header-symbols.js';
 
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
@@ -256,6 +257,7 @@ export function rebuildIndex(model) {
     byName.get(fn.name).push(fn);
   }
   for (const ex of externals) byId.set(ex.id, ex);
+  for (const symbol of model.headerSymbols || []) byId.set(symbol.id, symbol);
   for (const v of model.variables || []) byId.set(v.id, v);
 
   const outAdj = new Map();
@@ -440,6 +442,10 @@ export function buildIndex(root, sourceFiles = null) {
         cond: c.cond,
         via: c.via,
         macroChain: c.macroChain,
+        macroDefinitions: (c.macroChain || []).map((name) => {
+          const def = macrosByFile.get(fn.file)?.get(name);
+          return def ? `header::${def.file}::${name}` : null;
+        }).filter(Boolean),
       });
     }
     // 全局变量读写：画成虚线，同时记录方向供数据流分析
@@ -503,6 +509,26 @@ export function buildIndex(root, sourceFiles = null) {
   }
 
   const allNodes = new Map([...byId, ...externals]);
+  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.map((e) => e.callee)]));
+  for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
+    const id = symbol.targetIds[i];
+    if (!allNodes.has(id) && id.startsWith('ext::')) {
+      const node = { id, name: symbol.targetNames[i], file: '<external>', line: 0, external: true, params: [] };
+      externals.set(id, node);
+      allNodes.set(id, node);
+    }
+  }
+  for (const symbol of symbols) allNodes.set(symbol.id, symbol);
+  const callsByMacro = new Map();
+  for (const e of edges) for (const id of e.macroDefinitions || []) {
+    if (!callsByMacro.has(id)) callsByMacro.set(id, []);
+    callsByMacro.get(id).push(e);
+  }
+  const headerEdges = symbols.flatMap((symbol) => [
+    ...symbol.targetIds.map((to, i) => ({ from: symbol.id, to, callee: symbol.targetNames[i],
+      kind: 'macro', line: symbol.line, via: symbol.name, headerReference: true })),
+    ...(callsByMacro.get(symbol.id) || []).map((e) => ({ ...e, to: symbol.id, callee: symbol.name, headerReference: true })),
+  ]);
 
   const model = {
     root,
@@ -511,6 +537,8 @@ export function buildIndex(root, sourceFiles = null) {
     elapsedMs: Date.now() - t0,
     files: parsed.map((p) => ({ rel: p.rel, isHeader: p.isHeader, bytes: p.bytes })),
     functions,
+    headerSymbols: symbols,
+    headerEdges,
     variables,
     externals: [...externals.values()],
     edges,
@@ -695,8 +723,17 @@ export function tarjan(model) {
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
 export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true } = {}) {
-  const { byId, outAdj, inAdj } = model._index;
+  let { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
+
+  // 仅选中头文件宏时加入定义映射，普通函数调用深度保持原来的语义。
+  const header = byId.get(rootId);
+  if (header.headerSymbol) {
+    outAdj = new Map(outAdj);
+    inAdj = new Map(inAdj);
+    outAdj.set(rootId, (model.headerEdges || []).filter((e) => e.from === rootId));
+    inAdj.set(rootId, (model.headerEdges || []).filter((e) => e.to === rootId));
+  }
 
   const nodes = new Map();
   const edges = [];
@@ -777,13 +814,15 @@ export function search(model, q, limit = 30) {
   const query = q.trim().toLowerCase();
   if (!query) return [];
   const scored = [];
-  for (const fn of model.functions) {
+  for (const fn of [...model.functions, ...(model.headerSymbols || [])]) {
     const name = fn.name.toLowerCase();
+    const targets = (fn.targetNames || []).join(' ').toLowerCase();
     const file = fn.file.toLowerCase();
     let score = 0;
     if (name === query) score = 100;
     else if (name.startsWith(query)) score = 80;
     else if (name.includes(query)) score = 60;
+    else if (targets.includes(query)) score = 50;
     else if (file.includes(query)) score = 20;
     if (score) scored.push({ fn, score });
   }

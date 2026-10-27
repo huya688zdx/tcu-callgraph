@@ -10,6 +10,7 @@ import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 import { showExpansion } from './expand.js';
+import { setNodeName } from './node-name.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -304,7 +305,7 @@ function flashRow(row) {
  */
 export function revealInTree(kind, id) {
   let row = null;
-  populateTreeFiles.get(kind === 'fn' ? id.split('::')[0] : id)?.();
+  populateTreeFiles.get(kind === 'fn' ? (id.startsWith('header::') ? id.split('::')[1] : id.split('::')[0]) : id)?.();
   if (kind === 'fn') {
     row = document.querySelector(`#tree .tn.fn[data-fnid="${CSS.escape(id)}"]`);
   } else {
@@ -585,11 +586,17 @@ async function renderDetail(id) {
 
   // 节点只展示身份信息：标注已经改成「连线标签」，挂在连线上而不是函数上
   els.detail.innerHTML = `
-    <div class="detail-title">${esc(n.name)}</div>
+    <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
+      <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
+        <option value="alias" ${target.nameMode !== 'target' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
+        <option value="target" ${target.nameMode === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
+      </select></label>` : ''}
     ${state.view?.comparison ? comparisonDetail(n) : ''}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
+  els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
 
   const inE = d.inEdges || [];
   const outE = d.outEdges || [];

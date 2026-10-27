@@ -294,8 +294,11 @@ function matchNodeColor(v) {
 
 function buildFileTree(model) {
   const root = { name: ROOT_LABEL, type: 'dir', path: '', children: new Map() };
-  for (const fn of model.functions) {
-    const parts = String(fn.file).split('/');
+  const fileNodes = new Map();
+  const symbols = [...model.functions, ...(model.headerSymbols || [])];
+  const files = new Set([...model.files.map((f) => f.rel), ...symbols.map((n) => n.file)]);
+  for (const rel of files) {
+    const parts = String(rel).split('/');
     let cur = root;
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i];
@@ -310,8 +313,11 @@ function buildFileTree(model) {
         });
       }
       cur = cur.children.get(name);
-      if (isFile) cur.functions.push({ id: fn.id, name: fn.name, line: fn.line });
+      if (isFile) fileNodes.set(rel, cur);
     }
+  }
+  for (const fn of symbols) {
+    fileNodes.get(fn.file)?.functions.push({ id: fn.id, name: fn.name, line: fn.line });
   }
   const toObj = (n) => ({
     name: n.name,
@@ -635,6 +641,12 @@ async function buildView(
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  for (const n of clean) {
+    if (n.headerSymbol) {
+      n.nameMode = viewOverlay.nodes?.[n.id]?.nameMode === 'target' ? 'target' : 'alias';
+      n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;
+    }
+  }
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -1381,7 +1393,7 @@ const server = http.createServer(async (req, res) => {
       const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
       if (!roots.length) {
         if (COMPARISON) return json(res, await buildView(COMPARISON.roots, 0, 0, group, null, varSel, viewOverlay, previous));
-        if (!MODEL.functions.length) {
+        if (!MODEL.functions.length && !MODEL.headerSymbols?.length) {
           return json(res, {
             nodes: [],
             edges: [],
@@ -1393,13 +1405,13 @@ const server = http.createServer(async (req, res) => {
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile
-          ? MODEL.functions.filter((f) => f.file === MODEL.focusFile)
-          : MODEL.functions;
+          ? [...MODEL.functions, ...(MODEL.headerSymbols || [])].filter((f) => f.file === MODEL.focusFile)
+          : MODEL.functions.length ? MODEL.functions : MODEL.headerSymbols;
         const deg = (id) => (MODEL._index.outAdj.get(id) || []).length;
         const entries = pool
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
-        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
+        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0] || MODEL.headerSymbols?.[0];
         return json(
           res,
           await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous)
@@ -1414,8 +1426,8 @@ const server = http.createServer(async (req, res) => {
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
         node: { ...fn, bodyTokens: undefined },
-        inEdges: MODEL._index.inAdj.get(id) || [],
-        outEdges: MODEL._index.outAdj.get(id) || [],
+        inEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [],
+        outEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [],
         overlay: overlay.nodes?.[id] || {},
       });
     }
@@ -1556,6 +1568,7 @@ const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then((patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
+          if (patch.data.nameMode !== undefined && !['alias', 'target'].includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias 或 target');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           // 连线标签（一线可多条）：

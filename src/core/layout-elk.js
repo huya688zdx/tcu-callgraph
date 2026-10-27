@@ -157,7 +157,8 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
   const ids = new Set(nodes.map((n) => n.id));
   edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
   const sized = nodes.map((n) => ({ ...n,
-    w: n.w || Math.min(190, Math.max(120, textWidth(n.label || n.name || n.id) + 28 + (n.kind === 'var' ? 0 : 16))),
+    w: n.w || Math.min(190, Math.max(120, Math.max(textWidth(n.label || n.name || n.id),
+      textWidth((n.targetNames || []).join(' / '))) + 28 + (n.kind === 'var' ? 0 : 16))),
     h: n.h || (n.sub ? 58 : 44),
   }));
   // 删除时保留空位的几何快照。重新加入同一批节点时直接复用，避免再次
