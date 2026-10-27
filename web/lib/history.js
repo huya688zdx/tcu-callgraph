@@ -23,6 +23,14 @@ function snapshotView() {
       h: n.h,
       group: n.group,
       name: n.name,
+      displayName: n.displayName,
+      nameMode: n.nameMode,
+      nameModeOverride: n.nameModeOverride,
+      headerSymbol: n.headerSymbol,
+      targetNames: n.targetNames,
+      targetIds: n.targetIds,
+      raw: n.raw,
+      macroParams: n.macroParams,
       file: n.file,
       line: n.line,
       color: n.color,
@@ -80,7 +88,12 @@ function applySnapshot(str) {
   // 所以撤销时必须把标签差异也写回服务端，否则画布回退了、库里还是新值，
   // 刷新一下又变回来——看起来像撤销没生效。
   const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.labels || null)]));
+  const beforeNames = new Map(v.nodes.filter((n) => n.headerSymbol).map((n) => [n.id, n.nameModeOverride || null]));
   v.nodes = s.nodes;
+  for (const n of v.nodes) if (n.headerSymbol) {
+    n.nameMode = n.nameModeOverride || v.macroNameMode || 'alias';
+    n.displayName = n.nameMode === 'target' ? n.targetNames.join(' / ') : n.name;
+  }
   v.edges = s.edges.map((e) => ({ ...e }));
   if (s.groups) v.groups = s.groups;
   if (s.containers) v.containers = s.containers;
@@ -93,6 +106,10 @@ function applySnapshot(str) {
   state.hover = null;
   draw();
   persistLabelDiff(before);
+  for (const n of v.nodes) if (n.headerSymbol && beforeNames.has(n.id) && beforeNames.get(n.id) !== (n.nameModeOverride || null)) {
+    const patch = { nodeId: n.id, projectId: v.projectId, data: { nameMode: n.nameModeOverride || null } };
+    labelWrites = labelWrites.then(() => api.overlay(patch)).catch((err) => console.warn('[撤销] 名称写回失败：', err));
+  }
   saveLayout();
 }
 

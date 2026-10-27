@@ -5,13 +5,32 @@
  * 颜色通过应用内小调色板选取（预设色网格 + 自定义入口），不直接弹系统调色盘。
  * 模块加载即恢复已存主题（在首次画图之前），并自己接好工具栏入口。
  */
-import { THEME, applyTheme, setThemeColor, setThemeFlag } from './state.js';
+import { THEME, state, applyTheme, setThemeColor, setThemeFlag } from './state.js';
 import { draw } from './render.js';
 import { openModal, esc } from './modal.js';
+import { api } from './api.js';
+import { hooks } from './hooks.js';
 
 const STORE_KEY = 'cg.theme.v1';
 // 默认值快照必须在使用 localStorage 恢复之前取，否则「恢复默认」会恢复成自定义值
 const DEFAULTS = structuredClone(THEME);
+let macroNameMode = 'alias';
+
+async function saveMacroNameMode(mode) {
+  const result = await api.setUiPrefs({ macroNameMode: mode });
+  if (!result?.ok) throw new Error(result?.error || '保存失败，请重试');
+  macroNameMode = mode;
+  const view = state.view;
+  if (view) {
+    view.macroNameMode = mode;
+    for (const n of view.nodes) if (n.headerSymbol && !n.nameModeOverride) {
+      n.nameMode = mode;
+      n.displayName = mode === 'target' ? n.targetNames.join(' / ') : n.name;
+    }
+    draw();
+    if (state.selected) hooks.renderDetail(state.selected);
+  }
+}
 
 /** 调色板预设：灰阶 / 暖色 / 冷色 / 画布常用浅色，包含全部默认值，便于一键改回单项 */
 const PALETTE = [
@@ -196,7 +215,17 @@ const findItem = (path) => SECTIONS.flatMap((s) => s.items).find((it) => it.path
 function render() {
   const body = document.getElementById('styleBody');
   if (!body) return;
-  body.innerHTML = SECTIONS.map(
+  body.innerHTML = `<div class="style-sec">
+    <h3>宏节点显示</h3>
+    <label class="style-row"><span class="sl">默认显示名称</span>
+      <select id="macroNameDefault">
+        <option value="alias" ${macroNameMode === 'alias' ? 'selected' : ''}>左侧：宏名</option>
+        <option value="target" ${macroNameMode === 'target' ? 'selected' : ''}>右侧：实际函数名</option>
+      </select>
+    </label>
+    <p class="hint">跨工程保存，立即应用于跟随设置的节点。单个节点可通过右键或右侧详情单独选择。</p>
+    <span id="macroNameStatus" role="status"></span>
+  </div>` + SECTIONS.map(
     (sec) => `
     <div class="style-sec">
       <h3>${esc(sec.title)}</h3>
@@ -215,6 +244,15 @@ function render() {
       </div>
     </div>`
   ).join('');
+  const nameSelect = body.querySelector('#macroNameDefault');
+  nameSelect.addEventListener('change', async () => {
+    nameSelect.disabled = true;
+    const status = body.querySelector('#macroNameStatus');
+    status.textContent = '正在保存…';
+    try { await saveMacroNameMode(nameSelect.value); status.textContent = '已保存'; }
+    catch (err) { nameSelect.value = macroNameMode; status.textContent = err.message; }
+    finally { nameSelect.disabled = false; }
+  });
   body.querySelectorAll('input[type=color]').forEach((input) => {
     input.addEventListener('input', () => {
       if (!setThemeColor(input.dataset.path, input.value)) return;
@@ -244,7 +282,9 @@ function render() {
   syncSwatches();
 }
 
-function resetDefaults() {
+async function resetDefaults() {
+  try { await saveMacroNameMode('alias'); }
+  catch (err) { document.getElementById('macroNameStatus').textContent = err.message; return; }
   applyTheme(Object.fromEntries(flatten(DEFAULTS)));
   try {
     localStorage.removeItem(STORE_KEY);
@@ -257,7 +297,11 @@ function resetDefaults() {
 }
 
 const btn = document.getElementById('styleBtn');
-btn?.addEventListener('click', () => {
+btn?.addEventListener('click', async () => {
+  try {
+    const prefs = await api.uiPrefs();
+    macroNameMode = prefs.macroNameMode === 'target' ? 'target' : 'alias';
+  } catch { macroNameMode = state.view?.macroNameMode || 'alias'; }
   render();
   openModal('styleModal');
 });

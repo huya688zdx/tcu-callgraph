@@ -597,7 +597,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     ctx.textBaseline = 'middle';
 
     // 函数名统一带 ()，变量名不带，便于一眼区分
-    let label = isVar ? n.name || n.id : `${n.name || n.id}()`;
+    let label = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
     const maxW = w - 18;
     if (ctx.measureText(label).width > maxW) {
       while (label.length > 1 && ctx.measureText(label + '…').width > maxW) {

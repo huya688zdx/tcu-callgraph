@@ -157,9 +157,30 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
   const ids = new Set(nodes.map((n) => n.id));
   edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
   const sized = nodes.map((n) => ({ ...n,
-    w: n.w || Math.min(190, Math.max(120, textWidth(n.label || n.name || n.id) + 28 + (n.kind === 'var' ? 0 : 16))),
+    w: n.w || Math.min(190, Math.max(120, Math.max(textWidth(n.label || n.name || n.id),
+      textWidth((n.targetNames || []).join(' / '))) + 28 + (n.kind === 'var' ? 0 : 16))),
     h: n.h || (n.sub ? 58 : 44),
   }));
+  // 删除时保留空位的几何快照。重新加入同一批节点时直接复用，避免再次
+  // 运行 INTERACTIVE 排版产生逐轮漂移；拖动过任一剩余节点就不再复用。
+  const slots = previous?.layoutSlots;
+  if (slots && Array.isArray(slots.nodes) && Array.isArray(slots.edges) &&
+      Array.isArray(slots.groups) && Array.isArray(slots.containers) &&
+      slots.nodes.every((n) => [n.x, n.y, n.w, n.h].every(Number.isFinite))) {
+    const saved = new Map(slots.nodes.map((n) => [n.id, n]));
+    const unchanged = (n) => {
+      const old = saved.get(n.id);
+      return old && ['file', 'x', 'y', 'w', 'h'].every((key) => old[key] === n[key]);
+    };
+    if (previous.nodes.every(unchanged) && sized.every((n) => {
+      const old = saved.get(n.id);
+      return old && old.file === n.file && old.w === n.w && old.h === n.h;
+    })) {
+      const order = new Map(slots.nodes.map((n, i) => [n.id, i]));
+      sized.sort((a, b) => order.get(a.id) - order.get(b.id));
+      previous = { ...slots, edges: [...new Map([...slots.edges, ...previous.edges].map((e) => [edgeKey(e), e])).values()] };
+    }
+  }
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
   const oldEdges = new Map((previous?.edges || []).map((e) => [edgeKey(e), e]));
   const direction = previous?.layoutDirection === 'DOWN' ? 'DOWN' : 'RIGHT';
@@ -188,6 +209,11 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     for (const c of view.containers) if (c.root) {
       c.w = Math.max(c.w, view.width);
       c.h = Math.max(c.h, view.height);
+    }
+    if (previous.nodes.some((n) => !ids.has(n.id))) {
+      // 只保存一层快照，不递归携带历史画面。
+      const { nodes, edges, groups, containers, width, height, layoutDirection } = previous;
+      view.layoutSlots = { nodes, edges, groups, containers, width, height, layoutDirection };
     }
     return view;
   }

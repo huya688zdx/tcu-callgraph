@@ -11,6 +11,8 @@ import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { renderLabelPanel } from './label-panel.js';
 import { analyseDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
+import { showExpansion } from './expand.js';
+import { setNodeName } from './node-name.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 // 色块用 getter 在菜单打开时现读 THEME：样式面板改色后菜单立即跟上
@@ -31,6 +33,11 @@ const EDGE_ITEMS = [
 export function showNodeMenu(x, y, n) {
   const comparing = Boolean(state.view?.comparison);
   const sections = [
+    ...(n.headerSymbol ? [{ id: 'name', label: 'name.title', items: [
+      { value: 'name:default', label: 'name.default', active: !n.nameModeOverride },
+      { value: 'name:alias', label: 'name.alias', active: n.nameModeOverride === 'alias' },
+      { value: 'name:target', label: 'name.target', active: n.nameModeOverride === 'target' },
+    ] }] : []),
     {
       id: 'locate',
       label: 'menu.locate',
@@ -39,6 +46,7 @@ export function showNodeMenu(x, y, n) {
     {
       id: 'df',
       items: [
+        { value: 'expand', label: 'expand.menu' },
         { value: 'df', label: 'menu.dataflow' },
         ...(!comparing ? [{ value: 'callOrder', label: 'callOrder.find' }] : []),
       ],
@@ -46,6 +54,8 @@ export function showNodeMenu(x, y, n) {
     ...(!comparing ? [{ id: 'change', label: 'menu.change', items: CHANGE_ITEMS }] : []),
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
+    if (v.startsWith('name:')) return setNodeName(n, v.slice(5));
+    if (v === 'expand') return showExpansion(n);
     if (v === 'tree:fn') return revealInTree('fn', n.id);
     if (v === 'df') return analyseDataflow(n.id);
     if (v === 'callOrder') return findCallOrder(n.id);

@@ -31,6 +31,8 @@ const state = {
   root: null,
   /** 当前所有入口函数（文件树多选时会有多个） */
   roots: [],
+  /** 右键按函数添加的局部查找范围，独立于顶部默认层数。 */
+  expansions: [],
   /** 当前点选的框：{ kind:'file'|'dir', id } —— 右侧变量面板按它过滤 */
   ctxBox: null,
   /** 手动勾选要显示在图里的全局变量 id */
@@ -41,8 +43,8 @@ const state = {
   at: 0,
   selected: null,
   hover: null,
-  down: 3,
-  up: 0,
+  down: 1,
+  up: 1,
   group: true,
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */

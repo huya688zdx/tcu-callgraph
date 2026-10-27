@@ -12,6 +12,7 @@ import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
+import { normalizeExpansions } from './core/expansion.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import {
@@ -62,11 +63,44 @@ let pageState = null;
 
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
+const modelCacheKeys = new WeakMap();
+const analysisPending = new WeakMap();
+
+/** 变量/数据流查询或失效标注检查需要 AST 时再构建；完成后升级磁盘缓存。 */
+async function ensureAnalysis(model) {
+  if (model._df) return;
+  if (analysisPending.has(model)) return analysisPending.get(model);
+  const pending = (async () => {
+    await buildDataflowIndex(model);
+    if (model === MODEL) S = stats(model);
+    const key = modelCacheKeys.get(model);
+    if (key && !model._df?.failedFiles) {
+      try {
+        const r = store.putCachedModel(key, model);
+        if (!r.cached) console.log(`[缓存] 未缓存变量分析：${r.reason}`);
+      } catch (err) {
+        console.warn('[缓存] 变量分析缓存写入失败：', err.message);
+      }
+    }
+  })();
+  analysisPending.set(model, pending);
+  try { await pending; } finally { analysisPending.delete(model); }
+}
 
 // ---- 界面偏好：范围下拉（向下 / 向上层数）----
 // 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
 const DEPTH_DOWN = [1, 2, 3, 5, 9];
 const DEPTH_UP = [0, 1, 2];
+const NAME_MODES = ['alias', 'target'];
+const macroNameDefault = () => store.getSetting('ui.macroNameMode', 'alias') === 'target' ? 'target' : 'alias';
+function withMacroName(node, viewOverlay, defaultMode) {
+  if (!node.headerSymbol) return node;
+  const override = viewOverlay.nodes?.[node.id]?.nameMode;
+  const nameModeOverride = NAME_MODES.includes(override) ? override : null;
+  const nameMode = nameModeOverride || defaultMode;
+  return { ...node, nameModeOverride, nameMode,
+    displayName: nameMode === 'target' ? node.targetNames.join(' / ') : node.name };
+}
 
 // ---- MCP 权限（AI 访问）：环境变量 CALLGRAPH_MCP > 库设置 mcp.access > 默认 readonly ----
 const MCP_LEVELS = ['off', 'readonly', 'readwrite'];
@@ -164,14 +198,9 @@ async function openTarget(targetPath, { first = false } = {}) {
     model = loadModel(abs);
   }
 
-  // 预先建好 AST 变量索引：右侧「全局变量」面板要按它列变量，
-  // 正则版的 index.js 只认白名单类型，GearCtx 这类 typedef 变量会漏掉
-  try {
-    await buildDataflowIndex(model);
-  } catch (err) {
-    console.warn('[数据流] 索引构建失败，变量面板将不可用：', err.message);
-  }
-  if (key && !fromCache && model._df) {
+  // 首屏只需要调用关系；变量清单/数据流由 ensureAnalysis 按需构建。
+  modelCacheKeys.set(model, key);
+  if (key && !fromCache) {
     const r = store.putCachedModel(key, model);
     if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
   }
@@ -231,8 +260,20 @@ function reloadOverlay() {
  * 找出库里指向「已经不存在的函数 / 连线」的条目。
  * 判定规则在 core/orphans.js，那边能直接拿真实模型写单测。
  */
-function collectOrphans() {
-  return collectOrphansOf(MODEL, store.listAllTargets(PROJECT.id));
+async function collectOrphans() {
+  const model = MODEL;
+  const project = PROJECT;
+  const comparison = COMPARISON;
+  if (switching) return null;
+  // 冷缓存只有词法索引，不能把尚未分析到的 typedef 变量误判成已删除。
+  // 分析失败时直接拒绝检测/清理；等待期间切换了工程也不能使用旧结果。
+  // 比较模型已由两侧完整索引合并，DOT/GV 也自带完整的图索引；
+  // 两者都不能按 C 源码重新分析，完整性检查也只适用于 C 分析。
+  const needsCAnalysis = !comparison && model.source !== 'dot';
+  if (needsCAnalysis) await ensureAnalysis(model);
+  if (switching || model !== MODEL || project !== PROJECT || comparison !== COMPARISON) return null;
+  if (needsCAnalysis && model._df?.failedFiles) throw new Error('变量索引不完整，无法安全清理标注；请检查源码读取或解析错误，重新打开工程后重试');
+  return collectOrphansOf(model, store.listAllTargets(project.id));
 }
 
 /** 只取 patch 里涉及到的键，事件里存增量而不是全量，避免时间轴被坐标淹没 */
@@ -263,8 +304,11 @@ function matchNodeColor(v) {
 
 function buildFileTree(model) {
   const root = { name: ROOT_LABEL, type: 'dir', path: '', children: new Map() };
-  for (const fn of model.functions) {
-    const parts = String(fn.file).split('/');
+  const fileNodes = new Map();
+  const symbols = [...model.functions, ...(model.headerSymbols || [])];
+  const files = new Set([...model.files.map((f) => f.rel), ...symbols.map((n) => n.file)]);
+  for (const rel of files) {
+    const parts = String(rel).split('/');
     let cur = root;
     for (let i = 0; i < parts.length; i++) {
       const name = parts[i];
@@ -279,8 +323,11 @@ function buildFileTree(model) {
         });
       }
       cur = cur.children.get(name);
-      if (isFile) cur.functions.push({ id: fn.id, name: fn.name, line: fn.line });
+      if (isFile) fileNodes.set(rel, cur);
     }
+  }
+  for (const fn of symbols) {
+    fileNodes.get(fn.file)?.functions.push({ id: fn.id, name: fn.name, line: fn.line });
   }
   const toObj = (n) => ({
     name: n.name,
@@ -325,6 +372,7 @@ const bookmarkEventPayload = (b) => ({
   down: b.down,
   group: !!b.group,
   vars: b.vars || [],
+  expansions: b.expansions || [],
 });
 
 /** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
@@ -445,14 +493,23 @@ async function buildView(
   previous = null
 ) {
   const projectId = PROJECT.id;
+  const model = MODEL;
+  if (!COMPARISON && (varSel.want?.length || dfNode)) {
+    await ensureAnalysis(model);
+    if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
+  }
   // 支持多个入口（文件树多选）：各自取子图后合并节点与边
   const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
   const nodeMap = new Map();
   const edgeList = [];
   const seenEdge = new Set();
-  for (const r of roots) {
-    const part = subgraph(MODEL, r, { up, down, maxNodes: perRoot });
+  let truncated = false;
+  const scopes = [...roots.map((root) => ({ root, up, down })), ...(varSel.expansions || [])];
+  for (const scope of scopes) {
+    const part = subgraph(MODEL, scope.root, { up: scope.up, down: scope.down,
+      maxNodes: perRoot, includeVariables: !!COMPARISON });
+    truncated ||= part.truncated;
     for (const n of part.nodes) if (!nodeMap.has(n.id)) nodeMap.set(n.id, n);
     for (const e of part.edges) {
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
@@ -467,8 +524,8 @@ async function buildView(
     nodes: [...nodeMap.values()],
     edges: edgeList,
   };
-  const truncated = !!COMPARISON && g.nodes.length > 600;
-  if (COMPARISON) {
+  truncated ||= g.nodes.length > 600;
+  if (g.nodes.length > 600) {
     g.nodes = g.nodes.slice(0, 600);
   }
   // 过滤用户删掉的函数与连线。文件框 / 目录容器是从节点推导出来的，
@@ -590,10 +647,13 @@ async function buildView(
   }
   if (COMPARISON) {
     const ids = new Set(clean.map((n) => n.id));
-    viewEdges = MODEL.edges.filter((e) => ids.has(e.from) && ids.has(e.to));
+    viewEdges = [...MODEL.edges, ...(MODEL.headerEdges || []).map((e) => ({ ...e, change: 'existing' }))]
+      .filter((e) => ids.has(e.from) && ids.has(e.to));
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => ({ ...e, change: COMPARISON ? e.change : viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }));
+  const macroNameMode = macroNameDefault();
+  clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -616,7 +676,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, layoutEngine: 'elk', projectId,
+  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId, macroNameMode,
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -768,6 +828,7 @@ const server = http.createServer(async (req, res) => {
               down: Math.max(0, Number(p.down) || 0),
               group: !!p.group,
               vars: strArr(p.vars),
+              expansions: normalizeExpansions(p.expansions),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
@@ -782,7 +843,7 @@ const server = http.createServer(async (req, res) => {
             }
             json(res, { ok: true });
           })
-          .catch(() => {});
+          .catch((err) => { if (!res.headersSent) bad(res, err.message); });
       }
       return json(res, {
         page: u.searchParams.has('saved') ? COMPARISON ? null : store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
@@ -971,15 +1032,17 @@ const server = http.createServer(async (req, res) => {
 
     // 孤儿标注：库里指向已不存在的函数 / 连线的条目
     if (u.pathname === '/api/orphans') {
-      const o = collectOrphans();
+      const o = await collectOrphans();
+      if (!o) return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
       return json(res, { ...o, total: countOrphans(o) });
     }
 
     if (u.pathname === '/api/orphans/purge' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((p) => {
-          const o = collectOrphans();
+        .then(async (p) => {
+          const o = await collectOrphans();
+          if (!o) return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
           const total = countOrphans(o);
           if (!total) return json(res, { ok: true, removed: 0 });
           // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
@@ -1289,26 +1352,33 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/view') {
       let previous = null;
+      let expansions = [];
       if (req.method === 'POST') {
         if (!guardWrite(req, res)) return;
         let body;
         try { body = await readJson(req, res); } catch { return; }
+        try { expansions = normalizeExpansions(body.expansions); } catch (err) { return bad(res, err.message); }
+        expansions = expansions.filter((e) => MODEL._index.byId.has(e.root) && MODEL._index.byId.get(e.root).kind !== 'var');
+        if (body.projectId != null && body.projectId !== PROJECT.id) return json(res, { error: '工程已切换，请重试' }, 409);
+        if (body.previous == null && !body.expansions?.length) return bad(res, '缺少增量布局或局部展开参数');
         previous = body.previous;
-        const rect = (n) => n && typeof n.id === 'string' &&
-          [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
-        if (!previous || !Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
-            !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
-            ![previous.width, previous.height].every(Number.isFinite) ||
-            ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
-          return bad(res, '增量布局数据无效');
+        if (previous != null) {
+          const rect = (n) => n && typeof n.id === 'string' &&
+            [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
+          if (!Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
+              !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
+              ![previous.width, previous.height].every(Number.isFinite) ||
+              ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
+            return bad(res, '增量布局数据无效');
+          }
+          const ids = new Set(previous.nodes.map((n) => n.id));
+          if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
+              Array.isArray(e.points) && e.points.length >= 2 &&
+              e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
+            return bad(res, '增量布局连线无效');
+          }
+          if (previous.projectId !== PROJECT.id || previous.comparisonId !== COMPARISON?.id) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
         }
-        const ids = new Set(previous.nodes.map((n) => n.id));
-        if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
-            Array.isArray(e.points) && e.points.length >= 2 &&
-            e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
-          return bad(res, '增量布局连线无效');
-        }
-        if (previous.projectId !== PROJECT.id || previous.comparisonId !== COMPARISON?.id) return json(res, { error: '增量布局不属于当前工程或比较会话' }, 409);
       }
       const rootsParam = u.searchParams.get('roots');
       const rootId = u.searchParams.get('root');
@@ -1317,20 +1387,20 @@ const server = http.createServer(async (req, res) => {
         : rootId
         ? [rootId]
         : [];
-      const up = Number(u.searchParams.get('up') || 0);
-      const down = Number(u.searchParams.get('down') || 3);
+      const up = Number(u.searchParams.get('up') ?? 1);
+      const down = Number(u.searchParams.get('down') ?? 1);
       const group = u.searchParams.get('group') !== '0';
       if (previous && !!previous.groups.length !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
-      const varSel = { want: split('vars'), skip: split('novars') };
+      const varSel = { want: split('vars'), skip: split('novars'), expansions };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       const at = Number(u.searchParams.get('at') || 0);
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
       const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
       if (!roots.length) {
         if (COMPARISON) return json(res, await buildView(COMPARISON.roots, 0, 0, group, null, varSel, viewOverlay, previous));
-        if (!MODEL.functions.length) {
+        if (!MODEL.functions.length && !MODEL.headerSymbols?.length) {
           return json(res, {
             nodes: [],
             edges: [],
@@ -1342,16 +1412,16 @@ const server = http.createServer(async (req, res) => {
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile
-          ? MODEL.functions.filter((f) => f.file === MODEL.focusFile)
-          : MODEL.functions;
+          ? [...MODEL.functions, ...(MODEL.headerSymbols || [])].filter((f) => f.file === MODEL.focusFile)
+          : MODEL.functions.length ? MODEL.functions : MODEL.headerSymbols;
         const deg = (id) => (MODEL._index.outAdj.get(id) || []).length;
         const entries = pool
           .filter((f) => !(MODEL._index.inAdj.get(f.id) || []).length)
           .sort((a, b) => deg(b.id) - deg(a.id));
-        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0];
+        const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0] || MODEL.headerSymbols?.[0];
         return json(
           res,
-          await buildView([pick.id], up, Math.max(down, 3), group, df, varSel, viewOverlay, previous)
+          await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous)
         );
       }
       return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay, previous));
@@ -1363,8 +1433,8 @@ const server = http.createServer(async (req, res) => {
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
         node: { ...fn, bodyTokens: undefined },
-        inEdges: MODEL._index.inAdj.get(id) || [],
-        outEdges: MODEL._index.outAdj.get(id) || [],
+        inEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [],
+        outEdges: fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [],
         overlay: overlay.nodes?.[id] || {},
       });
     }
@@ -1375,6 +1445,11 @@ const server = http.createServer(async (req, res) => {
       const dir = u.searchParams.get('dir') || 'out';
       if (!fnId) return json(res, { error: 'missing fn' }, 400);
       if (!MODEL._index) return json(res, { error: '该视图不支持数据流分析' }, 400);
+      if (!COMPARISON) {
+        const model = MODEL;
+        await ensureAnalysis(model);
+        if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
+      }
       return (COMPARISON ? comparisonDataflow(COMPARISON, fnId, dir) : dataflowFor(MODEL, fnId, dir))
         .then((r) => json(res, r))
         .catch((err) => {
@@ -1385,6 +1460,9 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/vars') {
       if (COMPARISON) return json(res, { list: comparisonGlobals(COMPARISON) });
+      const model = MODEL;
+      await ensureAnalysis(model);
+      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
       return listGlobals(MODEL)
         .then((list) => json(res, { list }))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
@@ -1398,6 +1476,9 @@ const server = http.createServer(async (req, res) => {
         }
         return json(res, { list: records });
       }
+      const model = MODEL;
+      await ensureAnalysis(model);
+      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
       return sharedVariables(MODEL)
         .then((list) => json(res, { list }))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
@@ -1417,10 +1498,11 @@ const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/export/html') {
       const rootId = u.searchParams.get('root');
-      const up = Number(u.searchParams.get('up') || 0);
-      const down = Number(u.searchParams.get('down') || 3);
+      const up = Number(u.searchParams.get('up') ?? 1);
+      const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
+      g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();
       const inAdj = new Map();
@@ -1494,6 +1576,7 @@ const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then((patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
+          if (patch.data.nameMode !== undefined && patch.data.nameMode !== null && !NAME_MODES.includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias / target，或 null（跟随设置）');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
           // 连线标签（一线可多条）：
@@ -1611,19 +1694,27 @@ const server = http.createServer(async (req, res) => {
         if (!guardWrite(req, res)) return;
         return readJson(req, res)
           .then((p) => {
+            const hasDepth = p.down !== undefined || p.up !== undefined;
+            const hasName = p.macroNameMode !== undefined;
+            if (!hasDepth && !hasName) return bad(res, '缺少界面偏好');
             const down = Number(p.down);
             const up = Number(p.up);
-            if (!DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
-            if (!DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
-            store.setSetting('ui.depth', { down, up });
-            json(res, { ok: true, down, up });
+            if (hasDepth && !DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
+            if (hasDepth && !DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
+            if (hasName && !NAME_MODES.includes(p.macroNameMode)) return bad(res, 'macroNameMode 必须是 alias / target');
+            store.transaction(() => {
+              if (hasDepth) store.setSetting('ui.depth', { down, up });
+              if (hasName) store.setSetting('ui.macroNameMode', p.macroNameMode);
+            });
+            json(res, { ok: true, ...(hasDepth ? { down, up } : {}), macroNameMode: macroNameDefault() });
           })
           .catch(() => {});
       }
       const saved = store.getSetting('ui.depth', null) || {};
       return json(res, {
-        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 3,
-        up: DEPTH_UP.includes(saved.up) ? saved.up : 0,
+        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 1,
+        up: DEPTH_UP.includes(saved.up) ? saved.up : 1,
+        macroNameMode: macroNameDefault(),
       });
     }
 

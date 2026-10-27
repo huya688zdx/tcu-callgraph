@@ -6,7 +6,7 @@ import { layoutElk } from '../src/core/layout-elk.js';
 test('默认只使用 ELK：旧模式和坐标不覆盖布局，手工关系参与排版', async (t) => {
   const srv = await launchServer();
   t.after(() => srv.close());
-  const url = srv.baseUrl + '/api/view?root=main.c::main';
+  const url = srv.baseUrl + '/api/view?root=main.c::main&down=3&up=0';
   const before = await (await fetch(url)).json();
   assert.equal(before.layoutEngine, 'elk');
   assert.ok(before.groups.length, '默认打开带文件层级的 ELK 布局');
@@ -98,7 +98,8 @@ test('增量布局保留已有顺序，删除新增项后其余坐标和路径�
     assert.deepEqual(removed.edges.map((e) => e.points), added.edges.slice(0, -1).map((e) => e.points));
     let cycled = removed;
     for (let round = 0; round < 4; round++) {
-      cycled = await layoutElk(nodes, edges, { previous: cycled });
+      // 页面通过 JSON 传回 previous，空位快照也必须能往返。
+      cycled = await layoutElk(nodes, edges, { previous: JSON.parse(JSON.stringify(cycled)) });
       assert.deepEqual(cycled.nodes.map((n) => [n.id, n.x, n.y]), added.nodes.map((n) => [n.id, n.x, n.y]),
         '反复取消、加入同一变量，函数不能逐轮下移');
       assert.deepEqual(cycled.groups, added.groups, '文件框不能逐轮增高');
@@ -123,7 +124,7 @@ test('变量关系可单独移出并恢复，不影响同一函数的其他变�
   const srv = await launchServer({ target: 'samples/shared-state' });
   t.after(() => srv.close());
   const query = new URLSearchParams({
-    roots: 'producer.c::Sensor_Update,consumer.c::Control_Read', down: '0',
+    roots: 'producer.c::Sensor_Update,consumer.c::Control_Read', down: '0', up: '0',
     vars: 'var::g_rpm,var::g_index',
   });
   const view = () => fetch(`${srv.baseUrl}/api/view?${query}`).then((r) => r.json());

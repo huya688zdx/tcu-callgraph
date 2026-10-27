@@ -9,6 +9,8 @@ import { showMenuSections } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
+import { showExpansion } from './expand.js';
+import { setNodeName } from './node-name.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -34,14 +36,40 @@ async function loadStats() {
 // ---------------- 全局变量 / 常量 ----------------
 
 let varList = null;
+let varsLoading = false;
+let varsError = '';
+let varsSeq = 0;
+
+export function resetVars() {
+  varsSeq++;
+  varList = null;
+  varsLoading = false;
+  varsError = '';
+  varQuery = '';
+  collapsedFiles.clear();
+  renderVars();
+}
 
 async function loadVars() {
-  try {
-    varList = (await api.vars()).list || [];
-  } catch {
-    varList = [];
-  }
+  if (varsLoading || varList) return;
+  const seq = ++varsSeq;
+  varsLoading = true;
+  varsError = '';
   renderVars();
+  try {
+    const result = await api.vars();
+    if (seq !== varsSeq) return;
+    if (!Array.isArray(result?.list)) throw new Error(result?.error || t('vars.failed'));
+    varList = result.list;
+  } catch (err) {
+    if (seq !== varsSeq) return;
+    varsError = String(err.message || err);
+  } finally {
+    if (seq === varsSeq) {
+      varsLoading = false;
+      renderVars();
+    }
+  }
 }
 
 /** 当前视图里出现过的文件（变量面板按它过滤） */
@@ -77,8 +105,14 @@ export function renderVars() {
   if (!el) return;
   const v = state.view;
   const ctx = state.ctxBox;
-  if (!varList || !v || !ctx) {
+  if (!v || !ctx) {
     el.innerHTML = `<div class="empty">${t('vars.hint')}</div>`;
+    return;
+  }
+  if (!varList) {
+    el.innerHTML = `<div class="empty">${esc(varsError || t('vars.onDemand'))}</div>
+      <button type="button" data-load-vars ${varsLoading ? 'disabled' : ''}>${t(varsLoading ? 'vars.loading' : 'vars.load')}</button>`;
+    el.querySelector('[data-load-vars]').addEventListener('click', () => loadVars());
     return;
   }
 
@@ -271,7 +305,7 @@ function flashRow(row) {
  */
 export function revealInTree(kind, id) {
   let row = null;
-  populateTreeFiles.get(kind === 'fn' ? id.split('::')[0] : id)?.();
+  populateTreeFiles.get(kind === 'fn' ? (id.startsWith('header::') ? id.split('::')[1] : id.split('::')[0]) : id)?.();
   if (kind === 'fn') {
     row = document.querySelector(`#tree .tn.fn[data-fnid="${CSS.escape(id)}"]`);
   } else {
@@ -304,6 +338,7 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
+    items.push({ value: 'expand', label: 'expand.menu' });
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
     if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
@@ -319,6 +354,7 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
+      if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (v === 'locate') {
@@ -550,11 +586,18 @@ async function renderDetail(id) {
 
   // 节点只展示身份信息：标注已经改成「连线标签」，挂在连线上而不是函数上
   els.detail.innerHTML = `
-    <div class="detail-title">${esc(n.name)}</div>
+    <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
+      <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
+        <option value="default" ${!target.nameModeOverride ? 'selected' : ''}>${t('name.default')}（${t(target.nameMode === 'target' ? 'name.target' : 'name.alias')}）</option>
+        <option value="alias" ${target.nameModeOverride === 'alias' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
+        <option value="target" ${target.nameModeOverride === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
+      </select></label>` : ''}
     ${state.view?.comparison ? comparisonDetail(n) : ''}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
+  els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
 
   const inE = d.inEdges || [];
   const outE = d.outEdges || [];

@@ -172,6 +172,7 @@ export async function buildDataflowIndex(model) {
     }
 
     const idx = {
+      failedFiles,
       defs,
       byId: new Map(defs.map((d) => [d.id, d])),
       fnAccess,

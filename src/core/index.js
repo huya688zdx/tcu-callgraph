@@ -9,6 +9,7 @@ import { lex } from './lexer.js';
 import { preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
 import { parseDot, modelFromDot } from './dot.js';
+import { headerSymbols } from './header-symbols.js';
 
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
@@ -256,6 +257,7 @@ export function rebuildIndex(model) {
     byName.get(fn.name).push(fn);
   }
   for (const ex of externals) byId.set(ex.id, ex);
+  for (const symbol of model.headerSymbols || []) byId.set(symbol.id, symbol);
   for (const v of model.variables || []) byId.set(v.id, v);
 
   const outAdj = new Map();
@@ -440,6 +442,10 @@ export function buildIndex(root, sourceFiles = null) {
         cond: c.cond,
         via: c.via,
         macroChain: c.macroChain,
+        macroDefinitions: (c.macroChain || []).map((name) => {
+          const def = macrosByFile.get(fn.file)?.get(name);
+          return def ? `header::${def.file}::${name}` : null;
+        }).filter(Boolean),
       });
     }
     // 全局变量读写：画成虚线，同时记录方向供数据流分析
@@ -503,6 +509,26 @@ export function buildIndex(root, sourceFiles = null) {
   }
 
   const allNodes = new Map([...byId, ...externals]);
+  const callsByMacro = new Map();
+  for (const e of edges.filter((edge) => edge.kind !== 'var')) for (const id of e.macroDefinitions || []) {
+    if (!callsByMacro.has(id)) callsByMacro.set(id, []);
+    callsByMacro.get(id).push(e);
+  }
+  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.filter((e) => e.kind !== 'var').map((e) => e.callee)]), macros, callsByMacro);
+  for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
+    const id = symbol.targetIds[i];
+    if (!allNodes.has(id) && id.startsWith('ext::')) {
+      const node = { id, name: id.slice(5), file: '<external>', line: 0, external: true, params: [] };
+      externals.set(id, node);
+      allNodes.set(id, node);
+    }
+  }
+  for (const symbol of symbols) allNodes.set(symbol.id, symbol);
+  const headerEdges = symbols.flatMap((symbol) => [
+    ...symbol.targetIds.map((to) => ({ from: symbol.id, to, callee: allNodes.get(to)?.name || to,
+      kind: 'macro', line: symbol.line, via: symbol.name, headerReference: true })),
+    ...(callsByMacro.get(symbol.id) || []).map((e) => ({ ...e, to: symbol.id, callee: symbol.name, headerReference: true })),
+  ]);
 
   const model = {
     root,
@@ -511,6 +537,8 @@ export function buildIndex(root, sourceFiles = null) {
     elapsedMs: Date.now() - t0,
     files: parsed.map((p) => ({ rel: p.rel, isHeader: p.isHeader, bytes: p.bytes })),
     functions,
+    headerSymbols: symbols,
+    headerEdges,
     variables,
     externals: [...externals.values()],
     edges,
@@ -694,12 +722,22 @@ export function tarjan(model) {
 /**
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {}) {
-  const { byId, outAdj, inAdj } = model._index;
+export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true } = {}) {
+  let { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
+
+  // 仅选中头文件宏时加入定义映射，普通函数调用深度保持原来的语义。
+  const header = byId.get(rootId);
+  if (header.headerSymbol) {
+    outAdj = new Map(outAdj);
+    inAdj = new Map(inAdj);
+    outAdj.set(rootId, (model.headerEdges || []).filter((e) => e.from === rootId));
+    inAdj.set(rootId, (model.headerEdges || []).filter((e) => e.to === rootId));
+  }
 
   const nodes = new Map();
   const edges = [];
+  let truncated = false;
   const seenCall = new Set();
   // 同一对节点之间的多次调用合并成一条边，调用次数与行号记在 calls 里，
   // 避免画出并排的多条平行边
@@ -744,9 +782,14 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
       const next = [];
       for (const id of frontier) {
         for (const e of adj.get(id) || []) {
+          // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
+          if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
           addEdge(e);
-          if (nodes.size >= maxNodes) continue;
+          if (nodes.size >= maxNodes) {
+            if (!nodes.has(other) && byId.has(other)) truncated = true;
+            continue;
+          }
           if (addNode(other)) next.push(other);
         }
       }
@@ -760,6 +803,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   return {
     root: rootId,
+    truncated,
     nodes: [...nodes.values()],
     edges: edges.filter((e) => nodes.has(e.from) && nodes.has(e.to)),
   };
@@ -770,13 +814,15 @@ export function search(model, q, limit = 30) {
   const query = q.trim().toLowerCase();
   if (!query) return [];
   const scored = [];
-  for (const fn of model.functions) {
+  for (const fn of [...model.functions, ...(model.headerSymbols || [])]) {
     const name = fn.name.toLowerCase();
+    const targets = (fn.targetNames || []).join(' ').toLowerCase();
     const file = fn.file.toLowerCase();
     let score = 0;
     if (name === query) score = 100;
     else if (name.startsWith(query)) score = 80;
     else if (name.includes(query)) score = 60;
+    else if (targets.includes(query)) score = 50;
     else if (file.includes(query)) score = 20;
     if (score) scored.push({ fn, score });
   }
