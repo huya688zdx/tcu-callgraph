@@ -436,6 +436,11 @@
 
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
+  .compare-pick-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  .compare-pick-row { display:flex; align-items:flex-start; gap:10px; padding:10px 4px; border-bottom:1px solid #eee; cursor:pointer; }
+  .compare-pick-row small { display:block; color:#777; margin-top:3px; overflow-wrap:anywhere; }
+  #compareSelectModal .modal-foot { display:flex; gap:10px; flex-wrap:wrap; }
+  #comparePickCount { flex:1; font-size:12px; }
   /* 样式设置：两列紧凑网格；点色样弹应用内调色板（预设网格 + 自定义入口），不直接弹系统调色盘 */
   #styleModal { width: 520px; }
   .style-sec { padding: 6px 2px 2px; }
@@ -715,6 +720,7 @@
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
       <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
+      <span><i id="lg-modified" style="border-color:#D89A00"></i><em data-i18n="legend.modified">修改</em></span>
       <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>
@@ -771,6 +777,25 @@
       <input type="file" id="sessionFile" accept=".cgx,application/json" hidden>
       <span class="hint" id="sessionHint"></span>
     </div>
+  </div>
+
+  <div id="compareSelectModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareSelectTitle" style="width:min(900px,94vw)">
+    <div class="modal-head"><h2 id="compareSelectTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
+    <div class="modal-body">
+      <p class="hint">解析已完成。勾选要加入的函数或变量，原图中的节点会保留；取消不会改变当前画面。</p>
+      <p class="hint" id="comparePickRetainWarning" role="status"></p>
+      <div class="compare-pick-tools">
+        <input id="comparePickSearch" type="search" placeholder="搜索名称或文件路径" aria-label="搜索比较结果">
+        <select id="comparePickType" aria-label="对象类型"><option value="all">函数和变量</option><option value="fn">只看函数</option><option value="var">只看变量</option></select>
+        <select id="comparePickChange" aria-label="变更分类"><option value="changed">直接变更</option><option value="all">全部（含影响和上下文）</option><option value="modified">修改</option><option value="added">新增</option><option value="deleted">删除</option><option value="existing">未修改</option></select>
+        <button id="comparePickChanged" type="button">勾选直接变更</button><button id="comparePickClear" type="button">清空选择</button>
+      </div>
+      <details><summary id="comparePickWarningCount">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
+      <div id="comparePickList" style="max-height:42vh;overflow:auto"></div>
+      <div class="compare-pick-tools"><button id="comparePickPrev" type="button">上一页</button><span id="comparePickPage"></span><button id="comparePickNext" type="button">下一页</button></div>
+      <div id="comparePickError" class="detail-meta" role="alert" style="color:#A32D2D"></div>
+    </div>
+    <div class="modal-foot"><span id="comparePickCount" role="status"></span><button id="comparePickApply" class="primary" type="button" disabled>加入当前图</button><button id="comparePickCancel" type="button">取消</button></div>
   </div>
 
   <div id="styleModal" class="modal">

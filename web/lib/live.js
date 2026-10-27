@@ -155,6 +155,13 @@ export async function restorePage(root = null, isCurrent = () => true) {
       els.groupMode.checked = state.group;
     }
     const view = await hooks.loadView(root || saved?.roots || null, { nav: false, expansions: saved?.expansions || [] });
+    // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
+    // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
+    // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
+    if (state.view?.comparison) {
+      state.up = 0; state.down = 0;
+      els.depth.value = '0'; els.updepth.value = '0';
+    }
     if (saved && view && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;

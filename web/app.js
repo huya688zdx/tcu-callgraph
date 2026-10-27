@@ -55,8 +55,8 @@ async function loadView(rootId, opts = {}) {
   const data = await api.view({
     roots,
     expansions,
-    up: state.up,
-    down: state.down,
+    up: opts.exact ? 0 : state.up,
+    down: opts.exact ? 0 : state.down,
     group: state.group,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
@@ -118,8 +118,48 @@ hooks.expandFunction = async (root, direction, depth) => {
   return loadView(state.roots, { incremental: true, expansions });
 };
 hooks.renderDetail = renderDetail;
+hooks.syncComparison = syncComparison;
 // live.js 收到 AI 改动推送后用它刷新画面（保留视角）；函数声明有提升，这里可以先引用
 hooks.reloadKeepCam = reloadKeepCam;
+let comparisonPage = null;
+hooks.applyComparison = async (roots) => {
+  if (!comparisonPage) comparisonPage = {
+    view: structuredClone(state.view), roots: [...state.roots], expansions: structuredClone(state.expansions),
+    vars: [...state.vars], hiddenVars: [...state.hiddenVars], up: state.up, down: state.down,
+    cam: { ...cam }, nav: [...navStack], deleted: [...deleteStack],
+  };
+  state.at = 0;
+  state.expansions = [];
+  state.vars = new Set(roots.filter((id) => id.startsWith('var::')));
+  state.hiddenVars.clear();
+  navStack.length = 0;
+  await loadView(roots, { nav: false, incremental: true, exact: true, expansions: [] });
+  if (!state.view?.comparison) throw new Error('比较结果已准备，画布加载失败，请重试');
+  // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
+  // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
+  state.up = 0; state.down = 0;
+  els.depth.value = '0'; els.updepth.value = '0';
+  resetVars();
+  await Promise.all([loadStats(), loadTree()]);
+};
+hooks.restoreComparison = async () => {
+  if (!comparisonPage) return hooks.reloadAll();
+  const saved = comparisonPage;
+  comparisonPage = null;
+  state.view = saved.view;
+  state.roots = saved.roots;
+  state.expansions = saved.expansions;
+  state.vars = new Set(saved.vars);
+  state.hiddenVars = new Set(saved.hiddenVars);
+  state.up = saved.up; state.down = saved.down;
+  els.depth.value = String(saved.down); els.updepth.value = String(saved.up);
+  Object.assign(cam, saved.cam);
+  navStack.splice(0, navStack.length, ...saved.nav);
+  deleteStack.splice(0, deleteStack.length, ...saved.deleted);
+  resetVars();
+  await loadView(saved.roots, { nav: false, incremental: true, expansions: saved.expansions });
+  await Promise.all([loadStats(), loadTree()]);
+};
 
 /** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
 hooks.applyBookmark = async (b) => {
@@ -140,6 +180,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async () => {
+  comparisonPage = null;
   const seq = ++viewSeq;
   state.view = null;
   state.selected = null;

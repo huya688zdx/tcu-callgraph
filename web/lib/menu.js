@@ -3,29 +3,29 @@
  */
 import { state, edgeKey, THEME } from './state.js';
 import { hideMenu, showMenu, showMenuSections } from './ctxmenu.js';
-import { api } from './api.js';
 import { draw } from './render.js';
-import { pushHistory } from './history.js';
-import { fullReroute } from './geometry.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { renderLabelPanel } from './label-panel.js';
 import { analyseDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 import { showExpansion } from './expand.js';
 import { setNodeName } from './node-name.js';
+import { setStatus } from './change-status.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 // 色块用 getter 在菜单打开时现读 THEME：样式面板改色后菜单立即跟上
 const CHANGE_ITEMS = [
-  { value: 'existing', label: 'change.existing', get color() { return THEME.fill.existing; } },
-  { value: 'modified', label: 'change.modified', get color() { return THEME.fill.modified; } },
-  { value: 'added', label: 'change.added', get color() { return THEME.fill.added; } },
-  { value: 'deleted', label: 'change.deleted', get color() { return THEME.fill.deleted; } },
+  { value: 'existing', label: 'status.existing', get color() { return THEME.fill.existing; } },
+  { value: 'modified', label: 'status.modified', get color() { return THEME.fill.modified; } },
+  { value: 'added', label: 'status.added', get color() { return THEME.fill.added; } },
+  { value: 'deleted', label: 'status.deleted', get color() { return THEME.fill.deleted; } },
 ];
+export const COMPARISON_ITEMS = [{ value: 'auto', label: 'status.auto' }, ...CHANGE_ITEMS];
 
 const EDGE_ITEMS = [
   { value: 'existing', label: 'edgeState.existing', get color() { return THEME.edge.call; } },
   { value: 'added', label: 'edgeState.added', get color() { return THEME.edge.added; } },
+  { value: 'modified', label: 'status.modified', get color() { return THEME.edge.modified; } },
   { value: 'deleted', label: 'edgeState.deleted', get color() { return THEME.edge.call; } },
 ];
 
@@ -51,7 +51,8 @@ export function showNodeMenu(x, y, n) {
         ...(!comparing ? [{ value: 'callOrder', label: 'callOrder.find' }] : []),
       ],
     },
-    ...(!comparing ? [{ id: 'change', label: 'menu.change', items: CHANGE_ITEMS }] : []),
+    { id: 'change', label: 'status.title', items: (comparing ? COMPARISON_ITEMS : CHANGE_ITEMS).map((it) => ({ ...it,
+      active: it.value === (comparing && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing') })) },
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
     if (v.startsWith('name:')) return setNodeName(n, v.slice(5));
@@ -64,20 +65,13 @@ export function showNodeMenu(x, y, n) {
 }
 
 async function setNodeChange(n, change) {
-  if (state.view?.comparison) return;
-  n.change = change;
-  draw();
-  await api.overlay({ nodeId: n.id, data: { change } });
-  pushHistory();
+  return setStatus(n, change);
 }
 
 async function setEdgeChange(edge, change) {
-  if (state.view?.comparison) return;
-  edge.change = change;
-  fullReroute(); // 颜色变化后立即分开原先共用的线路。
-  draw();
-  await api.overlay({ edgeKey: edgeKey(edge), data: { change } });
-  pushHistory();
+  const result = await setStatus(edge, change, true);
+  if (result?.ok) renderLabelPanel();
+  return result;
 }
 
 function selectNode(id) {

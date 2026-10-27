@@ -40,9 +40,11 @@ export const api = {
     if (vars && vars.length) q.set('vars', vars.join(','));
     if (hiddenVars && hiddenVars.length) q.set('novars', hiddenVars.join(','));
     if (at > 0) q.set('at', String(at));
-    if (!previous && !expansions.length) return get('/api/view?' + q);
+    const bodyRoots = q.toString().length > 6000 ? list : null;
+    if (bodyRoots) { for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key); }
+    if (!previous && !expansions.length && !bodyRoots) return get('/api/view?' + q);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
-    return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId, expansions, previous: previous ? {
+    return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId, ...(bodyRoots ? { roots: bodyRoots, vars: vars || [], hiddenVars: hiddenVars || [] } : {}), expansions, previous: previous ? {
       projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points }) => ({ from, to, kind, line, change, points })),
@@ -60,6 +62,9 @@ export const api = {
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
   compare: (body) => post('/api/compare', body),
+  applyComparison: (body) => post('/api/compare/apply', body),
+  comparisonStatus: (body) => post('/api/compare/status', body),
+  cancelComparison: (previewId) => post('/api/compare/cancel', { previewId }),
   exitComparison: () => post('/api/compare/exit', {}),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */
   events: ({ limit = 50, before = 0, ops = [], q = '' } = {}) => {

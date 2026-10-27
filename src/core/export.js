@@ -13,7 +13,7 @@ export function buildSVGFromLayout(laid) {
   const W = laid.width + pad * 2;
   const H = laid.height + pad * 2;
   const out = [];
-  const C = { direct: '#9A9890', macro: '#D85A30', fnptr: '#7F77DD', unknown: '#C9C7BE' };
+  const C = { direct: '#9A9890', macro: '#D85A30', fnptr: '#7F77DD', unknown: '#C9C7BE', added: '#D9303E', modified: '#D89A00' };
 
   out.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${-pad} ${-pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
@@ -30,17 +30,18 @@ export function buildSVGFromLayout(laid) {
 
   for (const e of laid.edges) {
     const d = roundedPathD(e.points, 7);
-    const c = C[e.kind] || C.direct;
+    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind in C ? e.kind : 'direct';
+    const c = C[style];
     const dash = e.kind !== 'direct' ? ' stroke-dasharray="5 3"' : '';
     out.push(
-      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in C ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${style})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 
   for (const n of laid.nodes) {
     out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.displayName || n.name)}">`);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="#fff" stroke="#B5D4F4" stroke-width="1"/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${{existing:'#CCFFCC',modified:'#FFFF99',added:'#FFCCFF',deleted:'#BFBFBF'}[n.change] || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
@@ -103,6 +104,9 @@ export async function exportHtml(model, outPath, opts = {}) {
       name: n.displayName || n.name,
       file: n.file,
       line: n.line,
+      change: n.change,
+      detectedChange: n.detectedChange,
+      statusSource: n.statusSource,
       fanIn: (model._index.inAdj.get(n.id) || []).length,
       fanOut: (model._index.outAdj.get(n.id) || []).length,
     })),

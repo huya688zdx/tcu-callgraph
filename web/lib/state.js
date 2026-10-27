@@ -90,6 +90,7 @@ export const THEME = {
     call: '#2C2C2A', // 函数调用
     var: '#2C2C2A', // 变量访问
     added: '#D9303E', // 新增边
+    modified: '#D89A00', // 手动标记为修改的连线
     manual: '#639922', // 手动连线预览
     callDash: false, // 函数调用虚线（默认实线）
     varDash: true, // 变量访问虚线（默认虚线）
@@ -137,6 +138,7 @@ function syncThemeSideEffects() {
   chip('lg-call', THEME.edge.call);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
+  chip('lg-modified', THEME.edge.modified);
   // 虚实开关只改线型不改色，图例也要跟着换，否则与画布不一致（离线导出复制图例 DOM 会带出去）
   const chipDash = (id, dash) => {
     const el = document.getElementById(id);

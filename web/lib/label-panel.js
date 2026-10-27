@@ -28,6 +28,7 @@ import {
   afterConnDelete,
 } from './edge-labels.js';
 import { hooks } from './hooks.js';
+import { statusControl, bindStatusControl } from './change-status.js';
 
 /** 预设演示：和画布上的实际样式保持一致（黑框 / 红框 / 无框） */
 const PRESET_UI = [
@@ -225,11 +226,12 @@ export function renderLabelPanel() {
   const selLabel = labels.find((l) => l.id === sel) || null;
   if (sel && labels.length && !selLabel) state.selectedLabel = `${edgeKey(edge)}#${labels[0].id}`;
 
-  const head = `<div class="lbl-head">${esc(nodeName(edge.from))} → ${esc(nodeName(edge.to))}</div>`;
+  const head = `<div class="lbl-head">${esc(nodeName(edge.from))} → ${esc(nodeName(edge.to))}</div>${statusControl(edge)}`;
 
   if (state.view?.comparison) {
     const rows = labels.map((l) => `<div class="lbl-row"><span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span><span class="lbl-row-txt">${esc(l.note || '')}</span></div>`).join('');
     box.innerHTML = head + (rows ? `<div class="lbl-rows">${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
+    bindStatusControl(box, edge, true, renderLabelPanel);
     return;
   }
 
@@ -341,6 +343,7 @@ export function renderLabelPanel() {
   }
 
   box.innerHTML = head + `<div class="lbl-rows">${rows}</div>` + editor + addArea + modeArea + detectArea;
+  bindStatusControl(box, edge, true, renderLabelPanel);
 
   // ---- 事件 ----
   box.querySelectorAll('.lbl-row').forEach((row) => {

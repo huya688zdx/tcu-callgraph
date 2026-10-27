@@ -11,6 +11,7 @@ import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 import { showExpansion } from './expand.js';
 import { setNodeName } from './node-name.js';
+import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -546,8 +547,7 @@ function comparisonDetail(node) {
       return v.reason || v.text || v.name || JSON.stringify(v);
     }).map(esc).join(' · ') || '—';
   };
-  return `<div class="detail-meta">${t('compare.change')}: ${esc(t(`change.${node.change || 'existing'}`))}</div>
-    <div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
+  return `<div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
     <div class="detail-meta">${t('compare.locationAfter')}: ${esc(location('after'))}</div>
     ${node.reasons ? `<div class="detail-meta">${t('compare.reasons')}: ${describe(node.reasons)}</div>` : ''}
     ${node.impact ? `<div class="detail-meta">${t('compare.impact')}</div>` : ''}
@@ -560,12 +560,14 @@ async function renderDetail(id) {
   const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
   const isFn = !!target && target.kind !== 'var';
   syncDetailSections(isFn);
-  if (state.view?.comparison && target?.kind === 'var') {
+  if (target?.kind === 'var') {
     if (els.secDetail) els.secDetail.style.display = '';
     if (els.secEdges) els.secEdges.style.display = 'none';
     els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
       <div class="detail-meta">${esc(target.file || '')}:${target.line || ''}</div>
-      ${comparisonDetail(target)}`;
+      ${statusControl(target)}
+      ${state.view?.comparison ? comparisonDetail(target) : ''}`;
+    bindStatusControl(els.detail, target);
     els.edges.innerHTML = '';
     return;
   }
@@ -588,6 +590,7 @@ async function renderDetail(id) {
   els.detail.innerHTML = `
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${statusControl(target)}
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
       <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
         <option value="default" ${!target.nameModeOverride ? 'selected' : ''}>${t('name.default')}（${t(target.nameMode === 'target' ? 'name.target' : 'name.alias')}）</option>
@@ -598,6 +601,7 @@ async function renderDetail(id) {
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
+  bindStatusControl(els.detail, target);
 
   const inE = d.inEdges || [];
   const outE = d.outEdges || [];
@@ -609,7 +613,7 @@ async function renderDetail(id) {
     else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">${t('edge.chipFnptr')}${e.via ? ':' + esc(e.via) : ''}</span>`;
     else if (e.kind === 'manual') chip = `<span class="chip manual">${t('edge.chipManual')}</span>`;
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
-    return `<div class="edge-item">${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span> ${chip}${cond}</div>`;
+    return `<div class="edge-item">${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span> · ${statusLabel(e.change)} ${chip}${cond}</div>`;
   };
 
   els.edges.innerHTML =
