@@ -28,6 +28,7 @@ import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
 import { restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
+import { clearPairFlow } from './lib/pair-flow.js';
 
 /**
  * 加载视图
@@ -51,6 +52,7 @@ function syncViewDepths(up, down) {
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
   const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
+  clearPairFlow();
   stopCamAnim();
   // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
   const prior = nav && state.view && state.roots.length ? {

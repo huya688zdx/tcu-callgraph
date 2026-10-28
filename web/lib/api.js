@@ -99,6 +99,8 @@ export const api = {
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir)),
+  pairDataflow: (a, b) => post('/api/dataflow/pair', { a, b, projectId: state.view?.projectId,
+    comparisonId: state.view?.comparison?.id }),
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),

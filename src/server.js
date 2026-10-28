@@ -7,6 +7,7 @@ import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildInd
 import { layoutElk } from './core/layout-elk.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { compareProjects, comparisonDataflow, comparisonGlobals } from './core/compare.js';
+import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
 import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from './core/comparison-status.js';
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
@@ -1539,6 +1540,25 @@ const server = http.createServer(async (req, res) => {
           .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
         overlay: overlay.nodes?.[id] || {},
       });
+    }
+
+    if (u.pathname === '/api/dataflow/pair') {
+      if (req.method !== 'POST') return json(res, { error: '只支持 POST' }, 405);
+      if (!guardWrite(req, res)) return;
+      let body;
+      try { body = await readJson(req, res); } catch { return; }
+      if (!body || typeof body !== 'object' || Array.isArray(body) ||
+          ![body.a, body.b].every(id => typeof id === 'string' && id.length > 0 && id.length <= 2048) || body.a === body.b) {
+        return bad(res, '请选择两个不同的函数或变量');
+      }
+      const model = MODEL, comparison = COMPARISON, projectId = PROJECT.id;
+      if (body.projectId !== projectId || body.comparisonId !== comparison?.id) return json(res, { error: '工程或比较会话已切换，请重新选择' }, 409);
+      if (!comparison) await ensureAnalysis(model);
+      if (MODEL !== model || COMPARISON !== comparison) return json(res, { error: '工程已切换，请重新选择' }, 409);
+      if (![body.a, body.b].every(id => model._index.byId.has(id))) return bad(res, '所选函数或变量不存在');
+      const result = await (comparison ? comparisonPairDataflow(comparison, body.a, body.b) : pairDataflow(model, body.a, body.b));
+      if (MODEL !== model || COMPARISON !== comparison) return json(res, { error: '工程已切换，请重新选择' }, 409);
+      return json(res, { ...result, projectId, comparisonId: comparison?.id });
     }
 
     // 数据流：按需分析，不在扫描阶段做

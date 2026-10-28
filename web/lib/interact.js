@@ -32,6 +32,7 @@ import { renderLabelPanel } from './label-panel.js';
 import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
+import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 function worldPos(e) {
   const rect = els.cv.getBoundingClientRect();
   return {
@@ -309,6 +310,14 @@ els.cv.addEventListener('pointerdown', (e) => {
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
   const comparing = Boolean(state.view?.comparison);
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+    const node = hitTest(e);
+    if (node) {
+      e.preventDefault(); document.activeElement?.blur(); void pickPairFlow(node.id);
+      els.tooltip.style.opacity = '0';
+      renderDetail(null); renderLabelPanel(); return;
+    }
+  }
 
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
@@ -531,6 +540,7 @@ els.cv.addEventListener('pointermove', (e) => {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
     }
+    if (n) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 查看数据流</span>';
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -689,6 +699,8 @@ document.addEventListener('keydown', (e) => {
     state.moveTarget = null;
     cancelDrag();
     draw();
+  } else if (e.key === 'Escape' && state.pairFlow && !document.querySelector('.modal.show')) {
+    e.preventDefault(); e.stopImmediatePropagation(); clearPairFlow();
   } else if (state.multiSelection && !document.querySelector('.modal.show')) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -702,6 +714,7 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 els.cv.addEventListener('dblclick', (e) => {
+  if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }
   const n = hitTest(e);
   if (n) {
     selectNode(n.id);

@@ -6,6 +6,8 @@ import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
+import { routeEdges, collectSegments } from '/core/routing.js';
+import { pairFlowSegments, flowPulseColor } from './flow-geometry.js';
 
 // 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
 let animationFrame = 0;
@@ -15,6 +17,7 @@ let effects = [];
 let effectCamera = null;
 const scene = document.createElement('canvas');
 const sceneCtx = scene.getContext('2d');
+let pairRoutes = null;
 
 export function pulseAdded(nodes, edges) {
   state.recent = nodes.length || edges.length ? {
@@ -61,18 +64,42 @@ function drawEffects(now) {
       ctx.lineDashOffset = -now * 0.024 / c.k;
       ctx.stroke();
     } else {
-      ctx.fillStyle = '#86B9EC';
+      ctx.fillStyle = effect.color || flowPulseColor(THEME.node.selected);
       for (let i = 0; i < 3; i++) {
         const p = pathPointAt(effect.points, now / 2400 - i / 3);
-        ctx.globalAlpha = 0.9 - i * 0.3;
+        ctx.globalAlpha = 1 - i * 0.15;
         ctx.beginPath();
-        ctx.arc(p[0], p[1], (2.2 - i * 0.4) / c.k, 0, Math.PI * 2);
+        ctx.arc(p[0], p[1], (4.2 - i * 0.6) / c.k, 0, Math.PI * 2);
+        ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 3.8 / c.k; ctx.stroke();
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 2.2 / c.k; ctx.stroke();
         ctx.fill();
       }
     }
     ctx.restore();
   }
   ctx.restore();
+}
+
+/** 数据流只作临时覆盖，不修改原连线方向、节点集合或保存的标注。 */
+function drawPairFlow(ctx, view) {
+  const pair = state.pairFlow;
+  if (!pair?.result) { pairRoutes = null; return; }
+  const segments = pairFlowSegments(view, pair.result);
+  const signature = view.nodes.map(n => [n.id, n.x, n.y, n.w, n.h].join(',')).join(';') +
+    segments.map(s => s.points?.flat().join(',')).join(';');
+  if (pairRoutes?.result !== pair.result || pairRoutes.signature !== signature) {
+    routeEdges(view.nodes, segments.filter(s => !s.points), { existing: collectSegments(view.edges) });
+    pairRoutes = { result: pair.result, signature, segments };
+  }
+  for (const segment of pairRoutes.segments) {
+    if (!segment.points?.length) continue;
+    ctx.save();
+    ctx.beginPath(); strokeRounded(ctx, segment.points);
+    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 5 / cam.k; ctx.globalAlpha = 0.85; ctx.stroke();
+    ctx.strokeStyle = '#7C3AED'; ctx.lineWidth = 2.2 / cam.k; ctx.setLineDash([6 / cam.k, 4 / cam.k]); ctx.stroke();
+    ctx.restore();
+    effects.push({ kind: 'flow', points: segment.points, color: flowPulseColor('#7C3AED') });
+  }
 }
 
 function resize() {
@@ -213,6 +240,7 @@ function draw() {
   }
   // 高亮最后画，避免共用干线上的其他边盖住它。
   for (const e of focusedEdges) drawEdge(ctx, e, false, true, true);
+  drawPairFlow(ctx, v);
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -243,6 +271,15 @@ function draw() {
 
   const nb = neighborSet();
   for (const n of v.nodes) drawNode(ctx, n, nb, focusedNodes);
+  for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
+    const node = v.nodes.find(n => n.id === id);
+    if (!node) continue;
+    const gap = 5 / cam.k;
+    recordBoxEffect({ x: node.x - gap, y: node.y - gap, w: node.w + gap * 2, h: node.h + gap * 2 },
+      [6 / cam.k, 4 / cam.k], 2.5 / cam.k, 10, '#7C3AED');
+    ctx.save(); ctx.fillStyle = '#7C3AED'; ctx.font = `bold ${12 / cam.k}px ${FONT}`;
+    ctx.textAlign = 'left'; ctx.fillText(String(index + 1), node.x + 4 / cam.k, node.y - 9 / cam.k); ctx.restore();
+  }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
   drawEdgeLabels(ctx, v, recordBoxEffect);
@@ -445,7 +482,7 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.setLineDash([]);
 
   if (collectingEffects && selected && THEME.edge.selPulse) {
-    effects.push({ kind: 'edge', points: pts.map((p) => [...p]) });
+    effects.push({ kind: 'edge', points: pts.map((p) => [...p]), color: flowPulseColor(color) });
   }
 
   const a = pts[pts.length - 2];
