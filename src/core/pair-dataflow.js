@@ -29,7 +29,9 @@ function pathsBetween(index, from, to) {
       if (++inspected > MAX_EDGES) { truncated = true; break; }
       const rec = variable ? index.fnAccess.get(id)?.reads.get(state.id) : index.fnAccess.get(state.id)?.writes.get(id);
       if (!rec) continue;
-      const { fields, line } = metadata(rec);
+      const meta = metadata(rec);
+      const fields = index.byId.get(variable ? state.id : id)?.containsUnion ? [] : meta.fields;
+      const { line } = meta;
       if (variable && !overlap(state.fields, fields)) continue;
       const next = keyOf(id, variable ? [] : fields);
       const edge = { from: state.id, to: id, kind: variable ? 'df-read' : 'df-write',

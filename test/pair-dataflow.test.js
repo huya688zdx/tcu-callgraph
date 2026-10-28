@@ -64,6 +64,24 @@ test('结构体读写：整体与成员混用保留通配，嵌套字段区分�
   assert.ok((await pairDataflow(model, fn('write_parent'), fn('read_left'))).paths.length, '父成员写入覆盖子成员');
 });
 
+test('联合体不同成员共享存储，包括嵌套及 typedef 引用', async t => {
+  const dir = fixture(t);
+  fs.appendFileSync(path.join(dir, 'flow.c'), `
+typedef union U { unsigned a, b; } U;
+struct Holder { int x; U shared; } holder;
+U data;
+void union_write(void) { data.a = 1; }
+unsigned union_read(void) { return data.b; }
+void nested_union_write(void) { holder.shared.a = 1; }
+unsigned nested_union_read(void) { return holder.shared.b; }
+`);
+  const model = loadModel(dir), fn = name => `flow.c::${name}`;
+  assert.ok((await pairDataflow(model, fn('union_write'), fn('union_read'))).paths.length);
+  assert.ok((await pairDataflow(model, fn('nested_union_write'), fn('nested_union_read'))).paths.length);
+  assert.equal((await pairDataflow(model, fn('write_left'), fn('read_right_same_leaf'))).paths.length, 0,
+    '其他没有联合体的结构体仍区分成员');
+});
+
 test('比较两点数据流：before 和 after 各自独立查找，不拼接跨版本读写', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pair-compare-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

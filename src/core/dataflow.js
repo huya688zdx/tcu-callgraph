@@ -20,6 +20,51 @@ import { lex } from './lexer.js';
 import { preprocess } from './preproc.js';
 
 const MAX_VARS = 16;
+
+// 联合体成员共享存储。保守识别含联合体的聚合类型；对无法解析的类型，工程中
+// 存在联合体时不按字段排除，以免把真实依赖误报为不存在。
+function unionTypeResolver(parsedFiles) {
+  const types = new Map();
+  let hasUnion = false;
+  const register = (name, node) => {
+    if (!types.has(name)) types.set(name, []);
+    types.get(name).push(node);
+  };
+  const walk = (node) => {
+    if (node.type === 'union_specifier') hasUnion = true;
+    if (node.type === 'struct_specifier' || node.type === 'union_specifier') {
+      const name = node.childForFieldName('name')?.text;
+      if (name && node.childForFieldName('body')) register(`${node.type === 'struct_specifier' ? 'struct' : 'union'} ${name}`, node);
+    }
+    if (node.type === 'type_definition') {
+      const alias = node.childForFieldName('declarator')?.text;
+      if (alias) register(alias, node.childForFieldName('type'));
+    }
+    for (const child of node.namedChildren) walk(child);
+  };
+  for (const { root } of parsedFiles) walk(root);
+  const contains = (node, seen) => {
+    if (!node) return hasUnion;
+    if (node.type === 'union_specifier') return true;
+    if (node.type === 'type_identifier') return resolve(node.text, seen);
+    if (node.type !== 'struct_specifier') return false;
+    const body = node.childForFieldName('body');
+    if (!body) return resolve(`struct ${node.childForFieldName('name')?.text}`, seen);
+    return body.namedChildren.some((field) => field.type === 'field_declaration' && contains(field.childForFieldName('type'), seen));
+  };
+  const resolve = (name, seen = new Set()) => {
+    if (name.startsWith('union ')) return true;
+    if (seen.has(name)) return false;
+    const next = new Set(seen); next.add(name);
+    return types.has(name) ? types.get(name).some((node) => contains(node, next)) : hasUnion;
+  };
+  return (typeText) => {
+    const name = typeText.replace(/\b(const|volatile)\b/g, '').trim();
+    if (/^union\b/.test(name)) return true;
+    const match = name.match(/^struct\s+([A-Za-z_]\w*)|^([A-Za-z_]\w*)$/);
+    return match ? resolve(match[1] ? `struct ${match[1]}` : match[2]) : hasUnion;
+  };
+}
 const MAX_PEERS = 24;
 const MAX_NODES = 90;
 
@@ -100,6 +145,9 @@ export async function buildDataflowIndex(model) {
         defsByName.set(g.name, [...prev, def]);
       }
     }
+
+    const containsUnion = unionTypeResolver(parsedFiles);
+    for (const def of defs) def.containsUnion = containsUnion(def.typeText);
 
     // 先收齐声明与函数，再沿明确的实参将目标绑定到指针形参。
     const defsById = new Map(defs.map((d) => [d.id, d]));
