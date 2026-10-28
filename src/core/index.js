@@ -778,6 +778,9 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
 
   const walk = (adj, depth) => {
     let frontier = [rootId];
+    // 两个方向分别记录已遍历节点：互相调用的节点可能已在另一方向中入图，
+    // 仍须沿本方向继续查找它的上层/下层，不能用共享 nodes 提前截断。
+    const visited = new Set(frontier);
     for (let d = 0; d < depth; d++) {
       const next = [];
       for (const id of frontier) {
@@ -785,12 +788,17 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
           // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
           if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
-          addEdge(e);
-          if (nodes.size >= maxNodes) {
-            if (!nodes.has(other) && byId.has(other)) truncated = true;
+          if (!byId.has(other)) continue;
+          if (!nodes.has(other) && nodes.size >= maxNodes) {
+            truncated = true;
             continue;
           }
-          if (addNode(other)) next.push(other);
+          addNode(other);
+          addEdge(e);
+          if (!visited.has(other)) {
+            visited.add(other);
+            next.push(other);
+          }
         }
       }
       frontier = next;

@@ -5,7 +5,7 @@
 export const hooks = {
   /** 以某个函数为入口重新加载视图（支持传入多个 id） */
   loadView: () => {},
-  /** 将指定函数向上/向下的若干层调用关系加入当前画布。 */
+  /** 聚焦指定函数的单向调用关系；append 可保留原画布并加入结果。 */
   expandFunction: async () => {},
   /** 刷新右侧节点详情 */
   renderDetail: () => {},

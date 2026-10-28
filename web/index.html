@@ -827,12 +827,13 @@
         <label><span data-i18n="expand.depth">查找层数</span>
           <input id="expandDepth" type="number" min="1" max="20" step="1" value="1" required>
         </label>
-        <p data-i18n="expand.hint">以这个函数为起点查找，层数可选 1–20。已显示的函数会保留，变量按需勾选。</p>
+        <label><input id="expandAppend" type="checkbox"><span data-i18n="expand.append">加入当前画布（保留已有分支）</span></label>
+        <p data-i18n="expand.hint">默认只显示所选方向的调用链，不展开上层函数的其他分支。层数可选 1–20，无调用者时保留当前函数；Ctrl+Z 可返回原图。</p>
       </form>
     </div>
     <div class="modal-foot">
       <span id="expandMessage" role="status" aria-live="polite"></span>
-      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">查找并加入画布</button>
+      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">查找</button>
     </div>
   </div>
 
