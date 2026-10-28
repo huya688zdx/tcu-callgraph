@@ -1,9 +1,24 @@
-import { state, esc } from './state.js';
-import { api } from './api.js';
+import { state, cam, els, esc } from './state.js';
 import { draw } from './render.js';
+import { focusBox } from './camera.js';
+import { traceVisiblePaths, visibleGraphKey } from './visible-paths.js';
 
-let sequence = 0;
 let panel;
+function focusPath(force = false) {
+  const result = state.pairFlow?.result, view = state.view;
+  if (!result?.paths.length) return;
+  const ids = new Set(result.paths.flatMap(p => p.nodes));
+  let x = Infinity, y = Infinity, maxX = -Infinity, maxY = -Infinity, visible = true;
+  const include = ([px, py]) => {
+    x = Math.min(x, px); y = Math.min(y, py); maxX = Math.max(maxX, px); maxY = Math.max(maxY, py);
+    visible &&= px * cam.k + cam.x >= 55 && px * cam.k + cam.x <= els.cv.clientWidth - 55 &&
+      py * cam.k + cam.y >= 55 && py * cam.k + cam.y <= els.cv.clientHeight - 55;
+  };
+  for (const n of view.nodes) if (ids.has(n.id)) { include([n.x, n.y]); include([n.x + n.w, n.y + n.h]); }
+  for (const index of result.edgeIndices) for (const point of view.edges[index].points || []) include(point);
+  if (force || !visible) focusBox({ x, y, w: maxX - x, h: maxY - y }, 80);
+}
+
 function renderPanel() {
   if (!panel) {
     panel = document.createElement('div');
@@ -11,54 +26,57 @@ function renderPanel() {
     panel.className = 'pair-flow-bar';
     panel.setAttribute('role', 'status');
     document.getElementById('cv').parentElement.appendChild(panel);
-    panel.addEventListener('click', e => { if (e.target.closest('[data-pair-clear]')) clearPairFlow(); });
+    panel.addEventListener('click', e => {
+      if (e.target.closest('[data-pair-clear]')) clearPairFlow();
+      if (e.target.closest('[data-pair-focus]')) focusPath(true);
+    });
   }
   const pair = state.pairFlow;
   panel.hidden = !pair;
   if (!pair) { panel.textContent = ''; return; }
   const labels = new Map([...(pair.result?.nodes || []), ...state.view.nodes].map(n => [n.id, n.name || n.id]));
   const names = pair.ids.map(id => esc(labels.get(id) || id));
-  let message = pair.ids.length === 1 ? `已选 ${names[0]}，Ctrl 点击另一个函数或变量` : `${names.join(' ↔ ')} · 正在分析…`;
+  let message = pair.ids.length === 1 ? `已选 ${names[0]}，Ctrl 点击另一个函数或变量` : `${names.join(' ↔ ')}`;
   let details = '';
-  if (pair.error) message = esc(pair.error);
-  else if (pair.result) {
+  if (pair.result) {
     const r = pair.result;
-    message = `${names.join(' ↔ ')} · ${r.paths.length ? `${r.paths.length} 条最短数据流路径` : '未找到数据流路径'}`;
-    details = `<div class="pair-flow-hint">按变量读写关系显示潜在流向，点击顺序不改变流向。${r.truncated ? '已达查询上限，结果可能不完整。' : ''}${r.partial ? '部分文件未能分析，结果可能不完整。' : ''}</div>`;
-    if (r.paths.length) details += `<details><summary>查看路径</summary>${r.paths.map(p => `<div class="pair-flow-path">${p.nodes.map(id => esc(labels.get(id) || id)).join(' → ')}${p.versions ? ` <small>${p.versions.map(v => v === 'before' ? '修改前' : '修改后').join(' / ')}</small>` : ''}</div>`).join('')}</details>`;
+    message = `${names.join(' ↔ ')} · ${r.paths.length ? `${r.paths.length} 条最短连线路径` : '当前画布中没有相连路径'}`;
+    details = `<div class="pair-flow-hint">${r.paths.length ? '路径高亮，其他关系已淡化；脉冲沿原连线箭头方向移动。' : '只检查当前已显示的连线，可展开更多层级后重试。'}${r.truncated ? '路径较多，仅显示部分最短路径。' : ''}</div>`;
+    if (r.paths.length) details += `<details><summary>查看路径</summary>${r.paths.map(p => `<div class="pair-flow-path">${p.nodes.map((id, i) => `${i ? p.steps[i - 1].forward ? ' → ' : ' ← ' : ''}${esc(labels.get(id) || id)}`).join('')}${p.mixed ? ' <small>方向不连续的关联</small>' : ''}${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? '修改前' : '修改后').join(' / ') : '跨版本连线'}</small>` : ''}</div>`).join('')}</details>`;
   }
-  panel.innerHTML = `<div class="pair-flow-heading"><span>${message}</span><button type="button" data-pair-clear>清除 <kbd>Esc</kbd></button></div>${details}`;
+  panel.innerHTML = `<div class="pair-flow-heading"><span>${message}</span>${pair.result?.paths.length ? '<button type="button" data-pair-focus>显示整条路径</button>' : ''}<button type="button" data-pair-clear>清除 <kbd>Esc</kbd></button></div>${details}`;
 }
 
 export function clearPairFlow() {
-  sequence++;
   state.pairFlow = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
   draw();
 }
 
-export async function pickPairFlow(id) {
+export function pickPairFlow(id) {
   const view = state.view;
   if (!view?.nodes.some(n => n.id === id)) return;
   const prior = state.pairFlow;
   if (prior?.ids.length === 1 && prior.ids[0] === id) { clearPairFlow(); return; }
   const ids = prior?.ids.length === 1 ? [...prior.ids, id] : [id];
-  const pair = { ids, result: null, error: '' };
-  const seq = ++sequence;
+  const pair = { ids, result: null, view };
   state.pairFlow = pair;
   state.selected = null; state.selectedEdge = null; state.selectedLabel = null;
   state.moveTarget = null; state.multiSelection = null;
-  renderPanel(); draw();
-  if (ids.length !== 2) return;
-  try {
-    if (window.__EXPORT) throw new Error('离线快照无法重新分析数据流，请在应用中查询');
-    const result = await api.pairDataflow(...ids);
-    if (seq !== sequence || view !== state.view) return;
-    if (!result?.ok) throw new Error(result?.error || '数据流分析失败');
-    pair.result = result;
-  } catch (error) {
-    if (seq !== sequence || view !== state.view) return;
-    pair.error = error.message;
-  }
+  state.recent = null; state.flash = null;
+  let signature;
+  pair.refresh = current => {
+    if (current !== view || !ids.every(id => current.nodes.some(n => n.id === id))) {
+      state.pairFlow = null; renderPanel(); return;
+    }
+    if (ids.length !== 2) return;
+    const next = visibleGraphKey(current);
+    if (signature === next) return;
+    signature = next;
+    pair.result = traceVisiblePaths(current, ...ids);
+    renderPanel();
+  };
+  pair.refresh(view);
+  focusPath();
   renderPanel(); draw();
 }

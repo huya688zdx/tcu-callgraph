@@ -540,7 +540,7 @@ els.cv.addEventListener('pointermove', (e) => {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
     }
-    if (n) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 查看数据流</span>';
+    if (n) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 追踪连线路径</span>';
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -662,6 +662,7 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     window.getSelection()?.removeAllRanges();
     if (!state.view || document.querySelector('.modal.show') || state.dragBox || state.dragNode || state.dragLabel || state.dragSeg || state.dragEnd) return;
+    if (state.pairFlow) clearPairFlow();
     const anchor = state.selectedLabel || state.selectedEdge || state.selected;
     if (!anchor) return;
     const node = state.view.nodes.find((n) => n.id === state.selected);

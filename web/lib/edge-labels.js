@@ -125,13 +125,14 @@ export function hitLabel(p, view = state.view) {
 }
 
 /** 画布上绘制全部标签（由 render.js 在节点之后调用，保证标签在最上层） */
-export function drawEdgeLabels(ctx, view = state.view, onAnimatedBox = null) {
+export function drawEdgeLabels(ctx, view = state.view, onAnimatedBox = null, focusedEdges = null) {
   const items = labelLayout(view);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
     const key = `${edgeKey(edge)}#${label.id}`;
     const selected = state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key;
     ctx.save();
+    if (focusedEdges?.size && !focusedEdges.has(edge)) ctx.globalAlpha = 0.22;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const cx = rect.x + rect.w / 2;
