@@ -2,7 +2,7 @@
  * 入口：视图加载、删除、工具栏与快捷键、启动
  * 具体职责已拆到 lib/ 下的模块
  */
-import { applyI18n } from './i18n.js';
+import { applyI18n, t } from './i18n.js';
 import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
@@ -26,7 +26,7 @@ import './lib/timeline.js';
 import './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
-import { restorePage } from './lib/live.js';
+import { restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
 
 /**
@@ -39,27 +39,40 @@ let viewSeq = 0;
 const navStack = [];
 const NAV_MAX = 30;
 
+function syncViewDepths(up, down) {
+  for (const [select, value, key] of [[els.updepth, up, 'depth.upN'], [els.depth, down, 'depth.downN']]) {
+    if (![...select.options].some((option) => option.value === String(value))) {
+      select.add(new Option(t(key).replace('{n}', value), String(value)));
+    }
+    select.value = String(value);
+  }
+}
+
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
   const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
   stopCamAnim();
-  // 记录跳转前的入口与视角，供 Ctrl+Z 回退
-  if (nav && state.view && state.roots.length) {
-    navStack.push({ roots: [...state.roots], expansions: structuredClone(state.expansions), cam: { x: cam.x, y: cam.y, k: cam.k } });
-    if (navStack.length > NAV_MAX) navStack.shift();
-  }
+  // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
+  const prior = nav && state.view && state.roots.length ? {
+    roots: [...state.roots], expansions: structuredClone(state.expansions), cam: { ...cam },
+    up: state.up, down: state.down, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+  } : null;
   const seq = ++viewSeq;
   clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
+  const up = opts.exact ? 0 : opts.up ?? state.up;
+  const down = opts.exact ? 0 : opts.down ?? state.down;
+  const vars = opts.vars ?? [...state.vars];
+  const hiddenVars = opts.hiddenVars ?? [...state.hiddenVars];
   const data = await api.view({
     roots,
     expansions,
-    up: opts.exact ? 0 : state.up,
-    down: opts.exact ? 0 : state.down,
+    up,
+    down,
     group: state.group,
-    vars: [...state.vars],
-    hiddenVars: [...state.hiddenVars],
+    vars,
+    hiddenVars,
     at: state.at,
     previous,
   });
@@ -68,6 +81,13 @@ async function loadView(rootId, opts = {}) {
     console.warn(data?.error || '读取视图失败，保留当前画面');
     return;
   }
+  if (prior) {
+    navStack.push(prior);
+    if (navStack.length > NAV_MAX) navStack.shift();
+  }
+  state.up = up; state.down = down;
+  state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
+  syncViewDepths(up, down);
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
@@ -102,14 +122,21 @@ async function loadView(rootId, opts = {}) {
   history.stack = [];
   history.idx = -1;
   pushHistory();
-  return data;
+  // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
+  await savePage(true).catch((error) => console.warn('保存视图范围失败：', error));
+  return seq === viewSeq ? data : undefined;
 }
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.expandFunction = async (root, direction, depth) => {
+hooks.expandFunction = async (root, direction, depth, { append = false } = {}) => {
   if (!['up', 'down'].includes(direction) || !Number.isInteger(depth) || depth < 1 || depth > 20) {
     throw new Error('请选择方向及 1 到 20 的整数层数');
+  }
+  if (!append) {
+    // 只从选中函数沿一个方向查找；旧入口和局部范围不再把上层旁支带回来。
+    return loadView(root, { up: direction === 'up' ? depth : 0, down: direction === 'down' ? depth : 0,
+      expansions: [], vars: [], hiddenVars: [] });
   }
   const expansions = structuredClone(state.expansions);
   let scope = expansions.find((e) => e.root === root);
@@ -219,9 +246,12 @@ async function postDelete(body) {
 
 /** 回退到上一个视图（入口 + 视角一起还原） */
 async function navigateBack() {
-  const prev = navStack.pop();
+  const prev = navStack.at(-1);
   if (!prev) return false;
-  await loadView(prev.roots.length ? prev.roots : null, { nav: false, expansions: prev.expansions || [] });
+  const view = await loadView(prev.roots.length ? prev.roots : null, { nav: false, expansions: prev.expansions || [],
+    up: prev.up, down: prev.down, vars: prev.vars, hiddenVars: prev.hiddenVars });
+  if (!view) return false;
+  navStack.pop();
   cam.x = prev.cam.x;
   cam.y = prev.cam.y;
   cam.k = prev.cam.k;

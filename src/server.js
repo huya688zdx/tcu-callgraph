@@ -93,9 +93,8 @@ async function ensureAnalysis(model) {
 }
 
 // ---- 界面偏好：范围下拉（向下 / 向上层数）----
-// 与 index.html 里的 option 集合保持一致；存全局 setting 表，跨重启、跨工程生效
-const DEPTH_DOWN = [1, 2, 3, 5, 9];
-const DEPTH_UP = [0, 1, 2];
+// 聚焦查找允许 0–20 层，保存到全局 setting 表，跨重启、跨工程生效。
+const validDepth = (v) => Number.isInteger(v) && v >= 0 && v <= 20;
 const NAME_MODES = ['alias', 'target'];
 const macroNameDefault = () => store.getSetting('ui.macroNameMode', 'alias') === 'target' ? 'target' : 'alias';
 function withMacroName(node, viewOverlay, defaultMode) {
@@ -1804,10 +1803,10 @@ const server = http.createServer(async (req, res) => {
             const hasDepth = p.down !== undefined || p.up !== undefined;
             const hasName = p.macroNameMode !== undefined;
             if (!hasDepth && !hasName) return bad(res, '缺少界面偏好');
-            const down = Number(p.down);
-            const up = Number(p.up);
-            if (hasDepth && !DEPTH_DOWN.includes(down)) return bad(res, 'down 必须是 1 / 2 / 3 / 5 / 9');
-            if (hasDepth && !DEPTH_UP.includes(up)) return bad(res, 'up 必须是 0 / 1 / 2');
+            const down = p.down == null || p.down === '' ? NaN : Number(p.down);
+            const up = p.up == null || p.up === '' ? NaN : Number(p.up);
+            if (hasDepth && !validDepth(down)) return bad(res, 'down 必须是 0–20 的整数');
+            if (hasDepth && !validDepth(up)) return bad(res, 'up 必须是 0–20 的整数');
             if (hasName && !NAME_MODES.includes(p.macroNameMode)) return bad(res, 'macroNameMode 必须是 alias / target');
             store.transaction(() => {
               if (hasDepth) store.setSetting('ui.depth', { down, up });
@@ -1819,8 +1818,8 @@ const server = http.createServer(async (req, res) => {
       }
       const saved = store.getSetting('ui.depth', null) || {};
       return json(res, {
-        down: DEPTH_DOWN.includes(saved.down) ? saved.down : 1,
-        up: DEPTH_UP.includes(saved.up) ? saved.up : 1,
+        down: validDepth(saved.down) ? saved.down : 1,
+        up: validDepth(saved.up) ? saved.up : 1,
         macroNameMode: macroNameDefault(),
       });
     }
