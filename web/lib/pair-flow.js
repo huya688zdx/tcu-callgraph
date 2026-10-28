@@ -1,7 +1,7 @@
 import { state, cam, els, esc } from './state.js';
 import { draw } from './render.js';
 import { focusBox } from './camera.js';
-import { traceVisiblePaths, visibleGraphKey } from './visible-paths.js';
+import { traceVisiblePaths, visibleGraphKey, pathEdgeColors } from './visible-paths.js';
 
 let panel;
 function focusPath(force = false) {
@@ -23,9 +23,9 @@ function renderPanel() {
   if (!panel) {
     panel = document.createElement('div');
     panel.id = 'pairFlowBar';
-    panel.className = 'pair-flow-bar';
+    panel.className = 'sec pair-flow-bar';
     panel.setAttribute('role', 'status');
-    document.getElementById('cv').parentElement.appendChild(panel);
+    document.getElementById('right').prepend(panel);
     panel.addEventListener('click', e => {
       if (e.target.closest('[data-pair-clear]')) clearPairFlow();
       if (e.target.closest('[data-pair-focus]')) focusPath(true);
@@ -40,11 +40,12 @@ function renderPanel() {
   let details = '';
   if (pair.result) {
     const r = pair.result;
-    message = `${names.join(' ↔ ')} · ${r.paths.length ? `${r.paths.length} 条最短连线路径` : '当前画布中没有相连路径'}`;
-    details = `<div class="pair-flow-hint">${r.paths.length ? '路径高亮，其他关系已淡化；脉冲沿原连线箭头方向移动。' : '只检查当前已显示的连线，可展开更多层级后重试。'}${r.truncated ? '路径较多，仅显示部分最短路径。' : ''}</div>`;
-    if (r.paths.length) details += `<details><summary>查看路径</summary>${r.paths.map(p => `<div class="pair-flow-path">${p.nodes.map((id, i) => `${i ? p.steps[i - 1].forward ? ' → ' : ' ← ' : ''}${esc(labels.get(id) || id)}`).join('')}${p.mixed ? ' <small>方向不连续的关联</small>' : ''}${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? '修改前' : '修改后').join(' / ') : '跨版本连线'}</small>` : ''}</div>`).join('')}</details>`;
+    const directed = r.paths.filter(p => !p.mixed).length, related = r.paths.length - directed;
+    message = `${names.join(' ↔ ')} · ${r.paths.length ? `${directed} 条有向路径${related ? ` · ${related} 条静态关联` : ''}` : '当前画布中没有相连路径'}`;
+    details = `<div class="pair-flow-hint">${r.paths.length ? '同色表示方向连续的一段，换色处方向中断；共用连线颜色一致。仅有向路径播放动画。' : '只检查当前已显示的连线，可展开更多层级后重试。'}${r.truncated ? '路径较多，仅显示部分最短路径。' : ''}</div>`;
+    if (r.paths.length) details += `<details open><summary>查看路径</summary>${r.paths.map((p, index) => `<div class="pair-flow-path"><strong>路径 ${index + 1}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${p.steps[i - 1].forward ? ' → ' : ' ← '}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? '静态关联 · 方向不连续' : '有向路径 · 匀速动画'}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? '修改前' : '修改后').join(' / ') : '跨版本连线'}</small>` : ''}</div>`).join('')}</details>`;
   }
-  panel.innerHTML = `<div class="pair-flow-heading"><span>${message}</span>${pair.result?.paths.length ? '<button type="button" data-pair-focus>显示整条路径</button>' : ''}<button type="button" data-pair-clear>清除 <kbd>Esc</kbd></button></div>${details}`;
+  panel.innerHTML = `<h3>连线路径</h3><div class="pair-flow-heading">${message}</div><div class="pair-flow-actions">${pair.result?.paths.length ? '<button type="button" data-pair-focus>显示整条路径</button>' : ''}<button type="button" data-pair-clear>清除 <kbd>Esc</kbd></button></div>${details}`;
 }
 
 export function clearPairFlow() {
@@ -74,6 +75,7 @@ export function pickPairFlow(id) {
     if (signature === next) return;
     signature = next;
     pair.result = traceVisiblePaths(current, ...ids);
+    pair.colors = pathEdgeColors(pair.result.paths);
     renderPanel();
   };
   pair.refresh(view);
