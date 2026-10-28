@@ -1,5 +1,5 @@
 // ELK 节点尺寸与连线度量工具。
-import { edgeStyleKey, routeOverlapConflicts, routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
+import { edgeStyleKey, routeOverlapConflicts, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody, collapse, STUB } from './routing.js';
 
 export function textWidth(s) {
   let w = 0;
@@ -9,7 +9,7 @@ export function textWidth(s) {
   return w;
 }
 
-export function routeLengthAndCrossings(edges) {
+export function routeLengthAndCrossings(edges, geometryOnly = false) {
   const horizontal = [];
   const vertical = [];
   const pathKeys = new Set();
@@ -62,6 +62,8 @@ export function routeLengthAndCrossings(edges) {
     return total;
   };
   const length = unionLength(horizontal, 'y', ['x1', 'x2']) + unionLength(vertical, 'x', ['y1', 'y2']);
+  // 汇流候选只比较线长和拐点，无需反复计算全组交叉。
+  if (geometryOnly) return { length, bends };
 
   const intersections = new Set();
   for (const h of horizontal) {
@@ -108,6 +110,54 @@ export function improveEdgeRoutes(view, subset) {
       const score = routeScore(trial);
       // 坐标变换会带来浮点尾差；等价路径保留原线，避免 GUI 与离线拖动选出不同连接面。
       if (score < best - 1e-6) { edge.points = candidate.points; best = score; metrics = next; }
+    }
+  }
+}
+
+/** 只复用同组已经画出的通道，不增加新的交叉位置；反转路径即可处理同目标汇流。 */
+export function mergeSharedRoutes(view, subset = view.edges) {
+  const affected = new Set(subset), nodes = new Map(view.nodes.map((n) => [n.id, n]));
+  // 汇流按画面的颜色和虚实线判断，原始调用种类及既有布局评分不变。
+  const visible = (e) => ({ ...e, kind: e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct' });
+  const cost = (edges) => { const m = routeLengthAndCrossings(edges.map(visible), true); return m.length + STUB * m.bends; };
+  for (const role of ['from', 'to']) {
+    const groups = new Map();
+    for (const e of view.edges) {
+      if (e.custom || e.fromSide || e.toSide || e.from === e.to || !e.points?.length) continue;
+      const key = e[role] + '|' + edgeStyleKey(visible(e));
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(e);
+    }
+    for (const edges of groups.values()) {
+      if (edges.length < 2 || !edges.some((e) => affected.has(e))) continue;
+      let groupCost = cost(edges);
+      for (const edge of edges.slice().sort((a, b) => b.points.length - a.points.length)) {
+        const q = role === 'from' ? edge.points : edge.points.slice().reverse();
+        let best = null, gain = 0;
+        for (const donor of edges) {
+          if (donor === edge) continue;
+          const p = role === 'from' ? donor.points : donor.points.slice().reverse();
+          const before = cost([donor, edge]);
+          for (let i = 1; i < p.length; i++) for (let j = 1; j < q.length; j++) {
+            const ph = Math.abs(p[i][1] - p[i - 1][1]) < 0.5, qh = Math.abs(q[j][1] - q[j - 1][1]) < 0.5;
+            if (ph === qh) continue;
+            const at = ph ? [q[j][0], p[i][1]] : [p[i][0], q[j][1]];
+            if (![0, 1].every((axis) => at[axis] >= Math.min(p[i - 1][axis], p[i][axis]) - 1e-6 &&
+                at[axis] <= Math.max(p[i - 1][axis], p[i][axis]) + 1e-6 &&
+                at[axis] >= Math.min(q[j - 1][axis], q[j][axis]) - 1e-6 &&
+                at[axis] <= Math.max(q[j - 1][axis], q[j][axis]) + 1e-6)) continue;
+            let points = collapse([...p.slice(0, i), at, ...q.slice(j)]);
+            if (role === 'to') points.reverse();
+            const next = before - cost([donor, { ...edge, points }]);
+            if (next <= gain + 0.5 || pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) ||
+                pathCrossesBody(points, nodes.get(edge.from)) || pathCrossesBody(points, nodes.get(edge.to))) continue;
+            best = points; gain = next;
+          }
+        }
+        if (!best) continue;
+        const next = cost(edges.map((e) => e === edge ? { ...e, points: best } : e));
+        if (next < groupCost - 0.5) { edge.points = best; groupCost = next; }
+      }
     }
   }
 }
