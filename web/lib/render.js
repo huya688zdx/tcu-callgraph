@@ -6,8 +6,7 @@ import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
-import { routeEdges, collectSegments } from '/core/routing.js';
-import { pairFlowSegments, flowPulseColor } from './flow-geometry.js';
+import { flowPulseColor } from './flow-geometry.js';
 
 // 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
 let animationFrame = 0;
@@ -17,7 +16,6 @@ let effects = [];
 let effectCamera = null;
 const scene = document.createElement('canvas');
 const sceneCtx = scene.getContext('2d');
-let pairRoutes = null;
 
 export function pulseAdded(nodes, edges) {
   state.recent = nodes.length || edges.length ? {
@@ -78,28 +76,6 @@ function drawEffects(now) {
     ctx.restore();
   }
   ctx.restore();
-}
-
-/** 数据流只作临时覆盖，不修改原连线方向、节点集合或保存的标注。 */
-function drawPairFlow(ctx, view) {
-  const pair = state.pairFlow;
-  if (!pair?.result) { pairRoutes = null; return; }
-  const segments = pairFlowSegments(view, pair.result);
-  const signature = view.nodes.map(n => [n.id, n.x, n.y, n.w, n.h].join(',')).join(';') +
-    segments.map(s => s.points?.flat().join(',')).join(';');
-  if (pairRoutes?.result !== pair.result || pairRoutes.signature !== signature) {
-    routeEdges(view.nodes, segments.filter(s => !s.points), { existing: collectSegments(view.edges) });
-    pairRoutes = { result: pair.result, signature, segments };
-  }
-  for (const segment of pairRoutes.segments) {
-    if (!segment.points?.length) continue;
-    ctx.save();
-    ctx.beginPath(); strokeRounded(ctx, segment.points);
-    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 5 / cam.k; ctx.globalAlpha = 0.85; ctx.stroke();
-    ctx.strokeStyle = '#7C3AED'; ctx.lineWidth = 2.2 / cam.k; ctx.setLineDash([6 / cam.k, 4 / cam.k]); ctx.stroke();
-    ctx.restore();
-    effects.push({ kind: 'flow', points: segment.points, color: flowPulseColor('#7C3AED') });
-  }
 }
 
 function resize() {
@@ -182,6 +158,7 @@ function draw() {
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
+  state.pairFlow?.refresh?.(v);
   const moving = state.moveTarget;
   if (moving && (moving.view !== v ||
       !(moving.kind === 'edge' ? v.edges : moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
@@ -228,7 +205,9 @@ function draw() {
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
   const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
-  const focusedEdges = new Set(state.multiSelection?.edges
+  const trace = state.pairFlow?.result;
+  const tracedEdges = new Set((trace?.edgeIndices || []).map(index => v.edges[index]));
+  const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.edges
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
@@ -239,8 +218,7 @@ function draw() {
     drawEdge(ctx, e, related, false, !!focusedEdges.size);
   }
   // 高亮最后画，避免共用干线上的其他边盖住它。
-  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true);
-  drawPairFlow(ctx, v);
+  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true, tracedEdges.has(e));
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -282,7 +260,7 @@ function draw() {
   }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
-  drawEdgeLabels(ctx, v, recordBoxEffect);
+  drawEdgeLabels(ctx, v, recordBoxEffect, tracedEdges);
 
   // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
   if (state.moveTarget && !['edge', 'node'].includes(state.moveTarget.kind)) {
@@ -442,12 +420,12 @@ function pathPointAt(pts, t) {
 /** 该连线是否画成虚线（变量访问默认虚线；虚实可在样式面板按类型调整） */
 const edgeDashed = (e) => (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash);
 
-function drawEdge(ctx, e, related, selected, focused = false) {
+function drawEdge(ctx, e, related, selected, focused = false, traced = false) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = selected
+  const color = traced ? '#7C3AED' : selected
     ? THEME.node.selected
     : e.change === 'added'
     ? THEME.edge.added
@@ -473,15 +451,19 @@ function drawEdge(ctx, e, related, selected, focused = false) {
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
+  if (traced) {
+    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 / cam.k; ctx.globalAlpha = 0.9; ctx.stroke();
+  }
+
   ctx.strokeStyle = color;
-  ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
+  ctx.lineWidth = traced ? 3 / cam.k : selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
   // 变量访问=虚线，函数调用=实线
   if (edgeDashed(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (collectingEffects && selected && THEME.edge.selPulse) {
+  if (collectingEffects && selected && (traced || THEME.edge.selPulse)) {
     effects.push({ kind: 'edge', points: pts.map((p) => [...p]), color: flowPulseColor(color) });
   }
 

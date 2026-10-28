@@ -7,7 +7,7 @@ import { loadModel } from '../src/core/index.js';
 import { pairDataflow, comparisonPairDataflow } from '../src/core/pair-dataflow.js';
 import { compareProjects } from '../src/core/compare.js';
 import { launchServer } from '../scripts/lib/server.mjs';
-import { pairFlowSegments, flowPulseColor } from '../web/lib/flow-geometry.js';
+import { flowPulseColor } from '../web/lib/flow-geometry.js';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pair-'));
@@ -120,15 +120,7 @@ test('两点接口：仅显式查询触发分析，不改画布；无效端点�
   assert.deepEqual((await get(view)).nodes.map(n => n.id), original);
 });
 
-test('数据流展示：读取逆向沿原线播放，隐藏变量只形成临时段；脉冲与自定义选中色区分', () => {
-  const view = { nodes: [{ id: 'reader' }, { id: 'var' }], edges: [{ from: 'reader', to: 'var', points: [[0, 0], [20, 0]] }] };
-  const result = { nodes: [{ id: 'var', name: 'state' }, { id: 'reader' }], paths: [{ nodes: ['var', 'reader'] }] };
-  const segment = pairFlowSegments(view, result)[0];
-  assert.deepEqual(segment.points, [[20, 0], [0, 0]]);
-  assert.deepEqual(view.edges[0].points, [[0, 0], [20, 0]], '不反转原图数据');
-  const hidden = pairFlowSegments({ nodes: [{ id: 'writer' }, { id: 'reader' }], edges: [] },
-    { ...result, paths: [{ nodes: ['writer', 'var', 'reader'] }] });
-  assert.deepEqual(hidden.map(s => [s.from, s.to, s.via]), [['writer', 'reader', 'state']]);
+test('脉冲与自定义选中色区分', () => {
   for (const color of ['#185FA5', '#FF8A00', '#00E5FF', '#7C2D12', '#FFFFFF', '#000000']) assert.notEqual(flowPulseColor(color), color);
 });
 
