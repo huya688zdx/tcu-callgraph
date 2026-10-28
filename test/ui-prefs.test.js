@@ -33,12 +33,16 @@ test('界面偏好：保存后读回，非法值拒绝且不覆盖旧值', async
   assert.equal(w.ok, true);
   assert.deepEqual(await (await fetch(base + '/api/ui-prefs')).json(), { down: 5, up: 2, macroNameMode: 'alias' });
 
-  // 非法值：不在下拉选项集合里的一律拒绝，库里保持上次合法值
-  for (const bad of [{ down: 4, up: 0 }, { down: 1, up: 7 }, { down: 5 }, {}]) {
+  // 聚焦查找产生的范围同样可以保存，包含零层及边界值。
+  for (const depths of [{ down: 0, up: 3 }, { down: 4, up: 7 }, { down: 20, up: 20 }]) {
+    assert.equal((await jsonPost(base, '/api/ui-prefs', depths)).ok, true);
+    assert.deepEqual(await (await fetch(base + '/api/ui-prefs')).json(), { ...depths, macroNameMode: 'alias' });
+  }
+  for (const bad of [{ down: -1, up: 0 }, { down: 1, up: 21 }, { down: 1.5, up: 1 }, { down: 5 }, {}]) {
     const r = await jsonPost(base, '/api/ui-prefs', bad);
     assert.equal(r.ok, false, `非法载荷应被拒绝：${JSON.stringify(bad)}`);
   }
-  assert.deepEqual(await (await fetch(base + '/api/ui-prefs')).json(), { down: 5, up: 2, macroNameMode: 'alias' });
+  assert.deepEqual(await (await fetch(base + '/api/ui-prefs')).json(), { down: 20, up: 20, macroNameMode: 'alias' });
 });
 
 test('宏名称默认偏好：独立更新、跨工程保存；非法混合更新不会部分写入', async (t) => {
