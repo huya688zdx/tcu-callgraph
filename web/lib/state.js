@@ -51,6 +51,8 @@ const state = {
   selectedLabel: null,
   /** Ctrl+A 选择同类型、同样式的组件，保存匹配的节点 / 连线 / 标签集合。 */
   multiSelection: null,
+  /** Ctrl 点选的两个数据流端点及临时查询结果，不写入工程模型。 */
+  pairFlow: null,
   /** 双击后才允许移动节点、层级或调整连线；普通单击不解锁。 */
   moveTarget: null,
   dragSeg: null,

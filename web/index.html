@@ -10,6 +10,16 @@
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; }
+  .pair-flow-bar { position:absolute; top:52px; left:12px; max-width:min(580px,calc(100% - 24px)); z-index:12;
+    padding:10px 12px; border:1px solid #C4B5FD; border-radius:10px; background:rgba(255,255,255,.96);
+    box-shadow:0 3px 16px #0002; font-size:12px; }
+  .pair-flow-bar[hidden] { display:none; }
+  .pair-flow-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; color:#5B21B6; font-weight:600; }
+  .pair-flow-heading span { min-width:0; overflow-wrap:anywhere; }
+  .pair-flow-heading button { flex-shrink:0; }
+  .pair-flow-hint { color:#666; margin-top:6px; font-size:11px; }
+  .pair-flow-bar details { margin-top:7px; max-height:160px; overflow:auto; }
+  .pair-flow-path { padding:5px 0; overflow-wrap:anywhere; }
   body {
     font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     font-size: 13px; color: #2C2C2A; background: #F7F6F2;
@@ -658,6 +668,7 @@
             <p><span>缩放范围</span><kbd>50%–200% · 大图支持整图预览</kbd></p>
             <p><span>平移画布</span><kbd>拖拽空白处</kbd></p>
             <p><span>查看函数 / 变量详情</span><kbd>单击节点</kbd></p>
+            <p><span>查看两个节点间的数据流向</span><kbd>Ctrl+依次点击两个节点 · Esc 清除</kbd></p>
             <p><span>搜索结果加入画布</span><kbd>单击 · 双击单独打开</kbd></p>
             <p><span>移动函数 / 变量</span><kbd>双击选中后拖动</kbd></p>
             <p><span>整体移动文件 / 目录</span><kbd>双击标题选中后拖动</kbd></p>
