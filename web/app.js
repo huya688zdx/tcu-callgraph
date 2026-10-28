@@ -129,15 +129,11 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.expandFunction = async (root, direction, depth, { append = false } = {}) => {
+hooks.expandFunction = async (root, direction, depth) => {
   if (!['up', 'down'].includes(direction) || !Number.isInteger(depth) || depth < 1 || depth > 20) {
     throw new Error('请选择方向及 1 到 20 的整数层数');
   }
-  if (!append) {
-    // 只从选中函数沿一个方向查找；旧入口和局部范围不再把上层旁支带回来。
-    return loadView(root, { up: direction === 'up' ? depth : 0, down: direction === 'down' ? depth : 0,
-      expansions: [], vars: [], hiddenVars: [] });
-  }
+  // 始终保留当前入口和画布，只将本次指定方向的调用关系加入局部范围。
   const expansions = structuredClone(state.expansions);
   let scope = expansions.find((e) => e.root === root);
   if (!scope) { scope = { root, up: 0, down: 0 }; expansions.push(scope); }
