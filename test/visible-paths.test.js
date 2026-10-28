@@ -73,3 +73,13 @@ test('结构缓存跟随节点、连线次序与版本变化；拖动节点不�
   view.edges.reverse(); assert.notEqual(visibleGraphKey(view), original);
   view.edges.reverse(); view.edges[0].versions = ['after']; assert.notEqual(visibleGraphKey(view), original);
 });
+
+test('共享边位于不同分段时，所有路径的方向中断仍有颜色区分', () => {
+  const view = graph(['a', 'x', 'm', 'y', 'b'], [['a', 'x'], ['m', 'x'], ['m', 'b'], ['y', 'a'], ['y', 'm']]);
+  const { paths } = traceVisiblePaths(view, 'a', 'b'), colors = pathEdgeColors(paths);
+  assert.equal(paths.length, 2);
+  for (const path of paths) for (let i = 1; i < path.steps.length; i++) {
+    const [previous, current] = [path.steps[i - 1], path.steps[i]];
+    assert.equal(colors.get(previous.edge) === colors.get(current.edge), previous.forward === current.forward);
+  }
+});

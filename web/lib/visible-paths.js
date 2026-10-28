@@ -44,16 +44,8 @@ export function traceVisiblePaths(view, a, b, limit = 24) {
 export const visibleGraphKey = view => JSON.stringify([view.nodes.map(n => n.id),
   view.edges.map(e => [e.from, e.to, e.kind, e.versions])]);
 
-/** 方向中断时换色；共用边只保留一种颜色，连续有向路径优先。 */
+/** 最短路径中共用边的正反向一致，按方向赋色可同时保留连续段和换向边界。 */
 export function pathEdgeColors(paths) {
-  const colors = new Map(), palette = ['#2563EB', '#C26A08', '#0F766E', '#BE185D'];
-  for (const path of paths) if (!path.mixed) for (const step of path.steps) colors.set(step.edge, '#7C3AED');
-  for (const path of paths) {
-    let section = 0;
-    path.steps.forEach((step, i) => {
-      if (i && step.forward !== path.steps[i - 1].forward) section++;
-      if (!colors.has(step.edge)) colors.set(step.edge, palette[section % palette.length]);
-    });
-  }
-  return colors;
+  return new Map(paths.flatMap(path => path.steps.map(step =>
+    [step.edge, step.forward ? '#2563EB' : '#C26A08'])));
 }
