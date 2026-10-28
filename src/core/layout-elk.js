@@ -1,6 +1,6 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
-import { textWidth, routeScore, improveEdgeRoutes } from './layout-metrics.js';
+import { textWidth, routeScore, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
 import { routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
@@ -202,6 +202,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     if (addedEdges.length) routeEdges(view.nodes, addedEdges, {
       existing: collectSegments(view.edges.filter((e) => e.points)),
     });
+    if (addedEdges.length) mergeSharedRoutes(view, addedEdges);
     for (const e of addedEdges) for (const [x, y] of e.points) {
       view.width = Math.max(view.width, x + 40);
       view.height = Math.max(view.height, y + 40);
@@ -246,6 +247,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     const byId = new Map(view.nodes.map((n) => [n.id, n]));
     improveEdgeRoutes(view, view.edges.filter((e) => byId.get(e.from).file !== byId.get(e.to).file));
   }
+  mergeSharedRoutes(view);
   if (!group) for (const n of view.nodes) delete n.group;
   if (group && rootLabel) {
     for (const box of [...view.containers, ...view.groups]) box.depth++;

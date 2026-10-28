@@ -1,7 +1,36 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { routeEdges, routeOverlapConflicts } from '../src/core/routing.js';
-import { improveEdgeRoutes } from '../src/core/layout-metrics.js';
+import { improveEdgeRoutes, mergeSharedRoutes } from '../src/core/layout-metrics.js';
+import { exportSvg } from '../src/core/export-svg.js';
+
+test('ELK 已有的同源调用通道合并，函数指针调用使用相同的可见线型', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+  const edges = [
+    { from: 's', to: 'a', kind: 'direct', points: [[150, 40], [150, 100], [350, 100], [350, 300]] },
+    { from: 's', to: 'b', kind: 'fnptr', points: [[150, 40], [150, 120], [550, 120], [550, 300]] },
+  ];
+  const positions = structuredClone(nodes);
+  mergeSharedRoutes({ nodes, edges });
+  assert.equal(edges[0].points[1][1], edges[1].points[1][1], '平行横线应共用同一根干线');
+  assert.deepEqual(edges.map((e) => e.points.at(-1)), [[350, 300], [550, 300]], '各目标箭头保留');
+  assert.deepEqual(nodes, positions);
+  const paths = exportSvg({ nodes, edges }).match(/<path[^>]*data-from="s"[^>]*>/g);
+  assert.ok(paths.every((p) => p.includes('mk-direct') && !p.includes('stroke-dasharray')), '导出也统一为函数调用实线');
+});
+
+test('汇流不合并虚实线、不同颜色，也不覆盖手工折线', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+  const edges = ['direct', 'var', 'direct', 'direct'].map((kind, i) => ({ from: 's', to: i ? 'b' : 'a', kind,
+    change: i === 2 ? 'added' : 'existing', custom: i === 3,
+    points: [[150, 40], [150, 100 + i * 20], [i ? 550 : 350, 100 + i * 20], [i ? 550 : 350, 300]] }));
+  const before = structuredClone(edges);
+  mergeSharedRoutes({ nodes, edges });
+  assert.deepEqual(edges, before);
+  assert.match(exportSvg({ nodes, edges }), /stroke-dasharray="7 4"[^>]*mk-var/);
+});
 
 test('跨层级连线下方无遮挡时，从下方出线一次转弯进入目标', () => {
   const nodes = [
