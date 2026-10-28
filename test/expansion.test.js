@@ -86,3 +86,38 @@ test('旧版书签数据库升级后保留旧内容，并支持局部范围', (t
   const ranges = [{ root: 'b', up: 2, down: 3 }];
   assert.deepEqual(store.saveBookmark(project.id, { name: '旧书签', roots: ['b'], expansions: ranges }).bookmark.expansions, ranges);
 });
+
+test('向上查找追加到当前多入口画布，保留原函数和变量，不拉入上层旁支', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-expand-append-'));
+  fs.writeFileSync(path.join(dir, 'calls.c'), `
+int shared;
+void leaf(void) { shared++; }
+void b(void) { leaf(); }
+void keep(void) {}
+void x(void) {}
+void a(void) { b(); x(); }
+void y(void) {}
+void top(void) { a(); y(); }
+`);
+  const srv = await launchServer({ target: dir });
+  t.after(async () => { await srv.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const roots = ['calls.c::b', 'calls.c::keep'];
+  const url = srv.baseUrl + '/api/view?' + new URLSearchParams({ roots: roots.join(','), up: 0, down: 1, vars: 'var::shared' });
+  const names = view => view.nodes.map(n => n.name).sort();
+  const original = await (await fetch(url)).json();
+  assert.deepEqual(names(original), ['b', 'keep', 'leaf', 'shared']);
+  const expand = async expansions => (await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId: original.projectId, expansions }) })).json();
+  const firstScope = { root: 'calls.c::b', up: 1, down: 0 };
+  const first = await expand([firstScope]);
+  assert.deepEqual(first.roots, roots, '新找到的调用者不成为入口');
+  assert.deepEqual(names(first), ['a', 'b', 'keep', 'leaf', 'shared']);
+  assert.ok(first.edges.some(e => e.from === 'calls.c::a' && e.to === 'calls.c::b'));
+  assert.ok(original.edges.every(old => first.edges.some(e => e.from === old.from && e.to === old.to)));
+  const next = await expand([firstScope, { root: 'calls.c::a', up: 1, down: 0 }]);
+  assert.deepEqual(names(next), ['a', 'b', 'keep', 'leaf', 'shared', 'top']);
+  assert.ok(next.edges.some(e => e.from === 'calls.c::top' && e.to === 'calls.c::a'));
+  assert.ok(!next.nodes.some(n => ['x', 'y'].includes(n.name)), '上层的其他被调用分支不新增');
+  const none = await expand([...next.expansions, { root: 'calls.c::keep', up: 2, down: 0 }]);
+  assert.deepEqual(names(none), names(next), '无调用者时保留整张画布');
+});

@@ -7,7 +7,6 @@ import { openModal, closeModal } from './modal.js';
 const form = document.getElementById('expandForm');
 const direction = document.getElementById('expandDirection');
 const depth = document.getElementById('expandDepth');
-const append = document.getElementById('expandAppend');
 const message = document.getElementById('expandMessage');
 const apply = document.getElementById('expandApply');
 let target = null;
@@ -20,7 +19,6 @@ export function showExpansion(fn) {
   document.getElementById('expandFunction').textContent = fn.name || fn.label || fn.id;
   direction.value = 'up';
   depth.value = '1';
-  append.checked = false;
   message.textContent = '';
   apply.disabled = false;
   openModal('expandModal');
@@ -40,7 +38,7 @@ form?.addEventListener('submit', async (event) => {
   apply.disabled = true;
   message.textContent = t('expand.loading');
   try {
-    const view = await hooks.expandFunction(current.root, direction.value, Number(depth.value), { append: append.checked });
+    const view = await hooks.expandFunction(current.root, direction.value, Number(depth.value));
     if (seq !== sequence) return;
     if (!view) throw new Error(t('expand.failed'));
     if (view.truncated) message.textContent = t('expand.truncated');
