@@ -144,6 +144,7 @@ export async function buildDataflowIndex(model) {
           result.set(d.id, prev ? {
             lines: new Set([...prev.lines, ...access.lines]),
             fields: new Set([...prev.fields, ...access.fields]),
+            whole: prev.whole || access.whole,
             indirect: prev.indirect || access.indirect,
           } : access);
         }

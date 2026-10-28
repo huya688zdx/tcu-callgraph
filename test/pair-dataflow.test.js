@@ -17,6 +17,7 @@ int input, output, isolated;
 typedef int Number;
 Number deferred;
 struct S { int a, b; } state;
+struct Nested { struct S left, right; } nested, replacement;
 void writer(void) { input = 1; }
 int reader(void) { return input; }
 void transform(void) { output = input + 1; }
@@ -24,6 +25,13 @@ int consumer(void) { return output; }
 void caller(void) { consumer(); }
 void write_field(void) { state.a = 1; }
 int read_other_field(void) { return state.b; }
+void write_mixed(void) { nested = replacement; nested.left.a = 1; }
+int read_right(void) { return nested.right.b; }
+void write_left(void) { nested.left.a = 1; }
+void write_parent(void) { nested.left = replacement.left; }
+int read_right_same_leaf(void) { return nested.right.a; }
+int read_left(void) { return nested.left.a; }
+int read_mixed(void) { struct Nested copy = nested; return nested.right.b; }
 void bidirectional(void) { input = output; }
 `);
   return dir;
@@ -45,6 +53,15 @@ test('两点数据流：支持函数/函数、函数/变量、变量/变量和�
   assert.equal((await pairDataflow(model, 'var::isolated', fn('reader'))).paths.length, 0);
   const indirect = await pairDataflow(model, fn('writer'), fn('consumer'));
   assert.ok(paths(indirect).some(p => p.length === 5 && p.includes(fn('transform'))));
+});
+
+test('结构体读写：整体与成员混用保留通配，嵌套字段区分分支并匹配父子路径', async t => {
+  const model = loadModel(fixture(t)), fn = name => `flow.c::${name}`;
+  assert.ok((await pairDataflow(model, fn('write_mixed'), fn('read_right'))).paths.length, '整体写入覆盖其他成员');
+  assert.ok((await pairDataflow(model, fn('write_left'), fn('read_mixed'))).paths.length, '整体读取覆盖其他成员');
+  assert.equal((await pairDataflow(model, fn('write_left'), fn('read_right_same_leaf'))).paths.length, 0, '同名叶字段不代表同一成员');
+  assert.ok((await pairDataflow(model, fn('write_left'), fn('read_left'))).paths.length);
+  assert.ok((await pairDataflow(model, fn('write_parent'), fn('read_left'))).paths.length, '父成员写入覆盖子成员');
 });
 
 test('比较两点数据流：before 和 after 各自独立查找，不拼接跨版本读写', async t => {

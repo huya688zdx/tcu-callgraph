@@ -90,6 +90,8 @@ async function loadView(rootId, opts = {}) {
   state.up = up; state.down = down;
   state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
   syncViewDepths(up, down);
+  // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
+  clearPairFlow();
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);

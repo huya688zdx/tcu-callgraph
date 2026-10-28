@@ -6,7 +6,7 @@ function metadata(rec) {
   if (!accessMetadata.has(rec)) {
     let line = 0;
     for (const value of rec.lines) if (!line || value < line) line = value;
-    accessMetadata.set(rec, { line, fields: rec.indirect ? [] : [...rec.fields].sort() });
+    accessMetadata.set(rec, { line, fields: rec.indirect || rec.whole ? [] : [...rec.fields].sort() });
   }
   return accessMetadata.get(rec);
 }
