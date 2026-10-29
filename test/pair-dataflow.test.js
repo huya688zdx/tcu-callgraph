@@ -7,7 +7,7 @@ import { loadModel } from '../src/core/index.js';
 import { pairDataflow, comparisonPairDataflow } from '../src/core/pair-dataflow.js';
 import { compareProjects } from '../src/core/compare.js';
 import { launchServer } from '../scripts/lib/server.mjs';
-import { flowPulseColor } from '../web/lib/flow-geometry.js';
+import { flowPulseColor, flowPath, flowPointAt } from '../web/lib/flow-geometry.js';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pair-'));
@@ -122,6 +122,17 @@ test('两点接口：仅显式查询触发分析，不改画布；无效端点�
 
 test('脉冲与自定义选中色区分', () => {
   for (const color of ['#185FA5', '#FF8A00', '#00E5FF', '#7C2D12', '#FFFFFF', '#000000']) assert.notEqual(flowPulseColor(color), color);
+});
+
+test('流动标记按距离匀速前进，折弯和反向重合保留各自方向', () => {
+  const short = flowPath([[0, 0], [100, 0]]);
+  const long = flowPath([[0, 0], [100, 0], [100, 900]]);
+  assert.deepEqual(flowPointAt(short, 40), flowPointAt(long, 40));
+  assert.deepEqual(flowPointAt(long, 120), [100, 20, 0, 1]);
+  const reverse = flowPath([[100, 0], [100, 0], [0, 0]]);
+  assert.deepEqual(flowPointAt(short, 40), [40, 0, 1, 0]);
+  assert.deepEqual(flowPointAt(reverse, 60), [40, 0, -1, 0]);
+  assert.equal(flowPath([[0, 0], [0, 0]]).length, 0);
 });
 
 test('两点路径查询有界：分支很多时限制路径数量，过深链路明确提示截断', async () => {

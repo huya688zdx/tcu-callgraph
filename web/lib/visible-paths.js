@@ -35,6 +35,7 @@ export function traceVisiblePaths(view, a, b, limit = 24) {
     }
   }
   return { ok: true, a, b, paths, edgeIndices: [...new Set(paths.flatMap(p => p.steps.map(s => s.edge)))],
+    flowEdgeIndices: [...new Set(paths.filter(p => !p.mixed).flatMap(p => p.steps.map(s => s.edge)))],
     nodes: [...new Set(paths.flatMap(p => p.nodes))].map(id => ({ id, name: nodes.get(id).name })),
     truncated: stack.length > 0, basis: 'visible-edges' };
 }
@@ -42,3 +43,9 @@ export function traceVisiblePaths(view, a, b, limit = 24) {
 /** 路径使用连线下标，结构/顺序变化后重新查找；拖动和缩放无需重新遍历。 */
 export const visibleGraphKey = view => JSON.stringify([view.nodes.map(n => n.id),
   view.edges.map(e => [e.from, e.to, e.kind, e.versions])]);
+
+/** 最短路径中共用边的正反向一致，按方向赋色可同时保留连续段和换向边界。 */
+export function pathEdgeColors(paths) {
+  return new Map(paths.flatMap(path => path.steps.map(step =>
+    [step.edge, step.forward ? '#2563EB' : '#C26A08'])));
+}

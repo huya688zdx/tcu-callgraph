@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { traceVisiblePaths, visibleGraphKey } from '../web/lib/visible-paths.js';
+import { traceVisiblePaths, visibleGraphKey, pathEdgeColors } from '../web/lib/visible-paths.js';
 
 const graph = (nodes, pairs) => ({ nodes: nodes.map(id => ({ id, name: id })),
   edges: pairs.map(([from, to], i) => ({ from, to, kind: 'direct', points: [[i, 0], [i, 20]] })) });
@@ -14,6 +14,8 @@ test('当前图路径：没有变量读写也能沿调用线定位远端节点�
   assert.equal(result.paths[0].steps.length, 29, '不沿用 AST 查询的 8 跳限制');
   assert.ok(result.paths[0].steps.every(s => s.forward));
   assert.equal(result.edgeIndices.length, 29);
+  assert.deepEqual(result.flowEdgeIndices, result.edgeIndices);
+  assert.equal(new Set(pathEdgeColors(result.paths).values()).size, 1, '连续路径保持同色');
   assert.ok(!result.nodes.some(n => n.id === 'side'));
   assert.equal(JSON.stringify(view), before);
 });
@@ -24,8 +26,12 @@ test('反向选择保留原箭头；共同调用者属于连线关联，不伪�
   assert.deepEqual(result.paths[0].nodes, ['a', 'parent', 'b']);
   assert.deepEqual(result.paths[0].steps.map(s => s.forward), [false, true]);
   assert.equal(result.paths[0].mixed, true);
+  const colors = pathEdgeColors(result.paths);
+  assert.notEqual(colors.get(0), colors.get(1), '方向中断的两段使用不同颜色');
+  assert.deepEqual(result.flowEdgeIndices, [], '共同调用目标的关联不能播放连续流动动画');
   const reverse = traceVisiblePaths(view, 'a', 'parent');
   assert.deepEqual(reverse.paths[0].steps, [{ edge: 0, forward: false }]);
+  assert.deepEqual(reverse.flowEdgeIndices, [0], '反向选择仍沿原连线方向播放');
   assert.equal(view.edges[0].from, 'parent');
 });
 
@@ -66,4 +72,14 @@ test('结构缓存跟随节点、连线次序与版本变化；拖动节点不�
   assert.equal(visibleGraphKey(view), original);
   view.edges.reverse(); assert.notEqual(visibleGraphKey(view), original);
   view.edges.reverse(); view.edges[0].versions = ['after']; assert.notEqual(visibleGraphKey(view), original);
+});
+
+test('共享边位于不同分段时，所有路径的方向中断仍有颜色区分', () => {
+  const view = graph(['a', 'x', 'm', 'y', 'b'], [['a', 'x'], ['m', 'x'], ['m', 'b'], ['y', 'a'], ['y', 'm']]);
+  const { paths } = traceVisiblePaths(view, 'a', 'b'), colors = pathEdgeColors(paths);
+  assert.equal(paths.length, 2);
+  for (const path of paths) for (let i = 1; i < path.steps.length; i++) {
+    const [previous, current] = [path.steps[i - 1], path.steps[i]];
+    assert.equal(colors.get(previous.edge) === colors.get(current.edge), previous.forward === current.forward);
+  }
 });

@@ -6,7 +6,7 @@ import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
-import { flowPulseColor } from './flow-geometry.js';
+import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
 
 // 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
 let animationFrame = 0;
@@ -63,14 +63,28 @@ function drawEffects(now) {
       ctx.stroke();
     } else {
       ctx.fillStyle = effect.color || flowPulseColor(THEME.node.selected);
-      for (let i = 0; i < 3; i++) {
-        const p = pathPointAt(effect.points, now / 2400 - i / 3);
-        ctx.globalAlpha = 1 - i * 0.15;
+      const path = effect.path;
+      if (!path.length) { ctx.restore(); continue; }
+      const scale = Math.min(1, 1 / c.k);
+      const spacing = Math.min(90, path.length);
+      // 所有连线每秒前进 80 个画布单位，长线只增加标记数量。
+      for (let distance = (now * 0.08) % spacing; distance < path.length; distance += spacing) {
+        const [x, y, dx, dy] = flowPointAt(path, distance);
+        ctx.save();
+        // 固定放在前进方向右侧，相向重合时各走一侧。
+        ctx.translate(x - dy * 5 * scale, y + dx * 5 * scale);
+        ctx.rotate(Math.atan2(dy, dx));
+        ctx.scale(scale, scale);
         ctx.beginPath();
-        ctx.arc(p[0], p[1], (4.2 - i * 0.6) / c.k, 0, Math.PI * 2);
-        ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 3.8 / c.k; ctx.stroke();
-        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 2.2 / c.k; ctx.stroke();
+        ctx.moveTo(5, 0);
+        ctx.lineTo(-3, -3);
+        ctx.lineTo(-1, 0);
+        ctx.lineTo(-3, 3);
+        ctx.closePath();
+        ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1; ctx.stroke();
         ctx.fill();
+        ctx.restore();
       }
     }
     ctx.restore();
@@ -206,7 +220,9 @@ function draw() {
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
   const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
   const trace = state.pairFlow?.result;
-  const tracedEdges = new Set((trace?.edgeIndices || []).map(index => v.edges[index]));
+  const tracedColors = new Map((trace?.edgeIndices || []).map(index => [v.edges[index], state.pairFlow.colors.get(index)]));
+  const tracedEdges = new Set(tracedColors.keys());
+  const flowingEdges = new Set((trace?.flowEdgeIndices || []).map(index => v.edges[index]));
   const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.edges
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
@@ -218,7 +234,7 @@ function draw() {
     drawEdge(ctx, e, related, false, !!focusedEdges.size);
   }
   // 高亮最后画，避免共用干线上的其他边盖住它。
-  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true, tracedEdges.has(e));
+  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true, tracedColors.get(e), !tracedEdges.has(e) || flowingEdges.has(e));
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -393,39 +409,15 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-/** 折线上按 0~1 的进度取点（选中线上的流动小圆点用） */
-function pathPointAt(pts, t) {
-  let total = 0;
-  const segs = [];
-  for (let i = 1; i < pts.length; i++) {
-    const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
-    segs.push(d);
-    total += d;
-  }
-  let target = (t - Math.floor(t)) * total;
-  for (let i = 0; i < segs.length; i++) {
-    if (target > segs[i] && i < segs.length - 1) {
-      target -= segs[i];
-      continue;
-    }
-    const r = segs[i] ? target / segs[i] : 0;
-    return [
-      pts[i][0] + (pts[i + 1][0] - pts[i][0]) * r,
-      pts[i][1] + (pts[i + 1][1] - pts[i][1]) * r,
-    ];
-  }
-  return pts[pts.length - 1];
-}
-
 /** 该连线是否画成虚线（变量访问默认虚线；虚实可在样式面板按类型调整） */
 const edgeDashed = (e) => (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash);
 
-function drawEdge(ctx, e, related, selected, focused = false, traced = false) {
+function drawEdge(ctx, e, related, selected, focused = false, traceColor = null, animated = true) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
   // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = traced ? '#7C3AED' : selected
+  const color = traceColor ? traceColor : selected
     ? THEME.node.selected
     : e.change === 'added'
     ? THEME.edge.added
@@ -451,20 +443,20 @@ function drawEdge(ctx, e, related, selected, focused = false, traced = false) {
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
-  if (traced) {
-    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 / cam.k; ctx.globalAlpha = 0.9; ctx.stroke();
+  if (traceColor) {
+    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 * Math.min(1, 1 / cam.k); ctx.globalAlpha = 0.9; ctx.stroke();
   }
 
   ctx.strokeStyle = color;
-  ctx.lineWidth = traced ? 3 / cam.k : selected ? 2.6 : related ? 2.4 : 1.4;
+  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
   // 变量访问=虚线，函数调用=实线
   if (edgeDashed(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (collectingEffects && selected && (traced || THEME.edge.selPulse)) {
-    effects.push({ kind: 'edge', points: pts.map((p) => [...p]), color: flowPulseColor(color) });
+  if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
+    effects.push({ kind: 'edge', path: flowPath(pts), color: flowPulseColor(color) });
   }
 
   const a = pts[pts.length - 2];

@@ -10,7 +10,7 @@ export async function buildStandaloneHtml() {
     theme: structuredClone(THEME) };
   const right = document.getElementById('right').cloneNode(true);
   right.removeAttribute('data-mode');
-  right.querySelector('#secLabel')?.remove();
+  right.querySelectorAll('#secLabel, #pairFlowBar').forEach(panel => panel.remove());
   const css = [...document.querySelectorAll('style')].map((s) => s.textContent).join('\n');
 
   // 只收集此离线入口实际依赖的现有模块；统一模块地址，避免 file:// 下的相对导入和跨域限制。
