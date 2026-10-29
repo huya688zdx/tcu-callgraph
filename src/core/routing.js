@@ -136,7 +136,7 @@ function vLineBlocked(seg, nodes, skip, clear = CLEAR) {
  * 折线是否穿过节点「内部」（贴着边界或落在端口点不算）。
  * pathBlockedByNodes 会跳过两端节点，因此端点自身被穿过时查不出来；这里补上。
  */
-function pathCrossesBody(points, n, eps = 0.5) {
+export function pathCrossesBody(points, n, eps = 0.5) {
   if (!points || points.length < 2) return false;
   const x0 = n.x + eps;
   const x1 = n.x + n.w - eps;
@@ -441,7 +441,7 @@ function routeOuterColumn(p0, p1, a, b, sa, sb, ctx) {
 // ---------------- 折线整理 ----------------
 
 /** 去掉零长度段、合并共线点，保证输出为严格正交折线 */
-function collapse(pts) {
+export function collapse(pts) {
   const dedup = [];
   for (const p of pts) {
     const n = dedup.length;
