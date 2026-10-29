@@ -93,7 +93,10 @@ export function improveEdgeRoutes(view, subset) {
   const edges = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.points.length > 2)
     .sort((a, b) => detour(b) - detour(a)).slice(0, 6);
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
-  let metrics = routeLengthAndCrossings(view.edges), best = routeScore(view.edges);
+  // 宏和函数指针在画布上也是调用实线，避让按实际可见样式计量。
+  const measure = (edges) => routeLengthAndCrossings(edges.map((e) => ({ ...e,
+    kind: e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct' })));
+  let metrics = measure(view.edges), best = routeScore(view.edges);
   for (const edge of edges) {
     const a = byId.get(edge.from), b = byId.get(edge.to);
     if (a === b) continue;
@@ -105,11 +108,13 @@ export function improveEdgeRoutes(view, subset) {
       const candidate = { ...edge, fromSide, toSide, points: edge.points.map((p) => [...p]) };
       routeEdges(view.nodes, [candidate], { existing: collectSegments(others) });
       if (candidate.blocked || pathBlockedByNodes(candidate.points, view.nodes, new Set([edge.from, edge.to]))) continue;
-      const trial = [...others, candidate], next = routeLengthAndCrossings(trial);
-      if (next.crossings > metrics.crossings || next.overlapLength > metrics.overlapLength + 0.5) continue;
+      const trial = [...others, candidate], next = measure(trial);
+      // 无关连线重叠会伪造关系，优先拆开；不能因少量交叉而保留整段错误共线。
+      const fewerConflicts = next.overlapLength < metrics.overlapLength - 0.5;
+      if (next.overlapLength > metrics.overlapLength + 0.5 || (next.crossings > metrics.crossings && !fewerConflicts)) continue;
       const score = routeScore(trial);
       // 坐标变换会带来浮点尾差；等价路径保留原线，避免 GUI 与离线拖动选出不同连接面。
-      if (score < best - 1e-6) { edge.points = candidate.points; best = score; metrics = next; }
+      if (fewerConflicts || score < best - 1e-6) { edge.points = candidate.points; best = score; metrics = next; }
     }
   }
 }
