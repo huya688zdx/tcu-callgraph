@@ -72,7 +72,6 @@ const dict = {
     'status.existing': '未修改',
     'status.added': '新增',
     'status.deleted': '删除',
-    'legend.modified': '修改',
     'name.default': '跟随设置',
     'name.alias': '左侧：宏名',
     'name.target': '右侧：实际函数名',

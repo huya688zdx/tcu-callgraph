@@ -14,7 +14,6 @@ import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './la
 
 const COLORS = {
   added: '#D9303E',
-  modified: '#D89A00',
   direct: '#2C2C2A',
   var: '#2C2C2A',
   macro: '#D85A30',
@@ -154,7 +153,7 @@ export function exportSvg(view, { title = '' } = {}) {
   for (const e of v.edges || []) {
     if (!Array.isArray(e.points) || e.points.length < 2) continue;
     const d = roundedPathD(e.points, 7);
-    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind === 'var' ? 'var' : 'direct';
+    const style = e.change === 'added' ? 'added' : e.kind === 'var' ? 'var' : 'direct';
     const c = COLORS[style];
     const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
     out.push(

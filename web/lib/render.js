@@ -416,13 +416,9 @@ function drawEdge(ctx, e, related, selected, focused = false, traceColor = null,
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = traceColor ? traceColor : selected
-    ? THEME.node.selected
-    : e.change === 'added'
+  // 连线只按黑 / 红区分状态；选中只加粗，删除另在中央画 X。
+  const color = traceColor ? traceColor : e.change === 'added'
     ? THEME.edge.added
-    : e.change === 'modified'
-    ? THEME.edge.modified
     : e.kind === 'var'
     ? THEME.edge.var
     : THEME.edge.call;

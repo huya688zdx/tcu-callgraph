@@ -89,10 +89,9 @@
   button.primary { background: #185FA5; color: #fff; border-color: #185FA5; }
   button.primary:hover { background: #0C447C; }
   :root { --chev-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' fill='none' stroke='%23888780' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
-  /* 范围下拉的自定义样式：原生 select 的展开列表是系统绘制的，由 ui-select.js 换成下面的结构 */
-  .fsel { position: relative; }
+  .fsel { display: inline-block; position: relative; }
   .fsel select { display: none; }
-  .fsel-btn { display: flex; align-items: center; gap: 7px; }
+  .fsel-btn { display: inline-flex; align-items: center; gap: 7px; }
   .fsel-btn::after {
     content: ''; width: 10px; height: 10px; flex: 0 0 auto;
     background: var(--chev-down) center / 100% no-repeat;
@@ -100,13 +99,12 @@
   }
   .fsel.open .fsel-btn::after { transform: rotate(180deg); }
   .fsel-pop {
-    position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 100%;
+    position: fixed; z-index: 10000; overflow: auto; max-width: calc(100vw - 12px);
     padding: 5px; background: #fff; border: 1px solid #DEDDD6; border-radius: 10px;
     box-shadow: 0 8px 24px #0000001A; display: none;
   }
-  .fsel.open .fsel-pop { display: block; animation: popIn .16s ease; }
   .fsel-pop button { display: block; width: 100%; height: 32px; border: 0; border-radius: 6px; text-align: left; }
-  .fsel-pop button:hover { background: #F1EFE8; }
+  .fsel-pop button:hover, .fsel-pop button.focus { background: #F1EFE8; }
   .fsel-pop button.on { background: #E6F1FB; color: #185FA5; font-weight: 500; }
   @keyframes popIn { from { opacity: 0; transform: translateY(-4px); } }
   .hint { color: #888780; font-size: 11.5px; white-space: nowrap; }
@@ -416,7 +414,7 @@
   #expandForm { display: grid; gap: 14px; }
   #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
   #expandForm label { display: flex; align-items: center; gap: 12px; }
-  #expandForm select, #expandForm input { padding: 7px 10px; border: 1px solid #D3D1C8; border-radius: 6px; font: inherit; }
+  #expandForm input { padding: 7px 10px; border: 1px solid #D3D1C8; border-radius: 6px; font: inherit; }
   #expandForm input { width: 80px; }
   #expandForm p { margin: 0; color: #888780; font-size: 12px; line-height: 1.6; }
   #expandMessage { font-size: 12px; color: #A32D2D; margin-right: auto; align-self: center; }
@@ -732,7 +730,6 @@
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
       <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
-      <span><i id="lg-modified" style="border-color:#D89A00"></i><em data-i18n="legend.modified">修改</em></span>
       <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>

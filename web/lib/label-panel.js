@@ -226,7 +226,7 @@ export function renderLabelPanel() {
   const selLabel = labels.find((l) => l.id === sel) || null;
   if (sel && labels.length && !selLabel) state.selectedLabel = `${edgeKey(edge)}#${labels[0].id}`;
 
-  const head = `<div class="lbl-head">${esc(nodeName(edge.from))} → ${esc(nodeName(edge.to))}</div>${statusControl(edge)}`;
+  const head = `<div class="lbl-head">${esc(nodeName(edge.from))} → ${esc(nodeName(edge.to))}</div>${statusControl(edge, true)}`;
 
   if (state.view?.comparison) {
     const rows = labels.map((l) => `<div class="lbl-row"><span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span><span class="lbl-row-txt">${esc(l.note || '')}</span></div>`).join('');
