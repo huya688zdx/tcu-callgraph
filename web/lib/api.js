@@ -47,7 +47,8 @@ export const api = {
     return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId, ...(bodyRoots ? { roots: bodyRoots, vars: vars || [], hiddenVars: hiddenVars || [] } : {}), expansions, previous: previous ? {
       projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
-      edges: previous.edges.map(({ from, to, kind, line, change, points }) => ({ from, to, kind, line, change, points })),
+      edges: previous.edges.map(({ from, to, kind, line, change, points, custom, fromSide, toSide }) =>
+        ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
       layoutSlots: previous.layoutSlots,
     } : null });
