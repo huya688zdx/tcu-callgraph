@@ -114,12 +114,13 @@ export function improveEdgeRoutes(view, subset) {
   }
 }
 
-/** 只复用同组已经画出的通道，不增加新的交叉位置；反转路径即可处理同目标汇流。 */
+/** 同源或同目标连线复用干线，允许延伸已有通道接入平行分支。 */
 export function mergeSharedRoutes(view, subset = view.edges) {
   const affected = new Set(subset), nodes = new Map(view.nodes.map((n) => [n.id, n]));
   // 汇流按画面的颜色和虚实线判断，原始调用种类及既有布局评分不变。
   const visible = (e) => ({ ...e, kind: e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct' });
   const cost = (edges) => { const m = routeLengthAndCrossings(edges.map(visible), true); return m.length + STUB * m.bends; };
+  const length = (pts) => pts.slice(1).reduce((sum, p, i) => sum + Math.abs(p[0] - pts[i][0]) + Math.abs(p[1] - pts[i][1]), 0);
   for (const role of ['from', 'to']) {
     const groups = new Map();
     for (const e of view.edges) {
@@ -131,32 +132,48 @@ export function mergeSharedRoutes(view, subset = view.edges) {
     for (const edges of groups.values()) {
       if (edges.length < 2 || !edges.some((e) => affected.has(e))) continue;
       let groupCost = cost(edges);
-      for (const edge of edges.slice().sort((a, b) => b.points.length - a.points.length)) {
+      for (const edge of edges.filter((e) => affected.has(e)).sort((a, b) => b.points.length - a.points.length)) {
         const q = role === 'from' ? edge.points : edge.points.slice().reverse();
         let best = null, gain = 0;
-        for (const donor of edges) {
-          if (donor === edge) continue;
+        const originalLength = length(edge.points);
+        // 共用端点且样式相同的边可以汇流；其他边逐对检查，避免每个候选都重算全图交叉。
+        const obstacles = view.edges.filter((other) => other !== edge &&
+          !(edgeStyleKey(visible(other)) === edgeStyleKey(visible(edge)) &&
+            (other.from === edge.from || other.to === edge.to || (other.from === edge.to && other.to === edge.from))));
+        const conflicts = obstacles.map((other) => routeLengthAndCrossings([visible(edge), visible(other)]));
+        // 只比较邻近的少量分支，避免大扇出在拖动松手时全组两两枚举。
+        const end = (e) => role === 'from' ? e.points.at(-1) : e.points[0];
+        const distance = (e) => Math.abs(end(e)[0] - end(edge)[0]) + Math.abs(end(e)[1] - end(edge)[1]);
+        const donors = edges.filter((e) => e !== edge).sort((a, b) => distance(a) - distance(b)).slice(0, 8);
+        for (const donor of donors) {
           const p = role === 'from' ? donor.points : donor.points.slice().reverse();
           const before = cost([donor, edge]);
           for (let i = 1; i < p.length; i++) for (let j = 1; j < q.length; j++) {
             const ph = Math.abs(p[i][1] - p[i - 1][1]) < 0.5, qh = Math.abs(q[j][1] - q[j - 1][1]) < 0.5;
             if (ph === qh) continue;
             const at = ph ? [q[j][0], p[i][1]] : [p[i][0], q[j][1]];
-            if (![0, 1].every((axis) => at[axis] >= Math.min(p[i - 1][axis], p[i][axis]) - 1e-6 &&
-                at[axis] <= Math.max(p[i - 1][axis], p[i][axis]) + 1e-6 &&
-                at[axis] >= Math.min(q[j - 1][axis], q[j][axis]) - 1e-6 &&
+            // 允许延伸共用通道，但接入点必须落在原分支上。
+            if (![0, 1].every((axis) => at[axis] >= Math.min(q[j - 1][axis], q[j][axis]) - 1e-6 &&
                 at[axis] <= Math.max(q[j - 1][axis], q[j][axis]) + 1e-6)) continue;
             let points = collapse([...p.slice(0, i), at, ...q.slice(j)]);
             if (role === 'to') points.reverse();
             const next = before - cost([donor, { ...edge, points }]);
-            if (next <= gain + 0.5 || pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) ||
+            if (next <= gain + 0.5 || length(points) > originalLength + 0.5 ||
+                pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) ||
                 pathCrossesBody(points, nodes.get(edge.from)) || pathCrossesBody(points, nodes.get(edge.to))) continue;
+            if (obstacles.some((other, index) => {
+              const trial = routeLengthAndCrossings([visible({ ...edge, points }), visible(other)]), old = conflicts[index];
+              return trial.overlapLength > old.overlapLength + 0.5 || trial.crossings > old.crossings;
+            })) continue;
             best = points; gain = next;
           }
         }
         if (!best) continue;
         const next = cost(edges.map((e) => e === edge ? { ...e, points: best } : e));
-        if (next < groupCost - 0.5) { edge.points = best; groupCost = next; }
+        // 同目标汇流也不能拆散其他同源组已有的干线。
+        if (next < groupCost - 0.5 && cost(view.edges.map((e) => e === edge ? { ...e, points: best } : e)) < cost(view.edges) - 0.5) {
+          edge.points = best; groupCost = next;
+        }
       }
     }
   }

@@ -193,7 +193,11 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     const view = { width: previous.width, height: previous.height, layoutDirection: direction,
       nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
         ...(group ? { group: n.file || 'unknown' } : {}) })),
-      edges: edges.map((e) => ({ ...e, points: oldEdges.get(edgeKey(e))?.points.map((p) => [...p]) })),
+      edges: edges.map((e) => {
+        const old = oldEdges.get(edgeKey(e));
+        return { ...e, points: old?.points.map((p) => [...p]),
+          custom: old?.custom ?? e.custom, fromSide: old?.fromSide ?? e.fromSide, toSide: old?.toSide ?? e.toSide };
+      }),
       groups: group ? (previous.groups || []).filter((g) => files.has(g.id)).map((g) => ({ ...g })) : [],
       containers: group ? (previous.containers || []).filter((c) => c.root ||
         [...files].some((file) => file.startsWith(c.id + '/'))).map((c) => ({ ...c })) : [],

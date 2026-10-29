@@ -13,7 +13,7 @@ export function buildSVGFromLayout(laid) {
   const W = laid.width + pad * 2;
   const H = laid.height + pad * 2;
   const out = [];
-  const C = { direct: '#9A9890', macro: '#D85A30', fnptr: '#7F77DD', unknown: '#C9C7BE', added: '#D9303E', modified: '#D89A00' };
+  const C = { direct: '#2C2C2A', var: '#2C2C2A', added: '#D9303E', modified: '#D89A00' };
 
   out.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${-pad} ${-pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
@@ -30,9 +30,9 @@ export function buildSVGFromLayout(laid) {
 
   for (const e of laid.edges) {
     const d = roundedPathD(e.points, 7);
-    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind in C ? e.kind : 'direct';
+    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind === 'var' ? 'var' : 'direct';
     const c = C[style];
-    const dash = e.kind !== 'direct' ? ' stroke-dasharray="5 3"' : '';
+    const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
     out.push(
       `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${style})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
