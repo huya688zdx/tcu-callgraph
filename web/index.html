@@ -413,9 +413,13 @@
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
   #expandForm { display: grid; gap: 14px; }
   #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
-  #expandForm label { display: flex; align-items: center; gap: 12px; }
-  #expandForm input { padding: 7px 10px; border: 1px solid #D3D1C8; border-radius: 6px; font: inherit; }
-  #expandForm input { width: 80px; }
+  #expandForm label { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #2C2C2A; }
+  #expandForm input {
+    height: 30px; padding: 0 9px; font-size: 12.5px; flex: 0 0 auto;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 8px; background: #fff; color: #2C2C2A;
+  }
+  #expandForm input:focus { outline: none; border-color: #185FA5; }
+  #expandForm input { width: 64px; text-align: center; }
   #expandForm p { margin: 0; color: #888780; font-size: 12px; line-height: 1.6; }
   #expandMessage { font-size: 12px; color: #A32D2D; margin-right: auto; align-self: center; }
   .call-order-row { display: grid; grid-template-columns: 18px 90px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px dashed #E8E7E1; cursor: pointer; }
