@@ -14,7 +14,7 @@ import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
 import { buildStandaloneHtml } from './lib/html.js';
-import { upgradeSelect } from './lib/ui-select.js';
+import './lib/ui-select.js';
 // 样式设置面板：恢复已存主题并接好「样式」按钮，纯副作用导入
 import './lib/appearance.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
@@ -276,6 +276,10 @@ async function deleteSelection() {
     body = { edges: [edgeKey(state.selectedEdge)] };
   } else if (state.selected) {
     body = { nodes: [state.selected] };
+  } else if (state.moveTarget?.kind === 'file' && state.moveTarget.view === v) {
+    // 文件框只隐藏当前框内节点，沿用单节点删除的存档与撤销。
+    body = { nodes: v.nodes.filter(n => n.group === state.moveTarget.item.id).map(n => n.id) };
+    if (!body.nodes.length) return;
   } else {
     return;
   }
@@ -298,6 +302,7 @@ async function deleteSelection() {
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.hover = null;
+  if (state.moveTarget?.kind === 'file') { state.moveTarget = null; state.ctxBox = null; }
   await reloadKeepCam();
   renderDetail(null);
   renderLabelPanel();
@@ -350,7 +355,7 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selected || state.selectedEdge || state.selectedLabel) {
+    if (state.selected || state.selectedEdge || state.selectedLabel || state.moveTarget?.kind === 'file') {
       e.preventDefault();
       deleteSelection();
     }
@@ -361,10 +366,6 @@ window.addEventListener('keydown', (e) => {
   if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
   if (e.key === 'f' || e.key === 'F') fit();
 });
-
-// 范围下拉换成自定义样式（原 select 展开列表是系统绘制，无法定制）；change 仍派发在原 select 上
-upgradeSelect(els.depth);
-upgradeSelect(els.updepth);
 
 // 范围是界面习惯：记到服务端 setting 表，重启后从 /api/ui-prefs 恢复（见启动段）
 const saveUiPrefs = () => api.setUiPrefs({ down: state.down, up: state.up }).catch(() => {});

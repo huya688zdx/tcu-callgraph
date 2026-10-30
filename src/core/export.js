@@ -13,7 +13,7 @@ export function buildSVGFromLayout(laid) {
   const W = laid.width + pad * 2;
   const H = laid.height + pad * 2;
   const out = [];
-  const C = { direct: '#2C2C2A', var: '#2C2C2A', added: '#D9303E', modified: '#D89A00' };
+  const C = { direct: '#2C2C2A', var: '#2C2C2A', added: '#D9303E' };
 
   out.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${-pad} ${-pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
@@ -30,7 +30,7 @@ export function buildSVGFromLayout(laid) {
 
   for (const e of laid.edges) {
     const d = roundedPathD(e.points, 7);
-    const style = e.change === 'added' || e.change === 'modified' ? e.change : e.kind === 'var' ? 'var' : 'direct';
+    const style = e.change === 'added' ? 'added' : e.kind === 'var' ? 'var' : 'direct';
     const c = C[style];
     const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
     out.push(

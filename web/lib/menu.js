@@ -25,7 +25,6 @@ export const COMPARISON_ITEMS = [{ value: 'auto', label: 'status.auto' }, ...CHA
 const EDGE_ITEMS = [
   { value: 'existing', label: 'edgeState.existing', get color() { return THEME.edge.call; } },
   { value: 'added', label: 'edgeState.added', get color() { return THEME.edge.added; } },
-  { value: 'modified', label: 'status.modified', get color() { return THEME.edge.modified; } },
   { value: 'deleted', label: 'edgeState.deleted', get color() { return THEME.edge.call; } },
 ];
 

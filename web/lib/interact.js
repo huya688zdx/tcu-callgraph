@@ -649,7 +649,7 @@ const nodeSelectionType = (n) => JSON.stringify([
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
   e.kind, (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash) ? 'dashed' : 'solid',
-  e.change === 'added' ? THEME.edge.added : e.change === 'modified' ? THEME.edge.modified : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
+  e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
   e.change === 'deleted',
 ]);
 const labelSelectionType = (l) => JSON.stringify([

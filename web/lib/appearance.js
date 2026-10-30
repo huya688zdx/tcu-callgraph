@@ -64,7 +64,6 @@ const SECTIONS = [
       { path: 'edge.var', label: '变量访问', kind: 'dash' },
       { path: 'edge.varDash', label: '变量访问线型', kind: 'toggle', icon: 'line', onLabel: '虚线', offLabel: '实线' },
       { path: 'edge.added', label: '新增边', kind: 'line' },
-      { path: 'edge.modified', label: '修改边', kind: 'line' },
       { path: 'edge.manual', label: '手动连线预览', kind: 'dash' },
       { path: 'edge.selPulse', label: '选中线动画', kind: 'toggle', icon: 'line', onLabel: '开', offLabel: '关' },
     ],

@@ -46,7 +46,7 @@ test('弹窗状态覆盖与节点/变量状态：保留自动结果，刷新可�
   assert.equal((await get('/api/node?id=main.c::target')).overlay.change,'added');
 });
 
-test('同一位置的不同版本连线可独立调整，修改色进入 SVG，恢复后仍是自动新增/删除',async t=>{
+test('同一位置的不同版本连线可独立调整，导出只用黑红，恢复后仍是自动新增/删除',async t=>{
   const {get,post,prepare,srv}=await setup(t);
   const p=await prepare();
   const applied=await post('/api/compare/apply',{previewId:p.preview.id,selectedIds:['main.c::caller','main.c::target']});
@@ -55,14 +55,16 @@ test('同一位置的不同版本连线可独立调整，修改色进入 SVG，�
   const added=v.edges.find(e=>e.change==='added'),deleted=v.edges.find(e=>e.change==='deleted');
   assert.equal(added.line,deleted.line);
   assert.notEqual(added.comparisonKey,deleted.comparisonKey);
-  const result=await post('/api/compare/status',{comparisonId:applied.comparison.id,edgeId:added.comparisonKey,change:'modified'});
+  const result=await post('/api/compare/status',{comparisonId:applied.comparison.id,edgeId:added.comparisonKey,change:'existing'});
   assert.equal(result.ok,true);
   v=await get('/api/view');
-  assert.equal(v.edges.find(e=>e.comparisonKey===added.comparisonKey).change,'modified');
+  assert.equal(v.edges.find(e=>e.comparisonKey===added.comparisonKey).change,'existing');
   assert.equal(v.edges.find(e=>e.comparisonKey===deleted.comparisonKey).change,'deleted');
-  assert.match(exportSvg(v),/#D89A00/);
+  assert.match(exportSvg(v),/#2C2C2A/);
+  assert.doesNotMatch(exportSvg(v),/#D89A00/);
   const html=await(await fetch(srv.baseUrl+'/api/export/html?root=main.c::caller&down=1')).text();
-  assert.match(html,/#D89A00/);
+  assert.match(html,/#2C2C2A/);
+  assert.doesNotMatch(html,/#D89A00/);
   await post('/api/compare/status',{comparisonId:applied.comparison.id,edgeId:added.comparisonKey,change:null});
   assert.equal((await get('/api/view')).edges.find(e=>e.comparisonKey===added.comparisonKey).change,'added');
 });

@@ -10,6 +10,7 @@ export async function buildStandaloneHtml() {
     theme: structuredClone(THEME) };
   const right = document.getElementById('right').cloneNode(true);
   right.removeAttribute('data-mode');
+  right.querySelectorAll('.fsel').forEach(wrap => wrap.replaceWith(wrap.querySelector('select')));
   right.querySelectorAll('#secLabel, #pairFlowBar').forEach(panel => panel.remove());
   const css = [...document.querySelectorAll('style')].map((s) => s.textContent).join('\n');
 
