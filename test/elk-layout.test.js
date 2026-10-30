@@ -76,21 +76,17 @@ test('跨文件变量布局减少向右绕行的台阶', async () => {
   assert.ok(view.edges.find((e) => e.to === 'gear').points.length < 6, '比原先向右绕行的六点路径更简洁');
 });
 
-test('增量布局保留已有顺序，删除新增项后其余坐标和路径不变', async () => {
+test('新增节点自动使用完整排版，删除与恢复后坐标和路径不漂移', async () => {
   const srv = await launchServer();
   try {
     const before = await (await fetch(srv.baseUrl + '/api/view?root=main.c::main')).json();
     const nodes = [...before.nodes, { id: 'v', name: 'global_var', kind: 'var', file: 'main.c', w: 120, h: 44 }];
     const edges = [...before.edges, { from: before.root, to: 'v', kind: 'var', line: 0 }];
     const added = await layoutElk(nodes, edges, { previous: before });
+    const arranged = await layoutElk(nodes, edges);
+    assert.deepEqual(added.nodes.map((n) => [n.id, n.x, n.y]), arranged.nodes.map((n) => [n.id, n.x, n.y]),
+      '新增节点后的排版应与点击重新排版一致');
     const byId = new Map(added.nodes.map((n) => [n.id, n]));
-    const main = before.nodes.find((n) => n.id === before.root);
-    assert.ok(Math.abs(byId.get(main.id).y - main.y) < 60, '加入变量不应让入口函数大幅跳动');
-    for (const a of before.nodes) for (const b of before.nodes) {
-      if (a.group === b.group && a.y < b.y - 1) {
-        assert.ok(byId.get(a.id).y < byId.get(b.id).y, '保留同一文件中已有节点的纵向顺序');
-      }
-    }
     const removed = await layoutElk(before.nodes, before.edges, { previous: added });
     for (const n of removed.nodes) {
       assert.deepEqual([n.x, n.y], [byId.get(n.id).x, byId.get(n.id).y], '删除不挪动剩余节点');

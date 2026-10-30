@@ -150,8 +150,6 @@ export async function restorePage(root = null, isCurrent = () => true) {
       Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
-      els.depth.value = String(state.down);
-      els.updepth.value = String(state.up);
       els.groupMode.checked = state.group;
     }
     const view = await hooks.loadView(root || saved?.roots || null, { nav: false, expansions: saved?.expansions || [] });
@@ -160,7 +158,6 @@ export async function restorePage(root = null, isCurrent = () => true) {
     // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
     if (state.view?.comparison) {
       state.up = 0; state.down = 0;
-      els.depth.value = '0'; els.updepth.value = '0';
     }
     if (saved && view && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;

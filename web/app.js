@@ -40,15 +40,6 @@ let viewSeq = 0;
 const navStack = [];
 const NAV_MAX = 30;
 
-function syncViewDepths(up, down) {
-  for (const [select, value, key] of [[els.updepth, up, 'depth.upN'], [els.depth, down, 'depth.downN']]) {
-    if (![...select.options].some((option) => option.value === String(value))) {
-      select.add(new Option(t(key).replace('{n}', value), String(value)));
-    }
-    select.value = String(value);
-  }
-}
-
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
   const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
@@ -89,7 +80,6 @@ async function loadView(rootId, opts = {}) {
   }
   state.up = up; state.down = down;
   state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
-  syncViewDepths(up, down);
   // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
   clearPairFlow();
   state.view = data;
@@ -107,20 +97,21 @@ async function loadView(rootId, opts = {}) {
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
-  if (!previous) fit();
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
   const oldEdges = new Set((previous?.edges || []).map(edgeKey));
+  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const rearranged = addedNodes.length > 0;
+  if (!previous || rearranged) fit();
   const common = data.nodes.filter((n) => oldNodes.has(n.id));
-  // ELK 扩展层间通道可能整体平移文件框，用共同节点的中位偏移稳住屏幕位置。
-  if (common.length) for (const axis of ['x', 'y']) {
+  // 新增节点已完整排版并适配；其余增量刷新继续稳住已有画面。
+  if (!rearranged && common.length) for (const axis of ['x', 'y']) {
     const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
     cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
   }
-  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   constrainCam();
   const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
   pulseAdded(addedNodes, addedEdges);
-  if (previous) revealAdded(addedNodes, addedEdges);
+  if (previous && !rearranged) revealAdded(addedNodes, addedEdges);
   renderDetail(null);
   renderLabelPanel();
   history.stack = [];
@@ -133,16 +124,35 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.expandFunction = async (root, direction, depth) => {
-  if (!['up', 'down'].includes(direction) || !Number.isInteger(depth) || depth < 1 || depth > 20) {
-    throw new Error('请选择方向及 1 到 20 的整数层数');
+hooks.addFunction = async (root) => {
+  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => !state.view?.nodes.some((n) => n.id === id));
+  if (!ids.length) return state.view;
+  const projectId = state.view?.projectId;
+  if (!state.at && !state.view?.comparison) {
+    const hidden = (await Promise.all(ids.map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
+    if (state.view?.projectId !== projectId) return;
+    if (hidden.length) {
+      const result = await api.del({ nodes: hidden, restore: true, projectId });
+      if (!result?.ok) throw new Error(result?.error || '重新加入失败');
+    }
   }
-  // 始终保留当前入口和画布，只将本次指定方向的调用关系加入局部范围。
-  const expansions = structuredClone(state.expansions);
-  let scope = expansions.find((e) => e.root === root);
-  if (!scope) { scope = { root, up: 0, down: 0 }; expansions.push(scope); }
-  scope[direction] = Math.max(scope[direction], depth);
-  return loadView(state.roots, { incremental: true, expansions });
+  const selected = state.selected;
+  const expansions = [...state.expansions, ...ids.filter((id) => !state.expansions.some((scope) => scope.root === id))
+    .map((id) => ({ root: id, up: 0, down: 0 }))];
+  const view = await loadView(state.roots, { incremental: true, expansions });
+  if (view && selected && view.nodes.some((n) => n.id === selected)) {
+    state.selected = selected;
+    await renderDetail(selected);
+    draw();
+  }
+  return view;
+};
+hooks.removeFunction = async (id) => {
+  if (state.at || state.view?.comparison || !state.view?.nodes.some((n) => n.id === id)) return;
+  state.selected = id;
+  state.selectedEdge = null;
+  state.selectedLabel = null;
+  await deleteSelection();
 };
 hooks.renderDetail = renderDetail;
 hooks.syncComparison = syncComparison;
@@ -165,7 +175,6 @@ hooks.applyComparison = async (roots) => {
   // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
   // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
   state.up = 0; state.down = 0;
-  els.depth.value = '0'; els.updepth.value = '0';
   resetVars();
   await Promise.all([loadStats(), loadTree()]);
 };
@@ -179,7 +188,6 @@ hooks.restoreComparison = async () => {
   state.vars = new Set(saved.vars);
   state.hiddenVars = new Set(saved.hiddenVars);
   state.up = saved.up; state.down = saved.down;
-  els.depth.value = String(saved.down); els.updepth.value = String(saved.up);
   Object.assign(cam, saved.cam);
   navStack.splice(0, navStack.length, ...saved.nav);
   deleteStack.splice(0, deleteStack.length, ...saved.deleted);
@@ -197,8 +205,6 @@ hooks.applyBookmark = async (b) => {
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
 
-  els.depth.value = String(state.down);
-  els.updepth.value = String(state.up);
   els.groupMode.checked = state.group;
 
   const roots = (b.roots || []).filter(Boolean);
@@ -241,7 +247,8 @@ hooks.toggleVar = (id, on) => {
 };
 
 async function postDelete(body) {
-  await api.del(body);
+  const result = await api.del(body);
+  if (!result?.ok) throw new Error(result?.error || '移出画布失败');
 }
 
 /** 回退到上一个视图（入口 + 视角一起还原） */
@@ -284,15 +291,7 @@ async function deleteSelection() {
     return;
   }
 
-  // 删掉的正是当前入口时，把它从入口集合里摘掉；全删空则回退到自动选择
-  if (body.nodes && body.nodes.length) {
-    const rest = state.roots.filter((id) => !body.nodes.includes(id));
-    if (rest.length !== state.roots.length) {
-      state.roots = rest;
-      state.root = rest[0] || null;
-    }
-  }
-
+  // 保留查找入口作为范围锚点；隐藏入口也不自动选入其他函数，撤销时仍能恢复原图。
   await postDelete(body);
   // 记下删除时所在的入口集合：换视图后不能拿这条记录去恢复（见 canRestoreDelete）
   deleteStack.push({ ...body, roots: state.roots.join('+'), at: Date.now() });
@@ -367,20 +366,6 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') fit();
 });
 
-// 范围是界面习惯：记到服务端 setting 表，重启后从 /api/ui-prefs 恢复（见启动段）
-const saveUiPrefs = () => api.setUiPrefs({ down: state.down, up: state.up }).catch(() => {});
-
-els.depth.addEventListener('change', () => {
-  state.down = Number(els.depth.value);
-  saveUiPrefs();
-  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
-});
-els.updepth.addEventListener('change', () => {
-  state.up = Number(els.updepth.value);
-  saveUiPrefs();
-  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
-});
-
 els.groupMode.addEventListener('change', () => {
   state.group = els.groupMode.checked;
   state.selectedEdge = null;
@@ -441,19 +426,18 @@ applyI18n();
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 const initialPanels = Promise.all([loadStats(), loadTree()]);
-// 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
-// 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 1 / 1。
+// 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {
   const seq = viewSeq;
   try {
     const p = await api.uiPrefs();
     if (seq === viewSeq && Number.isInteger(p?.down)) {
       state.down = p.down;
-      els.depth.value = String(p.down);
+      state.addDepths.down = p.down;
     }
     if (seq === viewSeq && Number.isInteger(p?.up)) {
       state.up = p.up;
-      els.updepth.value = String(p.up);
+      state.addDepths.up = p.up;
     }
   } catch {
     /* 服务端没有该接口或暂时不可达：用默认值 */

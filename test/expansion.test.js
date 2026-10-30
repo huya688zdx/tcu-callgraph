@@ -108,6 +108,13 @@ void top(void) { a(); y(); }
   assert.deepEqual(names(original), ['b', 'keep', 'leaf', 'shared']);
   const expand = async expansions => (await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId: original.projectId, expansions }) })).json();
+  const singleScope = { root: 'calls.c::a', up: 0, down: 0 };
+  const single = await expand([singleScope]);
+  assert.deepEqual(names(single), ['a', 'b', 'keep', 'leaf', 'shared'], '零层添加只能新增指定函数，不能带出 top 或 x');
+  assert.deepEqual(single.roots, roots, '单个添加不改变原入口层数');
+  assert.ok(single.edges.some(e => e.from === 'calls.c::a' && e.to === 'calls.c::b'), '保留与已有函数的调用线');
+  assert.ok(original.edges.every(old => single.edges.some(e => e.from === old.from && e.to === old.to)));
+  assert.deepEqual(names(await expand(single.expansions)), names(single), '刷新后仍然只显示指定函数');
   const firstScope = { root: 'calls.c::b', up: 1, down: 0 };
   const first = await expand([firstScope]);
   assert.deepEqual(first.roots, roots, '新找到的调用者不成为入口');

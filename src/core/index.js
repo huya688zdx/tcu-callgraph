@@ -722,7 +722,7 @@ export function tarjan(model) {
 /**
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true } = {}) {
+export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true, allowedIds = null } = {}) {
   let { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
 
@@ -789,6 +789,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
           if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
           if (!byId.has(other)) continue;
+          if (allowedIds && !allowedIds.has(other)) continue;
           if (!nodes.has(other) && nodes.size >= maxNodes) {
             truncated = true;
             continue;

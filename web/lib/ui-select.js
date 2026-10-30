@@ -29,7 +29,9 @@ function position() {
   if (!active || !active.isConnected) { close(); return; }
   const rect = controls.get(active).button.getBoundingClientRect();
   pop.style.minWidth = `${rect.width}px`;
-  pop.style.maxHeight = `${Math.max(80, window.innerHeight - 12)}px`;
+  const below = window.innerHeight - rect.bottom - 12;
+  const above = rect.top - 12;
+  pop.style.maxHeight = `${Math.max(40, Math.min(266, Math.max(below, above)))}px`;
   pop.style.left = '0px';
   pop.style.top = '0px';
   const width = pop.offsetWidth;
