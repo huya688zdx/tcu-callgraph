@@ -52,7 +52,10 @@ function choose(index) {
   sel.selectedIndex = index;
   sync(sel);
   close();
-  if (changed) sel.dispatchEvent(new Event('change', { bubbles: true }));
+  if (changed) {
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
   controls.get(sel).button.focus();
 }
 
@@ -123,6 +126,15 @@ pop.addEventListener('click', (event) => {
   const item = event.target.closest('button');
   if (item && active) choose([...pop.children].indexOf(item));
 });
+// 窗口捕获阶段早于弹窗的 document 捕获处理：第一次 Escape 只收起选项。
+window.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || !active) return;
+  const button = controls.get(active).button;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  close();
+  button.focus();
+}, true);
 document.addEventListener('click', (event) => {
   if (active && !controls.get(active).wrap.contains(event.target) && !pop.contains(event.target)) close();
 }, true);
