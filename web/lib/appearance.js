@@ -223,7 +223,14 @@ const findItem = (path) => SECTIONS.flatMap((s) => s.items).find((it) => it.path
 function render() {
   const body = document.getElementById('styleBody');
   if (!body) return;
+  const depthOptions = (value) => Array.from({ length: 21 }, (_, n) => `<option value="${n}" ${n === value ? 'selected' : ''}>${n} 层</option>`).join('');
   body.innerHTML = `<div class="style-sec">
+    <h3>添加函数</h3>
+    <label class="style-row"><span class="sl">调用者（向上）</span><select id="addDepthUp" aria-label="添加函数向上查找层数">${depthOptions(state.addDepths.up)}</select></label>
+    <label class="style-row"><span class="sl">被调用函数（向下）</span><select id="addDepthDown" aria-label="添加函数向下查找层数">${depthOptions(state.addDepths.down)}</select></label>
+    <p class="settings-note">用于“添加调用关系”的预览，默认上下各 1 层。确认勾选后才加入画布；更改设置不会改动已有图。“仅添加此函数”不查找调用关系。</p>
+    <span id="addDepthStatus" role="status"></span>
+  </div><div class="style-sec">
     <h3>宏节点显示</h3>
     <label class="style-row"><span class="sl">默认显示名称</span>
       <select id="macroNameDefault">
@@ -252,6 +259,23 @@ function render() {
       </div>
     </div>`
   ).join('');
+  const depthInputs = [body.querySelector('#addDepthUp'), body.querySelector('#addDepthDown')];
+  for (const input of depthInputs) input.addEventListener('change', async () => {
+    depthInputs.forEach((select) => { select.disabled = true; });
+    const status = body.querySelector('#addDepthStatus');
+    const values = { up: Number(depthInputs[0].value), down: Number(depthInputs[1].value) };
+    status.textContent = '正在保存…';
+    try {
+      const result = await api.setUiPrefs(values);
+      if (!result?.ok) throw new Error(result?.error || '保存失败，请重试');
+      state.addDepths = values;
+      status.textContent = '已保存，仅影响之后的添加';
+    } catch (err) {
+      depthInputs[0].value = String(state.addDepths.up);
+      depthInputs[1].value = String(state.addDepths.down);
+      status.textContent = err.message;
+    } finally { depthInputs.forEach((select) => { select.disabled = false; }); }
+  });
   const nameSelect = body.querySelector('#macroNameDefault');
   nameSelect.addEventListener('change', async () => {
     nameSelect.disabled = true;
@@ -293,6 +317,9 @@ function render() {
 async function resetDefaults() {
   try { await saveMacroNameMode('alias'); }
   catch (err) { document.getElementById('macroNameStatus').textContent = err.message; return; }
+  const result = await api.setUiPrefs({ up: 1, down: 1 }).catch(() => null);
+  if (!result?.ok) { document.getElementById('addDepthStatus').textContent = '默认层数保存失败，请重试'; return; }
+  state.addDepths = { up: 1, down: 1 };
   applyTheme(Object.fromEntries(flatten(DEFAULTS)));
   try {
     localStorage.removeItem(STORE_KEY);
@@ -309,6 +336,7 @@ btn?.addEventListener('click', async () => {
   try {
     const prefs = await api.uiPrefs();
     macroNameMode = prefs.macroNameMode === 'target' ? 'target' : 'alias';
+    if (Number.isInteger(prefs.up) && Number.isInteger(prefs.down)) state.addDepths = { up: prefs.up, down: prefs.down };
   } catch { macroNameMode = state.view?.macroNameMode || 'alias'; }
   render();
   openModal('styleModal');

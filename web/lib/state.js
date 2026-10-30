@@ -6,8 +6,6 @@ const els = {
   cv: document.getElementById('cv'),
   ctx: document.getElementById('cv').getContext('2d'),
   search: document.getElementById('search'),
-  depth: document.getElementById('depth'),
-  updepth: document.getElementById('updepth'),
   resetLayout: document.getElementById('resetLayout'),
   groupMode: document.getElementById('groupMode'),
   stats: document.getElementById('stats'),
@@ -33,6 +31,8 @@ const state = {
   roots: [],
   /** 右键按函数添加的局部查找范围，独立于顶部默认层数。 */
   expansions: [],
+  /** 新添加函数的调用关系查找层数，不改动已有画布范围。 */
+  addDepths: { up: 1, down: 1 },
   /** 当前点选的框：{ kind:'file'|'dir', id } —— 右侧变量面板按它过滤 */
   ctxBox: null,
   /** 手动勾选要显示在图里的全局变量 id */

@@ -529,6 +529,16 @@ async function buildView(
     nodes: [...nodeMap.values()],
     edges: edgeList,
   };
+  // 零层范围只补当前已显示节点之间的关系，不带入邻接函数。
+  const allowedIds = new Set(nodeMap.keys());
+  for (const scope of varSel.expansions || []) {
+    if (scope.up || scope.down) continue;
+    const part = subgraph(MODEL, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
+    for (const e of part.edges) {
+      const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
+      if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
+    }
+  }
   truncated ||= g.nodes.length > 600;
   if (g.nodes.length > 600) {
     g.nodes = g.nodes.slice(0, 600);
@@ -552,7 +562,7 @@ async function buildView(
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
   if (!clean.length) {
     return { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260, root: g.root, roots,
-      empty: true, projectId, comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
+      empty: true, projectId, expansions: varSel.expansions || [], comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
   // 右侧面板里勾选的全局变量：补节点 + 视图内函数对它的引用边
   if (wantVars.size) {
@@ -1534,6 +1544,7 @@ const server = http.createServer(async (req, res) => {
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
         node: { ...(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn), bodyTokens: undefined },
+        hidden: !COMPARISON && !!overlay.deleted.nodes[id],
         inEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [])
           .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
         outEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [])
