@@ -55,26 +55,20 @@ export async function syncProjectLabel() {
 async function switchTo(body) {
   if (listEl) listEl.innerHTML = `<div class="empty">${t('project.switching')}</div>`;
   let r;
-  state.projectSwitchPending = true;
   try {
     r = await api.switchProject(body);
   } catch (err) {
     r = { ok: false, error: String(err.message || err) };
   }
   if (!r || !r.ok) {
-    state.projectSwitchPending = false;
     if (listEl) {
       listEl.innerHTML = `<div class="empty">${t('project.failed')}：${esc(r?.error || '未知错误')}</div>`;
     }
     return;
   }
   closeModal();
-  try {
-    await hooks.reloadAll();
-    await syncProjectLabel();
-  } finally {
-    state.projectSwitchPending = false;
-  }
+  await hooks.reloadAll();
+  await syncProjectLabel();
 }
 
 async function render() {

@@ -248,11 +248,12 @@ test('e2e：删除 / 布局写操作也广播；切工程广播 project.switch',
     assert.equal(layoutEv.json.actor, 'ai');
 
     // 切工程：广播带新工程名
-    const sw = await postJson(base + '/api/switch', { path: path.join(ROOT, 'samples', 'demo'), actor: 'ai' });
+    const sw = await postJson(base + '/api/switch', { path: path.join(ROOT, 'samples', 'demo'), actor: 'ai' }, { 'X-Callgraph-Client': 'test-client-id' });
     assert.equal(sw.ok, true, '切到 samples/demo 应成功');
     const swEv = await stream.waitFor((e) => e.json && e.json.op === 'project.switch');
     assert.equal(swEv.json.actor, 'ai');
     assert.ok(swEv.json.project, '广播应带工程名');
+    assert.equal(swEv.json.clientId, 'test-client-id');
 
     // 切工程后页面状态作废（前端重载后会重新上报）
     const page = await (await fetch(base + '/api/page')).json();

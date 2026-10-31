@@ -3,12 +3,15 @@
  */
 import { state } from './state.js';
 
+// 页面标识用于识别延迟到达的自身切换广播，不依赖请求是否已经结束。
+export const clientId = crypto.randomUUID();
+
 const get = (url) => fetch(url).then((r) => r.json());
 
 const post = (url, body) =>
   fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json',
+    headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId,
       ...((body.projectId ?? state.view?.projectId) == null ? {} :
         { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }) },
     body: JSON.stringify(body),

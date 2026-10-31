@@ -1095,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
             summary: comparison.summary, warnings: comparison.warnings, mappings: comparison.mappings, candidates,
             validRetainIds: [...comparison.model._index.byId.keys()] } });
         }
-        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL, projectId: PROJECT.id });
+        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
         return json(res, { ok: true, comparison: comparisonInfo(), roots: COMPARISON?.roots || [] });
       } catch (err) {
         if (!res.headersSent) return json(res, { ok: false, error: String(err.message || err) }, 400);
@@ -1123,7 +1123,7 @@ const server = http.createServer(async (req, res) => {
         comparisonPreview = null;
         comparisonBase = null;
         // 打开着的页面整体重载：跨工程没有任何状态可保留。
-        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name, projectId: PROJECT.id });
+        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
         json(res, {
           ok: true,
           project: { id: project.id, name: project.name, path: root },

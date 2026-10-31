@@ -12,7 +12,7 @@
  * 「过去」和「现在」搅在一起；只弹提示，让用户自己决定何时回到最新。
  */
 import { state, cam, els, edgeKey } from './state.js';
-import { api } from './api.js';
+import { api, clientId } from './api.js';
 import { hooks } from './hooks.js';
 import { loadStats, renderVars, renderDetail } from './panels.js';
 import { draw } from './render.js';
@@ -91,7 +91,7 @@ if (es) {
     }
     if (!m) return;
     if (m.op === 'project.switch') {
-      if (state.projectSwitchPending) return;
+      if (m.clientId === clientId) return;
       dirtyCount = 0;
       hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast('工程切换后刷新失败，请手动刷新页面'));
       toast(`已切换工程：${m.project || ''}`);
