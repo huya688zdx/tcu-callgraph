@@ -403,10 +403,10 @@ export function buildIndex(root, sourceFiles = null) {
     if (!all || !all.length) return `ext::${name}`;
     const local = all.filter((f) => f.file === fromFile);
     if (local.length === 1) return local[0].id;
-    if (all.length === 1) return all[0].id;
+    if (local.length > 1) return `ext::${name}`;
     const nonStatic = all.filter((f) => !f.isStatic);
     if (nonStatic.length === 1) return nonStatic[0].id;
-    return (local[0] || all[0]).id;
+    return `ext::${name}`;
   };
 
   const edges = [];

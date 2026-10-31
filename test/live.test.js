@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 import { createMcpServer } from '../src/mcp.js';
@@ -130,6 +131,14 @@ test('e2e：/api/stream 握手与守卫（405 / 跨站 Origin 403）', async () 
 
     const evil = await fetch(base + '/api/stream', { headers: { Origin: 'http://evil.example' } });
     assert.equal(evil.status, 403);
+    const hostStatus = await new Promise((resolve, reject) => {
+      http.get(base + '/api/stats', { headers: { Host: 'evil.example' } }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject);
+    });
+    assert.equal(hostStatus, 403);
+    assert.equal((await fetch(base + '/api/export/xlsx', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+    assert.equal((await fetch(base + '/api/export/html', { headers: { Origin: 'http://evil.example' } })).status, 403);
+    const invalid = await fetch(base + '/api/overlay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nodeId: 'main.c::main', data: { change: 'unknown' } }) });
+    assert.equal(invalid.status, 400);
   } finally {
     await srv.close();
   }

@@ -529,10 +529,9 @@ async function buildView(
     nodes: [...nodeMap.values()],
     edges: edgeList,
   };
-  // 零层范围只补当前已显示节点之间的关系，不带入邻接函数。
+  // 局部范围补当前已显示节点之间的关系，不带入邻接函数。
   const allowedIds = new Set(nodeMap.keys());
   for (const scope of varSel.expansions || []) {
-    if (scope.up || scope.down) continue;
     const part = subgraph(MODEL, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
     for (const e of part.edges) {
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
@@ -561,7 +560,9 @@ async function buildView(
   );
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
   if (!clean.length) {
-    return { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260, root: g.root, roots,
+    const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
+      : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
+    return { ...emptyLayout, root: g.root, roots,
       empty: true, projectId, expansions: varSel.expansions || [], comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
   // 右侧面板里勾选的全局变量：补节点 + 视图内函数对它的引用边
@@ -741,6 +742,9 @@ function readRawBody(req, limit = 4 * 1024 * 1024) {
 
 // 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
 const server = http.createServer(async (req, res) => {
+  if (!/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(req.headers.host || '')) {
+    return json(res, { ok: false, error: 'forbidden host' }, 403);
+  }
   // 请求体可能稍后才读完，工程身份必须在进入请求时固定。
   req.projectId = PROJECT.id;
   req.comparisonId = COMPARISON?.id;
@@ -756,6 +760,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (req.method === 'GET' && ['/api/export/xlsx', '/api/export/html'].includes(u.pathname) &&
+        ((req.headers.origin && !LOCAL_ORIGIN.test(req.headers.origin)) || req.headers['sec-fetch-site'] === 'cross-site')) {
+      return json(res, { ok: false, error: 'forbidden origin' }, 403);
+    }
     if (COMPARISON && ((req.method === 'POST' && /^\/api\/(overlay|delete|layout|orphans\/purge|bookmarks|session|restore|labels)/.test(u.pathname)) ||
         u.pathname === '/api/session/export')) {
       return json(res, { ok: false, error: '比较视图仅供查看，请退出比较后编辑普通工程' }, 409);
@@ -1087,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
             summary: comparison.summary, warnings: comparison.warnings, mappings: comparison.mappings, candidates,
             validRetainIds: [...comparison.model._index.byId.keys()] } });
         }
-        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL });
+        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL, projectId: PROJECT.id });
         return json(res, { ok: true, comparison: comparisonInfo(), roots: COMPARISON?.roots || [] });
       } catch (err) {
         if (!res.headersSent) return json(res, { ok: false, error: String(err.message || err) }, 400);
@@ -1115,7 +1123,7 @@ const server = http.createServer(async (req, res) => {
         comparisonPreview = null;
         comparisonBase = null;
         // 打开着的页面整体重载：跨工程没有任何状态可保留。
-        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name });
+        broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: project.name, projectId: PROJECT.id });
         json(res, {
           ok: true,
           project: { id: project.id, name: project.name, path: root },
@@ -1232,6 +1240,7 @@ const server = http.createServer(async (req, res) => {
     // 导出会话：标注 + 删除记录 + 手工布局 + 书签 + 操作历史，打成单个 .cgx
     if (u.pathname === '/api/session/export') {
       const withEvents = u.searchParams.get('events') !== '0';
+      const eventsTotal = store.countEvents(PROJECT.id);
       const payload = {
         format: 'tcu-callgraph-session',
         version: 1,
@@ -1246,6 +1255,8 @@ const server = http.createServer(async (req, res) => {
         overlay: store.loadOverlay(PROJECT.id),
         bookmarks: store.listBookmarks(PROJECT.id),
         events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
+        eventsTotal,
+        eventsTruncated: withEvents && eventsTotal > 5000,
       };
       // 中文工程名不能直接塞进 header：HTTP 头是 latin1，Node 会抛
       // ERR_INVALID_CHAR，导出直接 500。按 RFC 5987 给一份 ASCII 兜底名 +
@@ -1501,7 +1512,7 @@ const server = http.createServer(async (req, res) => {
       const up = Number(u.searchParams.get('up') ?? 1);
       const down = Number(u.searchParams.get('down') ?? 1);
       const group = u.searchParams.get('group') !== '0';
-      if (previous && !!previous.groups.length !== group) previous = null;
+      if (previous && !!(previous.groups.length || previous.layoutSlots?.groups?.length) !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions };
@@ -1713,6 +1724,8 @@ const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then((patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
+          if (Object.keys(patch.data).some((key) => !['note', 'color', 'tag', 'change', 'nameMode', 'label', 'labels'].includes(key))) return bad(res, 'data 包含不支持的字段');
+          if (patch.data.change !== undefined && ![null, 'existing', 'modified', 'added', 'deleted'].includes(patch.data.change)) return bad(res, 'change 不合法');
           if (patch.data.nameMode !== undefined && patch.data.nameMode !== null && !NAME_MODES.includes(patch.data.nameMode)) return bad(res, 'nameMode 必须是 alias / target，或 null（跟随设置）');
           if (patch.nodeId !== undefined && typeof patch.nodeId !== 'string') return bad(res, 'nodeId 必须是字符串');
           if (patch.edgeKey !== undefined && typeof patch.edgeKey !== 'string') return bad(res, 'edgeKey 必须是字符串');
@@ -2036,6 +2049,11 @@ server.on('clientError', (err, socket) => {
 // 兜底：任何漏网的未捕获异常只记日志，避免 Electron 侧只看到「exited with 1」
 process.on('uncaughtException', (err) => {
   console.error('[未捕获异常]', err && err.stack ? err.stack : err);
+});
+
+server.on('error', (err) => {
+  console.error('[服务] 启动失败：', err.message);
+  process.exitCode = 1;
 });
 
 server.listen(PORT, '127.0.0.1', () => {

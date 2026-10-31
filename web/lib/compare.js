@@ -110,6 +110,7 @@ pickApply?.addEventListener('click', async () => {
   document.getElementById('comparePickCancel').disabled = true;
   picker.querySelector('.modal-close').disabled = true;
   pickError.textContent = '';
+  state.projectSwitchPending = true;
   try {
     const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds: retainedIds(), statusOverrides: Object.fromEntries(statuses) });
     if (!result?.ok) throw new Error(result?.error || '加入失败');
@@ -120,6 +121,7 @@ pickApply?.addEventListener('click', async () => {
     closeModal();
   } catch (error) { pickError.textContent = error.message || String(error); }
   finally {
+    state.projectSwitchPending = false;
     applying = false;
     document.getElementById('comparePickCancel').disabled = false;
     picker.querySelector('.modal-close').disabled = false;
@@ -196,6 +198,7 @@ startBtn?.addEventListener('click', async () => {
 
 exitBtn?.addEventListener('click', async () => {
   exitBtn.disabled = true;
+  state.projectSwitchPending = true;
   try {
     const result = await api.exitComparison();
     if (result && result.ok === false) throw new Error(result.error || t('compare.failed'));
@@ -206,6 +209,7 @@ exitBtn?.addEventListener('click', async () => {
   } catch (error) {
     if (summaryEl) summaryEl.title = `${t('compare.failed')}：${error.message || error}`;
   } finally {
+    state.projectSwitchPending = false;
     exitBtn.disabled = false;
   }
 });

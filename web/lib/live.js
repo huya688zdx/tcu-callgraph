@@ -3,7 +3,7 @@
  *
  * 1. 监听 SSE（/api/stream）：AI 通过 MCP 写入（标注 / 删除 / 布局 / 切工程）后
  *    服务端广播 change 事件，页面立即刷新画面——用户不用手动刷新。
- *    只响应 actor=ai：用户自己的写操作界面已就地处理，若也跟着刷新，
+ *    工程切换同步到其他页面，其他操作只响应 actor=ai：若用户自己的写操作也刷新，
  *    重复刷新会打断用户正在进行的拖拽。
  * 2. 上报页面视图状态（POST /api/page）：入口、深度、选中项。
  *    AI 用 cg_page 工具读取，对齐「用户正在看什么」再动手改。
@@ -19,6 +19,7 @@ import { draw } from './render.js';
 import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
+import { syncProjectLabel } from './projects.js';
 
 // ---------------- SSE 监听 ----------------
 
@@ -88,13 +89,15 @@ if (es) {
     } catch {
       return;
     }
-    if (!m || m.actor !== 'ai') return;
+    if (!m) return;
     if (m.op === 'project.switch') {
+      if (state.projectSwitchPending) return;
       dirtyCount = 0;
-      hooks.reloadAll(); // 跨工程没有任何可保留的状态，整体重载
-      toast(`AI 切换了工程：${m.project || ''}`);
+      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast('工程切换后刷新失败，请手动刷新页面'));
+      toast(`已切换工程：${m.project || ''}`);
       return;
     }
+    if (m.actor !== 'ai') return;
     scheduleReload();
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror

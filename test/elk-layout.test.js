@@ -143,3 +143,20 @@ test('变量关系可单独移出并恢复，不影响同一函数的其他变�
   assert.equal(restored.edges.length, 4);
   assert.equal(restored.layoutEngine, 'elk');
 });
+
+
+test('删除最后节点后恢复空图快照中的坐标', async (t) => {
+  const srv = await launchServer();
+  t.after(() => srv.close());
+  const url = srv.baseUrl + '/api/view?root=main.c::main&up=0&down=0';
+  const before = await (await fetch(url)).json();
+  before.nodes[0].x += 90;
+  const post = (endpoint, body) => fetch(srv.baseUrl + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  assert.equal((await post('/api/delete', { nodes: [before.root] })).status, 200);
+  const empty = await (await post('/api/view?root=main.c::main&up=0&down=0', { previous: before })).json();
+  assert.equal(empty.nodes.length, 0);
+  assert.equal(empty.layoutSlots.nodes[0].x, before.nodes[0].x);
+  assert.equal((await post('/api/delete', { nodes: [before.root], restore: true })).status, 200);
+  const restored = await (await post('/api/view?root=main.c::main&up=0&down=0', { previous: empty })).json();
+  assert.deepEqual(restored.nodes.map((n) => [n.id, n.x, n.y]), before.nodes.map((n) => [n.id, n.x, n.y]));
+});

@@ -2,7 +2,7 @@
  * 轻量预处理器
  * - 建立 #define 宏表（对象宏 / 函数式宏）
  * - 维护 #if / #ifdef / #elif / #else 嵌套栈，给每个 token 打上 condition 标签
- * - 不做真假求值：所有分支都保留，靠 condition 标签在界面上按配置过滤
+ * - 保留各分支并标注 condition；明确恒假分支不修改宏表
  */
 
 import { lex, collectArgs } from './lexer.js';
@@ -81,6 +81,8 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     const dir = m[1].toLowerCase();
     const rest = m[2].trim();
 
+    if ((dir === 'define' || dir === 'undef') && frames.some((f) => f.inactive)) continue;
+
     if (dir === 'define') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
       if (!nm) continue;
@@ -129,17 +131,24 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       continue;
     }
     if (dir === 'if') {
-      frames.push({ expr: rest.replace(/\s+/g, ' ') });
+      frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
       continue;
     }
     if (dir === 'elif') {
-      if (frames.length) frames[frames.length - 1].expr = rest.replace(/\s+/g, ' ');
+      if (frames.length) {
+        const frame = frames[frames.length - 1];
+        frame.expr = rest.replace(/\s+/g, ' ');
+        frame.inactive = frame.definitelyTaken || rest === '0';
+        frame.definitelyTaken ||= rest === '1';
+      }
       continue;
     }
     if (dir === 'else') {
       if (frames.length) {
         const cur = frames[frames.length - 1].expr || '';
-        frames[frames.length - 1].expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
+        const frame = frames[frames.length - 1];
+        frame.expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
+        frame.inactive = !!frame.definitelyTaken;
       }
       continue;
     }

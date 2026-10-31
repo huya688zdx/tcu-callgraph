@@ -1,6 +1,6 @@
 /** 从画布或文件树里的函数发起局部层级查找。 */
 import { t } from '../i18n.js';
-import { state } from './state.js';
+import { state, edgeKey } from './state.js';
 import { hooks } from './hooks.js';
 import { api } from './api.js';
 import { openModal, closeModal, esc } from './modal.js';
@@ -11,6 +11,7 @@ const pickAll = document.getElementById('addFunctionsAll');
 const pickMessage = document.getElementById('addFunctionsMessage');
 let previewSequence = 0;
 let previewView = null;
+let missingEdges = [];
 
 function syncPickCount() {
   const inputs = [...pickList.querySelectorAll('input')];
@@ -18,8 +19,8 @@ function syncPickCount() {
   pickAll.checked = !!inputs.length && count === inputs.length;
   pickAll.indeterminate = count > 0 && count < inputs.length;
   pickAll.disabled = !inputs.length;
-  pickApply.disabled = !count;
-  pickApply.textContent = count ? `确认添加 ${count} 个函数` : '确认添加';
+  pickApply.disabled = !count && !missingEdges.length;
+  pickApply.textContent = count ? `确认添加 ${count} 个函数` : missingEdges.length ? `确认补充 ${missingEdges.length} 条关系` : '确认添加';
 }
 
 /** 仅预览候选范围；确认时用零层范围加入勾选函数，避免未勾选分支再次展开。 */
@@ -31,6 +32,7 @@ export async function previewAddition(fn, depths = state.addDepths) {
   document.getElementById('addFunctionsTarget').textContent = fn.name || fn.id.split('::').pop();
   document.getElementById('addFunctionsScope').textContent = `查找调用者 ${up} 层 / 被调用函数 ${down} 层。`;
   pickList.replaceChildren();
+  missingEdges = [];
   syncPickCount();
   pickMessage.textContent = '正在查找，画布尚未改动…';
   openModal('addFunctionsModal');
@@ -41,6 +43,8 @@ export async function previewAddition(fn, depths = state.addDepths) {
     if (state.view !== previewView || view.projectId !== previewView.projectId) throw new Error('画布已变化，请重新预览');
     const shown = new Set(previewView.nodes.map((node) => node.id));
     const names = new Map(view.nodes.map((node) => [node.id, node.name]));
+    const existingEdges = new Set(previewView.edges.map(edgeKey));
+    missingEdges = view.edges.filter((edge) => shown.has(edge.from) && shown.has(edge.to) && !existingEdges.has(edgeKey(edge)));
     const candidates = view.nodes.filter((node) => node.kind !== 'var' && !shown.has(node.id));
     pickList.innerHTML = candidates.map((node) => {
       const calls = node.id === fn.id ? '目标函数' : view.edges.filter((edge) => edge.from === node.id || edge.to === node.id)
@@ -48,7 +52,8 @@ export async function previewAddition(fn, depths = state.addDepths) {
       return `<label class="function-pick"><input type="checkbox" data-function-id="${esc(node.id)}" checked>
         <span><b>${esc(node.name)}</b><small>${esc(node.file || '')}:${node.line || ''}</small>${calls ? `<small>${esc(calls)}</small>` : ''}</span></label>`;
     }).join('');
-    pickMessage.textContent = candidates.length ? (view.truncated ? '查找已达上限，可减少层数后重试' : '取消不会改动画布') : '这些函数均已在画布中';
+    pickMessage.textContent = missingEdges.length ? `已有函数之间可补充 ${missingEdges.length} 条关系，取消不会改动画布`
+      : candidates.length ? (view.truncated ? '查找已达上限，可减少层数后重试' : '取消不会改动画布') : '这些函数均已在画布中';
     syncPickCount();
   } catch (error) { if (seq === previewSequence) pickMessage.textContent = error.message; }
 }
@@ -65,8 +70,10 @@ pickApply?.addEventListener('click', async () => {
   pickApply.disabled = true;
   pickMessage.textContent = '正在加入…';
   try {
-    const view = await hooks.addFunction(ids);
-    if (!view || !ids.every((id) => view.nodes.some((node) => node.id === id))) throw new Error('加入失败，请重试');
+    const edgeIds = missingEdges.flatMap((edge) => [edge.from, edge.to]);
+    const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true });
+    if (!view || !ids.every((id) => view.nodes.some((node) => node.id === id)) ||
+        !missingEdges.every((edge) => view.edges.some((item) => edgeKey(item) === edgeKey(edge)))) throw new Error('加入失败，请重试');
     closeModal();
   } catch (error) { pickMessage.textContent = error.message; syncPickCount(); }
 });

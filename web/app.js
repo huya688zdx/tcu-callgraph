@@ -42,7 +42,7 @@ const NAV_MAX = 30;
 
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
-  const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
+  const previous = incremental && !state.at && state.view ? state.view : null;
   clearPairFlow();
   stopCamAnim();
   // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
@@ -94,10 +94,15 @@ async function loadView(rootId, opts = {}) {
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';
+  if (data.truncated && !data.comparison) els.rootName.textContent += ` · ${t('compare.truncated')}`;
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
+  for (const n of previous?.layoutSlots?.nodes || []) {
+    const restored = data.nodes.find((item) => item.id === n.id && item.x === n.x && item.y === n.y);
+    if (restored && !oldNodes.has(n.id)) oldNodes.set(n.id, n);
+  }
   const oldEdges = new Set((previous?.edges || []).map(edgeKey));
   const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   const rearranged = addedNodes.length > 0;
@@ -124,12 +129,13 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.addFunction = async (root) => {
-  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => !state.view?.nodes.some((n) => n.id === id));
+hooks.addFunction = async (root, { includeShown = false } = {}) => {
+  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => includeShown || !state.view?.nodes.some((n) => n.id === id));
   if (!ids.length) return state.view;
   const projectId = state.view?.projectId;
   if (!state.at && !state.view?.comparison) {
-    const hidden = (await Promise.all(ids.map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
+    const hidden = (await Promise.all(ids.filter((id) => !state.view?.nodes.some((n) => n.id === id))
+      .map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
     if (state.view?.projectId !== projectId) return;
     if (hidden.length) {
       const result = await api.del({ nodes: hidden, restore: true, projectId });
@@ -362,6 +368,7 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  if (document.querySelector('.modal.show')) return;
   if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
   if (e.key === 'f' || e.key === 'F') fit();
 });
@@ -425,7 +432,6 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
-const initialPanels = Promise.all([loadStats(), loadTree()]);
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {
   const seq = viewSeq;
@@ -442,9 +448,12 @@ const initialPanels = Promise.all([loadStats(), loadTree()]);
   } catch {
     /* 服务端没有该接口或暂时不可达：用默认值 */
   }
-  await initialPanels;
+  await Promise.all([loadStats(), loadTree()]);
   await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
-})();
+  if (!state.view) throw new Error('未能加载视图');
+})().catch((error) => {
+  if (confirm(`启动失败：${error.message}\n是否刷新页面重试？`)) location.reload();
+});
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
 window.__cg = {

@@ -55,20 +55,26 @@ export async function syncProjectLabel() {
 async function switchTo(body) {
   if (listEl) listEl.innerHTML = `<div class="empty">${t('project.switching')}</div>`;
   let r;
+  state.projectSwitchPending = true;
   try {
     r = await api.switchProject(body);
   } catch (err) {
     r = { ok: false, error: String(err.message || err) };
   }
   if (!r || !r.ok) {
+    state.projectSwitchPending = false;
     if (listEl) {
       listEl.innerHTML = `<div class="empty">${t('project.failed')}：${esc(r?.error || '未知错误')}</div>`;
     }
     return;
   }
   closeModal();
-  await hooks.reloadAll();
-  await syncProjectLabel();
+  try {
+    await hooks.reloadAll();
+    await syncProjectLabel();
+  } finally {
+    state.projectSwitchPending = false;
+  }
 }
 
 async function render() {
@@ -269,7 +275,9 @@ fileInput?.addEventListener('change', async () => {
     hint(`${t('session.importFailed')}：文件不是合法 JSON`);
     return;
   }
-  const r = await api.importSession(payload);
+  const ok = await confirmDialog({ title: '导入会话', message: '导入会覆盖同名的本地标注、布局和书签。确定继续吗？' });
+  if (!ok) return;
+  const r = await api.importSession(payload).catch((error) => ({ ok: false, error: error.message }));
   if (!r || !r.ok) {
     hint(`${t('session.importFailed')}：${r?.error || ''}`);
     return;
