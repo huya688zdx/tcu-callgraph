@@ -8,6 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 
 import { createMcpServer } from '../src/mcp.js';
@@ -130,6 +131,14 @@ test('e2e：/api/stream 握手与守卫（405 / 跨站 Origin 403）', async () 
 
     const evil = await fetch(base + '/api/stream', { headers: { Origin: 'http://evil.example' } });
     assert.equal(evil.status, 403);
+    const hostStatus = await new Promise((resolve, reject) => {
+      http.get(base + '/api/stats', { headers: { Host: 'evil.example' } }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', reject);
+    });
+    assert.equal(hostStatus, 403);
+    assert.equal((await fetch(base + '/api/export/xlsx', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+    assert.equal((await fetch(base + '/api/export/html', { headers: { Origin: 'http://evil.example' } })).status, 403);
+    const invalid = await fetch(base + '/api/overlay', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nodeId: 'main.c::main', data: { change: 'unknown' } }) });
+    assert.equal(invalid.status, 400);
   } finally {
     await srv.close();
   }
@@ -239,11 +248,12 @@ test('e2e：删除 / 布局写操作也广播；切工程广播 project.switch',
     assert.equal(layoutEv.json.actor, 'ai');
 
     // 切工程：广播带新工程名
-    const sw = await postJson(base + '/api/switch', { path: path.join(ROOT, 'samples', 'demo'), actor: 'ai' });
+    const sw = await postJson(base + '/api/switch', { path: path.join(ROOT, 'samples', 'demo'), actor: 'ai' }, { 'X-Callgraph-Client': 'test-client-id' });
     assert.equal(sw.ok, true, '切到 samples/demo 应成功');
     const swEv = await stream.waitFor((e) => e.json && e.json.op === 'project.switch');
     assert.equal(swEv.json.actor, 'ai');
     assert.ok(swEv.json.project, '广播应带工程名');
+    assert.equal(swEv.json.clientId, 'test-client-id');
 
     // 切工程后页面状态作废（前端重载后会重新上报）
     const page = await (await fetch(base + '/api/page')).json();

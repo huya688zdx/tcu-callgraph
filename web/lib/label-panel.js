@@ -86,8 +86,12 @@ function nodeName(id) {
 async function commit(edge, projectId = state.view?.projectId) {
   applyLabels(edge, edge.labels);
   draw();
-  await persistLabels(edge, projectId);
-  if (state.view?.projectId === projectId) pushHistory();
+  try {
+    await persistLabels(edge, projectId);
+    if (state.view?.projectId === projectId) pushHistory();
+  } catch (error) {
+    alert(`标签未保存：${error.message}`);
+  }
 }
 
 /** 删一条标签；结合点删除后按编号模式收尾（重排 → 紧凑） */
@@ -100,14 +104,19 @@ async function removeLabel(edge, id) {
   }
   draw();
   renderLabelPanel();
-  await persistLabels(edge);
-  pushHistory();
-  if (wasConn) {
-    const changes = await afterConnDelete();
-    if (changes.length) {
-      await api.renumberConns(changes);
-      if (hooks.reloadKeepCam) hooks.reloadKeepCam();
+  try {
+    await persistLabels(edge);
+    pushHistory();
+    if (wasConn) {
+      const changes = await afterConnDelete();
+      if (changes.length) {
+        const result = await api.renumberConns(changes);
+        if (!result?.ok) throw new Error(result?.error || '结合点重排失败');
+        if (hooks.reloadKeepCam) await hooks.reloadKeepCam();
+      }
     }
+  } catch (error) {
+    alert(`标签保存或重排失败：${error.message}`);
   }
 }
 
@@ -122,8 +131,12 @@ async function addLabel(edge, preset, num) {
   connPick = false;
   draw();
   renderLabelPanel();
-  await persistLabels(edge);
-  pushHistory();
+  try {
+    await persistLabels(edge);
+    pushHistory();
+  } catch (error) {
+    alert(`标签未保存：${error.message}`);
+  }
 }
 
 // ---- 自动检测 ----

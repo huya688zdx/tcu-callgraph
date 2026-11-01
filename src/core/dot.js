@@ -229,6 +229,15 @@ export function parseDot(src) {
         continue;
       }
 
+      // 端口只影响连线位置，不是节点名称。
+      const skipPort = () => {
+        for (let i = 0; i < 2 && is(':'); i++) {
+          p++;
+          if (peek()?.t === 'id') p++;
+        }
+      };
+      skipPort();
+
       // 链式边
       let chained = false;
       while (is('->') || is('--')) {
@@ -237,6 +246,7 @@ export function parseDot(src) {
         const target = next();
         if (!target) break;
         parts.push(target);
+        skipPort();
         chained = true;
       }
 

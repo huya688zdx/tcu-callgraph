@@ -8,6 +8,7 @@ import { normalizeExpansions } from '../src/core/expansion.js';
 import { openStore } from '../src/core/store.js';
 
 test('局部层级参数：合并同一函数的两个方向，拒绝无界/小数/非法层数', () => {
+  assert.equal(normalizeExpansions(Array.from({ length: 601 }, (_, i) => ({ root: `n${i}`, up: 0, down: 0 }))).length, 601);
   assert.deepEqual(normalizeExpansions([{ root: 'b', up: 2, down: 0 }, { root: 'b', up: 0, down: 3 }]),
     [{ root: 'b', up: 2, down: 3 }]);
   for (const invalid of [null, {}, [{ root: 'b', up: -1, down: 1 }], [{ root: 'b', up: 1.5, down: 0 }],
@@ -59,12 +60,16 @@ void side(void) { c(); }
   assert.equal((await post(base, { expansions: [{ root: 'chain.c::b', up: 0, down: 21 }] })).status, 400);
 
   const project = await get('/api/project');
+  const zeroScopes = Array.from({ length: 601 }, (_, i) => ({ root: `hidden${i}`, up: 0, down: 0 }));
+  assert.equal((await post('/api/page', { projectId: project.id, roots: ['chain.c::b'], up: 1, down: 1, expansions: zeroScopes, group: true })).status, 200);
+  assert.equal((await get('/api/page?saved=1')).page.expansions.length, 601);
+  assert.equal((await post('/api/bookmarks', { name: '批量', roots: ['chain.c::b'], up: 1, down: 1, expansions: zeroScopes })).status, 200);
   assert.equal((await post('/api/page', { projectId: project.id, roots: ['chain.c::b'], up: 1, down: 1, expansions: both, group: true })).status, 200);
   assert.deepEqual((await get('/api/page?saved=1')).page.expansions, both);
   const bookmark = await post('/api/bookmarks', { name: '局部查找', roots: ['chain.c::b'], up: 1, down: 1, expansions: both });
   assert.equal(bookmark.status, 200);
   assert.deepEqual(bookmark.data.bookmark.expansions, both);
-  assert.deepEqual((await get('/api/bookmarks')).list[0].expansions, both);
+  assert.deepEqual((await get('/api/bookmarks')).list.find((b) => b.name === '局部查找').expansions, both);
   await post('/api/switch', { path: path.resolve('samples/tcu') });
   assert.equal((await get('/api/page?saved=1')).page, null);
   await post('/api/switch', { path: dir });
@@ -108,6 +113,13 @@ void top(void) { a(); y(); }
   assert.deepEqual(names(original), ['b', 'keep', 'leaf', 'shared']);
   const expand = async expansions => (await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ projectId: original.projectId, expansions }) })).json();
+  const singleScope = { root: 'calls.c::a', up: 0, down: 0 };
+  const single = await expand([singleScope]);
+  assert.deepEqual(names(single), ['a', 'b', 'keep', 'leaf', 'shared'], '零层添加只能新增指定函数，不能带出 top 或 x');
+  assert.deepEqual(single.roots, roots, '单个添加不改变原入口层数');
+  assert.ok(single.edges.some(e => e.from === 'calls.c::a' && e.to === 'calls.c::b'), '保留与已有函数的调用线');
+  assert.ok(original.edges.every(old => single.edges.some(e => e.from === old.from && e.to === old.to)));
+  assert.deepEqual(names(await expand(single.expansions)), names(single), '刷新后仍然只显示指定函数');
   const firstScope = { root: 'calls.c::b', up: 1, down: 0 };
   const first = await expand([firstScope]);
   assert.deepEqual(first.roots, roots, '新找到的调用者不成为入口');
@@ -120,4 +132,24 @@ void top(void) { a(); y(); }
   assert.ok(!next.nodes.some(n => ['x', 'y'].includes(n.name)), '上层的其他被调用分支不新增');
   const none = await expand([...next.expansions, { root: 'calls.c::keep', up: 2, down: 0 }]);
   assert.deepEqual(names(none), names(next), '无调用者时保留整张画布');
+});
+
+
+test('仅补充已显示函数之间的关系，不引入其他函数', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-edge-'));
+  fs.writeFileSync(path.join(dir, 'calls.c'), 'void b(void) {} void root(void) { b(); } void a(void) { root(); b(); }');
+  const srv = await launchServer({ target: dir });
+  t.after(async () => { await srv.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const url = srv.baseUrl + '/api/view?root=calls.c::root&up=1&down=1';
+  const before = await (await fetch(url)).json();
+  assert.equal(before.nodes.length, 3);
+  assert.equal(before.edges.length, 2);
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId: before.projectId, expansions: [{ root: 'calls.c::a', up: 0, down: 0 }] }) });
+  const after = await response.json();
+  assert.equal(after.nodes.length, 3);
+  assert.equal(after.edges.length, 3);
+  const nonzero = await (await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId: before.projectId, expansions: [{ root: 'calls.c::a', up: 1, down: 0 }] }) })).json();
+  assert.equal(nonzero.edges.length, 3);
 });

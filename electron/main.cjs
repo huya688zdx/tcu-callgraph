@@ -128,7 +128,7 @@ async function startTargetNow(target) {
       // 数据库放在 Electron 的 userData 目录。只有主进程能拿到这个路径，
       // 解析跑在子进程里，所以必须用环境变量传过去，否则打包后两边指向不同目录，
       // 症状是「标注保存了但重启就没了」。
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
+      env: { ...process.env, CALLGRAPH_DB: '', ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
   } catch (err) {

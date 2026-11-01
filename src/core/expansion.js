@@ -1,6 +1,7 @@
 /** 单函数局部展开参数。限制深度和条数，避免误操作展开整个大工程。 */
 export function normalizeExpansions(value = []) {
-  if (!Array.isArray(value) || value.length > 128) throw new Error('局部展开最多支持 128 个函数');
+  if (!Array.isArray(value)) throw new Error('局部展开需要数组');
+  if (value.filter((item) => item?.up || item?.down).length > 128) throw new Error('非零层局部展开最多支持 128 个函数');
   const result = new Map();
   for (const item of value) {
     if (!item || typeof item.root !== 'string' || !item.root || item.root.length > 2048 ||

@@ -306,7 +306,7 @@ export async function afterConnDelete(view = state.view) {
     .map(({ key, id, num }) => ({ key, id, num }))
     .sort((a, b) => a.num - b.num);
   const changes = entries
-    .map((x, i) => (x.num !== i + 1 ? { key: x.key, id: x.id, num: i + 1 } : null))
+    .map((x, i) => (x.num !== i + 1 ? { edgeKey: x.key, id: x.id, num: i + 1 } : null))
     .filter(Boolean);
   return changes;
 }

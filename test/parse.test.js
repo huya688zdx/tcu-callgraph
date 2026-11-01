@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
+import { parseDot } from '../src/core/dot.js';
 import { loadModel, stats } from '../src/core/index.js';
 
 const SAMPLE = path.join(import.meta.dirname, '..', 'samples', 'tcu');
@@ -134,4 +137,22 @@ test('stats(samples/tcu)：计数口径自洽，cycleGroups 稳定', () => {
     [['gear.c::Gear_Apply', 'gear.c::Gear_Retry']]
   );
   assert.equal(st.cycles, 1);
+});
+
+
+test('恒假分支不修改宏，跨文件 static 不解析为调用目标', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-review-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), 'static void helper(void) {} void real_target(void) {}');
+  fs.writeFileSync(path.join(dir, 'b.c'), 'static void helper(void) {}');
+  fs.writeFileSync(path.join(dir, 'c.c'), '#define CALL real_target\n#if 0\n#undef CALL\n#define CALL wrong_target\n#endif\nvoid entry(void) { CALL(); helper(); }');
+  const edges = loadModel(dir).edges.filter((e) => e.from === 'c.c::entry');
+  assert.ok(edges.some((e) => e.to === 'a.c::real_target'));
+  assert.ok(edges.some((e) => e.to === 'ext::helper'));
+});
+
+test('DOT 端口不产生节点，引号内冒号保留', () => {
+  const graph = parseDot('digraph { a:ne -> "b:c":port:sw; }');
+  assert.deepEqual([...graph.nodes.keys()], ['a', 'b:c']);
+  assert.deepEqual(graph.edges.map(({ from, to }) => [from, to]), [['a', 'b:c']]);
 });

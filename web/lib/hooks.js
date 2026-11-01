@@ -5,8 +5,10 @@
 export const hooks = {
   /** 以某个函数为入口重新加载视图（支持传入多个 id） */
   loadView: () => {},
-  /** 保留当前画布，加入指定函数的单向调用关系。 */
-  expandFunction: async () => {},
+  /** 保留当前画布，只加入指定函数（支持标识数组）。 */
+  addFunction: async () => {},
+  /** 移出画布，沿用删除与撤销流程，不改源码。 */
+  removeFunction: async () => {},
   /** 刷新右侧节点详情 */
   renderDetail: () => {},
   /** 勾选 / 取消勾选一个全局变量 */

@@ -181,6 +181,11 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
       previous = { ...slots, edges: [...new Map([...slots.edges, ...previous.edges].map((e) => [edgeKey(e), e])).values()] };
     }
   }
+  // 新增函数或变量时使用与“重新排版”相同的完整布局，避免旧方向与位置约束拉长新图。
+  if (previous) {
+    const oldIds = new Set(previous.nodes.map((n) => n.id));
+    if (sized.some((n) => !oldIds.has(n.id))) previous = null;
+  }
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
   const oldEdges = new Map((previous?.edges || []).map((e) => [edgeKey(e), e]));
   const direction = previous?.layoutDirection === 'DOWN' ? 'DOWN' : 'RIGHT';
