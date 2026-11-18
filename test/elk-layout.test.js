@@ -2,6 +2,29 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { layoutElk } from '../src/core/layout-elk.js';
+import { pathCrossesBody, routeOverlapConflicts } from '../src/core/routing.js';
+
+test('多个调用方分别调用多个目标时，只共享有归属的干线，调用行仍可独立选择', async () => {
+  const nodes = ['a', 'b', 'x', 'y'].map((id) => ({ id, name: id, file: 'dispatch.c' }));
+  const edges = ['a', 'b'].flatMap((from) => ['x', 'y'].map((to) => ({ from, to, kind: 'direct' })));
+  edges.push({ from: 'a', to: 'x', kind: 'fnptr' });
+  edges.forEach((e, i) => { e.line = i + 1; });
+  for (const group of [true, false]) {
+    const view = await layoutElk(nodes, edges, { group });
+    assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
+    assert.equal(routeOverlapConflicts(view.edges).length, 0);
+    assert.deepEqual(view.edges[0].points, view.edges.at(-1).points, '同端点同线型的调用保留同一条路径');
+    for (const e of view.edges) {
+      assert.ok(!view.nodes.some((n) => pathCrossesBody(e.points, n)));
+      for (const [id, p] of [[e.from, e.points[0]], [e.to, e.points.at(-1)]]) {
+        const n = view.nodes.find((n) => n.id === id);
+        assert.ok([[n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2],
+          [n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h]]
+          .some(([x, y]) => Math.abs(x - p[0]) < 0.5 && Math.abs(y - p[1]) < 0.5));
+      }
+    }
+  }
+});
 
 test('默认只使用 ELK：旧模式和坐标不覆盖布局，手工关系参与排版', async (t) => {
   const srv = await launchServer();

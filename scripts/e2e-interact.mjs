@@ -222,6 +222,29 @@ await drag(edgeFixture.x,edgeFixture.y,edgeFixture.x,edgeFixture.y+35,{steps:4})
 const shapedEdge = await evaluate(`(()=>{const e=__cg.view.edges[0],p=e.points;return e.custom&&p.length===6&&p[0][0]===220&&p[0][1]===122&&p.at(-1)[0]===400&&p.at(-1)[1]===122&&p.some(q=>q[1]===157)&&p.every((q,i)=>!i||q[0]===p[i-1][0]||q[1]===p[i-1][1])})()`);
 console.log(`  单击不能误拖: ${lockedEdge}；双击已解锁: ${editingEdge}；直线调形成功且保持正交: ${shapedEdge}`);
 if (!lockedEdge || !editingEdge || !shapedEdge) ok=false;
+// 高亮须可见并在到期后清除，期间的动画帧复用已绘制的文字和标签。
+const pulse = await evaluate(`(async () => {
+  const {state, els} = await import('/lib/state.js');
+  const {draw, pulseAdded} = await import('/lib/render.js');
+  state.selected = state.selectedEdge = state.moveTarget = null;
+  draw();
+  const original = els.cv.toDataURL();
+  pulseAdded(state.view.nodes, state.view.edges);
+  const lit = els.cv.toDataURL() !== original;
+  const measure = els.ctx.measureText;
+  let calls = 0;
+  els.ctx.measureText = function (...args) { calls++; return measure.apply(this, args); };
+  try {
+    for (let i = 0; i < 3; i++) await new Promise(requestAnimationFrame);
+  } finally {
+    els.ctx.measureText = measure;
+  }
+  state.recent.until = performance.now() - 1;
+  await new Promise(requestAnimationFrame);
+  return { lit, calls, cleared: !state.recent && els.cv.toDataURL() === original };
+})()`);
+console.log('\n[测试4] 批量新增高亮', pulse);
+if (!pulse.lit || pulse.calls !== 0 || !pulse.cleared) ok = false;
 await evaluate(`(async()=>{const {state,cam}=await import('/lib/state.js');state.view=__edgeBackup.view;state.selectedEdge=null;state.selectedLabel=null;state.moveTarget=null;Object.assign(cam,__edgeBackup.cam);delete window.__edgeBackup;(await import('/lib/render.js')).draw()})()`);
 
 try {

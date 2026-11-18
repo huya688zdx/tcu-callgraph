@@ -5,6 +5,37 @@ import { improveEdgeRoutes, mergeSharedRoutes } from '../src/core/layout-metrics
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
 
+test('不同样式只豁免同端口的短引线，远处的短重叠也要计入', () => {
+  const call = { from: 's', to: 'a', points: [[0, 0], [0, 40], [40, 40], [40, 80]] };
+  const ref = { from: 's', to: 'b', kind: 'var', points: [[0, 0], [10, 0], [10, 40], [20, 40], [20, 70]] };
+  assert.equal(routeOverlapConflicts([call, ref]).length, 10);
+  ref.points = [[0, 0], [0, 15], [-10, 15]];
+  assert.equal(routeOverlapConflicts([call, ref]).length, 0);
+});
+
+test('局部重布拆开同文件重合的直线，保留另一条手工路径及两端的函数位置', () => {
+  const nodes = ['a', 'b'].map((id, i) => ({ id, file: 'f.c', x: 40 + i * 300, y: 100, w: 120, h: 44 }));
+  const saved = { from: 'a', to: 'b', custom: true, points: [[160, 122], [340, 122]] };
+  const edge = { from: 'a', to: 'b', change: 'added', points: structuredClone(saved.points) };
+  const view = { nodes, edges: [saved, edge], width: 520, height: 250 };
+  const before = structuredClone(view);
+  assert.ok(routeOverlapConflicts(view.edges).length > 100);
+  improveEdgeRoutes(view, [edge], () => false);
+  assert.deepEqual(saved, before.edges[0]);
+  assert.deepEqual(nodes, before.nodes);
+  assert.equal(routeOverlapConflicts(view.edges).length, 0);
+  assert.ok(!pathBlockedByNodes(edge.points, nodes, new Set(['a', 'b'])));
+});
+
+test('同端点同线型的重复调用按各自指定的连接面布线', () => {
+  const nodes = [{ id: 'a', x: 20, y: 40, w: 120, h: 44 }, { id: 'b', x: 400, y: 220, w: 120, h: 44 }];
+  const edges = [{ from: 'a', to: 'b', kind: 'direct', fromSide: 'right', toSide: 'left' },
+    { from: 'a', to: 'b', kind: 'fnptr', fromSide: 'bottom', toSide: 'top' }];
+  routeEdges(nodes, edges);
+  assert.deepEqual(edges.map((e) => [e.points[0], e.points.at(-1)]),
+    [[[140, 62], [400, 242]], [[80, 84], [460, 220]]]);
+});
+
 test('ELK 已有的同源调用通道合并，函数指针调用使用相同的可见线型', () => {
   const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
     { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
