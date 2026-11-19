@@ -81,24 +81,27 @@ function overlapWithRouted(edge, routed) {
   return length;
 }
 
-/** 摆位和路由使用同一口径，避免把无关线或不同样式的重叠算作合并收益。 */
-export function routeOverlapConflicts(edges) {
-  let length = 0;
+/** 逐对统计共线长度。布局评分只计不同线型的遮盖，局部几何检查也可包含同线型。 */
+export function routeOverlapConflicts(edges, { differentStylesOnly = false } = {}) {
+  let length = 0, styleLength = 0;
   const hits = new Map(), byEdge = new Map();
-  const ordered = edges.map((edge) => ({ edge, ...routeBounds(edge.points) })).sort((a, b) => a.minX - b.minX);
+  const ordered = edges.map((edge) => ({ edge, style: edgeStyleKey(edge), ...routeBounds(edge.points) }));
+  if (differentStylesOnly && ordered.every((e) => e.style === ordered[0].style)) return { length, styleLength, hits, byEdge };
+  ordered.sort((a, b) => a.minX - b.minX);
   for (let i = 0; i < ordered.length; i++) for (let j = i + 1; j < ordered.length; j++) {
     const a = ordered[i], b = ordered[j];
     if (b.minX >= a.maxX + 0.5) break;
-    if (!boundsMeet(a, b)) continue;
+    if ((differentStylesOnly && a.style === b.style) || !boundsMeet(a, b)) continue;
     const overlap = incompatibleOverlap(a.edge, b.edge);
     if (overlap < 0.5) continue;
     length += overlap;
+    if (a.style !== b.style) styleLength += overlap;
     for (const e of [a.edge, b.edge]) {
       byEdge.set(e, (byEdge.get(e) || 0) + overlap);
       for (const id of [e.from, e.to]) hits.set(id, (hits.get(id) || 0) + overlap);
     }
   }
-  return { length, hits, byEdge };
+  return { length, styleLength, hits, byEdge };
 }
 
 // ---------------- 基础几何 ----------------

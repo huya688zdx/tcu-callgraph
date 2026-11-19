@@ -31,7 +31,7 @@ try {
   console.log('页面错误:', err0 || '无');
   if (err0) failures.push('页面报错: ' + err0);
 
-  // ---- 测试1：右键函数节点 → 选「追加モジュール」----
+  // ---- 测试1：右键函数节点 → 选「新增」----
   const nodeInfo = await evaluate(`(() => {
     const v = window.__cg.view;
     const c = window.__cg.cam;
@@ -48,7 +48,7 @@ try {
   if (!nodeInfo) {
     console.log('没有可测试的函数节点');
   } else {
-    console.log(`\n[测试1] 右键函数 ${nodeInfo.name}()，标记为「追加モジュール」`);
+    console.log(`\n[测试1] 右键函数 ${nodeInfo.name}()，标记为「新增」`);
     await rightClick(nodeInfo.x, nodeInfo.y);
     const shown = await tryWaitFor("document.getElementById('ctxMenu').classList.contains('show')", {
       timeoutMs: 3000,
@@ -66,16 +66,15 @@ try {
     } else {
       console.log(`  菜单标题: ${menuShown.title}`);
       console.log(`  菜单项: ${menuShown.items.join(' | ')}`);
-      // 按文案选「追加モジュール」：菜单现在分「データ流分析 / 変更分類」两区，序号会变
       changed.push({ kind: 'node', id: nodeInfo.id, prev: nodeInfo.change || 'existing' });
       const picked = await evaluate(`(() => {
-        const b = [...document.querySelectorAll('#ctxMenu button')].find(x => x.textContent.includes('追加'));
+        const b = [...document.querySelectorAll('#ctxMenu button')].find(x => x.textContent.trim() === '新增');
         if (!b) return false;
         b.click();
         return true;
       })()`);
       if (!picked) {
-        failures.push('右键菜单里没有「追加」选项');
+        failures.push('右键菜单里没有「新增」选项');
       } else {
         // 选完菜单项：状态立刻更新，菜单随之关闭
         const updated = await tryWaitFor(
@@ -88,7 +87,7 @@ try {
           return { change: n && n.change, menuOpen: document.getElementById('ctxMenu').classList.contains('show') };
         })()`);
         console.log(`  change: ${nodeInfo.change} -> ${after.change}`);
-        console.log(`  结论: ${after.change === 'added' ? '✅ 已标记为追加' : '❌ 状态未更新'}`);
+        console.log(`  结论: ${after.change === 'added' ? '✅ 已标记为新增' : '❌ 状态未更新'}`);
         console.log(`  菜单已关闭: ${after.menuOpen ? '❌' : '✅'}`);
         if (!updated) failures.push(`节点 ${nodeInfo.id} 未标记为 added`);
         if (after.menuOpen) failures.push('选择菜单项后菜单未关闭');
@@ -97,20 +96,23 @@ try {
   }
 
   // ---- 测试2：右键连线 → 选「新增」----
-  const edgeInfo = await evaluate(`(() => {
+  const edgeInfo = await evaluate(`(async () => {
     const v = window.__cg.view;
     const c = window.__cg.cam;
     const r = document.getElementById('cv').getBoundingClientRect();
+    const {hitTest, hitTitle, hitEdge} = await import('/lib/interact.js');
     for (const e of v.edges) {
       const pts = e.points || [];
       for (let i = 0; i < pts.length - 1; i++) {
         const mx = (pts[i][0] + pts[i+1][0]) / 2;
         const my = (pts[i][1] + pts[i+1][1]) / 2;
-        const onNode = v.nodes.some(n => mx >= n.x && mx <= n.x + n.w && my >= n.y && my <= n.y + n.h);
-        if (onNode) continue;
+        const p = {clientX: r.left + c.x + mx * c.k, clientY: r.top + c.y + my * c.k};
+        if (document.elementFromPoint(p.clientX, p.clientY)?.id !== 'cv' || hitTest(p) || hitTitle(p) || hitEdge(p) !== e) continue;
         return {
           key: e.from + '->' + e.to + ':' + e.line, change: e.change,
-          x: r.left + c.x + mx * c.k, y: r.top + c.y + my * c.k,
+          label: e.from + ' → ' + e.to + ' · ', line: 'L' + e.line,
+          others: JSON.stringify(v.edges.filter(other => other !== e).map(other => other.points)),
+          x: p.clientX, y: p.clientY,
         };
       }
     }
@@ -131,6 +133,10 @@ try {
     } else {
       changed.push({ kind: 'edge', id: edgeInfo.key, prev: edgeInfo.change || 'existing' });
       const picked = await evaluate(`(() => {
+        const options = [...document.querySelectorAll('#ctxMenu button')];
+        const relation = options.find(b => b.textContent.startsWith(${JSON.stringify(edgeInfo.label)}) &&
+          b.textContent.split(' · ').includes(${JSON.stringify(edgeInfo.line)}));
+        relation?.click();
         const b = [...document.querySelectorAll('#ctxMenu button')].find(x => x.textContent.trim() === '新增');
         if (!b) return false;
         b.click();
@@ -148,11 +154,12 @@ try {
         const after = await evaluate(`(() => {
           const v = window.__cg.view;
           const e = v.edges.find(x => (x.from + '->' + x.to + ':' + x.line) === ${JSON.stringify(edgeInfo.key)});
-          return { change: e && e.change };
+          return { change: e && e.change, others: JSON.stringify(v.edges.filter(other => other !== e).map(other => other.points)) };
         })()`);
         console.log(`  change: ${edgeInfo.change} -> ${after.change}`);
         console.log(`  结论: ${after.change === 'added' ? '✅ 已标记为新增' : '❌ 状态未更新'}`);
         if (!updated) failures.push(`连线 ${edgeInfo.key} 未标记为 added`);
+        if (after.others !== edgeInfo.others) failures.push('单条连线换色改变了其他干线的路径');
       }
     }
   }

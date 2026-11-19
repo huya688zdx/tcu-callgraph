@@ -180,6 +180,7 @@ const dict = {
     'callOrder.unavailable': '连线已移出',
     'edge.calledBy': '被调用',
     'edge.calls': '调用',
+    'edge.chooseAtPoint': '此处有 {n} 条关系，点击选择',
     'edge.chipMacro': '宏',
     'edge.chipFnptr': '指针',
     'edge.chipManual': '手动',

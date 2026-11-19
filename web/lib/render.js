@@ -17,6 +17,12 @@ let effectCamera = null;
 const scene = document.createElement('canvas');
 const sceneCtx = scene.getContext('2d');
 
+function sizeScene(canvas) {
+  if (scene.width === canvas.width && scene.height === canvas.height) return;
+  scene.width = canvas.width;
+  scene.height = canvas.height;
+}
+
 export function pulseAdded(nodes, edges) {
   state.recent = nodes.length || edges.length ? {
     nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
@@ -287,7 +293,8 @@ function draw() {
   const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
-  const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
+  const focusedEdge = state.selectedEdge && edgeKey(state.selectedEdge) === focusedKey && v.edges.includes(state.selectedEdge)
+    ? state.selectedEdge : focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
   const trace = state.pairFlow?.result;
   const tracedColors = new Map((trace?.edgeIndices || []).map(index => [v.edges[index], state.pairFlow.colors.get(index)]));
   const tracedEdges = new Set(tracedColors.keys());
@@ -296,14 +303,31 @@ function draw() {
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
+  const dim = focusedEdges.size || state.selected || selectedNodes?.size;
+  const related = [];
+  if (dim) {
+    sizeScene(cv);
+    sceneCtx.clearRect(0, 0, cv.width, cv.height);
+    sceneCtx.save();
+    sceneCtx.setTransform(ctx.getTransform());
+  }
   for (const e of v.edges) {
     if (focusedEdges.has(e)) continue;
-    const related = selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
-      : state.selected && (e.from === state.selected || e.to === state.selected);
-    drawEdge(ctx, e, related, false, !!focusedEdges.size);
+    if (!focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
+      : state.selected && (e.from === state.selected || e.to === state.selected))) related.push(e);
+    else drawEdge(dim ? sceneCtx : ctx, e, false, false);
   }
-  // 高亮最后画，避免共用干线上的其他边盖住它。
-  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true, tracedColors.get(e), !tracedEdges.has(e) || flowingEdges.has(e));
+  // 背景连线画完再整体淡化一次。数十条调用共线时，透明度不会叠加成一条黑线。
+  if (dim) {
+    sceneCtx.restore();
+    ctx.save();
+    ctx.resetTransform();
+    ctx.globalAlpha = focusedEdges.size ? 0.22 : 0.26;
+    ctx.drawImage(scene, 0, 0);
+    ctx.restore();
+  }
+  for (const e of related) drawEdge(ctx, e, true, false);
+  for (const e of focusedEdges) drawEdge(ctx, e, false, true, tracedColors.get(e), !tracedEdges.has(e) || flowingEdges.has(e));
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -385,10 +409,7 @@ function draw() {
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
   collectingEffects = false;
   if (effects.length || recentLayers || state.flash) {
-    if (scene.width !== cv.width || scene.height !== cv.height) {
-      scene.width = cv.width;
-      scene.height = cv.height;
-    }
+    sizeScene(cv);
     sceneCtx.clearRect(0, 0, scene.width, scene.height);
     sceneCtx.drawImage(cv, 0, 0);
     effectCamera = { ...cam, dpr };
@@ -466,7 +487,7 @@ function strokeRounded(ctx, pts) {
 /** 该连线是否画成虚线（变量访问默认虚线；虚实可在样式面板按类型调整） */
 const edgeDashed = (e) => (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash);
 
-function drawEdge(ctx, e, related, selected, focused = false, traceColor = null, animated = true) {
+function drawEdge(ctx, e, related, selected, traceColor = null, animated = true) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
@@ -486,7 +507,7 @@ function drawEdge(ctx, e, related, selected, focused = false, traceColor = null,
 
   ctx.strokeStyle = color;
   ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.6 : related ? 2.4 : 1.4;
-  ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
+  ctx.globalAlpha = 1;
   // 变量访问=虚线，函数调用=实线
   if (edgeDashed(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();

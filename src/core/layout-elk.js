@@ -8,27 +8,16 @@ const elk = new ELK();
 const TOP_PADDING = 40;
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
 
-// ELK 把共用逻辑端口的整组边作为一条干线。扇出又汇入时，给该调用方
-// 独立的目标端口，避免把多个调用方与多个目标连成一条看不清归属的线。
-// 所有逻辑端口仍落在各自面的中点，同一次关系的多条调用记录仍能共线。
+// ELK 会把共用逻辑端口的边排成干线。每一面按收发方向和线型设口，
+// 同组调用可以先汇集再分支，调用记录仍各自保留完整的端点与路径。
 function fixedPorts(nodes, edges, faces, separateStyles) {
-  const outgoing = new Map(), incoming = new Map(), ports = new Map();
+  const ports = new Map();
   const nodeIds = new Set(nodes.map((n) => n.id));
   let nextPort = 0;
-  const endpoint = (map, node, side, style, peer) => {
-    const key = JSON.stringify([node, side, style]);
-    if (!map.has(key)) map.set(key, new Set());
-    map.get(key).add(peer);
-    return key;
-  };
-  const ends = edges.map((e, i) => {
-    const style = separateStyles ? edgeStyleKey(e) : '';
-    return [endpoint(outgoing, e.from, faces[i][0], style, e.to),
-      endpoint(incoming, e.to, faces[i][1], style, e.from)];
-  });
-  const port = (node, key, side) => {
+  const port = (node, side, role, style) => {
     if (!ports.has(node)) ports.set(node, new Map());
     const list = ports.get(node);
+    const key = JSON.stringify([side, role, style]);
     if (!list.has(key)) {
       let id;
       do { id = 'port:' + nextPort++; } while (nodeIds.has(id));
@@ -36,11 +25,9 @@ function fixedPorts(nodes, edges, faces, separateStyles) {
     }
     return list.get(key).id;
   };
-  const pairs = ends.map(([source, target], i) => {
-    const e = edges[i];
-    const split = outgoing.get(source).size > 1 && incoming.get(target).size > 1;
-    return [port(e.from, source, faces[i][0]),
-      port(e.to, split ? target + ':from:' + source : target + ':in', faces[i][1])];
+  const pairs = edges.map((e, i) => {
+    const style = separateStyles ? edgeStyleKey(e) : '';
+    return [port(e.from, faces[i][0], 'out', style), port(e.to, faces[i][1], 'in', style)];
   });
   return { ports, pairs };
 }

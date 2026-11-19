@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { launchServer } from '../scripts/lib/server.mjs';
-import { layoutElk } from '../src/core/layout-elk.js';
-import { pathCrossesBody, routeOverlapConflicts } from '../src/core/routing.js';
+import { graphOf, layoutElk } from '../src/core/layout-elk.js';
+import { routeLengthAndCrossings } from '../src/core/layout-metrics.js';
+import { pathCrossesBody } from '../src/core/routing.js';
 
-test('多个调用方分别调用多个目标时，只共享有归属的干线，调用行仍可独立选择', async () => {
+test('多个调用方调用同一批目标时共用干线，所有调用记录及端点仍完整', async () => {
   const nodes = ['a', 'b', 'x', 'y'].map((id) => ({ id, name: id, file: 'dispatch.c' }));
   const edges = ['a', 'b'].flatMap((from) => ['x', 'y'].map((to) => ({ from, to, kind: 'direct' })));
   edges.push({ from: 'a', to: 'x', kind: 'fnptr' });
@@ -12,7 +13,9 @@ test('多个调用方分别调用多个目标时，只共享有归属的干线�
   for (const group of [true, false]) {
     const view = await layoutElk(nodes, edges, { group });
     assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
-    assert.equal(routeOverlapConflicts(view.edges).length, 0);
+    const metrics = routeLengthAndCrossings(view.edges);
+    assert.ok(metrics.length < metrics.rawLength, '画面实际占线长度小于分别铺线');
+    assert.ok(metrics.overlapLength > 0, '不同调用方到不同目标的同型调用也能共用中间线段');
     assert.deepEqual(view.edges[0].points, view.edges.at(-1).points, '同端点同线型的调用保留同一条路径');
     for (const e of view.edges) {
       assert.ok(!view.nodes.some((n) => pathCrossesBody(e.points, n)));
@@ -24,6 +27,34 @@ test('多个调用方分别调用多个目标时，只共享有归属的干线�
       }
     }
   }
+});
+
+test('密集跨文件调用共用收发通道，并保留不同线型、方向及递归', async () => {
+  const nodes = Array.from({ length: 24 }, (_, i) => ({ id: 'f' + i, file: 'layer' + Math.floor(i / 8) + '.c' }));
+  nodes.push({ id: 'state', kind: 'var', file: 'layer1.c' });
+  const edges = [];
+  for (let i = 0; i < 16; i++) for (const d of [0, 1, 3]) {
+    const to = 8 * (1 + Math.floor(i / 8)) + (i + d) % 8;
+    edges.push({ from: 'f' + i, to: 'f' + to, kind: d === 3 ? 'fnptr' : 'direct', line: 10 + d });
+  }
+  edges.push({ from: 'f0', to: 'f8', kind: 'direct', change: 'added', line: 20 },
+    { from: 'f8', to: 'state', kind: 'var', line: 21 }, { from: 'f9', to: 'state', kind: 'var', line: 22 },
+    { from: 'f16', to: 'f8', kind: 'fnptr', line: 23 }, { from: 'f10', to: 'f10', kind: 'direct', line: 24 });
+  const faces = edges.map(() => ['EAST', 'WEST']);
+  faces[edges.findIndex((e) => e.line === 23)][0] = 'WEST';
+  const ports = graphOf(nodes, edges, 'RIGHT', faces, true).edges;
+  const port = (from, line) => ports[edges.findIndex((e) => e.from === from && e.line === line)];
+  assert.equal(port('f0', 10).sources[0], port('f0', 13).sources[0], '普通调用与函数指针同型');
+  assert.equal(port('f0', 10).targets[0], port('f7', 11).targets[0], '两个调用方可在同一目标汇合');
+  assert.notEqual(port('f0', 10).sources[0], port('f0', 20).sources[0], '变更颜色有独立端口');
+  assert.notEqual(port('f8', 10).sources[0], port('f8', 21).sources[0], '同面的变量虚线有独立端口');
+  assert.notEqual(port('f8', 10).targets[0], port('f16', 23).sources[0], '同一面接收与发出仍有方向');
+  const view = await layoutElk(nodes, edges);
+  assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
+  const m = routeLengthAndCrossings(view.edges);
+  assert.ok(m.length * 2 < m.rawLength, '大部分可见线段应当合并');
+  assert.ok(m.crossings < edges.length, '多对多调用不能因分道而成倍增加可见交叉');
+  assert.ok(view.edges.every((e) => view.nodes.every((n) => !pathCrossesBody(e.points, n))));
 });
 
 test('默认只使用 ELK：旧模式和坐标不覆盖布局，手工关系参与排版', async (t) => {
