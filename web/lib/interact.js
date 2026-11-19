@@ -84,22 +84,54 @@ function hitTitle(e) {
   return null;
 }
 
-function hitEdge(e) {
-  if (!state.view) return null;
+function hitEdges(e) {
+  if (!state.view) return [];
   const p = worldPos(e);
-  let best = null;
-  let bestD = 9 / cam.k;
+  const radius = 9 / cam.k, tie = 0.5 / cam.k;
+  let nearest = radius;
+  const hits = [];
   for (const edge of state.view.edges) {
     const pts = edgePoints(edge);
+    let distance = Infinity;
+    const limit = Math.min(radius, nearest + tie);
     for (let i = 0; i < pts.length - 1; i++) {
-      const d = distToSegment(p, pts[i], pts[i + 1]);
-      if (d < bestD || d === bestD && edge === state.selectedEdge) {
-        bestD = d;
-        best = edge;
-      }
+      const a = pts[i], b = pts[i + 1];
+      if (p.x < Math.min(a[0], b[0]) - limit || p.x > Math.max(a[0], b[0]) + limit ||
+          p.y < Math.min(a[1], b[1]) - limit || p.y > Math.max(a[1], b[1]) + limit) continue;
+      distance = Math.min(distance, distToSegment(p, a, b));
+      if (!distance) break;
     }
+    if (distance > limit) continue;
+    hits.push({ edge, distance });
+    nearest = Math.min(nearest, distance);
   }
-  return best;
+  return hits.filter((hit) => hit.distance <= nearest + tie).map((hit) => hit.edge);
+}
+
+function hitEdge(e) {
+  const hits = hitEdges(e);
+  return hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0] || null;
+}
+
+function pickEdgeAt(e, onPick, useSelection = false) {
+  const view = state.view, hits = hitEdges(e);
+  if (!hits.length) return false;
+  if (useSelection && hits.includes(state.selectedEdge)) onPick(state.selectedEdge);
+  else if (hits.length === 1) onPick(hits[0]);
+  else {
+    const kinds = { direct: '函数调用', fnptr: '函数指针', macro: '宏调用', manual: '手工连接',
+      var: '变量访问', 'df-read': '读取变量', 'df-write': '写入变量' };
+    const items = hits.map((edge) => ({
+      value: edge,
+      label: [edge.from + ' → ' + edge.to, kinds[edge.kind] || edge.kind,
+        edge.line > 0 && 'L' + edge.line, edge.change && edge.change !== 'existing' && statusLabel(edge.change)].filter(Boolean).join(' · '),
+    }));
+    els.tooltip.style.opacity = '0';
+    showMenu(e.clientX + 8, e.clientY + 8, t('edge.chooseAtPoint', { n: hits.length }), items, state.selectedEdge,
+      (edge) => { if (state.view === view && view.edges.includes(edge)) onPick(edge); });
+    els.ctxMenu.querySelector('button')?.focus({ preventScroll: true });
+  }
+  return true;
 }
 
 /** 双击解锁后，整段连线都可拖动，不局限于控制点附近。 */
@@ -177,6 +209,7 @@ const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
 function selectEdge(edge) {
+  if (state.pairFlow) clearPairFlow();
   state.moveTarget = null;
   state.multiSelection = null;
   state.selected = null;
@@ -265,14 +298,12 @@ els.cv.addEventListener('contextmenu', (e) => {
     return;
   }
 
-  const edge = hitEdge(e);
-  if (edge) {
+  if (pickEdgeAt(e, (edge) => {
     selectEdge(edge);
     showMenu(e.clientX, e.clientY, t('menu.edge'), state.view?.comparison ? [{ value: 'auto', label: 'status.auto' }, ...EDGE_ITEMS] : EDGE_ITEMS, state.view?.comparison && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
-    return;
-  }
+  }, true)) return;
 
   // 文件框 / 目录容器：定位到当前文件或当前目录
   const box = hitBox(e);
@@ -409,8 +440,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  const edge = hitEdge(e);
-  if (edge) { selectEdge(edge); return; }
+  if (pickEdgeAt(e, selectEdge)) return;
   state.moveTarget = null;
   state.panning = true;
   state.panMoved = false;
@@ -510,7 +540,8 @@ els.cv.addEventListener('pointermove', (e) => {
     draw();
   }
   const title = next ? null : hitTitle(e);
-  const hoveredEdge = !n && !title ? hitEdge(e) : null;
+  const hits = !n && !title ? hitEdges(e) : [];
+  const hoveredEdge = hits[0];
   let cursor = title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
     : n ? (moveReady('node', n) ? 'move' : 'pointer') : hoveredEdge ? 'pointer' : '';
 
@@ -535,8 +566,9 @@ els.cv.addEventListener('pointermove', (e) => {
     els.tooltip.innerHTML = n
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
+      : hits.length > 1 ? esc(t('edge.chooseAtPoint', { n: hits.length }))
       : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
-    if (n || hoveredEdge) {
+    if (n || hits.length === 1) {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
     }
@@ -623,10 +655,7 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (panning) {
     if (!panMoved) {
-      const edge = hitEdge(e);
-      if (edge) {
-        selectEdge(edge);
-      } else {
+      if (!pickEdgeAt(e, selectEdge)) {
         state.selectedEdge = null;
         state.selectedLabel = null;
         selectNode(null); // 内部会收起节点详情并刷新标签面板
@@ -732,12 +761,12 @@ els.cv.addEventListener('dblclick', (e) => {
     draw();
     return;
   }
-  const edge = hitEdge(e);
-  if (edge) {
+  hideMenu();
+  pickEdgeAt(e, (edge) => {
     selectEdge(edge);
     if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };
     draw();
-  }
+  }, true);
 });
 
 els.cv.addEventListener(

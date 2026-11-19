@@ -2,7 +2,7 @@ import { state, edgeKey, esc } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { draw } from './render.js';
-import { fullReroute } from './geometry.js';
+import { improveEdgeRoutes, mergeSharedRoutes } from '/core/layout-metrics.js';
 import { pushHistory } from './history.js';
 
 export const STATUS_LABELS = { existing: '未修改', modified: '修改', added: '新增', deleted: '删除' };
@@ -39,14 +39,20 @@ export async function setStatus(target, value, isEdge = false) {
   writes = pending.catch(() => {});
   const result = await pending;
   if (!result?.ok || state.view !== view) return result;
-  const current = isEdge ? view.edges.find((e) => statusKey(e) === key) : view.nodes.find((n) => n.id === key);
+  const current = isEdge ? (view.edges.includes(target) ? target : view.edges.find((e) => statusKey(e) === key))
+    : view.nodes.find((n) => n.id === key);
   if (!current) return result;
+  const priorChange = current.change;
   if (comparing) {
     Object.assign(current, { change: result.target.change, detectedChange: result.target.detectedChange, statusSource: result.target.statusSource });
     view.comparison = { ...view.comparison, ...result.comparison };
     hooks.syncComparison(view.comparison);
   } else { current.change = change || 'existing'; if (!isEdge) delete current.color; }
-  if (isEdge) fullReroute();
+  if (isEdge && current.change !== priorChange) {
+    // 单条边换色只需要检查它与现有干线的遮盖，其他调用继续沿用原路径。
+    improveEdgeRoutes(view, [current], () => false);
+    mergeSharedRoutes(view, [current]);
+  }
   draw();
   pushHistory();
   if (!isEdge && state.selected === current.id) hooks.renderDetail(current.id);

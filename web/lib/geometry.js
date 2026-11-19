@@ -93,7 +93,8 @@ function edgePoints(e) {
 function rerouteScope(subset, preservePaths = false) {
   const v = state.view;
   if (!v || !subset.length) return;
-  const others = v.edges.filter((e) => !subset.includes(e));
+  const affected = new Set(subset);
+  const others = v.edges.filter((e) => !affected.has(e));
   routeEdges(v.nodes, subset, { existing: collectSegments(others), preservePaths });
 }
 
@@ -115,7 +116,7 @@ function fullReroute(movedIds = null) {
       pathBlockedByNodes(e.points, moved, new Set([e.from, e.to])));
     rerouteScope(affected, true);
     // 松手后尝试重新选面，只替换确实更好的边界连线；手工折线和指定端口不改。
-    improveEdgeRoutes(v, v.edges.filter((e) => movedIds.has(e.from) !== movedIds.has(e.to)));
+    improveEdgeRoutes(v, affected, (e) => movedIds.has(e.from) !== movedIds.has(e.to));
   } else {
     routeEdges(v.nodes, v.edges, { bounds: { minX: 40, maxX: Math.max(v.width, 600) } });
   }
