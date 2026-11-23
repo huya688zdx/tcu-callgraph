@@ -117,7 +117,7 @@ export function improveEdgeRoutes(view, subset, simplify = () => true) {
   const ranked = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2)
     .map((edge) => ({ edge, overlap: byEdge.get(edge) || 0, detour: detour(edge) }))
     .filter(({ edge, overlap, detour }) => overlap || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))
-    .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour).slice(0, 6);
+    .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour).slice(0, 12);
   if (!ranked.length) return;
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
@@ -174,7 +174,7 @@ function joinsBranch(q, j, p, i, axis, coord) {
   });
 }
 
-/** 汇合同端点分支，并吸附同样式的平行走廊。 */
+/** 汇合同端点分支，消除容器壁冗余折返，并吸附同样式的平行走廊。 */
 export function mergeSharedRoutes(view, subset = view.edges) {
   const affected = new Set(subset), nodes = new Map(view.nodes.map((n) => [n.id, n]));
   if (!affected.size) return;
@@ -202,6 +202,49 @@ export function mergeSharedRoutes(view, subset = view.edges) {
       });
     };
   };
+
+  // 先消除 ELK 跨容器边界产生的阶梯折弯与 U 型回头弯，拉直后再做干线汇流。
+  const straighten = () => {
+    for (const edge of automatic) {
+      if (!affected.has(edge) || edge.points.length < 4) continue;
+      let changed = true;
+      while (changed && edge.points.length >= 4) {
+        changed = false;
+        const pts = edge.points;
+        const origLen = length(pts);
+        const conflicts = addsConflict(edge);
+        for (let i = 0; i <= pts.length - 4; i++) {
+          const a = pts[i], b = pts[i + 1], c = pts[i + 2], d = pts[i + 3];
+          const h1 = Math.abs(a[1] - b[1]) < 0.5, h2 = Math.abs(b[1] - c[1]) < 0.5, h3 = Math.abs(c[1] - d[1]) < 0.5;
+          if (h1 !== h3 || h1 === h2) continue;
+          const cands = [];
+          if (i + 3 < pts.length - 1) {
+            const m1 = h1 ? [d[0], a[1]] : [a[0], d[1]];
+            cands.push(collapse([...pts.slice(0, i + 1), m1, ...pts.slice(i + 3)]));
+          }
+          if (i > 0) {
+            const m2 = h1 ? [a[0], d[1]] : [d[0], a[1]];
+            cands.push(collapse([...pts.slice(0, i + 1), m2, ...pts.slice(i + 3)]));
+          }
+          for (const cand of cands) {
+            if (cand.length >= pts.length || cand.length < 2) continue;
+            if (!samePoint(cand[0], pts[0]) || !samePoint(cand.at(-1), pts.at(-1))) continue;
+            if (cand.some((pt, idx) => idx > 0 && segmentAxis(cand[idx - 1], pt) < 0)) continue;
+            if (length(cand) > origLen + 0.5 || !clearsNodes(edge, cand) || conflicts(cand)) continue;
+            edge.points = cand;
+            bounds.set(edge, routeBounds(cand));
+            viewCost = undefined;
+            changed = true;
+            break;
+          }
+          if (changed) break;
+        }
+      }
+    }
+  };
+
+  straighten();
+
   for (const role of ['from', 'to']) {
     const groups = new Map();
     for (const e of automatic) {
@@ -260,7 +303,7 @@ export function mergeSharedRoutes(view, subset = view.edges) {
     if (!corridors.has(style)) corridors.set(style, []);
     corridors.get(style).push(edge);
   }
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < 3; pass++) {
     let changed = false;
     for (const edges of corridors.values()) for (const edge of edges) {
       if (!affected.has(edge) || edge.points.length < 4) continue;
@@ -275,13 +318,13 @@ export function mergeSharedRoutes(view, subset = view.edges) {
         const coords = new Set();
         let best = null, bestCost = Infinity;
         for (const donor of edges) {
-          if (donor === edge || donor.points.length < 3 || !boundsMeet(bounds.get(edge), bounds.get(donor), 65)) continue;
+          if (donor === edge || donor.points.length < 3 || !boundsMeet(bounds.get(edge), bounds.get(donor), 97)) continue;
           const p = donor.points;
           const sameStart = p.length >= 4 && samePoint(q[0], p[0]);
           const sameEnd = p.length >= 4 && samePoint(q.at(-1), p.at(-1));
           for (let i = 0; i < p.length - 1; i++) {
             const coord = p[i][normal], distance = Math.abs(coord - q[j][normal]);
-            if (distance <= 0.5 || distance > 64 || coords.has(coord) || segmentAxis(p[i], p[i + 1]) !== axis) continue;
+            if (distance <= 0.5 || distance > 96 || coords.has(coord) || segmentAxis(p[i], p[i + 1]) !== axis) continue;
             const overlap = Math.min(hi, Math.max(p[i][axis], p[i + 1][axis])) -
               Math.max(lo, Math.min(p[i][axis], p[i + 1][axis]));
             const portBend = (sameStart && j === 1 && i === 1) ||

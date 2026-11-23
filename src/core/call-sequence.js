@@ -53,14 +53,23 @@ export function callSequence(model, id) {
   return groups;
 }
 
-export function callNumbers(groups) {
+/**
+ * 按同一调用者内各被调函数首次出现的位置连续编号（1..K）。
+ * - 重复调用只记录第一次出现，不额外占号，也不追加重复序号；
+ * - 若传入 visibleTargets（当前画布中的节点集合），只对画布中可见的被调函数编号。
+ */
+export function callNumbers(groups, visibleTargets = null) {
   const byTarget = new Map();
-  if (!groups.length || groups.length === 1 && groups[0].length === 1) return byTarget;
-  groups.forEach((calls, i) => {
-    for (const to of new Set(calls.map(c => c.to))) {
-      if (!byTarget.has(to)) byTarget.set(to, []);
-      byTarget.get(to).push(String(i + 1) + (calls.length > 1 ? '*' : ''));
+  if (!groups.length) return byTarget;
+  for (const calls of groups) {
+    if (!calls) continue;
+    for (const { to } of calls) {
+      if (visibleTargets && !visibleTargets.has(to)) continue;
+      if (!byTarget.has(to)) {
+        byTarget.set(to, [String(byTarget.size + 1)]);
+      }
     }
-  });
+  }
+  if (byTarget.size < 2) byTarget.clear();
   return byTarget;
 }

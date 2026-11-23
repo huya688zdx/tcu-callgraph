@@ -95,10 +95,11 @@ async function layoutForExport(model, { root, ...opts }) {
   const functions = model.functions.some(n => n.kind !== 'var' && !n.headerSymbol && !n.taskPeriods)
     ? withTaskPeriods(model.functions, model).map((n, i) => model.functions[i].taskPeriods ? model.functions[i] : n)
     : model.functions;
+  const visibleNodes = new Set(functions.map((n) => n.id));
   const orders = new Map();
   const edges = model.edges.map(e => {
     if (Object.hasOwn(e, 'callNumbers') || e.headerReference || !['direct', 'macro', 'fnptr'].includes(e.kind)) return e;
-    if (!orders.has(e.from)) orders.set(e.from, callNumbers(callSequence(model, e.from)));
+    if (!orders.has(e.from)) orders.set(e.from, callNumbers(callSequence(model, e.from), visibleNodes));
     return { ...e, callNumbers: orders.get(e.from).get(e.to) };
   });
   return { ...await layoutElk(functions, edges, { group: false, ...opts }), root };

@@ -5,7 +5,7 @@ import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal } from './modal.js';
 import { edgeLabels, makeLabel, applyLabels } from './edge-labels.js';
-import { LABELS_MAX } from '/core/labels.js';
+import { LABELS_MAX, LABEL_PRESETS, visibleCallOrderMap } from '/core/labels.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 
@@ -22,30 +22,39 @@ function syncConfirm() {
 }
 
 export async function findCallOrder(fnId) {
-  if (!modal) return;
+  if (!modal || !state.view) return;
   const seq = ++sequence;
-  const projectId = state.view?.projectId;
+  const view = state.view;
+  const projectId = view.projectId;
   pending = null;
   confirm.disabled = true;
   message.textContent = '';
   body.innerHTML = `<div class="empty">${t('callOrder.loading')}</div>`;
   openModal('callOrderModal');
   try {
-    const [result, preview] = await Promise.all([
-      api.detectTasks(fnId),
-      api.view({ roots: [fnId], up: 0, down: 1, group: false, at: state.at }),
-    ]);
-    if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;
-    if (!result?.ok || !preview.edges) throw new Error(result?.error || preview.error || t('callOrder.failed'));
-    const byKey = new Map(preview.edges.map((e) => [edgeKey(e), e]));
-    const nodes = new Map(preview.nodes.map((n) => [n.id, n]));
+    const nodes = new Map(view.nodes.map((n) => [n.id, n]));
     const source = nodes.get(fnId);
-    const rows = result.suggestions.filter((s) => s.kind === 'call').map((s) => ({ suggestion: s, edge: byKey.get(s.edgeKey) }));
+    // 只对当前画布上可见的被调函数排序，且重复调用只表现第一次（编号 1..K）。
+    const visibleOrders = visibleCallOrderMap(view, fnId);
+    const rows = [...visibleOrders.values()].map(({ order, edge }) => ({
+      suggestion: {
+        kind: 'call',
+        preset: 'call',
+        edgeKey: edgeKey(edge),
+        from: edge.from,
+        to: edge.to,
+        line: edge.line,
+        text: `${LABEL_PRESETS.call.text}${order}`,
+        evidence: `${source?.file || ''}:${edge.line} · 图中首次调用顺序 ${order}`,
+      },
+      edge,
+    }));
+    if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;
     pending = { projectId, fnId, rows };
     const items = rows.map(({ suggestion: s, edge }, index) => {
       const labels = edgeLabels(edge);
       const previous = labels.find((l) => l.preset === 'call');
-      const disabled = !edge || !previous && labels.length >= LABELS_MAX;
+      const disabled = !edge || (!previous && labels.length >= LABELS_MAX);
       const status = !edge ? 'callOrder.unavailable' : disabled ? 'callOrder.full' : previous ? 'callOrder.marked' : null;
       return `<label class="call-order-row${disabled ? ' unavailable' : ''}" title="${esc(s.evidence)}">
         <input type="checkbox" data-index="${index}" ${disabled ? 'disabled' : 'checked'}>
@@ -54,9 +63,8 @@ export async function findCallOrder(fnId) {
         <span class="call-order-status">${status ? t(status) : ''}</span>
       </label>`;
     }).join('');
-    const warnings = (result.skipped || []).map((s) => `<p class="detail-meta">${esc(s.reason)}</p>`).join('');
     body.innerHTML = `<div class="detail-title">${esc(source?.name || fnId.split('::').pop())}</div>
-      ${items ? `<p class="detail-meta">${t('callOrder.hint')}</p>${items}` : warnings || `<div class="empty">${t('callOrder.empty')}</div>`}`;
+      ${items ? `<p class="detail-meta">仅按当前画布中可见的被调函数首次调用顺序编号（1..${rows.length}）</p>${items}` : `<div class="empty">${t('callOrder.empty')}</div>`}`;
     syncConfirm();
   } catch (error) {
     if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;

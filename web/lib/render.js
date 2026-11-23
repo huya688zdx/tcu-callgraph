@@ -8,21 +8,25 @@ import { isDataEdge, edgeDirection } from './edge-flow.js';
 import { periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
-import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
+import { flowPulseColor, mergeFlowStreams } from './flow-geometry.js';
 
 // 选中动画使用独立画布，箭头和虚线移动时保留主画布上的文字、标签与连线。
 let animationFrame = 0;
+let lastEffectPaint = 0;
 let recentTimer = 0;
 let collectingEffects = false;
 let effects = [];
+let rawFlowStreams = [];
 let effectCamera = null;
 let panOrigin = null;
-const effectRects = [];
+let effectDirty = null;
+const EFFECT_FRAME_MS = 32; // 约 30fps，流动平滑且核显占用极低
 const RECENT_HIGHLIGHT_MS = 2600;
 const RECENT_RIPPLE_MS = 850;
 const RECENT_COLOR = '#0284C7';
-const scene = document.createElement('canvas');
-const sceneCtx = scene.getContext('2d');
+const SELECTED_EDGE_COLOR = '#0284C7';
+const DIM_EDGE_COLOR = '#D6D4CC';
+const DIM_ADDED_COLOR = '#F0C2C6';
 const effectCanvas = document.createElement('canvas');
 effectCanvas.id = 'cvEffects';
 effectCanvas.setAttribute('aria-hidden', 'true');
@@ -33,14 +37,18 @@ effectCanvas.width = effectCanvas.height = 0;
 const effectCtx = effectCanvas.getContext('2d');
 const nodeNames = new WeakMap();
 
-function sizeScene(canvas) {
-  if (scene.width === canvas.width && scene.height === canvas.height) return;
-  scene.width = canvas.width;
-  scene.height = canvas.height;
-}
-
-function releaseScene() {
-  if (scene.width || scene.height) scene.width = scene.height = 0;
+function markDirtyPixels(x0, y0, x1, y1) {
+  const ix0 = Math.max(0, Math.floor(x0)), iy0 = Math.max(0, Math.floor(y0));
+  const ix1 = Math.min(effectCanvas.width, Math.ceil(x1)), iy1 = Math.min(effectCanvas.height, Math.ceil(y1));
+  if (ix1 <= ix0 || iy1 <= iy0) return;
+  if (!effectDirty) {
+    effectDirty = { x0: ix0, y0: iy0, x1: ix1, y1: iy1 };
+  } else {
+    if (ix0 < effectDirty.x0) effectDirty.x0 = ix0;
+    if (iy0 < effectDirty.y0) effectDirty.y0 = iy0;
+    if (ix1 > effectDirty.x1) effectDirty.x1 = ix1;
+    if (iy1 > effectDirty.y1) effectDirty.y1 = iy1;
+  }
 }
 
 function viewport(width, height) {
@@ -121,7 +129,9 @@ function scheduleDraw() {
   if (animationFrame || document.hidden || (!effects.length && !state.flash)) return;
   animationFrame = requestAnimationFrame((now) => {
     animationFrame = 0;
-    drawEffects(now);
+    if (now - lastEffectPaint >= EFFECT_FRAME_MS) {
+      drawEffects(now);
+    }
     scheduleDraw();
   });
 }
@@ -132,7 +142,7 @@ function recordBoxEffect(box, dash, width, radius = 8, color = THEME.node.select
 
 function markEffectArea(box, padding) {
   const rect = screenRect(box, padding, effectCamera, effectCamera.dpr);
-  if (rect) effectRects.push(rect);
+  if (rect) markDirtyPixels(rect.x, rect.y, rect.right, rect.bottom);
 }
 
 function markEffectOutline({ x, y, w, h }, radius, padding) {
@@ -147,7 +157,7 @@ function releaseEffectCanvas() {
   if (!effectCanvas.width) return;
   effectCanvas.remove();
   effectCanvas.width = effectCanvas.height = 0;
-  effectRects.length = 0;
+  effectDirty = null;
 }
 
 function compositeEffects(ctx) {
@@ -155,6 +165,7 @@ function compositeEffects(ctx) {
 }
 
 function drawEffects(now) {
+  lastEffectPaint = now;
   if (state.flash && now >= state.flash.until) state.flash = null;
   if (now >= (state.recent?.rippleUntil ?? 0) && effects.some((effect) => effect.kind === 'ripple')) {
     effects = effects.filter((effect) => effect.kind !== 'ripple');
@@ -164,13 +175,16 @@ function drawEffects(now) {
   if (effectCanvas.width !== cv.width || effectCanvas.height !== cv.height) {
     effectCanvas.width = cv.width;
     effectCanvas.height = cv.height;
-    effectRects.length = 0;
+    effectDirty = null;
   }
   if (!effectCanvas.isConnected) cv.after(effectCanvas);
   const ctx = effectCtx, c = effectCamera;
-  // 基础画布保留连线和文字。每帧只擦除上次绘制的特效区域。
-  for (const { x, y, right, bottom } of effectRects) ctx.clearRect(x, y, right - x, bottom - y);
-  effectRects.length = 0;
+  // 每帧仅调用一次 clearRect 擦除上一帧的合并脏矩形，避免数百次 GPU clear 调用。
+  if (effectDirty) {
+    ctx.clearRect(effectDirty.x0, effectDirty.y0, effectDirty.x1 - effectDirty.x0, effectDirty.y1 - effectDirty.y0);
+    effectDirty = null;
+  }
+  const W = cv.width / c.dpr, H = cv.height / c.dpr;
   ctx.save();
   ctx.setTransform(c.dpr, 0, 0, c.dpr, 0, 0);
   ctx.translate(c.x, c.y);
@@ -184,7 +198,12 @@ function drawEffects(now) {
     ctx.lineWidth = 3 / c.k;
     ctx.stroke();
   }
+  const streams = [];
   for (const effect of effects) {
+    if (effect.kind === 'stream') {
+      streams.push(effect);
+      continue;
+    }
     ctx.save();
     if (effect.kind === 'ripple') {
       const p = Math.min(1, Math.max(0, (now - effect.started) / effect.dur));
@@ -205,38 +224,78 @@ function drawEffects(now) {
       ctx.setLineDash(effect.dash);
       ctx.lineDashOffset = -now * 0.024 / c.k;
       ctx.stroke();
-    } else {
-      ctx.fillStyle = effect.color || flowPulseColor(THEME.node.selected);
-      const path = effect.path;
-      if (!path.length) { ctx.restore(); continue; }
-      const scale = Math.min(1, 1 / c.k);
-      const spacing = Math.min(Math.max(90, 20 / c.k), path.length);
-      // 所有连线每秒前进 80 个画布单位，长线只增加标记数量。
-      for (let distance = (now * 0.08) % spacing; distance < path.length; distance += spacing) {
-        const [x, y, dx, dy] = flowPointAt(path, distance);
-        if (x < c.area.left || x > c.area.right || y < c.area.top || y > c.area.bottom) continue;
-        ctx.save();
-        // 固定放在前进方向右侧，相向重合时各走一侧。
-        const mx = x - dy * 5 * scale, my = y + dx * 5 * scale;
-        markEffectArea({ x: mx, y: my, w: 0, h: 0 }, 9 * c.k * scale + 2);
-        ctx.translate(mx, my);
-        ctx.rotate(Math.atan2(dy, dx));
-        ctx.scale(scale, scale);
-        ctx.beginPath();
-        ctx.moveTo(5, 0);
-        ctx.lineTo(-3, -3);
-        ctx.lineTo(-1, 0);
-        ctx.lineTo(-3, 3);
-        ctx.closePath();
-        ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 2; ctx.stroke();
-        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1; ctx.stroke();
-        ctx.fill();
-        ctx.restore();
-      }
     }
     ctx.restore();
   }
   ctx.restore();
+
+  // 屏幕像素空间批量绘制线上数据流脉冲：
+  // 1. 脉冲严格居中贴合在线上（仅双向读写边微偏 2.5px 分道）；
+  // 2. 间距按屏幕像素固定（88px），缩小时屏幕线段变短，粒子数自动减少，绝不越缩越密；
+  // 3. 同一颜色合并为单次 Path2D 批处理绘制，无逐粒子 save/rotate/scale，核显零压力。
+  if (streams.length) {
+    ctx.save();
+    ctx.setTransform(c.dpr, 0, 0, c.dpr, 0, 0);
+    const spacingPx = 88;
+    const speedPx = 68;
+    const travelPx = (now * 0.001 * speedPx) % spacingPx;
+    let totalPulses = 0;
+    const MAX_PULSES = 56;
+    for (const stream of streams) {
+      if (totalPulses >= MAX_PULSES) break;
+      const tailPath = new Path2D();
+      const headPath = new Path2D();
+      let count = 0;
+      for (const seg of stream.segments) {
+        if (totalPulses >= MAX_PULSES) break;
+        const lenPx = seg.size * c.k;
+        if (lenPx < 20) continue;
+        const nOff = seg.offset || 0;
+        const sx0 = seg.x * c.k + c.x - seg.dy * nOff;
+        const sy0 = seg.y * c.k + c.y + seg.dx * nOff;
+        const sx1 = sx0 + seg.dx * lenPx;
+        const sy1 = sy0 + seg.dy * lenPx;
+        if (Math.max(sx0, sx1) < -16 || Math.min(sx0, sx1) > W + 16 ||
+            Math.max(sy0, sy1) < -16 || Math.min(sy0, sy1) > H + 16) continue;
+        const phasePx = ((seg.phase * c.k) % spacingPx + spacingPx) % spacingPx;
+        let dPx = (travelPx - phasePx + spacingPx) % spacingPx;
+        if (dPx < 8) dPx += spacingPx;
+        for (; dPx <= lenPx - 8 && totalPulses < MAX_PULSES; dPx += spacingPx) {
+          const hx = sx0 + seg.dx * dPx;
+          const hy = sy0 + seg.dy * dPx;
+          if (hx < -12 || hx > W + 12 || hy < -12 || hy > H + 12) continue;
+          const tailLen = Math.min(16, dPx - 4);
+          if (tailLen > 3) {
+            tailPath.moveTo(hx - seg.dx * tailLen, hy - seg.dy * tailLen);
+            tailPath.lineTo(hx - seg.dx * 1.5, hy - seg.dy * 1.5);
+          }
+          // 紧贴连线中心的流线型箭头
+          headPath.moveTo(hx + seg.dx * 5.2, hy + seg.dy * 5.2);
+          headPath.lineTo(hx - seg.dx * 3.6 + seg.dy * 3.4, hy - seg.dy * 3.6 - seg.dx * 3.4);
+          headPath.lineTo(hx - seg.dx * 1.3, hy - seg.dy * 1.3);
+          headPath.lineTo(hx - seg.dx * 3.6 - seg.dy * 3.4, hy - seg.dy * 3.6 + seg.dx * 3.4);
+          headPath.closePath();
+          const pad = (tailLen + 8) * c.dpr;
+          markDirtyPixels(hx * c.dpr - pad, hy * c.dpr - pad, hx * c.dpr + pad, hy * c.dpr + pad);
+          count++;
+          totalPulses++;
+        }
+      }
+      if (count) {
+        ctx.strokeStyle = stream.tailColor;
+        ctx.lineWidth = 3.2;
+        ctx.lineCap = 'round';
+        ctx.stroke(tailPath);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+        ctx.lineWidth = 2.2;
+        ctx.lineJoin = 'round';
+        ctx.stroke(headPath);
+        ctx.fillStyle = stream.color;
+        ctx.fill(headPath);
+      }
+    }
+    ctx.restore();
+  }
 }
 
 function syncCanvasSize() {
@@ -321,6 +380,7 @@ function draw({ geometryUnchanged = false } = {}) {
   cancelAnimationFrame(animationFrame);
   animationFrame = 0;
   effects = [];
+  rawFlowStreams = [];
   collectingEffects = false;
   const { ctx, cv } = els;
   if (panOrigin) {
@@ -328,7 +388,7 @@ function draw({ geometryUnchanged = false } = {}) {
     cv.style.clipPath = '';
     cv.style.translate = effectCanvas.style.translate = '';
   }
-  if (!cv.width || !cv.height) { releaseScene(); releaseEffectCanvas(); return; }
+  if (!cv.width || !cv.height) { releaseEffectCanvas(); return; }
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
   const H = cv.height / dpr;
@@ -356,7 +416,6 @@ function draw({ geometryUnchanged = false } = {}) {
     v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
   );
   if (!v) {
-    releaseScene();
     releaseEffectCanvas();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
@@ -370,7 +429,6 @@ function draw({ geometryUnchanged = false } = {}) {
   ctx.scale(cam.k, cam.k);
 
   if (!v.nodes.length) {
-    releaseScene();
     releaseEffectCanvas();
     ctx.restore();
     ctx.fillStyle = '#B4B2A9';
@@ -400,34 +458,24 @@ function draw({ geometryUnchanged = false } = {}) {
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
-  const dim = focusedEdges.size || state.selected || selectedNodes?.size;
+  const dim = Boolean(focusedEdges.size || state.selected || selectedNodes?.size);
   const related = [];
-  if (dim) {
-    sizeScene(cv);
-    sceneCtx.clearRect(0, 0, cv.width, cv.height);
-    sceneCtx.save();
-    sceneCtx.setTransform(ctx.getTransform());
-  }
   for (const e of v.edges) {
     if (focusedEdges.has(e) || !pathVisible(edgePoints(e), area)) continue;
     if (!focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
       : state.selected && (e.from === state.selected || e.to === state.selected))) related.push(e);
-    else drawEdge(dim ? sceneCtx : ctx, e, false, false);
-  }
-  // 背景连线画完再整体淡化一次。数十条调用共线时，透明度不会叠加成一条黑线。
-  if (dim) {
-    sceneCtx.restore();
-    ctx.save();
-    ctx.resetTransform();
-    ctx.globalAlpha = focusedEdges.size ? 0.22 : 0.26;
-    ctx.drawImage(scene, 0, 0);
-    ctx.restore();
+    else drawEdge(ctx, e, false, false, null, false, dim);
   }
   for (const e of related) drawEdge(ctx, e, true, false);
   for (const e of focusedEdges) {
     if (!pathVisible(edgePoints(e), area)) continue;
     const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || state.multiSelection.trunk || e === focusedEdge;
     drawEdge(ctx, e, false, true, tracedColors.get(e), animated);
+  }
+  if (rawFlowStreams.length) {
+    for (const stream of mergeFlowStreams(rawFlowStreams)) {
+      effects.push({ kind: 'stream', ...stream });
+    }
   }
 
   if (state.linkFrom && state.linkPos) {
@@ -510,7 +558,6 @@ function draw({ geometryUnchanged = false } = {}) {
   ctx.textAlign = 'left';
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
   collectingEffects = false;
-  if (!dim) releaseScene();
   effectCamera = { ...cam, dpr, area };
   drawEffects(now);
   scheduleDraw();
@@ -581,16 +628,21 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-function drawEdge(ctx, e, related, selected, traceColor = null, animated = true) {
+function drawEdge(ctx, e, related, selected, traceColor = null, animated = true, dimmed = false) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  // 连线只按黑 / 红区分状态；选中只加粗，删除另在中央画 X。
-  const color = traceColor ? traceColor : e.change === 'added'
+  // 背景淡化连线直接使用不透明的预混浅色：共线几十条也不会叠加变深，且彻底省掉全屏离屏画布拷贝。
+  const baseColor = traceColor ? traceColor : e.change === 'added'
     ? THEME.edge.added
     : isDataEdge(e)
     ? THEME.edge.var
     : THEME.edge.call;
+  const color = dimmed
+    ? (e.change === 'added' ? DIM_ADDED_COLOR : DIM_EDGE_COLOR)
+    : selected && !traceColor && e.change !== 'added'
+    ? SELECTED_EDGE_COLOR
+    : baseColor;
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
@@ -600,32 +652,40 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
     ctx.lineWidth = Math.max(4.5, 3 / cam.k);
     ctx.stroke();
   }
-  if (traceColor) {
-    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 * Math.min(1, 1 / cam.k); ctx.globalAlpha = 0.9; ctx.stroke();
+  if (traceColor || selected) {
+    ctx.strokeStyle = traceColor ? '#FFFFFF' : hexToRgba(color, 0.18);
+    ctx.lineWidth = (traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
+    ctx.globalAlpha = traceColor ? 0.9 : 1;
+    ctx.stroke();
   }
 
   ctx.strokeStyle = color;
-  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.6 : related ? 2.4 : 1.4;
+  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.5 : related ? 2.2 : 1.4;
   ctx.globalAlpha = 1;
-  // 变量访问=虚线，函数调用=实线
-  if (isDataEdge(e)) ctx.setLineDash([7, 4]);
+  // 变量访问=虚线，函数调用=实线（极小缩放下的淡化背景线省去虚线切分以降低核显负载）
+  if (isDataEdge(e) && (!dimmed || cam.k >= 0.45)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
   const direction = edgeDirection(e);
+  const biOffset = direction === 'both' ? 2.5 : 0;
   const drawDirection = (a, b, reverse) => {
     if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
-      const path = flowPath(reverse ? pts.toReversed() : pts);
-      if (path.length) {
-        effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
-      }
+      const pulseColor = traceColor ? flowPulseColor(traceColor) : e.change === 'added' ? '#FF4D6D' : '#0284C7';
+      const tailColor = hexToRgba(pulseColor, 0.38);
+      rawFlowStreams.push({
+        pts: reverse ? pts.toReversed() : pts,
+        color: pulseColor,
+        tailColor,
+        offset: biOffset,
+      });
     }
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     const len = Math.hypot(dx, dy) || 1;
     dx /= len;
     dy /= len;
-    const s = 6;
+    const s = selected ? 6.8 : 6;
     ctx.beginPath();
     ctx.moveTo(b[0], b[1]);
     ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);

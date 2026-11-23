@@ -16,17 +16,9 @@ import { showExpansion, previewAddition } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
 async function loadStats() {
-  const d = await fetch('/api/stats?summary=1&tasks=1').then(res => res.json());
+  const d = await fetch('/api/stats?summary=1').then(res => res.json());
   const s = d.stats;
-  const tasks = d.tasks || [];
   const row = (label, val) => `<div class="stat-row"><span>${label}</span><span>${val}</span></div>`;
-  const taskList = tasks.length ? `<div class="task-list-head">周期任务入口 (${tasks.length})</div>
-    <ul class="task-list">${tasks.map(task => `<li class="task-row" data-task-id="${esc(task.id)}">
-      <button type="button" class="task-name" title="${esc(task.name)}">${esc(task.name)}</button>
-      <span class="chip">${esc(formatPeriod(task.us))}</span>
-      ${task.version ? `<small>${task.version === 'before' ? '修改前' : '修改后'}</small>` : ''}
-      ${addFunctionButton(task.id)}
-    </li>`).join('')}</ul>` : '<div class="detail-meta">未识别到显式周期 TASK 入口</div>';
   const metrics = [
     row(t('stat.edges'), s.edges),
     // 只有存在重复调用（同一对函数被调多次）时才显示，用来解释与边数的差额
@@ -40,7 +32,7 @@ async function loadStats() {
     (s.files > 1500
       ? `<div class="stat-row" style="color:#993C1D"><span>${t('stat.hintTitle')}</span><span>${t('stat.hintSlow')}</span></div>`
       : '');
-  els.stats.innerHTML = taskList + row('文件 / 函数 / 变量', `${s.files} / ${s.functions} / ${s.variables || 0}`) +
+  els.stats.innerHTML = row('文件 / 函数 / 变量', `${s.files} / ${s.functions} / ${s.variables || 0}`) +
     `<details class="stat-more"><summary>详细解析指标</summary>${metrics}</details>`;
 }
 
@@ -642,17 +634,10 @@ async function renderDetail(id) {
   if (my !== detailSeq) return; // 已经切到别的节点，丢弃这次的结果
   if (d.error) return;
   const n = state.view?.comparison ? { ...d.node, ...target } : d.node;
-  const subtitle = periodSubtitle(target);
-  const periodList = contexts => (contexts || []).map(c => `${c.task.split('::').pop()}(${formatPeriod(c.us)})`).join('、');
-  const currentPeriods = periodList(target.taskPeriods);
-  const previousPeriods = periodList(target.previousTaskPeriods);
 
   els.detail.innerHTML = `
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
-    ${subtitle ? `<div class="detail-period"><span class="chip">${esc(subtitle)}</span>
-      ${previousPeriods && previousPeriods !== currentPeriods ? `<small>修改前 ${esc(previousPeriods)}</small>` : ''}
-      ${currentPeriods ? `<small>${previousPeriods && previousPeriods !== currentPeriods ? '修改后 ' : ''}${esc(currentPeriods)}</small>` : ''}</div>` : ''}
     ${dataDirections}
     ${statusControl(target)}
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
@@ -677,9 +662,8 @@ async function renderDetail(id) {
     else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">${t('edge.chipFnptr')}${e.via ? ':' + esc(e.via) : ''}</span>`;
     else if (e.kind === 'manual') chip = `<span class="chip manual">${t('edge.chipManual')}</span>`;
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
-    const order = e.callNumbers?.length ? `<span class="chip">${esc(LABEL_PRESETS.call.text + e.callNumbers.join('、'))}</span>` : '';
     const status = e.change && e.change !== 'existing' ? ` · ${statusLabel(e.change)}` : '';
-    return `<div class="edge-item call-relation"><span>${dir === 'in' ? '←' : '→'} ${order}<b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
+    return `<div class="edge-item call-relation"><span>${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
   };
 
   els.edges.innerHTML =

@@ -124,19 +124,53 @@ export function normalizeLabels(raw) {
   return out;
 }
 
-export function displayEdgeLabels(edge, labels = [], viewOrCaller) {
-  if (!edge.callNumbers?.length || labels.some(l => l.preset === 'call')) return labels;
-  if (typeof viewOrCaller === 'string') {
-    if (edge.from !== viewOrCaller) return labels;
-  } else if (edge.from !== viewOrCaller?.root && edge.callNumbers.length === 1) {
-    const calls = viewOrCaller?.edges?.filter(e => e.from === edge.from &&
-      ['direct', 'macro', 'fnptr'].includes(e.kind));
-    if ((calls?.length || 0) < 2) return labels;
+/**
+ * 计算当前画布（view.edges / view.nodes）中某条调用边的可见コール順编号（1..K）。
+ * 规则：
+ * 1. 只统计当前画布里实际存在的被调函数（不在图中的函数不参与编号）；
+ * 2. 同一被调函数被重复调用时，只按首次调用排序并表现第一次（不重复占号）。
+ */
+export function visibleCallOrderMap(view, callerId) {
+  const map = new Map();
+  if (!view?.edges || !callerId) return map;
+  const visibleNodes = view.nodes?.length ? new Set(view.nodes.map((n) => n.id)) : null;
+  const calls = view.edges
+    .filter((e) => e.from === callerId && ['direct', 'macro', 'fnptr'].includes(e.kind) &&
+      (!visibleNodes || visibleNodes.has(e.to)))
+    .slice()
+    .sort((a, b) => {
+      const oa = (a.callNumbers?.length ? parseInt(a.callNumbers[0], 10) : 0) || a.orderGroup || a.line || 0;
+      const ob = (b.callNumbers?.length ? parseInt(b.callNumbers[0], 10) : 0) || b.orderGroup || b.line || 0;
+      return oa - ob || (a.line || 0) - (b.line || 0);
+    });
+  for (const e of calls) {
+    if (!map.has(e.to)) {
+      map.set(e.to, { order: map.size + 1, edge: e });
+    }
   }
-  const summary = edge.callNumbers.slice(0, 4).join('、') + (edge.callNumbers.length > 4 ? '…' : '');
-  const label = normalizeLabel({ preset: 'call', text: LABEL_PRESETS.call.text + summary });
+  return map;
+}
+
+export function displayEdgeLabels(edge, labels = [], viewOrCaller) {
+  if (labels.some((l) => l.preset === 'call')) return labels;
+  if (!['direct', 'macro', 'fnptr'].includes(edge?.kind)) return labels;
+  let orderNum = null;
+  if (typeof viewOrCaller === 'string') {
+    if (edge.from !== viewOrCaller || !edge.callNumbers?.length) return labels;
+    orderNum = parseInt(edge.callNumbers[0], 10) || 1;
+  } else if (viewOrCaller?.edges) {
+    const orders = visibleCallOrderMap(viewOrCaller, edge.from);
+    if (orders.size < 2) return labels;
+    const entry = orders.get(edge.to);
+    if (!entry || entry.edge !== edge) return labels;
+    orderNum = entry.order;
+  } else if (edge.callNumbers?.length) {
+    orderNum = parseInt(edge.callNumbers[0], 10) || 1;
+  }
+  if (!orderNum) return labels;
+  const label = normalizeLabel({ id: 'auto', preset: 'call', text: `${LABEL_PRESETS.call.text}${orderNum}` });
   if (edge.versions?.length === 1) label.note = edge.versions.includes('after') ? '修改后' : '修改前';
-  return [...labels, { ...label, auto: true }];
+  return [...labels, { ...label, id: 'auto', auto: true, orderNum }];
 }
 
 /** 下一张结合点的编号：同一画面内取最小未占用值 */
