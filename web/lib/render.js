@@ -4,6 +4,8 @@
  */
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
+import { isDataEdge, edgeDirection } from './edge-flow.js';
+import { periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
@@ -139,7 +141,7 @@ function prepareRecentLayers(view, area) {
   glow.shadowBlur = 10;
   for (const e of edges) {
     addPathDamage(e.points, 36);
-    glow.setLineDash(edgeDashed(e) ? [7, 4] : []);
+    glow.setLineDash(isDataEdge(e) ? [7, 4] : []);
     glow.beginPath(); strokeRounded(glow, e.points); glow.stroke();
   }
   const gap = 5 / cam.k;
@@ -564,9 +566,6 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-/** 该连线是否画成虚线（变量访问默认虚线；虚实可在样式面板按类型调整） */
-const edgeDashed = (e) => (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash);
-
 function drawEdge(ctx, e, related, selected, traceColor = null, animated = true) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
@@ -574,7 +573,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
   // 连线只按黑 / 红区分状态；选中只加粗，删除另在中央画 X。
   const color = traceColor ? traceColor : e.change === 'added'
     ? THEME.edge.added
-    : e.kind === 'var'
+    : isDataEdge(e)
     ? THEME.edge.var
     : THEME.edge.call;
   ctx.save();
@@ -589,33 +588,35 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
   ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.6 : related ? 2.4 : 1.4;
   ctx.globalAlpha = 1;
   // 变量访问=虚线，函数调用=实线
-  if (edgeDashed(e)) ctx.setLineDash([7, 4]);
+  if (isDataEdge(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
-    const path = flowPath(pts);
-    if (path.length) {
-      addPathDamage(pts);
-      effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
+  const direction = edgeDirection(e);
+  const drawDirection = (a, b, reverse) => {
+    if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
+      const path = flowPath(reverse ? pts.toReversed() : pts);
+      if (path.length) {
+        addPathDamage(pts);
+        effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
+      }
     }
-  }
-
-  const a = pts[pts.length - 2];
-  const b = pts[pts.length - 1];
-  let dx = b[0] - a[0];
-  let dy = b[1] - a[1];
-  const len = Math.hypot(dx, dy) || 1;
-  dx /= len;
-  dy /= len;
-  const s = 6;
-  ctx.beginPath();
-  ctx.moveTo(b[0], b[1]);
-  ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
-  ctx.lineTo(b[0] - s * dx + s * 0.55 * dy, b[1] - s * dy - s * 0.55 * dx);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    const s = 6;
+    ctx.beginPath();
+    ctx.moveTo(b[0], b[1]);
+    ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
+    ctx.lineTo(b[0] - s * dx + s * 0.55 * dy, b[1] - s * dy - s * 0.55 * dx);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  };
+  if (direction === 'forward' || direction === 'both') drawDirection(pts.at(-2), pts.at(-1), false);
+  if (direction === 'reverse' || direction === 'both') drawDirection(pts[1], pts[0], true);
 
   if (selected && !state.multiSelection && !state.view?.comparison &&
       state.moveTarget?.kind === 'edge' && state.moveTarget.item === e) {
@@ -752,9 +753,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
       saved = { name, font, width: maxW, label };
       nodeNames.set(n, saved);
     }
-    ctx.fillText(saved.label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
+    const period = periodSubtitle(n);
+    const showSubtitle = cam.k >= 0.62 || (period && cam.k >= 0.4);
+    ctx.fillText(saved.label, cx, y + (showSubtitle ? h / 2 - 8 : h / 2));
 
-    if (cam.k >= 0.62) {
+    if (showSubtitle) {
       ctx.font = `10.5px ${FONT}`;
       ctx.fillStyle = '#888780';
       const sub = n.external
@@ -762,7 +765,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
         : isVar
         ? n.typeText || t('node.variable')
         : `${shortFile(n.file)}:${n.line}`;
-      ctx.fillText(sub, cx, y + h / 2 + 10);
+      if (period) {
+        ctx.fillStyle = '#124B71';
+        ctx.font = `600 11px ${FONT}`;
+      }
+      ctx.fillText(period || sub, cx, y + h / 2 + 10, maxW);
     }
   }
 

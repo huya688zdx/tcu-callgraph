@@ -12,6 +12,8 @@ import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from 
 import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
+import { callSequence, callNumbers } from './core/call-sequence.js';
+import { projectTasks, withTaskPeriods } from './core/task-periods.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import { normalizeExpansions } from './core/expansion.js';
@@ -681,6 +683,7 @@ async function buildView(
   if (COMPARISON) clean = clean.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
   const macroNameMode = macroNameDefault();
   clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
+  clean = withTaskPeriods(clean, model, COMPARISON);
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -691,7 +694,17 @@ async function buildView(
     n.change = COMPARISON ? n.change || 'existing' : (ov && ov.change) || 'existing';
     n.kind = n.kind === 'var' ? 'var' : 'fn';
   }
+  const orders = new Map();
   for (const e of laid.edges) {
+    if (['direct', 'macro', 'fnptr'].includes(e.kind) && !e.headerReference) {
+      const version = COMPARISON && !e.versions?.includes('after') ? 'before' : 'after';
+      const orderKey = version + ':' + e.from;
+      if (!orders.has(orderKey)) {
+        const source = COMPARISON ? COMPARISON[version + 'Model'] : model;
+        orders.set(orderKey, callNumbers(callSequence(source, e.from)));
+      }
+      e.callNumbers = orders.get(orderKey).get(e.to);
+    }
     const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = COMPARISON ? e.change || 'existing' : (ov && ov.change) || 'existing';
@@ -930,12 +943,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/stats') {
+      const tasks = () => COMPARISON ? [
+        ...projectTasks(COMPARISON.beforeModel).map(task => ({ ...task, version: 'before' })),
+        ...projectTasks(COMPARISON.afterModel).map(task => ({ ...task, version: 'after' })),
+      ] : projectTasks(MODEL);
       if (u.searchParams.get('summary') === '1') {
         const { cycleGroups, selfLoops, ...stats } = S;
-        return json(res, { stats });
+        return json(res, u.searchParams.get('tasks') === '1' ? { stats, projectId: PROJECT.id, tasks: tasks() } : { stats });
       }
       return json(res, {
         stats: S,
+        projectId: PROJECT.id, tasks: tasks(),
         root,
         macros: MODEL.macros
           .filter((m) => m.raw && m.raw.trim())
@@ -1559,6 +1577,8 @@ const server = http.createServer(async (req, res) => {
       if (!fn) return json(res, { error: 'not found' }, 404);
       return json(res, {
         node: { ...(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn), bodyTokens: undefined },
+        callSequence: callSequence(COMPARISON?.afterModel || MODEL, id),
+        ...(COMPARISON ? { previousCallSequence: callSequence(COMPARISON.beforeModel, id) } : {}),
         hidden: !COMPARISON && !!overlay.deleted.nodes[id],
         inEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [])
           .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
@@ -1655,6 +1675,7 @@ const server = http.createServer(async (req, res) => {
         g.edges = g.edges.map((e) => comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)));
       }
       g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
+      g.nodes = withTaskPeriods(g.nodes, MODEL, COMPARISON);
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();
       const inAdj = new Map();

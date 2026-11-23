@@ -12,8 +12,11 @@
  *    宏间接调用（CALL(Task_10ms)）与函数指针在解析期已还原成普通边，这里不用管。
  */
 
+import { projectTasks } from './task-periods.js';
+import { formatPeriod } from '../../web/lib/period-text.js';
+
 /** 名字里的周期：Task_10ms / 100ms_task / cyclic_5ms → { n: 10, unit: 'ms' } */
-const PERIOD_IN_NAME = /(\d+)\s*(ms|us|µs|s)\b/i;
+const PERIOD_IN_NAME = /(\d+)\s*(ms|us|µs|s)(?=$|_)/i;
 /** 任务函数名：Task_xxx / xxx_task / cyclic_xxx / periodic_xxx */
 const TASK_NAME = /(^|_)(task|cyclic|periodic)(_|$)/i;
 /** 中断入口：xxx_isr / xxx_handler / irq_xxx / xxx_interrupt */
@@ -67,12 +70,15 @@ export function detectTasks(model, from = null) {
   // ---- 1. 任务函数与 ISR ----
   const tasks = []; // { id, period, isIsr }
   const isrs = [];
+  const recognized = new Map(projectTasks(model).map(task => [task.id, task]));
   for (const fn of fns) {
-    const p = taskPeriodOf(fn.name);
+    const task = recognized.get(fn.id);
+    const p = task?.us ? { text: 'TASK:' + formatPeriod(task.us).replace(' ', '').replace('µs', 'us'), why: task.source }
+      : taskPeriodOf(fn.name);
     if (p && TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: p });
     else if (p && ISR_NAME.test(fn.name)) isrs.push({ id: fn.id, period: p });
     else if (p) tasks.push({ id: fn.id, period: p });
-    else if (TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: null });
+    else if (task || TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: null });
     else if (ISR_NAME.test(fn.name)) isrs.push({ id: fn.id, period: null });
   }
 

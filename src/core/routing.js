@@ -27,7 +27,7 @@ const SIDES = new Set(['top', 'bottom', 'left', 'right']);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 /** 不同线型或变更颜色不能共用干线；入口处不可避免的短引线除外。 */
-export const edgeStyleKey = (e) => `${e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
+export const edgeStyleKey = (e) => `${e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 
 export function canShareTrunk(a, b) {
   return (a.from === b.from || a.to === b.to || (a.from === b.to && a.to === b.from)) &&

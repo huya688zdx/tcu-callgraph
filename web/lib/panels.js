@@ -3,6 +3,8 @@
  */
 import { t } from '../i18n.js';
 import { els, state, esc, shortFile } from './state.js';
+import { isDataEdge } from './edge-flow.js';
+import { formatPeriod } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections, hideMenu } from './ctxmenu.js';
@@ -12,8 +14,32 @@ import { findCallOrder } from './call-order.js';
 import { showExpansion, previewAddition } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
+let statsSeq = 0;
+
+function renderTasks(tasks, projectId) {
+  const list = document.getElementById('taskList');
+  document.getElementById('taskCount').textContent = String(new Set(tasks.map(t => t.id)).size);
+  list.innerHTML = tasks.map(task => {
+    const version = task.version ? t(`compare.version.${task.version}`) + ' · ' : '';
+    const period = task.us ? formatPeriod(task.us) : '周期待确认';
+    return `<button class="task-entry" type="button" data-task-id="${esc(task.id)}" title="${esc(task.source)} · ${esc(task.file)}:${task.line} · 点击定位，未显示的任务将加入画布">
+      <b>${esc(task.name)}</b><strong>${period}</strong>
+      <small>${esc(version + task.file)}:${task.line}</small></button>`;
+  }).join('') || '<div class="empty">未识别到 TASK 入口</div>';
+  list.onclick = async event => {
+    const button = event.target.closest('[data-task-id]');
+    if (!button || projectId !== state.view?.projectId) return;
+    try {
+      if (!await locateNode(button.dataset.taskId)) throw new Error('当前视图无法定位该任务');
+    } catch (err) { alert(err.message); }
+  };
+}
+
 async function loadStats() {
+  const seq = ++statsSeq;
   const d = await api.stats();
+  if (seq !== statsSeq) return;
+  renderTasks(d.tasks || [], d.projectId);
   const s = d.stats;
   const row = (label, val) => `<div class="stat-row"><span>${label}</span><span>${val}</span></div>`;
   els.stats.innerHTML = [
@@ -592,6 +618,38 @@ function comparisonDetail(node) {
     ${node.context ? `<div class="detail-meta">${t('compare.context')}</div>` : ''}`;
 }
 
+function sequenceList(groups, label) {
+  if (!groups?.length) return '';
+  return `<section class="sequence-list"><h4>コール順${label ? ' · ' + label : ''}</h4>
+    <p>按源码列出调用点。分支按条件执行，循环可能重复。</p>
+    <ol>${groups.map(calls => `<li>${calls.map(call =>
+      `<div><b>${esc(call.name)}</b> <small title="调用行">L${call.line}</small>${call.cond ? ` <small>${esc(call.cond)}</small>` : ''}</div>`
+    ).join('')}${calls.length > 1 ? '<small>* 同一语句的调用点共用序号。嵌套调用先求实参，多个实参的求值顺序未指定。</small>' : ''}</li>`).join('')}</ol>
+  </section>`;
+}
+
+function periodImpact(node) {
+  if (node.headerSymbol) return '';
+  const group = (label, contexts = []) => {
+    const byPeriod = new Map();
+    for (const { us, task } of contexts) {
+      if (!byPeriod.has(us)) byPeriod.set(us, []);
+      byPeriod.get(us).push(task);
+    }
+    return `<h5>${label}</h5>${byPeriod.size ? [...byPeriod].map(([us, tasks]) =>
+      `<div class="period-row"><strong>${formatPeriod(us)}</strong><span>${tasks.map(id =>
+        `<span title="${esc(id)}">${esc(id.split('::').pop())}</span>`).join('、')}</span></div>`).join('')
+      : '<div class="detail-meta">周期待确认</div>'}`;
+  };
+  const groups = state.view?.comparison
+    ? (node.versions?.includes('before') ? group('修改前', node.previousTaskPeriods) : '') +
+      (node.versions?.includes('after') ? group('修改后', node.taskPeriods) : '')
+    : group('可能调用此函数的任务', node.taskPeriods);
+  return `<section class="period-impact"><h4>周期影响</h4>${groups}
+    <div class="detail-meta">标称周期取自任务入口名或 DelayUntil 的显式毫秒间隔，调用链覆盖整个工程。条件分支的执行频率需结合调度配置确认。</div>
+    ${!window.__EXPORT && !node.external ? '<button type="button" data-period-flow>查看上下游数据与周期</button>' : ''}</section>`;
+}
+
 async function renderDetail(id) {
   clearDataflow();
   const my = ++detailSeq;
@@ -629,6 +687,9 @@ async function renderDetail(id) {
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
     ${statusControl(target)}
+    ${periodImpact(target)}
+    ${sequenceList(d.previousCallSequence, '修改前')}
+    ${sequenceList(d.callSequence, state.view?.comparison ? '修改后' : '')}
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
       <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
         <option value="default" ${!target.nameModeOverride ? 'selected' : ''}>${t('name.default')}（${t(target.nameMode === 'target' ? 'name.target' : 'name.alias')}）</option>
@@ -638,11 +699,12 @@ async function renderDetail(id) {
     ${state.view?.comparison ? comparisonDetail(n) : ''}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
+  els.detail.querySelector('[data-period-flow]')?.addEventListener('click', () => analyseDataflow(id));
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
   bindStatusControl(els.detail, target);
 
-  const inE = d.inEdges || [];
-  const outE = d.outEdges || [];
+  const inE = (d.inEdges || []).filter(e => !isDataEdge(e));
+  const outE = (d.outEdges || []).filter(e => !isDataEdge(e));
   const item = (e, dir) => {
     const other = dir === 'in' ? e.from : e.to;
     const nm = e.callee || other.split('::')[1] || other;

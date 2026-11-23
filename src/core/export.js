@@ -1,9 +1,12 @@
+import { edgeCaption, isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
+import { periodSubtitle } from '../../web/lib/period-text.js';
 /**
  * 导出：Excel 多 sheet / 单文件 HTML / SVG
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { withTaskPeriods } from './task-periods.js';
 import { stats } from './index.js';
 import { layoutElk } from './layout-elk.js';
 import { roundedPathD } from './routing.js';
@@ -30,11 +33,11 @@ export function buildSVGFromLayout(laid) {
 
   for (const e of laid.edges) {
     const d = roundedPathD(e.points, 7);
-    const style = e.change === 'added' ? 'added' : e.kind === 'var' ? 'var' : 'direct';
+    const style = e.change === 'added' ? 'added' : isDataEdge(e) ? 'var' : 'direct';
     const c = C[style];
-    const dash = e.kind === 'var' ? ' stroke-dasharray="7 4"' : '';
+    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
     out.push(
-      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${style})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 
@@ -47,7 +50,7 @@ export function buildSVGFromLayout(laid) {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? '外部符号' : `${n.file}:${n.line}`)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(periodSubtitle(n) || (n.external ? '外部符号' : `${n.file}:${n.line}`))}</text>`
     );
     out.push('</g>');
   }
@@ -75,8 +78,15 @@ function inlineJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
+function layoutForExport(model, opts) {
+  // 服务端子图已携带从全工程推得的周期，CLI 从完整模型计算。
+  const nodes = model.functions.some(n => Array.isArray(n.taskPeriods))
+    ? model.functions : withTaskPeriods(model.functions, model);
+  return layoutElk(nodes, model.edges, { group: false, ...opts });
+}
+
 export async function exportSvg(model, outPath, opts = {}) {
-  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
+  const laid = await layoutForExport(model, opts);
   const svg = buildSVGFromLayout(laid);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, svg, 'utf8');
@@ -85,7 +95,7 @@ export async function exportSvg(model, outPath, opts = {}) {
 
 /** 单文件 HTML：内嵌 SVG 与数据，双击即可离线查看 */
 export async function exportHtml(model, outPath, opts = {}) {
-  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
+  const laid = await layoutForExport(model, opts);
   const svg = buildSVGFromLayout(laid);
   const S = stats(model);
 
@@ -113,6 +123,8 @@ export async function exportHtml(model, outPath, opts = {}) {
     edges: laid.edges.map((e) => ({
       from: e.from,
       to: e.to,
+      dataEdge: isDataEdge(e),
+      caption: edgeCaption(e, id => model._index.byId.get(id)?.name || id),
       callee: e.callee,
       kind: e.kind,
       line: e.line,
@@ -208,11 +220,13 @@ function select(id){
   const info = document.getElementById('info');
   if (!id) { info.textContent = '点击图中节点查看'; document.querySelectorAll('path').forEach(p => p.classList.remove('hit')); return; }
   const n = DATA.nodes.find(x => x.id === id);
-  const out = DATA.edges.filter(e => e.from === id);
-  const inc = DATA.edges.filter(e => e.to === id);
+  const out = DATA.edges.filter(e => !e.dataEdge && e.from === id);
+  const inc = DATA.edges.filter(e => !e.dataEdge && e.to === id);
+  const data = DATA.edges.filter(e => e.dataEdge && (e.from === id || e.to === id));
   const chip = e => e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : '';
   info.innerHTML = '<div style="font-weight:500;font-size:13px;color:#2C2C2A;margin-bottom:2px">' + escHtml(n.name) + '</div>' +
     '<div style="margin-bottom:8px">' + escHtml(n.file) + ':' + n.line + ' · ↑' + n.fanIn + ' ↓' + n.fanOut + '</div>' +
+    (data.length ? '<div>数据流向</div>' + data.map(e => '<div>' + escHtml(e.caption) + '</div>').join('') : '') +
     (out.length ? '<div style="margin-bottom:2px">调用：</div>' + out.map(e => '<div>→ ' + escHtml(e.callee) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '') +
     (inc.length ? '<div style="margin-top:6px;margin-bottom:2px">被调用：</div>' + inc.map(e => '<div>← ' + escHtml((DATA.nodes.find(x => x.id === e.from) || {}).name) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '');
   document.querySelectorAll('path[data-from]').forEach(p => {

@@ -16,6 +16,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from './cparse.js';
 import { rebuildIndex, decodeSource } from './index.js';
+import { taskPeriods } from './task-periods.js';
+import { taskDeclarations } from './task-declarations.js';
 import { lex } from './lexer.js';
 import { fileMacroScope, preprocess } from './preproc.js';
 
@@ -83,7 +85,10 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
   const headerMacros = new Map();
   for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
   for (const f of sources) {
-    const { tokens } = preprocess(lex(f.src, f.rel), fileMacroScope(headerMacros), f.rel, { expand: true });
+    const original = lex(f.src, f.rel);
+    const taskDefs = taskDeclarations(f.src, original);
+    f.src = taskDefs.source;
+    const { tokens } = preprocess(taskDefs.names.size ? lex(f.src, f.rel) : original, fileMacroScope(headerMacros), f.rel, { expand: true });
     const parts = [];
     let line = 1;
     for (const tk of tokens) {
@@ -308,6 +313,7 @@ export async function dataflowFor(model, fnId, dir = 'out') {
 
   const firstLine = (rec) => (rec && rec.lines.size ? Math.min(...rec.lines) : 0);
 
+  const periods = taskPeriods(model);
   const emitVar = (varId, rec, mode) => {
     const def = idx.byId.get(varId);
     if (!def) return null;
@@ -329,6 +335,7 @@ export async function dataflowFor(model, fnId, dir = 'out') {
     });
 
     const entry = {
+      fnTaskPeriods: periods.get(fnId) || [],
       id: def.id,
       name: def.name,
       typeText: def.typeText,
@@ -347,14 +354,14 @@ export async function dataflowFor(model, fnId, dir = 'out') {
         const pn = fnNodeOf(model, peer);
         if (pn) addNode(pn);
         pushEdge(def.id, peer, 'df-read', def.name, firstLine(idx.fnAccess.get(peer)?.reads.get(varId)));
-        entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '' });
+        entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '', taskPeriods: periods.get(peer) || [] });
       }
     } else {
       for (const peer of list) {
         const pn = fnNodeOf(model, peer);
         if (pn) addNode(pn);
         pushEdge(peer, def.id, 'df-write', def.name, firstLine(idx.fnAccess.get(peer)?.writes.get(varId)));
-        entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '' });
+        entry.peers.push({ id: peer, name: pn?.name || peer, file: pn?.file || '', taskPeriods: periods.get(peer) || [] });
       }
       pushEdge(def.id, fnId, 'df-read', def.name, firstLine(rec));
     }

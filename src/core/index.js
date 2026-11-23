@@ -5,6 +5,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { captureTaskEvidence } from './task-periods.js';
+import { assignCallGroups } from './call-sequence.js';
+import { taskDeclarations } from './task-declarations.js';
 import { lex } from './lexer.js';
 import { fileMacroScope, preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
@@ -339,12 +342,16 @@ export function buildIndex(root, sourceFiles = null) {
       return;
     }
     const src = decodeSource(buf);
+    const original = lex(src, rel);
+    const taskDefs = taskDeclarations(src, original);
+    const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
     const fileMacros = fileMacroScope(noMacros);
-    const { tokens, includes: inc } = preprocess(lex(src, rel), fileMacros, rel);
+    const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
     const fileFunctions = [];
     for (const fn of findFunctions(tokens, rel)) {
+      if (taskDefs.names.has(fn.name)) fn.taskDeclaration = true;
       fn.id = `${fn.file}::${fn.name}`;
       // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
       if (seenFnId.has(fn.id)) continue;
@@ -369,7 +376,7 @@ export function buildIndex(root, sourceFiles = null) {
       if (keptTokens + tokens.length <= RETAINED_TOKENS) {
         entry.tokens = tokens;
         keptTokens += tokens.length;
-      } else entry.src = src;
+      } else entry.src = taskDefs.source;
     }
     parsed.push(entry);
   };
@@ -441,7 +448,7 @@ export function buildIndex(root, sourceFiles = null) {
           to: resolveCallee(c.callee, fn.file),
           callee: c.callee,
           kind: c.kind,
-          line: c.line,
+          line: c.line, col: c.col,
           cond: c.cond,
           via: c.via,
           macroChain: c.macroChain,
@@ -452,7 +459,10 @@ export function buildIndex(root, sourceFiles = null) {
         });
       }
       // 调用顺序检测只需知道是否存在嵌套调用，无需长期持有整份函数体。
-      if (edges.length - edgeStart > 1 && hasNestedCall(body, edges.slice(edgeStart))) fn.hasNestedCalls = true;
+      const calls = edges.slice(edgeStart);
+      if (calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
+      assignCallGroups(body, calls);
+      captureTaskEvidence(fn, body, byName);
       const access = scanVarAccess(body, (n) => lookupVar(fn.file, n));
       fn.varAccess = access;
       for (const a of access) {
@@ -764,7 +774,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
     const callKey = `${e.from}|${e.to}|${e.line}|${e.kind}`;
     if (seenCall.has(callKey)) return;
     seenCall.add(callKey);
-    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}`;
+    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}|${e.kind === 'dataflow' ? 'dataflow' : 'access'}`;
     let m = byPair.get(pairKey);
     if (!m) {
       m = { ...e, calls: [] };
