@@ -1,3 +1,4 @@
+import { t } from '../i18n.js';
 /**
  * AI 改动实时同步
  *
@@ -52,12 +53,13 @@ function scheduleReload() {
 async function flushReload() {
   flushTimer = null;
   if (!dirtyCount || applyingCompose) return;
+  if (state.view?.comparison) return;
   if (state.at > 0) {
     // 回看历史：画面是过去的重放，不能就地刷新，改完的量记在提示里
     const n = dirtyCount;
     dirtyCount = 0;
-    toast(pendingCompose ? 'AI 更新了画布（正在回看历史，回到最新后可见）' :
-      `AI 改了 ${n} 处（正在回看历史，回到最新后可见）`);
+    toast(pendingCompose ? t('live.reviewCompose') :
+      t('live.reviewEdits', { n }));
     reloadTimeline();
     return;
   }
@@ -78,17 +80,17 @@ async function flushReload() {
         nav: true, incremental: true, expansions: page.expansions || [],
         up: page.up ?? 0, down: page.down ?? 0, vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
-      if (!view) throw new Error('读取 AI 画布失败');
+      if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
       state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
       renderVars();
       renderLabelPanel();
       draw();
       renderDetail(state.selected).catch(() => {});
-      toast(`AI 已更新画布${reason ? '：' + reason : ''}`);
+      toast([t('live.composed'), reason].filter(Boolean).join(' · '));
     } else {
       await hooks.reloadKeepCam();
-      toast(n > 1 ? `AI 更新了视图（${n} 处改动）` : 'AI 更新了视图');
+      toast(n > 1 ? t('live.edits', { n }) : t('live.updated'));
     }
     failures = 0;
     loadStats();
@@ -101,7 +103,7 @@ async function flushReload() {
       pendingCompose ??= compose;
       if (!flushTimer) flushTimer = setTimeout(flushReload, 2000);
     } else {
-      toast('AI 的改动刷新失败，请手动刷新页面');
+      toast(t('live.refreshFailed'));
     }
   } finally {
     applyingCompose = false;
@@ -134,8 +136,8 @@ if (es) {
       if (m.clientId === clientId) return;
       dirtyCount = 0;
       pendingCompose = null;
-      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast('工程切换后刷新失败，请手动刷新页面'));
-      toast(`已切换工程：${m.project || ''}`);
+      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast(t('live.projectRefreshFailed')));
+      toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }
     if (m.actor !== 'ai') return;
@@ -176,13 +178,16 @@ export function savePage(force = false) {
   pendingSave = pendingSave.catch(() => {}).then(async () => {
     if (sig === lastSig) return;
     const result = await api.reportPage(page);
-    if (!result?.ok) throw new Error(result?.error || '保存当前视图失败');
+    if (!result?.ok) throw new Error(result?.error || t('live.saveFailed'));
     lastSig = sig;
   });
   return pendingSave;
 }
 setInterval(() => {
-  if (pendingCompose && !state.at && !dirtyCount) scheduleReload();
+  if (!state.view?.comparison && !state.at && (pendingCompose || dirtyCount) && !flushTimer) {
+    flushTimer = setTimeout(flushReload, 400);
+    if (!dirtyCount) dirtyCount = 1;
+  }
   savePage().catch(() => {});
 }, 800);
 

@@ -10,15 +10,24 @@ import { lex, collectArgs } from './lexer.js';
 const DIRECTIVE = /^#\s*([A-Za-z_]+)\s*([\s\S]*)$/;
 
 /** 文件只保存自己修改的宏，null 表示屏蔽继承来的定义。 */
-export function fileMacroScope(base, changes = new Map()) {
+export function fileMacroScope(base, changes = new Map(), { trackPositions = false } = {}) {
+  const history = trackPositions ? new Map() : null;
+  const update = (name, value, line) => {
+    changes.set(name, value);
+    if (!history) return;
+    if (!history.has(name)) history.set(name, []);
+    history.get(name).push({ value, line });
+  };
   return {
     changes,
-    get(name) {
-      const value = changes.get(name);
+    get(name, line) {
+      const value = history && line !== undefined
+        ? history.get(name)?.findLast(entry => entry.line < line)?.value
+        : changes.get(name);
       return value === undefined ? base.get(name) : value;
     },
-    set(name, def) { changes.set(name, def); },
-    delete(name) { changes.set(name, null); },
+    set(name, def) { update(name, def, def.line); },
+    delete(name, line) { update(name, null, line); },
   };
 }
 
@@ -128,13 +137,13 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
 
     if (dir === 'undef') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
-      if (nm) macros.delete(nm[1]);
+      if (nm) macros.delete(nm[1], tk.line);
       continue;
     }
 
     if (dir === 'include') {
       const im = /^[<"]([^>"]+)[>"]/.exec(rest);
-      if (im) includes.push({ file, target: im[1], line: tk.line });
+      if (im && !frames.some(f => f.inactive)) includes.push({ file, target: im[1], line: tk.line });
       continue;
     }
 

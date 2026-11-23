@@ -26,7 +26,6 @@ const restoreBtn = document.getElementById('reviewRestore');
 const exitBtn = document.getElementById('reviewExit');
 
 const PAGE = 50;
-const CHANGE_LABEL = { modified: '修改', existing: '既存', added: '新增', deleted: '删除', changed: '修改' };
 
 const OP_KIND = {
   'node.annotate': 'Node',
@@ -59,11 +58,9 @@ const dayLabel = (ts) => {
   const d = new Date(ts);
   const today = new Date();
   return d.toDateString() === today.toDateString()
-    ? '今天'
+    ? t('common.today')
     : `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
 };
-
-const pair = (a, b, sep) => (a && b ? sep : '');
 
 function formatTarget(target) {
   const parts = target.split('->');
@@ -91,54 +88,53 @@ function describe(e) {
     case 'node.annotate':
     case 'edge.annotate': {
       const bits = [];
-      if (b.change) bits.push(CHANGE_LABEL[b.change] || b.change);
-      if (b.note) bits.push(`备注「${b.note}」`);
-      if (b.tag) bits.push(`标签 ${b.tag}`);
-      if (b.color) bits.push('标记颜色');
+      if (b.change) bits.push(t(`compare.version.${b.change === 'changed' ? 'modified' : b.change}`));
+      if (b.note) bits.push(t('timeline.note', { note: b.note }));
+      if (b.tag) bits.push(t('timeline.tag', { tag: b.tag }));
+      if (b.color) bits.push(t('timeline.color'));
       const labels = Array.isArray(b.labels) ? b.labels.filter(Boolean) : [];
       if (!labels.length && b.label) labels.push(b.label);
-      if (labels.length) bits.push(`设置标签：${labels.join('、')}`);
-      else if (b.labelsCount > 0) bits.push(`设置 ${b.labelsCount} 个标签`);
-      if (b.cleared === true) bits.push('清空标注');
-      return bits.join(' · ') || (e.op === 'edge.annotate' ? '更新连线标签/标注' : '更新节点标注');
+      if (labels.length) bits.push(t('timeline.labels', { labels: labels.join(' · ') }));
+      else if (b.labelsCount > 0) bits.push(t('timeline.labelCount', { n: b.labelsCount }));
+      if (b.cleared === true) bits.push(t('timeline.cleared'));
+      return bits.join(' · ') || t(e.op === 'edge.annotate' ? 'op.edge.annotate' : 'op.node.annotate');
     }
     case 'labels.renumber':
-      return '结合点编号重排（删除后自动紧凑）';
+      return t('timeline.renumber');
     case 'delete':
-      return `${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${b.edges ? `${b.edges} 条连线` : ''} 被删除`;
-    case 'delete.restore':
-      return `恢复 ${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${
-        b.edges ? `${b.edges} 条连线` : ''
-      }`;
+    case 'delete.restore': {
+      const items = [b.nodes && t('common.functionCount', { n: b.nodes }), b.edges && t('common.edgeCount', { n: b.edges })]
+        .filter(Boolean).join(' / ');
+      return items ? t(e.op === 'delete' ? 'timeline.deleted' : 'timeline.recovered', { items }) : t(`op.${e.op}`);
+    }
     case 'delete.clear':
-      return '清空全部删除记录';
+      return t('op.delete.clear');
     case 'layout.save':
-      return `调整布局${b.nodes ? `（${b.nodes} 个节点）` : ''}`;
+      return b.nodes ? t('timeline.layoutNodes', { n: b.nodes }) : t('op.layout.save');
     case 'layout.clear':
-      return '重置布局';
+      return t('op.layout.clear');
     case 'baseline':
-      return '打开工程（历史起点）';
+      return t('op.baseline');
     case 'import':
-      return '导入旧版 out/overlay.json';
+      return t('timeline.legacy');
     case 'session.import': {
       const im = b.import || {};
-      const base = `导入会话 · 标注 ${im.annotations || 0} · 布局 ${im.layout || 0} · 书签 ${
-        im.bookmarks || 0
-      }`;
-      return b.codeMismatch ? base + '（代码版本不一致）' : base;
+      const base = t('session.imported', { a: im.annotations || 0, l: im.layout || 0, b: im.bookmarks || 0 });
+      return b.codeMismatch ? base + ' ' + t('session.codeMismatch') : base;
     }
     case 'restore_point':
-      return '恢复到历史时刻';
+      return t('op.restore_point');
     case 'bookmark.save':
-      return `保存书签${b.roots ? ` · ${b.roots} 个入口` : ''}`;
+      return [t('op.bookmark.save'), b.roots ? t('common.scopeCount', { n: b.roots }) : ''].filter(Boolean).join(' · ');
     case 'bookmark.delete':
-      return '删除书签';
+      return t('op.bookmark.delete');
     case 'view.compose': {
       const reason = b.reason ?? (target.includes('::') ? '' : target);
-      return `AI 筛选并更新画布${b.count != null ? `（${b.count} 个函数）` : ''}${reason ? ` · ${reason}` : ''}`;
+      const caption = b.count == null ? t('timeline.compose') : t('timeline.composeCount', { n: b.count });
+      return [caption, reason].filter(Boolean).join(' · ');
     }
     case 'orphan.purge':
-      return `清理 ${b.total || 0} 条失效标注`;
+      return t('timeline.orphanCount', { n: b.total || 0 });
     default:
       return t(`op.${e.op}`) || e.op;
   }
@@ -185,7 +181,7 @@ function renderAll() {
       ? formatTarget(displayTarget)
       : { title: displayTarget, meta: '' };
     const on = state.at === e.id ? ' on' : '';
-    const sub = [meta, hhmm(e.ts), e.actor === 'system' ? '系统' : ''].filter(Boolean).join(' · ');
+    const sub = [meta, hhmm(e.ts), e.actor === 'system' ? t('common.system') : ''].filter(Boolean).join(' · ');
     html += `<div class="ev k-${kind.toLowerCase()}${on}" data-id="${esc(e.id)}" data-ts="${esc(e.ts)}">
       <div class="ev-content">
         <div class="ev-heading">
@@ -233,9 +229,11 @@ async function load({ append = false } = {}) {
     tl.total = Number(r.total || 0);
   } catch {
     if (seq !== tl.seq) return;
-    tl.events = [];
-    tl.hasMore = false;
-    tl.total = 0;
+    if (!append) {
+      tl.events = [];
+      tl.hasMore = false;
+      tl.total = 0;
+    }
   } finally {
     if (seq === tl.seq) tl.loading = false;
   }
@@ -326,4 +324,14 @@ document.addEventListener('cg:review-blocked', () => {
 
 wireModals();
 
-export { exitReview, reviewAt, hideBar, load as reloadTimeline };
+export function reloadTimeline() {
+  if (document.getElementById('timelineModal')?.classList.contains('show')) return load();
+}
+
+document.addEventListener('callgraph:langchange', () => {
+  setCount();
+  renderAll();
+  if (state.at) showBar(tl.events.find(event => event.id === state.at)?.ts || Date.now());
+});
+
+export { exitReview, reviewAt, hideBar };

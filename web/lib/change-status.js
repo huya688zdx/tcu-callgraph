@@ -1,3 +1,4 @@
+import { t } from '../i18n.js';
 import { state, edgeKey, esc } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
@@ -5,27 +6,27 @@ import { draw } from './render.js';
 import { improveEdgeRoutes, mergeSharedRoutes } from '/core/layout-metrics.js';
 import { pushHistory } from './history.js';
 
-export const STATUS_LABELS = { existing: '未修改', modified: '修改', added: '新增', deleted: '删除' };
-export const statusLabel = (value) => STATUS_LABELS[value] || '未修改';
+const STATUS_KEYS = { existing: 'status.existing', modified: 'status.modified', added: 'status.added', deleted: 'status.deleted' };
+export const statusLabel = value => t(STATUS_KEYS[value] || STATUS_KEYS.existing);
 export const statusKey = (edge) => edge.comparisonKey || edgeKey(edge);
 let writes = Promise.resolve();
 
 export function statusOptions(change, detected = null) {
-  return (detected ? `<option value="auto" ${change === 'auto' ? 'selected' : ''}>自动：${statusLabel(detected)}</option>` : '') +
-    Object.entries(STATUS_LABELS)
-      .map(([value, label]) => `<option value="${value}" ${change === value ? 'selected' : ''}>${label}</option>`).join('');
+  return (detected ? `<option value="auto" ${change === 'auto' ? 'selected' : ''}>${t('compare.autoStatus', { status: statusLabel(detected) })}</option>` : '') +
+    Object.keys(STATUS_KEYS)
+      .map(value => `<option value="${value}" ${change === value ? 'selected' : ''}>${statusLabel(value)}</option>`).join('');
 }
 
 export function statusControl(target) {
   const comparing = !!state.view?.comparison;
   const value = comparing && target.statusSource !== 'manual' ? 'auto' : target.change || 'existing';
-  return `<label class="detail-meta">状态 <select data-change-status ${state.at > 0 || window.__EXPORT ? 'disabled' : ''}>
+  return `<label class="detail-meta">${t('status.title')} <select data-change-status ${state.at > 0 || window.__EXPORT ? 'disabled' : ''}>
     ${statusOptions(value, comparing ? target.detectedChange || target.change || 'existing' : null)}</select></label>
-    ${comparing ? `<div class="detail-meta">${target.statusSource === 'manual' ? '手动调整' : '自动识别'} · 自动结果：${esc(statusLabel(target.detectedChange || target.change))}<br>调整用于本次比较，可恢复自动判断。</div>` : ''}`;
+    ${comparing ? `<div class="detail-meta">${target.statusSource === 'manual' ? t('compare.statusManual') : t('compare.statusDetected')} · ${t('compare.statusResult', { status: statusLabel(target.detectedChange || target.change) })}<br>${t('compare.statusHint')}</div>` : ''}`;
 }
 
 export async function setStatus(target, value, isEdge = false) {
-  if (!state.view || state.at > 0) return { ok: false, error: '回看时不能修改状态' };
+  if (!state.view || state.at > 0) return { ok: false, error: t('compare.statusReviewBlocked') };
   const view = state.view;
   const comparing = !!view.comparison;
   const change = value === 'auto' ? null : value;
@@ -65,7 +66,7 @@ export function bindStatusControl(element, target, isEdge = false, refresh = nul
     select.disabled = true;
     try {
       const result = await setStatus(target, select.value, isEdge);
-      if (!result?.ok) throw new Error(result?.error || '保存状态失败');
+      if (!result?.ok) throw new Error(result?.error || t('compare.statusFailed'));
       refresh?.();
     } catch (error) { alert(error.message || String(error)); }
     finally { select.disabled = state.at > 0 || !!window.__EXPORT; }

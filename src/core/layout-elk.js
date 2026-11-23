@@ -661,6 +661,13 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     return old && old.file === n.file && old.w === n.w && old.h === n.h;
   })) {
     const files = new Set(sized.map((n) => n.file || 'unknown'));
+    const directories = new Set();
+    for (const file of files) {
+      for (let slash = file.lastIndexOf('/'); slash >= 0; slash = file.lastIndexOf('/', slash - 1)) {
+        directories.add(file.slice(0, slash));
+        if (!slash) break;
+      }
+    }
     const view = { width: previous.width, height: previous.height, layoutDirection: direction,
       nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
         ...(group ? { group: n.file || 'unknown' } : {}) })),
@@ -670,8 +677,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
           custom: old?.custom ?? e.custom, fromSide: old?.fromSide ?? e.fromSide, toSide: old?.toSide ?? e.toSide };
       }),
       groups: group ? (previous.groups || []).filter((g) => files.has(g.id)).map((g) => ({ ...g })) : [],
-      containers: group ? (previous.containers || []).filter((c) => c.root ||
-        [...files].some((file) => file.startsWith(c.id + '/'))).map((c) => ({ ...c })) : [],
+      containers: group ? (previous.containers || []).filter((c) => c.root || directories.has(c.id)).map((c) => ({ ...c })) : [],
     };
     const addedEdges = view.edges.filter((e) => !e.points);
     if (addedEdges.length) {

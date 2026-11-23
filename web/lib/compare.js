@@ -50,24 +50,24 @@ const retainedIds = () => {
 };
 
 const roleBadges = {
-  direct_change: ['direct', '直接修改'],
-  macro_lsb_impact: ['impact', 'LSB/宏影响'],
-  period_impact: ['period', '周期变化'],
-  dataflow_impact: ['impact', '数据流受影响'],
-  caller_impact: ['impact', '调用方受影响'],
-  callee_context: ['context', '被调上下文'],
+  direct_change: ['direct', 'compare.role.direct'],
+  macro_lsb_impact: ['impact', 'compare.role.macro'],
+  period_impact: ['period', 'compare.role.period'],
+  dataflow_impact: ['impact', 'compare.role.data'],
+  caller_impact: ['impact', 'compare.role.caller'],
+  callee_context: ['context', 'compare.role.callee'],
 };
 
 function roleBadge(n) {
   const change = effectiveChange(n);
-  if (change === 'added') return ['added', '新增'];
-  if (change === 'deleted') return ['deleted', '删除'];
+  if (change === 'added') return ['added', 'compare.version.added'];
+  if (change === 'deleted') return ['deleted', 'compare.version.deleted'];
   if (change === 'modified') return roleBadges.direct_change;
   if (n.macroImpact) return roleBadges.macro_lsb_impact;
   if (n.periodImpact) return roleBadges.period_impact;
   const role = n.impactRole === 'direct_change' && statuses.has(n.id) ? null : roleBadges[n.impactRole];
-  return role || (n.impact ? ['impact', '受影响'] :
-    n.context ? roleBadges.callee_context : ['context', '未修改']);
+  return role || (n.impact ? ['impact', 'compare.role.affected'] :
+    n.context ? roleBadges.callee_context : ['context', 'status.existing']);
 }
 
 function buildChangePoints() {
@@ -102,8 +102,8 @@ function renderChangePoints() {
   if (!pickFocus || !pickPoints) return;
   pickFocus.hidden = !changePoints.length;
   pickPoints.innerHTML = changePoints.map((point, index) => {
-    const type = point.kind === 'macro_lsb' ? 'LSB/宏' : point.kind === 'period' ? '周期Δ' :
-      point.change === 'added' ? '新增' : point.change === 'deleted' ? '删除' : '修改';
+    const type = point.kind === 'macro_lsb' ? t('compare.point.macro') : point.kind === 'period' ? t('compare.point.period') :
+      point.change === 'added' ? t('compare.version.added') : point.change === 'deleted' ? t('bookmark.delete') : t('compare.version.modified');
     const showValues = point.kind === 'macro_lsb' || point.kind === 'period';
     const hasValues = showValues && (point.beforeValue != null || point.afterValue != null);
     const value = (v) => {
@@ -115,7 +115,7 @@ function renderChangePoints() {
     return `<button class="compare-point" type="button" data-point="${index}" aria-pressed="false"
       title="${esc([point.file, point.summary].filter(Boolean).join('\n'))}">
       <span>${type}</span> <b>${esc(point.name || point.id)}</b>${diff ? ` <span>${esc(diff)}</span>` : ''}
-      <small>影响 ${point.affectedIds.size} 项</small></button>`;
+      <small>${t('compare.point.affected', { n: point.affectedIds.size })}</small></button>`;
   }).join('');
 }
 
@@ -161,27 +161,31 @@ function renderSelection() {
       const where = n.locations?.[version];
       return where?.file ? `${where.file}${where.line ? ':' + where.line : ''}` : '—';
     };
-    const source = n.locations ? `修改前 ${loc('before')} · 修改后 ${loc('after')}` : n.file;
+    const source = n.locations ? t('compare.sourceLocations', { before: loc('before'), after: loc('after') }) : n.file;
     return `<div class="compare-pick-row${focusedIds ? ' focused' : ''}">
       <label><input type="checkbox" data-id="${esc(n.id)}" ${checked ? 'checked' : ''}
         ${applying || (!checked && total >= limit && !retained.has(n.id)) ? 'disabled' : ''}>
         <span class="compare-row-copy"><span class="compare-row-heading"><b>${esc(n.name)}</b>
-          <span class="compare-row-kind">${n.kind === 'var' ? '变量' : '函数'}</span>
-          <span class="compare-badge ${role}">${label}</span>
+          <span class="compare-row-kind">${n.kind === 'var' ? t('stat.variables') : t('node.function')}</span>
+          <span class="compare-badge ${role}">${t(label)}</span>
           ${period ? `<span class="compare-badge ${period.includes('→') ? 'period' : 'context'}">${esc(period)}</span>` : ''}
         </span>
         ${reason ? `<small class="compare-row-reason">${esc(reason)}</small>` : ''}
         ${source ? `<small class="compare-row-source">${esc(source)}</small>` : ''}</span>
       </label>
-      <select data-status-id="${esc(n.id)}" aria-label="${esc(n.name)} 状态" ${applying ? 'disabled' : ''}>${statusOptions(statuses.get(n.id) || 'auto', n.change || 'existing')}</select></div>`;
-  }).join('') || '<div class="empty">没有符合筛选条件的对象</div>';
+      <select data-status-id="${esc(n.id)}" aria-label="${esc(t('compare.statusOf', { name: n.name }))}" ${applying ? 'disabled' : ''}>${statusOptions(statuses.get(n.id) || 'auto', n.change || 'existing')}</select></div>`;
+  }).join('') || `<div class="empty">${t('compare.pickEmpty')}</div>`;
   pickPoints?.querySelectorAll('[data-point]').forEach((button) =>
     button.setAttribute('aria-pressed', String(changePoints[Number(button.dataset.point)] === focusedPoint)));
   pickChange.disabled = applying || Boolean(focusedIds);
   const missing = (state.view?.nodes.length || 0) - retained.size;
-  document.getElementById('comparePickRetainWarning').textContent = missing ? `原图有 ${missing} 个节点未在对照模型中找到，无法保留到比较图；取消可继续保留原画面。` : '';
-  document.getElementById('comparePickCount').textContent = `已选 ${selected.size} 项 · 保留 ${retained.size} 项 · 合计 ${total} / ${limit}${statuses.size ? ` · 手动状态 ${statuses.size} 项` : ''}`;
-  document.getElementById('comparePickPage').textContent = `${selectionPage + 1} / ${Math.max(1, Math.ceil(list.length / pageSize))} · ${list.length} 项`;
+  document.getElementById('comparePickRetainWarning').textContent = missing ? t('compare.missingRetained', { n: missing }) : '';
+  document.getElementById('comparePickCount').textContent = [
+    t('compare.pickCount', { selected: selected.size, retained: retained.size, total, limit }),
+    statuses.size ? t('compare.manualCount', { n: statuses.size }) : '',
+  ].filter(Boolean).join(' · ');
+  document.getElementById('comparePickPage').textContent = t('compare.pickPage',
+    { page: selectionPage + 1, pages: Math.max(1, Math.ceil(list.length / pageSize)), n: list.length });
   document.getElementById('comparePickPrev').disabled = selectionPage === 0;
   document.getElementById('comparePickNext').disabled = (selectionPage + 1) * pageSize >= list.length;
   pickApply.disabled = applying || !selected.size || total > limit;
@@ -196,6 +200,13 @@ function cancelSelection() {
   closeModal();
   if (id) api.cancelComparison(id).catch(() => {});
 }
+document.addEventListener('callgraph:langchange', () => {
+  syncComparison(activeComparison);
+  if (!preview) return;
+  renderChangePoints();
+  renderSelection();
+  document.getElementById('comparePickWarningCount').textContent = t('compare.mappingsCount', { n: preview.warnings?.length || 0 });
+});
 pickList?.addEventListener('change', (event) => {
   if (applying) return;
   if (event.target.dataset.statusId) {
@@ -264,7 +275,7 @@ pickApply?.addEventListener('click', async () => {
   pickError.textContent = '';
   try {
     const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds, statusOverrides: Object.fromEntries(statuses) });
-    if (!result?.ok) throw new Error(result?.error || '加入失败');
+    if (!result?.ok) throw new Error(result?.error || t('common.addFailed'));
     preview = null;
     activeComparison = result.comparison;
     syncComparison(activeComparison);
@@ -293,7 +304,7 @@ function openSelectionModal(data) {
   pickError.textContent = '';
   const warnings = preview.warnings || [];
   document.getElementById('comparePickWarnings').textContent = warnings.slice(0, 100).join('\n');
-  document.getElementById('comparePickWarningCount').textContent = `解析提示与文件映射（${warnings.length}）`;
+  document.getElementById('comparePickWarningCount').textContent = t('compare.mappingsCount', { n: warnings.length });
   changePoints = buildChangePoints();
   renderChangePoints();
   resetSelectionPage();
@@ -353,7 +364,7 @@ startBtn?.addEventListener('click', async () => {
   try {
     const result = await api.compare(paths);
     if (!result || result.ok === false) throw new Error(result?.error || t('compare.failed'));
-    if (!result.preview) throw new Error('没有收到比较预览');
+    if (!result.preview) throw new Error(t('compare.noPreview'));
     if (comparePane?.hidden || !startBtn.closest('.modal')?.classList.contains('show')) {
       await api.cancelComparison(result.preview.id);
       return;
@@ -415,7 +426,7 @@ export function syncComparison(comparison) {
       summaryEl.title = [activeComparison.projectPath, activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
       if (activeComparison.warnings?.length) summaryEl.textContent += ' · ' + t('compare.warningCount', { n: activeComparison.warnings.length });
       if (activeComparison.truncated) summaryEl.textContent += ' · ' + t('compare.truncated');
-      if (activeComparison.manualStatusCount) summaryEl.textContent += ` · 手动状态 ${activeComparison.manualStatusCount} 项`;
+      if (activeComparison.manualStatusCount) summaryEl.textContent += ' · ' + t('compare.manualCount', { n: activeComparison.manualStatusCount });
     }
   }
   if (exitBtn) exitBtn.hidden = !enabled;

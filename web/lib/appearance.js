@@ -1,3 +1,4 @@
+import { getLang, setLang, SUPPORTED_LANGS, t } from '../i18n.js';
 /**
  * 样式设置面板：调整画布 / 连线 / 函数框 / 分组容器的颜色与虚实线型。
  * 单一数据源是 state.js 的 THEME——画布、图例、SVG 导出、离线导出全读它，
@@ -38,39 +39,39 @@ const PALETTE = [
 ];
 
 const SEMANTICS = [
-  { path: 'fill.existing', label: '既存', detail: '未修改' },
-  { path: 'fill.modified', label: '变更', detail: '修改' },
-  { path: 'fill.added', label: '追加', detail: '新增' },
-  { path: 'fill.deleted', label: '删除' },
+  { path: 'fill.existing', label: 'compare.version.existing', detail: 'status.existing' },
+  { path: 'fill.modified', label: 'compare.version.modified' },
+  { path: 'fill.added', label: 'compare.version.added' },
+  { path: 'fill.deleted', label: 'compare.version.deleted' },
 ];
 
 const SECTIONS = [
   {
-    title: '节点',
+    title: 'style.nodes',
     items: [
-      { path: 'node.border', label: '函数框描边', kind: 'line' },
-      { path: 'node.fnDash', label: '函数框线型', kind: 'toggle' },
-      { path: 'node.varBorder', label: '变量框描边', kind: 'line' },
-      { path: 'node.varDash', label: '变量框线型', kind: 'toggle' },
-      { path: 'node.selected', label: '选中描边', kind: 'line' },
-      { path: 'node.external', label: '外部符号底色' },
+      { path: 'node.border', label: 'style.fnBorder', kind: 'line' },
+      { path: 'node.fnDash', label: 'style.fnDash', kind: 'toggle' },
+      { path: 'node.varBorder', label: 'style.varBorder', kind: 'line' },
+      { path: 'node.varDash', label: 'style.varDash', kind: 'toggle' },
+      { path: 'node.selected', label: 'style.selectedBorder', kind: 'line' },
+      { path: 'node.external', label: 'style.externalFill' },
     ],
   },
   {
-    title: '连线',
+    title: 'style.edges',
     items: [
-      { path: 'edge.call', label: '函数调用', kind: 'line' },
-      { path: 'edge.var', label: '数据流', kind: 'dash' },
-      { path: 'edge.added', label: '新增连线', kind: 'line' },
-      { path: 'edge.manual', label: '手动连线预览', kind: 'dash' },
+      { path: 'edge.call', label: 'legend.call', kind: 'line' },
+      { path: 'edge.var', label: 'style.dataFlow', kind: 'dash' },
+      { path: 'edge.added', label: 'style.newEdge', kind: 'line' },
+      { path: 'edge.manual', label: 'style.manualPreview', kind: 'dash' },
     ],
   },
   {
-    title: '画布与容器',
+    title: 'style.containers',
     items: [
-      { path: 'bg', label: '画布背景' },
-      { path: 'container.fill', label: '容器底色' },
-      { path: 'container.stroke', label: '容器描边', kind: 'line' },
+      { path: 'bg', label: 'style.canvasBg' },
+      { path: 'container.fill', label: 'style.containerFill' },
+      { path: 'container.stroke', label: 'style.containerBorder', kind: 'line' },
     ],
   },
 ];
@@ -83,9 +84,9 @@ const flatten = (obj, prefix = '') =>
 
 const DEFAULT_COLORS = Object.fromEntries(flatten(DEFAULTS).filter(([, value]) => typeof value === 'string'));
 const PRESETS = [
-  { label: '默认工程风', colors: DEFAULT_COLORS },
+  { label: 'style.defaultPreset', colors: DEFAULT_COLORS },
   {
-    label: '纯白打印风',
+    label: 'style.printPreset',
     colors: {
       ...DEFAULT_COLORS,
       bg: '#FFFFFF',
@@ -100,7 +101,7 @@ const PRESETS = [
     },
   },
   {
-    label: '柔和护眼风',
+    label: 'style.softPreset',
     colors: {
       ...DEFAULT_COLORS,
       bg: '#F7F5EE',
@@ -127,12 +128,13 @@ function persist() {
 /* ---------- 预览与控件 ---------- */
 
 function colorControl({ path, label, detail, kind = 'box' }) {
+  const name = t(label);
   return `<span class="appearance-color">
-    <button type="button" data-color="${path}" aria-label="${esc(label)}配色" aria-haspopup="dialog">
+    <button type="button" data-color="${path}" aria-label="${esc(t('style.colorFor', { label: name }))}" aria-haspopup="dialog">
       <i class="appearance-swatch ${kind}" aria-hidden="true"></i>
-      <span>${esc(label)}${detail ? `<small>${esc(detail)}</small>` : ''}</span>
+      <span>${esc(name)}${detail ? `<small>${esc(t(detail))}</small>` : ''}</span>
     </button>
-    <input type="color" class="sw-picker" tabindex="-1" data-path="${path}" aria-label="${esc(label)}自定义颜色">
+    <input type="color" class="sw-picker" tabindex="-1" data-path="${path}" aria-label="${esc(name + ' · ' + t('style.customColor'))}">
   </span>`;
 }
 
@@ -193,7 +195,7 @@ function openPalette(body, anchor) {
           `<button type="button" class="pal-chip${c.toLowerCase() === current ? ' cur' : ''}" data-c="${c}" aria-label="${c}" title="${c}" style="background:${c}"></button>`
       ).join('')}
     </div>
-    <button type="button" class="pal-custom">自定义颜色…</button>`;
+    <button type="button" class="pal-custom">${t('style.customColorMore')}</button>`;
   palEl.addEventListener('click', (e) => e.stopPropagation());
   palEl.querySelectorAll('.pal-chip').forEach((chip) => {
     chip.addEventListener('click', () => {
@@ -257,11 +259,11 @@ function depthRow(direction, label) {
     <span id="${id}Label">${label}</span>
     <div class="appearance-depth-options">
       <div class="appearance-segment" role="group" aria-labelledby="${id}Label">
-        ${[0, 1, 2, 3].map((n) => `<button type="button" data-depth="${direction}" value="${n}">${n}层</button>`).join('')}
+        ${[0, 1, 2, 3].map((n) => `<button type="button" data-depth="${direction}" value="${n}">${t('expand.layers', { n })}</button>`).join('')}
       </div>
-      <select id="${id}" data-depth="${direction}" aria-label="${label}：更多层数">
-        <option value="" disabled hidden>更多层数</option>
-        ${Array.from({ length: 17 }, (_, n) => `<option value="${n + 4}">${n + 4}层</option>`).join('')}
+      <select id="${id}" data-depth="${direction}" aria-label="${esc(label + ' · ' + t('style.moreDepth'))}">
+        <option value="" disabled hidden>${t('style.moreDepth')}</option>
+        ${Array.from({ length: 17 }, (_, n) => `<option value="${n + 4}">${t('expand.layers', { n: n + 4 })}</option>`).join('')}
       </select>
     </div>
   </div>`;
@@ -269,14 +271,14 @@ function depthRow(direction, label) {
 
 function advancedSection({ title, items }) {
   return `<section>
-    <h4>${esc(title)}</h4>
+    <h4>${esc(t(title))}</h4>
     <div class="appearance-advanced-grid">
       ${items.map((item) => item.kind === 'toggle'
         ? `<div class="appearance-line-type">
-            <span id="${item.path}Label">${esc(item.label)}</span>
+            <span id="${item.path}Label">${esc(t(item.label))}</span>
             <div class="appearance-segment" role="group" aria-labelledby="${item.path}Label">
-              <button type="button" data-flag="${item.path}" value="true">虚线框</button>
-              <button type="button" data-flag="${item.path}" value="false">实线框</button>
+              <button type="button" data-flag="${item.path}" value="true">${t('style.dashed')}</button>
+              <button type="button" data-flag="${item.path}" value="false">${t('style.solid')}</button>
             </div>
           </div>`
         : colorControl(item)).join('')}
@@ -284,23 +286,23 @@ function advancedSection({ title, items }) {
   </section>`;
 }
 
-const PREVIEW = `
+const previewMarkup = () => `
   <div class="appearance-preview">
     <div class="appearance-preview-group">
       <div class="appearance-preview-graph">
-        <span class="appearance-preview-node existing">既存函数</span>
-        <span class="appearance-preview-edge call">调用<i aria-hidden="true"></i></span>
-        <span class="appearance-preview-node modified">变更函数</span>
-        <span class="appearance-preview-edge data">数据流<i aria-hidden="true"></i></span>
-        <span class="appearance-preview-node variable">全局变量</span>
+        <span class="appearance-preview-node existing">${t('style.existingFn')}</span>
+        <span class="appearance-preview-edge call">${t('legend.call')}<i aria-hidden="true"></i></span>
+        <span class="appearance-preview-node modified">${t('style.modifiedFn')}</span>
+        <span class="appearance-preview-edge data">${t('style.dataFlow')}<i aria-hidden="true"></i></span>
+        <span class="appearance-preview-node variable">${t('vars.global')}</span>
       </div>
     </div>
     <div class="appearance-preview-samples">
-      <span class="appearance-preview-node external">外部符号</span>
-      <span class="appearance-preview-node added">追加</span>
-      <span class="appearance-preview-node deleted">删除</span>
-      <span class="appearance-preview-edge new-line"><i aria-hidden="true"></i>新增连线</span>
-      <span class="appearance-preview-edge manual"><i aria-hidden="true"></i>手动连线</span>
+      <span class="appearance-preview-node external">${t('node.external')}</span>
+      <span class="appearance-preview-node added">${t('compare.version.added')}</span>
+      <span class="appearance-preview-node deleted">${t('compare.version.deleted')}</span>
+      <span class="appearance-preview-edge new-line"><i aria-hidden="true"></i>${t('style.newEdge')}</span>
+      <span class="appearance-preview-edge manual"><i aria-hidden="true"></i>${t('style.manualEdge')}</span>
     </div>
   </div>`;
 
@@ -488,12 +490,12 @@ async function savePreferences(body, prefs, reset = false) {
   const status = body.querySelector('#appearanceStatus');
   const focused = document.activeElement;
   savingPrefs = true;
-  status.textContent = '正在保存…';
+  status.textContent = t('common.saving');
   status.classList.remove('error');
   syncPrefControls(body);
   try {
     const result = await api.setUiPrefs(prefs);
-    if (!result?.ok) throw new Error(result?.error || '保存失败，请重试');
+    if (!result?.ok) throw new Error(result?.error || t('common.retrySave'));
     if (prefs.up !== undefined) state.addDepths = { up: prefs.up, down: prefs.down };
     if (prefs.macroNameMode) applyMacroNameMode(prefs.macroNameMode);
     if (reset) {
@@ -504,7 +506,7 @@ async function savePreferences(body, prefs, reset = false) {
     }
     if (reset || (prefs.macroNameMode && state.view)) draw();
     if (prefs.macroNameMode && state.view && state.selected) hooks.renderDetail(state.selected);
-    status.textContent = reset ? '已恢复默认设置' : '已保存';
+    status.textContent = reset ? t('style.resetDone') : t('common.saved');
   } catch (err) {
     status.textContent = err.message;
     status.classList.add('error');
@@ -530,40 +532,48 @@ function selectTab(body, id) {
 
 function render(body) {
   installPanelStyle();
+  const languageNames = { 'zh-CN': '简体中文', ja: '日本語', en: 'English' };
   body.innerHTML = `
-    <div class="appearance-tabs" role="tablist" aria-label="显示与样式设置">
-      <button type="button" role="tab" id="appearanceGeneralTab" aria-controls="appearanceGeneral">通用与行为</button>
-      <button type="button" role="tab" id="appearanceCanvasTab" aria-controls="appearanceCanvas">画布配色与线型</button>
+    <div class="appearance-tabs" role="tablist" aria-label="${t('style.title')}">
+      <button type="button" role="tab" id="appearanceGeneralTab" aria-controls="appearanceGeneral">${t('style.tabs.general')}</button>
+      <button type="button" role="tab" id="appearanceCanvasTab" aria-controls="appearanceCanvas">${t('style.tabs.canvas')}</button>
     </div>
     <div id="appearanceGeneral" class="appearance-panel" role="tabpanel" aria-labelledby="appearanceGeneralTab">
       <section class="appearance-card">
-        <h3>添加关系默认展开深度</h3>
-        <p>用于“挑选调用关系”预览时的默认初始层数。</p>
-        ${depthRow('up', '↑ 向上查调用方')}
-        ${depthRow('down', '↓ 向下查被调函数')}
-      </section>
-      <section class="appearance-card">
-        <h3 id="appearanceMacroTitle">宏函数节点显示名称</h3>
-        <div class="appearance-segment appearance-choices" role="group" aria-labelledby="appearanceMacroTitle">
-          <button type="button" data-macro-mode value="alias">显示宏别名<small>例如 #define 名称</small></button>
-          <button type="button" data-macro-mode value="target">显示实际函数名<small>展开后的目标函数</small></button>
+        <h3 id="appearanceLanguage">${t('style.language')}</h3>
+        <div class="appearance-segment" role="group" aria-labelledby="appearanceLanguage">
+          ${SUPPORTED_LANGS.map(lang => `<button type="button" data-language="${lang}" lang="${lang}"
+            aria-pressed="${lang === getLang()}">${languageNames[lang]}</button>`).join('')}
         </div>
       </section>
       <section class="appearance-card">
-        <h3 id="appearanceMotionTitle">连线选中动效</h3>
+        <h3>${t('style.addDepth')}</h3>
+        <p>${t('style.addDepthHint')}</p>
+        ${depthRow('up', t('style.findCallers'))}
+        ${depthRow('down', t('style.findCallees'))}
+      </section>
+      <section class="appearance-card">
+        <h3 id="appearanceMacroTitle">${t('style.macroTitle')}</h3>
+        <div class="appearance-segment appearance-choices" role="group" aria-labelledby="appearanceMacroTitle">
+          <button type="button" data-macro-mode value="alias">${t('style.macroAlias')}<small>${t('style.macroAliasHint')}</small></button>
+          <button type="button" data-macro-mode value="target">${t('style.macroTarget')}<small>${t('style.macroTargetHint')}</small></button>
+        </div>
+      </section>
+      <section class="appearance-card">
+        <h3 id="appearanceMotionTitle">${t('style.motionTitle')}</h3>
         <div class="appearance-segment appearance-choices" role="group" aria-labelledby="appearanceMotionTitle">
-          <button type="button" data-flag="edge.selPulse" value="true">流动脉冲动画<small>沿调用方向流动</small></button>
-          <button type="button" data-flag="edge.selPulse" value="false">静态高亮<small>低占用、无动画</small></button>
+          <button type="button" data-flag="edge.selPulse" value="true">${t('style.motionPulse')}<small>${t('style.motionPulseHint')}</small></button>
+          <button type="button" data-flag="edge.selPulse" value="false">${t('style.motionStatic')}<small>${t('style.motionStaticHint')}</small></button>
         </div>
       </section>
     </div>
     <div id="appearanceCanvas" class="appearance-panel" role="tabpanel" aria-labelledby="appearanceCanvasTab" hidden>
       <section class="appearance-card">
-        <h3>画布预览</h3>
-        ${PREVIEW}
+        <h3>${t('style.preview')}</h3>
+        ${previewMarkup()}
       </section>
       <section class="appearance-card">
-        <h3>配色预设</h3>
+        <h3>${t('style.presets')}</h3>
         <div class="appearance-presets">
           ${PRESETS.map(({ label, colors }, index) => `
             <button type="button" data-preset="${index}">
@@ -571,22 +581,25 @@ function render(body) {
                 <i style="background:${colors['fill.existing']}"></i>
                 <i style="background:${colors['fill.modified']}"></i>
                 <i style="background:${colors['fill.added']}"></i>
-              </span>${label}
+              </span>${t(label)}
             </button>`).join('')}
         </div>
       </section>
       <section class="appearance-card">
-        <h3>变更状态配色</h3>
+        <h3>${t('style.statusPalette')}</h3>
         <div class="appearance-semantics">${SEMANTICS.map(colorControl).join('')}</div>
       </section>
       <details class="appearance-card appearance-advanced">
-        <summary>高级：边框线型、连线与容器配色</summary>
+        <summary>${t('style.advanced')}</summary>
         ${SECTIONS.map(advancedSection).join('')}
       </details>
     </div>
     <div id="appearanceStatus" role="status"></div>`;
 
   const tabs = [...body.querySelectorAll('[role="tab"]')];
+  body.querySelectorAll('[data-language]').forEach(button => {
+    button.addEventListener('click', () => setLang(button.dataset.language));
+  });
   tabs.forEach((tab, index) => {
     tab.addEventListener('click', () => selectTab(body, tab.id));
     tab.addEventListener('keydown', (event) => {
@@ -634,6 +647,16 @@ function render(body) {
 
 const body = document.getElementById('styleBody');
 const btn = document.getElementById('styleBtn');
+document.addEventListener('callgraph:langchange', () => {
+  if (!body?.querySelector('.appearance-tabs')) return;
+  const tab = body.querySelector('[aria-selected="true"]')?.id || 'appearanceGeneralTab';
+  const focusedLanguage = document.activeElement?.dataset.language;
+  render(body);
+  selectTab(body, tab);
+  syncPrefControls(body);
+  syncThemeControls(body);
+  if (focusedLanguage) body.querySelector(`[data-language="${getLang()}"]`)?.focus();
+});
 btn?.addEventListener('click', async () => {
   if (!body) return;
   if (!savingPrefs) {

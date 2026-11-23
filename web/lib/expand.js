@@ -30,8 +30,9 @@ function syncPickCount() {
   pickAll.indeterminate = selected.length > 0 && selected.length < inputs.length;
   pickAll.disabled = !inputs.length;
   pickApply.disabled = !selected.length && !missingEdges.length;
-  const additions = [count && `${count} 个函数`, varCount && `${varCount} 个变量`].filter(Boolean).join('、');
-  pickApply.textContent = additions ? `确认添加 ${additions}` : missingEdges.length ? `确认补充 ${missingEdges.length} 条关系` : '确认添加';
+  const additions = [count && t('common.functionCount', { n: count }), varCount && t('common.variableCount', { n: varCount })].filter(Boolean).join(' · ');
+  pickApply.textContent = additions ? t('expand.confirmCount', { items: additions })
+    : missingEdges.length ? t('expand.confirmLinks', { n: missingEdges.length }) : t('callOrder.apply');
   for (const button of pickList.querySelectorAll('[data-pick-group]')) {
     const rows = button.closest('section').querySelectorAll('input');
     button.textContent = t([...rows].every(row => row.checked) ? 'expand.clearGroup' : 'expand.selectGroup');
@@ -139,8 +140,8 @@ function renderRecommendations(fn, view, dataflow, shown) {
     if (!peers.length) return '';
     const writes = v.mode === 'write';
     const rows = peers.map(peer => pickRow(peer, { group: v.mode, varId: v.id, version: v.version, chips: [
-        chip(writes ? '读变量' : '写变量'),
-        shown.has(peer.id) ? chip('已在画布') : '',
+        chip(writes ? t('expand.readVar') : t('expand.writeVar')),
+        shown.has(peer.id) ? chip(t('compare.inCanvas')) : '',
       ].filter(Boolean) })).join('');
     const { write, read } = accessByVariable.get(`${v.version || ''}|${v.id}`);
     return `<div class="function-pick-context"><b>${esc(v.name)}</b>
@@ -201,22 +202,22 @@ async function loadPreview() {
   pickList.replaceChildren();
   missingEdges = [];
   syncPickCount();
-  pickMessage.textContent = '正在查找，画布尚未改动…';
+  pickMessage.textContent = t('expand.previewLoading');
   try {
     const [view, dataflow] = await Promise.all([
       api.view({ root: fn.id, up, down, group: false, at: state.at, preview: true }),
       api.dataflow(fn.id, 'both').catch(() => null),
     ]);
     if (seq !== previewSequence || !pickModal.classList.contains('show')) return;
-    if (!Array.isArray(view.nodes)) throw new Error(view.error || '查找失败，请重试');
-    if (state.view !== previewView || view.projectId !== previewView.projectId) throw new Error('画布已变化，请重新预览');
+    if (!Array.isArray(view.nodes)) throw new Error(view.error || t('expand.failed'));
+    if (state.view !== previewView || view.projectId !== previewView.projectId) throw new Error(t('common.viewChanged'));
     const shown = new Set(previewView.nodes.map((node) => node.id));
     const existingEdges = new Set(previewView.edges.map(edgeKey));
     missingEdges = view.edges.filter((edge) => shown.has(edge.from) && shown.has(edge.to) && !existingEdges.has(edgeKey(edge)));
     renderRecommendations(fn, view, dataflow, shown);
-    pickMessage.textContent = missingEdges.length ? `已有函数之间可补充 ${missingEdges.length} 条关系，取消不会改动画布`
-      : pickList.querySelector('input') ? (view.truncated ? '查找已达上限，可减少层数后重试' : '取消不会改动画布')
-      : '没有可添加的函数或变量';
+    pickMessage.textContent = missingEdges.length ? t('expand.linkPreview', { n: missingEdges.length })
+      : pickList.querySelector('input') ? (view.truncated ? t('expand.limit') : t('expand.cancelHint'))
+      : t('expand.noItems');
     syncPickCount();
   } catch (error) { if (seq === previewSequence) pickMessage.textContent = error.message; }
 }
@@ -266,7 +267,7 @@ pickAll?.addEventListener('change', () => {
 });
 pickApply?.addEventListener('click', async () => {
   if (pickApply.disabled) return;
-  if (state.view !== previewView) { pickMessage.textContent = '画布已变化，请重新预览'; return; }
+  if (state.view !== previewView) { pickMessage.textContent = t('common.viewChanged'); return; }
   const selected = [...pickList.querySelectorAll('input:checked')];
   const ids = [...new Set(selected.map(input => input.dataset.functionId))];
   const varIds = [...new Set(selected.map(input => input.dataset.varId).filter(Boolean))];
@@ -279,7 +280,7 @@ pickApply?.addEventListener('click', async () => {
   pickAll.disabled = true;
   pickControls.disabled = true;
   pickList.inert = true;
-  pickMessage.textContent = '正在加入…';
+  pickMessage.textContent = t('expand.adding');
   try {
     const edgeIds = edges.flatMap((edge) => [edge.from, edge.to]);
     for (const id of varIds) {
@@ -290,7 +291,7 @@ pickApply?.addEventListener('click', async () => {
     const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true, restoreHidden: false });
     const visible = new Set(view?.nodes.map(node => node.id));
     if (!view || ![...ids, ...varIds].every(id => visible.has(id)) ||
-        !edges.every(edge => view?.edges.some(item => edgeKey(item) === edgeKey(edge)))) throw new Error('加入失败，请重试');
+        !edges.every(edge => view?.edges.some(item => edgeKey(item) === edgeKey(edge)))) throw new Error(t('common.addFailed'));
     if (seq === previewSequence) closeModal();
   } catch (error) {
     if (state.view === originalView && state.vars === vars && state.hiddenVars === hiddenVars) {

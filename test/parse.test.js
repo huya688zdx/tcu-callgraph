@@ -197,6 +197,30 @@ test('子图将头文件 static inline 解析为工程内节点，外部调用�
   assert.deepEqual(externalRoot.edges.map(({ from, to }) => [from, to]), [[root, external]]);
 });
 
+test('头文件静态函数只对直接或间接包含该头文件的调用方可见', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-header-scope-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'include', 'driver'), { recursive: true });
+  const files = {
+    'include/driver/private.h': 'static inline int helper(void) { return 1; }\nstatic inline int scoped(void) { return 2; }',
+    'include/public.h': '#include "driver/private.h"\n',
+    'uses.c': '#include "private.h"\nint uses(void) { return helper(); }',
+    'transitive.c': '#include "include/public.h"\nint transitive(void) { return helper(); }',
+    'inactive.c': '#if 0\n#include "private.h"\n#endif\nint inactive(void) { return helper(); }',
+    'noinc.c': 'extern int helper(void);\nint noinc(void) { return helper(); }',
+    'linked.c': 'int scoped(void) { return 3; }',
+    'app.c': '#include "private.h"\nint app(void) { return scoped(); }',
+  };
+  for (const [file, source] of Object.entries(files)) fs.writeFileSync(path.join(dir, file), source);
+  const model = loadModel(dir);
+  const target = (name) => model._index.outAdj.get(`${name}.c::${name}`)[0].to;
+  assert.equal(target('uses'), 'include/driver/private.h::helper');
+  assert.equal(target('transitive'), 'include/driver/private.h::helper');
+  assert.equal(target('inactive'), 'ext::helper');
+  assert.equal(target('noinc'), 'ext::helper');
+  assert.equal(target('app'), 'include/driver/private.h::scoped');
+});
+
 test('DOT 端口不产生节点，引号内冒号保留', () => {
   const graph = parseDot('digraph { a:ne -> "b:c":port:sw; }');
   assert.deepEqual([...graph.nodes.keys()], ['a', 'b:c']);

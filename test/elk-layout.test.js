@@ -206,6 +206,18 @@ test('增量布局拒绝其他工程的画面坐标', async (t) => {
   assert.equal(response.status, 409);
 });
 
+test('增量布局拒绝损坏的空位快照', async (t) => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const url = srv.baseUrl + '/api/view?root=main.c::main';
+  const previous = await (await fetch(url)).json();
+  previous.layoutSlots = { nodes: [null], edges: [], groups: [], containers: [], width: 800, height: 600 };
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ previous }) });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /增量布局数据无效/);
+});
+
 test('变量关系可单独移出并恢复，不影响同一函数的其他变量引用', async (t) => {
   const srv = await launchServer({ target: 'samples/shared-state' });
   t.after(() => srv.close());

@@ -258,6 +258,43 @@ function sourceComparison(t, before, after) {
   return dirs;
 }
 
+test('提前返回条件变化会影响同块后续写入及其读者', async (t) => {
+  const before = `
+int g_shared;
+int g_other;
+void update(int x) {
+  g_other = 2;
+  if (x < 0) return;
+  { g_shared = 1; }
+}
+int read_shared(void) { return g_shared; }
+`;
+  const result = await compareProjects(...sourceComparison(t, before, before.replace('x < 0', 'x <= 0')));
+  const point = result.changePoints.find(({ id }) => id === 'work.c::update');
+  assert.ok(point.affectedIds.includes('var::g_shared'));
+  assert.ok(point.affectedIds.includes('work.c::read_shared'));
+  assert.ok(!point.affectedIds.includes('var::g_other'));
+});
+
+test('提前退出条件使用退出点的局部变量，循环内 break 不传播到循环外', async (t) => {
+  const before = `
+int g_shared;
+int g_unrelated;
+void update(int x) {
+  { int stop = x < 0; if (stop) return; }
+  g_shared = 1;
+}
+void process(int x) {
+  while (x) { if (x == 1) break; --x; }
+  g_unrelated = 1;
+}
+`;
+  const after = before.replace('x < 0', 'x <= 0').replace('x == 1', 'x == 2');
+  const { changePoints } = await compareProjects(...sourceComparison(t, before, after));
+  assert.ok(changePoints.find(({ id }) => id === 'work.c::update').affectedIds.includes('var::g_shared'));
+  assert.ok(!changePoints.find(({ id }) => id === 'work.c::process').affectedIds.includes('var::g_unrelated'));
+});
+
 test('纯 C 工程中 RTOS 延时宏从 20 ms 改为 10 ms，工作函数和下游函数均标记周期影响', async t => {
   const src = `
 #include "schedule.h"

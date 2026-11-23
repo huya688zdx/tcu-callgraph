@@ -19,7 +19,7 @@ const delays = new Map([
   ['vTaskDelay', 0], ['vTaskDelayUntil', 1], ['xTaskDelayUntil', 1], ['osDelay', 0],
 ]);
 
-export function collectTaskEvidence(fn, tokens) {
+export function collectTaskEvidence(fn, tokens, fileMacros) {
   const found = [];
   const intervals = [];
   let loopEnd = -1;
@@ -43,8 +43,12 @@ export function collectTaskEvidence(fn, tokens) {
     } else if (delays.has(api)) {
       const [args] = collectArgs(tokens, i + 1);
       const argument = args[delays.get(api)];
-      if (argument) intervals.push({ api, argument: argument.map(t => t.v), inLoop: i < loopEnd,
-        evidence: `${api} · ${fn.file}:${tokens[i].line}` });
+      if (argument) {
+        const delay = { api, argument: argument.map(t => t.v), inLoop: i < loopEnd,
+          evidence: `${api} · ${fn.file}:${tokens[i].line}` };
+        if (fileMacros) delay.resolved = resolveDelay(delay, name => fileMacros.get(name, tokens[i].line), fn.file);
+        intervals.push(delay);
+      }
     }
   }
   return found.length || intervals.length ? { registrations: found, intervals } : null;
@@ -80,7 +84,7 @@ function unwrap(tokens) {
   return tokens;
 }
 
-function numericConstant(tokens, macros, file) {
+function numericConstant(tokens, findMacro, file) {
   const seen = new Set();
   let value = unwrap(tokens);
   while (value.length === 1) {
@@ -89,7 +93,7 @@ function numericConstant(tokens, macros, file) {
       const number = text.replace(/[uUlL]+$/, '');
       return /^0[0-7]+$/.test(number) ? parseInt(number, 8) : Number(number);
     }
-    const macro = macros.get(text);
+    const macro = findMacro(text);
     if (!macro || macro.params !== null || seen.has(text) ||
         (macro.file !== file && !/\.(h|hh|hpp)$/i.test(macro.file))) break;
     seen.add(text);
@@ -98,31 +102,37 @@ function numericConstant(tokens, macros, file) {
   return null;
 }
 
+function resolveDelay({ api, argument, inLoop }, findMacro, file) {
+  const arg = unwrap(argument);
+  let ms = [];
+  let budget = false;
+  let requiresCmsisMillis = false;
+  if (arg[0] === 'pdMS_TO_TICKS' && arg[1] === '(') {
+    ms = arg.slice(1);
+  } else if (arg.at(-2) === '/' && arg.at(-1) === 'portTICK_PERIOD_MS') {
+    const numerator = unwrap(arg.slice(0, -2));
+    // 周期预算减去本轮耗时，例如 (STEP_TIME - elapsed) / portTICK_PERIOD_MS。
+    let depth = 0;
+    const minus = numerator.findIndex(token => {
+      if (token === '(') depth++;
+      if (token === ')') depth--;
+      return !depth && token === '-';
+    });
+    budget = inLoop && arg[0] === '(' && minus > 0 &&
+      numerator.slice(minus + 1).some(token => /^[A-Za-z_]\w*$/.test(token) && numericConstant([token], findMacro, file) === null);
+    ms = budget ? numerator.slice(0, minus) : numerator;
+  } else if (api === 'osDelay') {
+    ms = arg;
+    requiresCmsisMillis = true;
+  }
+  const us = numericConstant(ms, findMacro, file) * 1000;
+  return { us: Number.isSafeInteger(us) && us > 0 ? us : null, budget, requiresCmsisMillis };
+}
+
 function delayInterval(fn, delays, macros, cmsisMillis) {
-  const intervals = delays.map(({ api, argument, evidence, inLoop }) => {
-    const arg = unwrap(argument);
-    let ms = [];
-    let budget = false;
-    if (arg[0] === 'pdMS_TO_TICKS' && arg[1] === '(') {
-      ms = arg.slice(1);
-    } else if (arg.at(-2) === '/' && arg.at(-1) === 'portTICK_PERIOD_MS') {
-      const numerator = unwrap(arg.slice(0, -2));
-      // 周期预算减去本轮耗时，例如 (STEP_TIME - elapsed) / portTICK_PERIOD_MS。
-      let depth = 0;
-      const minus = numerator.findIndex(token => {
-        if (token === '(') depth++;
-        if (token === ')') depth--;
-        return !depth && token === '-';
-      });
-      budget = inLoop && arg[0] === '(' && minus > 0 &&
-        numerator.slice(minus + 1).some(token => /^[A-Za-z_]\w*$/.test(token) &&
-          numericConstant([token], macros, fn.file) === null);
-      ms = budget ? numerator.slice(0, minus) : numerator;
-    } else if (api === 'osDelay' && cmsisMillis) {
-      ms = arg;
-    }
-    const us = numericConstant(ms, macros, fn.file) * 1000;
-    return { us: Number.isSafeInteger(us) && us > 0 ? us : null, evidence, budget };
+  const intervals = delays.map(delay => {
+    const { us, budget, requiresCmsisMillis } = delay.resolved ?? resolveDelay(delay, name => macros.get(name), fn.file);
+    return { us: requiresCmsisMillis && !cmsisMillis ? null : us, budget, evidence: delay.evidence };
   });
   // 明确的循环预算优先于分支中的等待，例如诊断暂停时的 tick 延时。
   const budgets = intervals.filter(delay => delay.budget && delay.us);

@@ -48,8 +48,8 @@ function timingSummary(fn, entries, comparison) {
   }
   changed ||= [...byParticipant.values()].some(({ before, after }) => before != null && after != null && before !== after);
   const badges = [
-    crossPeriods.size > 1 && `⏱ 跨周期数据流: ${[...crossPeriods].join(' ↔ ')}`,
-    changed && '⏱ 周期变化影响',
+    crossPeriods.size > 1 && t('df.crossPeriod', { periods: [...crossPeriods].join(' ↔ ') }),
+    changed && t('df.periodImpact'),
   ].filter(Boolean);
   return badges.map((label) => `<span class="compare-badge period">${esc(label)}</span>`).join(' ');
 }
@@ -95,11 +95,11 @@ function renderDataflowResult(error = '') {
       const variableVersion = versionLabel(v.version);
       const peerVersion = versionLabel(peer.version);
       const period = periodCaption(periodNode(peer), comparison);
-      const hint = comparison ? '加入当前图' : t('df.toggleHint');
+      const hint = comparison ? t('common.relAdd') : t('df.toggleHint');
       const html = `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
         <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
         <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
-        ${period ? `<span class="compare-badge period" title="任务周期">${esc(period)}</span>` : ''}
+        ${period ? `<span class="compare-badge period" title="${t('df.period')}">${esc(period)}</span>` : ''}
         ${line ? `<span class="df-access-line">:${line}</span>` : ''}
         <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
         ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
@@ -118,7 +118,7 @@ function renderDataflowResult(error = '') {
   };
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
-    <div class="df-actions"><button class="primary" data-df="toggle">加入当前图</button>
+    <div class="df-actions"><button class="primary" data-df="toggle">${t('common.relAdd')}</button>
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -126,6 +126,8 @@ function renderDataflowResult(error = '') {
     ${res.truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}`);
   filterResults();
 }
+
+document.addEventListener('callgraph:langchange', () => renderDataflowResult());
 
 /** 原地筛选，不改变输入焦点或画布。 */
 function filterResults() {
@@ -150,7 +152,7 @@ function filterResults() {
   const button = panel.querySelector('[data-df="toggle"]');
   const comparing = Boolean(comparisonInfo());
   button.disabled = updating || !chosen || (comparing && present);
-  button.textContent = present ? t(comparing ? 'compare.inCanvas' : 'df.remove') : '加入当前图';
+  button.textContent = present ? t(comparing ? 'compare.inCanvas' : 'df.remove') : t('common.relAdd');
   panel.querySelector('[data-df-total]').textContent = query ? `${visible.length}/${labels.length}` : t('df.summary', { n: labels.length });
   panel.querySelector('[data-df-empty]').hidden = !!visible.length;
 }

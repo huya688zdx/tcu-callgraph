@@ -389,17 +389,36 @@ function timelineEvent({ before, after, ...event }, withPayload) {
 
 const callRank = { direct: 3, macro: 2, fnptr: 1 };
 const callLabelOrder = (text) => Number(/^コール順(\d+)$/.exec(text)?.[1]);
+const mcpSourceEdgeIndexes = new WeakMap();
 
-function mcpEdgeIndex() {
+function indexSourceEdges(edges) {
   const exact = new Map();
   const pairs = new Map();
-  for (const edge of MODEL.edges) {
-    exact.set(edgeKeyOf(edge), edge);
+  for (const edge of edges) {
+    const key = edgeKeyOf(edge);
+    if (!exact.has(key)) exact.set(key, edge);
     const pair = `${edge.from}->${edge.to}`;
     const prev = pairs.get(pair);
     if (!prev || (callRank[edge.kind] ?? 0) > (callRank[prev.kind] ?? 0)) pairs.set(pair, edge);
   }
-  return { exact, resolve: (key) => exact.get(key) || pairs.get(key) };
+  return { exact, pairs };
+}
+
+function mcpEdgeIndex() {
+  const edges = MODEL.edges;
+  // 数据流分析重建边数组时，新的引用会自动触发索引重建。
+  if (!mcpSourceEdgeIndexes.has(edges)) mcpSourceEdgeIndexes.set(edges, indexSourceEdges(edges));
+  const source = mcpSourceEdgeIndexes.get(edges);
+  const manual = new Map();
+  for (const slot of Object.values(overlay.layout || {})) {
+    for (const edge of slot?.manual || []) {
+      if (!MODEL._index.byId.has(edge?.from) || !MODEL._index.byId.has(edge?.to)) continue;
+      const entry = { from: edge.from, to: edge.to, line: 0, kind: 'manual' };
+      manual.set(edgeKeyOf(entry), entry);
+    }
+  }
+  const exact = key => source.exact.get(key) || manual.get(key);
+  return { exact, resolve: key => exact(key) || source.pairs.get(key) || manual.get(`${key}:0`) };
 }
 
 function normalizeAiLabel(raw) {
@@ -430,7 +449,7 @@ function normalizeAiLabel(raw) {
 function checkAiCallOrders(index, updates) {
   const pending = new Map();
   for (const [key, labels] of updates) {
-    const edge = index.exact.get(key);
+    const edge = index.exact(key);
     if (!edge) continue;
     for (const label of labels || []) {
       const order = callLabelOrder(label.text);
@@ -476,10 +495,14 @@ async function readMcpSource(q) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
   const realRoot = fs.realpathSync(model.root);
-  const realFile = fs.realpathSync(path.join(realRoot, file));
-  const rel = path.relative(realRoot, realFile);
-  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel) || !fs.statSync(realFile).isFile()) {
-    throw new Error('源码文件必须位于当前工程根目录内');
+  const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
+  const roots = comparison ? [realRoot, comparison.beforePath, comparison.afterPath] : [realRoot];
+  const withinRoots = roots.some(root => {
+    const rel = path.relative(root, realFile);
+    return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+  });
+  if (!withinRoots || !fs.statSync(realFile).isFile()) {
+    throw new Error('源码文件必须位于当前工程或对照目录内');
   }
   const lines = decodeSource(fs.readFileSync(realFile)).split(/\r\n|\n|\r/);
   if (lines.at(-1) === '') lines.pop();
@@ -539,17 +562,20 @@ function composeMcpView(p) {
   const saved = store.getSetting(key);
   const before = pageState?.roots.length && !pageState.reviewing ? { ...saved, ...pageState } : saved;
   const prior = mode === 'add' ? before : null;
-  const allRoots = [...new Set([...(prior?.roots || []), ...roots])];
+  const keepRoots = Boolean(prior?.roots?.length);
+  const allRoots = keepRoots ? prior.roots : [...new Set(roots)];
   if (!allRoots.length) allRoots.push(functions[0]);
-  // 追加时保留原入口的展开深度，新入口仍按本次指定的深度展开。
-  const oldScopes = (prior?.roots || []).filter((root) => prior.up > up || prior.down > down)
-    .map((root) => ({ root, up: prior.up, down: prior.down }));
+  // 保留画布入口和全局深度，追加入口用各自的局部深度。
+  const existing = new Set([...allRoots, ...(prior?.expansions || []).map(scope => scope.root)]);
+  const addedScopes = keepRoots ? [...new Set(roots)].filter(root => !existing.has(root)).map(root => ({ root, up, down })) : [];
   const expansions = normalizeExpansions([
-    ...(prior?.expansions || []), ...oldScopes,
-    ...[...allRoots.slice(1), ...functions].map((root) => ({ root, up: 0, down: 0 })),
+    ...(prior?.expansions || []), ...addedScopes,
+    ...[...(keepRoots ? [] : allRoots.slice(1)), ...functions].map((root) => ({ root, up: 0, down: 0 })),
   ]);
   const page = {
-    projectId: PROJECT.id, roots: allRoots, expansions, up, down,
+    projectId: PROJECT.id, roots: allRoots, expansions,
+    up: keepRoots ? prior.up : roots.length ? up : 0,
+    down: keepRoots ? prior.down : roots.length ? down : 0,
     group: before?.group ?? true,
     vars: [...new Set([...(prior?.vars || []), ...vars])],
     hiddenVars: (prior?.hiddenVars || []).filter((id) => !vars.includes(id)),
@@ -1956,19 +1982,21 @@ const server = http.createServer(async (req, res) => {
         if (body.previous == null && !body.expansions?.length && !bodyRoots?.length) return bad(res, '缺少增量布局、局部展开或入口参数');
         previous = body.previous;
         if (previous != null) {
-          const rect = (n) => n && typeof n.id === 'string' &&
-            [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
-          if (!Array.isArray(previous.nodes) || !Array.isArray(previous.edges) ||
-              !Array.isArray(previous.groups) || !Array.isArray(previous.containers) ||
-              ![previous.width, previous.height].every(Number.isFinite) ||
-              ![...previous.nodes, ...previous.groups, ...previous.containers].every(rect)) {
-            return bad(res, '增量布局数据无效');
-          }
-          const ids = new Set(previous.nodes.map((n) => n.id));
-          if (!previous.edges.every((e) => e && ids.has(e.from) && ids.has(e.to) &&
-              Array.isArray(e.points) && e.points.length >= 2 &&
-              e.points.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
-            return bad(res, '增量布局连线无效');
+          for (const snapshot of [previous, previous.layoutSlots].filter(item => item != null)) {
+            const rect = n => n && typeof n.id === 'string' &&
+              [n.x, n.y, n.w, n.h].every(Number.isFinite) && n.w > 0 && n.h > 0;
+            if (!Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.edges) ||
+                !Array.isArray(snapshot.groups) || !Array.isArray(snapshot.containers) ||
+                ![snapshot.width, snapshot.height].every(Number.isFinite) ||
+                ![...snapshot.nodes, ...snapshot.groups, ...snapshot.containers].every(rect)) {
+              return bad(res, '增量布局数据无效');
+            }
+            const ids = new Set(snapshot.nodes.map(n => n.id));
+            if (!snapshot.edges.every(e => e && ids.has(e.from) && ids.has(e.to) &&
+                Array.isArray(e.points) && e.points.length >= 2 &&
+                e.points.every(p => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)))) {
+              return bad(res, '增量布局连线无效');
+            }
           }
           const sameComparison = previous.comparisonId === COMPARISON?.id ||
             (COMPARISON && previous.comparisonId === COMPARISON.previousComparisonId);

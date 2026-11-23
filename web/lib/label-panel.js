@@ -31,7 +31,7 @@ import {
 import { hooks } from './hooks.js';
 import { statusControl, bindStatusControl } from './change-status.js';
 
-const LABEL_NAMES = { call: '调用顺序', task: 'TASK 周期', conn: '结合点', custom: '自定义标签' };
+const LABEL_NAMES = { call: 'label.callOrder', task: 'label.taskPeriod', conn: 'label.conn', custom: 'label.custom' };
 const TRUNK_ARROWS = { forward: '→', reverse: '←', both: '↔', unknown: '—' };
 
 const selectedId = (edge) => {
@@ -88,7 +88,7 @@ async function commit(edge, projectId = state.view?.projectId) {
     if (state.view?.projectId === projectId) pushHistory();
     return true;
   } catch (error) {
-    alert(`标签未保存：${error.message}`);
+    alert(t('label.notSaved', { error: error.message }));
     return false;
   }
 }
@@ -110,12 +110,12 @@ async function removeLabel(edge, id) {
       const changes = await afterConnDelete();
       if (changes.length) {
         const result = await api.renumberConns(changes);
-        if (!result?.ok) throw new Error(result?.error || '结合点重排失败');
+        if (!result?.ok) throw new Error(result?.error || t('label.renumberFailed'));
         if (hooks.reloadKeepCam) await hooks.reloadKeepCam();
       }
     }
   } catch (error) {
-    alert(`标签保存或重排失败：${error.message}`);
+    alert(t('label.reorderSaveFailed', { error: error.message }));
   }
 }
 
@@ -155,7 +155,7 @@ async function addLabel(edge, preset, num) {
     await persistLabels(edge);
     pushHistory();
   } catch (error) {
-    alert(`标签未保存：${error.message}`);
+    alert(t('label.notSaved', { error: error.message }));
   }
 }
 
@@ -256,11 +256,11 @@ let displayedTrunk = null;
 function trunkNavigator(trunkHits, activeBranches, allTrunk, edge) {
   return `<div class="trunk-nav">
     <div class="trunk-header">
-      <strong>共线干线 (${trunkHits.length} 条分支)</strong>
-      <button type="button" class="trunk-all${allTrunk ? ' on' : ''}" data-trunk-pick="all" aria-pressed="${allTrunk}">全部高亮 (${trunkHits.length})</button>
+      <strong>${t('trunk.title', { n: trunkHits.length })}</strong>
+      <button type="button" class="trunk-all${allTrunk ? ' on' : ''}" data-trunk-pick="all" aria-pressed="${allTrunk}">${t('trunk.all', { n: trunkHits.length })}</button>
     </div>
-    <p class="trunk-hint">💡 直接点击画布上共线关联的函数框，或点击下方列表即可切换分支：</p>
-    <div class="trunk-list" role="group" aria-label="共线分支">
+    <p class="trunk-hint">${t('trunk.hint')}</p>
+    <div class="trunk-list" role="group" aria-label="${t('trunk.branches')}">
       ${trunkHits.map((item, idx) => {
         const active = activeBranches.has(item);
         const line = item.line > 0 ? `<span class="trunk-line">:${esc(item.line)}</span>` : '';
@@ -301,9 +301,9 @@ function bindTrunkNavigator(box, trunkHits, scrollTop, revealAnchor) {
 
 function labelRow(label, selected, readOnly = false) {
   const auto = Boolean(label.auto);
-  const detail = auto && !readOnly ? '点击改号' : label.note;
-  const summary = `<span class="lbl-demo ${label.preset}">${esc(label.text || LABEL_NAMES[label.preset])}</span>
-    <span class="lbl-state${auto ? ' auto' : ''}">${auto ? '自动' : '已保存'}</span>
+  const detail = auto && !readOnly ? t('label.changeNumber') : label.note;
+  const summary = `<span class="lbl-demo ${label.preset}">${esc(label.text || t(LABEL_NAMES[label.preset] || LABEL_NAMES.custom))}</span>
+    <span class="lbl-state${auto ? ' auto' : ''}">${auto ? t('common.ready') : t('common.saved')}</span>
     ${detail ? `<span class="lbl-row-txt" title="${esc(detail)}">${esc(detail)}</span>` : ''}`;
   if (readOnly) return `<div class="lbl-row"><div class="lbl-row-summary">${summary}</div></div>`;
   return `<div class="lbl-row${selected ? ' on' : ''}" data-id="${esc(label.id)}">
@@ -313,20 +313,20 @@ function labelRow(label, selected, readOnly = false) {
 }
 
 function taskDetection() {
-  if (!detectResult) return '<button type="button" class="lbl-add lbl-detect" id="lblDetect">自动检测 TASK</button>';
+  if (!detectResult) return `<button type="button" class="lbl-add lbl-detect" id="lblDetect">${t('label.detectAuto')}</button>`;
   const { error, inView, offView } = detectResult;
   const items = inView.map((suggestion, index) => `<label class="dt-item">
     <input type="checkbox" class="dt-check" data-idx="${index}" checked>
     <span class="lbl-demo task">${esc(suggestion.text)}</span>
     <span class="dt-ev">${esc(suggestion.evidence || '')}</span>
   </label>`).join('');
-  const message = error ? '检测失败，请重试' : items ? t('label.detect.title') : t('label.detect.none');
+  const message = error ? t('label.detectFailed') : items ? t('label.detect.title') : t('label.detect.none');
   return `<div class="lbl-note">${message}</div>
     ${items ? `<div class="dt-list">${items}</div>` : ''}
     ${offView.length ? `<div class="lbl-note">${offView.length} ${t('label.detect.offview')}</div>` : ''}
     <div class="lbl-actions">
-      ${items ? `<button type="button" id="dtApply">${t('label.detect.apply')}</button>` : '<button type="button" id="lblDetect">重新检测 TASK</button>'}
-      <button type="button" id="dtCancel">关闭建议</button>
+      ${items ? `<button type="button" id="dtApply">${t('label.detect.apply')}</button>` : `<button type="button" id="lblDetect">${t('label.detectAgain')}</button>`}
+      <button type="button" id="dtCancel">${t('label.hideSuggestions')}</button>
     </div>`;
 }
 
@@ -366,8 +366,8 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const activeBranches = new Set(state.multiSelection?.trunk ? state.multiSelection.hits : [edge]);
   const allTrunk = Boolean(trunkHits && trunkHits.every((item) => activeBranches.has(item)));
   const focusName = trunkHits && state.trunkFocusNode ? nodeName(state.trunkFocusNode) : null;
-  const caption = focusName && activeBranches.size > 1 ? `${focusName} · 已高亮 ${activeBranches.size} 条分支`
-    : allTrunk ? `已高亮全部 ${trunkHits.length} 条分支`
+  const caption = focusName && activeBranches.size > 1 ? `${focusName} · ${t('trunk.highlighted', { n: activeBranches.size })}`
+    : allTrunk ? t('trunk.highlightedAll', { n: trunkHits.length })
     : focusName ? `${focusName} · ${edgeCaption(edge, nodeName)}` : edgeCaption(edge, nodeName);
   const trunkScrollTop = trunkHits === displayedTrunk ? box.querySelector('.trunk-list')?.scrollTop || 0 : 0;
   displayedTrunk = trunkHits;
@@ -376,7 +376,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
 
   if (state.view?.comparison) {
     const rows = labels.map((label) => labelRow(label, false, true)).join('');
-    box.innerHTML = head + (rows ? `<div class="lbl-rows"><h4>已有标签</h4>${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
+    box.innerHTML = head + (rows ? `<div class="lbl-rows"><h4>${t('label.existing')}</h4>${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
     bindStatusControl(box, edge, true, renderLabelPanel);
     bindTrunkNavigator(box, trunkHits, trunkScrollTop, scrollToTrunkBranch);
     return;
@@ -385,10 +385,10 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const rows = labels.map((label) => labelRow(label, sel === label.id)).join('');
   const hasAutoCallOrder = labels.some((label) => label.auto && label.preset === 'call');
   const existing = `<section class="lbl-rows">
-    <h4>已有标签</h4>
-    ${rows || '<div class="lbl-note">此连线还没有标签</div>'}
+    <h4>${t('label.existing')}</h4>
+    ${rows || `<div class="lbl-note">${t('label.empty')}</div>`}
     ${hasAutoCallOrder ? `<button type="button" class="lbl-batch" id="lblBatchCallOrder"
-      title="${esc(nodeName(edge.from))}">固化此调用方全部可见序号</button>` : ''}
+      title="${esc(nodeName(edge.from))}">${t('label.keepAllOrders')}</button>` : ''}
   </section>`;
 
   // ---- 选中条的编辑区 ----
@@ -410,26 +410,26 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
       : '';
     editor = `
     <section class="lbl-editor">
-      <h4>编辑当前标签 <span>${LABEL_NAMES[selLabel.preset]}</span></h4>
+      <h4>${t('label.edit')} <span>${t(LABEL_NAMES[selLabel.preset] || LABEL_NAMES.custom)}</span></h4>
       ${
         isConn
-          ? `<div class="field"><label for="lblNum">结合点编号</label><input id="lblNum" type="number" min="1" max="999" value="${selLabel.num}"></div>`
-          : `<div class="field"><label for="lblText">${isTask ? '周期文字' : t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>${quickCallNums}${quickTaskPeriods}`
+          ? `<div class="field"><label for="lblNum">${t('label.mode')}</label><input id="lblNum" type="number" min="1" max="999" value="${selLabel.num}"></div>`
+          : `<div class="field"><label for="lblText">${isTask ? t('label.periodText') : t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>${quickCallNums}${quickTaskPeriods}`
       }
       ${isConn ? `<div class="lbl-mode">
-        <div class="lbl-mode-title">编号规则</div>
-        <div class="lbl-segs" role="group" aria-label="结合点编号规则">
+        <div class="lbl-mode-title">${t('label.numberRule')}</div>
+        <div class="lbl-segs" role="group" aria-label="${t('label.connRule')}">
           <button type="button" class="lbl-seg${connMode === 'fixed' ? ' on' : ''}" data-mode="fixed" aria-pressed="${connMode === 'fixed'}">${t('label.mode.fixed')}</button>
           <button type="button" class="lbl-seg${connMode === 'renumber' ? ' on' : ''}" data-mode="renumber" aria-pressed="${connMode === 'renumber'}">${t('label.mode.renumber')}</button>
         </div>
       </div>` : ''}
       <div class="field">
-        <label for="lblNote">备注（可选）</label>
+        <label for="lblNote">${t('label.optionalNote')}</label>
         <input id="lblNote" type="text" maxlength="80" value="${esc(selLabel.note || '')}">
       </div>
       ${isTask ? taskDetection() : ''}
       <details class="lbl-style-more">
-        <summary>自定义颜色与边框</summary>
+        <summary>${t('label.styleMore')}</summary>
         <div class="field">
           <label for="lblBorder">${t('label.border')}</label>
           <div class="lbl-colors">
@@ -449,13 +449,13 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   }
 
   const addArea = `<section class="lbl-add-area">
-    <h4>添加标签</h4>
+    <h4>${t('label.addTitle')}</h4>
     <div class="lbl-adds">
-      <button type="button" class="lbl-add" data-add="call" data-preset="call">+ 调用顺序</button>
-      <button type="button" class="lbl-add" data-add="task" data-preset="task">+ TASK 周期</button>
-      <button type="button" class="lbl-add${connPick ? ' on' : ''}" data-add="conn" data-preset="conn" aria-expanded="${Boolean(connPick)}">+ 结合点</button>
+      <button type="button" class="lbl-add" data-add="call" data-preset="call">${t('label.addCall')}</button>
+      <button type="button" class="lbl-add" data-add="task" data-preset="task">${t('label.addTask')}</button>
+      <button type="button" class="lbl-add${connPick ? ' on' : ''}" data-add="conn" data-preset="conn" aria-expanded="${Boolean(connPick)}">${t('label.addConn')}</button>
     </div>
-    ${connPick ? `<div class="lbl-picknum" role="group" aria-label="选择新增结合点的编号">
+    ${connPick ? `<div class="lbl-picknum" role="group" aria-label="${t('label.chooseConn')}">
       ${connChoices(state.view, edge).map((n) => `<button type="button" class="lbl-num" data-num="${n}">${n}</button>`).join('')}
     </div>` : ''}
   </section>`;
@@ -592,7 +592,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
     const button = event.currentTarget;
     button.disabled = true;
     try { await applyCallerVisibleCallOrders(edge); }
-    catch (error) { alert(`调用序号未能全部固化：${error.message}`); }
+    catch (error) { alert(t('label.ordersPartial', { error: error.message })); }
     finally { button.disabled = false; }
   });
 

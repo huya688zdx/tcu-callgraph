@@ -812,16 +812,16 @@
   <header>
     <div class="top-row">
       <div class="brand"><span data-i18n="app.title">TCU 调用关系图 · ELK</span><small id="rootName"></small></div>
-      <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
+      <button id="projectBtn" title="切换工程" data-i18n-title="btn.project" data-i18n="timeline.kindProject">工程</button>
       <span id="compareSummary" hidden></span>
       <button id="compareExit" hidden data-i18n="compare.exit">退出比较</button>
       <div class="tool-group">
         <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
       </div>
       <div class="tool-group">
-        <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n="btn.reset">重新排版</button>
+        <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n-title="toolbar.relayoutHint" data-i18n="btn.reset">重新排版</button>
       </div>
-      <div class="top-actions" aria-label="工程工具">
+      <div class="top-actions" aria-label="工程工具" data-i18n-aria-label="toolbar.projectTools">
         <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
         <details class="tool-menu" id="exportMenu">
@@ -833,31 +833,31 @@
             <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
           </div>
         </details>
-        <button id="styleBtn" data-i18n="btn.style" title="调整默认显示名称与画布样式">设置</button>
-        <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
+        <button id="styleBtn" data-i18n="btn.style" title="调整默认显示名称与画布样式" data-i18n-title="toolbar.styleHint">设置</button>
+        <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai" data-i18n="btn.ai">AI 访问</button>
         <details class="tool-menu" id="helpMenu">
           <summary data-i18n="toolbar.help">操作说明</summary>
           <div class="tool-popover help-popover">
-            <p><span>上下移动画布</span><kbd>鼠标滚轮</kbd></p>
-            <p><span>左右移动画布</span><kbd>Shift+滚轮</kbd></p>
-            <p><span>缩放画布</span><kbd>Ctrl+滚轮</kbd></p>
-            <p><span>缩放范围</span><kbd>50%–200% · 大图支持整图预览</kbd></p>
-            <p><span>平移画布</span><kbd>拖拽空白处</kbd></p>
-            <p><span>查看函数 / 变量详情</span><kbd>单击节点</kbd></p>
-            <p><span>追踪两个节点间已有的连线路径</span><kbd>Ctrl+依次点击两个节点 · Esc 清除</kbd></p>
-            <p><span>搜索结果加入画布</span><kbd>单击 · 双击单独打开</kbd></p>
-            <p><span>移动函数 / 变量</span><kbd>双击选中后拖动</kbd></p>
-            <p><span>整体移动文件 / 目录</span><kbd>双击标题选中后拖动</kbd></p>
-            <p><span>移动状态</span><kbd>实线高亮 · 空白处 / Esc 退出</kbd></p>
-            <p><span>层级拖动</span><kbd>Shift 暂停吸附 · Esc 撤回</kbd></p>
-            <p><span>调整连线</span><kbd>双击选中后拖动线段</kbd></p>
-            <p><span>重新连接端点</span><kbd>双击连线后拖动圆点</kbd></p>
-            <p><span>移动标签</span><kbd>直接拖动标签</kbd></p>
-            <p><span>手动连接节点</span><kbd>Shift+拖动节点到目标</kbd></p>
-            <p><span>撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
-            <p><span>全选同类组件 / 退出全选</span><kbd>Ctrl+A / Esc</kbd></p>
-            <p><span>重做修改</span><kbd>Ctrl+Shift+Z</kbd></p>
-            <p><span>适应画布</span><kbd>F</kbd></p>
+            <p><span data-i18n="help.panVertical">上下移动画布</span><kbd data-i18n="help.wheel">鼠标滚轮</kbd></p>
+            <p><span data-i18n="help.panHorizontal">左右移动画布</span><kbd data-i18n="help.shiftWheel">Shift+滚轮</kbd></p>
+            <p><span data-i18n="help.zoom">缩放画布</span><kbd data-i18n="help.ctrlWheel">Ctrl+滚轮</kbd></p>
+            <p><span data-i18n="help.zoomRange">缩放范围</span><kbd data-i18n="help.zoomRangeHint">50%–200% · 大图支持整图预览</kbd></p>
+            <p><span data-i18n="help.pan">平移画布</span><kbd data-i18n="help.dragBlank">拖拽空白处</kbd></p>
+            <p><span data-i18n="help.details">查看函数 / 变量详情</span><kbd data-i18n="help.clickNode">单击节点</kbd></p>
+            <p><span data-i18n="help.trace">追踪两个节点间已有的连线路径</span><kbd data-i18n="help.traceKeys">Ctrl+依次点击两个节点 · Esc 清除</kbd></p>
+            <p><span data-i18n="help.addSearch">搜索结果加入画布</span><kbd data-i18n="help.addSearchKeys">单击 · 双击单独打开</kbd></p>
+            <p><span data-i18n="help.moveNode">移动函数 / 变量</span><kbd data-i18n="help.moveNodeKeys">双击选中后拖动</kbd></p>
+            <p><span data-i18n="help.moveGroup">整体移动文件 / 目录</span><kbd data-i18n="help.moveGroupKeys">双击标题选中后拖动</kbd></p>
+            <p><span data-i18n="help.moveMode">移动状态</span><kbd data-i18n="help.moveModeKeys">实线高亮 · 空白处 / Esc 退出</kbd></p>
+            <p><span data-i18n="help.groupDrag">层级拖动</span><kbd data-i18n="help.groupDragKeys">Shift 暂停吸附 · Esc 撤回</kbd></p>
+            <p><span data-i18n="help.adjustEdge">调整连线</span><kbd data-i18n="help.adjustEdgeKeys">双击选中后拖动线段</kbd></p>
+            <p><span data-i18n="help.reconnect">重新连接端点</span><kbd data-i18n="help.reconnectKeys">双击连线后拖动圆点</kbd></p>
+            <p><span data-i18n="help.moveLabel">移动标签</span><kbd data-i18n="help.moveLabelKeys">直接拖动标签</kbd></p>
+            <p><span data-i18n="help.manualEdge">手动连接节点</span><kbd data-i18n="help.manualEdgeKeys">Shift+拖动节点到目标</kbd></p>
+            <p><span data-i18n="help.undo">撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
+            <p><span data-i18n="help.selectAll">全选同类组件 / 退出全选</span><kbd>Ctrl+A / Esc</kbd></p>
+            <p><span data-i18n="help.redo">重做修改</span><kbd>Ctrl+Shift+Z</kbd></p>
+            <p><span data-i18n="help.fit">适应画布</span><kbd>F</kbd></p>
           </div>
         </details>
       </div>
@@ -866,11 +866,11 @@
 
   <aside id="left">
     <div class="sec sec-search">
-      <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
+      <input id="search" type="search" aria-label="搜索函数" data-i18n-aria-label="search.label" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
     </div>
     <div class="sec" id="stats"></div>
     <div class="sec tree-sec">
-      <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数">已加入 <span>0</span></button></div>
+      <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数" data-i18n-title="tree.shownHint"><span data-i18n="tree.shown">已加入</span> <span>0</span></button></div>
       <ul id="results" class="results-list"></ul>
       <div id="tree"><div class="empty" data-i18n="tree.loading">加载中…</div></div>
     </div>
@@ -881,7 +881,7 @@
     <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
-      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var" title="写入函数 → 变量 → 读取函数，双箭头表示读写">数据流向</em></span>
+      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var" title="写入函数 → 变量 → 读取函数，双箭头表示读写" data-i18n-title="legend.varHint">数据流向</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
       <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
@@ -890,8 +890,8 @@
 
     <div id="reviewBar" class="review-bar">
       <span id="reviewText"></span>
-      <button id="reviewRestore" class="primary">恢复到此</button>
-      <button id="reviewExit">回到最新</button>
+      <button id="reviewRestore" class="primary" data-i18n="timeline.restore">恢复到此</button>
+      <button id="reviewExit" data-i18n="timeline.exit">回到最新</button>
     </div>
   </main>
 
@@ -949,29 +949,29 @@
   </div>
 
   <div id="compareSelectModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareSelectTitle" style="width:min(900px,94vw)">
-    <div class="modal-head"><h2 id="compareSelectTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
+    <div class="modal-head"><h2 id="compareSelectTitle" data-i18n="compare.pickTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
     <div class="modal-body">
       <p class="hint" id="comparePickRetainWarning" role="status"></p>
       <section id="comparePickFocus" class="compare-focus" aria-labelledby="comparePickFocusTitle" hidden>
-        <h3 id="comparePickFocusTitle">变更点与影响链</h3>
+        <h3 id="comparePickFocusTitle" data-i18n="compare.pickPoints">变更点与影响链</h3>
         <div id="comparePickPoints" class="compare-points"></div>
       </section>
-      <div class="compare-pick-tools" aria-label="批量勾选">
-        <button id="comparePickCore" type="button">全选核心影响链</button>
-        <button id="comparePickChanged" type="button">仅选直接变更点</button>
-        <button id="comparePickClear" type="button">清空勾选</button>
+      <div class="compare-pick-tools" aria-label="批量勾选" data-i18n-aria-label="compare.bulk">
+        <button id="comparePickCore" type="button" data-i18n="compare.pickCore">全选核心影响链</button>
+        <button id="comparePickChanged" type="button" data-i18n="compare.pickDirect">仅选直接变更点</button>
+        <button id="comparePickClear" type="button" data-i18n="compare.pickClear">清空勾选</button>
       </div>
       <div class="compare-pick-tools">
-        <input id="comparePickSearch" type="search" placeholder="搜索名称或文件路径" aria-label="搜索比较结果">
-        <select id="comparePickType" aria-label="对象类型"><option value="all">函数和变量</option><option value="fn">只看函数</option><option value="var">只看变量</option></select>
-        <select id="comparePickChange" aria-label="变更分类"><option value="core_chain">核心影响链（变更点+受影响）</option><option value="changed">直接变更</option><option value="all">全部</option><option value="modified">修改</option><option value="added">新增</option><option value="deleted">删除</option><option value="existing">未修改</option></select>
+        <input id="comparePickSearch" type="search" placeholder="搜索名称或文件路径" data-i18n-ph="compare.pickSearch" aria-label="搜索比较结果" data-i18n-aria-label="compare.pickSearchLabel">
+        <select id="comparePickType" aria-label="对象类型" data-i18n-aria-label="compare.pickType"><option value="all" data-i18n="compare.pickBoth">函数和变量</option><option value="fn" data-i18n="compare.pickFns">只看函数</option><option value="var" data-i18n="compare.pickVars">只看变量</option></select>
+        <select id="comparePickChange" aria-label="变更分类" data-i18n-aria-label="compare.change"><option value="core_chain" data-i18n="compare.pickImpact">核心影响链（变更点+受影响）</option><option value="changed" data-i18n="compare.pickChanged">直接变更</option><option value="all" data-i18n="common.all">全部</option><option value="modified" data-i18n="compare.version.modified">修改</option><option value="added" data-i18n="compare.version.added">新增</option><option value="deleted" data-i18n="bookmark.delete">删除</option><option value="existing" data-i18n="status.existing">未修改</option></select>
       </div>
       <div id="comparePickList"></div>
-      <div class="compare-pick-tools"><button id="comparePickPrev" type="button">上一页</button><span id="comparePickPage"></span><button id="comparePickNext" type="button">下一页</button></div>
-      <details><summary id="comparePickWarningCount">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
+      <div class="compare-pick-tools"><button id="comparePickPrev" type="button" data-i18n="common.prev">上一页</button><span id="comparePickPage"></span><button id="comparePickNext" type="button" data-i18n="common.next">下一页</button></div>
+      <details><summary id="comparePickWarningCount" data-i18n="compare.mappings">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
       <div id="comparePickError" class="detail-meta" role="alert" style="color:#A32D2D"></div>
     </div>
-    <div class="modal-foot"><span id="comparePickCount" role="status"></span><button id="comparePickApply" class="primary" type="button" disabled>加入当前图</button><button id="comparePickCancel" type="button">取消</button></div>
+    <div class="modal-foot"><span id="comparePickCount" role="status"></span><button id="comparePickApply" class="primary" type="button" disabled data-i18n="common.relAdd">加入当前图</button><button id="comparePickCancel" type="button" data-i18n="common.cancel">取消</button></div>
   </div>
 
   <div id="styleModal" class="modal">
@@ -1022,7 +1022,7 @@
   </div>
 
   <div id="addFunctionsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="addFunctionsTitle">
-    <div class="modal-head"><h2 id="addFunctionsTitle">选择要添加的调用关系</h2><button class="modal-close" data-close="addFunctionsModal">&times;</button></div>
+    <div class="modal-head"><h2 id="addFunctionsTitle" data-i18n="expand.pickTitle">选择要添加的调用关系</h2><button class="modal-close" data-close="addFunctionsModal">&times;</button></div>
     <div class="modal-body">
       <p class="scope-target"><span data-i18n="expand.targetLabel">🎯 当前目标函数</span> <strong id="addFunctionsTarget"></strong></p>
       <fieldset id="addFunctionsControls" class="scope-controls">
@@ -1044,7 +1044,7 @@
       <label class="pick-all"><input id="addFunctionsAll" type="checkbox" checked> <span data-i18n="expand.selectAll">全选所有候选项</span></label>
       <div id="addFunctionsList"></div>
     </div>
-    <div class="modal-foot"><span id="addFunctionsMessage" role="status"></span><button id="addFunctionsApply" class="primary" disabled>确认添加</button><button id="addFunctionsCancel">取消</button></div>
+    <div class="modal-foot"><span id="addFunctionsMessage" role="status"></span><button id="addFunctionsApply" class="primary" disabled data-i18n="callOrder.apply">确认添加</button><button id="addFunctionsCancel" data-i18n="common.cancel">取消</button></div>
   </div>
 
   <div id="callOrderModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="callOrderTitle">

@@ -154,5 +154,8 @@ nameInput?.addEventListener('keydown', (e) => {
 });
 
 wireModals();
+document.addEventListener('callgraph:langchange', () => {
+  if (document.getElementById('bookmarkModal')?.classList.contains('show')) render();
+});
 
 export { render as renderBookmarks };

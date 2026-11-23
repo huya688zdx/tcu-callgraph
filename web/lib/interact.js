@@ -639,21 +639,21 @@ function handlePointerMove(e) {
   if (n || title || hoveredEdge) {
     const rect = els.cv.getBoundingClientRect();
     const trunkEndpoint = n && activeTrunk()?.some((edge) => edge.from === n.id || edge.to === n.id);
-    const nodeAction = trunkEndpoint ? '点击切换此节点的共线分支'
-      : moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动';
+    const nodeAction = trunkEndpoint ? t('trunk.switch')
+      : moveReady('node', n) ? t('canvas.dragActive') : t('canvas.dragInactive');
     els.tooltip.style.opacity = '1';
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
-      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${nodeAction}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
-      : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
-      : hits.length > 1 ? `<b>共线干线 (${hits.length} 条分支)</b><br>点击高亮全部走向 · 再点击共线两端的任意函数框可直接切换对应分支`
-      : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${nodeAction}${state.view?.comparison ? '' : `<br><span style="opacity:.5;font-size:11px">${t('canvas.connectHint')}</span>`}`
+      : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? t('canvas.groupDragActive') : t('canvas.groupDragInactive')}`
+      : hits.length > 1 ? `<b>${t('trunk.title', { n: hits.length })}</b><br>${t('trunk.hitHint')}`
+      : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? t('canvas.edgeComparison') : moveReady('edge', hoveredEdge) ? t('canvas.edgeActive') : t('canvas.edgeInactive')}`;
     if (n || hits.length === 1) {
       const target = n || hoveredEdge;
-      els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
+      els.tooltip.innerHTML += `<br>${t('canvas.status', { status: statusLabel(target.change) })}${target.statusSource === 'manual' ? t('canvas.manualStatus') : ''}`;
     }
-    if (n && !trunkEndpoint) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 追踪连线路径</span>';
+    if (n && !trunkEndpoint) els.tooltip.innerHTML += `<br><span style="opacity:.7;font-size:11px">${t('canvas.traceHint')}</span>`;
   } else {
     els.tooltip.style.opacity = '0';
   }

@@ -27,6 +27,44 @@ function sharedDirectoryDepth(directory, file) {
   return depth;
 }
 
+function includedHeaders(headers, includes) {
+  const paths = new Set(headers.map(({ rel }) => rel));
+  const suffixes = new Map();
+  for (const rel of paths) {
+    for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
+      const suffix = rel.slice(slash + 1);
+      suffixes.set(suffix, suffixes.has(suffix) ? null : rel);
+    }
+  }
+  const direct = new Map();
+  for (const { file, target } of includes) {
+    const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
+    const relative = path.posix.join(path.posix.dirname(file), normalized);
+    const header = paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+    if (!header) continue;
+    if (!direct.has(file)) direct.set(file, new Set());
+    direct.get(file).add(header);
+  }
+  const closure = new Map();
+  const byIncludes = new Map();
+  return (file, header) => {
+    if (!direct.has(file)) return false;
+    if (!closure.has(file)) {
+      const entries = direct.get(file);
+      const key = JSON.stringify([...entries].sort());
+      if (!byIncludes.has(key)) {
+        const reachable = new Set(entries);
+        for (const included of reachable) {
+          for (const nested of direct.get(included) || []) reachable.add(nested);
+        }
+        byIncludes.set(key, reachable);
+      }
+      closure.set(file, byIncludes.get(key));
+    }
+    return closure.get(file).has(header);
+  };
+}
+
 /**
  * 源码解码：先按 UTF-8 严格解码，失败则回退 CP932(Shift-JIS)。
  * 汽车电子不少 TCU 工程出自日文环境，源码是 CP932 编码，
@@ -358,7 +396,7 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
     const original = lex(src, rel);
     const taskDefs = taskDeclarations(src, original);
     const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
-    const fileMacros = fileMacroScope(macros);
+    const fileMacros = fileMacroScope(macros, new Map(), { trackPositions: true });
     const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -382,7 +420,7 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
       const nesting = deferred ? callNestingTokens(body) : null;
       assignCallGroups(body, calls);
       functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body),
-        taskEvidence: collectTaskEvidence(fn, body) });
+        taskEvidence: collectTaskEvidence(fn, body, fileMacros) });
       functions.push(fn);
     }
     for (const [name, map] of findFnPtrTables(tokens)) {
@@ -407,6 +445,7 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
   // 每个文件只词法分析一次。宏按头文件顺序生效，跨文件符号在定义收齐后绑定。
   for (const file of headers) parseFile(file);
   for (const file of sources) parseFile(file);
+  const includesHeader = includedHeaders(headers, includes);
 
   const byId = new Map();
   const byName = new Map();
@@ -428,8 +467,10 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
     if (!all) return `ext::${name}`;
     const local = all.find((f) => f.file === fromFile);
     if (local) return local.id;
-    // 头文件中的 static 定义可被包含进调用方，其他源文件的 static 定义不可见。
-    let candidates = all.filter((f) => !f.isStatic || HDR_EXT.test(f.file));
+    const visibleStatic = f => f.isStatic && HDR_EXT.test(f.file) && includesHeader(fromFile, f.file);
+    if (all.length === 1) return !all[0].isStatic || visibleStatic(all[0]) ? all[0].id : `ext::${name}`;
+    const visibleStatics = all.filter(visibleStatic);
+    let candidates = visibleStatics.length ? visibleStatics : all.filter(f => !f.isStatic);
     if (!candidates.length) return `ext::${name}`;
     if (candidates.length === 1) return candidates[0].id;
 

@@ -15,8 +15,12 @@ import { findCallOrder } from './call-order.js';
 import { showExpansion, previewAddition } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
+
+let statsSeq = 0;
 async function loadStats() {
+  const seq = ++statsSeq;
   const d = await fetch('/api/stats?summary=1').then(res => res.json());
+  if (seq !== statsSeq || !d.stats) return;
   const s = d.stats;
   const row = (label, val) => `<div class="stat-row"><span>${label}</span><span>${val}</span></div>`;
   const metrics = [
@@ -32,8 +36,8 @@ async function loadStats() {
     (s.files > 1500
       ? `<div class="stat-row" style="color:#993C1D"><span>${t('stat.hintTitle')}</span><span>${t('stat.hintSlow')}</span></div>`
       : '');
-  els.stats.innerHTML = row('文件 / 函数 / 变量', `${s.files} / ${s.functions} / ${s.variables || 0}`) +
-    `<details class="stat-more"><summary>详细解析指标</summary>${metrics}</details>`;
+  els.stats.innerHTML = row(t('stat.filesFnsVars'), `${s.files} / ${s.functions} / ${s.variables || 0}`) +
+    `<details class="stat-more"><summary>${t('stat.more')}</summary>${metrics}</details>`;
 }
 
 els.stats?.addEventListener('click', (event) => {
@@ -90,18 +94,19 @@ const typeLabel = (x) => {
 const varPeerId = (peer) => typeof peer === 'string' ? peer : peer.id;
 
 function varPeerNames(peers) {
-  if (!peers.length) return '无';
+  if (!peers.length) return t('common.none');
   const names = peers.slice(0, 6).map((peer) => (peer.name || varPeerId(peer)).split('::').pop());
-  return `${names.join('、')}${peers.length > names.length ? ` 等 ${peers.length} 个` : ''}`;
+  return [...names, peers.length > names.length ? t('vars.otherPeers', { n: peers.length - names.length }) : '']
+    .filter(Boolean).join(' · ');
 }
 
 function varTitle(x) {
   return [
     x.name,
     `${x.file}:${x.line}`,
-    x.typeText || '未知类型',
-    `写入函数（${x.writers.length}）：${varPeerNames(x.writers)}`,
-    `读取函数（${x.readers.length}）：${varPeerNames(x.readers)}`,
+    x.typeText || t('vars.unknownType'),
+    `${t('vars.writers', { n: x.writers.length })}: ${varPeerNames(x.writers)}`,
+    `${t('vars.readers', { n: x.readers.length })}: ${varPeerNames(x.readers)}`,
   ].join('\n');
 }
 
@@ -154,10 +159,10 @@ export function renderVars() {
   const checkedCount = rows.filter((row) => row.checked).length;
   const mutableCount = rows.filter((row) => row.mutable).length;
   const modes = [
-    ['all', '全部', rows.length],
-    ['linked', '图中关联', rows.filter((row) => row.linked).length],
-    ['mutable', '读写变量', mutableCount],
-    ['readonly', '只读/常量', rows.length - mutableCount],
+    ['all', t('common.all'), rows.length],
+    ['linked', t('vars.linked'), rows.filter((row) => row.linked).length],
+    ['mutable', t('vars.mutable'), mutableCount],
+    ['readonly', t('vars.readonly'), rows.length - mutableCount],
   ];
 
   const q = varQuery.trim().toLowerCase();
@@ -176,20 +181,20 @@ export function renderVars() {
 
   const fileCounts = new Map();
   if (multiFile) {
-    for (const { x, checked } of list) {
-      if (!fileCounts.has(x.file)) fileCounts.set(x.file, { total: 0, checked: 0 });
+    for (const row of list) {
+      const { x, checked } = row;
+      if (!fileCounts.has(x.file)) fileCounts.set(x.file, { rows: [], checked: 0 });
       const count = fileCounts.get(x.file);
-      count.total++;
+      count.rows.push(row);
       if (checked) count.checked++;
     }
   }
 
   const parts = [];
   let lastFile = null;
-  const foldedHeaders = new Set();
-  for (const { x, checked, linked } of list) {
+  const groupedList = multiFile ? Array.from(fileCounts.values()).flatMap(group => group.rows) : list;
+  for (const { x, checked, linked } of groupedList) {
     const folded = multiFile && collapsedFiles.has(x.file);
-    if (foldedHeaders.has(x.file)) continue;
     if (multiFile && x.file !== lastFile) {
       if (lastFile !== null) parts.push('</div>');
       lastFile = x.file;
@@ -197,13 +202,10 @@ export function renderVars() {
       parts.push(`<div>
         <button type="button" class="var-file" data-file="${esc(x.file)}" title="${esc(x.file)}" aria-expanded="${!folded}">
           <span class="tw" aria-hidden="true">${folded ? '▶' : '▼'}</span>
-          <span class="fn">${esc(shortFile(x.file))}</span><span class="cnt">${count.checked}/${count.total}</span>
+          <span class="fn">${esc(shortFile(x.file))}</span><span class="cnt">${count.checked}/${count.rows.length}</span>
         </button>`);
     }
-    if (folded) {
-      foldedHeaders.add(x.file);
-      continue;
-    }
+    if (folded) continue;
     parts.push(`<label class="var-row" data-id="${esc(x.id)}" title="${esc(varTitle(x))}">
       <span class="var-name">
         <input type="checkbox" aria-label="${esc(x.name)}" ${checked ? 'checked' : ''}>
@@ -213,8 +215,8 @@ export function renderVars() {
         ${x.isConst ? '<span class="vg">const</span>' : ''}
         ${x.isStatic ? '<span class="vg static">static</span>' : ''}
         <span class="vt">${esc(typeLabel(x))}${x.line ? ` :${esc(x.line)}` : ''}</span>
-        ${linked ? '<span class="vg in-canvas">图中关联</span>' : ''}
-        <span class="vc ${x.writers.length ? 'rw' : 'ro'}">写 ${x.writers.length} · 读 ${x.readers.length}</span>
+        ${linked ? `<span class="vg in-canvas">${t('vars.linked')}</span>` : ''}
+        <span class="vc ${x.writers.length ? 'rw' : 'ro'}">${t('vars.rwCount', { write: x.writers.length, read: x.readers.length })}</span>
       </span>
     </label>`);
   }
@@ -226,7 +228,7 @@ export function renderVars() {
   el.innerHTML = `<div class="vars-bar">
     <div class="vars-search">
       <input id="varFilter" type="search" aria-label="${filterLabel}" placeholder="${filterLabel}" value="${esc(varQuery)}">
-      <span class="vars-cnt" title="已勾选 / 全部">${checkedCount}/${scope.length}</span>
+      <span class="vars-cnt" title="${t('vars.checked')}">${checkedCount}/${scope.length}</span>
     </div>
     <div class="vars-modes">${modes.map(([mode, label, count]) =>
       `<button type="button" data-var-mode="${mode}" aria-pressed="${varMode === mode}">${label} (${count})</button>`
@@ -273,13 +275,14 @@ export function renderVars() {
 // ---------------- 文件树 ----------------
 
 let treeData = null;
+let treeSeq = 0;
 let showEmptyFiles = false;
 const emptyTreeFiles = new Set();
+let visibleTreeNodes = new WeakSet();
 const populateTreeFiles = new Map();
 
 function hasVisibleContent(node) {
-  if (node.type === 'file') return showEmptyFiles || Boolean(node.functions?.length);
-  return showEmptyFiles || (node.children || []).some(hasVisibleContent);
+  return showEmptyFiles || visibleTreeNodes.has(node);
 }
 
 function visibleTreeChildren(node) {
@@ -293,16 +296,24 @@ function visibleTreeChildren(node) {
 }
 
 async function loadTree() {
+  const seq = ++treeSeq;
   try {
-    treeData = await api.tree();
+    const data = await api.tree();
+    if (seq !== treeSeq) return;
+    treeData = data;
     emptyTreeFiles.clear();
+    visibleTreeNodes = new WeakSet();
     const visit = (node) => {
-      if (node.type === 'file' && !node.functions?.length) emptyTreeFiles.add(node.path);
-      for (const child of node.children || []) visit(child);
+      let visible = Boolean(node.functions?.length);
+      if (node.type === 'file' && !visible) emptyTreeFiles.add(node.path);
+      for (const child of node.children || []) if (visit(child)) visible = true;
+      if (visible) visibleTreeNodes.add(node);
+      return visible;
     };
     visit(treeData);
     renderTree();
   } catch {
+    if (seq !== treeSeq) return;
     document.getElementById('tree').innerHTML = `<div class="empty">${t('tree.loadFail')}</div>`;
   }
 }
@@ -357,8 +368,8 @@ export function syncTreeSelection() {
   });
   document.querySelectorAll('[data-add-function]').forEach((button) => {
     const inView = shown.has(button.dataset.addFunction);
-    const label = inView ? '在图中定位或操作' : '加入当前图或单独查看';
-    button.textContent = inView ? '操作 ▾' : '添加 ▾';
+    const label = inView ? t('tree.locateManage') : t('tree.addOrOpen');
+    button.textContent = inView ? t('tree.manage') : t('tree.add');
     button.title = label;
     button.setAttribute('aria-label', label);
     button.setAttribute('aria-haspopup', 'menu');
@@ -373,29 +384,29 @@ const inCanvas = (id) => state.view?.nodes.some((node) => node.id === id);
 function addFunctionButton(id) {
   if (id.startsWith('var::')) return '';
   const inView = inCanvas(id);
-  const label = inView ? '在图中定位或操作' : '加入当前图或单独查看';
+  const label = inView ? t('tree.locateManage') : t('tree.addOrOpen');
   const key = esc(id);
-  return `<button type="button" class="add-function" data-add-function="${key}" title="${label}" aria-label="${label}" aria-haspopup="menu" aria-expanded="false" ${window.__EXPORT ? 'hidden' : ''}>${inView ? '操作 ▾' : '添加 ▾'}</button>`;
+  return `<button type="button" class="add-function" data-add-function="${key}" title="${label}" aria-label="${label}" aria-haspopup="menu" aria-expanded="false" ${window.__EXPORT ? 'hidden' : ''}>${inView ? t('tree.manage') : t('tree.add')}</button>`;
 }
 
 async function removeShownFunction(id) {
   try { await hooks.removeFunction(id); }
-  catch (error) { alert(error.message || '移出画布失败'); }
+  catch (error) { alert(error.message || t('common.removeFailed')); }
 }
 
 async function addSingleFunction(id) {
   try {
     const view = await hooks.addFunction(id);
-    if (!view?.nodes.some((node) => node.id === id)) throw new Error('未能加入函数，请重试');
-  } catch (error) { alert(error.message || '加入函数失败'); }
+    if (!view?.nodes.some((node) => node.id === id)) throw new Error(t('tree.addRetry'));
+  } catch (error) { alert(error.message || t('tree.addFailed')); }
 }
 
 async function openFunctionAlone(id) {
   try {
     const view = await hooks.loadView(id);
-    if (!view?.nodes.some((node) => node.id === id)) throw new Error('未能打开该节点，请重试');
+    if (!view?.nodes.some((node) => node.id === id)) throw new Error(t('tree.openRetry'));
     if (view === state.view) locateNode(id);
-  } catch (error) { alert(error.message || '单独查看失败'); }
+  } catch (error) { alert(error.message || t('tree.openFailed')); }
 }
 
 function functionViewActions(id) {
@@ -517,8 +528,8 @@ function openTreeMenu(ev, kind, payload) {
     items.push(...functionViewActions(payload.id).filter(({ value }) => !window.__EXPORT || value === 'locate'));
   } else {
     const boxes = kind === 'file' ? state.view?.groups : state.view?.containers;
-    if (boxes?.some((box) => box.id === payload.id)) items.push({ value: 'locate', label: '在图中定位' });
-    else if (!window.__EXPORT && payload.fnIds?.length) items.push({ value: 'alone', label: '单独查看' });
+    if (boxes?.some((box) => box.id === payload.id)) items.push({ value: 'locate', label: t('common.locateCanvas') });
+    else if (!window.__EXPORT && payload.fnIds?.length) items.push({ value: 'alone', label: t('common.openAlone') });
   }
   if (!items.length) return;
   showMenuSections(
@@ -574,6 +585,7 @@ function buildTreeNode(node, depth, expanded = new Map()) {
   const populateFunctions = () => {
     if (populated) return;
     populated = true;
+    const shown = new Set(state.view?.nodes.map(node => node.id));
     for (const f of node.functions || []) {
       const fr = document.createElement('div');
       fr.className = 'tn fn';
@@ -585,7 +597,7 @@ function buildTreeNode(node, depth, expanded = new Map()) {
       lab.title = `${node.path}:${f.line}`;
       fr.appendChild(lab);
       fr.insertAdjacentHTML('beforeend', addFunctionButton(f.id));
-      fr.classList.toggle('shown', !!state.view?.nodes.some((n) => n.id === f.id));
+      fr.classList.toggle('shown', shown.has(f.id));
       fr.addEventListener('click', () => searchPick(f.id, fr.querySelector('[data-add-function]')));
       fr.addEventListener('contextmenu', (ev) =>
         openTreeMenu(ev, 'fn', { id: f.id, label: f.name })
@@ -644,7 +656,7 @@ function renderFunctionResults(list) {
   els.results.innerHTML = list.length ? list.map((f) => `<li data-id="${esc(f.id)}" title="${esc(t('search.itemHint'))}">
     <div class="search-summary"><div class="fn">${esc(f.displayName || f.name)}</div>${addFunctionButton(f.id)}</div>
     <div class="meta">${esc(shortFile(f.file || ''))}:${f.line || ''}${Number.isInteger(f.inCount) ? ` · ↑${f.inCount} ↓${f.outCount}` : ''}</div>
-    </li>`).join('') : `<li class="empty">${shownOnly ? '当前没有符合条件的已加入函数' : t('empty.noMatch')}</li>`;
+    </li>`).join('') : `<li class="empty">${shownOnly ? t('tree.noShownMatch') : t('empty.noMatch')}</li>`;
 }
 
 function renderShownFunctions() {
@@ -661,7 +673,7 @@ function syncSearchMode() {
   const section = els.results.closest('.tree-sec');
   if (section) {
     section.scrollTop = 0;
-    section.querySelector('h3').textContent = shownOnly ? '已加入函数' : searching ? '搜索结果' : t('panel.files');
+    section.querySelector('h3').textContent = shownOnly ? t('tree.shownFunctions') : searching ? t('panel.results') : t('panel.files');
   }
 }
 
@@ -714,23 +726,23 @@ function syncDetailSections(isFn) {
 let detailSeq = 0;
 
 const impactRoles = {
-  added: ['added', '新增'],
-  deleted: ['deleted', '删除'],
-  modified: ['direct', '直接修改'],
-  direct_change: ['direct', '直接修改'],
-  macro_lsb_impact: ['impact', 'LSB/宏影响'],
-  period_impact: ['period', '周期变化'],
-  dataflow_impact: ['impact', '数据流受影响'],
-  caller_impact: ['impact', '调用方受影响'],
-  callee_context: ['context', '被调上下文'],
+  added: ['added', 'compare.version.added'],
+  deleted: ['deleted', 'compare.version.deleted'],
+  modified: ['direct', 'compare.role.direct'],
+  direct_change: ['direct', 'compare.role.direct'],
+  macro_lsb_impact: ['impact', 'compare.role.macro'],
+  period_impact: ['period', 'compare.role.period'],
+  dataflow_impact: ['impact', 'compare.role.data'],
+  caller_impact: ['impact', 'compare.role.caller'],
+  callee_context: ['context', 'compare.role.callee'],
 };
 
 function impactRoleBadge(node) {
   const automaticRole = node.impactRole === 'direct_change' && node.statusSource === 'manual' ? null : impactRoles[node.impactRole];
   const [style, label] = impactRoles[node.change] || (node.macroImpact && impactRoles.macro_lsb_impact) ||
     (node.periodImpact && impactRoles.period_impact) || automaticRole || (node.context && impactRoles.callee_context) ||
-    (node.impact ? ['impact', '受影响'] : ['context', '未修改']);
-  return `<div class="detail-meta"><b>影响角色</b> <span class="compare-badge ${style}">${label}</span></div>`;
+    (node.impact ? ['impact', 'compare.role.affected'] : ['context', 'status.existing']);
+  return `<div class="detail-meta"><b>${t('compare.role.title')}</b> <span class="compare-badge ${style}">${t(label)}</span></div>`;
 }
 
 function rootChangePoints(node, points) {
@@ -739,7 +751,7 @@ function rootChangePoints(node, points) {
   const rootPoints = points.filter((point) => ids.has(point.id));
   if (!rootPoints.length) return '';
   const value = (v) => (Array.isArray(v) ? v.join(' / ') : String(v ?? '')) || '—';
-  return `<div class="detail-meta"><b>关联变更点</b></div><div class="compare-points">${rootPoints.map((point) => {
+  return `<div class="detail-meta"><b>${t('compare.relatedPoints')}</b></div><div class="compare-points">${rootPoints.map((point) => {
     const sourceId = point.sourceId || (point.kind === 'period' ? point.id.replace(/^period::/, '') : point.id);
     const source = inCanvas(sourceId) ? sourceId : point.kind === 'macro_lsb'
       ? state.view?.nodes.find((n) => n.headerSymbol && n.name === point.name && n.file === point.file)?.id : null;
@@ -748,7 +760,7 @@ function rootChangePoints(node, points) {
     const diff = point.beforeValue != null || point.afterValue != null
       ? `${value(point.beforeValue)} → ${value(point.afterValue)}` : '';
     const description = point.kind === 'function' ? point.summary || diff : diff || point.summary;
-    const action = source ? '在图中定位变更点' : '在图中定位受影响节点';
+    const action = source ? t('compare.point.locate') : t('compare.point.locateAffected');
     return `<button type="button" class="compare-point" data-locate-node="${esc(target)}" title="${esc([action, point.file, point.summary].filter(Boolean).join('\n'))}"><b>${esc(point.name || point.id)}</b>${description ? ` <span>${esc(description)}</span>` : ''}</button>`;
   }).join('')}</div>`;
 }
@@ -770,7 +782,7 @@ function comparisonDetail(node, points) {
   };
   const period = periodCaption(node);
   return `${impactRoleBadge(node)}
-    ${period.includes('→') ? `<div class="detail-meta"><b>周期变化</b> <span class="compare-badge period">${esc(period)}</span></div>` : ''}
+    ${period.includes('→') ? `<div class="detail-meta"><b>${t('compare.role.period')}</b> <span class="compare-badge period">${esc(period)}</span></div>` : ''}
     ${rootChangePoints(node, points)}
     <div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
     <div class="detail-meta">${t('compare.locationAfter')}: ${esc(location('after'))}</div>
@@ -790,7 +802,7 @@ function showEdgeDetails(edge) {
   const name = (id) => state.view.nodes.find((n) => n.id === id)?.name || id;
   if (els.secDetail) els.secDetail.style.display = '';
   els.detail.innerHTML = `<div class="detail-title">${esc(edgeCaption(edge, name))}</div>
-    <div class="detail-meta"><b>调用次数: ${before} → ${after} 次</b></div>`;
+    <div class="detail-meta"><b>${t('compare.callsChanged', { before, after })}</b></div>`;
   els.edges.innerHTML = '';
   return true;
 }
@@ -809,19 +821,19 @@ async function renderDetail(id) {
   const names = dataEdges.length ? new Map(state.view.nodes.map(n => [n.id, n.displayName || n.name])) : null;
   const dataDir = (e) => {
     if (e.kind === 'var') {
-      if (e.via === '读写') return 'both';
+      if (e.via === t('ai.level.readwrite')) return 'both';
       if (e.via === '读') return e.from === id ? 'in' : 'out';
       if (e.via === '写') return e.from === id ? 'out' : 'in';
       return '';
     }
     return e.from === id ? 'out' : 'in';
   };
-  const dataDirections = dataEdges.length ? `<div class="detail-directions"><b>画布中的变量读写方向</b>
+  const dataDirections = dataEdges.length ? `<div class="detail-directions"><b>${t('node.rwDirections')}</b>
     ${dataEdges.map(e => {
       const peerId = e.from === id ? e.to : e.from;
       const dir = dataDir(e);
       const inView = inViewIds.has(peerId);
-      return `<div class="df-dir-item call-relation${inView ? ' in-view' : ''}" data-peer-id="${esc(peerId)}" data-edge-key="${esc(edgeKey(e))}"${dir ? ` data-rel-dir="${dir}"` : ''}${inView ? ' title="点击在图中定位"' : ''}><span>${esc(edgeCaption(e, nodeId => names.get(nodeId) || nodeId))}</span>${addFunctionButton(peerId)}</div>`;
+      return `<div class="df-dir-item call-relation${inView ? ' in-view' : ''}" data-peer-id="${esc(peerId)}" data-edge-key="${esc(edgeKey(e))}"${dir ? ` data-rel-dir="${dir}"` : ''}${inView ? ` title="${esc(t('common.locateClick'))}"` : ''}><span>${esc(edgeCaption(e, nodeId => names.get(nodeId) || nodeId))}</span>${addFunctionButton(peerId)}</div>`;
     }).join('')}</div>` : '';
   if (target?.kind === 'var') {
     if (els.secDetail) els.secDetail.style.display = '';
@@ -881,7 +893,7 @@ async function renderDetail(id) {
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
     const status = e.change && e.change !== 'existing' ? ` · ${statusLabel(e.change)}` : '';
     const arrow = `<span class="rel-dir ${dir}">${dir === 'in' ? '←' : '→'}</span>`;
-    return `<div class="edge-item call-relation${inView ? ' in-view' : ''}"${inView ? ` data-peer-id="${esc(other)}" data-rel-dir="${dir}" data-edge-key="${esc(edgeKey(e))}" title="在图中定位"` : ''}><span>${arrow} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
+    return `<div class="edge-item call-relation${inView ? ' in-view' : ''}"${inView ? ` data-peer-id="${esc(other)}" data-rel-dir="${dir}" data-edge-key="${esc(edgeKey(e))}" title="${t('common.locateCanvas')}"` : ''}><span>${arrow} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
   };
 
   els.edges.innerHTML =

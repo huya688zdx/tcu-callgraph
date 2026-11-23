@@ -441,7 +441,7 @@ function draw({ geometryUnchanged = false } = {}) {
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
+    ctx.fillText(t('canvas.noFunctions'), W / 2, H / 2);
     return;
   }
   collectingEffects = true;
@@ -853,8 +853,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     n.impactRole === 'dataflow_impact' || n.impactRole === 'caller_impact');
   const accent = macroImpact ? '#69419A' : periodImpact || taskEntry ? '#185FA5' :
     changed ? '#8A490E' : impacted ? '#69419A' : null;
-  const tags = [taskEntry && 'TASK', macroImpact && 'LSB影响', periodImpact && '周期Δ',
-    impacted && !changed && !macroImpact && !periodImpact && '受影响'].filter(Boolean);
+  const tags = [taskEntry && 'TASK', macroImpact && t('canvas.lsb'), periodImpact && t('compare.point.period'),
+    impacted && !changed && !macroImpact && !periodImpact && t('compare.role.affected')].filter(Boolean);
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
   const alpha = dimmed ? (trunkEndpoint ? 0.65 : 0.22) : 1;

@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -186,6 +187,13 @@ async function callTool(base, name, args) {
   return payload;
 }
 
+async function postJson(base, route, body) {
+  const response = await fetch(base + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  return response.json();
+}
+
 test('e2e：cg_source 返回函数定义和分析信息，按行读源码时拒绝越界路径', async (t) => {
   const srv = await launchServer({ target: 'samples/tcu' });
   t.after(srv.close);
@@ -212,6 +220,81 @@ test('e2e：cg_source 返回函数定义和分析信息，按行读源码时拒�
   }
   assert.equal((await callTool(base, 'cg_source', { file: 'main.c', startLine: 5, endLine: 2 })).ok, false);
   assert.equal((await callTool(base, 'cg_source', { id: 'ext::missing' })).ok, false);
+});
+
+test('e2e：比较模式的 cg_source 读取映射后的修改和新增源码', async (t) => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-compare-'));
+  t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
+  const [project, beforePath, afterPath] = ['project', 'before', 'after'].map(dir => path.join(temp, dir));
+  for (const dir of [beforePath, afterPath]) fs.mkdirSync(dir);
+  fs.mkdirSync(path.join(project, 'src'), { recursive: true });
+  const old = 'int work(void) { return 1; }';
+  const updated = 'int work(void) { return 2; }';
+  const added = 'int added(void) { return 3; }';
+  fs.writeFileSync(path.join(project, 'src', 'work.c'), old);
+  fs.writeFileSync(path.join(beforePath, 'work.c'), old);
+  fs.writeFileSync(path.join(afterPath, 'work.c'), '\n\n' + updated);
+  fs.writeFileSync(path.join(afterPath, 'added.c'), added);
+
+  const srv = await launchServer({ target: project });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  const preview = await postJson(base, '/api/compare', { beforePath, afterPath });
+  assert.equal(preview.ok, true, preview.error);
+  const applied = await postJson(base, '/api/compare/apply', {
+    previewId: preview.preview.id, selectedIds: ['src/work.c::work', 'added.c::added'],
+  });
+  assert.equal(applied.ok, true, applied.error);
+  const source = await callTool(base, 'cg_source', { id: 'src/work.c::work' });
+  assert.equal(source.source, updated, source.error);
+  assert.equal(source.startLine, 3);
+  const range = await callTool(base, 'cg_source', { file: 'added.c', startLine: 1, endLine: 1 });
+  assert.equal(range.source, added, range.error);
+});
+
+test('e2e：追加入口独立展开，原入口保留原深度', async (t) => {
+  const { baseUrl: base, close } = await launchServer({ target: 'samples/tcu' });
+  t.after(close);
+  assert.equal((await postJson(base, '/api/mcp-config', { level: 'readwrite' })).ok, true);
+  const compose = (mode, root, down) => callTool(base, 'cg_compose_view', { mode, roots: [root], up: 0, down });
+  const view = (page) => postJson(base, `/api/view?up=${page.up}&down=${page.down}`, page);
+  const main = 'main.c::main';
+  const tick = 'main.c::SysTick_Handler';
+  const task = 'main.c::Task_10ms';
+  const picked = await callTool(base, 'cg_compose_view', { mode: 'replace', functionIds: [main], up: 2, down: 2 });
+  assert.equal(picked.ok, true, picked.error);
+  assert.deepEqual((await view(picked.page)).nodes.map(node => node.id), [main]);
+  for (const [oldDepth, newDepth, hasTask, hasInit] of [[0, 2, true, false], [1, 0, true, true]]) {
+    assert.equal((await compose('replace', main, oldDepth)).ok, true);
+    const added = await compose('add', tick, newDepth);
+    assert.equal(added.ok, true, added.error);
+    const ids = new Set((await view(added.page)).nodes.map(node => node.id));
+    assert.ok(ids.has(main) && ids.has(tick));
+    assert.equal(ids.has(task), hasTask);
+    assert.equal([...ids].some(id => id.endsWith('::Can_Init')), hasInit);
+    assert.equal(ids.has('main.c::Task_Shift'), newDepth === 2);
+  }
+});
+
+test('e2e：已保存的手工连线可以标注并写入 TASK 标签', async (t) => {
+  const { baseUrl: base, close } = await launchServer({ target: 'samples/tcu' });
+  t.after(close);
+  assert.equal((await postJson(base, '/api/mcp-config', { level: 'readwrite' })).ok, true);
+  const root = 'main.c::main', to = 'main.c::SysTick_Handler';
+  const roots = [root, to], edgeKey = `${root}->${to}:0`;
+  const view = () => callTool(base, 'cg_view', { roots, up: 0, down: 0 });
+  const data = { note: '手工调度关系' };
+  assert.equal((await callTool(base, 'cg_annotate', { edgeKey, data })).ok, false);
+  assert.equal((await callTool(base, 'cg_save_layout', { root: roots.join('+'), manual: [{ from: root, to }] })).ok, true);
+  assert.ok((await view()).edges.some(edge => edge.from === root && edge.to === to && edge.manual && edge.line === 0));
+  const annotation = await callTool(base, 'cg_annotate', { edgeKey, data });
+  assert.equal(annotation.ok, true, annotation.error);
+  const applied = await callTool(base, 'cg_apply_task_labels', { items: [{ edgeKey, preset: 'task', text: '10ms TASK' }] });
+  assert.equal(applied.ok, true, applied.error);
+  assert.deepEqual(applied.edgeKeys, [edgeKey]);
+  assert.equal((await view()).edges.find(edge => edge.from === root && edge.to === to && edge.manual).label.text, '10ms TASK');
+  const events = await (await fetch(base + '/api/events?detail=1')).json();
+  assert.ok(events.events.some(event => event.target === edgeKey && event.after?.note === data.note));
 });
 
 test('e2e：cg_apply_task_labels 解析简写边键，合并预设并拒绝批内和库内重号', async (t) => {

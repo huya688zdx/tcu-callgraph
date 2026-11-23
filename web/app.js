@@ -9,7 +9,7 @@ import { hooks } from './lib/hooks.js';
 import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
 import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, resetVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { loadStats, loadTree, resetVars, renderVars, renderDetail, renderTree, runSearch, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
@@ -71,7 +71,7 @@ async function loadView(rootId, opts = {}) {
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
-    console.warn(data?.error || '读取视图失败，保留当前画面');
+    console.warn(data?.error || t('app.viewFailed'));
     return;
   }
   if (prior) {
@@ -127,13 +127,13 @@ async function loadView(rootId, opts = {}) {
     }
   }
   pulseAdded(addedNodes, addedEdges);
-  renderDetail(state.selected).catch((error) => console.warn('读取节点详情失败：', error));
+  renderDetail(state.selected).catch((error) => console.warn(t('common.detailError'), error));
   renderLabelPanel();
   history.stack = [];
   history.idx = -1;
   pushHistory();
   // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
-  await savePage(true).catch((error) => console.warn('保存视图范围失败：', error));
+  await savePage(true).catch((error) => console.warn(t('app.scopeSaveFailed'), error));
   return seq === viewSeq ? data : undefined;
 }
 
@@ -150,7 +150,7 @@ hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } 
     if (state.view?.projectId !== projectId) return;
     if (hidden.length) {
       const result = await api.del({ nodes: hidden, restore: true, projectId });
-      if (!result?.ok) throw new Error(result?.error || '重新加入失败');
+      if (!result?.ok) throw new Error(result?.error || t('app.readdFailed'));
     }
   }
   const selected = state.selected;
@@ -192,7 +192,7 @@ hooks.applyComparison = async (roots) => {
   state.hiddenVars.clear();
   navStack.length = 0;
   await loadView(roots, { nav: false, incremental: true, exact: true, expansions: [] });
-  if (!state.view?.comparison) throw new Error('比较结果已准备，画布加载失败，请重试');
+  if (!state.view?.comparison) throw new Error(t('app.compareViewFailed'));
   // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
   // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
   state.up = 0; state.down = 0;
@@ -271,7 +271,7 @@ hooks.toggleVar = (id, on) => {
 
 async function postDelete(body) {
   const result = await api.del(body);
-  if (!result?.ok) throw new Error(result?.error || '移出画布失败');
+  if (!result?.ok) throw new Error(result?.error || t('common.removeFailed'));
 }
 
 /** 回退到上一个视图（入口 + 视角一起还原） */
@@ -443,7 +443,7 @@ for (const [id, extension, build] of [
     try {
       await saveExport(extension, await build());
     } catch (error) {
-      alert('导出失败：' + error.message);
+      alert(t('app.exportFailed', { error: error.message }));
     } finally {
       button.disabled = false;
     }
@@ -457,6 +457,16 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
+document.addEventListener('callgraph:langchange', () => {
+  renderTree(true);
+  syncTreeSelection();
+  runSearch().catch(() => {});
+  loadStats().catch(() => {});
+  renderVars();
+  if (document.getElementById('secDataflow').hidden) renderDetail(state.selected).catch(() => {});
+  renderLabelPanel();
+  draw();
+});
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
@@ -477,9 +487,9 @@ resize();
   }
   await Promise.all([loadStats(), loadTree()]);
   await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
-  if (!state.view) throw new Error('未能加载视图');
+  if (!state.view) throw new Error(t('app.noView'));
 })().catch((error) => {
-  if (confirm(`启动失败：${error.message}\n是否刷新页面重试？`)) location.reload();
+  if (confirm(t('app.retryStart', { error: error.message }))) location.reload();
 });
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）

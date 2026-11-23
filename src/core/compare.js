@@ -19,6 +19,8 @@ const addReason = (node, reason) => {
   if (!node.reasons.includes(reason)) node.reasons.push(reason);
 };
 const fieldOverlap = (a, b) => !a || !b || a === b || a.startsWith(b + '.') || b.startsWith(a + '.');
+const earlyExits = new Set(['return_statement', 'break_statement', 'continue_statement', 'goto_statement']);
+const loops = new Set(['for_statement', 'while_statement', 'do_statement']);
 const accessFields = (record, variable) => record && !record.whole && !record.indirect && !variable.containsUnion
   ? [...record.fields] : [''];
 
@@ -84,14 +86,17 @@ function functionWrites(fn, model, id, findMacros) {
 
   function effect(node, guards, sources) {
     const inputs = [], locals = new Set();
-    for (const { condition } of guards) dependencies(condition, inputs, locals);
+    for (const { control } of guards) {
+      inputs.push(...control.inputs);
+      for (const local of control.locals) locals.add(local);
+    }
     for (const source of sources) dependencies(source, inputs, locals);
     const refs = [...new Map(inputs.map(dep => [JSON.stringify(dep), dep])).values()];
     const macroNames = findMacros ? new Set([
-      ...findMacros([node.text, ...guards.map(g => g.condition.text)].join('\n')),
+      ...findMacros(node.text), ...guards.flatMap(g => [...g.control.macroNames]),
       ...[...locals].flatMap(local => [...local.macroNames]),
     ]) : undefined;
-    const signature = JSON.stringify([fingerprint(node.text), guards.map(g => [g.branch, fingerprint(g.condition.text)]),
+    const signature = JSON.stringify([fingerprint(node.text), guards.map(g => [g.branch, g.control.signature]),
       [...locals].map(local => local.signature), refs]);
     return { inputs: refs, signature: createHash('sha256').update(signature).digest('hex'), macroNames };
   }
@@ -143,14 +148,37 @@ function functionWrites(fn, model, id, findMacros) {
     }
     const condition = field('condition') || (node.type === 'case_statement' ? field('value') : null);
     const alternative = field('alternative'), initializer = field('initializer');
+    const sequential = node.type === 'compound_statement' || node.type === 'case_statement';
+    let activeGuards = guards;
+    let control;
+    let exits = earlyExits.has(node.type) ? new Map([[node.type, new Set()]]) : null;
     for (const child of node.namedChildren) {
       const guarded = condition && child.id !== condition.id && child.id !== initializer?.id;
-      visit(child, guarded ? [...guards, { condition, branch: child.id === alternative?.id ? 'else' : 'then' }] : guards, scope);
+      if (guarded && !control) {
+        const inputs = [], localEffects = new Set();
+        dependencies(condition, inputs, localEffects);
+        control = { inputs, locals: localEffects, signature: fingerprint(condition.text), macroNames: findMacros?.(condition.text) };
+      }
+      const guard = guarded ? { control, branch: child.id === alternative?.id ? 'else' : 'then' } : null;
+      const childExits = visit(child, guard ? [...activeGuards, guard] : activeGuards, scope);
+      if (!childExits) continue;
+      for (const [kind, controls] of childExits) {
+        // break / continue 只影响其目标循环或 switch 内的后续语句。
+        if ((kind === 'break_statement' && (node.type === 'switch_statement' || loops.has(node.type))) ||
+            (kind === 'continue_statement' && loops.has(node.type))) continue;
+        exits ??= new Map();
+        if (!exits.has(kind)) exits.set(kind, new Set());
+        const collected = exits.get(kind);
+        if (guard) collected.add(guard);
+        for (const control of controls) collected.add(control);
+      }
+      if (sequential && exits) activeGuards = [...guards, ...new Set([...exits.values()].flatMap(controls => [...controls]))];
     }
     if (scope !== shadowed) for (const [name, prior] of scope) {
       if (prior) locals.set(name, prior);
       else locals.delete(name);
     }
+    return exits;
   }
   visit(fn.childForFieldName('body'), [], new Map());
 

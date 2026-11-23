@@ -1,6 +1,7 @@
 /** 离线查看器：绘图、节点/层级拖动和折线路由直接使用 GUI 模块。 */
 import { state, cam, els, applyTheme } from './state.js';
 import { api } from './api.js';
+import { applyI18n, t } from '../i18n.js';
 import { hooks } from './hooks.js';
 import { resize } from './render.js';
 import { fit, focusBox, constrainCam } from './camera.js';
@@ -12,6 +13,7 @@ import './interact.js';
 import './ui-select.js';
 
 const saved = window.__EXPORT.snapshot;
+applyI18n();
 // 导出时的主题色先落回 THEME，离线页与原界面所见一致（file:// 下没有原 localStorage）
 applyTheme(saved.theme);
 state.view = saved.view;
@@ -24,7 +26,7 @@ state.hiddenVars = new Set(saved.hiddenVars);
 Object.assign(cam, saved.cam);
 
 // 面板查询从导出时的完整数据读取，不用图中的局部边反推调用与变量数据。
-api.node = async (id) => saved.details[id] || { error: '该节点未包含在快照中' };
+api.node = async (id) => saved.details[id] || { error: t('offline.nodeMissing') };
 api.vars = async () => ({ list: saved.variables });
 api.project = async () => saved.project;
 // 拖线、撤销仅更新当前离线页面，不访问原工程。
@@ -39,7 +41,7 @@ hooks.loadView = async (id) => {
 const disableVars = () => {
   for (const input of els.vars.querySelectorAll('input[type="checkbox"]')) {
     input.disabled = true;
-    input.title = '导出时的入图状态；增删变量请在 GUI 中操作后重新导出';
+    input.title = t('offline.vars');
   }
 };
 new MutationObserver(disableVars).observe(els.vars, { childList: true, subtree: true });
@@ -54,7 +56,7 @@ for (const [id, extension, build] of [
     const button = event.currentTarget;
     button.disabled = true;
     try { await saveExport(extension, await build()); }
-    catch (error) { alert('导出失败：' + error.message); }
+    catch (error) { alert(t('app.exportFailed', { error: error.message })); }
     finally { button.disabled = false; }
   });
 }

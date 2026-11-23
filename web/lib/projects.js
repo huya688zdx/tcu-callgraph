@@ -47,7 +47,7 @@ const fmtTime = (ts) => {
   const sameDay = d.toDateString() === now.toDateString();
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
-  if (sameDay) return `今天 ${hh}:${mm}`;
+  if (sameDay) return `${t('common.today')} ${hh}:${mm}`;
   return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
 };
 
@@ -85,7 +85,7 @@ async function switchTo(body) {
   projectMessage(t('project.switching'));
   try {
     const result = await api.switchProject(body);
-    if (!result?.ok) throw new Error(result?.error || '未知错误');
+    if (!result?.ok) throw new Error(result?.error || t('common.unknown'));
     await hooks.reloadAll();
     await syncProjectLabel();
     projectMessage('');
@@ -124,9 +124,9 @@ async function render() {
       </div>
       <div class="proj-tools"><div class="tm">${fmtTime(p.openedAt)}</div>
         <div class="proj-actions">
-          <button class="icon-btn" data-action="rename" title="重命名" aria-label="重命名">${ICONS.rename}</button>
-          <button class="icon-btn" data-action="folder" title="打开工程所在文件夹" aria-label="所在文件夹">${ICONS.folder}</button>
-          <button class="icon-btn danger" data-action="remove" title="从最近列表移除，保留源码与存档；重新打开原路径即可恢复" aria-label="移出列表">${ICONS.remove}</button>
+          <button class="icon-btn" data-action="rename" title="${t('project.rename')}" aria-label="${t('project.rename')}">${ICONS.rename}</button>
+          <button class="icon-btn" data-action="folder" title="${t('project.openFolder')}" aria-label="${t('project.folder')}">${ICONS.folder}</button>
+          <button class="icon-btn danger" data-action="remove" title="${t('project.removeHint')}" aria-label="${t('project.remove')}">${ICONS.remove}</button>
         </div>
       </div>
     </div>`
@@ -144,12 +144,12 @@ async function render() {
       try {
         if (button.dataset.action === 'rename') return rename(row, project);
         if (button.dataset.action === 'folder') {
-          if (!window.callgraph?.openProjectFolder) return hint('请在桌面版中打开工程所在文件夹');
+          if (!window.callgraph?.openProjectFolder) return hint(t('project.desktopFolder'));
           await window.callgraph.openProjectFolder(project.id);
         } else if (button.dataset.action === 'remove') {
           const ok = await confirmDialog({
-            title: '移出最近列表',
-            message: `确定将工程“${project.name}”移出最近列表吗？\n${project.path}\n源码和存档都会保留，重新打开原路径即可恢复。`,
+            title: t('project.removeRecent'),
+            message: [t('project.removeConfirm', { name: project.name }), project.path, t('project.removeKeep')].join('\n'),
             danger: true,
           });
           if (!ok || switching) return;
@@ -157,7 +157,7 @@ async function render() {
           const result = await api.removeProject(project.id);
           if (!result.ok) throw new Error(result.error);
           await render();
-          hint('已移出最近列表，源码和存档保留；打开原路径即可恢复');
+          hint(t('project.removedRecent'));
         }
       } catch (error) { hint(error.message); button.disabled = false; }
     });
@@ -171,7 +171,7 @@ function rename(row, project) {
   const name = row.querySelector('.nm');
   const original = name.innerHTML;
   row.classList.add('renaming'); // 编辑期间收起右侧操作图标，少一层干扰
-  name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button class="icon-btn ok" data-save title="保存" aria-label="保存">${ICONS.save}</button><button class="icon-btn" data-cancel title="取消" aria-label="取消">${ICONS.cancel}</button></div>`;
+  name.innerHTML = `<div class="proj-rename"><input aria-label="${t('project.name')}" maxlength="80" value="${esc(project.name)}"><button class="icon-btn ok" data-save title="${t('common.save')}" aria-label="${t('common.save')}">${ICONS.save}</button><button class="icon-btn" data-cancel title="${t('common.cancel')}" aria-label="${t('common.cancel')}">${ICONS.cancel}</button></div>`;
   const input = name.querySelector('input'), save = name.querySelector('[data-save]');
   const cancel = () => {
     if (save.disabled) return;
@@ -301,10 +301,10 @@ fileInput?.addEventListener('change', async () => {
   try {
     payload = JSON.parse(await file.text());
   } catch {
-    hint(`${t('session.importFailed')}：文件不是合法 JSON`);
+    hint(`${t('session.importFailed')}: ${t('session.invalidJson')}`);
     return;
   }
-  const ok = await confirmDialog({ title: '导入会话', message: '导入会覆盖同名的本地标注、布局和书签。确定继续吗？' });
+  const ok = await confirmDialog({ title: t('session.import'), message: t('session.overwrite') });
   if (!ok) return;
   const r = await api.importSession(payload).catch((error) => ({ ok: false, error: error.message }));
   if (!r || !r.ok) {

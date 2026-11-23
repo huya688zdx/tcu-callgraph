@@ -182,6 +182,23 @@ test('单次扫描保留跨文件任务注册、间隔和后绑定成员调用�
   assert.ok(model.functions.every(fn => !fn.bodyTokens), '不因恢复任务证据而长期保留函数 token');
 });
 
+test('延时周期使用调用位置的宏定义及 undef 状态', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-scope-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'worker.c'), `
+#define STEP 10
+#define INTERVAL STEP
+void workerA(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+#undef STEP
+void worker_unknown(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+#define STEP 20
+void workerB(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+`);
+  assert.deepEqual(Object.fromEntries(projectTasks(loadModel(root)).map(({ name, us }) => [name, us])), {
+    workerA: 10000, worker_unknown: null, workerB: 20000,
+  });
+});
+
 test('纯 C 周期识别支持 RTOS 注册、循环工作函数、毫秒宏和调度表', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-c-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

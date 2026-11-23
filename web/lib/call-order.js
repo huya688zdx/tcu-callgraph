@@ -45,7 +45,7 @@ export async function findCallOrder(fnId) {
         to: edge.to,
         line: edge.line,
         text: `${LABEL_PRESETS.call.text}${order}`,
-        evidence: `${source?.file || ''}:${edge.line} · 编号 ${order}`,
+        evidence: `${source?.file || ''}:${edge.line} · ${t('callOrder.number')} ${order}`,
       },
       edge,
     }));
@@ -64,7 +64,7 @@ export async function findCallOrder(fnId) {
       </label>`;
     }).join('');
     body.innerHTML = `<div class="detail-title">${esc(source?.name || fnId.split('::').pop())}</div>
-      ${items ? `<p class="detail-meta">按图中首次调用顺序分配空号，保留已保存的编号。</p>${items}` : `<div class="empty">${t('callOrder.empty')}</div>`}`;
+      ${items ? `<p class="detail-meta">${t('callOrder.assign')}</p>${items}` : `<div class="empty">${t('callOrder.empty')}</div>`}`;
     syncConfirm();
   } catch (error) {
     if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;
@@ -77,7 +77,7 @@ async function applySelected() {
   const session = pending;
   if (applying || !session || session.projectId !== state.view?.projectId) return;
   if (session.view !== state.view) {
-    message.textContent = '画布已更新，请重新查找调用顺序。';
+    message.textContent = t('callOrder.viewChanged');
     return;
   }
   const chosen = [...body.querySelectorAll('input:checked:not(:disabled)')].map((input) => session.rows[Number(input.dataset.index)]);
