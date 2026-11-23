@@ -9,18 +9,30 @@ import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
 import { routeBounds } from '/core/routing.js';
 
-// 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
+// 选中动画使用独立画布，箭头和虚线移动时保留主画布上的文字、标签与连线。
 let animationFrame = 0;
+let recentTimer = 0;
 let recentLayers = null;
 let collectingEffects = false;
 let effects = [];
 let effectCamera = null;
-let damage = null;
-let lastAnimationPaint = 0;
-// 动画按实时时间推进，限制空闲时的合成频率。
-const ANIMATION_INTERVAL = 32;
+let recentDamage = null;
+let lastGlowPaint = 0;
+let panOrigin = null;
+const effectRects = [];
+const GLOW_INTERVAL = 32;
+const RECENT_HIGHLIGHT_MS = 6000;
+const RECENT_COLOR = '#E69A16';
 const scene = document.createElement('canvas');
 const sceneCtx = scene.getContext('2d');
+const effectCanvas = document.createElement('canvas');
+effectCanvas.id = 'cvEffects';
+effectCanvas.setAttribute('aria-hidden', 'true');
+Object.assign(effectCanvas.style, {
+  position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none',
+});
+effectCanvas.width = effectCanvas.height = 0;
+const effectCtx = effectCanvas.getContext('2d');
 const nodeNames = new WeakMap();
 
 function sizeScene(canvas) {
@@ -44,6 +56,35 @@ function boxVisible(box, area, width = box.w) {
     box.y <= area.bottom && box.y + box.h >= area.top;
 }
 
+const groupPaintWidth = (box) => Math.max(box.w, 26 * String(box.label).length + 30);
+
+function panCanvas(dx, dy, contentBounds) {
+  const { cv } = els;
+  const view = state.view;
+  // 只有全部对象已画在当前画布内才可平移位图。底部状态文字在松手时恢复。
+  if (!panOrigin && contentBounds && view?.nodes.length && !recentLayers) {
+    const b = contentBounds();
+    if (b.x * cam.k + cam.x >= 8 && b.y * cam.k + cam.y >= 8 &&
+        (b.x + b.w) * cam.k + cam.x <= cv.clientWidth - 8 &&
+        (b.y + b.h) * cam.k + cam.y <= cv.clientHeight - 24 &&
+        [...(view.groups || []), ...(view.containers || [])].every((g) =>
+          (g.x + groupPaintWidth(g)) * cam.k + cam.x <= cv.clientWidth - 8)) {
+      panOrigin = { x: cam.x, y: cam.y };
+      cv.style.clipPath = 'inset(0 0 22px)';
+    }
+  }
+  cam.x += dx;
+  cam.y += dy;
+  if (panOrigin) {
+    const shift = `${cam.x - panOrigin.x}px ${cam.y - panOrigin.y}px`;
+    cv.style.translate = effectCanvas.style.translate = shift;
+  } else draw({ geometryUnchanged: true });
+}
+
+function finishPan() {
+  if (panOrigin) draw({ geometryUnchanged: true });
+}
+
 function pathVisible(points, area) {
   for (let i = 1; i < points.length; i++) {
     const [x1, y1] = points[i - 1], [x2, y2] = points[i];
@@ -53,48 +94,58 @@ function pathVisible(points, area) {
   return false;
 }
 
-function addDamage(box, padding = 16) {
-  const { cv } = els, dpr = window.devicePixelRatio || 1;
-  const x = Math.max(0, Math.floor((box.x * cam.k + cam.x - padding) * dpr));
-  const y = Math.max(0, Math.floor((box.y * cam.k + cam.y - padding) * dpr));
-  const right = Math.min(cv.width, Math.ceil(((box.x + box.w) * cam.k + cam.x + padding) * dpr));
-  const bottom = Math.min(cv.height, Math.ceil(((box.y + box.h) * cam.k + cam.y + padding) * dpr));
-  if (right <= x || bottom <= y) return;
-  if (!damage) damage = { x, y, right, bottom };
+function screenRect(box, padding, camera = cam, dpr = window.devicePixelRatio || 1) {
+  const { cv } = els, { x: cx, y: cy, k } = camera;
+  const x = Math.max(0, Math.floor((box.x * k + cx - padding) * dpr));
+  const y = Math.max(0, Math.floor((box.y * k + cy - padding) * dpr));
+  const right = Math.min(cv.width, Math.ceil(((box.x + box.w) * k + cx + padding) * dpr));
+  const bottom = Math.min(cv.height, Math.ceil(((box.y + box.h) * k + cy + padding) * dpr));
+  return right > x && bottom > y ? { x, y, right, bottom } : null;
+}
+
+function addRecentDamage(box, padding) {
+  const rect = screenRect(box, padding);
+  if (!rect) return;
+  if (!recentDamage) recentDamage = rect;
   else {
-    damage.x = Math.min(damage.x, x);
-    damage.y = Math.min(damage.y, y);
-    damage.right = Math.max(damage.right, right);
-    damage.bottom = Math.max(damage.bottom, bottom);
+    recentDamage.x = Math.min(recentDamage.x, rect.x);
+    recentDamage.y = Math.min(recentDamage.y, rect.y);
+    recentDamage.right = Math.max(recentDamage.right, rect.right);
+    recentDamage.bottom = Math.max(recentDamage.bottom, rect.bottom);
   }
 }
 
-function addPathDamage(points, padding) {
-  const { minX, minY, maxX, maxY } = routeBounds(points);
-  addDamage({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, padding);
-}
-
 export function pulseAdded(nodes, edges) {
-  state.recent = nodes.length || edges.length ? {
+  clearTimeout(recentTimer);
+  const count = nodes.length + edges.length;
+  const now = performance.now();
+  const recent = count ? {
     nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
-    started: performance.now(), until: performance.now() + 6000,
+    started: now, until: now + RECENT_HIGHLIGHT_MS, animated: count === 1,
   } : null;
+  state.recent = recent;
+  if (recent) recentTimer = setTimeout(() => {
+    if (state.recent !== recent) return;
+    state.recent = null;
+    if (!document.hidden) draw({ geometryUnchanged: true });
+  }, RECENT_HIGHLIGHT_MS);
   draw();
 }
 function scheduleDraw() {
-  if (animationFrame || !damage || document.hidden) return;
+  if (animationFrame || document.hidden || (!recentDamage && !effects.length && !state.flash)) return;
   animationFrame = requestAnimationFrame((now) => {
     animationFrame = 0;
     if (recentLayers && (!state.recent || now >= state.recent.until)) { draw({ geometryUnchanged: true }); return; }
-    if (now - lastAnimationPaint >= ANIMATION_INTERVAL || (state.flash && now >= state.flash.until)) {
-      drawCachedFrame(now);
-      lastAnimationPaint = now;
+    if (recentDamage && now - lastGlowPaint >= GLOW_INTERVAL) {
+      drawRecentFrame(now);
+      lastGlowPaint = now;
     }
-    if (effects.length || recentLayers || state.flash) scheduleDraw();
+    if (effects.length || state.flash) drawEffects(now);
+    scheduleDraw();
   });
 }
 
-function drawCachedFrame(now, region = damage) {
+function drawRecentFrame(now, region = recentDamage) {
   const { ctx } = els;
   const { x, y, right, bottom } = region;
   const w = right - x, h = bottom - y;
@@ -102,16 +153,13 @@ function drawCachedFrame(now, region = damage) {
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(x, y, w, h);
-  if (recentLayers) {
-    blit(recentLayers.background.canvas);
-    ctx.globalAlpha = (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
-      Math.min(1, (state.recent.until - now) / 700);
-    blit(recentLayers.glow.canvas);
-    ctx.globalAlpha = 1;
-  }
+  blit(recentLayers.background.canvas);
+  ctx.globalAlpha = (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
+    Math.min(1, (state.recent.until - now) / 700);
+  blit(recentLayers.glow.canvas);
+  ctx.globalAlpha = 1;
   blit(scene);
   ctx.restore();
-  drawEffects(now);
 }
 
 // 金色光晕夹在分组背景与文字、箭头之间。只在画面变化时生成，呼吸动画只改变透明度。
@@ -134,11 +182,12 @@ function prepareRecentLayers(view, area) {
   glow.clearRect(0, 0, cv.width, cv.height);
   glow.save();
   glow.setTransform(ctx.getTransform());
-  glow.strokeStyle = glow.shadowColor = '#E69A16';
+  glow.strokeStyle = glow.shadowColor = RECENT_COLOR;
   glow.lineWidth = 7 / cam.k;
   glow.shadowBlur = 10;
   for (const e of edges) {
-    addPathDamage(e.points, 36);
+    const { minX, minY, maxX, maxY } = routeBounds(e.points);
+    addRecentDamage({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, 36);
     glow.setLineDash(edgeDashed(e) ? [7, 4] : []);
     glow.beginPath(); strokeRounded(glow, e.points); glow.stroke();
   }
@@ -147,7 +196,7 @@ function prepareRecentLayers(view, area) {
   glow.shadowBlur = 12;
   glow.setLineDash([]);
   for (const n of nodes) {
-    addDamage(n, 36);
+    addRecentDamage(n, 36);
     roundRect(glow, n.x - gap, n.y - gap, n.w + gap * 2, n.h + gap * 2, 10);
     glow.stroke();
   }
@@ -159,20 +208,56 @@ function prepareRecentLayers(view, area) {
 }
 
 function recordBoxEffect(box, dash, width, radius = 8, color = THEME.node.selected) {
-  addDamage(box, width * cam.k / 2 + 4);
-  effects.push({ kind: 'box', box: { x: box.x, y: box.y, w: box.w, h: box.h }, dash, width, radius, color });
+  if (screenRect(box, width * cam.k / 2 + 4)) effects.push({ kind: 'box', box, dash, width, radius, color });
+}
+
+function markEffectArea(box, padding) {
+  const rect = screenRect(box, padding, effectCamera, effectCamera.dpr);
+  if (rect) effectRects.push(rect);
+}
+
+function markEffectOutline({ x, y, w, h }, radius, padding) {
+  const r = Math.min(radius, w / 2, h / 2);
+  markEffectArea({ x, y, w, h: r }, padding);
+  markEffectArea({ x, y: y + h - r, w, h: r }, padding);
+  markEffectArea({ x, y: y + r, w: 0, h: h - 2 * r }, padding);
+  markEffectArea({ x: x + w, y: y + r, w: 0, h: h - 2 * r }, padding);
+}
+
+function releaseEffectCanvas() {
+  if (!effectCanvas.width) return;
+  effectCanvas.remove();
+  effectCanvas.width = effectCanvas.height = 0;
+  effectRects.length = 0;
+}
+
+function compositeEffects(ctx) {
+  if (effectCanvas.width) ctx.drawImage(effectCanvas, 0, 0);
 }
 
 function drawEffects(now) {
-  const { ctx } = els, c = effectCamera;
+  if (state.flash && now >= state.flash.until) state.flash = null;
+  if (!effects.length && !state.flash) { releaseEffectCanvas(); return; }
+  const { cv } = els;
+  if (effectCanvas.width !== cv.width || effectCanvas.height !== cv.height) {
+    effectCanvas.width = cv.width;
+    effectCanvas.height = cv.height;
+    effectRects.length = 0;
+  }
+  if (!effectCanvas.isConnected) cv.after(effectCanvas);
+  const ctx = effectCtx, c = effectCamera;
+  // 基础画布保留连线和文字。每帧只擦除上次的流动标记与虚线轮廓。
+  for (const { x, y, right, bottom } of effectRects) ctx.clearRect(x, y, right - x, bottom - y);
+  effectRects.length = 0;
   ctx.save();
   ctx.setTransform(c.dpr, 0, 0, c.dpr, 0, 0);
   ctx.translate(c.x, c.y);
   ctx.scale(c.k, c.k);
   const flash = state.flash;
-  if (flash && now >= flash.until) state.flash = null;
-  else if (flash) {
-    roundRect(ctx, flash.box.x - 2, flash.box.y - 2, flash.box.w + 4, flash.box.h + 4, 16);
+  if (flash) {
+    const box = { x: flash.box.x - 2, y: flash.box.y - 2, w: flash.box.w + 4, h: flash.box.h + 4 };
+    markEffectOutline(box, 16, 4);
+    roundRect(ctx, box.x, box.y, box.w, box.h, 16);
     ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.9 * Math.min(1, (flash.until - now) / flash.dur));
     ctx.lineWidth = 3 / c.k;
     ctx.stroke();
@@ -181,6 +266,7 @@ function drawEffects(now) {
     ctx.save();
     if (effect.kind === 'box') {
       const b = effect.box;
+      markEffectOutline(b, effect.radius, effect.width * c.k / 2 + 2);
       roundRect(ctx, b.x, b.y, b.w, b.h, effect.radius);
       ctx.strokeStyle = effect.color;
       ctx.lineWidth = effect.width;
@@ -199,7 +285,9 @@ function drawEffects(now) {
         if (x < c.area.left || x > c.area.right || y < c.area.top || y > c.area.bottom) continue;
         ctx.save();
         // 固定放在前进方向右侧，相向重合时各走一侧。
-        ctx.translate(x - dy * 5 * scale, y + dx * 5 * scale);
+        const mx = x - dy * 5 * scale, my = y + dx * 5 * scale;
+        markEffectArea({ x: mx, y: my, w: 0, h: 0 }, 9 * c.k * scale + 2);
+        ctx.translate(mx, my);
         ctx.rotate(Math.atan2(dy, dx));
         ctx.scale(scale, scale);
         ctx.beginPath();
@@ -299,18 +387,23 @@ function neighborSet() {
 function draw({ geometryUnchanged = false } = {}) {
   cancelAnimationFrame(animationFrame);
   animationFrame = 0;
-  damage = null;
+  recentDamage = null;
   effects = [];
   collectingEffects = false;
   const { ctx, cv } = els;
-  if (!cv.width || !cv.height) { recentLayers = null; releaseScene(); return; }
+  if (panOrigin) {
+    panOrigin = null;
+    cv.style.clipPath = '';
+    cv.style.translate = effectCanvas.style.translate = '';
+  }
+  if (!cv.width || !cv.height) { recentLayers = null; releaseScene(); releaseEffectCanvas(); return; }
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
   const H = cv.height / dpr;
   const now = performance.now();
   if (state.recent && now >= state.recent.until) state.recent = null;
   if (state.flash && now >= state.flash.until) state.flash = null;
-  if (!state.recent || !state.view?.nodes.length) recentLayers = null;
+  if (!state.recent?.animated || !state.view?.nodes.length) recentLayers = null;
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
@@ -333,6 +426,7 @@ function draw({ geometryUnchanged = false } = {}) {
   );
   if (!v) {
     releaseScene();
+    releaseEffectCanvas();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
     ctx.textAlign = 'center';
@@ -346,6 +440,7 @@ function draw({ geometryUnchanged = false } = {}) {
 
   if (!v.nodes.length) {
     releaseScene();
+    releaseEffectCanvas();
     ctx.restore();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
@@ -357,11 +452,11 @@ function draw({ geometryUnchanged = false } = {}) {
   const area = viewport(W, H);
 
   // 标题可以比文件框宽，视口判断要包含标题可能占到的范围。
-  const groupVisible = (box) => boxVisible(box, area, Math.max(box.w, 26 * String(box.label).length + 30));
+  const groupVisible = (box) => boxVisible(box, area, groupPaintWidth(box));
   for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c);
   for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g);
 
-  if (state.recent) prepareRecentLayers(v, area);
+  if (state.recent?.animated) prepareRecentLayers(v, area);
 
   const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
@@ -486,17 +581,16 @@ function draw({ geometryUnchanged = false } = {}) {
   ctx.textAlign = 'left';
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
   collectingEffects = false;
-  if (state.flash) addDamage(state.flash.box);
-  if (recentLayers || damage) {
+  if (recentLayers) {
     sizeScene(cv);
     sceneCtx.clearRect(0, 0, scene.width, scene.height);
     sceneCtx.drawImage(cv, 0, 0);
-    effectCamera = { ...cam, dpr, area };
-    if (recentLayers) drawCachedFrame(now, { x: 0, y: 0, right: cv.width, bottom: cv.height });
-    else drawEffects(now);
-    lastAnimationPaint = now;
+    drawRecentFrame(now, { x: 0, y: 0, right: cv.width, bottom: cv.height });
+    lastGlowPaint = now;
   } else if (!dim) releaseScene();
-  if (recentLayers || state.flash || effects.length) scheduleDraw();
+  effectCamera = { ...cam, dpr, area };
+  drawEffects(now);
+  scheduleDraw();
 }
 
 function drawContainer(ctx, c) {
@@ -581,6 +675,13 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
+  const recent = state.recent;
+  // 增加节点时用节点边框提示位置。单独增加多条关系时用静态线条提示。
+  if (recent && !recent.animated && !recent.nodes.size && recent.edges.has(edgeKey(e))) {
+    ctx.strokeStyle = hexToRgba(RECENT_COLOR, 0.45);
+    ctx.lineWidth = Math.max(3.4, 2 / cam.k);
+    ctx.stroke();
+  }
   if (traceColor) {
     ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 * Math.min(1, 1 / cam.k); ctx.globalAlpha = 0.9; ctx.stroke();
   }
@@ -595,10 +696,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
 
   if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
     const path = flowPath(pts);
-    if (path.length) {
-      addPathDamage(pts);
-      effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
-    }
+    if (path.length) effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
   }
 
   const a = pts[pts.length - 2];
@@ -682,6 +780,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const edgeRelated = focusedNodes?.has(n.id);
+  const recentlyAdded = state.recent && !state.recent.animated && state.recent.nodes.has(n.id);
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
 
@@ -696,11 +795,14 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
-  ctx.lineWidth = dropTarget ? 2.6 : selected || edgeRelated ? 2.4 : hover ? 1.6 : 1;
+  ctx.lineWidth = dropTarget ? 2.6 : selected || edgeRelated ? 2.4
+    : recentlyAdded ? Math.max(1.6, 1 / cam.k) : hover ? 1.6 : 1;
   ctx.strokeStyle = dropTarget
     ? '#639922'
     : selected || edgeRelated
     ? THEME.node.selected
+    : recentlyAdded
+    ? RECENT_COLOR
     : hover
     ? THEME.node.hover
     : n.external
@@ -782,6 +884,9 @@ export {
   roundRect,
   updateGroups,
   draw,
+  compositeEffects,
+  panCanvas,
+  finishPan,
   drawContainer,
   drawGroup,
   strokeRounded,

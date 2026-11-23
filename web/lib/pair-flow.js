@@ -48,10 +48,10 @@ function renderPanel() {
   panel.innerHTML = `<h3>连线路径</h3><div class="pair-flow-heading">${message}</div><div class="pair-flow-actions">${pair.result?.paths.length ? '<button type="button" data-pair-focus>显示整条路径</button>' : ''}<button type="button" data-pair-clear>清除 <kbd>Esc</kbd></button></div>${details}`;
 }
 
-export function clearPairFlow() {
+export function clearPairFlow({ paint = true } = {}) {
   state.pairFlow = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
-  draw();
+  if (paint) draw();
 }
 
 export function pickPairFlow(id) {

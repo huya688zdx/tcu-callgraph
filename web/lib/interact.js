@@ -12,8 +12,8 @@ import {
   edgePoints,
   distToSegment,
 } from './geometry.js';
-import { draw } from './render.js';
-import { stopCamAnim, panCam, zoomCam } from './camera.js';
+import { draw, panCanvas, finishPan } from './render.js';
+import { contentBounds, stopCamAnim, panCam, zoomCam } from './camera.js';
 import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
@@ -34,7 +34,7 @@ import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
 import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 function worldPos(e) {
-  const rect = els.cv.getBoundingClientRect();
+  const rect = els.cv.parentElement.getBoundingClientRect();
   return {
     x: (e.clientX - rect.left - cam.x) / cam.k,
     y: (e.clientY - rect.top - cam.y) / cam.k,
@@ -448,8 +448,10 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   if (pickEdgeAt(e, selectEdge)) return;
+  const editing = state.moveTarget;
   state.moveTarget = null;
   state.panning = true;
+  if (editing) draw({ geometryUnchanged: true });
   state.panMoved = false;
   state.last = { x: e.clientX, y: e.clientY };
   state.dragStart = state.last;
@@ -540,11 +542,10 @@ function handlePointerMove(e) {
     const dx = e.clientX - state.last.x;
     const dy = e.clientY - state.last.y;
     const start = state.dragStart || state.last;
+    const previewBounds = state.panMoved ? null : contentBounds;
     if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) > 3) state.panMoved = true;
-    cam.x += dx;
-    cam.y += dy;
     state.last = { x: e.clientX, y: e.clientY };
-    draw({ geometryUnchanged: true });
+    panCanvas(dx, dy, previewBounds);
     return;
   }
 
@@ -698,6 +699,7 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (panning) {
+    finishPan();
     if (!panMoved) {
       if (!pickEdgeAt(e, selectEdge)) {
         state.selectedEdge = null;
@@ -818,7 +820,7 @@ els.cv.addEventListener(
   (e) => {
     e.preventDefault();
     if (state.dragBox) return;
-    const rect = els.cv.getBoundingClientRect();
+    const rect = els.cv.parentElement.getBoundingClientRect();
     if (!e.ctrlKey) {
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? (e.shiftKey ? rect.width : rect.height) : 1;
       if (e.shiftKey) panCam(-(e.deltaY || e.deltaX) * unit, 0);

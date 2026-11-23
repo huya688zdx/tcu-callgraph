@@ -184,3 +184,34 @@ test('紧凑索引保留头文件宏的生效顺序、文件内 undef 和嵌套�
   assert.ok(model.functions.every((fn) => !Object.hasOwn(fn, 'bodyTokens')));
   assert.deepEqual(detectTasks(model, 'b.c::inherited').skipped.map(({ from }) => from), ['b.c::inherited']);
 });
+
+test('单次词法分析后绑定在后续文件中定义的函数指针和全局变量', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-deferred-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'caller.c'), `
+static int local_count = 0;
+void entry(void) {
+  later = 3;
+  local_count += later;
+  outer(ops.tick());
+}
+void unknown_member(void) { outer(unknown.tick()); entry(); }
+void unknown_field(void) { ops.toString(); }
+`);
+  fs.writeFileSync(path.join(dir, 'table.c'), `
+int later = 0;
+int local_count = 0;
+void outer(int value) {}
+int tick(void) { return 1; }
+const Ops ops = { .tick = tick };
+`);
+  const model = loadModel(dir);
+  const entry = model._index.byId.get('caller.c::entry');
+  const edges = model._index.outAdj.get(entry.id);
+  assert.ok(edges.some((e) => e.kind === 'fnptr' && e.to === 'table.c::tick' && e.via === 'ops.tick'));
+  assert.equal(entry.hasNestedCalls, true);
+  assert.equal(model._index.byId.get('caller.c::unknown_member').hasNestedCalls, undefined);
+  assert.ok(!model._index.outAdj.get('caller.c::unknown_field')?.some((e) => e.kind === 'fnptr'));
+  assert.deepEqual(entry.varAccess.map(({ id, read, write }) => [id, read, write]),
+    [['var::later', true, true], ['var::caller.c::local_count', true, true]]);
+});

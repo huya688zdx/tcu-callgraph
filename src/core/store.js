@@ -926,7 +926,7 @@ export function openStore({ dbPath, userData } = {}) {
       const r = q.cacheGet.get(key);
       if (!r || !r.model) return null;
       try {
-        return deserialize(gunzipSync(Buffer.from(r.model)));
+        return deserialize(gunzipSync(r.model));
       } catch {
         q.cacheDel.run(key);
         return null;

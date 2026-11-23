@@ -4,11 +4,16 @@
  * 预处理指令整行识别为 preproc token（支持 \ 续行）。
  */
 
-const OPS3 = new Set(['<<=', '>>=']);
-const OPS2 = new Set([
-  '->', '++', '--', '<<', '>>', '<=', '>=', '==', '!=', '&&', '||',
-  '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '##',
-]);
+const OPS2 = {
+  '-': { '>': '->', '-': '--', '=': '-=' },
+  '+': { '+': '++', '=': '+=' },
+  '<': { '<': '<<', '=': '<=' },
+  '>': { '>': '>>', '=': '>=' },
+  '&': { '&': '&&', '=': '&=' },
+  '|': { '|': '||', '=': '|=' },
+  '=': { '=': '==' }, '!': { '=': '!=' }, '*': { '=': '*=' }, '/': { '=': '/=' },
+  '%': { '=': '%=' }, '^': { '=': '^=' }, '#': { '#': '##' },
+};
 
 const isIdStart = (c) => (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '_';
 const isIdChar = (c) => isIdStart(c) || (c >= '0' && c <= '9');
@@ -172,24 +177,12 @@ export function lex(src, file = '') {
       continue;
     }
 
-    // 运算符
-    const three = src.slice(i, i + 3);
-    if (OPS3.has(three)) {
-      tokens.push({ t: 'punct', v: three, s: i, e: i + 3, line, col });
-      i += 3;
-      col += 3;
-      continue;
-    }
-    const two = src.slice(i, i + 2);
-    if (OPS2.has(two)) {
-      tokens.push({ t: 'punct', v: two, s: i, e: i + 2, line, col });
-      i += 2;
-      col += 2;
-      continue;
-    }
-    tokens.push({ t: 'punct', v: c, s: i, e: i + 1, line, col });
-    i++;
-    col++;
+    // 普通标点不必先切出两段字符串再查多字符运算符。
+    let op = OPS2[c]?.[src[i + 1]] || c;
+    if ((op === '<<' || op === '>>') && src[i + 2] === '=') op += '=';
+    tokens.push({ t: 'punct', v: op, s: i, e: i + op.length, line, col });
+    i += op.length;
+    col += op.length;
   }
 
   return tokens;
