@@ -206,7 +206,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v13-compact-task-order\0');
+  h.update('analyzed-model-v14-single-pass-task-order\0');
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
@@ -926,7 +926,7 @@ export function openStore({ dbPath, userData } = {}) {
       const r = q.cacheGet.get(key);
       if (!r || !r.model) return null;
       try {
-        return deserialize(gunzipSync(Buffer.from(r.model)));
+        return deserialize(gunzipSync(r.model));
       } catch {
         q.cacheDel.run(key);
         return null;

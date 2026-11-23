@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { fork } from 'node:child_process';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
 import { layoutElk } from './core/layout-elk.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
@@ -73,6 +74,9 @@ let pageState = null;
 const store = openStore();
 const modelCacheKeys = new WeakMap();
 const analysisPending = new WeakMap();
+
+// Electron 停止服务时断开 IPC，让服务先终止正在扫描源码的子进程。
+if (process.connected) process.once('disconnect', () => process.exit(0));
 
 /** 变量/数据流查询或失效标注检查需要 AST 时再构建；完成后升级磁盘缓存。 */
 async function ensureAnalysis(model) {
@@ -169,6 +173,32 @@ function migrateLegacy(project) {
   }
 }
 
+function scanInProcess(target, scan) {
+  return new Promise((resolve, reject) => {
+    const child = fork(fileURLToPath(new URL('./core/scan-model.js', import.meta.url)), [], {
+      execArgv: [],
+      stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+      serialization: 'advanced',
+      windowsHide: true,
+    });
+    let result;
+    const stop = () => child.kill();
+    process.once('exit', stop);
+    child.once('message', (message) => { result = message; });
+    child.once('error', reject);
+    child.once('close', (code, signal) => {
+      process.off('exit', stop);
+      if (code === 0 && result?.model) resolve(result.model);
+      else reject(new Error(result?.error || `源码扫描中断（${signal || code}）`));
+    });
+    child.send({ target, scan }, (error) => {
+      if (!error) return;
+      stop();
+      reject(error);
+    });
+  });
+}
+
 /**
  * 加载一个工程并切换会话状态。
  * 解析结果是纯派生的，切工程时整份重建；标注 / 布局从库里按 project_id 读。
@@ -186,32 +216,43 @@ async function openTarget(targetPath, { first = false } = {}) {
   const label = path.basename(isFile ? path.dirname(abs) : abs) || abs;
 
   console.log(`[加载] ${abs}`);
-  const t0 = Date.now();
+  const t0 = performance.now();
 
   // 解析缓存：源码没动过就直接反序列化模型，省掉整轮词法 + 语法分析。
   // .dot / .gv 走另一套模型（没有文件清单），不参与缓存。
   const isDot = isFile && /\.(dot|gv)$/i.test(abs);
   const scanRoot = isFile ? path.dirname(abs) : abs;
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
-  const key = isDot ? '' : cacheKey(scanSources(scanRoot), focus);
+  const warnings = [];
+  const scan = isDot ? null : { files: scanSources(scanRoot, warnings), warnings };
+  const key = scan && !warnings.length ? cacheKey(scan.files, focus) : '';
+  const scanMs = performance.now() - t0;
 
+  const readAt = performance.now();
   let model = key ? store.getCachedModel(key) : null;
   const fromCache = !!model;
+  const cacheReadMs = performance.now() - readAt;
+  const parseAt = performance.now();
   if (model) {
     model.root = isFile ? path.dirname(abs) : abs;
     if (focus) model.focusFile = focus;
     rebuildIndex(model);
+  } else if (scan) {
+    model = rebuildIndex(await scanInProcess(abs, scan));
   } else {
     model = loadModel(abs);
   }
+  const analyzeMs = performance.now() - parseAt;
 
   // 首屏只需要调用关系；变量清单/数据流由 ensureAnalysis 按需构建。
+  const saveAt = performance.now();
   modelCacheKeys.set(model, key);
   if (key && !fromCache) {
     const r = store.putCachedModel(key, model);
     if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
   }
-  const loadMs = Date.now() - t0;
+  const cacheWriteMs = performance.now() - saveAt;
+  const loadMs = Math.round(performance.now() - t0);
   model.elapsedMs = loadMs;
   const st = stats(model);
   const project = store.upsertProject({
@@ -247,6 +288,7 @@ async function openTarget(targetPath, { first = false } = {}) {
       fromCache ? '（解析缓存）' : ''
     }`
   );
+  if (scan) console.log(`[耗时] 文件清单 ${Math.round(scanMs)}ms / 缓存读取 ${Math.round(cacheReadMs)}ms / ${fromCache ? '索引重建' : '源码分析'} ${Math.round(analyzeMs)}ms / 缓存写入 ${Math.round(cacheWriteMs)}ms`);
   console.log(`[存储] ${store.file} · 工程 #${project.id} ${project.isNew ? '(新建)' : ''}`);
   return { project, stats: st };
 }
@@ -562,6 +604,7 @@ async function buildView(
   );
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
   if (!clean.length) {
+    if (varSel.preview) return { nodes: [], edges: [], projectId, truncated };
     const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
       : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
     return { ...emptyLayout, root: g.root, roots,
@@ -683,6 +726,12 @@ async function buildView(
   if (COMPARISON) clean = clean.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
   const macroNameMode = macroNameDefault();
   clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
+  if (varSel.preview) return {
+    nodes: clean.map(({ id, name, file, line, kind }) => ({ id, name, file, line, kind })),
+    edges: viewEdges.map(({ from, to, kind, line, change }) => ({ from, to, kind, line, change })),
+    projectId,
+    truncated,
+  };
   clean = withTaskPeriods(clean, model, COMPARISON);
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
@@ -1537,7 +1586,8 @@ const server = http.createServer(async (req, res) => {
       if (previous && !!(previous.groups.length || previous.layoutSlots?.groups?.length) !== group) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
-      const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions };
+      const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions,
+        preview: u.searchParams.get('preview') === '1' };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       const at = Number(u.searchParams.get('at') || 0);
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');

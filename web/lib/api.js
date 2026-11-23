@@ -34,8 +34,9 @@ const guardWrite = (name) => {
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
-  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null }) {
+  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null, preview = false }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
+    if (preview) q.set('preview', '1');
     // 支持多入口：勾选多个函数时一起入图
     const list = (roots && roots.length ? roots : root ? [root] : []).filter(Boolean);
     if (list.length === 1) q.set('root', list[0]);

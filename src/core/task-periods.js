@@ -10,18 +10,31 @@ const unitUs = { s: 1000000, ms: 1000, us: 1, 'µs': 1 };
 
 // 调度器显式指定的函数可使用任意名称。只解析能唯一绑定到定义的直接标识符。
 const registrations = new Set(['xTaskCreate', 'xTaskCreateStatic', 'ActivateTask', 'ChainTask']);
-export function captureTaskEvidence(fn, tokens, byName) {
+export function collectTaskEvidence(fn, tokens) {
+  const found = [];
   for (let i = 0; i < tokens.length; i++) {
     if (!registrations.has(tokens[i].v) || tokens[i + 1]?.v !== '(') continue;
     const start = i + (tokens[i + 2]?.v === '&' ? 3 : 2);
     if (tokens[start]?.t !== 'id' || ![',', ')'].includes(tokens[start + 1]?.v)) continue;
-    const candidates = byName.get(tokens[start].v) || [];
-    const local = candidates.filter(f => f.file === fn.file);
-    const targets = local.length ? local : candidates.filter(f => !f.isStatic);
-    if (targets.length === 1) targets[0].taskRegistration = `${tokens[i].v} · ${fn.file}:${tokens[i].line}`;
+    found.push({ name: tokens[start].v, source: `${tokens[i].v} · ${fn.file}:${tokens[i].line}` });
   }
   const interval = delayInterval(fn, tokens);
-  if (interval) fn.delayInterval = interval;
+  return found.length || interval ? { registrations: found, interval } : null;
+}
+
+export function applyTaskEvidence(fn, evidence, byName) {
+  if (!evidence) return;
+  for (const registration of evidence.registrations) {
+    const candidates = byName.get(registration.name) || [];
+    const local = candidates.filter(f => f.file === fn.file);
+    const targets = local.length ? local : candidates.filter(f => !f.isStatic);
+    if (targets.length === 1) targets[0].taskRegistration = registration.source;
+  }
+  if (evidence.interval) fn.delayInterval = evidence.interval;
+}
+
+export function captureTaskEvidence(fn, tokens, byName) {
+  applyTaskEvidence(fn, collectTaskEvidence(fn, tokens), byName);
 }
 
 // DelayUntil 的第二实参是 tick 数。只有显式毫秒转换可以直接还原标称间隔。

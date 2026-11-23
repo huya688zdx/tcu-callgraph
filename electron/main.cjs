@@ -80,19 +80,21 @@ function stopServer() {
     let timer;
     const done = () => {
       clearTimeout(timer);
+      c.off('exit', done);
       stopping = false;
       resolve();
     };
     c.once('exit', done);
+    // 断开 IPC 后由服务终止当前源码扫描。服务无响应时再强制退出。
+    timer = setTimeout(() => { c.kill(); done(); }, 2000);
+    timer.unref();
     try {
-      c.kill();
+      if (c.connected) c.disconnect();
+      else c.kill();
     } catch {
+      c.kill();
       done();
-      return;
     }
-    // 兜底：万一 exit 事件没来，2s 后继续，不让切工程卡死
-    timer = setTimeout(done, 2000);
-    if (timer.unref) timer.unref();
   });
 }
 

@@ -37,18 +37,25 @@ export async function previewAddition(fn, depths = state.addDepths) {
   pickMessage.textContent = '正在查找，画布尚未改动…';
   openModal('addFunctionsModal');
   try {
-    const view = await api.view({ root: fn.id, up, down, group: false, at: state.at });
+    const view = await api.view({ root: fn.id, up, down, group: false, at: state.at, preview: true });
     if (seq !== previewSequence) return;
     if (!Array.isArray(view.nodes)) throw new Error(view.error || '查找失败，请重试');
     if (state.view !== previewView || view.projectId !== previewView.projectId) throw new Error('画布已变化，请重新预览');
     const shown = new Set(previewView.nodes.map((node) => node.id));
     const names = new Map(view.nodes.map((node) => [node.id, node.name]));
     const existingEdges = new Set(previewView.edges.map(edgeKey));
+    const callsByNode = new Map();
+    for (const edge of view.edges) {
+      const label = `${names.get(edge.from) || edge.from} → ${names.get(edge.to) || edge.to}`;
+      for (const id of new Set([edge.from, edge.to])) {
+        if (!callsByNode.has(id)) callsByNode.set(id, []);
+        callsByNode.get(id).push(label);
+      }
+    }
     missingEdges = view.edges.filter((edge) => shown.has(edge.from) && shown.has(edge.to) && !existingEdges.has(edgeKey(edge)));
     const candidates = view.nodes.filter((node) => node.kind !== 'var' && !shown.has(node.id));
     pickList.innerHTML = candidates.map((node) => {
-      const calls = node.id === fn.id ? '目标函数' : view.edges.filter((edge) => edge.from === node.id || edge.to === node.id)
-        .map((edge) => `${names.get(edge.from) || edge.from} → ${names.get(edge.to) || edge.to}`).join('；');
+      const calls = node.id === fn.id ? '目标函数' : callsByNode.get(node.id)?.join('；');
       return `<label class="function-pick"><input type="checkbox" data-function-id="${esc(node.id)}" checked>
         <span><b>${esc(node.name)}</b><small>${esc(node.file || '')}:${node.line || ''}</small>${calls ? `<small>${esc(calls)}</small>` : ''}</span></label>`;
     }).join('');
@@ -71,7 +78,8 @@ pickApply?.addEventListener('click', async () => {
   pickMessage.textContent = '正在加入…';
   try {
     const edgeIds = missingEdges.flatMap((edge) => [edge.from, edge.to]);
-    const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true });
+    // 预览结果已经过滤了隐藏函数，无需为每个候选单独请求详情。
+    const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true, restoreHidden: false });
     if (!view || !ids.every((id) => view.nodes.some((node) => node.id === id)) ||
         !missingEdges.every((edge) => view.edges.some((item) => edgeKey(item) === edgeKey(edge)))) throw new Error('加入失败，请重试');
     closeModal();

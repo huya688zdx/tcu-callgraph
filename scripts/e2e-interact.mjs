@@ -222,14 +222,14 @@ await drag(edgeFixture.x,edgeFixture.y,edgeFixture.x,edgeFixture.y+35,{steps:4})
 const shapedEdge = await evaluate(`(()=>{const e=__cg.view.edges[0],p=e.points;return e.custom&&p.length===6&&p[0][0]===220&&p[0][1]===122&&p.at(-1)[0]===400&&p.at(-1)[1]===122&&p.some(q=>q[1]===157)&&p.every((q,i)=>!i||q[0]===p[i-1][0]||q[1]===p[i-1][1])})()`);
 console.log(`  单击不能误拖: ${lockedEdge}；双击已解锁: ${editingEdge}；直线调形成功且保持正交: ${shapedEdge}`);
 if (!lockedEdge || !editingEdge || !shapedEdge) ok=false;
-// 高亮须可见并在到期后清除，期间的动画帧复用已绘制的文字和标签。
+// 单条高亮复用已绘制的文字和标签，批量高亮只在加入和到期时绘制。
 const pulse = await evaluate(`(async () => {
   const {state, els} = await import('/lib/state.js');
   const {draw, pulseAdded} = await import('/lib/render.js');
   state.selected = state.selectedEdge = state.moveTarget = null;
   draw();
   const original = els.cv.toDataURL();
-  pulseAdded(state.view.nodes, state.view.edges);
+  pulseAdded([], state.view.edges.slice(0, 1));
   const lit = els.cv.toDataURL() !== original;
   const measure = els.ctx.measureText;
   const drawImage = els.ctx.drawImage;
@@ -249,10 +249,60 @@ const pulse = await evaluate(`(async () => {
   }
   state.recent.until = performance.now() - 1;
   for (let i = 0; state.recent && i < 5; i++) await new Promise(requestAnimationFrame);
-  return { lit, calls, partialCopies, cleared: !state.recent && els.cv.toDataURL() === original };
+  const cleared = !state.recent && els.cv.toDataURL() === original;
+  pulseAdded(state.view.nodes, state.view.edges);
+  const batchLit = els.cv.toDataURL() !== original;
+  const clearRect = els.ctx.clearRect;
+  let batchFrames = 0;
+  els.ctx.clearRect = function (...args) { batchFrames++; return clearRect.apply(this, args); };
+  try {
+    for (let i = 0; i < 8; i++) await new Promise(requestAnimationFrame);
+  } finally {
+    els.ctx.clearRect = clearRect;
+  }
+  await new Promise(resolve => setTimeout(resolve, 6050));
+  return { lit, calls, partialCopies, cleared, batchLit, batchFrames,
+    batchCleared: !state.recent && els.cv.toDataURL() === original };
 })()`);
-console.log('\n[测试4] 批量新增高亮', pulse);
-if (!pulse.lit || pulse.calls !== 0 || !pulse.partialCopies || !pulse.cleared) ok = false;
+console.log('\n[测试4] 单条与批量新增高亮', pulse);
+if (!pulse.lit || pulse.calls !== 0 || !pulse.partialCopies || !pulse.cleared ||
+    !pulse.batchLit || pulse.batchFrames || !pulse.batchCleared) ok = false;
+
+const animation = await evaluate(`(async () => {
+  const {state, els, THEME} = await import('/lib/state.js');
+  const {draw} = await import('/lib/render.js');
+  const clearRect = els.ctx.clearRect;
+  let basePaints = 0;
+  els.ctx.clearRect = function (...args) { basePaints++; return clearRect.apply(this, args); };
+  const moving = async () => {
+    const layer = document.getElementById('cvEffects');
+    if (!layer) return false;
+    const first = layer.toDataURL(), beforePaints = basePaints;
+    for (let i = 0; i < 6; i++) await new Promise(requestAnimationFrame);
+    return first !== layer.toDataURL() && beforePaints === basePaints;
+  };
+  const pulse = THEME.edge.selPulse;
+  try {
+    THEME.edge.selPulse = true;
+    state.selectedEdge = state.view.edges[0];
+    draw();
+    const edge = await moving();
+    state.selectedEdge = null;
+    const item = state.view.nodes[0];
+    state.selected = item.id;
+    state.moveTarget = { kind: 'node', item, view: state.view };
+    draw();
+    const node = await moving();
+    state.selected = state.moveTarget = null;
+    draw();
+    return { edge, node, released: !document.getElementById('cvEffects') };
+  } finally {
+    els.ctx.clearRect = clearRect;
+    THEME.edge.selPulse = pulse;
+  }
+})()`);
+console.log('\n[选中动画] 连线标记与函数边框', animation);
+if (!animation.edge || !animation.node || !animation.released) ok = false;
 
 // 共线处列出逐条调用。用足够多的记录覆盖菜单滚动和背景线反复叠色的情况。
 const bundlePoint = await evaluate(`(async () => {
@@ -312,17 +362,21 @@ const pan = await evaluate(`(async () => {
   const x = cam.x, y = cam.y;
   const p = {pointerId:1,clientX:0,clientY:0};
   state.panning = true;
+  state.panMoved = false;
   state.dragStart = state.last = {x:0,y:0};
   const clear = els.ctx.clearRect;
   let draws = 0;
   els.ctx.clearRect = function (...args) { draws++; return clear.apply(this, args); };
-  let reused;
+  let reused, translated;
   try {
     for (let j = 1; j <= 12; j++) {
       els.cv.dispatchEvent(new PointerEvent('pointermove', {...p,clientX:j,clientY:j*2}));
     }
+    await new Promise(requestAnimationFrame);
+    translated = els.cv.style.translate === '12px 24px' && draws === 0;
     // 在 RAF 之前松手，最终位置也必须应用。
-    els.cv.dispatchEvent(new PointerEvent('pointerup', {...p,clientX:12,clientY:24}));
+    els.cv.dispatchEvent(new PointerEvent('pointermove', {...p,clientX:13,clientY:26}));
+    els.cv.dispatchEvent(new PointerEvent('pointerup', {...p,clientX:13,clientY:26}));
     await new Promise(requestAnimationFrame);
     reused = edge._lbs?.[0]?.rect === before;
   } finally { els.ctx.clearRect = clear; }
@@ -330,11 +384,11 @@ const pan = await evaluate(`(async () => {
   draw();
   const after = edge._lbs?.[0]?.rect;
   const hit = after && hitLabel({x:after.x+after.w/2,y:after.y+after.h/2});
-  return {draws,reused,applied:cam.x===x+12 && cam.y===y+24 && !state.panning,
+  return {draws,reused,translated,applied:cam.x===x+13 && cam.y===y+26 && !state.panning && !els.cv.style.translate,
     updated:after?.w>before.w && hit?.edge===edge && hit.label.text==='Check transmission input'};
 })()`);
 console.log('\n[测试6] 连续平移与标签更新', pan);
-if (pan.draws !== 1 || !pan.reused || !pan.applied || !pan.updated) ok = false;
+if (pan.draws !== 1 || !pan.reused || !pan.translated || !pan.applied || !pan.updated) ok = false;
 
 await evaluate(`(async()=>{const {state,cam}=await import('/lib/state.js');state.view=__edgeBackup.view;state.selected=null;state.selectedEdge=null;state.selectedLabel=null;state.moveTarget=null;Object.assign(cam,__edgeBackup.cam);delete window.__edgeBackup;(await import('/lib/render.js')).draw()})()`);
 

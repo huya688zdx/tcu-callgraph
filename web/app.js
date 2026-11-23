@@ -43,7 +43,7 @@ const NAV_MAX = 30;
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
   const previous = incremental && !state.at && state.view ? state.view : null;
-  clearPairFlow();
+  if (state.pairFlow) clearPairFlow();
   stopCamAnim();
   // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
   const prior = nav && state.view && state.roots.length ? {
@@ -81,7 +81,7 @@ async function loadView(rootId, opts = {}) {
   state.up = up; state.down = down;
   state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
   // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
-  clearPairFlow();
+  if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
@@ -106,7 +106,7 @@ async function loadView(rootId, opts = {}) {
   const oldEdges = new Set((previous?.edges || []).map(edgeKey));
   const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   const rearranged = addedNodes.length > 0;
-  if (!previous || rearranged) fit();
+  if (!previous || rearranged) fit({ paint: false });
   const common = data.nodes.filter((n) => oldNodes.has(n.id));
   // 新增节点已完整排版并适配；其余增量刷新继续稳住已有画面。
   if (!rearranged && common.length) for (const axis of ['x', 'y']) {
@@ -115,8 +115,8 @@ async function loadView(rootId, opts = {}) {
   }
   constrainCam();
   const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  pulseAdded(addedNodes, addedEdges);
   if (previous && !rearranged) revealAdded(addedNodes, addedEdges);
+  pulseAdded(addedNodes, addedEdges);
   renderDetail(null);
   renderLabelPanel();
   history.stack = [];
@@ -129,12 +129,13 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.addFunction = async (root, { includeShown = false } = {}) => {
-  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => includeShown || !state.view?.nodes.some((n) => n.id === id));
+hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } = {}) => {
+  const shown = new Set(state.view?.nodes.map((n) => n.id));
+  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => includeShown || !shown.has(id));
   if (!ids.length) return state.view;
   const projectId = state.view?.projectId;
-  if (!state.at && !state.view?.comparison) {
-    const hidden = (await Promise.all(ids.filter((id) => !state.view?.nodes.some((n) => n.id === id))
+  if (restoreHidden && !state.at && !state.view?.comparison) {
+    const hidden = (await Promise.all(ids.filter((id) => !shown.has(id))
       .map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
     if (state.view?.projectId !== projectId) return;
     if (hidden.length) {
@@ -143,7 +144,8 @@ hooks.addFunction = async (root, { includeShown = false } = {}) => {
     }
   }
   const selected = state.selected;
-  const expansions = [...state.expansions, ...ids.filter((id) => !state.expansions.some((scope) => scope.root === id))
+  const expanded = new Set(state.expansions.map((scope) => scope.root));
+  const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
     .map((id) => ({ root: id, up: 0, down: 0 }))];
   const view = await loadView(state.roots, { incremental: true, expansions });
   if (view && selected && view.nodes.some((n) => n.id === selected)) {

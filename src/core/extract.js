@@ -296,8 +296,8 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
         let j = i - 1;
         while (j >= 0 && tokens[j].t !== 'id') j--;
         const recv = j >= 0 ? tokens[j].v : null;
-        const table = recv ? ctx.fnptr.get(recv) : null;
-        if (table && table[member.v]) {
+        const table = recv ? ctx.fnptr?.get(recv) : null;
+        if (table && Object.hasOwn(table, member.v)) {
           out.push({
             callee: table[member.v],
             kind: 'fnptr',
@@ -309,6 +309,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
         } else {
           out.push({
             callee: null,
+            receiver: recv,
             member: member.v,
             kind: 'unknown',
             line: member.line, col: member.col,

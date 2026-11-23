@@ -40,7 +40,15 @@ void side(void) { c(); }
   };
   const ids = (view) => view.nodes.map((n) => n.name).sort();
   const base = '/api/view?root=chain.c::b';
-  assert.deepEqual(ids(await get(base)), ['a', 'b', 'c']);
+  const view = await get(base);
+  assert.deepEqual(ids(view), ['a', 'b', 'c']);
+  const preview = await get(base + '&preview=1');
+  const keys = (v) => v.edges.map(({ from, to, line }) => `${from}|${to}|${line}`).sort();
+  assert.deepEqual(ids(preview), ids(view));
+  assert.deepEqual(keys(preview), keys(view));
+  assert.equal(preview.projectId, view.projectId);
+  assert.ok(preview.nodes.every((n) => !Object.hasOwn(n, 'x')));
+  assert.ok(preview.edges.every((e) => !Object.hasOwn(e, 'points')));
   assert.deepEqual(ids(await get('/api/view')), ['a', 'top'], '自动入口也必须遵守一层默认值');
   assert.deepEqual(ids(await get('/api/view?down=0&up=0')), ['top'], '显式零层不能被强行提高到三层');
   const downward = [{ root: 'chain.c::b', up: 0, down: 2 }];

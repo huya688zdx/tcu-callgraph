@@ -42,11 +42,12 @@ test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用
     { from: 'write', to: 'v', kind: 'var', via: '写' },
     { from: 'read', to: 'v', kind: 'var', via: '读' },
     { from: 'both', to: 'v', kind: 'var', via: '读写' },
+    { from: 'unknown', to: 'v', kind: 'var' },
   ].map(e => ({ ...e, points: [[10,10],[10,20]] }));
-  const view = { width: 100, height: 100, nodes: ['write','read','v','both'].map(id => ({
+  const view = { width: 100, height: 100, nodes: ['write','read','v','both','unknown'].map(id => ({
     id, name: id, kind: id === 'v' ? 'var' : 'fn', file: 'test.c', x: 0, y: 0, w: 10, h: 10,
   })), edges };
-  assert.deepEqual(edges.map(e => edgeCaption(e, id => id)), ['write → v','read ← v','both ↔ v']);
+  assert.deepEqual(edges.map(e => edgeCaption(e, id => id)), ['write → v','read ← v','both ↔ v','unknown — v']);
   assert.deepEqual(traceVisiblePaths(view, 'write', 'read').flowEdgeIndices, [0,1]);
   assert.deepEqual(traceVisiblePaths(view, 'both', 'read').flowEdgeIndices, [2,1]);
   assert.deepEqual(traceVisiblePaths(view, 'read', 'write').paths[0].steps.map(s => s.forward), [false,false]);
@@ -57,6 +58,7 @@ test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用
   }
   assert.doesNotMatch(paths[1], /marker-end/);
   assert.match(paths[2], /marker-start=.*marker-end=/);
+  assert.doesNotMatch(paths[3], /marker-(?:start|end)=/, '未声明读写方向时不推测箭头');
   assert.deepEqual(traceVisiblePaths(view, 'write', 'read').paths[0].nodes, ['write', 'v', 'read']);
 });
 
@@ -97,4 +99,18 @@ test('注册的 RTOS 任务按显式毫秒间隔显示，原始 tick 保留待�
   const tasks = projectTasks(loadModel(root));
   assert.deepEqual(tasks.map(t => [t.name, t.us]), [['work',25000], ['sensor',null]]);
   assert.match(tasks[0].source, /xTaskCreate.*vTaskDelayUntil/);
+});
+
+test('单次扫描保留跨文件任务注册、间隔和后绑定成员调用的连续顺序', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-merged-scan-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'a_start.c'),
+    'void start(void) { xTaskCreate(worker, "worker", 0, 0, 0, 0); ops.run(); missing.run(); end(); }');
+  fs.writeFileSync(path.join(root, 'z_runtime.c'),
+    'Ops ops = { .run = worker }; void worker(void) { vTaskDelayUntil(&last, pdMS_TO_TICKS(10)); } void end(void) {}');
+  const model = loadModel(root);
+  assert.deepEqual(projectTasks(model).map(t => [t.id, t.us]), [['z_runtime.c::worker', 10000]]);
+  assert.deepEqual(callSequence(model, 'a_start.c::start').map(group => group.map(call => call.name)),
+    [['xTaskCreate'], ['worker'], ['end']]);
+  assert.ok(model.functions.every(fn => !fn.bodyTokens), '不因恢复任务证据而长期保留函数 token');
 });
