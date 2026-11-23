@@ -4,7 +4,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { parseDot } from '../src/core/dot.js';
-import { loadModel, stats } from '../src/core/index.js';
+import { buildIndex, loadModel, stats } from '../src/core/index.js';
+import { detectTasks } from '../src/core/detect-tasks.js';
 
 const SAMPLE = path.join(import.meta.dirname, '..', 'samples', 'tcu');
 
@@ -155,4 +156,31 @@ test('DOT 端口不产生节点，引号内冒号保留', () => {
   const graph = parseDot('digraph { a:ne -> "b:c":port:sw; }');
   assert.deepEqual([...graph.nodes.keys()], ['a', 'b:c']);
   assert.deepEqual(graph.edges.map(({ from, to }) => [from, to]), [['a', 'b:c']]);
+});
+
+test('紧凑索引保留头文件宏的生效顺序、文件内 undef 和嵌套调用判断', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-scopes-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const files = new Map([
+    ['a.h', '#define CALL first\nstatic void early(void) { CALL(); }\n'],
+    ['b.h', '#undef CALL\n#define CALL second\nstatic void late(void) { CALL(); }\n'],
+    ['a.c', '#undef CALL\nvoid isolated(void) { CALL(); }\n'],
+    ['b.c', 'void first(void) {}\nvoid second(void) {}\n' +
+      'int inner(void) { return 0; }\nvoid outer(int n) {}\n' +
+      'void inherited(void) { CALL(); outer(inner()); }\n'],
+  ]);
+  const sources = new Map();
+  for (const [name, source] of files) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, source);
+    sources.set(name, file);
+  }
+  const model = buildIndex(dir, sources);
+  const target = (from) => model._index.outAdj.get(from)[0].to;
+  assert.equal(target('a.h::early'), 'b.c::first');
+  assert.equal(target('b.h::late'), 'b.c::second');
+  assert.equal(target('a.c::isolated'), 'ext::CALL');
+  assert.equal(target('b.c::inherited'), 'b.c::second');
+  assert.ok(model.functions.every((fn) => !Object.hasOwn(fn, 'bodyTokens')));
+  assert.deepEqual(detectTasks(model, 'b.c::inherited').skipped.map(({ from }) => from), ['b.c::inherited']);
 });

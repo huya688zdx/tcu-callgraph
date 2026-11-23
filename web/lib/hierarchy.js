@@ -12,10 +12,16 @@ export function beginHierarchyMove(view, selection) {
     .sort((a, b) => b.box.depth - a.box.depth);
   const files = new Set(moving.filter((b) => b.kind === 'file').map((b) => b.box.id));
   const nodes = view.nodes.filter((n) => files.has(n.group));
-  return { ...selection, view, boxes, moving, ancestors, nodes, ids: new Set(nodes.map((n) => n.id)),
+  const ids = new Set(nodes.map((n) => n.id));
+  const internal = [], crossing = [], stationary = [];
+  for (const edge of view.edges) {
+    const from = ids.has(edge.from), to = ids.has(edge.to);
+    (from && to ? internal : from || to ? crossing : stationary).push(edge);
+  }
+  return { ...selection, view, boxes, moving, ancestors, nodes, ids, internal, crossing, stationary,
     rects: [...moving, ...ancestors].map(({ box }) => ({ item: box, x: box.x, y: box.y, w: box.w, h: box.h })),
     positions: nodes.map((n) => ({ item: n, x: n.x, y: n.y })),
-    paths: view.edges.map((edge) => ({ edge, points: edge.points.map((p) => [...p]) })),
+    paths: [...internal, ...crossing].map((edge) => ({ edge, points: edge.points.map((p) => [...p]) })),
     width: view.width, height: view.height, dx: 0, dy: 0, guides: [],
   };
 }
@@ -72,11 +78,11 @@ export function moveHierarchy(drag, dx, dy, tolerance = 0) {
   const changed = accepted[0] !== drag.dx || accepted[1] !== drag.dy;
   [drag.dx, drag.dy] = accepted;
   drag.guides = guides.filter((g) => (g.axis === 'x' ? drag.dx : drag.dy) === snapped[g.axis]);
-  for (const { edge, points } of drag.paths) {
-    const internal = drag.ids.has(edge.from) && drag.ids.has(edge.to);
-    edge.points = points.map(([x, y]) => internal ? [x + drag.dx, y + drag.dy] : [x, y]);
-  }
   if (changed) {
+    for (const { edge, points } of drag.paths) {
+      const internal = drag.ids.has(edge.from) && drag.ids.has(edge.to);
+      edge.points = points.map(([x, y]) => internal ? [x + drag.dx, y + drag.dy] : [x, y]);
+    }
     drag.view.width = Math.max(drag.width, ...drag.boxes.map(({ box }) => box.x + box.w));
     drag.view.height = Math.max(drag.height, ...drag.boxes.map(({ box }) => box.y + box.h));
   }

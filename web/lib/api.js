@@ -56,7 +56,7 @@ export const api = {
       layoutSlots: previous.layoutSlots,
     } : null });
   },
-  stats: () => get('/api/stats'),
+  stats: () => get('/api/stats?summary=1'),
   /** 当前工程身份（名字、路径、指纹是否变过） */
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */

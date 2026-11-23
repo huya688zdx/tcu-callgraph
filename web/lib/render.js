@@ -7,6 +7,7 @@ import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './s
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
+import { routeBounds } from '/core/routing.js';
 
 // 静态画面只在交互后重建，持续动画帧复用位图，不重复测字和计算标签避让。
 let animationFrame = 0;
@@ -14,13 +15,63 @@ let recentLayers = null;
 let collectingEffects = false;
 let effects = [];
 let effectCamera = null;
+let damage = null;
+let lastAnimationPaint = 0;
+// 动画按实时时间推进，限制空闲时的合成频率。
+const ANIMATION_INTERVAL = 32;
 const scene = document.createElement('canvas');
 const sceneCtx = scene.getContext('2d');
+const nodeNames = new WeakMap();
 
 function sizeScene(canvas) {
   if (scene.width === canvas.width && scene.height === canvas.height) return;
   scene.width = canvas.width;
   scene.height = canvas.height;
+}
+
+function releaseScene() {
+  if (scene.width || scene.height) scene.width = scene.height = 0;
+}
+
+function viewport(width, height) {
+  const pad = 36;
+  return { left: (-cam.x - pad) / cam.k, right: (width - cam.x + pad) / cam.k,
+    top: (-cam.y - pad) / cam.k, bottom: (height - cam.y + pad) / cam.k };
+}
+
+function boxVisible(box, area, width = box.w) {
+  return box.x <= area.right && box.x + width >= area.left &&
+    box.y <= area.bottom && box.y + box.h >= area.top;
+}
+
+function pathVisible(points, area) {
+  for (let i = 1; i < points.length; i++) {
+    const [x1, y1] = points[i - 1], [x2, y2] = points[i];
+    if (Math.min(x1, x2) <= area.right && Math.max(x1, x2) >= area.left &&
+        Math.min(y1, y2) <= area.bottom && Math.max(y1, y2) >= area.top) return true;
+  }
+  return false;
+}
+
+function addDamage(box, padding = 16) {
+  const { cv } = els, dpr = window.devicePixelRatio || 1;
+  const x = Math.max(0, Math.floor((box.x * cam.k + cam.x - padding) * dpr));
+  const y = Math.max(0, Math.floor((box.y * cam.k + cam.y - padding) * dpr));
+  const right = Math.min(cv.width, Math.ceil(((box.x + box.w) * cam.k + cam.x + padding) * dpr));
+  const bottom = Math.min(cv.height, Math.ceil(((box.y + box.h) * cam.k + cam.y + padding) * dpr));
+  if (right <= x || bottom <= y) return;
+  if (!damage) damage = { x, y, right, bottom };
+  else {
+    damage.x = Math.min(damage.x, x);
+    damage.y = Math.min(damage.y, y);
+    damage.right = Math.max(damage.right, right);
+    damage.bottom = Math.max(damage.bottom, bottom);
+  }
+}
+
+function addPathDamage(points, padding) {
+  const { minX, minY, maxX, maxY } = routeBounds(points);
+  addDamage({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, padding);
 }
 
 export function pulseAdded(nodes, edges) {
@@ -31,35 +82,44 @@ export function pulseAdded(nodes, edges) {
   draw();
 }
 function scheduleDraw() {
-  if (animationFrame) return;
+  if (animationFrame || !damage || document.hidden) return;
   animationFrame = requestAnimationFrame((now) => {
     animationFrame = 0;
-    if (recentLayers && (!state.recent || now >= state.recent.until)) { draw(); return; }
-    drawCachedFrame(now);
-    if (effects.length || state.recent || state.flash) scheduleDraw();
+    if (recentLayers && (!state.recent || now >= state.recent.until)) { draw({ geometryUnchanged: true }); return; }
+    if (now - lastAnimationPaint >= ANIMATION_INTERVAL || (state.flash && now >= state.flash.until)) {
+      drawCachedFrame(now);
+      lastAnimationPaint = now;
+    }
+    if (effects.length || recentLayers || state.flash) scheduleDraw();
   });
 }
 
-function drawCachedFrame(now) {
-  const { ctx, cv } = els;
+function drawCachedFrame(now, region = damage) {
+  const { ctx } = els;
+  const { x, y, right, bottom } = region;
+  const w = right - x, h = bottom - y;
+  const blit = (canvas) => ctx.drawImage(canvas, x, y, w, h, x, y, w, h);
   ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.clearRect(x, y, w, h);
   if (recentLayers) {
-    ctx.drawImage(recentLayers.background.canvas, 0, 0);
+    blit(recentLayers.background.canvas);
     ctx.globalAlpha = (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
       Math.min(1, (state.recent.until - now) / 700);
-    ctx.drawImage(recentLayers.glow.canvas, 0, 0);
+    blit(recentLayers.glow.canvas);
     ctx.globalAlpha = 1;
   }
-  ctx.drawImage(scene, 0, 0);
+  blit(scene);
   ctx.restore();
   drawEffects(now);
 }
 
 // 金色光晕夹在分组背景与文字、箭头之间。只在画面变化时生成，呼吸动画只改变透明度。
-function prepareRecentLayers(view) {
+function prepareRecentLayers(view, area) {
   const { ctx, cv } = els;
+  const edges = view.edges.filter((e) => state.recent.edges.has(edgeKey(e)) && pathVisible(edgePoints(e), area));
+  const nodes = view.nodes.filter((n) => state.recent.nodes.has(n.id) && boxVisible(n, area));
+  if (!edges.length && !nodes.length) { recentLayers = null; return; }
   const layer = () => {
     const canvas = document.createElement('canvas');
     canvas.width = cv.width; canvas.height = cv.height;
@@ -77,8 +137,8 @@ function prepareRecentLayers(view) {
   glow.strokeStyle = glow.shadowColor = '#E69A16';
   glow.lineWidth = 7 / cam.k;
   glow.shadowBlur = 10;
-  for (const e of view.edges) {
-    if (!state.recent.edges.has(edgeKey(e)) || !e.points?.length) continue;
+  for (const e of edges) {
+    addPathDamage(e.points, 36);
     glow.setLineDash(edgeDashed(e) ? [7, 4] : []);
     glow.beginPath(); strokeRounded(glow, e.points); glow.stroke();
   }
@@ -86,8 +146,8 @@ function prepareRecentLayers(view) {
   glow.lineWidth = 3 / cam.k;
   glow.shadowBlur = 12;
   glow.setLineDash([]);
-  for (const n of view.nodes) {
-    if (!state.recent.nodes.has(n.id)) continue;
+  for (const n of nodes) {
+    addDamage(n, 36);
     roundRect(glow, n.x - gap, n.y - gap, n.w + gap * 2, n.h + gap * 2, 10);
     glow.stroke();
   }
@@ -99,6 +159,7 @@ function prepareRecentLayers(view) {
 }
 
 function recordBoxEffect(box, dash, width, radius = 8, color = THEME.node.selected) {
+  addDamage(box, width * cam.k / 2 + 4);
   effects.push({ kind: 'box', box: { x: box.x, y: box.y, w: box.w, h: box.h }, dash, width, radius, color });
 }
 
@@ -131,10 +192,11 @@ function drawEffects(now) {
       const path = effect.path;
       if (!path.length) { ctx.restore(); continue; }
       const scale = Math.min(1, 1 / c.k);
-      const spacing = Math.min(90, path.length);
+      const spacing = Math.min(Math.max(90, 20 / c.k), path.length);
       // 所有连线每秒前进 80 个画布单位，长线只增加标记数量。
       for (let distance = (now * 0.08) % spacing; distance < path.length; distance += spacing) {
         const [x, y, dx, dy] = flowPointAt(path, distance);
+        if (x < c.area.left || x > c.area.right || y < c.area.top || y > c.area.bottom) continue;
         ctx.save();
         // 固定放在前进方向右侧，相向重合时各走一侧。
         ctx.translate(x - dy * 5 * scale, y + dx * 5 * scale);
@@ -174,6 +236,12 @@ function resize() {
 
 // 工具栏内容换行也会改变画布高度，窗口尺寸可能保持不变。
 new ResizeObserver(() => { if (syncCanvasSize()) draw(); }).observe(els.cv);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+  } else if (state.view) draw({ geometryUnchanged: true });
+});
 
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -228,25 +296,27 @@ function neighborSet() {
   return set;
 }
 
-function draw() {
+function draw({ geometryUnchanged = false } = {}) {
   cancelAnimationFrame(animationFrame);
   animationFrame = 0;
+  damage = null;
   effects = [];
   collectingEffects = false;
   const { ctx, cv } = els;
-  if (!cv.width || !cv.height) { recentLayers = null; return; }
+  if (!cv.width || !cv.height) { recentLayers = null; releaseScene(); return; }
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
   const H = cv.height / dpr;
   const now = performance.now();
   if (state.recent && now >= state.recent.until) state.recent = null;
+  if (state.flash && now >= state.flash.until) state.flash = null;
   if (!state.recent || !state.view?.nodes.length) recentLayers = null;
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
-  state.pairFlow?.refresh?.(v);
+  if (!geometryUnchanged) state.pairFlow?.refresh?.(v);
   const moving = state.moveTarget;
   if (moving && (moving.view !== v ||
       !(moving.kind === 'edge' ? v.edges : moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
@@ -262,6 +332,7 @@ function draw() {
     v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
   );
   if (!v) {
+    releaseScene();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
     ctx.textAlign = 'center';
@@ -274,6 +345,7 @@ function draw() {
   ctx.scale(cam.k, cam.k);
 
   if (!v.nodes.length) {
+    releaseScene();
     ctx.restore();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
@@ -282,13 +354,14 @@ function draw() {
     return;
   }
   collectingEffects = true;
+  const area = viewport(W, H);
 
-  if (v.containers) for (const c of v.containers) drawContainer(ctx, c);
+  // 标题可以比文件框宽，视口判断要包含标题可能占到的范围。
+  const groupVisible = (box) => boxVisible(box, area, Math.max(box.w, 26 * String(box.label).length + 30));
+  for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c);
+  for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g);
 
-  if (v.groups) {
-    for (const g of v.groups) drawGroup(ctx, g);
-  }
-  if (state.recent) prepareRecentLayers(v);
+  if (state.recent) prepareRecentLayers(v, area);
 
   const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
@@ -312,7 +385,7 @@ function draw() {
     sceneCtx.setTransform(ctx.getTransform());
   }
   for (const e of v.edges) {
-    if (focusedEdges.has(e)) continue;
+    if (focusedEdges.has(e) || !pathVisible(edgePoints(e), area)) continue;
     if (!focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
       : state.selected && (e.from === state.selected || e.to === state.selected))) related.push(e);
     else drawEdge(dim ? sceneCtx : ctx, e, false, false);
@@ -327,7 +400,11 @@ function draw() {
     ctx.restore();
   }
   for (const e of related) drawEdge(ctx, e, true, false);
-  for (const e of focusedEdges) drawEdge(ctx, e, false, true, tracedColors.get(e), !tracedEdges.has(e) || flowingEdges.has(e));
+  for (const e of focusedEdges) {
+    if (!pathVisible(edgePoints(e), area)) continue;
+    const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || e === focusedEdge;
+    drawEdge(ctx, e, false, true, tracedColors.get(e), animated);
+  }
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -357,10 +434,10 @@ function draw() {
   }
 
   const nb = neighborSet();
-  for (const n of v.nodes) drawNode(ctx, n, nb, focusedNodes);
+  for (const n of v.nodes) if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes);
   for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
     const node = v.nodes.find(n => n.id === id);
-    if (!node) continue;
+    if (!node || !boxVisible(node, area)) continue;
     const gap = 5 / cam.k;
     recordBoxEffect({ x: node.x - gap, y: node.y - gap, w: node.w + gap * 2, h: node.h + gap * 2 },
       [6 / cam.k, 4 / cam.k], 2.5 / cam.k, 10, '#7C3AED');
@@ -369,10 +446,11 @@ function draw() {
   }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
-  drawEdgeLabels(ctx, v, recordBoxEffect, tracedEdges);
+  drawEdgeLabels(ctx, v, { onAnimatedBox: recordBoxEffect, focusedEdges: tracedEdges,
+    visible: (box) => boxVisible(box, area), reuse: geometryUnchanged });
 
   // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
-  if (state.moveTarget && !['edge', 'node'].includes(state.moveTarget.kind)) {
+  if (state.moveTarget && !state.dragBox && !['edge', 'node'].includes(state.moveTarget.kind)) {
     const b = state.moveTarget.item, gap = 4 / cam.k;
     recordBoxEffect({ x: b.x - gap, y: b.y - gap, w: b.w + gap * 2, h: b.h + gap * 2 },
       [5 / cam.k, 4 / cam.k], 1.5 / cam.k, state.moveTarget.kind === 'dir' ? 14 : 12);
@@ -408,15 +486,17 @@ function draw() {
   ctx.textAlign = 'left';
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
   collectingEffects = false;
-  if (effects.length || recentLayers || state.flash) {
+  if (state.flash) addDamage(state.flash.box);
+  if (recentLayers || damage) {
     sizeScene(cv);
     sceneCtx.clearRect(0, 0, scene.width, scene.height);
     sceneCtx.drawImage(cv, 0, 0);
-    effectCamera = { ...cam, dpr };
-    if (recentLayers) drawCachedFrame(now);
+    effectCamera = { ...cam, dpr, area };
+    if (recentLayers) drawCachedFrame(now, { x: 0, y: 0, right: cv.width, bottom: cv.height });
     else drawEffects(now);
-  }
-  if (state.recent || state.flash || effects.length) scheduleDraw();
+    lastAnimationPaint = now;
+  } else if (!dim) releaseScene();
+  if (recentLayers || state.flash || effects.length) scheduleDraw();
 }
 
 function drawContainer(ctx, c) {
@@ -514,7 +594,11 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true)
   ctx.setLineDash([]);
 
   if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
-    effects.push({ kind: 'edge', path: flowPath(pts), color: flowPulseColor(color) });
+    const path = flowPath(pts);
+    if (path.length) {
+      addPathDamage(pts);
+      effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
+    }
   }
 
   const a = pts[pts.length - 2];
@@ -626,7 +710,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     : THEME.node.border;
   // 函数框/变量框各自的虚实线型，样式面板可调；选中时的流动虚线只在虚线开启时有效
   ctx.setLineDash((isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
-  const animated = collectingEffects && selected && (allNodes ||
+  const animated = collectingEffects && selected && !state.dragNode && ((allNodes && n.id === state.selected) ||
     state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
   const dash = ctx.getLineDash();
   if (animated && dash.length) recordBoxEffect(n, dash, ctx.lineWidth, 8, ctx.strokeStyle);
@@ -655,15 +739,20 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     ctx.textBaseline = 'middle';
 
     // 函数名统一带 ()，变量名不带，便于一眼区分
-    let label = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
+    const name = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
     const maxW = w - 18;
-    if (ctx.measureText(label).width > maxW) {
-      while (label.length > 1 && ctx.measureText(label + '…').width > maxW) {
-        label = label.slice(0, -1);
+    const font = ctx.font;
+    let saved = nodeNames.get(n);
+    if (!saved || saved.name !== name || saved.font !== font || saved.width !== maxW) {
+      let label = name;
+      if (ctx.measureText(label).width > maxW) {
+        while (label.length > 1 && ctx.measureText(label + '…').width > maxW) label = label.slice(0, -1);
+        label += '…';
       }
-      label += '…';
+      saved = { name, font, width: maxW, label };
+      nodeNames.set(n, saved);
     }
-    ctx.fillText(label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
+    ctx.fillText(saved.label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
 
     if (cam.k >= 0.62) {
       ctx.font = `10.5px ${FONT}`;

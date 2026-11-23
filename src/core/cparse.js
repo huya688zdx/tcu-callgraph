@@ -46,30 +46,12 @@ export function getParser() {
   return parserPromise;
 }
 
-/** 文件级解析缓存：key 为绝对路径 */
-const treeCache = new Map();
-
+/** 语法树归本次分析所有，由调用方在读取完成后释放。 */
 export async function parseFile(abs, rel, src) {
   const text = src ?? fs.readFileSync(abs, 'utf8');
-  const hit = treeCache.get(abs);
-  if (hit?.src === text) return hit;
   const parser = await getParser();
   const tree = parser.parse(text);
-  const rec = { tree, root: tree.rootNode, src: text, rel };
-  if (hit) hit.tree.delete();
-  treeCache.set(abs, rec);
-  return rec;
-}
-
-export function clearParseCache() {
-  for (const rec of treeCache.values()) {
-    try {
-      rec.tree.delete();
-    } catch {
-      /* ignore */
-    }
-  }
-  treeCache.clear();
+  return { tree, root: tree.rootNode, src: text, rel };
 }
 
 // ---------------- AST 小工具 ----------------

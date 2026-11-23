@@ -43,9 +43,11 @@ void probe(void)
 
 async function fixtureAccesses() {
   const rec = await parseFile('test://df-fixture', 'fixture.c', FIXTURE);
-  const names = new Set(collectGlobals(rec.root).map((g) => g.name));
-  const fn = collectFunctions(rec.root).get('probe');
-  return { names, acc: collectAccesses(fn, (n) => names.has(n)) };
+  try {
+    const names = new Set(collectGlobals(rec.root).map((g) => g.name));
+    const fn = collectFunctions(rec.root).get('probe');
+    return { names, acc: collectAccesses(fn, (n) => names.has(n)) };
+  } finally { rec.tree.delete(); }
 }
 
 test('数据流口径：裸标识符读进入读集合（此前整条漏掉）', async () => {
@@ -95,6 +97,7 @@ void probe(void) {
 }`;
   const rec = await parseFile('test://df-block-scope', 'scope.c', src);
   const acc = collectAccesses(collectFunctions(rec.root).get('probe'), (name) => name === 'g_mode');
+  rec.tree.delete();
   assert.deepEqual([...(acc.reads.get('g_mode')?.lines || [])], [5]);
   assert.deepEqual([...acc.writes.get('g_mode').lines], [3, 5]);
 });

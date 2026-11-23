@@ -196,6 +196,12 @@ export function pathCrossesBody(points, n, eps = 0.5) {
   return false;
 }
 
+function pathCrossesNodes(points, nodes) {
+  const { minX, minY, maxX, maxY } = routeBounds(points);
+  return nodes.some((n) => n.x < maxX && n.x + n.w > minX && n.y < maxY && n.y + n.h > minY &&
+    pathCrossesBody(points, n));
+}
+
 /** 折线是否穿过了自己的两个端点（源/目标本体） */
 function crossesEndpoints(points, a, b) {
   if (pathCrossesBody(points, a)) return true;
@@ -1236,13 +1242,13 @@ export function routeEdges(nodes, edges, opts = {}) {
       e.back = false;
       // ELK 的紧凑通道可能只有几像素余量；拖动时不能因安全间距而推翻整条路径。
       let blocked = opts.preservePaths
-        ? nodes.some((n) => pathCrossesBody(e.points, n))
+        ? pathCrossesNodes(e.points, nodes)
         : pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id])) || crossesEndpoints(e.points, a, b);
       if (blocked && opts.preservePaths) {
         e.points = original;
         retargetCustom(e, a, b, true);
         e.points = collapse(e.points);
-        blocked = nodes.some((n) => pathCrossesBody(e.points, n));
+        blocked = pathCrossesNodes(e.points, nodes);
       }
       if (!blocked) {
         preserved.add(e);

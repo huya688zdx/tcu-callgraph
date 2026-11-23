@@ -9,6 +9,19 @@ import { lex, collectArgs } from './lexer.js';
 
 const DIRECTIVE = /^#\s*([A-Za-z_]+)\s*([\s\S]*)$/;
 
+/** 文件只保存自己修改的宏，null 表示屏蔽继承来的定义。 */
+export function fileMacroScope(base, changes = new Map()) {
+  return {
+    changes,
+    get(name) {
+      const value = changes.get(name);
+      return value === undefined ? base.get(name) : value;
+    },
+    set(name, def) { changes.set(name, def); },
+    delete(name) { changes.set(name, null); },
+  };
+}
+
 function parseDefineParams(text) {
   // text 形如 "(a, b) body..."
   const params = [];
@@ -55,7 +68,11 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
 
   // 识别 include guard：#ifndef X 紧跟 #define X，不参与 condition 计算
   let guardName = null;
-  const preprocs = tokens.filter((t) => t.t === 'preproc');
+  const preprocs = [];
+  for (const tk of tokens) {
+    if (tk.t === 'preproc') preprocs.push(tk);
+    if (preprocs.length === 2) break;
+  }
   if (preprocs.length >= 2) {
     const m1 = /^#\s*ifndef\s+([A-Za-z_]\w*)/.exec(preprocs[0].v);
     const m2 = /^#\s*define\s+([A-Za-z_]\w*)/.exec(preprocs[1].v);
@@ -65,12 +82,13 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     const parts = frames.map((f) => f.expr).filter(Boolean);
     return parts.length ? parts.join(' && ') : undefined;
   };
+  let cond;
 
   for (let k = 0; k < tokens.length; k++) {
     const tk = tokens[k];
 
     if (tk.t !== 'preproc') {
-      (expand ? pending : out).push({ ...tk, cond: currentCond() });
+      (expand ? pending : out).push(cond ? { ...tk, cond } : tk);
       continue;
     }
 
@@ -128,10 +146,12 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       } else {
         frames.push({ expr: dir === 'ifdef' ? n : `!${n}` });
       }
+      cond = currentCond();
       continue;
     }
     if (dir === 'if') {
       frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
+      cond = currentCond();
       continue;
     }
     if (dir === 'elif') {
@@ -140,6 +160,7 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
         frame.expr = rest.replace(/\s+/g, ' ');
         frame.inactive = frame.definitelyTaken || rest === '0';
         frame.definitelyTaken ||= rest === '1';
+        cond = currentCond();
       }
       continue;
     }
@@ -149,11 +170,13 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
         const frame = frames[frames.length - 1];
         frame.expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
         frame.inactive = !!frame.definitelyTaken;
+        cond = currentCond();
       }
       continue;
     }
     if (dir === 'endif') {
       frames.pop();
+      cond = currentCond();
       continue;
     }
   }
@@ -230,9 +253,8 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
-    if (tk.t === 'id' && macros.has(tk.v) && !seen.has(tk.v)) {
-      const m = macros.get(tk.v);
-
+    const m = tk.t === 'id' ? macros.get(tk.v) : undefined;
+    if (m && !seen.has(tk.v)) {
       if (m.params === null) {
         const body = m.body.map((b) => ({
           ...b,

@@ -17,7 +17,7 @@ import path from 'node:path';
 import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from './cparse.js';
 import { rebuildIndex, decodeSource } from './index.js';
 import { lex } from './lexer.js';
-import { preprocess } from './preproc.js';
+import { fileMacroScope, preprocess } from './preproc.js';
 
 const MAX_VARS = 16;
 
@@ -69,7 +69,7 @@ const MAX_PEERS = 24;
 const MAX_NODES = 90;
 
 /** 比较与数据流复用同一份逐文件宏展开口径和原始行号。 */
-export function analysisSources(model) {
+export function analysisSources(model, { keepOriginal = true } = {}) {
   const sources = [];
   let failedFiles = 0;
   for (const f of model.files) {
@@ -83,15 +83,17 @@ export function analysisSources(model) {
   const headerMacros = new Map();
   for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
   for (const f of sources) {
-    const { tokens } = preprocess(lex(f.src, f.rel), new Map(headerMacros), f.rel, { expand: true });
-    let expanded = '', line = 1;
+    const { tokens } = preprocess(lex(f.src, f.rel), fileMacroScope(headerMacros), f.rel, { expand: true });
+    const parts = [];
+    let line = 1;
     for (const tk of tokens) {
-      if (tk.line > line) expanded += '\n'.repeat(tk.line - line);
+      if (tk.line > line) parts.push('\n'.repeat(tk.line - line));
       line = Math.max(line, tk.line);
-      expanded += `${tk.v} `;
+      parts.push(tk.v, ' ');
       line += (tk.v.match(/\n/g) || []).length;
     }
-    f.expanded = expanded;
+    f.expanded = parts.join('');
+    if (!keepOriginal) delete f.src;
   }
   return { sources, failedFiles };
 }
@@ -101,9 +103,10 @@ export async function buildDataflowIndex(model) {
   if (model._df) return model._df;
   if (model._dfPending) return model._dfPending;
 
+  const parsedFiles = [];
   const pending = (async () => {
     const defs = [];
-    let { sources, failedFiles } = analysisSources(model);
+    let { sources, failedFiles } = analysisSources(model, { keepOriginal: false });
     const defsByName = new Map();
     const fnAccess = new Map(); // fnId -> { writes: Map, reads: Map }
     const readers = new Map(); // varId -> Set<fnId>
@@ -114,7 +117,6 @@ export async function buildDataflowIndex(model) {
     };
 
     const fnsByFile = new Map();
-    const parsedFiles = [];
     for (const fn of model.functions) {
       if (!fnsByFile.has(fn.file)) fnsByFile.set(fn.file, []);
       fnsByFile.get(fn.file).push(fn);
@@ -129,7 +131,7 @@ export async function buildDataflowIndex(model) {
         console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);
         continue; // 单个文件解析失败不影响整体
       }
-      parsedFiles.push({ file: f.rel, root: rec.root });
+      parsedFiles.push({ file: f.rel, root: rec.root, tree: rec.tree });
 
       for (const g of collectGlobals(rec.root)) {
         const id = g.isStatic ? `var::${f.rel}::${g.name}` : `var::${g.name}`;
@@ -145,6 +147,7 @@ export async function buildDataflowIndex(model) {
         defsByName.set(g.name, [...prev, def]);
       }
     }
+    sources.length = 0;
 
     const containsUnion = unionTypeResolver(parsedFiles);
     for (const def of defs) def.containsUnion = containsUnion(def.typeText);
@@ -259,10 +262,9 @@ export async function buildDataflowIndex(model) {
   model._dfPending = pending;
   try {
     return await pending;
-  } catch (err) {
-    // 失败后清空占位：否则 rejected promise 会被永久复用，面板直到重启都不可用
+  } finally {
+    for (const { tree } of parsedFiles) tree.delete();
     model._dfPending = null;
-    throw err;
   }
 }
 
