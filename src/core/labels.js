@@ -331,7 +331,7 @@ export function placeLabel({ label, size, pts = [], nodes = [], others = [], max
  * items = [{label, size}]；返回同序矩形数组（null = 这条放不下）。
  */
 export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [], otherPaths = [], maxDist = LABEL_MAX_DIST } = {}) {
-  const paths = privateLabelPaths(pts, otherPaths);
+  let paths;
   const placed = [...others];
   const out = [];
   items.forEach(({ label, size }, i) => {
@@ -340,7 +340,7 @@ export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [],
       return;
     }
     const manual = (label.dx || 0) !== 0 || (label.dy || 0) !== 0;
-    const path = manual ? pts : paths[0];
+    const path = manual ? pts : (paths ??= privateLabelPaths(pts, otherPaths))[0];
     const anchor = path && midAnchor(path);
     if (!anchor) { out.push(null); return; }
     const nx = -anchor.uy;
@@ -369,10 +369,12 @@ function privateLabelPaths(pts, otherPaths) {
     const cross = 1 - axis;
     let parts = [[Math.min(a[axis], b[axis]), Math.max(a[axis], b[axis])]];
     for (const other of otherPaths) {
-      for (let j = 1; j < other.length; j++) {
+      if (!parts.length) break;
+      for (let j = 1; j < other.length && parts.length; j++) {
         const c = other[j - 1], d = other[j];
         if (Math.abs(c[cross] - d[cross]) > 0.5 || Math.abs(c[cross] - a[cross]) > 0.5) continue;
         const lo = Math.min(c[axis], d[axis]), hi = Math.max(c[axis], d[axis]);
+        if (!parts.some(([start, end]) => Math.min(end, hi) - Math.max(start, lo) > 0.5)) continue;
         parts = parts.flatMap(([start, end]) => {
           const left = Math.max(start, lo), right = Math.min(end, hi);
           if (right - left <= 0.5) return [[start, end]];

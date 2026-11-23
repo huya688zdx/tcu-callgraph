@@ -930,6 +930,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/stats') {
+      if (u.searchParams.get('summary') === '1') {
+        const { cycleGroups, selfLoops, ...stats } = S;
+        return json(res, { stats });
+      }
       return json(res, {
         stats: S,
         root,

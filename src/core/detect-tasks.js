@@ -35,18 +35,20 @@ function taskPeriodOf(name) {
 }
 
 /** 嵌套实参调用不按标识符出现顺序猜执行顺序，留给用户手动标注。 */
-function hasNestedCall(tokens, calls) {
+export function hasNestedCall(tokens, calls) {
   const names = new Set(calls.flatMap((e) => [
     e.callee || shortName(e.to), e.macroChain?.[0], e.via?.split(' > ')[0],
     e.kind === 'fnptr' ? e.via?.split('.').pop() : null,
   ]).filter(Boolean));
   const stack = [];
+  let enclosingCalls = 0;
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].v === '(') {
       const call = names.has(tokens[i - 1]?.v);
-      if (call && stack.includes(true)) return true;
+      if (call && enclosingCalls) return true;
       stack.push(call);
-    } else if (tokens[i].v === ')') stack.pop();
+      if (call) enclosingCalls++;
+    } else if (tokens[i].v === ')' && stack.pop()) enclosingCalls--;
   }
   return false;
 }
@@ -119,7 +121,7 @@ export function detectTasks(model, from = null) {
     const calls = out(fn.id).filter((e) => Object.hasOwn(CALL_RANK, e.kind))
       .sort((a, b) => a.line - b.line);
     if (calls.length < 2) continue;
-    if (hasNestedCall(fn.bodyTokens || [], calls)) {
+    if (fn.hasNestedCalls ?? hasNestedCall(fn.bodyTokens || [], calls)) {
       skipped.push({ from: fn.id, reason: '当前函数含嵌套实参调用，コール順 请手动标注' });
       continue;
     }

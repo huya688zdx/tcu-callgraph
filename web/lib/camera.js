@@ -92,7 +92,7 @@ function stepCam(now) {
     cam.k = f.k + (to.k - f.k) * e;
     camAnim.on = t < 1;
   }
-  draw();
+  draw({ geometryUnchanged: true });
   if (camAnim.on) camAnim.raf = requestAnimationFrame(stepCam);
 }
 

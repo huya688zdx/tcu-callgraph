@@ -6,13 +6,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { lex } from './lexer.js';
-import { preprocess } from './preproc.js';
+import { fileMacroScope, preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
 import { parseDot, modelFromDot } from './dot.js';
 import { headerSymbols } from './header-symbols.js';
+import { hasNestedCall } from './detect-tasks.js';
 
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
+// 小工程直接复用 token。大工程按文件重建 token，只短暂保留超出预算的源码。
+const RETAINED_TOKENS = 160_000;
 
 /**
  * 源码解码：先按 UTF-8 严格解码，失败则回退 CP932(Shift-JIS)。
@@ -299,7 +302,6 @@ export function buildIndex(root, sourceFiles = null) {
   const headers = files.filter(([rel]) => HDR_EXT.test(rel));
   const sources = files.filter(([rel]) => !HDR_EXT.test(rel));
 
-  const macros = new Map();
   const parsed = [];
   const includes = [];
   const warnings = [];
@@ -307,11 +309,12 @@ export function buildIndex(root, sourceFiles = null) {
   const macroDefs = new Map();
   const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-  /** 把头文件解析后的宏表并回全局表（含 #undef 带来的删除效果） */
-  const mergeMacros = (target, snap) => {
-    for (const name of [...target.keys()]) if (!snap.has(name)) target.delete(name);
-    for (const [name, def] of snap) target.set(name, def);
-  };
+  const functions = [];
+  const fnptrTables = new Map();
+  const seenFnId = new Set();
+  const varById = new Map();
+  const noMacros = new Map();
+  let keptTokens = 0;
 
   const parseFile = (rel, abs, isHeader) => {
     let buf;
@@ -336,40 +339,44 @@ export function buildIndex(root, sourceFiles = null) {
       return;
     }
     const src = decodeSource(buf);
-    const toks = lex(src, rel);
-    // 每个文件一份宏表快照：本文件的 #define/#undef 只作用于本文件，
-    // 避免 a.c 里定义的宏泄漏到 b.c；头文件解析完再并回全局表，
-    // 保证「头文件 → 源文件」这一方向的累积仍然成立。
-    const fileMacros = new Map(macros);
-    const { tokens, includes: inc } = preprocess(toks, fileMacros, rel);
-    if (isHeader) mergeMacros(macros, fileMacros);
-    // 本文件自己定义的宏进入清单（继承来的头文件宏不算，避免重复）
-    for (const def of fileMacros.values()) if (def.file === rel) macroDefs.set(def.name, def);
+    const fileMacros = fileMacroScope(noMacros);
+    const { tokens, includes: inc } = preprocess(lex(src, rel), fileMacros, rel);
+    for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
-    parsed.push({ abs, rel, tokens, macros: fileMacros, isHeader, bytes: src.length });
-  };
-
-  // 先头文件（宏定义先入表），再源文件
-  for (const [rel, abs] of headers) parseFile(rel, abs, true);
-  for (const [rel, abs] of sources) parseFile(rel, abs, false);
-
-  const functions = [];
-  const fnptrTables = new Map();
-  const seenFnId = new Set();
-
-  for (const p of parsed) {
-    for (const fn of findFunctions(p.tokens, p.rel)) {
+    const fileFunctions = [];
+    for (const fn of findFunctions(tokens, rel)) {
       fn.id = `${fn.file}::${fn.name}`;
       // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
-      fn.bodyTokens = p.tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      fileFunctions.push(fn);
       functions.push(fn);
     }
-    for (const [name, map] of findFnPtrTables(p.tokens)) {
+    for (const [name, map] of findFnPtrTables(tokens)) {
       fnptrTables.set(name, { ...map });
     }
-  }
+    for (const v of findGlobalVars(tokens, rel)) {
+      // static 变量按文件区分；普通全局变量跨文件同名即同一个
+      v.id = v.isStatic ? `var::${rel}::${v.name}` : `var::${v.name}`;
+      v.kind = 'var';
+      v.params = [];
+      const prev = varById.get(v.id);
+      // extern 只是声明，真实定义优先
+      if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
+    }
+    const entry = { rel, isHeader, bytes: src.length, functions: fileFunctions, macroChanges: fileMacros.changes };
+    if (fileFunctions.length) {
+      if (keptTokens + tokens.length <= RETAINED_TOKENS) {
+        entry.tokens = tokens;
+        keptTokens += tokens.length;
+      } else entry.src = src;
+    }
+    parsed.push(entry);
+  };
+
+  // 收齐定义后解析调用与变量引用。头文件先于源文件，宏按同一顺序生效。
+  for (const [rel, abs] of headers) parseFile(rel, abs, true);
+  for (const [rel, abs] of sources) parseFile(rel, abs, false);
 
   const byId = new Map();
   const byName = new Map();
@@ -378,21 +385,7 @@ export function buildIndex(root, sourceFiles = null) {
     if (!byName.has(fn.name)) byName.set(fn.name, []);
     byName.get(fn.name).push(fn);
   }
-
-  // 全局 / 静态变量：作为独立节点参与绘图，函数读写它们时连虚线
   const variables = [];
-  const varById = new Map();
-  for (const p of parsed) {
-    for (const v of findGlobalVars(p.tokens, p.rel)) {
-      // static 变量按文件区分；普通全局变量跨文件同名即同一个
-      v.id = v.isStatic ? `var::${p.rel}::${v.name}` : `var::${v.name}`;
-      v.kind = 'var';
-      v.params = [];
-      const prev = varById.get(v.id);
-      // extern 只是声明，真实定义优先
-      if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
-    }
-  }
   for (const v of varById.values()) {
     variables.push(v);
     byId.set(v.id, v);
@@ -410,8 +403,7 @@ export function buildIndex(root, sourceFiles = null) {
   };
 
   const edges = [];
-  // 每个函数用它所属文件的宏快照展开，避免跨文件互相污染
-  const macrosByFile = new Map(parsed.map((p) => [p.rel, p.macros]));
+  const macros = new Map();
 
   // 变量名 → 节点：优先本文件的 static，其次同名全局
   const varByName = new Map();
@@ -428,38 +420,51 @@ export function buildIndex(root, sourceFiles = null) {
     return (glob || list[0]).id;
   };
 
-  for (const fn of functions) {
-    const raw = [];
-    scanCalls(fn.bodyTokens, { macros: macrosByFile.get(fn.file) || macros, fnptr: fnptrTables }, raw);
-    for (const c of raw) {
-      if (!c.callee) continue;
-      edges.push({
-        from: fn.id,
-        to: resolveCallee(c.callee, fn.file),
-        callee: c.callee,
-        kind: c.kind,
-        line: c.line,
-        cond: c.cond,
-        via: c.via,
-        macroChain: c.macroChain,
-        macroDefinitions: (c.macroChain || []).map((name) => {
-          const def = macrosByFile.get(fn.file)?.get(name);
-          return def ? `header::${def.file}::${name}` : null;
-        }).filter(Boolean),
-      });
+  for (const p of parsed) {
+    if (p.isHeader) for (const [name, def] of p.macroChanges) {
+      if (def) macros.set(name, def);
+      else macros.delete(name);
     }
-    // 全局变量读写：画成虚线，同时记录方向供数据流分析
-    const access = scanVarAccess(fn.bodyTokens, (n) => lookupVar(fn.file, n));
-    fn.varAccess = access;
-    for (const a of access) {
-      edges.push({
-        from: fn.id,
-        to: a.id,
-        callee: a.name,
-        kind: 'var',
-        line: a.line,
-        via: a.write ? (a.read ? '读写' : '写') : '读',
-      });
+    if (!p.functions.length) continue;
+    const scope = p.isHeader ? macros : fileMacroScope(macros, p.macroChanges);
+    const tokens = p.tokens ?? preprocess(lex(p.src, p.rel), new Map(), p.rel).tokens;
+    p.tokens = p.src = null;
+    for (const fn of p.functions) {
+      const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      const raw = [];
+      const edgeStart = edges.length;
+      scanCalls(body, { macros: scope, fnptr: fnptrTables }, raw);
+      for (const c of raw) {
+        if (!c.callee) continue;
+        edges.push({
+          from: fn.id,
+          to: resolveCallee(c.callee, fn.file),
+          callee: c.callee,
+          kind: c.kind,
+          line: c.line,
+          cond: c.cond,
+          via: c.via,
+          macroChain: c.macroChain,
+          macroDefinitions: (c.macroChain || []).map((name) => {
+            const def = scope.get(name);
+            return def ? `header::${def.file}::${name}` : null;
+          }).filter(Boolean),
+        });
+      }
+      // 调用顺序检测只需知道是否存在嵌套调用，无需长期持有整份函数体。
+      if (edges.length - edgeStart > 1 && hasNestedCall(body, edges.slice(edgeStart))) fn.hasNestedCalls = true;
+      const access = scanVarAccess(body, (n) => lookupVar(fn.file, n));
+      fn.varAccess = access;
+      for (const a of access) {
+        edges.push({
+          from: fn.id,
+          to: a.id,
+          callee: a.name,
+          kind: 'var',
+          line: a.line,
+          via: a.write ? (a.read ? '读写' : '写') : '读',
+        });
+      }
     }
   }
 

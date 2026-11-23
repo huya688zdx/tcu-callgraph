@@ -326,8 +326,8 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (KEYWORDS.has(tk.v)) continue;
 
     // 宏调用：展开后继续扫
-    if (ctx.macros.has(tk.v) && !macroChain.includes(tk.v)) {
-      const m = ctx.macros.get(tk.v);
+    const m = ctx.macros.get(tk.v);
+    if (m && !macroChain.includes(tk.v)) {
       if (m.params === null) {
         // 对象宏也可能是函数别名：展开时必须带上调用括号和实参，
         // 否则只剩一个裸函数名，递归扫描无法识别调用。

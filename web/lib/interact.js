@@ -41,6 +41,9 @@ function worldPos(e) {
   };
 }
 
+// 浏览器会对屏幕坐标取整。去掉换算后的尾差，避免同一落点选出不同的绕线路径。
+const dragDelta = (pixels) => Math.round(pixels / cam.k * 1000) / 1000;
+
 function hitTest(e) {
   if (!state.view) return null;
   const p = worldPos(e);
@@ -205,6 +208,8 @@ function moveSeg(seg, x, y) {
  * 等价于 geometry.js 的 liveReroute(nodeId)，只是把 O(E) 的准备工作挪到了拖拽开始。
  */
 let dragCache = null;
+let moveFrame = 0;
+let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
@@ -222,6 +227,9 @@ function selectEdge(edge) {
 
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
 function resetDragState() {
+  cancelAnimationFrame(moveFrame);
+  moveFrame = 0;
+  pendingMove = null;
   state.dragNode = null;
   state.dragBox = null;
   state.dragEnd = null;
@@ -396,8 +404,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     if (moveReady(title.kind, title.box)) {
       pushHistory();
       state.dragBox = beginHierarchyMove(state.view, title);
-      state.dragBox.crossing = state.view.edges.filter((ed) =>
-        state.dragBox.ids.has(ed.from) !== state.dragBox.ids.has(ed.to));
+      if (state.dragBox.crossing.length) state.dragBox.stationarySegments = collectSegments(state.dragBox.stationary);
       state.dragStart = { x: e.clientX, y: e.clientY };
       els.cv.style.cursor = 'grabbing';
       els.cv.setPointerCapture(e.pointerId);
@@ -445,22 +452,28 @@ els.cv.addEventListener('pointerdown', (e) => {
   state.panning = true;
   state.panMoved = false;
   state.last = { x: e.clientX, y: e.clientY };
+  state.dragStart = state.last;
   els.cv.classList.add('panning');
   els.cv.setPointerCapture(e.pointerId);
 });
 
-els.cv.addEventListener('pointermove', (e) => {
+function handlePointerMove(e) {
   if (state.dragBox) {
     const drag = state.dragBox;
     if (drag.view !== state.view) { cancelDrag(); return; }
     const dx = e.clientX - state.dragStart.x, dy = e.clientY - state.dragStart.y;
     if (Math.abs(dx) + Math.abs(dy) > 3) state.dragMoved = true;
     if (state.dragMoved) {
-      moveHierarchy(drag, dx / cam.k, dy / cam.k, e.shiftKey ? 0 : 8 / cam.k);
-      routeEdges(state.view.nodes, drag.crossing, {
-        existing: collectSegments(state.view.edges.filter((ed) => !drag.crossing.includes(ed))), preservePaths: true,
-      });
-      draw();
+      const changed = moveHierarchy(drag, dragDelta(dx), dragDelta(dy), e.shiftKey ? 0 : 8 / cam.k);
+      if (changed && drag.crossing.length) {
+        const moving = collectSegments(drag.internal);
+        const fixed = drag.stationarySegments;
+        routeEdges(state.view.nodes, drag.crossing, {
+          existing: { h: [...fixed.h, ...moving.h], v: [...fixed.v, ...moving.v], edges: [...fixed.edges, ...moving.edges] },
+          preservePaths: true,
+        });
+      }
+      draw({ geometryUnchanged: !changed });
     }
     return;
   }
@@ -484,7 +497,7 @@ els.cv.addEventListener('pointermove', (e) => {
     const n = hitTest(e);
     const other = state.dragEnd.which === 'from' ? state.dragEnd.edge.to : state.dragEnd.edge.from;
     state.dragEnd.hover = n && n.id !== other ? n : null;
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
@@ -501,11 +514,13 @@ els.cv.addEventListener('pointermove', (e) => {
   }
 
   if (state.dragNode) {
-    const rawDx = (e.clientX - state.dragStart.x) / cam.k;
-    const rawDy = (e.clientY - state.dragStart.y) / cam.k;
+    const dx = dragDelta(e.clientX - state.dragStart.x);
+    const dy = dragDelta(e.clientY - state.dragStart.y);
     if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) > 3) state.dragMoved = true;
     if (!state.dragMoved) return;
-    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
+    const { x, y } = state.dragNode;
+    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + dx, state.dragStart.ny + dy);
+    if (x === state.dragNode.x && y === state.dragNode.y) return;
     // 从本次按下时的 ELK 路径调整端部，避免逐帧重新选面和改走廊。
     if (dragCache) {
       dragCache.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => p.slice()); });
@@ -517,18 +532,19 @@ els.cv.addEventListener('pointermove', (e) => {
 
   if (state.linkFrom) {
     state.linkPos = worldPos(e);
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
   if (state.panning) {
     const dx = e.clientX - state.last.x;
     const dy = e.clientY - state.last.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) state.panMoved = true;
+    const start = state.dragStart || state.last;
+    if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) > 3) state.panMoved = true;
     cam.x += dx;
     cam.y += dy;
     state.last = { x: e.clientX, y: e.clientY };
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
@@ -537,7 +553,7 @@ els.cv.addEventListener('pointermove', (e) => {
   if (next !== state.hover) {
     state.hover = next;
     els.cv.classList.toggle('over-node', !!next);
-    draw();
+    draw({ geometryUnchanged: true });
   }
   const title = next ? null : hitTitle(e);
   const hits = !n && !title ? hitEdges(e) : [];
@@ -576,9 +592,28 @@ els.cv.addEventListener('pointermove', (e) => {
   } else {
     els.tooltip.style.opacity = '0';
   }
+}
+
+function flushPointerMove() {
+  cancelAnimationFrame(moveFrame);
+  moveFrame = 0;
+  const move = pendingMove;
+  pendingMove = null;
+  if (move && move.view === state.view) handlePointerMove(move.event);
+}
+
+els.cv.addEventListener('pointermove', (e) => {
+  if (!(state.panning || state.dragBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
+    handlePointerMove(e);
+    return;
+  }
+  pendingMove = { event: e, view: state.view };
+  if (!moveFrame) moveFrame = requestAnimationFrame(flushPointerMove);
 });
 
 els.cv.addEventListener('pointerup', (e) => {
+  // 同一帧内松手也要应用最后的指针位置，再执行保存和收尾布线。
+  if (pendingMove?.event.pointerId === e.pointerId) flushPointerMove();
   // 先把本次手势的拖拽态取成快照，再统一清理：后面的分支只依赖快照，
   // 这样「清理」和「收尾」只有一处，pointercancel 也能复用同一套复位逻辑
   const dragEnd = state.dragEnd;
@@ -586,6 +621,8 @@ els.cv.addEventListener('pointerup', (e) => {
   const dragNode = state.dragNode;
   const dragBox = state.dragBox;
   const dragLabel = state.dragLabel;
+  const dragStart = state.dragStart;
+  const originalNodeRoutes = dragCache;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
   const panning = state.panning;
@@ -593,10 +630,14 @@ els.cv.addEventListener('pointerup', (e) => {
   resetDragState();
 
   if (dragBox) {
-    if (moved) {
+    if (dragBox.dx || dragBox.dy) {
+      // 松手时依据起始折线和最终位置布线，预览经过多少帧都得到同一结果。
+      for (const { edge, points } of dragBox.paths) {
+        if (dragBox.ids.has(edge.from) !== dragBox.ids.has(edge.to)) edge.points = points;
+      }
       fullReroute(dragBox.ids);
       pushHistory();
-    }
+    } else if (moved) cancelHierarchyMove(dragBox);
     draw();
     return;
   }
@@ -638,7 +679,10 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (dragNode) {
-    if (moved) {
+    if (moved && originalNodeRoutes) {
+      originalNodeRoutes.related.forEach((edge, i) => { edge.points = originalNodeRoutes.paths[i]; });
+    }
+    if (moved && (dragNode.x !== dragStart.nx || dragNode.y !== dragStart.ny)) {
       fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
       pushHistory();
     }

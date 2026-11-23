@@ -1,4 +1,4 @@
-import { expandSeq } from './preproc.js';
+import { expandSeq, fileMacroScope } from './preproc.js';
 import { scanCalls } from './extract.js';
 
 /** 头文件中的可调用宏作为可选入口；常量/包含保护不生成函数节点。 */
@@ -6,10 +6,9 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
   const symbols = [];
   for (const p of parsed) {
     if (!p.isHeader) continue;
-    const context = new Map(headerMacros);
-    for (const def of p.macros.values()) if (def.file === p.rel) context.set(def.name, def);
-    for (const m of p.macros.values()) {
-      if (m.file !== p.rel) continue;
+    const definitions = new Map([...p.macroChanges].filter(([, def]) => def));
+    const context = fileMacroScope(headerMacros, definitions);
+    for (const m of definitions.values()) {
       const id = `header::${p.rel}::${m.name}`;
       const calls = invocations.get(id) || [];
       let callable = m;

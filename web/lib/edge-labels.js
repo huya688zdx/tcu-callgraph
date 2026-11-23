@@ -13,6 +13,7 @@
 import { els, state, edgeKey, FONT, THEME, hexToRgba } from './state.js';
 import { api } from './api.js';
 import { t } from '../i18n.js';
+import { boundsMeet, routeBounds } from '/core/routing.js';
 import {
   LABEL_FONT,
   LABEL_NOTE_FONT,
@@ -33,6 +34,8 @@ import {
 
 const FONT_SPEC = (size) => `600 ${size}px ${FONT}`;
 const NOTE_SPEC = `400 ${LABEL_NOTE_FONT}px ${FONT}`;
+const labelSizes = new WeakMap();
+const layouts = new WeakMap();
 
 /** 文字宽度：用画布测量，和真正绘制时的字体保持一致 */
 function measure(text, font = LABEL_FONT) {
@@ -55,7 +58,12 @@ function roundRectPath(ctx, x, y, w, h, r) {
 }
 
 export function labelSizeOf(label) {
-  return labelBoxSize(label, measure);
+  const text = labelText(label);
+  const saved = labelSizes.get(label);
+  if (saved && saved.text === text && saved.note === label.note) return saved.size;
+  const size = labelBoxSize(label, measure);
+  labelSizes.set(label, { text, note: label.note, size });
+  return size;
 }
 
 /** 连线的「线中央」锚点（拖动时把指针位移换算成相对锚点的偏移） */
@@ -76,21 +84,31 @@ export function edgeLabels(edge) {
  * 同一条线的多条标签由 placeEdgeLabels 交替放线的两侧并互相避让；
  * 不同线之间先放的矩形参与后者的避让。
  */
-export function labelLayout(view = state.view) {
+export function labelLayout(view = state.view, reuse = false) {
   if (!view) return [];
+  const cached = layouts.get(view);
+  if (reuse && cached?.edges === view.edges && cached.nodes === view.nodes) return cached.items;
+
   const placed = [];
   const out = [];
+  const labeled = [];
   for (const e of view.edges) {
     e._lbs = null;
+    if (e.labels?.length || e.label || (e.labels && !Array.isArray(e.labels))) labeled.push(e);
+  }
+  const paths = labeled.length ? view.edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
+  for (const e of labeled) {
     const labels = edgeLabels(e);
     if (!labels.length) continue;
     const items = labels.map((label) => ({ label, size: labelSizeOf(label) }));
+    const bounds = routeBounds(e.points);
     const rects = placeEdgeLabels({
       items,
       pts: e.points || [],
       nodes: view.nodes,
       others: placed,
-      otherPaths: view.edges.filter((other) => other !== e).map((other) => other.points || []),
+      otherPaths: paths.filter((other) => other.edge !== e && boundsMeet(bounds, other.bounds, 0.501))
+        .map(({ edge }) => edge.points || []),
       maxDist: LABEL_MAX_DIST,
     });
     const own = [];
@@ -103,32 +121,28 @@ export function labelLayout(view = state.view) {
     });
     if (!own.length) e._lbs = null;
   }
+  layouts.set(view, { nodes: view.nodes, edges: view.edges, items: out });
   return out;
 }
 
 /** 命中最上层的标签（标签画在节点之上，所以倒序找）；返回具体命中了哪一条 */
 export function hitLabel(p, view = state.view) {
-  if (!view) return null;
-  if (view.edges.some((e) => e.labels?.length && !e._lbs)) labelLayout(view);
-  for (let i = view.edges.length - 1; i >= 0; i--) {
-    const e = view.edges[i];
-    if (!e._lbs) continue;
-    for (let j = e._lbs.length - 1; j >= 0; j--) {
-      const { id, rect: r } = e._lbs[j];
-      if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
-        const label = edgeLabels(e).find((l) => l.id === id) || null;
-        return label ? { edge: e, label, rect: r } : null;
-      }
+  const items = labelLayout(view, true);
+  for (let i = items.length - 1; i >= 0; i--) {
+    const { rect: r } = items[i];
+    if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
+      return items[i];
     }
   }
   return null;
 }
 
 /** 画布上绘制全部标签（由 render.js 在节点之后调用，保证标签在最上层） */
-export function drawEdgeLabels(ctx, view = state.view, onAnimatedBox = null, focusedEdges = null) {
-  const items = labelLayout(view);
+export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible, reuse } = {}) {
+  const items = labelLayout(view, reuse);
   if (!items.length) return;
   for (const { edge, label, rect } of items) {
+    if (visible && !visible(rect)) continue;
     const key = `${edgeKey(edge)}#${label.id}`;
     const selected = state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key;
     ctx.save();
@@ -168,7 +182,7 @@ export function drawEdgeLabels(ctx, view = state.view, onAnimatedBox = null, foc
 
     if (selected) {
       const box = { x: rect.x - 2.5, y: rect.y - 2.5, w: rect.w + 5, h: rect.h + 5 };
-      if (onAnimatedBox && state.multiSelection?.kind === 'label') {
+      if (onAnimatedBox && state.multiSelection?.kind === 'label' && state.selectedLabel === key) {
         onAnimatedBox(box, [4, 3], 1.4, 6, '#185FA5');
       } else {
         roundRectPath(ctx, box.x, box.y, box.w, box.h, 6);
@@ -266,6 +280,7 @@ export function applyLabels(edge, labels) {
   edge.labels = normalizeLabels(labels);
   edge.label = edge.labels[0] || null;
   edge._lbs = null;
+  if (state.view) layouts.delete(state.view);
   return edge.labels;
 }
 
