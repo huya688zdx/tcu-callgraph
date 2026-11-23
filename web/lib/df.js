@@ -3,6 +3,7 @@ import { t } from '../i18n.js';
 import { state, esc, edgeKey } from './state.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
+import { periodCaption, periodText } from './period-text.js';
 
 export const df = { root: null, result: null, selected: 0, query: '' };
 let querySeq = 0;
@@ -11,6 +12,47 @@ let updating = false;
 const relations = (res) => ['read', 'write'].flatMap((mode) =>
   res.vars.filter((v) => v.mode === mode).flatMap((v) => v.peers.map((peer) => ({ v, peer }))));
 const versionLabel = (version) => version ? t(`compare.version.${version}`) : '';
+const comparisonInfo = () => state.compareInfo?.active ? state.compareInfo : state.view?.comparison;
+const periodNode = (node) => Array.isArray(node.periods) ? { ...node, periods: { after: node.periods } } : node;
+
+function knownPeriods(node, version) {
+  const before = version === 'before';
+  const labels = Array.isArray(node.periods) ? node.periods : before
+    ? node.periodBefore ?? node.periods?.before
+    : node.periodAfter ?? node.periods?.after;
+  const contexts = before ? node.previousTaskPeriods ?? node.taskPeriods : node.taskPeriods;
+  return new Set((labels ?? periodText(contexts).split(' / ')).map((label) => label.trim())
+    .filter((label) => /^\d+(?:\.\d+)?\s*(?:s|ms|µs|μs|us)$/i.test(label))
+    .map((label) => label.replace(/\s+/g, '').replace(/μs|us/gi, 'µs')));
+}
+
+function timingSummary(fn, entries, comparison) {
+  const crossPeriods = new Set();
+  const byParticipant = new Map();
+  let changed = false;
+  for (const entry of entries) {
+    const version = entry.version;
+    const target = entry.fnTaskPeriods ? { id: fn.id, taskPeriods: entry.fnTaskPeriods } : fn;
+    const rootPeriods = knownPeriods(target, version);
+    const peerPeriods = new Set(entry.peers.flatMap((peer) => [...knownPeriods(peer, version)]));
+    const periods = new Set([...rootPeriods, ...peerPeriods]);
+    if (rootPeriods.size && peerPeriods.size && periods.size > 1) {
+      periods.forEach((period) => crossPeriods.add(period));
+    }
+    for (const node of [target, ...entry.peers]) {
+      if (periodCaption(periodNode(node), comparison).includes('→')) changed = true;
+      if (!version) continue;
+      if (!byParticipant.has(node.id)) byParticipant.set(node.id, {});
+      byParticipant.get(node.id)[version] = [...knownPeriods(node, version)].sort().join(',');
+    }
+  }
+  changed ||= [...byParticipant.values()].some(({ before, after }) => before != null && after != null && before !== after);
+  const badges = [
+    crossPeriods.size > 1 && `⏱ 跨周期数据流: ${[...crossPeriods].join(' ↔ ')}`,
+    changed && '⏱ 周期变化影响',
+  ].filter(Boolean);
+  return badges.map((label) => `<span class="compare-badge period">${esc(label)}</span>`).join(' ');
+}
 
 function relationInView({ v, peer }, res = df.result) {
   const ids = new Set((state.view?.nodes || []).map((n) => n.id));
@@ -25,15 +67,22 @@ function showPanel(html) {
   document.getElementById('right').dataset.mode = 'dataflow';
 }
 
-function renderResults(error = '') {
+function renderDataflowResult(error = '') {
   const res = df.result;
   if (!res) return;
   const rows = relations(res);
+  const varsById = new Map();
+  for (const v of res.vars) {
+    if (!varsById.has(v.id)) varsById.set(v.id, []);
+    varsById.get(v.id).push(v);
+  }
+  const comparison = comparisonInfo();
   const group = (mode, title) => {
+    const byVariable = new Map();
     let count = 0;
-    const entries = rows.map((row, index) => {
+    rows.forEach((row, index) => {
       const { v, peer } = row;
-      if (v.mode !== mode) return '';
+      if (v.mode !== mode) return;
       count++;
       const access = res.edges.filter((e) => !v.version || e.version === v.version).find((e) => mode === 'read'
         ? e.from === peer.id && e.to === v.id && e.kind === 'df-write'
@@ -45,14 +94,22 @@ function renderResults(error = '') {
       const search = `${v.name} ${v.file} ${peer.name} ${peer.file}`.toLowerCase();
       const variableVersion = versionLabel(v.version);
       const peerVersion = versionLabel(peer.version);
-      const hint = state.view?.comparison ? t('compare.addToCanvas') : t('df.toggleHint');
-      return `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
+      const period = periodCaption(periodNode(peer), comparison);
+      const hint = comparison ? '加入当前图' : t('df.toggleHint');
+      const html = `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
         <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
         <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
+        ${period ? `<span class="compare-badge period" title="任务周期">${esc(period)}</span>` : ''}
         ${line ? `<span class="df-access-line">:${line}</span>` : ''}
         <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
         ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
       </label>`;
+      if (!byVariable.has(v.id)) byVariable.set(v.id, { name: v.name, rows: [] });
+      byVariable.get(v.id).rows.push(html);
+    });
+    const entries = [...byVariable].map(([id, variable]) => {
+      const timing = timingSummary(res.fn, varsById.get(id), comparison);
+      return `<div data-df-variable><div class="detail-meta"><b>${esc(variable.name)}</b> ${timing}</div>${variable.rows.join('')}</div>`;
     }).join('');
     const truncated = res.vars.some((v) => v.mode === mode && v.truncated);
     return entries ? `<div class="df-group"><h4>${t(title)} (${count})</h4>${entries}
@@ -61,7 +118,7 @@ function renderResults(error = '') {
   };
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
-    <div class="df-actions"><button class="primary" data-df="toggle">${state.view?.comparison ? t('compare.addToCanvas') : t('df.add')}</button>
+    <div class="df-actions"><button class="primary" data-df="toggle">加入当前图</button>
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -76,7 +133,7 @@ function filterResults() {
   const panel = document.getElementById('dataflow');
   const labels = [...panel.querySelectorAll('.df-relation')];
   for (const label of labels) label.hidden = !label.dataset.search.includes(query);
-  for (const group of panel.querySelectorAll('.df-group')) {
+  for (const group of panel.querySelectorAll('.df-group, [data-df-variable]')) {
     group.hidden = ![...group.querySelectorAll('.df-relation')].some((label) => !label.hidden);
   }
   const visible = labels.filter((label) => !label.hidden);
@@ -91,9 +148,9 @@ function filterResults() {
   const chosen = visible.find((label) => label.querySelector('input').checked);
   const present = chosen?.dataset.added === 'true';
   const button = panel.querySelector('[data-df="toggle"]');
-  const comparing = Boolean(state.view?.comparison);
+  const comparing = Boolean(comparisonInfo());
   button.disabled = updating || !chosen || (comparing && present);
-  button.textContent = comparing ? t(present ? 'compare.inCanvas' : 'compare.addToCanvas') : t(present ? 'df.remove' : 'df.add');
+  button.textContent = present ? t(comparing ? 'compare.inCanvas' : 'df.remove') : '加入当前图';
   panel.querySelector('[data-df-total]').textContent = query ? `${visible.length}/${labels.length}` : t('df.summary', { n: labels.length });
   panel.querySelector('[data-df-empty]').hidden = !!visible.length;
 }
@@ -123,7 +180,7 @@ export async function analyseDataflow(fnId) {
     if (seq !== querySeq || projectId !== state.view?.projectId) return;
     if (!res || res.error || res.ok === false) throw new Error(res?.error || t('df.unknownError'));
     df.result = res;
-    renderResults();
+    renderDataflowResult();
   } catch (err) {
     if (seq !== querySeq || projectId !== state.view?.projectId) return;
     showPanel(`<div class="df-error" role="alert">${t('df.failed')}：${esc(String(err))}</div>`);
@@ -136,12 +193,12 @@ async function toggleSelectedRelation() {
   const query = df.query;
   const chosen = res && relations(res)[selected];
   if (updating || !chosen) return;
-  const comparing = Boolean(state.view?.comparison);
+  const comparing = Boolean(comparisonInfo());
   if (comparing && relationInView(chosen, res)) return;
   const removing = document.querySelector('#dataflow input:checked')?.closest('.df-relation').dataset.added === 'true';
   updating = true;
   const projectId = state.view?.projectId;
-  renderResults();
+  renderDataflowResult();
   let roots = [...state.roots];
   let error = '';
   try {
@@ -189,7 +246,7 @@ async function toggleSelectedRelation() {
     error = `${t('df.updateFailed')}：${String(err)}`;
   } finally {
     updating = false;
-    if (df.result === res) renderResults(error);
+    if (df.result === res) renderDataflowResult(error);
   }
 }
 

@@ -17,7 +17,7 @@ function focusPath(force = false) {
   };
   for (const n of view.nodes) if (ids.has(n.id)) { include([n.x, n.y]); include([n.x + n.w, n.y + n.h]); }
   for (const index of result.edgeIndices) for (const point of view.edges[index].points || []) include(point);
-  if (force || !visible) focusBox({ x, y, w: maxX - x, h: maxY - y }, 80);
+  if (force || !visible) focusBox({ x, y, w: maxX - x, h: maxY - y }, 80, { keepZoom: !force });
 }
 
 function stepArrow(step) {
@@ -67,13 +67,13 @@ export function pickPairFlow(id) {
   const view = state.view;
   if (!view?.nodes.some(n => n.id === id)) return;
   const prior = state.pairFlow;
+  state.selected = null; state.selectedEdge = null; state.selectedLabel = null;
+  state.moveTarget = null; state.multiSelection = null;
   if (prior?.ids.length === 1 && prior.ids[0] === id) { clearPairFlow(); return; }
   const ids = prior?.ids.length === 1 ? [...prior.ids, id] : [id];
   const pair = { ids, result: null, view };
   state.pairFlow = pair;
   state.hoverRelation = null;
-  state.selected = null; state.selectedEdge = null; state.selectedLabel = null;
-  state.moveTarget = null; state.multiSelection = null;
   state.recent = null; state.flash = null;
   let signature;
   pair.refresh = current => {

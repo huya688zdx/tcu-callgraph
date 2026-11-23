@@ -24,7 +24,7 @@ import {
   labelText,
   normalizeLabel,
   normalizeLabels,
-  visibleCallOrderMap,
+  callOrderForEdge,
   displayEdgeLabels,
   labelBoxSize,
   placeEdgeLabels,
@@ -257,9 +257,8 @@ export function makeLabel(preset, edge, { num } = {}) {
     });
   }
   if (preset === 'call') {
-    const orders = edge?.from && state.view ? visibleCallOrderMap(state.view, edge.from) : null;
     const order = (Number.isFinite(Number(num)) && Number(num) > 0 ? Math.trunc(Number(num)) : null) ||
-      orders?.get(edge?.to)?.order ||
+      (edge?.from && state.view ? callOrderForEdge(state.view, edge) : null) ||
       (edge?.callNumbers?.length ? parseInt(edge.callNumbers[0], 10) : null) ||
       1;
     return normalizeLabel({

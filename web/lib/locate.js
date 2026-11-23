@@ -6,9 +6,11 @@
  * 避免「文件树 → 定位 → 文件树」的循环引用。
  */
 import { state } from './state.js';
-import { focusBox } from './camera.js';
+import { boxInViewport, focusBox } from './camera.js';
 import { draw } from './render.js';
 import { hooks } from './hooks.js';
+import { renderLabelPanel } from './label-panel.js';
+import { clearPairFlow } from './pair-flow.js';
 
 const FLASH_MS = 1500;
 
@@ -20,7 +22,7 @@ function flash(box) {
 
 const findNode = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
 
-/** 定位到某个函数：选中 + 居中放大 + 闪一下 */
+/** 定位到某个函数：选中、居中并闪一下。 */
 export async function locateNode(id) {
   let n = findNode(id);
   if (!n) {
@@ -28,20 +30,25 @@ export async function locateNode(id) {
     n = findNode(id);
   }
   if (!n) return false;
+  if (state.pairFlow) clearPairFlow({ paint: false });
+  state.multiSelection = null;
+  state.moveTarget = null;
   state.selected = id;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   hooks.renderDetail(id);
+  renderLabelPanel();
   draw();
-  focusBox(n, 140);
+  focusBox(n);
   flash(n);
   return true;
 }
 
-/** 只把视图中的邻居节点移到视野中央并闪一下，保留当前选中函数和关系上下文。 */
+/** 闪烁相邻节点，只有靠近视口边缘或超出视口时才平移。 */
 export function peekNode(id) {
   const n = findNode(id);
   if (!n) return false;
-  focusBox(n, 140);
+  if (!boxInViewport(n, 60)) focusBox(n);
   flash(n);
   return true;
 }
@@ -59,12 +66,12 @@ export async function locateBox(kind, id, fnIds = []) {
   if (!box) {
     const roots = fnIds.slice(0, 12); // 多入口加载，太多会把图撑爆
     if (!roots.length) return false;
-    await hooks.loadView(roots);
+    await hooks.loadView(roots, { fitOnLoad: false });
     box = pick(state.view).find((b) => b.id === id);
   }
   if (!box) return false;
   state.ctxBox = { kind, id };
-  focusBox(box, 70);
+  focusBox(box, 70, { keepZoom: false });
   flash(box);
   return true;
 }

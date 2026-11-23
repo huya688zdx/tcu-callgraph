@@ -104,6 +104,30 @@ function scoreMetrics(m) {
 
 export const routeScore = (edges) => scoreMetrics(layoutMetrics(edges));
 
+/** 统计同层目录与文件框之间的留白，父框的标题和边距不计入。 */
+export function directoryWhitespace({ groups, containers }) {
+  const siblings = new Map();
+  const add = (box, directory) => {
+    const parent = box.id.slice(0, Math.max(0, box.id.lastIndexOf('/')));
+    if (!siblings.has(parent)) siblings.set(parent, { boxes: [], directory: false });
+    const entry = siblings.get(parent);
+    entry.boxes.push(box);
+    entry.directory ||= directory;
+  };
+  for (const box of containers) add(box, true);
+  for (const box of groups) add(box, false);
+
+  let empty = 0;
+  for (const { boxes, directory } of siblings.values()) {
+    if (!directory || boxes.length < 2) continue;
+    const width = Math.max(...boxes.map((b) => b.x + b.w)) - Math.min(...boxes.map((b) => b.x));
+    const height = Math.max(...boxes.map((b) => b.y + b.h)) - Math.min(...boxes.map((b) => b.y));
+    const occupied = boxes.reduce((area, b) => area + b.w * b.h, 0);
+    empty += Math.max(0, width * height - occupied);
+  }
+  return empty;
+}
+
 /** 保留同线型的公共干线，处理不同线型相互遮盖及跨区绕行，只改动 subset。 */
 export function improveEdgeRoutes(view, subset, simplify = () => true) {
   if (!subset.length) return;

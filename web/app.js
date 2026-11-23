@@ -41,7 +41,7 @@ const navStack = [];
 const NAV_MAX = 30;
 
 async function loadView(rootId, opts = {}) {
-  const { nav = true, incremental = false } = opts;
+  const { nav = true, incremental = false, fitOnLoad = !incremental } = opts;
   const previous = incremental && !state.at && state.view ? state.view : null;
   if (state.pairFlow) clearPairFlow();
   stopCamAnim();
@@ -82,6 +82,8 @@ async function loadView(rootId, opts = {}) {
   state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
   // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
   if (state.pairFlow) clearPairFlow({ paint: false });
+  const priorView = state.view;
+  stopCamAnim();
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
@@ -91,6 +93,10 @@ async function loadView(rootId, opts = {}) {
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
+  state.multiSelection = null;
+  state.trunkHits = null;
+  state.prevTrunkHits = null;
+  state.trunkFocusNode = null;
   const rootNode = data.nodes.find((n) => n.id === data.root);
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
@@ -99,25 +105,22 @@ async function loadView(rootId, opts = {}) {
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
-  const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
-  const oldEdges = new Set((previous?.edges || []).map(edgeKey));
-  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
-  const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  const common = data.nodes.filter((n) => oldNodes.has(n.id));
-  if (!previous) {
+  const keepCam = !fitOnLoad && Boolean(priorView?.nodes.length);
+  const oldNodes = new Map((keepCam ? priorView.nodes : []).map((n) => [n.id, n]));
+  const oldEdges = new Set((keepCam ? priorView.edges : []).map(edgeKey));
+  const addedNodes = keepCam ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const addedEdges = keepCam ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
+  if (!keepCam) {
     fit({ paint: false });
-    constrainCam();
   } else {
     // 先按共同节点的位移锚定当前镜头起点，避免重排瞬间旧节点在屏幕上跳变，再平滑移向新增节点。
+    const common = data.nodes.filter((n) => oldNodes.has(n.id));
     if (common.length) {
       for (const axis of ['x', 'y']) {
         const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
         cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
       }
-    } else if (!previous.nodes.length) {
-      fit({ paint: false });
     }
-    constrainCam();
     if (addedNodes.length || addedEdges.length) {
       revealAdded(addedNodes, addedEdges);
       if (addedNodes.length === 1 && addedNodes[0].kind !== 'var') state.selected = addedNodes[0].id;
@@ -155,8 +158,11 @@ hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } 
   const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
     .map((id) => ({ root: id, up: 0, down: 0 }))];
   const view = await loadView(state.roots, { incremental: true, expansions });
-  if (view && !state.selected && selected && view.nodes.some((n) => n.id === selected)) {
+  if (view && view === state.view && !state.selected && !state.selectedEdge && !state.pairFlow &&
+      selected && view.nodes.some((n) => n.id === selected)) {
     state.selected = selected;
+    state.selectedEdge = null;
+    state.selectedLabel = null;
     await renderDetail(selected);
     draw();
   }
@@ -230,6 +236,7 @@ hooks.applyBookmark = async (b) => {
 hooks.reloadAll = async () => {
   comparisonPage = null;
   const seq = ++viewSeq;
+  if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = null;
   state.hoverRelation = null;
   state.selected = null;
@@ -292,13 +299,13 @@ async function deleteSelection() {
   const v = state.view;
   if (!v || v.comparison) return;
   // 选中标签时 Delete 只删标签，不删整条连线
-  if (state.selectedLabel && (await deleteSelectedLabel())) return;
+  if (!state.selected && state.selectedEdge && state.selectedLabel && (await deleteSelectedLabel())) return;
   let body = null;
 
-  if (state.selectedEdge) {
-    body = { edges: [edgeKey(state.selectedEdge)] };
-  } else if (state.selected) {
+  if (state.selected) {
     body = { nodes: [state.selected] };
+  } else if (state.selectedEdge) {
+    body = { edges: [edgeKey(state.selectedEdge)] };
   } else if (state.moveTarget?.kind === 'file' && state.moveTarget.view === v) {
     // 文件框只隐藏当前框内节点，沿用单节点删除的存档与撤销。
     body = { nodes: v.nodes.filter(n => n.group === state.moveTarget.item.id).map(n => n.id) };
@@ -387,10 +394,19 @@ window.addEventListener('keydown', (e) => {
 els.groupMode.addEventListener('change', () => {
   state.group = els.groupMode.checked;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 els.resetLayout.addEventListener('click', () => {
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
+});
+
+// interact.js 先完成命中检测和点选，普通单击选中节点后退出双点路径。
+els.cv.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || !state.selected) return;
+  state.selectedEdge = null;
+  state.selectedLabel = null;
+  if (state.pairFlow) clearPairFlow();
 });
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。

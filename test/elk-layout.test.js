@@ -281,6 +281,37 @@ test('多文件分层视图紧凑且接近 1:1，缩短相连函数距离并保�
   assertMidpointPorts(demoView);
 });
 
+test('固件的十个单测文件汇入 park_init 时使用多行多列布局并减少目录间留白', async () => {
+  const tests = Array.from({ length: 10 }, (_, i) => `test_${i + 1}`);
+  const appFiles = ['ti_shadow', 'main', 'pa7_hook', 'pa7_shadow', 'park', 'park_law'];
+  const nodes = [
+    ...tests.map((id) => ({ id, file: `firmware/tests/unit/${id}.c` })),
+    ...appFiles.map((name) => ({ id: name === 'park' ? 'park_init' : name, file: `firmware/app/${name}.c` })),
+    { id: 'park_mon', file: 'firmware/safety/park_mon.c' },
+  ];
+  const edges = [
+    ...[...tests, ...appFiles.slice(0, 4)].map((from) => ({ from, to: 'park_init', kind: 'direct' })),
+    ...['park_law', 'park_mon'].map((to) => ({ from: 'park_init', to, kind: 'direct' })),
+  ];
+  const view = await layoutElk(nodes, edges);
+  const unitFiles = view.groups.filter((box) => box.id.startsWith('firmware/tests/unit/'));
+  const unit = view.containers.find((box) => box.id === 'firmware/tests/unit');
+  assert.equal(unitFiles.length, 10);
+  assert.ok(new Set(unitFiles.map((box) => box.x)).size > 1);
+  assert.ok(new Set(unitFiles.map((box) => box.y)).size > 1);
+  assert.ok(unit.h < 650, `tests/unit 高度为 ${unit.h}`);
+  const aspect = view.width / view.height;
+  assert.ok(aspect >= 0.75 && aspect <= 1.33, `画布宽高比为 ${aspect.toFixed(2)}`);
+  const siblings = view.containers.filter((box) => box.depth === 2);
+  const siblingBoundsArea = (Math.max(...siblings.map((b) => b.x + b.w)) - Math.min(...siblings.map((b) => b.x))) *
+    (Math.max(...siblings.map((b) => b.y + b.h)) - Math.min(...siblings.map((b) => b.y)));
+  const occupied = siblings.reduce((area, box) => area + box.w * box.h, 0);
+  assert.ok(occupied / siblingBoundsArea > 0.6, '增加并排文件后，同层目录也应减少空白');
+  assert.deepEqual(view.edges.map(({ points, ...edge }) => edge), edges);
+  assert.ok(view.edges.every((e) => view.nodes.every((n) => !pathCrossesBody(e.points, n))));
+  assertMidpointPorts(view);
+});
+
 test('存在目录层时，跨文件显式 callNumbers 调用同文件多个目标仍保持调用序单调', async () => {
   const nodes = [
     { id: 'a/main.c::main', name: 'main', file: 'a/main.c', kind: 'fn' },

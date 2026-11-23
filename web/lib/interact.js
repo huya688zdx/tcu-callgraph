@@ -34,6 +34,7 @@ import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
 import { pickPairFlow, clearPairFlow } from './pair-flow.js';
+import { hooks } from './hooks.js';
 function worldPos(e) {
   const rect = els.cv.parentElement.getBoundingClientRect();
   return {
@@ -117,38 +118,28 @@ function hitEdge(e) {
   return hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0] || null;
 }
 
-function pickEdgeAt(e, onPick, useSelection = false, prevMulti = null) {
-  const view = state.view, hits = hitEdges(e);
+function pickEdgeAt(e, onPick, useSelection = false) {
+  const hits = hitEdges(e);
   if (!hits.length) return false;
   if (hits.length === 1) {
-    state.trunkHits = null;
     onPick(hits[0]);
     return true;
   }
   if (useSelection) {
     const target = hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0];
-    state.trunkHits = hits;
-    onPick(target);
+    onPick(target, { trunkHits: hits });
     return true;
   }
   // 点击共线干线绝不弹窗：首次点击直接在画布高亮经过该干线的全部连线与两端节点；
   // 连续点击同一干线时，在「全部共线分支 → 第 1 条 → 第 2 条 …」之间顺滑循环切换。
-  const hitKeys = new Set(hits.map(edgeKey));
-  const sameTrunk = (list) => list?.length === hits.length && list.every((ed) => hitKeys.has(edgeKey(ed)));
-  state.trunkHits = hits;
-  if (prevMulti?.trunk && sameTrunk(prevMulti.hits)) {
-    onPick(hits[0]);
-  } else if (!prevMulti?.trunk && sameTrunk(state.prevTrunkHits) && hits.includes(state.selectedEdge)) {
-    const idx = hits.indexOf(state.selectedEdge);
-    if (idx + 1 < hits.length) {
-      onPick(hits[idx + 1]);
-    } else {
-      onPick(hits[0], hits);
-    }
-  } else {
-    onPick(hits[0], hits);
-  }
-  state.prevTrunkHits = hits;
+  const hitSet = new Set(hits);
+  const sameTrunk = (list) => list?.length === hits.length && list.every((edge) => hitSet.has(edge));
+  const continuing = hits.includes(state.selectedEdge) && sameTrunk(state.prevTrunkHits);
+  const trunkHits = continuing ? state.prevTrunkHits : hits;
+  const group = state.multiSelection?.trunk ? state.multiSelection.hits : null;
+  const next = !continuing ? null : group
+    ? (sameTrunk(group) ? trunkHits[0] : null) : trunkHits[trunkHits.indexOf(state.selectedEdge) + 1];
+  onPick(next || trunkHits[0], { trunkHits, trunkGroup: next ? null : trunkHits, scrollToTrunkBranch: Boolean(next) });
   return true;
 }
 
@@ -228,13 +219,16 @@ let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
-function selectEdge(edge, trunkGroup = null) {
-  if (state.pairFlow) clearPairFlow();
+function selectEdge(edge, { trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false } = {}) {
+  if (state.pairFlow) clearPairFlow({ paint: false });
   state.moveTarget = null;
   state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = edge;
   state.selectedLabel = null;
+  state.trunkHits = trunkHits;
+  state.prevTrunkHits = trunkHits;
+  state.trunkFocusNode = focusNode;
   state.multiSelection = trunkGroup?.length > 1 ? {
     kind: 'edge',
     anchor: edge,
@@ -245,7 +239,41 @@ function selectEdge(edge, trunkGroup = null) {
   } : null;
   draw();
   renderDetail(null);
-  renderLabelPanel();
+  renderLabelPanel({ scrollToTrunkBranch });
+}
+
+hooks.selectEdge = selectEdge;
+
+function activeTrunk() {
+  const hits = state.trunkHits;
+  return hits?.length > 1 && (hits.includes(state.selectedEdge) || state.multiSelection?.trunk) ? hits : null;
+}
+
+function clearTrunk() {
+  state.trunkHits = null;
+  state.prevTrunkHits = null;
+  state.trunkFocusNode = null;
+}
+
+function pickTrunkEndpoint(id) {
+  const trunkHits = activeTrunk();
+  if (!trunkHits) return false;
+  const outgoing = trunkHits.filter((edge) => edge.from === id);
+  const incoming = trunkHits.filter((edge) => edge.to === id && edge.from !== id);
+  const connected = [...outgoing, ...incoming];
+  if (!connected.length) return false;
+
+  // 多分支端点依次展示整组、单条分支，再回到整组。自调用只计一次。
+  const options = { trunkHits, focusNode: id, scrollToTrunkBranch: true };
+  if (connected.length === 1) {
+    selectEdge(connected[0], options);
+    return true;
+  }
+  const currentIndex = connected.indexOf(state.selectedEdge);
+  const next = state.trunkFocusNode === id && currentIndex >= 0
+    ? connected[state.multiSelection?.trunk ? 0 : currentIndex + 1] : null;
+  selectEdge(next || connected[0], { ...options, trunkGroup: next ? null : connected });
+  return true;
 }
 
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
@@ -317,6 +345,7 @@ els.cv.addEventListener('contextmenu', (e) => {
 
   const n = hitTest(e);
   if (n) {
+    clearTrunk();
     selectNode(n.id);
     if (n.kind === 'var') {
       // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
@@ -329,8 +358,8 @@ els.cv.addEventListener('contextmenu', (e) => {
     return;
   }
 
-  if (pickEdgeAt(e, (edge) => {
-    selectEdge(edge);
+  if (pickEdgeAt(e, (edge, selection) => {
+    selectEdge(edge, selection);
     showMenu(e.clientX, e.clientY, t('menu.edge'), state.view?.comparison ? [{ value: 'auto', label: 'status.auto' }, ...EDGE_ITEMS] : EDGE_ITEMS, state.view?.comparison && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
@@ -367,8 +396,7 @@ els.cv.addEventListener('contextmenu', (e) => {
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
-  const prevMulti = state.multiSelection;
-  if (state.multiSelection) { state.multiSelection = null; draw(); }
+  if (state.multiSelection && !state.multiSelection.trunk) { state.multiSelection = null; draw(); }
   hideMenu();
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
@@ -376,6 +404,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
     const node = hitTest(e);
     if (node) {
+      clearTrunk();
       e.preventDefault(); document.activeElement?.blur(); void pickPairFlow(node.id);
       els.tooltip.style.opacity = '0';
       renderDetail(null); renderLabelPanel(); return;
@@ -385,6 +414,8 @@ els.cv.addEventListener('pointerdown', (e) => {
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
   if (lb && !comparing) {
+    clearTrunk();
+    state.multiSelection = null;
     state.moveTarget = null;
     state.hoverRelation = null;
     const anchor = labelAnchor(lb.edge);
@@ -423,9 +454,14 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
+  const n = hitTest(e);
+  if (n && !e.shiftKey && pickTrunkEndpoint(n.id)) return;
+
   // 只允许拖动已双击选中的层级；单击只切换右侧范围。
   const title = hitTitle(e);
   if (title) {
+    clearTrunk();
+    state.multiSelection = null;
     if (moveReady(title.kind, title.box)) {
       pushHistory();
       state.dragBox = beginHierarchyMove(state.view, title);
@@ -449,8 +485,6 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  const n = hitTest(e);
-
   if (n && e.shiftKey && !comparing) {
     state.moveTarget = null;
     state.linkFrom = n;
@@ -461,6 +495,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   if (n) {
+    clearTrunk();
     if (!moveReady('node', n)) { selectNode(n.id); return; }
     state.dragNode = n;
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
@@ -473,9 +508,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  if (pickEdgeAt(e, selectEdge, false, prevMulti)) return;
-  state.trunkHits = null;
-  state.prevTrunkHits = null;
+  if (pickEdgeAt(e, selectEdge)) return;
   const editing = state.moveTarget;
   state.moveTarget = null;
   state.panning = true;
@@ -605,19 +638,22 @@ function handlePointerMove(e) {
 
   if (n || title || hoveredEdge) {
     const rect = els.cv.getBoundingClientRect();
+    const trunkEndpoint = n && activeTrunk()?.some((edge) => edge.from === n.id || edge.to === n.id);
+    const nodeAction = trunkEndpoint ? '点击切换此节点的共线分支'
+      : moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动';
     els.tooltip.style.opacity = '1';
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
-      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${nodeAction}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
-      : hits.length > 1 ? `<b>共线干线（${hits.length} 条分支）</b><br>点击在画布高亮全部走向 · 连续点击逐条切换`
+      : hits.length > 1 ? `<b>共线干线 (${hits.length} 条分支)</b><br>点击高亮全部走向 · 再点击共线两端的任意函数框可直接切换对应分支`
       : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
     if (n || hits.length === 1) {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
     }
-    if (n) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 追踪连线路径</span>';
+    if (n && !trunkEndpoint) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 追踪连线路径</span>';
   } else {
     els.tooltip.style.opacity = '0';
   }
@@ -730,6 +766,7 @@ els.cv.addEventListener('pointerup', (e) => {
     finishPan();
     if (!panMoved) {
       if (!pickEdgeAt(e, selectEdge)) {
+        clearTrunk();
         state.selectedEdge = null;
         state.selectedLabel = null;
         selectNode(null); // 内部会收起节点详情并刷新标签面板
@@ -805,11 +842,12 @@ document.addEventListener('keydown', (e) => {
     draw();
   } else if (e.key === 'Escape' && state.pairFlow && !document.querySelector('.modal.show')) {
     e.preventDefault(); e.stopImmediatePropagation(); clearPairFlow();
-  } else if (state.multiSelection && !document.querySelector('.modal.show')) {
+  } else if ((state.multiSelection || activeTrunk()) && !document.querySelector('.modal.show')) {
     if (e.key === 'Escape') {
       e.preventDefault();
+      clearTrunk();
       selectNode(null);
-    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+    } else if (state.multiSelection && (e.key === 'Delete' || e.key === 'Backspace')) {
       // 全选只用于查看；避免旧的单选删除逻辑误删其中一个组件。
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -821,6 +859,7 @@ els.cv.addEventListener('dblclick', (e) => {
   if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }
   const n = hitTest(e);
   if (n) {
+    if (activeTrunk()?.some((edge) => edge.from === n.id || edge.to === n.id)) return;
     selectNode(n.id);
     state.moveTarget = { kind: 'node', item: n, view: state.view };
     els.cv.style.cursor = 'move';
@@ -836,8 +875,8 @@ els.cv.addEventListener('dblclick', (e) => {
     return;
   }
   hideMenu();
-  pickEdgeAt(e, (edge) => {
-    selectEdge(edge);
+  pickEdgeAt(e, (edge, selection) => {
+    selectEdge(edge, selection);
     if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };
     draw();
   }, true);

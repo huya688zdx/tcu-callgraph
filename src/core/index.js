@@ -17,6 +17,15 @@ import { callNestingTokens, hasNestedCall } from './detect-tasks.js';
 
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
+const isTestFile = (file) => /(^|\/)(tests?|unit|stubs?|mocks?)(\/|_|-)/i.test(file);
+const isHostSimFile = (file) => /(^|\/)(host|sim|simulator|pc|posix|win32)(\/|_|-)/i.test(file);
+
+function sharedDirectoryDepth(directory, file) {
+  const parts = file.split('/');
+  let depth = 0;
+  while (depth < directory.length && depth < parts.length - 1 && directory[depth] === parts[depth]) depth++;
+  return depth;
+}
 
 /**
  * 源码解码：先按 UTF-8 严格解码，失败则回退 CP932(Shift-JIS)。
@@ -412,15 +421,36 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
     byId.set(v.id, v);
   }
 
+  const callCounts = new Map(functionRecords.filter(({ fn }) => byName.get(fn.name).length > 1)
+    .map(({ fn, calls }) => [fn.id, calls.length]));
   const resolveCallee = (name, fromFile) => {
     const all = byName.get(name);
-    if (!all || !all.length) return `ext::${name}`;
-    const local = all.filter((f) => f.file === fromFile);
-    if (local.length === 1) return local[0].id;
-    if (local.length > 1) return `ext::${name}`;
-    const nonStatic = all.filter((f) => !f.isStatic);
-    if (nonStatic.length === 1) return nonStatic[0].id;
-    return `ext::${name}`;
+    if (!all) return `ext::${name}`;
+    const local = all.find((f) => f.file === fromFile);
+    if (local) return local.id;
+    // 头文件中的 static 定义可被包含进调用方，其他源文件的 static 定义不可见。
+    let candidates = all.filter((f) => !f.isStatic || HDR_EXT.test(f.file));
+    if (!candidates.length) return `ext::${name}`;
+    if (candidates.length === 1) return candidates[0].id;
+
+    const prefer = (predicate) => {
+      const preferred = candidates.filter(predicate);
+      if (preferred.length) candidates = preferred;
+    };
+    if (isTestFile(fromFile)) {
+      const directory = path.posix.dirname(fromFile);
+      const siblings = candidates.filter((f) => path.posix.dirname(f.file) === directory);
+      if (siblings.length) candidates = siblings;
+      else prefer((f) => isTestFile(f.file));
+    } else {
+      prefer((f) => !isTestFile(f.file));
+      if (candidates.length > 1 && !isHostSimFile(fromFile)) prefer((f) => !isHostSimFile(f.file));
+    }
+
+    const directory = fromFile.split('/').slice(0, -1);
+    return [...candidates].sort((a, b) => sharedDirectoryDepth(directory, b.file) - sharedDirectoryDepth(directory, a.file) ||
+      callCounts.get(b.id) - callCounts.get(a.id) || (b.bodyEnd - b.bodyStart) - (a.bodyEnd - a.bodyStart) ||
+      (a.file < b.file ? -1 : a.file > b.file ? 1 : 0))[0].id;
   };
 
   const edges = [];
@@ -740,11 +770,14 @@ export function tarjan(model) {
 }
 
 /**
- * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
+ * 取子图：以 rootId 为中心，向下 down 层、向上 up 层。默认隐藏外部符号。
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true, allowedIds = null } = {}) {
+export function subgraph(model, rootId, {
+  up = 0, down = 2, maxNodes = 400, includeVariables = true, includeExternals = false, allowedIds = null,
+} = {}) {
   let { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
+  const showExternals = includeExternals || rootId.startsWith('ext::');
 
   // 仅选中头文件宏时加入定义映射，普通函数调用深度保持原来的语义。
   const header = byId.get(rootId);
@@ -808,6 +841,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
           // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
           if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
+          if (!showExternals && other.startsWith('ext::')) continue;
           if (!byId.has(other)) continue;
           if (allowedIds && !allowedIds.has(other)) continue;
           if (!nodes.has(other) && nodes.size >= maxNodes) {

@@ -14,6 +14,31 @@ const btn = document.getElementById('projectBtn');
 const listEl = document.getElementById('projectList');
 const pathInput = document.getElementById('projectPath');
 const openBtn = document.getElementById('projectOpen');
+const projectError = document.getElementById('projectError') || (listEl && document.createElement('div'));
+if (projectError && !projectError.id) {
+  projectError.id = 'projectError';
+  projectError.setAttribute('role', 'status');
+  projectError.style.margin = '0 12px 8px';
+  projectError.hidden = true;
+  listEl.after(projectError);
+}
+let switching = false;
+const lockedControls = new Set();
+
+function lockProjectControls() {
+  document.querySelectorAll('#projectNormalPane button, #projectNormalPane input, #projectModeCompare').forEach((control) => {
+    if (control.disabled) return;
+    control.disabled = true;
+    lockedControls.add(control);
+  });
+}
+
+function projectMessage(message, error = false) {
+  if (!projectError) return;
+  projectError.className = error ? 'df-error' : 'detail-meta';
+  projectError.textContent = message;
+  projectError.hidden = !message;
+}
 
 const fmtTime = (ts) => {
   if (!ts) return '';
@@ -53,34 +78,40 @@ export async function syncProjectLabel() {
 }
 
 async function switchTo(body) {
-  if (listEl) listEl.innerHTML = `<div class="empty">${t('project.switching')}</div>`;
-  let r;
+  if (switching) return;
+  switching = true;
+  listEl?.setAttribute('aria-busy', 'true');
+  lockProjectControls();
+  projectMessage(t('project.switching'));
   try {
-    r = await api.switchProject(body);
-  } catch (err) {
-    r = { ok: false, error: String(err.message || err) };
+    const result = await api.switchProject(body);
+    if (!result?.ok) throw new Error(result?.error || '未知错误');
+    await hooks.reloadAll();
+    await syncProjectLabel();
+    projectMessage('');
+    if (document.getElementById('projectModal')?.classList.contains('show')) closeModal();
+  } catch (error) {
+    projectMessage(`${t('project.failed')}：${error.message || error}`, true);
+  } finally {
+    switching = false;
+    listEl?.removeAttribute('aria-busy');
+    for (const control of lockedControls) control.disabled = false;
+    lockedControls.clear();
   }
-  if (!r || !r.ok) {
-    if (listEl) {
-      listEl.innerHTML = `<div class="empty">${t('project.failed')}：${esc(r?.error || '未知错误')}</div>`;
-    }
-    return;
-  }
-  closeModal();
-  await hooks.reloadAll();
-  await syncProjectLabel();
 }
 
 async function render() {
   if (!listEl) return;
-  listEl.innerHTML = `<div class="empty">${t('project.empty')}</div>`;
   let rows = [];
   try {
     rows = await api.projects();
   } catch {
     return;
   }
-  if (!rows.length) return;
+  if (!rows.length) {
+    listEl.innerHTML = `<div class="empty">${t('project.empty')}</div>`;
+    return;
+  }
   listEl.innerHTML = rows
     .map(
       (p) => `
@@ -104,6 +135,7 @@ async function render() {
   listEl.querySelectorAll('.proj').forEach((row) => {
     const project = rows.find((p) => p.id === Number(row.dataset.id));
     row.addEventListener('click', async (event) => {
+      if (switching) return;
       const button = event.target.closest('button');
       if (!button) {
         if (!event.target.closest('input') && !row.querySelector('.proj-rename')) switchTo({ id: project.id });
@@ -120,7 +152,7 @@ async function render() {
             message: `确定将工程“${project.name}”移出最近列表吗？\n${project.path}\n源码和存档都会保留，重新打开原路径即可恢复。`,
             danger: true,
           });
-          if (!ok) return;
+          if (!ok || switching) return;
           button.disabled = true;
           const result = await api.removeProject(project.id);
           if (!result.ok) throw new Error(result.error);
@@ -130,6 +162,7 @@ async function render() {
       } catch (error) { hint(error.message); button.disabled = false; }
     });
   });
+  if (switching) lockProjectControls();
 }
 
 /** 在列表内编辑，避免 Electron 不支持浏览器 prompt，也避免误触工程切换。 */
@@ -206,6 +239,7 @@ async function renderOrphans() {
     </div>`;
 
   document.getElementById('orphanClean')?.addEventListener('click', async (e) => {
+    if (switching) return;
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.textContent = t('project.switching');
@@ -219,6 +253,7 @@ async function renderOrphans() {
       btn.textContent = t('orphan.failed');
     }
   });
+  if (switching) lockProjectControls();
 }
 
 function open() {

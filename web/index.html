@@ -191,18 +191,38 @@
   .edge-item:last-child { border: 0; }
   .edge-item b { font-weight: 500; }
   .search-summary, .call-relation { display: flex; align-items: center; gap: 6px; }
+  .search-summary > .fn, .call-relation > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .add-function { flex: 0 0 auto; margin-left: auto; height: 24px; padding: 0 7px; color: #185FA5; font-size: 11.5px; }
   .add-function[hidden] { display: none; }
   .settings-note { margin: 8px 0; color: #888780; font-size: 12px; line-height: 1.6; }
-  #addFunctionsModal { width: 620px; }
+  #addFunctionsModal { width: min(680px, calc(100vw - 24px)); }
+  #expandModal, #projectModal { max-width: calc(100vw - 24px); }
+  .scope-controls { display: grid; gap: 8px; border: 0; padding: 0; margin: 0; min-width: 0; }
+  .scope-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .scope-label { flex: 0 0 56px; color: #5F5E5A; font-size: 12px; }
+  .scope-row button { min-height: 30px; padding: 3px 10px; border-radius: 16px; font-size: 12px; }
+  .scope-row button[aria-pressed="true"] { border-color: #185FA5; color: #0C447C; background: #E6F1FB; font-weight: 600; }
+  .scope-target { margin: 0 0 10px; overflow-wrap: anywhere; }
+  .pick-all { display: flex; align-items: center; gap: 5px; font-size: 12px; }
   .function-pick { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid #EEEDE8; cursor: pointer; }
   .function-pick-info { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
   .function-pick small { color: #5F5E5A; }
   .function-pick-chips { display: flex; flex-wrap: wrap; gap: 2px; }
   .function-pick-group { margin-top: 12px; border: 1px solid #E6E9EC; border-radius: 8px; padding: 0 10px; }
-  .function-pick-group h3 { margin: 0 -10px; padding: 8px 10px; border-radius: 8px 8px 0 0; background: #F0F5FA; color: #124B71; font-size: 13px; }
-  .function-pick-context { padding: 6px 0; overflow-wrap: anywhere; }
+  .function-pick-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 -10px; padding: 7px 10px; border-radius: 8px 8px 0 0; background: #F0F5FA; }
+  .function-pick-heading h3 { margin: 0; color: #124B71; font-size: 13px; overflow-wrap: anywhere; }
+  .function-pick-heading button { flex: none; min-height: 26px; padding: 0 8px; font-size: 12px; }
+  .function-pick-group.up .function-pick-heading { background: #FBF2E5; }
+  .function-pick-group.up h3, .chip.caller-chip { color: #854707; }
+  .chip.caller-chip { background: #FBF2E5; }
+  .chip.callee-chip { background: #E6F1FB; color: #0C447C; }
+  .function-pick-target { margin-top: 12px; padding: 0 10px; border: 1px solid #B8D6EF; border-radius: 8px; background: #F0F7FD; }
+  .function-pick-target .function-pick { border: 0; }
+  .function-pick-context { padding: 8px 0 3px; overflow-wrap: anywhere; }
   .function-pick-group .function-pick:last-child { border-bottom: 0; }
+  .call-group-heading { margin: 8px 0 4px; font-size: 12px; font-weight: 600; }
+  .call-group-heading.in { color: #854707; }
+  .call-group-heading.out { color: #0C447C; }
   .chip.cross-period { color: #8A370C; background: #FCE9D9; font-weight: 600; }
   #addFunctionsMessage { flex: 1; align-self: center; color: #5F5E5A; font-size: 12px; }
   .empty { color: #B4B2A9; font-size: 12px; padding: 3px 0; }
@@ -213,15 +233,27 @@
     font-size: 12px; color: #5F5E5A; margin-bottom: 8px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .lbl-presets { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
-  .lbl-preset {
-    display: flex; align-items: center; gap: 8px; height: auto;
-    padding: 6px 8px; text-align: left; border-radius: 8px;
-    border: 1px solid rgba(0,0,0,.12); background: #fff;
+  .trunk-nav {
+    margin-bottom: 8px; padding: 8px; border: 1px solid #CDDDED;
+    border-radius: 8px; background: #F7FAFD;
   }
-  .lbl-preset:hover { background: #F7F6F2; }
-  .lbl-preset.on { border-color: #185FA5; background: #E6F1FB; }
-  .lbl-preset em { font-style: normal; margin-left: auto; color: #888780; font-size: 11px; }
+  .trunk-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 5px; }
+  .trunk-header strong { color: #173F64; font-size: 12px; }
+  .trunk-all { height: 25px; padding: 0 7px; font-size: 11px; }
+  .trunk-hint { margin: 6px 0; color: #536578; font-size: 11px; line-height: 1.5; }
+  .trunk-list { display: grid; gap: 3px; max-height: 220px; overflow-y: auto; overscroll-behavior: contain; }
+  .trunk-branch-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+    align-items: center; gap: 5px; min-width: 0; min-height: 28px; height: auto;
+    padding: 4px 5px; text-align: left; color: #263E55; background: #fff;
+    border: 1px solid #E0E7EF; border-radius: 5px; font-size: 11.5px;
+  }
+  .trunk-from, .trunk-to { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trunk-arrow, .trunk-line { color: #536578; }
+  .trunk-line { font-size: 10px; }
+  .trunk-branch-row:hover, .trunk-all:hover { background: #EDF5FC; }
+  .trunk-branch-row.on, .trunk-all.on { color: #134D80; border-color: #6A9DD0; background: #E6F1FB; }
+  .trunk-nav button:focus-visible { outline: 2px solid #185FA5; outline-offset: -2px; }
   .lbl-demo {
     font-family: inherit; font-size: 12px; font-weight: 600; line-height: 1.5;
     padding: 1px 7px; border-radius: 4px; white-space: nowrap;
@@ -240,31 +272,46 @@
   .lbl-actions button { flex: 1; }
   .lbl-note { color: #888780; font-size: 11px; line-height: 1.55; margin-top: 8px; }
 
-  /* 多标签列表：一行一条，点击选中（画布上同一条出虚线框） */
-  .lbl-rows { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  #labelPanel h4 { margin: 0; font-size: 12px; color: #333B43; }
+  .lbl-rows { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+  .lbl-rows > .lbl-note { margin-top: 0; }
   .lbl-row {
-    display: flex; align-items: center; gap: 7px; padding: 4px 6px;
-    border: 1px solid transparent; border-radius: 7px; cursor: pointer;
+    display: flex; align-items: center; gap: 3px; padding-right: 4px;
+    border: 1px solid #E4E5DF; border-radius: 7px;
   }
   .lbl-row:hover { background: #F7F6F2; }
   .lbl-row.on { border-color: #185FA5; background: #E6F1FB; }
+  .lbl-row-summary {
+    display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; min-height: 30px; height: auto;
+    padding: 4px 6px; color: inherit; background: transparent; border: 0; text-align: left;
+  }
+  button.lbl-row-summary:hover { background: transparent; }
+  .lbl-row-summary .lbl-demo { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .lbl-state { flex: 0 0 auto; padding: 1px 5px; border-radius: 4px; background: #F0F0EB; color: #565B56; font-size: 10px; }
+  .lbl-state.auto { background: #E3EFFB; color: #1D5687; }
   .lbl-row-txt { flex: 1; min-width: 0; font-size: 11.5px; color: #5F5E5A;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lbl-row-del { border: 0; background: none; color: #B4B2A9; cursor: pointer;
     font-size: 12px; padding: 2px 4px; border-radius: 4px; }
   .lbl-row-del:hover { color: #C0392B; background: #FAECE7; }
+  .lbl-batch { align-self: flex-start; height: auto; padding: 4px 7px; color: #185FA5; font-size: 11px; }
 
-  .lbl-editor { border-top: 1px solid #E8E7E1; padding-top: 8px; margin-top: 2px; }
-  .lbl-segs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .lbl-editor { padding: 8px; margin-bottom: 10px; border: 1px solid #DAE2E9; border-radius: 7px; background: #F7F9FB; }
+  .lbl-editor h4 { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
+  .lbl-editor h4 span { color: #185FA5; font-size: 11px; }
+  .lbl-editor .field { margin-top: 7px; }
+  .lbl-segs { display: flex; gap: 4px; }
   .lbl-seg {
     flex: 1; padding: 4px 6px; font-size: 11.5px; cursor: pointer;
     border: 1px solid rgba(0,0,0,.16); border-radius: 6px; background: #fff;
   }
   .lbl-seg.on { border-color: #185FA5; background: #E6F1FB; }
+  .lbl-style-more { margin-top: 8px; padding-top: 6px; border-top: 1px solid #DCE4EA; }
+  .lbl-style-more summary { cursor: pointer; font-size: 11.5px; color: #536578; }
 
-  .lbl-adds { display: flex; gap: 5px; margin-top: 8px; }
+  .lbl-adds { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
   .lbl-add {
-    flex: 1; padding: 5px 6px; font-size: 11.5px; cursor: pointer;
+    flex: 1 0 auto; padding: 5px 6px; font-size: 11.5px; cursor: pointer;
     border: 1px dashed rgba(0,0,0,.25); border-radius: 7px; background: none;
   }
   .lbl-add:hover, .lbl-add.on { border-color: #185FA5; border-style: solid; background: #E6F1FB; }
@@ -274,8 +321,9 @@
     min-width: 30px; padding: 4px 6px; font-size: 12px; cursor: pointer;
     border: 1px solid rgba(0,0,0,.16); border-radius: 6px; background: #fff;
   }
-  .lbl-num:hover { border-color: #185FA5; background: #E6F1FB; }
-  .lbl-mode { margin-top: 10px; border-top: 1px solid #E8E7E1; padding-top: 8px; }
+  .lbl-num:hover, .lbl-num.on { border-color: #185FA5; background: #E6F1FB; }
+  .lbl-mode { margin-top: 7px; }
+  .lbl-mode-title { margin-bottom: 4px; color: #536578; font-size: 11.5px; }
   .dt-list { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; max-height: 180px; overflow: auto; }
   .dt-item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; cursor: pointer; }
   .dt-ev { color: #888780; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -312,60 +360,81 @@
   }
   .tn.dir .nm { color: #444740; font-weight: 600; }
   .tn.file .nm { color: #444740; font-weight: 500; }
+  .tn.file:not([aria-expanded]) { cursor: default; }
+  .tree-fn-count {
+    flex: none; min-width: 19px; padding: 0 4px; border-radius: 5px;
+    background: #F0F0EB; color: #64645E; font-size: 10px; text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .tree-empty-toggle {
+    height: auto; margin: 8px 0 0; padding: 4px 6px; border: 0;
+    background: transparent; color: #185FA5; font-size: 11px; text-align: left;
+  }
+  .tree-empty-toggle:hover { text-decoration: underline; }
   .tn:hover { background: #F1EFE8; }
   .tn.hl { background: #FDF0C8; box-shadow: inset 0 0 0 1px #EFC35A; border-radius: 4px; }
-  #vars { max-height: 260px; overflow-y: auto; overflow-x: hidden; margin: -2px -2px 0; padding: 0 2px; }
-  .vars-bar { display: flex; align-items: center; gap: 6px; margin: 0 0 4px; }
+  #vars { position: relative; margin: 0 -2px; padding: 0 2px; }
+  .vars-bar { display: grid; gap: 6px; padding: 2px 0 7px; }
+  .vars-search { display: flex; align-items: center; gap: 6px; }
   .vars-bar input {
-    flex: 1 1 auto; min-width: 0; height: 22px; padding: 0 6px;
-    border: 1px solid #E4E1D8; border-radius: 5px; background: #FBFAF6;
+    flex: 1; min-width: 0; height: 27px; padding: 0 8px;
+    border: 1px solid #E4E1D8; border-radius: 6px; background: #FBFAF6;
     font: inherit; font-size: 11.5px; color: #2C2C2A;
   }
-  .vars-bar input:focus { outline: none; border-color: #B5D4F4; background: #fff; }
-  .vars-cnt { flex: 0 0 auto; color: #B4B2A9; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .vars-bar input:focus { border-color: #185FA5; background: #fff; }
+  .vars-cnt { flex: none; color: #64645E; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+  .vars-modes { display: flex; flex-wrap: wrap; gap: 4px; }
+  .vars-modes button {
+    height: 23px; padding: 0 7px; border: 1px solid #E4E1D8; border-radius: 999px;
+    background: #F7F6F2; color: #50504B; font-size: 10.5px; font-variant-numeric: tabular-nums;
+  }
+  .vars-modes button:hover { background: #F1EFE8; }
+  .vars-modes button[aria-pressed="true"] { background: #E6F1FB; border-color: #B5D4F4; color: #185FA5; }
+  .vars-list { max-height: 260px; overflow-y: auto; overflow-x: hidden; }
   .var-row {
-    display: grid;
-    grid-template-columns: 13px minmax(0, 1.15fr) auto minmax(0, 1fr) 38px;
-    align-items: center;
-    column-gap: 5px;
-    padding: 1px 2px;
-    font-size: 11.5px;
-    border-radius: 4px;
-    cursor: pointer;
-    line-height: 17px;
+    display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; margin: 3px 0; padding: 7px 8px;
+    border: 1px solid #EEEDE8; border-radius: 6px; background: #fff; cursor: pointer;
   }
-  .var-row:hover { background: #F5F3EC; }
-  .var-row input { margin: 0; width: 12px; height: 12px; cursor: pointer; }
+  .var-row:hover { background: #F7F6F2; }
+  .var-row:has(input:checked) { border-color: #B5D4F4; background: #F4F8FC; }
+  .var-row:has(input:focus-visible) { outline: 2px solid #185FA5; outline-offset: -2px; }
+  .var-name { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+  .var-row input { flex: none; width: 13px; height: 13px; margin: 2px 0 0; accent-color: #185FA5; cursor: pointer; }
   .var-row .vn {
-    grid-column: 2;
-    color: #2C2C2A; font-weight: 500;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    flex: 1; min-width: 0; word-break: break-all; color: #2C2C2A;
+    font: 600 12px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
   }
-  /* 各栏显式定位：没有 const 标签的行也不能左移，否则写/读计数会跟着错位 */
+  .var-meta { display: flex; align-items: center; gap: 3px 5px; flex-wrap: wrap; min-width: 0; padding-left: 19px; }
+  .var-row .vt { min-width: 0; overflow-wrap: anywhere; color: #64645E; font-size: 10.5px; }
+  .var-row .vg, .var-row .vc { padding: 1px 5px; border-radius: 4px; white-space: nowrap; font-size: 10px; line-height: 1.35; }
   .var-row .vg {
-    grid-column: 3;
-    padding: 0 4px; border-radius: 3px; background: #FDF0C8; border: 1px solid #F0D894; color: #8A6D1A;
-    font-size: 9px; line-height: 14px; letter-spacing: .02em;
+    background: #FDF0C8; color: #6D4E0B;
   }
-  .var-row .vt { grid-column: 4; color: #B4B2A9; font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .var-row .vc { grid-column: 5; color: #888780; font-size: 10.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .var-row .vg.static { background: #F0F0EB; color: #50504B; }
+  .var-row .vg.in-canvas { background: #E2F2DF; color: #235326; }
+  .var-row .vc { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .var-row .vc.rw { background: #E6F1FB; color: #185FA5; font-weight: 600; }
+  .var-row .vc.ro { background: #F0F0EB; color: #50504B; }
   .var-file {
     position: sticky; top: 0; z-index: 1;
     display: flex; align-items: center; gap: 4px;
-    overflow: hidden;
-    margin: 3px 0 1px; padding: 2px 2px;
-    background: #fff; color: #888780; font-size: 10.5px;
+    width: 100%; height: auto; overflow: hidden;
+    margin: 0; padding: 5px 4px; border: 0; border-bottom: 1px solid #EEEDE8; border-radius: 0;
+    background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+    color: #64645E; font-size: 10.5px; text-align: left;
     cursor: pointer; user-select: none;
   }
-  .var-file:hover { color: #2C2C2A; }
+  .var-file:hover { background: #fff; color: #2C2C2A; }
+  .var-file:focus-visible { outline: 2px solid #185FA5; outline-offset: -2px; }
   .var-file .tw { width: 9px; font-size: 7px; color: #A8A69C; line-height: 1; }
-  .var-file .cnt { margin-left: auto; color: #C9C6BC; font-size: 10px; flex: 0 0 auto; }
+  .var-file .cnt { margin-left: auto; color: #64645E; font-size: 10px; flex: none; }
   .var-file .fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tn .tw { width: 10px; flex: 0 0 10px; color: #999D94; font-size: 9px; text-align: center; }
   .tn .nm { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; }
   .tn.fn .nm { color: #6F736A; font-size: 11.5px; font-weight: 400; }
   .tn.fn.shown .nm { color: #185FA5; }
-  .tn.fn .add-function { height: 21px; padding: 0 5px; border-radius: 5px; border-color: #E5E7E1; background: transparent; color: #697C8E; font-size: 10.5px; }
+  .tn.fn .add-function { display: none; height: 20px; padding: 0 5px; border-radius: 5px; border-color: #E5E7E1; background: #fff; color: #697C8E; font-size: 10.5px; }
+  .tn.fn:hover .add-function, .tn.fn:focus-within .add-function, .tn.fn .add-function[aria-expanded="true"] { display: inline-flex; align-items: center; }
   .tn.fn .add-function:hover, .tn.fn .add-function[aria-expanded="true"] { background: #E6F1FB; border-color: #B5D4F4; color: #185FA5; }
   .results-list { list-style: none; margin: 0 0 6px; padding: 0; }
   .results-list:empty { display: none; }
@@ -465,6 +534,7 @@
   #expandForm input:focus { outline: none; border-color: #185FA5; }
   #expandForm input { width: 64px; text-align: center; }
   #expandForm p { margin: 0; color: #888780; font-size: 12px; line-height: 1.6; }
+  #expandForm .scope-row label { font-size: 12px; gap: 6px; }
   #expandMessage { font-size: 12px; color: #A32D2D; margin-right: auto; align-self: center; }
   .call-order-row { display: grid; grid-template-columns: 18px 90px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px dashed #E8E7E1; cursor: pointer; }
   .call-order-row input { margin: 0; }
@@ -494,9 +564,37 @@
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
   .compare-pick-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
-  .compare-pick-row { display:flex; align-items:flex-start; gap:10px; padding:10px 4px; border-bottom:1px solid #eee; cursor:pointer; }
-  .compare-pick-row small { display:block; color:#777; margin-top:3px; overflow-wrap:anywhere; }
+  .compare-focus { padding:10px 12px; background:#F5F7FA; border-radius:8px; }
+  .compare-focus h3 { margin:0 0 6px; font-size:13px; }
+  .compare-points { display:flex; flex-wrap:wrap; gap:6px; max-height:94px; overflow:auto; }
+  .compare-point { height:auto; min-height:28px; max-width:100%; padding:4px 8px; text-align:left; white-space:normal; overflow-wrap:anywhere; }
+  .compare-point span { color:#365572; }
+  .compare-point small { margin-left:3px; color:#555; }
+  .compare-point[aria-pressed="true"] { background:#E3EFFB; border-color:#185FA5; color:#124B71; }
+  .compare-pick-row { display:flex; align-items:flex-start; gap:10px; padding:8px; border-bottom:1px solid #E9E8E2; }
+  .compare-pick-row.focused { background:#F4F8FC; border-left:2px solid #7DAAD3; }
+  .compare-pick-row label { display:flex; align-items:flex-start; gap:10px; flex:1; min-width:0; cursor:pointer; }
+  .compare-pick-row input { flex:none; margin:3px 0 0; }
+  .compare-pick-row select { flex:none; max-width:38%; }
+  .compare-row-heading { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .compare-row-copy { min-width:0; overflow-wrap:anywhere; }
+  .compare-row-kind, .compare-row-source { color:#64645E; }
+  .compare-row-kind { font-size:11px; }
+  .compare-row-copy small { display:block; margin-top:3px; }
+  .compare-row-reason { color:#303B46; }
+  .compare-badge { padding:1px 6px; border-radius:4px; font-size:11px; font-weight:600; }
+  .compare-badge.direct { background:#FEF0CA; color:#6D4300; }
+  .compare-badge.added { background:#E2F2DF; color:#235326; }
+  .compare-badge.deleted { background:#FBE3E4; color:#88292C; }
+  .compare-badge.impact { background:#EFE6FA; color:#58348A; }
+  .compare-badge.period { background:#DEEFFA; color:#124B71; }
+  .compare-badge.context { background:#F0F0EB; color:#50504B; }
+  #compareSelectModal { max-height:84vh; }
+  #compareSelectModal .modal-body { display:flex; flex-direction:column; min-height:0; }
+  #compareSelectModal .modal-body > :not(#comparePickList) { flex-shrink:0; }
   #compareSelectModal .modal-foot { display:flex; gap:10px; flex-wrap:wrap; }
+  #comparePickList { min-height:80px; max-height:42vh; overflow:auto; }
+  #comparePickRetainWarning:empty { display:none; }
   #comparePickCount { flex:1; font-size:12px; }
   /* 样式设置：两列紧凑网格；点色样弹应用内调色板（预设网格 + 自定义入口），不直接弹系统调色盘 */
   #styleModal { width: 520px; }
@@ -585,33 +683,46 @@
   }
   .project-modes { display: flex; gap: 6px; padding: 10px 12px 0; }
   .project-modes button[aria-pressed="true"] { background: #185FA5; border-color: #185FA5; color: #fff; }
-  .compare-panel { display: grid; gap: 10px; padding: 14px 12px; }
+  #projectModal:has(#projectComparePane:not([hidden])) { width: 660px; }
+  .compare-panel { display: grid; gap: 10px; padding: 14px 12px; overflow: auto; }
   .compare-panel[hidden], #sessionTools[hidden] { display: none; }
   #compareEmpty { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); color: #888780; text-align: center; pointer-events: none; }
-  .compare-row { display: grid; grid-template-columns: 100px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
-  .compare-row label { font-size: 12px; color: #5F5E5A; }
+  .compare-guide { display: grid; gap: 8px; padding: 10px 12px; margin: 0 0 3px; border: 1px solid #DFEAF4; border-radius: 8px; background: #F4F8FC; list-style: none; }
+  .compare-guide b { font-size: 12px; color: #124B71; }
+  .compare-guide p { margin: 2px 0 0; color: #5F5E5A; font-size: 12px; line-height: 1.5; }
+  .compare-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 8px; }
+  .compare-row label { grid-column: 1 / -1; font-size: 12px; font-weight: 600; color: #5F5E5A; }
   .compare-row input { min-width: 0; height: 30px; padding: 0 9px; font: inherit; font-size: 12px; border: 1px solid rgba(0,0,0,.16); border-radius: 7px; }
+  .compare-row input[readonly] { grid-column: 1 / -1; background: #F5F6F7; }
+  .compare-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
   .compare-error { color: #A32D2D; font-size: 12px; white-space: pre-wrap; }
   #compareSummary { font-size: 12px; color: #5F5E5A; padding: 0 8px; }
 
+  #timelineModal, #bookmarkModal { width: min(640px, calc(100% - 24px)); }
   .ev {
-    display: flex; gap: 9px; padding: 7px 9px; border-radius: 8px; cursor: pointer;
+    display: flex; align-items: center; gap: 12px; padding: 9px 10px; margin-bottom: 4px;
+    border: 1px solid #EEEDE8; border-radius: 8px; cursor: pointer;
   }
+  .ev:focus-within,
   .ev:hover { background: #F5F4EF; }
   .ev.on { background: #E6F1FB; }
-  .ev .dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 6px; flex: 0 0 auto; background: #B4B2A9; }
-  .ev.k-annotate .dot { background: #378ADD; }
-  .ev.k-layout .dot { background: #97C459; }
-  .ev.k-delete .dot { background: #E24B4A; }
-  .ev.k-anchor .dot { background: #888780; }
-  .ev .txt { font-size: 12.5px; line-height: 1.5; }
-  .ev .sub { color: #888780; font-size: 11px; margin-top: 1px; }
-  /* AI 徽标：actor=ai 的事件（MCP 写入）与人工改动区分 */
-  .ev .ai-badge {
-    display: inline-block; font-size: 10px; line-height: 1; padding: 2px 5px;
-    border-radius: 4px; background: #F0E9FB; color: #7B5CD6; font-weight: 600;
-    vertical-align: 1px; margin-left: 4px;
+  .ev-content, .bm-content { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .ev-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 7px; }
+  .ev-title { font-size: 13px; font-weight: 650; }
+  .ev-kind, .ev-repeat, .ev .ai-badge {
+    padding: 2px 6px; border-radius: 5px; background: #F0F0EB; color: #50504B;
+    font-size: 10px; font-weight: 600; white-space: nowrap;
   }
+  .ev.k-edge .ev-kind, .ev.k-node .ev-kind { background: #E6F1FB; color: #185FA5; }
+  .ev.k-layout .ev-kind { background: #E2F2DF; color: #235326; }
+  .ev.k-delete .ev-kind { background: #FCEBEB; color: #A32D2D; }
+  .ev.k-bookmark .ev-kind { background: #FDF0C8; color: #6D4E0B; }
+  .ev.k-compose .ev-kind, .ev .ai-badge { background: #F0E9FB; color: #6145A3; }
+  .ev-detail { margin-top: 3px; font-size: 12px; line-height: 1.5; }
+  .ev .sub { margin-top: 3px; color: #65645E; font-size: 11px; font-variant-numeric: tabular-nums; }
+  .ev-review, .bm-actions button { height: 27px; padding: 0 8px; font-size: 11.5px; white-space: nowrap; }
+  .ev-review, .bm-open { flex: none; color: #185FA5; border-color: #B5D4F4; background: #F4F8FC; }
+  .ev-review:hover, .bm-open:hover { background: #E6F1FB; }
   .ev-day {
     font-size: 11px; color: #888780; padding: 10px 9px 4px; font-weight: 500;
   }
@@ -626,7 +737,7 @@
     border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none;
   }
   .tl-tools input:focus { border-color: #185FA5; }
-  .tl-chips { display: flex; gap: 4px; }
+  .tl-chips { display: flex; flex-wrap: wrap; gap: 4px; }
   .tl-chips button {
     height: 26px; padding: 0 9px; font-size: 11.5px; border-radius: 13px;
     border: 1px solid rgba(0, 0, 0, 0.14); background: #fff; color: #5F5E5A;
@@ -640,16 +751,28 @@
   .tl-more:hover { background: #F5F4EF; }
 
   /* 书签行 */
-  .bm { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 9px; cursor: pointer; }
-  .bm:hover { background: #F5F4EF; }
-  .bm .nm { font-size: 13px; font-weight: 500; word-break: break-all; }
-  .bm .meta { color: #888780; font-size: 11.5px; margin-top: 1px; }
-  .bm .del {
-    opacity: 0; border: 0; background: transparent; color: #A32D2D;
-    cursor: pointer; font-size: 15px; line-height: 1; padding: 3px 7px; border-radius: 6px;
+  .bm-summary {
+    margin: 10px 12px 0; padding: 8px 10px; border: 1px solid #DFEAF4;
+    border-radius: 8px; background: #F4F8FC; color: #124B71; font-size: 12px;
   }
-  .bm:hover .del { opacity: 1; }
-  .bm .del:hover { background: #FCEBEB; }
+  .bm {
+    display: flex; align-items: center; gap: 10px; padding: 9px 10px; margin-bottom: 5px;
+    border: 1px solid #EEEDE8; border-radius: 8px; cursor: pointer;
+  }
+  .bm:focus-within, .bm:hover { background: #F7F6F2; }
+  .bm .nm { font-size: 13px; font-weight: 650; }
+  .bm .meta { color: #65645E; font-size: 11.5px; line-height: 1.5; margin-top: 3px; }
+  .bm-actions { display: flex; flex: none; gap: 4px; }
+  .bm-delete { color: #A32D2D; }
+  .bm-delete:hover { background: #FCEBEB; }
+  .bm-feedback { padding: 0 12px 8px; font-size: 12px; color: #235326; }
+  .bm-feedback:empty { padding: 0; }
+  .bm-feedback.error { color: #A32D2D; }
+  @media (max-width: 460px) {
+    .bm { flex-wrap: wrap; }
+    .bm-content { flex-basis: 100%; }
+    .bm-actions { margin-left: auto; }
+  }
 
   /* 失效标注提示：贴在工程面板底部，有内容才出现 */
   .orphan-box { display: none; }
@@ -792,23 +915,30 @@
       </div>
     </div>
     <div id="projectComparePane" class="compare-panel" hidden>
+      <ol class="compare-guide">
+        <li><b data-i18n="compare.guide.base">① 基底全量工程（总代码目录）</b><p data-i18n="compare.guide.baseHint">自动使用当前工程，补齐未修改文件中的上游调用方、TASK 周期入口与共享变量读取者。</p></li>
+        <li><b data-i18n="compare.guide.paths">② 选择修改前和修改后目录（before / after）</b><p data-i18n="compare.guide.pathsHint">支持完整源码目录，也支持仅含改动 .c/.h 文件的局部目录。请保留文件在工程中的相对路径。</p></li>
+        <li><b data-i18n="compare.guide.result">③ 自动提取变更点与影响链</b><p data-i18n="compare.guide.resultHint">点击「开始比较」，识别代码增删改、LSB 与宏常量变化、TASK 周期变化及受影响链路。</p></li>
+      </ol>
       <div class="compare-row">
-        <label for="compareProjectPath" data-i18n="compare.project">总代码目录</label>
+        <label for="compareProjectPath" data-i18n="compare.project">① 基底总代码目录（当前工程）</label>
         <input id="compareProjectPath" type="text" readonly aria-readonly="true">
       </div>
-      <div class="detail-meta" data-i18n="compare.scopeHint">以当前工程为总代码目录；before/after 只放对照文件，并保留相同的相对路径。</div>
       <div class="compare-row">
-        <label for="compareBeforePath" data-i18n="compare.before">修改前 before</label>
-        <input id="compareBeforePath" type="text" data-i18n-ph="compare.pathPlaceholder">
+        <label for="compareBeforePath" data-i18n="compare.before">② 修改前目录 (before)</label>
+        <input id="compareBeforePath" type="text" data-i18n-ph="compare.beforePlaceholder" placeholder="选择修改前的源码目录（支持局部改动文件夹或完整目录）">
         <button type="button" data-compare-browse="before" data-i18n="compare.browse">浏览</button>
       </div>
       <div class="compare-row">
-        <label for="compareAfterPath" data-i18n="compare.after">修改后 after</label>
-        <input id="compareAfterPath" type="text" data-i18n-ph="compare.pathPlaceholder">
+        <label for="compareAfterPath" data-i18n="compare.after">③ 修改后目录 (after)</label>
+        <input id="compareAfterPath" type="text" data-i18n-ph="compare.afterPlaceholder" placeholder="选择修改后的源码目录（支持局部改动文件夹或完整目录）">
         <button type="button" data-compare-browse="after" data-i18n="compare.browse">浏览</button>
       </div>
       <div id="compareError" class="compare-error" role="alert"></div>
-      <div><button id="compareStart" class="primary" data-i18n="compare.start">开始比较</button></div>
+      <div class="compare-actions">
+        <button id="compareSwap" type="button" data-i18n="compare.swap">⇄ 交换前后目录</button>
+        <button id="compareStart" type="button" class="primary" data-i18n="compare.start">开始比较</button>
+      </div>
     </div>
     <div class="modal-foot session-foot" id="sessionTools">
       <button id="sessionExport" data-i18n="session.export">导出会话</button>
@@ -821,17 +951,24 @@
   <div id="compareSelectModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareSelectTitle" style="width:min(900px,94vw)">
     <div class="modal-head"><h2 id="compareSelectTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
     <div class="modal-body">
-      <p class="hint">解析已完成。勾选要加入的函数或变量，原图中的节点会保留；取消不会改变当前画面。</p>
       <p class="hint" id="comparePickRetainWarning" role="status"></p>
+      <section id="comparePickFocus" class="compare-focus" aria-labelledby="comparePickFocusTitle" hidden>
+        <h3 id="comparePickFocusTitle">变更点与影响链</h3>
+        <div id="comparePickPoints" class="compare-points"></div>
+      </section>
+      <div class="compare-pick-tools" aria-label="批量勾选">
+        <button id="comparePickCore" type="button">全选核心影响链</button>
+        <button id="comparePickChanged" type="button">仅选直接变更点</button>
+        <button id="comparePickClear" type="button">清空勾选</button>
+      </div>
       <div class="compare-pick-tools">
         <input id="comparePickSearch" type="search" placeholder="搜索名称或文件路径" aria-label="搜索比较结果">
         <select id="comparePickType" aria-label="对象类型"><option value="all">函数和变量</option><option value="fn">只看函数</option><option value="var">只看变量</option></select>
-        <select id="comparePickChange" aria-label="变更分类"><option value="changed">直接变更</option><option value="all">全部（含影响和上下文）</option><option value="modified">修改</option><option value="added">新增</option><option value="deleted">删除</option><option value="existing">未修改</option></select>
-        <button id="comparePickChanged" type="button">勾选直接变更</button><button id="comparePickClear" type="button">清空选择</button>
+        <select id="comparePickChange" aria-label="变更分类"><option value="core_chain">核心影响链（变更点+受影响）</option><option value="changed">直接变更</option><option value="all">全部</option><option value="modified">修改</option><option value="added">新增</option><option value="deleted">删除</option><option value="existing">未修改</option></select>
       </div>
-      <details><summary id="comparePickWarningCount">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
-      <div id="comparePickList" style="max-height:42vh;overflow:auto"></div>
+      <div id="comparePickList"></div>
       <div class="compare-pick-tools"><button id="comparePickPrev" type="button">上一页</button><span id="comparePickPage"></span><button id="comparePickNext" type="button">下一页</button></div>
+      <details><summary id="comparePickWarningCount">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
       <div id="comparePickError" class="detail-meta" role="alert" style="color:#A32D2D"></div>
     </div>
     <div class="modal-foot"><span id="comparePickCount" role="status"></span><button id="comparePickApply" class="primary" type="button" disabled>加入当前图</button><button id="comparePickCancel" type="button">取消</button></div>
@@ -857,31 +994,54 @@
     <div class="modal-body">
       <form id="expandForm">
         <strong id="expandFunction"></strong>
-        <label><span data-i18n="expand.direction">查找方向</span>
-          <select id="expandDirection">
+        <div class="scope-row" role="group" aria-labelledby="expandDirectionLabel">
+          <span id="expandDirectionLabel" class="scope-label" data-i18n="expand.direction">查找方向</span>
+          <button type="button" data-scope-direction="up" aria-pressed="true" data-i18n="expand.up">↑ 向上查调用方（谁调了它）</button>
+          <button type="button" data-scope-direction="down" aria-pressed="false" data-i18n="expand.down">↓ 向下查被调函数（它调了谁）</button>
+          <select id="expandDirection" hidden>
             <option value="down" data-i18n="expand.down">向下：查找被调用函数</option>
             <option value="up" data-i18n="expand.up">向上：查找调用者</option>
           </select>
-        </label>
-        <label><span data-i18n="expand.depth">查找层数</span>
-          <input id="expandDepth" type="number" min="1" max="20" step="1" value="1" required>
-        </label>
-        <p data-i18n="expand.hint">在当前画布中加入所选方向的调用关系，层数可选 1–20。向上一层只加入直接调用者，不展开它们的其他分支；没有调用者时保留原图。</p>
+        </div>
+        <p data-i18n="expand.hint">向上 = 追查触发来源（可追溯到 TASK 入口） · 向下 = 展开内部执行细节</p>
+        <div class="scope-row" role="group" aria-labelledby="expandDepthLabel">
+          <span id="expandDepthLabel" class="scope-label" data-i18n="expand.depth">查找层数</span>
+          <button type="button" data-scope-depth="1" aria-pressed="true" data-i18n="expand.directLayer">1 层（直接相连）</button>
+          <button type="button" data-scope-depth="2" aria-pressed="false" data-i18n="expand.layer2">2 层</button>
+          <button type="button" data-scope-depth="3" aria-pressed="false" data-i18n="expand.layer3">3 层</button>
+          <label><span data-i18n="expand.customDepth">自定义（1–20）</span>
+            <input id="expandDepth" type="number" min="1" max="20" step="1" value="1" required>
+          </label>
+        </div>
       </form>
     </div>
     <div class="modal-foot">
       <span id="expandMessage" role="status" aria-live="polite"></span>
-      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">查找并加入画布</button>
+      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">预览并选择</button>
     </div>
   </div>
 
   <div id="addFunctionsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="addFunctionsTitle">
     <div class="modal-head"><h2 id="addFunctionsTitle">选择要添加的调用关系</h2><button class="modal-close" data-close="addFunctionsModal">&times;</button></div>
     <div class="modal-body">
-      <strong id="addFunctionsTarget"></strong>
+      <p class="scope-target"><span data-i18n="expand.targetLabel">🎯 当前目标函数</span> <strong id="addFunctionsTarget"></strong></p>
+      <fieldset id="addFunctionsControls" class="scope-controls">
+        <div class="scope-row" role="group" aria-labelledby="addFunctionsDirectionLabel">
+          <span class="scope-label" id="addFunctionsDirectionLabel" data-i18n="expand.direction">查找方向</span>
+          <button type="button" data-scope-direction="both" aria-pressed="false" data-i18n="expand.both">⇅ 上下游同时</button>
+          <button type="button" data-scope-direction="up" aria-pressed="false" data-i18n="expand.onlyUp">↑ 仅查上游（谁调了它）</button>
+          <button type="button" data-scope-direction="down" aria-pressed="false" data-i18n="expand.onlyDown">↓ 仅查下游（它调了谁）</button>
+        </div>
+        <div class="scope-row" role="group" aria-labelledby="addFunctionsDepthLabel">
+          <span class="scope-label" id="addFunctionsDepthLabel" data-i18n="expand.depth">查找层数</span>
+          <button type="button" data-scope-depth="1" aria-pressed="false" data-i18n="expand.layer1">1 层</button>
+          <button type="button" data-scope-depth="2" aria-pressed="false" data-i18n="expand.layer2">2 层</button>
+          <button type="button" data-scope-depth="3" aria-pressed="false" data-i18n="expand.layer3">3 层</button>
+          <button type="button" id="addFunctionsCustomDepth" aria-pressed="false" hidden></button>
+        </div>
+      </fieldset>
       <p id="addFunctionsScope" class="settings-note"></p>
-      <p class="settings-note">勾选关联函数可同时加入它与目标函数共享的变量。</p>
-      <label><input id="addFunctionsAll" type="checkbox" checked> 全选待添加函数</label>
+      <label class="pick-all"><input id="addFunctionsAll" type="checkbox" checked> <span data-i18n="expand.selectAll">全选所有候选项</span></label>
       <div id="addFunctionsList"></div>
     </div>
     <div class="modal-foot"><span id="addFunctionsMessage" role="status"></span><button id="addFunctionsApply" class="primary" disabled>确认添加</button><button id="addFunctionsCancel">取消</button></div>
@@ -909,10 +1069,12 @@
       <input id="tlSearch" type="search" placeholder="搜索函数名 / 备注…" data-i18n-ph="timeline.search">
       <div class="tl-chips" id="tlChips">
         <button data-ops="" class="on" data-i18n="timeline.all">全部</button>
-        <button data-ops="node.annotate,edge.annotate" data-i18n="timeline.kindAnnotate">标注</button>
+        <button data-ops="edge.annotate,labels.renumber" data-i18n="timeline.kindEdge">连线标签</button>
+        <button data-ops="node.annotate" data-i18n="timeline.kindNode">节点标注</button>
         <button data-ops="layout.save,layout.clear" data-i18n="timeline.kindLayout">布局</button>
         <button data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
         <button data-ops="bookmark.save,bookmark.delete" data-i18n="timeline.kindBookmark">书签</button>
+        <button data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
       </div>
       <span class="tl-count" id="tlCount"></span>
     </div>
@@ -924,7 +1086,9 @@
       <h2 data-i18n="bookmark.title">视图书签</h2>
       <button class="modal-close" data-close="bookmarkModal">&times;</button>
     </div>
+    <div id="bookmarkSummary" class="bm-summary"></div>
     <div class="modal-body" id="bookmarkList"></div>
+    <div id="bookmarkFeedback" class="bm-feedback" role="status"></div>
     <div class="modal-foot">
       <input id="bookmarkName" type="text" placeholder="给当前视图起个名字，如「换挡链路」" data-i18n-ph="bookmark.placeholder">
       <button id="bookmarkSave" class="primary" data-i18n="bookmark.save">保存当前视图</button>

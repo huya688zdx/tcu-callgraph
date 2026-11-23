@@ -5,7 +5,7 @@ import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal } from './modal.js';
 import { edgeLabels, makeLabel, applyLabels } from './edge-labels.js';
-import { LABELS_MAX, LABEL_PRESETS, visibleCallOrderMap } from '/core/labels.js';
+import { LABELS_MAX, LABEL_PRESETS, numberedCallLabel, visibleCallOrderMap } from '/core/labels.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 
@@ -34,7 +34,7 @@ export async function findCallOrder(fnId) {
   try {
     const nodes = new Map(view.nodes.map((n) => [n.id, n]));
     const source = nodes.get(fnId);
-    // 只对当前画布上可见的被调函数排序，且重复调用只表现第一次（编号 1..K）。
+    // 只对画布上可见的被调函数按首次调用排序，保留已保存的编号。
     const visibleOrders = visibleCallOrderMap(view, fnId);
     const rows = [...visibleOrders.values()].map(({ order, edge }) => ({
       suggestion: {
@@ -45,15 +45,15 @@ export async function findCallOrder(fnId) {
         to: edge.to,
         line: edge.line,
         text: `${LABEL_PRESETS.call.text}${order}`,
-        evidence: `${source?.file || ''}:${edge.line} · 图中首次调用顺序 ${order}`,
+        evidence: `${source?.file || ''}:${edge.line} · 编号 ${order}`,
       },
       edge,
     }));
     if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;
-    pending = { projectId, fnId, rows };
+    pending = { projectId, fnId, rows, view };
     const items = rows.map(({ suggestion: s, edge }, index) => {
       const labels = edgeLabels(edge);
-      const previous = labels.find((l) => l.preset === 'call');
+      const previous = numberedCallLabel(labels) || labels.find((l) => l.preset === 'call');
       const disabled = !edge || (!previous && labels.length >= LABELS_MAX);
       const status = !edge ? 'callOrder.unavailable' : disabled ? 'callOrder.full' : previous ? 'callOrder.marked' : null;
       return `<label class="call-order-row${disabled ? ' unavailable' : ''}" title="${esc(s.evidence)}">
@@ -64,7 +64,7 @@ export async function findCallOrder(fnId) {
       </label>`;
     }).join('');
     body.innerHTML = `<div class="detail-title">${esc(source?.name || fnId.split('::').pop())}</div>
-      ${items ? `<p class="detail-meta">仅按当前画布中可见的被调函数首次调用顺序编号（1..${rows.length}）</p>${items}` : `<div class="empty">${t('callOrder.empty')}</div>`}`;
+      ${items ? `<p class="detail-meta">按图中首次调用顺序分配空号，保留已保存的编号。</p>${items}` : `<div class="empty">${t('callOrder.empty')}</div>`}`;
     syncConfirm();
   } catch (error) {
     if (seq !== sequence || projectId !== state.view?.projectId || !modal.classList.contains('show')) return;
@@ -76,6 +76,10 @@ export async function findCallOrder(fnId) {
 async function applySelected() {
   const session = pending;
   if (applying || !session || session.projectId !== state.view?.projectId) return;
+  if (session.view !== state.view) {
+    message.textContent = '画布已更新，请重新查找调用顺序。';
+    return;
+  }
   const chosen = [...body.querySelectorAll('input:checked:not(:disabled)')].map((input) => session.rows[Number(input.dataset.index)]);
   if (!chosen.length) return;
   applying = true;
@@ -85,7 +89,9 @@ async function applySelected() {
   const expand = chosen.some(({ suggestion: s }) => !current.has(s.edgeKey));
   try {
     for (const { suggestion: s, edge } of chosen) {
+      if (state.view !== view) return;
       const labels = structuredClone(edgeLabels(edge));
+      if (numberedCallLabel(labels)) continue;
       const previous = labels.find((l) => l.preset === 'call');
       if (previous?.text === s.text) continue;
       if (previous) previous.text = s.text;

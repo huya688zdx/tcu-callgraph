@@ -124,12 +124,40 @@ export function normalizeLabels(raw) {
   return out;
 }
 
-/**
- * 计算当前画布（view.edges / view.nodes）中某条调用边的可见コール順编号（1..K）。
- * 规则：
- * 1. 只统计当前画布里实际存在的被调函数（不在图中的函数不参与编号）；
- * 2. 同一被调函数被重复调用时，只按首次调用排序并表现第一次（不重复占号）。
- */
+function savedCallNumber(label) {
+  if (label?.auto) return 0;
+  const match = /^コール順(\d+)$/.exec(String(label?.text ?? '').trim());
+  const number = Number(match?.[1]);
+  return Number.isSafeInteger(number) && number > 0 ? number : 0;
+}
+
+export function numberedCallLabel(labels) {
+  return labels.find(savedCallNumber);
+}
+
+function savedCallOrders(view, callerId) {
+  const used = new Set();
+  const byEdge = new Map();
+  for (const edge of view?.edges || []) {
+    if (edge.from !== callerId) continue;
+    const raw = edge.labels ?? edge.label;
+    const labels = Array.isArray(raw) ? raw : raw ? [raw] : [];
+    for (const label of labels) {
+      const order = savedCallNumber(label);
+      if (!order) continue;
+      used.add(order);
+      if (!byEdge.has(edge)) byEdge.set(edge, order);
+    }
+  }
+  return { used, byEdge };
+}
+
+function firstFreeOrder(used, start = 1) {
+  while (used.has(start)) start++;
+  return start;
+}
+
+/** 当前画布按被调函数的首次调用分配编号，跳过同一调用方已保存的编号。 */
 export function visibleCallOrderMap(view, callerId) {
   const map = new Map();
   if (!view?.edges || !callerId) return map;
@@ -143,16 +171,31 @@ export function visibleCallOrderMap(view, callerId) {
       const ob = (b.callNumbers?.length ? parseInt(b.callNumbers[0], 10) : 0) || b.orderGroup || b.line || 0;
       return oa - ob || (a.line || 0) - (b.line || 0);
     });
-  for (const e of calls) {
-    if (!map.has(e.to)) {
-      map.set(e.to, { order: map.size + 1, edge: e });
-    }
+  const { used, byEdge } = savedCallOrders(view, callerId);
+  let next = 1;
+  for (const edge of calls) {
+    if (map.has(edge.to)) continue;
+    const saved = byEdge.get(edge);
+    const order = saved || firstFreeOrder(used, next);
+    if (!saved) next = order + 1;
+    map.set(edge.to, { order, edge });
   }
   return map;
 }
 
+/** 给单条边添加标签时，复用其可见编号，或在其余边已占编号之外取一个空号。 */
+export function callOrderForEdge(view, edge) {
+  const orders = visibleCallOrderMap(view, edge?.from);
+  const entry = orders.get(edge?.to);
+  if (entry && entry.edge === edge) return entry.order;
+  const { used, byEdge } = savedCallOrders(view, edge?.from);
+  if (byEdge.has(edge)) return byEdge.get(edge);
+  for (const { order } of orders.values()) used.add(order);
+  return firstFreeOrder(used);
+}
+
 export function displayEdgeLabels(edge, labels = [], viewOrCaller) {
-  if (labels.some((l) => l.preset === 'call')) return labels;
+  if (labels.some((l) => l.preset === 'call') || numberedCallLabel(labels)) return labels;
   if (!['direct', 'macro', 'fnptr'].includes(edge?.kind)) return labels;
   let orderNum = null;
   if (typeof viewOrCaller === 'string') {

@@ -231,6 +231,125 @@ test('e2e：AI 经 MCP 写标注 → SSE 广播 actor=ai；用户直连写 → a
   }
 });
 
+test('e2e：AI 精选函数组图广播可渲染的画布，追加沿用原范围，拒绝越限与无效 ID', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  assert.equal((await postJson(base + '/api/mcp-config', { level: 'readwrite' })).ok, true);
+  const stream = await openStream(base);
+  try {
+    const root = 'main.c::main';
+    const task = 'main.c::Task_10ms';
+    const shift = 'main.c::Task_Shift';
+    const vars = await (await fetch(base + '/api/vars')).json();
+    const tick = vars.list.find((v) => v.name === 'g_tick').id;
+    const compose = async (args) => {
+      const response = await postJson(base + '/mcp', {
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+          name: 'cg_compose_view', arguments: { mode: 'replace', roots: [root], reason: '核对主任务调用链', ...args },
+        },
+      });
+      return JSON.parse(response.result.content[0].text);
+    };
+    const getView = (page) => postJson(base + `/api/view?up=${page.up}&down=${page.down}`, page);
+    const overflow = await compose({ functionIds: Array(80).fill(task) });
+    assert.match(overflow.error, /80.*核心调用链/);
+    const invalid = await compose({ functionIds: ['ext::unknown', 'main.c::does_not_exist'], vars: ['var::missing'], selected: 'missing-selection' });
+    assert.match(invalid.error, /ext::unknown.*does_not_exist/);
+    assert.deepEqual(invalid.invalidIds, ['ext::unknown', 'main.c::does_not_exist', 'var::missing', 'missing-selection']);
+    assert.equal((await (await fetch(base + '/api/page?saved=1')).json()).page, null);
+    assert.equal(stream.events.filter((event) => event.json?.op === 'view.compose').length, 0);
+
+    const replaced = await compose({ functionIds: [task], vars: [tick], selected: task });
+    assert.equal(replaced.ok, true, replaced.error);
+    const update = await stream.waitFor((event) => event.json?.op === 'view.compose');
+    assert.equal(update.json.actor, 'ai');
+    assert.equal(update.json.reason, '核对主任务调用链');
+    assert.deepEqual(update.json.page, replaced.page);
+    assert.deepEqual(replaced.page.expansions, [{ root: task, up: 0, down: 0 }]);
+    assert.equal(replaced.page.selected, task);
+    assert.equal(replaced.page.down, 0);
+    assert.deepEqual((await (await fetch(base + '/api/page?saved=1')).json()).page, replaced.page);
+    assert.deepEqual((await (await fetch(base + '/api/page')).json()).page, replaced.page);
+    const stale = await postJson(base + '/api/page', { ...replaced.page, roots: [task], revision: 0 });
+    assert.equal(stale.ok, false);
+
+    const view = await getView(replaced.page);
+    assert.deepEqual(new Set(view.nodes.map((node) => node.id)), new Set([root, task, tick]));
+    assert.ok(view.edges.some((edge) => edge.from === root && edge.to === task));
+
+    const appended = await compose({ mode: 'add', roots: [], functionIds: [shift] });
+    assert.equal(appended.ok, true, appended.error);
+    assert.deepEqual(appended.page.roots, [root]);
+    assert.deepEqual(appended.page.vars, [tick]);
+    assert.equal(appended.page.selected, task);
+    const addedView = await getView(appended.page);
+    assert.ok(addedView.edges.some((edge) => edge.from === task && edge.to === shift));
+
+    const labels = await postJson(base + '/api/mcp-task-labels', {
+      items: [{ edgeKey: `${root}->${task}`, preset: 'call', order: 1 }],
+    });
+    assert.equal(labels.ok, true, labels.error);
+    const labelEvent = await stream.waitFor((event) => event.json?.op === 'labels.apply');
+    assert.equal(labelEvent.json.actor, 'ai');
+    assert.deepEqual(labelEvent.json.edgeKeys, labels.edgeKeys);
+    const events = await (await fetch(base + '/api/events?detail=1')).json();
+    const savedCompose = events.events.find((event) => event.id === appended.eventId);
+    assert.equal(savedCompose.actor, 'ai');
+    assert.equal(savedCompose.op, 'view.compose');
+    assert.equal(savedCompose.target, shift);
+    assert.deepEqual(savedCompose.brief, { count: 1, roots: 0, reason: '核对主任务调用链' });
+    assert.deepEqual(savedCompose.before.roots, [root]);
+    assert.deepEqual(savedCompose.after.expansions, appended.page.expansions);
+    assert.deepEqual(events.events.find((event) => event.op === 'edge.annotate').brief.labels, ['コール順1']);
+
+    const onlyFunctions = await compose({ roots: undefined, reason: undefined, functionIds: [shift] });
+    assert.equal(onlyFunctions.ok, true, onlyFunctions.error);
+    assert.deepEqual(onlyFunctions.page.roots, [shift]);
+  } finally {
+    stream.close();
+  }
+});
+
+test('e2e：标注时间轴显示实际标签，仅在整条标注清空时设置 cleared', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  const edgeKey = 'main.c::main->main.c::Task_10ms:56';
+  const annotate = (data) => postJson(base + '/api/overlay', { edgeKey, data });
+  const annotations = async () => (await (await fetch(base + '/api/events?ops=edge.annotate')).json()).events;
+
+  assert.deepEqual(await annotate({ labels: null }), { ok: true });
+  assert.equal((await annotations()).length, 0);
+  const labels = [{ preset: 'task', text: '10ms TASK' }, { preset: 'call', text: 'コール順1' }];
+  assert.deepEqual(await annotate({ labels, note: '主循环调用' }), { ok: true });
+  const [first] = await annotations();
+  assert.deepEqual(first.brief.labels, ['10ms TASK', 'コール順1']);
+  assert.equal(first.brief.cleared, undefined);
+  assert.equal(first.after, undefined);
+  assert.deepEqual(await annotate({ labels: labels.map(({ preset, text }) => ({ text, preset })) }), { ok: true });
+  assert.equal((await annotations()).length, 1, '同一组归一化后的标签只记录一次');
+
+  assert.deepEqual(await annotate({ labels: [] }), { ok: true });
+  const [partial] = await annotations();
+  assert.equal(partial.brief.note, '主循环调用');
+  assert.deepEqual(partial.brief.labels, []);
+  assert.equal(partial.brief.cleared, undefined);
+
+  assert.deepEqual(await annotate({ note: null }), { ok: true });
+  assert.deepEqual(await annotate({ note: null }), { ok: true });
+  const [cleared, ...earlier] = await annotations();
+  assert.deepEqual(cleared.brief, { cleared: true });
+  assert.equal(earlier.length, 2);
+
+  const annotateNode = (data) => postJson(base + '/api/overlay', { nodeId: 'main.c::main', data });
+  await annotateNode({ note: '入口' });
+  await annotateNode({ note: '入口' });
+  await annotateNode({ note: '' });
+  const nodeEvents = (await (await fetch(base + '/api/events?ops=node.annotate')).json()).events;
+  assert.deepEqual(nodeEvents.map((event) => event.brief), [{ cleared: true }, { note: '入口' }]);
+});
+
 test('e2e：删除 / 布局写操作也广播；切工程广播 project.switch', async () => {
   const prevEnv = process.env.CALLGRAPH_MCP;
   process.env.CALLGRAPH_MCP = 'readwrite';

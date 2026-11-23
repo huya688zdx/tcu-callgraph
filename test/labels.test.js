@@ -8,7 +8,9 @@ import {
   CONN_PREFIX,
   LABEL_MAX_DIST,
   LABEL_PRESETS,
+  callOrderForEdge,
   compactConnEntries,
+  displayEdgeLabels,
   freeConnNumbers,
   normalizeLabels,
   placeEdgeLabels,
@@ -21,10 +23,28 @@ import {
   normalizeLabel,
   placeLabel,
   rectsOverlap,
+  visibleCallOrderMap,
 } from '../src/core/labels.js';
 
 /** 固定的文字测量桩：等宽字体，结果可预测 */
 const measure = (s) => String(s).length * 7;
+
+test('コール順：保留同一调用方的已有编号，自动编号跳过占号', () => {
+  const call = (from, to, line, annotations = {}) => ({ from, to, line, kind: 'direct', ...annotations });
+  const saved = call('A', 'D', 40, { labels: [{ preset: 'call', text: 'コール順1' }] });
+  const first = call('A', 'B', 10);
+  const second = call('A', 'C', 20);
+  const repeated = call('A', 'B', 30, { label: { preset: 'call', text: 'コール順3' } });
+  const otherCaller = call('Z', 'B', 10, { labels: [{ preset: 'call', text: 'コール順2' }] });
+  const view = { edges: [saved, otherCaller, repeated, second, first] };
+  const orders = visibleCallOrderMap(view, 'A');
+  assert.deepEqual([...orders].map(([id, { order }]) => [id, order]), [['B', 2], ['C', 4], ['D', 1]]);
+  assert.equal(displayEdgeLabels(first, [], view)[0].text, 'コール順2');
+  assert.equal(displayEdgeLabels(second, [], view)[0].text, 'コール順4');
+  assert.deepEqual(displayEdgeLabels(repeated, [repeated.label], view), [repeated.label]);
+  assert.equal(callOrderForEdge(view, repeated), 3);
+  assert.equal(callOrderForEdge(view, call('A', 'B', 50)), 5);
+});
 
 test('normalizeLabel：结合点的文字由编号推导，不接受手填', () => {
   const l = normalizeLabel({ preset: 'conn', num: 3, text: '乱写' });

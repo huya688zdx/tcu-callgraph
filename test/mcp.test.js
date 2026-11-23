@@ -61,6 +61,8 @@ test('initialize 返回协议版本与当前权限', async () => {
   assert.equal(r.body.result.protocolVersion, '2025-06-18');
   assert.equal(r.body.result.serverInfo.name, 'tcu-callgraph');
   assert.match(r.body.result.instructions, /readonly/);
+  assert.match(r.body.result.instructions, /cg_source.*C 源码/);
+  assert.match(r.body.result.instructions, /コール順1/);
 });
 
 test('tools/list 按权限过滤：readonly 不含写工具，readwrite 全量，off 为空', async () => {
@@ -76,9 +78,13 @@ test('tools/list 按权限过滤：readonly 不含写工具，readwrite 全量�
   assert.ok(!ro.body.result.tools.some((t) => t.name === 'cg_annotate'), 'readonly 不应有写工具');
   assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_export_svg'), 'readonly 应有导出工具');
   assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_view'), 'readonly 应有读工具');
+  assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_source'));
+  assert.ok(!ro.body.result.tools.some((t) => ['cg_compose_view', 'cg_apply_task_labels'].includes(t.name)));
 
   const rw = await mcpLevel('readwrite').handlePost(rpc('tools/list', {}));
   assert.ok(rw.body.result.tools.some((t) => t.name === 'cg_annotate'), 'readwrite 应有写工具');
+  assert.ok(rw.body.result.tools.some((t) => t.name === 'cg_compose_view'));
+  assert.ok(rw.body.result.tools.some((t) => t.name === 'cg_apply_task_labels'));
 
   const off = await mcpLevel('off').handlePost(rpc('tools/list', {}));
   assert.equal(off.body.result.tools.length, 0, 'off 时工具列表为空');
@@ -166,6 +172,90 @@ test('导出工具的 outPath 只允许 out/ 下的文件名', async () => {
 // ---------------------------------------------------------------------------
 // 端到端：真实服务 + 真实库
 // ---------------------------------------------------------------------------
+
+async function callTool(base, name, args) {
+  const response = await fetch(base + '/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: rpc('tools/call', { name, arguments: args }),
+  });
+  const { result, error } = await response.json();
+  assert.ok(result, error?.message);
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(Boolean(result.isError), payload.ok === false);
+  return payload;
+}
+
+test('e2e：cg_source 返回函数定义和分析信息，按行读源码时拒绝越界路径', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  const source = await callTool(base, 'cg_source', { id: 'main.c::SysTick_Handler' });
+  assert.equal(source.ok, true);
+  assert.match(source.source, /^void SysTick_Handler\(void\)/);
+  assert.match(source.source, /g_tick % 10u/);
+  assert.match(source.source, /\n}$/);
+  assert.equal(source.truncated, false);
+  assert.ok(Array.isArray(source.taskPeriods));
+  assert.ok(source.calls.some((edge) => edge.to === 'main.c::Task_10ms' && edge.edgeKey.endsWith(':' + edge.line)));
+  assert.ok(source.varAccess.some((access) => access.name === 'g_tick'));
+
+  const range = await callTool(base, 'cg_source', { file: 'main.c', startLine: 1, endLine: 900 });
+  assert.equal(range.ok, true);
+  assert.equal(range.truncated, true);
+  assert.match(range.source, /^#include "gear.h"/);
+  assert.equal(range.source.split('\n').length, range.endLine);
+  for (const file of ['../demo/main.c', path.join(ROOT, 'samples', 'tcu', 'main.c')]) {
+    const denied = await callTool(base, 'cg_source', { file, startLine: 1, endLine: 2 });
+    assert.equal(denied.ok, false);
+    assert.match(denied.error, /工程内/);
+  }
+  assert.equal((await callTool(base, 'cg_source', { file: 'main.c', startLine: 5, endLine: 2 })).ok, false);
+  assert.equal((await callTool(base, 'cg_source', { id: 'ext::missing' })).ok, false);
+});
+
+test('e2e：cg_apply_task_labels 解析简写边键，合并预设并拒绝批内和库内重号', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  await fetch(base + '/api/mcp-config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ level: 'readwrite' }),
+  });
+  const caller = 'main.c::main';
+  const source = await callTool(base, 'cg_source', { id: caller });
+  const first = source.calls.find((edge) => edge.callee === 'Can_Init');
+  const second = source.calls.find((edge) => edge.callee === 'Adc_Init');
+  const taskEdge = 'main.c::SysTick_Handler->main.c::Task_10ms';
+  const shortKey = `${caller}->${first.to}`;
+  const firstCall = { edgeKey: shortKey, preset: 'call', order: 1 };
+  const secondCall = { edgeKey: second.edgeKey, preset: 'call', text: 'コール順1' };
+  const apply = (items, options) => callTool(base, 'cg_apply_task_labels', { items, ...options });
+  const events = async () => (await (await fetch(base + '/api/events?detail=1')).json()).events;
+  const duplicate = await apply([firstCall, secondCall]);
+  assert.match(duplicate.error, /コール順1.*重复/);
+  assert.match((await apply([firstCall, { edgeKey: 'missing->edge', preset: 'conn' }])).error, /missing->edge/);
+  assert.match((await apply([{ ...firstCall, order: 0 }])).error, /正整数/);
+  assert.ok(!(await events()).some((e) => e.actor === 'ai'));
+
+  assert.deepEqual((await apply([firstCall])).edgeKeys, [first.edgeKey]);
+  assert.match((await apply([secondCall])).error, /コール順1.*已用于/);
+  const lowLevel = await callTool(base, 'cg_annotate', {
+    edgeKey: second.edgeKey, data: { labels: [{ preset: 'call', text: 'コール順1' }] },
+  });
+  assert.match(lowLevel.error, /コール順1.*已用于/);
+  assert.ok((await apply([{ ...secondCall, text: 'コール順2' }, { edgeKey: shortKey, preset: 'conn' }])).ok);
+  assert.match((await apply([{ edgeKey: taskEdge, preset: 'task', text: ' ' }])).error, /非空文字/);
+  assert.ok((await apply([{ edgeKey: taskEdge, preset: 'task', text: '10ms TASK', note: 'main.c:16 每 10 次 tick 调度' }])).ok);
+
+  const list = await events();
+  const merged = list.find((event) => event.target === first.edgeKey);
+  assert.deepEqual(merged.after.labels.map((label) => label.preset), ['call', 'conn']);
+  assert.deepEqual(merged.brief.labels, ['コール順1', '結合点：1']);
+  assert.ok(list.find((event) => event.target.startsWith(taskEdge + ':')).after.labels[0].border);
+  assert.equal(merged.actor, 'ai');
+  assert.ok((await apply([{ edgeKey: shortKey, preset: 'conn' }], { merge: false })).ok);
+  assert.deepEqual((await events()).find((event) => event.target === first.edgeKey).after.labels.map((label) => label.preset), ['conn']);
+});
 
 test('e2e：initialize → tools/call 全链路，写操作带 actor=ai，SVG 导出落盘', async () => {
   const prevEnv = process.env.CALLGRAPH_MCP;

@@ -14,34 +14,47 @@ const btn = document.getElementById('bookmarkBtn');
 const listEl = document.getElementById('bookmarkList');
 const nameInput = document.getElementById('bookmarkName');
 const saveBtn = document.getElementById('bookmarkSave');
+const summaryEl = document.getElementById('bookmarkSummary');
+const feedbackEl = document.getElementById('bookmarkFeedback');
+let writing = false;
 
-const meta = (b) => {
-  const base = t('bookmark.meta').replace('{n}', b.roots.length).replace('{down}', b.down);
-  // 分组 / 平铺 也要走 t()：写死中文的话，切到别的语言会中英混排
-  const mode = b.group ? t('bookmark.grouped') : t('bookmark.flat');
-  return `${base} · ${mode}`;
-};
+const modeLabel = (group) => t(group ? 'bookmark.grouped' : 'bookmark.flat');
 
-/** 按钮上短暂显示一句提示，不弹 toast（这个界面没有 toast 系统） */
-function flash(msg, ok = true) {
-  if (!saveBtn) return;
-  saveBtn.textContent = msg;
-  saveBtn.disabled = false;
-  clearTimeout(flash.timer);
-  flash.timer = setTimeout(() => {
-    saveBtn.textContent = t('bookmark.save');
-  }, 1600);
-  if (!ok) saveBtn.style.background = '#A32D2D';
-  else saveBtn.style.background = '';
+function meta(b) {
+  const roots = (b.roots || []).filter(Boolean);
+  const names = roots.map((id) => id.split('::').at(-1));
+  const range = new Set([...roots, ...(b.expansions || []).map((scope) => scope.root)]).size;
+  return [
+    names.length ? t('bookmark.entries', { names: names.join(', ') }) : t('bookmark.noEntries'),
+    t('bookmark.range', { n: range }),
+    b.vars?.length ? t('bookmark.vars', { n: b.vars.length }) : '',
+    modeLabel(b.group),
+  ].filter(Boolean).join(' · ');
+}
+
+function feedback(message, error = false) {
+  if (!feedbackEl) return;
+  feedbackEl.textContent = message;
+  feedbackEl.classList.toggle('error', error);
 }
 
 async function render() {
   if (!listEl) return;
-  let rows = [];
+  if (summaryEl) {
+    const nodes = state.view?.nodes || [];
+    const vars = nodes.filter((node) => node.kind === 'var').length;
+    summaryEl.textContent = t('bookmark.summary', {
+      functions: nodes.length - vars,
+      vars,
+      mode: modeLabel(state.group),
+    });
+  }
+  let rows;
   try {
     rows = (await api.bookmarks()).list || [];
   } catch {
-    rows = [];
+    listEl.innerHTML = `<div class="empty">${esc(t('bookmark.loadFailed'))}</div>`;
+    return;
   }
   if (!rows.length) {
     listEl.innerHTML = `<div class="empty">${t('bookmark.empty')}</div>`;
@@ -50,53 +63,68 @@ async function render() {
   listEl.innerHTML = rows
     .map(
       (b) => `
-    <div class="bm" data-id="${b.id}">
-      <div style="flex:1;min-width:0">
+    <div class="bm">
+      <div class="bm-content">
         <div class="nm">${esc(b.name)}</div>
         <div class="meta">${esc(meta(b))}</div>
       </div>
-      <button class="del" data-del="${b.id}" title="${esc(t('bookmark.deleteTitle'))}">&times;</button>
+      <div class="bm-actions">
+        <button type="button" class="bm-open">${esc(t('bookmark.open'))}</button>
+        <button type="button" class="bm-update">${esc(t('bookmark.update'))}</button>
+        <button type="button" class="bm-delete">${esc(t('bookmark.delete'))}</button>
+      </div>
     </div>`
     )
     .join('');
 
-  listEl.querySelectorAll('.bm').forEach((row) => {
-    row.addEventListener('click', async () => {
-      const b = rows.find((x) => x.id === Number(row.dataset.id));
-      if (!b) return;
-      closeModal();
+  listEl.querySelectorAll('.bm').forEach((row, index) => {
+    const b = rows[index];
+    const open = row.querySelector('.bm-open');
+    const update = row.querySelector('.bm-update');
+    const remove = row.querySelector('.bm-delete');
+    row.addEventListener('click', async (event) => {
+      const button = event.target.closest('button');
+      if ((button && button !== open) || open.disabled) return;
+      open.disabled = true;
       try {
         await hooks.applyBookmark(b);
+        if (document.getElementById('bookmarkModal')?.classList.contains('show')) closeModal();
       } catch (err) {
-        // 书签指向的函数可能已经被删了 / 工程换过，跳不过去时别静默失败
-        console.warn('[书签] 跳转失败：', err);
+        feedback(`${t('bookmark.openFailed')}：${err.message || err}`, true);
+      } finally {
+        open.disabled = false;
       }
     });
-  });
-
-  listEl.querySelectorAll('[data-del]').forEach((el) => {
-    el.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const id = Number(el.dataset.del);
-      try {
-        const r = await api.deleteBookmark(id);
-        if (r && r.ok) await render();
-      } catch (err) {
-        // 网络断了 / 服务重启中：保持列表原样，不要因为一个未捕获异常把面板卡死
-        console.warn('[书签] 删除失败：', err);
-      }
-    });
+    update.addEventListener('click', () => save(b.name, update));
+    remove.addEventListener('click', () => write(remove, 'bookmark.deleteFailed', async () => {
+      const result = await api.deleteBookmark(b.id);
+      if (!result?.ok) throw new Error(result?.error);
+      return t('bookmark.deleted');
+    }));
   });
 }
 
-async function save() {
-  const name = (nameInput?.value || '').trim();
-  if (!name) return flash(t('bookmark.needName'), false);
-  if (!state.roots.length) return flash(t('bookmark.noRoot'), false);
-
-  let r;
+async function write(button, errorKey, action) {
+  if (writing) return;
+  writing = true;
+  button.disabled = true;
+  feedback('');
   try {
-    r = await api.saveBookmark({
+    feedback(await action());
+    await render();
+  } catch (err) {
+    feedback([t(errorKey), err.message].filter(Boolean).join('：'), true);
+  } finally {
+    button.disabled = false;
+    writing = false;
+  }
+}
+
+function save(name, button) {
+  if (!name) return feedback(t('bookmark.needName'), true);
+  if (!state.roots.length) return feedback(t('bookmark.noRoot'), true);
+  return write(button, 'bookmark.failed', async () => {
+    const result = await api.saveBookmark({
       name,
       roots: state.roots,
       expansions: state.expansions,
@@ -105,25 +133,24 @@ async function save() {
       group: state.group,
       vars: [...state.vars],
     });
-  } catch (err) {
-    // fetch 本身失败（服务重启 / 断网）会 reject，不接住就是一条 unhandled rejection
-    return flash(`${t('bookmark.failed')}：${err?.message || err}`, false);
-  }
-  if (!r || !r.ok) return flash(`${t('bookmark.failed')}：${r?.error || ''}`, false);
-
-  if (nameInput) nameInput.value = '';
-  flash(r.overwritten ? t('bookmark.overwritten') : t('bookmark.saved'));
-  await render();
+    if (!result?.ok) throw new Error(result?.error);
+    if (button !== saveBtn) return t('bookmark.updated');
+    if (nameInput.value.trim() === name) nameInput.value = '';
+    return t(result.overwritten ? 'bookmark.overwritten' : 'bookmark.saved');
+  });
 }
+
+const saveCurrent = () => save(nameInput.value.trim(), saveBtn);
 
 btn?.addEventListener('click', () => {
   openModal('bookmarkModal');
+  feedback('');
   render();
   nameInput?.focus();
 });
-saveBtn?.addEventListener('click', save);
+saveBtn?.addEventListener('click', saveCurrent);
 nameInput?.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') save();
+  if (e.key === 'Enter' && !e.isComposing) saveCurrent();
 });
 
 wireModals();
