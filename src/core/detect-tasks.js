@@ -12,8 +12,11 @@
  *    宏间接调用（CALL(Task_10ms)）与函数指针在解析期已还原成普通边，这里不用管。
  */
 
+import { projectTasks } from './task-periods.js';
+import { formatPeriod } from '../../web/lib/period-text.js';
+
 /** 名字里的周期：Task_10ms / 100ms_task / cyclic_5ms → { n: 10, unit: 'ms' } */
-const PERIOD_IN_NAME = /(\d+)\s*(ms|us|µs|s)\b/i;
+const PERIOD_IN_NAME = /(\d+)\s*(ms|us|µs|s)(?=$|_)/i;
 /** 任务函数名：Task_xxx / xxx_task / cyclic_xxx / periodic_xxx */
 const TASK_NAME = /(^|_)(task|cyclic|periodic)(_|$)/i;
 /** 中断入口：xxx_isr / xxx_handler / irq_xxx / xxx_interrupt */
@@ -25,6 +28,7 @@ const CALL_RANK = { direct: 3, macro: 2, fnptr: 1 };
 
 const shortName = (id) => String(id).split('::').pop();
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
+const NO_CALLEE = { v: '' };
 
 /** 名字里能提出周期就是任务函数；只有 Task/cyclic 字样而无周期的也算（周期留空） */
 function taskPeriodOf(name) {
@@ -35,20 +39,35 @@ function taskPeriodOf(name) {
 }
 
 /** 嵌套实参调用不按标识符出现顺序猜执行顺序，留给用户手动标注。 */
-function hasNestedCall(tokens, calls) {
+export function hasNestedCall(tokens, calls) {
   const names = new Set(calls.flatMap((e) => [
     e.callee || shortName(e.to), e.macroChain?.[0], e.via?.split(' > ')[0],
     e.kind === 'fnptr' ? e.via?.split('.').pop() : null,
   ]).filter(Boolean));
   const stack = [];
+  let enclosingCalls = 0;
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i].v === '(') {
       const call = names.has(tokens[i - 1]?.v);
-      if (call && stack.includes(true)) return true;
+      if (call && enclosingCalls) return true;
       stack.push(call);
-    } else if (tokens[i].v === ')') stack.pop();
+      if (call) enclosingCalls++;
+    } else if (tokens[i].v === ')' && stack.pop()) enclosingCalls--;
   }
   return false;
+}
+
+/** 成员调用要等函数指针表齐全后匹配，保留括号及其前的名字供调用顺序检测。 */
+export function callNestingTokens(tokens) {
+  const result = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.v === '(') {
+      const prev = tokens[i - 1];
+      result.push(prev?.t === 'id' ? prev : NO_CALLEE, token);
+    } else if (token.v === ')') result.push(token);
+  }
+  return result;
 }
 
 /**
@@ -65,12 +84,15 @@ export function detectTasks(model, from = null) {
   // ---- 1. 任务函数与 ISR ----
   const tasks = []; // { id, period, isIsr }
   const isrs = [];
+  const recognized = new Map(projectTasks(model).map(task => [task.id, task]));
   for (const fn of fns) {
-    const p = taskPeriodOf(fn.name);
+    const task = recognized.get(fn.id);
+    const p = task?.us ? { text: 'TASK:' + formatPeriod(task.us).replace(' ', '').replace('µs', 'us'), why: task.source }
+      : taskPeriodOf(fn.name);
     if (p && TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: p });
     else if (p && ISR_NAME.test(fn.name)) isrs.push({ id: fn.id, period: p });
     else if (p) tasks.push({ id: fn.id, period: p });
-    else if (TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: null });
+    else if (task || TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: null });
     else if (ISR_NAME.test(fn.name)) isrs.push({ id: fn.id, period: null });
   }
 
@@ -119,7 +141,7 @@ export function detectTasks(model, from = null) {
     const calls = out(fn.id).filter((e) => Object.hasOwn(CALL_RANK, e.kind))
       .sort((a, b) => a.line - b.line);
     if (calls.length < 2) continue;
-    if (hasNestedCall(fn.bodyTokens || [], calls)) {
+    if (fn.hasNestedCalls ?? hasNestedCall(fn.bodyTokens || [], calls)) {
       skipped.push({ from: fn.id, reason: '当前函数含嵌套实参调用，コール順 请手动标注' });
       continue;
     }

@@ -2,12 +2,25 @@
  * 轻量预处理器
  * - 建立 #define 宏表（对象宏 / 函数式宏）
  * - 维护 #if / #ifdef / #elif / #else 嵌套栈，给每个 token 打上 condition 标签
- * - 不做真假求值：所有分支都保留，靠 condition 标签在界面上按配置过滤
+ * - 保留各分支并标注 condition；明确恒假分支不修改宏表
  */
 
 import { lex, collectArgs } from './lexer.js';
 
 const DIRECTIVE = /^#\s*([A-Za-z_]+)\s*([\s\S]*)$/;
+
+/** 文件只保存自己修改的宏，null 表示屏蔽继承来的定义。 */
+export function fileMacroScope(base, changes = new Map()) {
+  return {
+    changes,
+    get(name) {
+      const value = changes.get(name);
+      return value === undefined ? base.get(name) : value;
+    },
+    set(name, def) { changes.set(name, def); },
+    delete(name) { changes.set(name, null); },
+  };
+}
 
 function parseDefineParams(text) {
   // text 形如 "(a, b) body..."
@@ -55,7 +68,11 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
 
   // 识别 include guard：#ifndef X 紧跟 #define X，不参与 condition 计算
   let guardName = null;
-  const preprocs = tokens.filter((t) => t.t === 'preproc');
+  const preprocs = [];
+  for (const tk of tokens) {
+    if (tk.t === 'preproc') preprocs.push(tk);
+    if (preprocs.length === 2) break;
+  }
   if (preprocs.length >= 2) {
     const m1 = /^#\s*ifndef\s+([A-Za-z_]\w*)/.exec(preprocs[0].v);
     const m2 = /^#\s*define\s+([A-Za-z_]\w*)/.exec(preprocs[1].v);
@@ -65,12 +82,13 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     const parts = frames.map((f) => f.expr).filter(Boolean);
     return parts.length ? parts.join(' && ') : undefined;
   };
+  let cond;
 
   for (let k = 0; k < tokens.length; k++) {
     const tk = tokens[k];
 
     if (tk.t !== 'preproc') {
-      (expand ? pending : out).push({ ...tk, cond: currentCond() });
+      (expand ? pending : out).push(cond ? { ...tk, cond } : tk);
       continue;
     }
 
@@ -80,6 +98,8 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     if (!m) continue;
     const dir = m[1].toLowerCase();
     const rest = m[2].trim();
+
+    if ((dir === 'define' || dir === 'undef') && frames.some((f) => f.inactive)) continue;
 
     if (dir === 'define') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
@@ -126,25 +146,37 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       } else {
         frames.push({ expr: dir === 'ifdef' ? n : `!${n}` });
       }
+      cond = currentCond();
       continue;
     }
     if (dir === 'if') {
-      frames.push({ expr: rest.replace(/\s+/g, ' ') });
+      frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
+      cond = currentCond();
       continue;
     }
     if (dir === 'elif') {
-      if (frames.length) frames[frames.length - 1].expr = rest.replace(/\s+/g, ' ');
+      if (frames.length) {
+        const frame = frames[frames.length - 1];
+        frame.expr = rest.replace(/\s+/g, ' ');
+        frame.inactive = frame.definitelyTaken || rest === '0';
+        frame.definitelyTaken ||= rest === '1';
+        cond = currentCond();
+      }
       continue;
     }
     if (dir === 'else') {
       if (frames.length) {
         const cur = frames[frames.length - 1].expr || '';
-        frames[frames.length - 1].expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
+        const frame = frames[frames.length - 1];
+        frame.expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
+        frame.inactive = !!frame.definitelyTaken;
+        cond = currentCond();
       }
       continue;
     }
     if (dir === 'endif') {
       frames.pop();
+      cond = currentCond();
       continue;
     }
   }
@@ -160,6 +192,7 @@ function stringifyTokens(tokens) {
 function substitute(m, args, siteTok) {
   const out = [];
   const body = m.body;
+  const macroOrigins = [...(siteTok.macroOrigins || []), m.name];
   for (let i = 0; i < body.length; i++) {
     const tk = body[i];
 
@@ -171,6 +204,7 @@ function substitute(m, args, siteTok) {
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
+        macroOrigins,
       });
       i++;
       continue;
@@ -188,6 +222,7 @@ function substitute(m, args, siteTok) {
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
+        macroOrigins,
       });
       i++;
       continue;
@@ -196,12 +231,16 @@ function substitute(m, args, siteTok) {
     const pidx = m.params ? m.params.indexOf(tk.v) : -1;
     if (pidx >= 0) {
       const a = args[pidx] || [];
-      for (const t of a) {
-        out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond });
+      for (let j = 0; j < a.length; j++) {
+        const t = a[j];
+        const isCallee = body[i + 1]?.v === '(' && j === a.length - 1 && t.t === 'id' &&
+          (a.length === 1 || ['.', '->'].includes(a[j - 1]?.v));
+        out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond,
+          macroOrigins: isCallee ? [...macroOrigins, ...(t.macroOrigins || [])] : t.macroOrigins || [] });
       }
       continue;
     }
-    out.push({ ...tk, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? tk.cond });
+    out.push({ ...tk, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? tk.cond, macroOrigins });
   }
   return out;
 }
@@ -214,15 +253,15 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
-    if (tk.t === 'id' && macros.has(tk.v) && !seen.has(tk.v)) {
-      const m = macros.get(tk.v);
-
+    const m = tk.t === 'id' ? macros.get(tk.v) : undefined;
+    if (m && !seen.has(tk.v)) {
       if (m.params === null) {
         const body = m.body.map((b) => ({
           ...b,
           line: tk.line,
           col: tk.col,
           cond: tk.cond ?? b.cond,
+          macroOrigins: [...(tk.macroOrigins || []), m.name],
         }));
         const nextSeen = new Set(seen);
         nextSeen.add(tk.v);

@@ -105,6 +105,8 @@ test('会话导出：中文工程名不再 500，文件名按 RFC 5987 编码', 
   const body = await res.json();
   assert.equal(body.format, 'tcu-callgraph-session');
   assert.equal(body.version, 1);
+  assert.equal(body.eventsTotal, body.events.length);
+  assert.equal(body.eventsTruncated, false);
   assert.ok(body.overlay && body.bookmarks, '会话文件应包含 overlay 与 bookmarks');
 });
 

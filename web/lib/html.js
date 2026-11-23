@@ -10,7 +10,8 @@ export async function buildStandaloneHtml() {
     theme: structuredClone(THEME) };
   const right = document.getElementById('right').cloneNode(true);
   right.removeAttribute('data-mode');
-  right.querySelector('#secLabel')?.remove();
+  right.querySelectorAll('.fsel').forEach(wrap => wrap.replaceWith(wrap.querySelector('select')));
+  right.querySelectorAll('#secLabel, #pairFlowBar').forEach(panel => panel.remove());
   const css = [...document.querySelectorAll('style')].map((s) => s.textContent).join('\n');
 
   // 只收集此离线入口实际依赖的现有模块；统一模块地址，避免 file:// 下的相对导入和跨域限制。
@@ -57,7 +58,7 @@ export async function buildStandaloneHtml() {
 <header class="offline-bar"><b>TCU 调用关系图</b><span>${esc(title)}</span><button id="offlineFit">适应</button>
 <button id="offlinePng">导出 PNG</button><button id="offlineSvg">导出 SVG</button>
 <span class="hint">离线快照 · 滚轮上下移动 · Shift+滚轮左右移动 · Ctrl+滚轮缩放 · 双击节点 / 层级标题 / 连线后调整 · 空白处 / Esc 退出移动 · Ctrl+Z 撤销 · 变量勾选表示导出时的入图状态</span></header>
-<main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu"></div></main>
+<main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu" class="ctx-menu"></div></main>
 ${right.outerHTML}
 </div><div hidden><input id="search"><ul id="results"></ul></div>
 <script>

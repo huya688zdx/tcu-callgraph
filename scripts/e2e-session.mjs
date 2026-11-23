@@ -193,9 +193,9 @@ try {
   // ---- 测试8：书签保存与跳回 ----
   console.log('\n[测试8] 保存当前视图为书签，改视图后一键跳回');
   await sleep(400);
-  const before = await evaluate(`(() => ({
+  const before = await evaluate(`(async () => ({
     root: window.__cg.root,
-    down: document.getElementById('depth').value,
+    down: (await import('/lib/state.js')).state.down,
   }))()`);
 
   await evaluate("document.getElementById('bookmarkBtn').click()");
@@ -216,23 +216,22 @@ try {
   // 关掉面板，改视图（深度换成 1 层）
   await evaluate(`document.querySelector('.modal-close[data-close=bookmarkModal]')?.click()`);
   await sleep(300);
-  await evaluate(`(() => {
-    const sel = document.getElementById('depth');
-    sel.value = '1';
-    sel.dispatchEvent(new Event('change'));
+  await evaluate(`(async () => {
+    const { hooks } = await import('/lib/hooks.js');
+    await hooks.loadView(window.__cg.root, { down: 1 });
   })()`);
   await sleep(1200);
-  const changed = await evaluate(`document.getElementById('depth').value`);
-  check('视图已改动', changed === '1', `down=${changed}`);
+  const changed = await evaluate(`import('/lib/state.js').then(({ state }) => state.down)`);
+  check('视图已改动', changed === 1, `down=${changed}`);
 
   // 打开书签面板，点第一条
   await evaluate("document.getElementById('bookmarkBtn').click()");
   await sleep(400);
   await evaluate("document.querySelector('#bookmarkList .bm').click()");
   await sleep(1500);
-  const restoredView = await evaluate(`(() => ({
+  const restoredView = await evaluate(`(async () => ({
     root: window.__cg.root,
-    down: document.getElementById('depth').value,
+    down: (await import('/lib/state.js')).state.down,
   }))()`);
   console.log('  跳回后:', JSON.stringify(restoredView));
   check('书签把深度恢复回来', restoredView.down === before.down, `${restoredView.down} vs ${before.down}`);

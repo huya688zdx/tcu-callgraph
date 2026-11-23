@@ -36,7 +36,7 @@ function constrainCam() {
   cam.k = k;
 }
 
-function fit() {
+function fit({ paint = true } = {}) {
   stopCamAnim();
   const v = state.view;
   if (!v) return;
@@ -46,7 +46,7 @@ function fit() {
   cam.k = fittedZoom(b);
   cam.x = W / 2 - (b.x + b.w / 2) * cam.k;
   cam.y = H / 2 - (b.y + b.h / 2) * cam.k;
-  draw();
+  if (paint) draw();
 }
 
 // ---------------- 视角动画 ----------------
@@ -92,7 +92,7 @@ function stepCam(now) {
     cam.k = f.k + (to.k - f.k) * e;
     camAnim.on = t < 1;
   }
-  draw();
+  draw({ geometryUnchanged: true });
   if (camAnim.on) camAnim.raf = requestAnimationFrame(stepCam);
 }
 
@@ -165,6 +165,11 @@ function revealAdded(nodes, edges) {
   const k = clampZoom(Math.min(cam.k, (W - pad * 2) / Math.max(1, x1 - x0), (H - pad * 2) / Math.max(1, y1 - y0)));
   const shift = (lo, hi, origin, size) => lo * k + origin < pad ? pad - lo * k :
     hi * k + origin > size - pad ? size - pad - hi * k : origin;
-  animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k });
+  const target = { x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k };
+  if (nodes.length + edges.length === 1) animateCam(target);
+  else {
+    stopCamAnim();
+    Object.assign(cam, target);
+  }
 }
-export { fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };
+export { contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };

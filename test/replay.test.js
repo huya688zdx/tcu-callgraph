@@ -111,6 +111,7 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
   const saved = await jsonPost(base, '/api/bookmarks', {
     name: '换挡链路',
     roots: ['main.c::main'],
+    expansions: [{ root: 'main.c::main', up: 2, down: 4 }],
     up: 1,
     down: 2,
     group: false,
@@ -129,6 +130,7 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
   assert.deepEqual(del.before, {
     name: '换挡链路',
     roots: ['main.c::main'],
+    expansions: [{ root: 'main.c::main', up: 2, down: 4 }],
     up: 1,
     down: 2,
     group: false,

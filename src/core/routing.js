@@ -27,11 +27,17 @@ const SIDES = new Set(['top', 'bottom', 'left', 'right']);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 /** 不同线型或变更颜色不能共用干线；入口处不可避免的短引线除外。 */
-export const edgeStyleKey = (e) => `${e.kind || 'direct'}|${e.change || 'existing'}`;
+export const edgeStyleKey = (e) => `${e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 
-function incompatibleOverlap(a, b) {
-  if (edgeStyleKey(a) === edgeStyleKey(b) &&
-    (a.from === b.from || a.to === b.to || (a.from === b.to && a.to === b.from))) return 0;
+export function canShareTrunk(a, b) {
+  return (a.from === b.from || a.to === b.to || (a.from === b.to && a.to === b.from)) &&
+    edgeStyleKey(a) === edgeStyleKey(b);
+}
+
+const samePort = (p, q) => Math.abs(p[0] - q[0]) < 0.5 && Math.abs(p[1] - q[1]) < 0.5;
+
+export function incompatibleOverlap(a, b) {
+  if (canShareTrunk(a, b)) return 0;
   const A = a.points || [];
   const B = b.points || [];
   let length = 0;
@@ -40,27 +46,62 @@ function incompatibleOverlap(a, b) {
     for (let j = 1; j < B.length; j++) {
       const otherAxis = Math.abs(B[j][1] - B[j - 1][1]) < 0.5 ? 0 : 1;
       if (axis !== otherAxis || Math.abs(A[i][1 - axis] - B[j][1 - axis]) >= 0.5) continue;
-      length += Math.max(0, Math.min(Math.max(A[i][axis], A[i - 1][axis]), Math.max(B[j][axis], B[j - 1][axis])) -
-        Math.max(Math.min(A[i][axis], A[i - 1][axis]), Math.min(B[j][axis], B[j - 1][axis])));
+      const overlap = Math.min(Math.max(A[i][axis], A[i - 1][axis]), Math.max(B[j][axis], B[j - 1][axis])) -
+        Math.max(Math.min(A[i][axis], A[i - 1][axis]), Math.min(B[j][axis], B[j - 1][axis]));
+      if (overlap <= 0) continue;
+      // 只豁免同一个物理端口向外的短引线，共用节点的两条线在远处重合仍是冲突。
+      const start = i === 1 && ((j === 1 && a.from === b.from && samePort(A[0], B[0])) ||
+        (j === B.length - 1 && a.from === b.to && samePort(A[0], B[j])));
+      const end = i === A.length - 1 && ((j === 1 && a.to === b.from && samePort(A[i], B[0])) ||
+        (j === B.length - 1 && a.to === b.to && samePort(A[i], B[j])));
+      length += Math.max(0, overlap - (Number(start) + Number(end)) * STUB);
     }
   }
-  const common = Number(a.from === b.from || a.from === b.to) +
-    Number(a.to !== a.from && (a.to === b.from || a.to === b.to));
-  return Math.max(0, length - common * STUB);
+  return length;
 }
 
-/** 摆位和路由使用同一口径，避免把无关线或不同样式的重叠算作合并收益。 */
-export function routeOverlapConflicts(edges) {
+export function routeBounds(points) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const [x, y] of points || []) {
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+export const boundsMeet = (a, b, margin = 0.5) => a.minX < b.maxX + margin && b.minX < a.maxX + margin &&
+  a.minY < b.maxY + margin && b.minY < a.maxY + margin;
+
+function overlapWithRouted(edge, routed) {
+  const bounds = routeBounds(edge.points);
   let length = 0;
-  const hits = new Map();
-  for (let i = 0; i < edges.length; i++) for (let j = i + 1; j < edges.length; j++) {
-    const overlap = incompatibleOverlap(edges[i], edges[j]);
+  for (const other of routed) {
+    if (boundsMeet(bounds, other.bounds)) length += incompatibleOverlap(edge, other.edge);
+  }
+  return length;
+}
+
+/** 逐对统计共线长度。布局评分只计不同线型的遮盖，局部几何检查也可包含同线型。 */
+export function routeOverlapConflicts(edges, { differentStylesOnly = false } = {}) {
+  let length = 0, styleLength = 0;
+  const hits = new Map(), byEdge = new Map();
+  const ordered = edges.map((edge) => ({ edge, style: edgeStyleKey(edge), ...routeBounds(edge.points) }));
+  if (differentStylesOnly && ordered.every((e) => e.style === ordered[0].style)) return { length, styleLength, hits, byEdge };
+  ordered.sort((a, b) => a.minX - b.minX);
+  for (let i = 0; i < ordered.length; i++) for (let j = i + 1; j < ordered.length; j++) {
+    const a = ordered[i], b = ordered[j];
+    if (b.minX >= a.maxX + 0.5) break;
+    if ((differentStylesOnly && a.style === b.style) || !boundsMeet(a, b)) continue;
+    const overlap = incompatibleOverlap(a.edge, b.edge);
     if (overlap < 0.5) continue;
     length += overlap;
-    for (const e of [edges[i], edges[j]]) for (const id of [e.from, e.to])
-      hits.set(id, (hits.get(id) || 0) + overlap);
+    if (a.style !== b.style) styleLength += overlap;
+    for (const e of [a.edge, b.edge]) {
+      byEdge.set(e, (byEdge.get(e) || 0) + overlap);
+      for (const id of [e.from, e.to]) hits.set(id, (hits.get(id) || 0) + overlap);
+    }
   }
-  return { length, hits };
+  return { length, styleLength, hits, byEdge };
 }
 
 // ---------------- 基础几何 ----------------
@@ -136,7 +177,7 @@ function vLineBlocked(seg, nodes, skip, clear = CLEAR) {
  * 折线是否穿过节点「内部」（贴着边界或落在端口点不算）。
  * pathBlockedByNodes 会跳过两端节点，因此端点自身被穿过时查不出来；这里补上。
  */
-function pathCrossesBody(points, n, eps = 0.5) {
+export function pathCrossesBody(points, n, eps = 0.5) {
   if (!points || points.length < 2) return false;
   const x0 = n.x + eps;
   const x1 = n.x + n.w - eps;
@@ -153,6 +194,12 @@ function pathCrossesBody(points, n, eps = 0.5) {
     }
   }
   return false;
+}
+
+function pathCrossesNodes(points, nodes) {
+  const { minX, minY, maxX, maxY } = routeBounds(points);
+  return nodes.some((n) => n.x < maxX && n.x + n.w > minX && n.y < maxY && n.y + n.h > minY &&
+    pathCrossesBody(points, n));
 }
 
 /** 折线是否穿过了自己的两个端点（源/目标本体） */
@@ -386,8 +433,7 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSid
         if (crossesEndpoints(points, a, b)) continue;
         const length = points.slice(1).reduce((sum, p, i) =>
           sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
-        const conflicts = ctx.currentEdge ? (ctx.routed || []).reduce((sum, e) =>
-          sum + incompatibleOverlap({ ...ctx.currentEdge, points }, e), 0) : 0;
+        const conflicts = ctx.currentEdge ? overlapWithRouted({ ...ctx.currentEdge, points }, ctx.routed) : 0;
         const score = length + points.length * 6 + conflicts * 20;
         if (!best || score < best.score) best = { points, score, conflicts };
       }
@@ -441,7 +487,7 @@ function routeOuterColumn(p0, p1, a, b, sa, sb, ctx) {
 // ---------------- 折线整理 ----------------
 
 /** 去掉零长度段、合并共线点，保证输出为严格正交折线 */
-function collapse(pts) {
+export function collapse(pts) {
   const dedup = [];
   for (const p of pts) {
     const n = dedup.length;
@@ -1196,13 +1242,13 @@ export function routeEdges(nodes, edges, opts = {}) {
       e.back = false;
       // ELK 的紧凑通道可能只有几像素余量；拖动时不能因安全间距而推翻整条路径。
       let blocked = opts.preservePaths
-        ? nodes.some((n) => pathCrossesBody(e.points, n))
+        ? pathCrossesNodes(e.points, nodes)
         : pathBlockedByNodes(e.points, nodes, new Set([a.id, b.id])) || crossesEndpoints(e.points, a, b);
       if (blocked && opts.preservePaths) {
         e.points = original;
         retargetCustom(e, a, b, true);
         e.points = collapse(e.points);
-        blocked = nodes.some((n) => pathCrossesBody(e.points, n));
+        blocked = pathCrossesNodes(e.points, nodes);
       }
       if (!blocked) {
         preserved.add(e);
@@ -1227,8 +1273,8 @@ export function routeEdges(nodes, edges, opts = {}) {
   }
 
   // ---- 共线合并：同一对节点、相同类型的调用边（不同调用行）只布一条折线 ----
-  // 类型决定颜色（direct/macro/fnptr/manual 各不同色），跨类型不合并，避免遮盖错色
-  const pairKey = (e) => e.from + '\u0000' + e.to + '\u0000' + edgeStyleKey(e);
+  // 可见线型与变更状态一致的调用可以共线。
+  const pairKey = (e) => [e.from, e.to, edgeStyleKey(e), e.fromSide || '', e.toSide || ''].join('\u0000');
   const pairFirst = new Map();
   const pairDups = [];
   for (const it of autos) {
@@ -1478,16 +1524,16 @@ export function routeEdges(nodes, edges, opts = {}) {
   for (const list of fanins.values()) routeFaninBus(list, ctx);
 
   // 先保留手工线和可直连的线，再把冲突的长线分开；四个边中点始终不变。
-  ctx.routed = [...(opts.existing?.edges || []), ...preserved];
+  ctx.routed = [...(opts.existing?.edges || []), ...preserved].map((edge) => ({ edge, bounds: routeBounds(edge.points) }));
   for (const it of items.slice().sort((a, b) => Number(b.straight) - Number(a.straight))) {
-    const overlap = ctx.routed.reduce((sum, e) => sum + incompatibleOverlap(it.e, e), 0);
+    const overlap = overlapWithRouted(it.e, ctx.routed);
     if (overlap > 0.5) {
       ctx.currentEdge = it.e;
       const alt = routeAroundNodes(it.a, it.b, it.sa, it.sb, ctx, it.e.fromSide, it.e.toSide);
-      if (alt && ctx.routed.reduce((sum, e) => sum + incompatibleOverlap({ ...it.e, points: alt }, e), 0) < overlap - 0.5)
+      if (alt && overlapWithRouted({ ...it.e, points: alt }, ctx.routed) < overlap - 0.5)
         it.e.points = alt;
     }
-    ctx.routed.push(it.e);
+    ctx.routed.push({ edge: it.e, bounds: routeBounds(it.e.points) });
   }
 
   // 重复边直接复用首条折线（展示上完全重合 = 合并为一条线）

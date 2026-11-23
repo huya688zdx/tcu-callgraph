@@ -1,3 +1,4 @@
+import { edgeCaption, isDataEdge } from './edge-flow.js';
 /**
  * 画布交互：命中测试、拖拽移动、连线、折线手柄、滚轮平移与缩放
  * 事件在模块加载时一次性绑定
@@ -12,8 +13,8 @@ import {
   edgePoints,
   distToSegment,
 } from './geometry.js';
-import { draw } from './render.js';
-import { stopCamAnim, panCam, zoomCam } from './camera.js';
+import { draw, panCanvas, finishPan } from './render.js';
+import { contentBounds, stopCamAnim, panCam, zoomCam } from './camera.js';
 import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
 import {
   selectNode,
@@ -22,21 +23,27 @@ import {
   setEdgeChange,
   CHANGE_ITEMS,
   EDGE_ITEMS,
+  COMPARISON_ITEMS,
 } from './menu.js';
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
 import { renderDetail, renderVars, revealInTree } from './panels.js';
 import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
 import { renderLabelPanel } from './label-panel.js';
+import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
+import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 function worldPos(e) {
-  const rect = els.cv.getBoundingClientRect();
+  const rect = els.cv.parentElement.getBoundingClientRect();
   return {
     x: (e.clientX - rect.left - cam.x) / cam.k,
     y: (e.clientY - rect.top - cam.y) / cam.k,
   };
 }
+
+// 浏览器会对屏幕坐标取整。去掉换算后的尾差，避免同一落点选出不同的绕线路径。
+const dragDelta = (pixels) => Math.round(pixels / cam.k * 1000) / 1000;
 
 function hitTest(e) {
   if (!state.view) return null;
@@ -81,22 +88,54 @@ function hitTitle(e) {
   return null;
 }
 
-function hitEdge(e) {
-  if (!state.view) return null;
+function hitEdges(e) {
+  if (!state.view) return [];
   const p = worldPos(e);
-  let best = null;
-  let bestD = 9 / cam.k;
+  const radius = 9 / cam.k, tie = 0.5 / cam.k;
+  let nearest = radius;
+  const hits = [];
   for (const edge of state.view.edges) {
     const pts = edgePoints(edge);
+    let distance = Infinity;
+    const limit = Math.min(radius, nearest + tie);
     for (let i = 0; i < pts.length - 1; i++) {
-      const d = distToSegment(p, pts[i], pts[i + 1]);
-      if (d < bestD || d === bestD && edge === state.selectedEdge) {
-        bestD = d;
-        best = edge;
-      }
+      const a = pts[i], b = pts[i + 1];
+      if (p.x < Math.min(a[0], b[0]) - limit || p.x > Math.max(a[0], b[0]) + limit ||
+          p.y < Math.min(a[1], b[1]) - limit || p.y > Math.max(a[1], b[1]) + limit) continue;
+      distance = Math.min(distance, distToSegment(p, a, b));
+      if (!distance) break;
     }
+    if (distance > limit) continue;
+    hits.push({ edge, distance });
+    nearest = Math.min(nearest, distance);
   }
-  return best;
+  return hits.filter((hit) => hit.distance <= nearest + tie).map((hit) => hit.edge);
+}
+
+function hitEdge(e) {
+  const hits = hitEdges(e);
+  return hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0] || null;
+}
+
+function pickEdgeAt(e, onPick, useSelection = false) {
+  const view = state.view, hits = hitEdges(e);
+  if (!hits.length) return false;
+  if (useSelection && hits.includes(state.selectedEdge)) onPick(state.selectedEdge);
+  else if (hits.length === 1) onPick(hits[0]);
+  else {
+    const kinds = { direct: '函数调用', fnptr: '函数指针', macro: '宏调用', manual: '手工连接',
+      var: '变量访问', 'df-read': '读取变量', 'df-write': '写入变量' };
+    const items = hits.map((edge) => ({
+      value: edge,
+      label: [edge.from + ' → ' + edge.to, kinds[edge.kind] || edge.kind,
+        edge.line > 0 && 'L' + edge.line, edge.change && edge.change !== 'existing' && statusLabel(edge.change)].filter(Boolean).join(' · '),
+    }));
+    els.tooltip.style.opacity = '0';
+    showMenu(e.clientX + 8, e.clientY + 8, t('edge.chooseAtPoint', { n: hits.length }), items, state.selectedEdge,
+      (edge) => { if (state.view === view && view.edges.includes(edge)) onPick(edge); });
+    els.ctxMenu.querySelector('button')?.focus({ preventScroll: true });
+  }
+  return true;
 }
 
 /** 双击解锁后，整段连线都可拖动，不局限于控制点附近。 */
@@ -170,10 +209,13 @@ function moveSeg(seg, x, y) {
  * 等价于 geometry.js 的 liveReroute(nodeId)，只是把 O(E) 的准备工作挪到了拖拽开始。
  */
 let dragCache = null;
+let moveFrame = 0;
+let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
 function selectEdge(edge) {
+  if (state.pairFlow) clearPairFlow();
   state.moveTarget = null;
   state.multiSelection = null;
   state.selected = null;
@@ -186,6 +228,9 @@ function selectEdge(edge) {
 
 /** 清掉所有拖拽态（不动连线预览）；pointerup 先取快照再调用 */
 function resetDragState() {
+  cancelAnimationFrame(moveFrame);
+  moveFrame = 0;
+  pendingMove = null;
   state.dragNode = null;
   state.dragBox = null;
   state.dragEnd = null;
@@ -252,9 +297,8 @@ els.cv.addEventListener('contextmenu', (e) => {
   if (n) {
     selectNode(n.id);
     if (n.kind === 'var') {
-      if (state.view?.comparison) return;
       // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
-      showMenu(e.clientX, e.clientY, n.name || n.id, CHANGE_ITEMS, n.change || 'existing', (v) =>
+      showMenu(e.clientX, e.clientY, n.name || n.id, state.view?.comparison ? COMPARISON_ITEMS : CHANGE_ITEMS, state.view?.comparison && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing', (v) =>
         setNodeChange(n, v)
       );
       return;
@@ -263,15 +307,12 @@ els.cv.addEventListener('contextmenu', (e) => {
     return;
   }
 
-  const edge = hitEdge(e);
-  if (edge) {
+  if (pickEdgeAt(e, (edge) => {
     selectEdge(edge);
-    if (state.view?.comparison) return;
-    showMenu(e.clientX, e.clientY, t('menu.edge'), EDGE_ITEMS, edge.change || 'existing', (v) =>
+    showMenu(e.clientX, e.clientY, t('menu.edge'), state.view?.comparison ? [{ value: 'auto', label: 'status.auto' }, ...EDGE_ITEMS] : EDGE_ITEMS, state.view?.comparison && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing', (v) =>
       setEdgeChange(edge, v)
     );
-    return;
-  }
+  }, true)) return;
 
   // 文件框 / 目录容器：定位到当前文件或当前目录
   const box = hitBox(e);
@@ -309,6 +350,14 @@ els.cv.addEventListener('pointerdown', (e) => {
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
   const comparing = Boolean(state.view?.comparison);
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+    const node = hitTest(e);
+    if (node) {
+      e.preventDefault(); document.activeElement?.blur(); void pickPairFlow(node.id);
+      els.tooltip.style.opacity = '0';
+      renderDetail(null); renderLabelPanel(); return;
+    }
+  }
 
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
   const lb = hitLabel(worldPos(e));
@@ -356,8 +405,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     if (moveReady(title.kind, title.box)) {
       pushHistory();
       state.dragBox = beginHierarchyMove(state.view, title);
-      state.dragBox.crossing = state.view.edges.filter((ed) =>
-        state.dragBox.ids.has(ed.from) !== state.dragBox.ids.has(ed.to));
+      if (state.dragBox.crossing.length) state.dragBox.stationarySegments = collectSegments(state.dragBox.stationary);
       state.dragStart = { x: e.clientX, y: e.clientY };
       els.cv.style.cursor = 'grabbing';
       els.cv.setPointerCapture(e.pointerId);
@@ -400,28 +448,35 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  const edge = hitEdge(e);
-  if (edge) { selectEdge(edge); return; }
+  if (pickEdgeAt(e, selectEdge)) return;
+  const editing = state.moveTarget;
   state.moveTarget = null;
   state.panning = true;
+  if (editing) draw({ geometryUnchanged: true });
   state.panMoved = false;
   state.last = { x: e.clientX, y: e.clientY };
+  state.dragStart = state.last;
   els.cv.classList.add('panning');
   els.cv.setPointerCapture(e.pointerId);
 });
 
-els.cv.addEventListener('pointermove', (e) => {
+function handlePointerMove(e) {
   if (state.dragBox) {
     const drag = state.dragBox;
     if (drag.view !== state.view) { cancelDrag(); return; }
     const dx = e.clientX - state.dragStart.x, dy = e.clientY - state.dragStart.y;
     if (Math.abs(dx) + Math.abs(dy) > 3) state.dragMoved = true;
     if (state.dragMoved) {
-      moveHierarchy(drag, dx / cam.k, dy / cam.k, e.shiftKey ? 0 : 8 / cam.k);
-      routeEdges(state.view.nodes, drag.crossing, {
-        existing: collectSegments(state.view.edges.filter((ed) => !drag.crossing.includes(ed))), preservePaths: true,
-      });
-      draw();
+      const changed = moveHierarchy(drag, dragDelta(dx), dragDelta(dy), e.shiftKey ? 0 : 8 / cam.k);
+      if (changed && drag.crossing.length) {
+        const moving = collectSegments(drag.internal);
+        const fixed = drag.stationarySegments;
+        routeEdges(state.view.nodes, drag.crossing, {
+          existing: { h: [...fixed.h, ...moving.h], v: [...fixed.v, ...moving.v], edges: [...fixed.edges, ...moving.edges] },
+          preservePaths: true,
+        });
+      }
+      draw({ geometryUnchanged: !changed });
     }
     return;
   }
@@ -445,7 +500,7 @@ els.cv.addEventListener('pointermove', (e) => {
     const n = hitTest(e);
     const other = state.dragEnd.which === 'from' ? state.dragEnd.edge.to : state.dragEnd.edge.from;
     state.dragEnd.hover = n && n.id !== other ? n : null;
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
@@ -462,11 +517,13 @@ els.cv.addEventListener('pointermove', (e) => {
   }
 
   if (state.dragNode) {
-    const rawDx = (e.clientX - state.dragStart.x) / cam.k;
-    const rawDy = (e.clientY - state.dragStart.y) / cam.k;
+    const dx = dragDelta(e.clientX - state.dragStart.x);
+    const dy = dragDelta(e.clientY - state.dragStart.y);
     if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) > 3) state.dragMoved = true;
     if (!state.dragMoved) return;
-    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + rawDx, state.dragStart.ny + rawDy);
+    const { x, y } = state.dragNode;
+    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + dx, state.dragStart.ny + dy);
+    if (x === state.dragNode.x && y === state.dragNode.y) return;
     // 从本次按下时的 ELK 路径调整端部，避免逐帧重新选面和改走廊。
     if (dragCache) {
       dragCache.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => p.slice()); });
@@ -478,18 +535,18 @@ els.cv.addEventListener('pointermove', (e) => {
 
   if (state.linkFrom) {
     state.linkPos = worldPos(e);
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
   if (state.panning) {
     const dx = e.clientX - state.last.x;
     const dy = e.clientY - state.last.y;
-    if (Math.abs(dx) + Math.abs(dy) > 3) state.panMoved = true;
-    cam.x += dx;
-    cam.y += dy;
+    const start = state.dragStart || state.last;
+    const previewBounds = state.panMoved ? null : contentBounds;
+    if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) > 3) state.panMoved = true;
     state.last = { x: e.clientX, y: e.clientY };
-    draw();
+    panCanvas(dx, dy, previewBounds);
     return;
   }
 
@@ -498,10 +555,11 @@ els.cv.addEventListener('pointermove', (e) => {
   if (next !== state.hover) {
     state.hover = next;
     els.cv.classList.toggle('over-node', !!next);
-    draw();
+    draw({ geometryUnchanged: true });
   }
   const title = next ? null : hitTitle(e);
-  const hoveredEdge = !n && !title ? hitEdge(e) : null;
+  const hits = !n && !title ? hitEdges(e) : [];
+  const hoveredEdge = hits[0];
   let cursor = title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
     : n ? (moveReady('node', n) ? 'move' : 'pointer') : hoveredEdge ? 'pointer' : '';
 
@@ -526,13 +584,38 @@ els.cv.addEventListener('pointermove', (e) => {
     els.tooltip.innerHTML = n
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
-      : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '对比连线（只读）' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+      : hits.length > 1 ? esc(t('edge.chooseAtPoint', { n: hits.length }))
+      : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+    if (n || hits.length === 1) {
+      const target = n || hoveredEdge;
+      els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
+    }
+    if (n) els.tooltip.innerHTML += '<br><span style="opacity:.7;font-size:11px">Ctrl+依次点击两个节点 追踪连线路径</span>';
   } else {
     els.tooltip.style.opacity = '0';
   }
+}
+
+function flushPointerMove() {
+  cancelAnimationFrame(moveFrame);
+  moveFrame = 0;
+  const move = pendingMove;
+  pendingMove = null;
+  if (move && move.view === state.view) handlePointerMove(move.event);
+}
+
+els.cv.addEventListener('pointermove', (e) => {
+  if (!(state.panning || state.dragBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
+    handlePointerMove(e);
+    return;
+  }
+  pendingMove = { event: e, view: state.view };
+  if (!moveFrame) moveFrame = requestAnimationFrame(flushPointerMove);
 });
 
 els.cv.addEventListener('pointerup', (e) => {
+  // 同一帧内松手也要应用最后的指针位置，再执行保存和收尾布线。
+  if (pendingMove?.event.pointerId === e.pointerId) flushPointerMove();
   // 先把本次手势的拖拽态取成快照，再统一清理：后面的分支只依赖快照，
   // 这样「清理」和「收尾」只有一处，pointercancel 也能复用同一套复位逻辑
   const dragEnd = state.dragEnd;
@@ -540,6 +623,8 @@ els.cv.addEventListener('pointerup', (e) => {
   const dragNode = state.dragNode;
   const dragBox = state.dragBox;
   const dragLabel = state.dragLabel;
+  const dragStart = state.dragStart;
+  const originalNodeRoutes = dragCache;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
   const panning = state.panning;
@@ -547,10 +632,14 @@ els.cv.addEventListener('pointerup', (e) => {
   resetDragState();
 
   if (dragBox) {
-    if (moved) {
+    if (dragBox.dx || dragBox.dy) {
+      // 松手时依据起始折线和最终位置布线，预览经过多少帧都得到同一结果。
+      for (const { edge, points } of dragBox.paths) {
+        if (dragBox.ids.has(edge.from) !== dragBox.ids.has(edge.to)) edge.points = points;
+      }
       fullReroute(dragBox.ids);
       pushHistory();
-    }
+    } else if (moved) cancelHierarchyMove(dragBox);
     draw();
     return;
   }
@@ -592,7 +681,10 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (dragNode) {
-    if (moved) {
+    if (moved && originalNodeRoutes) {
+      originalNodeRoutes.related.forEach((edge, i) => { edge.points = originalNodeRoutes.paths[i]; });
+    }
+    if (moved && (dragNode.x !== dragStart.nx || dragNode.y !== dragStart.ny)) {
       fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
       pushHistory();
     }
@@ -608,11 +700,9 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (panning) {
+    finishPan();
     if (!panMoved) {
-      const edge = hitEdge(e);
-      if (edge) {
-        selectEdge(edge);
-      } else {
+      if (!pickEdgeAt(e, selectEdge)) {
         state.selectedEdge = null;
         state.selectedLabel = null;
         selectNode(null); // 内部会收起节点详情并刷新标签面板
@@ -631,10 +721,11 @@ els.cv.addEventListener('lostpointercapture', cancelDrag);
 const nodeSelectionType = (n) => JSON.stringify([
   n.kind === 'var' ? 'var' : 'function', !!n.external,
   (n.color || (n.external ? THEME.node.external : THEME.fill[n.change] || THEME.fill.existing)).toLowerCase(),
+  n.kind === 'var' ? THEME.node.varDash : THEME.node.fnDash,
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
-  e.kind, e.kind === 'var' ? 'dashed' : 'solid',
-  e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
+  e.kind, isDataEdge(e) ? 'dashed' : 'solid',
+  e.change === 'added' ? THEME.edge.added : isDataEdge(e) ? THEME.edge.var : THEME.edge.call,
   e.change === 'deleted',
 ]);
 const labelSelectionType = (l) => JSON.stringify([
@@ -647,6 +738,7 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault();
     window.getSelection()?.removeAllRanges();
     if (!state.view || document.querySelector('.modal.show') || state.dragBox || state.dragNode || state.dragLabel || state.dragSeg || state.dragEnd) return;
+    if (state.pairFlow) clearPairFlow();
     const anchor = state.selectedLabel || state.selectedEdge || state.selected;
     if (!anchor) return;
     const node = state.view.nodes.find((n) => n.id === state.selected);
@@ -684,6 +776,8 @@ document.addEventListener('keydown', (e) => {
     state.moveTarget = null;
     cancelDrag();
     draw();
+  } else if (e.key === 'Escape' && state.pairFlow && !document.querySelector('.modal.show')) {
+    e.preventDefault(); e.stopImmediatePropagation(); clearPairFlow();
   } else if (state.multiSelection && !document.querySelector('.modal.show')) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -697,6 +791,7 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 els.cv.addEventListener('dblclick', (e) => {
+  if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }
   const n = hitTest(e);
   if (n) {
     selectNode(n.id);
@@ -713,12 +808,12 @@ els.cv.addEventListener('dblclick', (e) => {
     draw();
     return;
   }
-  const edge = hitEdge(e);
-  if (edge) {
+  hideMenu();
+  pickEdgeAt(e, (edge) => {
     selectEdge(edge);
     if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };
     draw();
-  }
+  }, true);
 });
 
 els.cv.addEventListener(
@@ -726,7 +821,7 @@ els.cv.addEventListener(
   (e) => {
     e.preventDefault();
     if (state.dragBox) return;
-    const rect = els.cv.getBoundingClientRect();
+    const rect = els.cv.parentElement.getBoundingClientRect();
     if (!e.ctrlKey) {
       const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? (e.shiftKey ? rect.width : rect.height) : 1;
       if (e.shiftKey) panCam(-(e.deltaY || e.deltaX) * unit, 0);

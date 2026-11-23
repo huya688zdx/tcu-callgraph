@@ -22,7 +22,7 @@ export function validNodeIds(model) {
 
 /** 当前模型里有效的连线 key 集合（与前端 edgeKey 一致） */
 export function validEdgeKeys(model) {
-  return new Set((model.edges || []).map((e) => `${e.from}->${e.to}:${e.line}`));
+  return new Set([...(model.edges || []), ...(model.headerEdges || [])].map((e) => `${e.from}->${e.to}:${e.line}`));
 }
 
 /**

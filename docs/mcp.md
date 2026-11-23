@@ -105,7 +105,7 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 ### 导出（readonly 即可用）
 | 工具 | 说明 |
 | --- | --- |
-| `cg_export_svg` | 当前视图导出 SVG（与界面同布局同配色），root 空则自动挑入口 |
+| `cg_export_svg` | 当前视图导出 SVG（按查询参数生成布局，使用固定配色，不读取浏览器自定义主题），root 空则自动挑入口 |
 | `cg_export_xlsx` | 全工程调用关系 Excel |
 | `cg_export_html` | 指定入口的交互式 HTML 图页 |
 

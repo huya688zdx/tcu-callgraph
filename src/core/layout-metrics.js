@@ -1,5 +1,6 @@
 // ELK 节点尺寸与连线度量工具。
-import { edgeStyleKey, routeOverlapConflicts, routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
+import { edgeStyleKey, canShareTrunk, routeBounds, boundsMeet, routeOverlapConflicts, routeEdges, collectSegments,
+  pathBlockedByNodes, pathCrossesBody, collapse, STUB } from './routing.js';
 
 export function textWidth(s) {
   let w = 0;
@@ -9,7 +10,7 @@ export function textWidth(s) {
   return w;
 }
 
-export function routeLengthAndCrossings(edges) {
+function measureLines(edges, geometryOnly = false) {
   const horizontal = [];
   const vertical = [];
   const pathKeys = new Set();
@@ -62,52 +63,170 @@ export function routeLengthAndCrossings(edges) {
     return total;
   };
   const length = unionLength(horizontal, 'y', ['x1', 'x2']) + unionLength(vertical, 'x', ['y1', 'y2']);
+  // 汇流候选只比较线长和拐点，无需反复计算全组交叉。
+  if (geometryOnly) return { length, bends };
 
   const intersections = new Set();
+  vertical.sort((a, b) => a.x - b.x);
   for (const h of horizontal) {
-    for (const v of vertical) {
-      if (v.x <= h.x1 + 0.5 || v.x >= h.x2 - 0.5 || h.y <= v.y1 + 0.5 || h.y >= v.y2 - 0.5) continue;
+    let lo = 0, hi = vertical.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (vertical[mid].x <= h.x1 + 0.5) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < vertical.length && vertical[i].x < h.x2 - 0.5; i++) {
+      const v = vertical[i];
+      if (h.y <= v.y1 + 0.5 || h.y >= v.y2 - 0.5) continue;
       const related = h.edge.from === v.edge.from || h.edge.from === v.edge.to || h.edge.to === v.edge.from || h.edge.to === v.edge.to;
       if (!related) intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
     }
   }
-  const overlapLength = routeOverlapConflicts(edges).length;
-  return { length, rawLength, sharedLength: Math.max(0, rawLength - length - overlapLength), overlapLength, crossings: intersections.size, bends };
+  return { length, rawLength, crossings: intersections.size, bends };
 }
 
-export function routeScore(edges) {
-  const m = routeLengthAndCrossings(edges);
-  return m.crossings * 40 + m.overlapLength / 20 + m.bends * 2 + m.rawLength / 200;
+export function routeLengthAndCrossings(edges, geometryOnly = false) {
+  const lines = measureLines(edges, geometryOnly);
+  if (geometryOnly) return lines;
+  const { length: overlapLength, styleLength: styleOverlapLength } = routeOverlapConflicts(edges);
+  // length 已按线型取并集，同一根干线上有再多调用也只画一段。
+  return { ...lines, sharedLength: Math.max(0, lines.rawLength - lines.length), overlapLength, styleOverlapLength };
 }
 
-/** 只试最绕的少数边，不动节点，也不覆盖手工折线或指定端口。 */
-export function improveEdgeRoutes(view, subset) {
+function layoutMetrics(edges) {
+  const { length: styleOverlapLength } = routeOverlapConflicts(edges, { differentStylesOnly: true });
+  return { ...measureLines(edges), styleOverlapLength };
+}
+
+function scoreMetrics(m) {
+  return m.crossings * 40 + m.styleOverlapLength / 20 + m.bends * 2 + m.length / 50 + m.rawLength / 200;
+}
+
+export const routeScore = (edges) => scoreMetrics(layoutMetrics(edges));
+
+/** 保留同线型的公共干线，处理不同线型相互遮盖及跨区绕行，只改动 subset。 */
+export function improveEdgeRoutes(view, subset, simplify = () => true) {
+  if (!subset.length) return;
   const detour = (e) => {
     const p = e.points;
     let length = 0;
     for (let i = 1; i < p.length; i++) length += Math.abs(p[i][0] - p[i - 1][0]) + Math.abs(p[i][1] - p[i - 1][1]);
     return length - Math.abs(p.at(-1)[0] - p[0][0]) - Math.abs(p.at(-1)[1] - p[0][1]);
   };
-  const edges = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.points.length > 2)
-    .sort((a, b) => detour(b) - detour(a)).slice(0, 6);
+  const { byEdge } = routeOverlapConflicts(view.edges, { differentStylesOnly: true });
+  const ranked = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2)
+    .map((edge) => ({ edge, overlap: byEdge.get(edge) || 0, detour: detour(edge) }))
+    .filter(({ edge, overlap, detour }) => overlap || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))
+    .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour).slice(0, 6);
+  if (!ranked.length) return;
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
-  let metrics = routeLengthAndCrossings(view.edges), best = routeScore(view.edges);
-  for (const edge of edges) {
+  const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
+  for (const { edge } of ranked) {
     const a = byId.get(edge.from), b = byId.get(edge.to);
-    if (a === b) continue;
     const right = b.x + b.w / 2 >= a.x + a.w / 2, below = b.y + b.h / 2 >= a.y + a.h / 2;
     const horizontal = [right ? 'right' : 'left', right ? 'left' : 'right'];
     const vertical = [below ? 'bottom' : 'top', below ? 'top' : 'bottom'];
     const others = view.edges.filter((e) => e !== edge);
+    const existing = collectSegments(others);
+    const candidates = [];
     for (const [fromSide, toSide] of [[vertical[0], horizontal[1]], [horizontal[0], vertical[1]], vertical, horizontal]) {
-      const candidate = { ...edge, fromSide, toSide, points: edge.points.map((p) => [...p]) };
-      routeEdges(view.nodes, [candidate], { existing: collectSegments(others) });
-      if (candidate.blocked || pathBlockedByNodes(candidate.points, view.nodes, new Set([edge.from, edge.to]))) continue;
-      const trial = [...others, candidate], next = routeLengthAndCrossings(trial);
-      if (next.crossings > metrics.crossings || next.overlapLength > metrics.overlapLength + 0.5) continue;
-      const score = routeScore(trial);
+      const candidate = { ...edge, fromSide, toSide };
+      routeEdges(view.nodes, [candidate], { existing });
+      if (candidate.blocked || candidate.points.some(([x, y]) => (view.width != null && (x < 0 || x > view.width)) ||
+        (view.height != null && (y < 0 || y > view.height)))) continue;
+      candidates.push(candidate);
+    }
+    if (!candidates.length) continue;
+    // 只改变一条线。比较原线与全部候选附近的同一批边，远处边对分差的贡献为零。
+    const boxes = [bounds.get(edge), ...candidates.map((e) => routeBounds(e.points))];
+    const nearby = others.filter((e) => boxes.some((box) => boundsMeet(box, bounds.get(e), 1)));
+    const current = layoutMetrics([...nearby, edge]);
+    let best = scoreMetrics(current), bestStyleOverlap = current.styleOverlapLength;
+    for (const candidate of candidates) {
+      const next = layoutMetrics([...nearby, candidate]);
+      // 只为解开重线允许一个新的交点，避免从拥挤的公共通道中逐条抽线穿过整图。
+      const fewerConflicts = next.styleOverlapLength < current.styleOverlapLength - 0.5;
+      if (next.styleOverlapLength > bestStyleOverlap + 0.5 || next.crossings > current.crossings + Number(fewerConflicts)) continue;
+      const score = scoreMetrics(next);
       // 坐标变换会带来浮点尾差；等价路径保留原线，避免 GUI 与离线拖动选出不同连接面。
-      if (score < best - 1e-6) { edge.points = candidate.points; best = score; metrics = next; }
+      if (next.styleOverlapLength < bestStyleOverlap - 0.5 || score < best - 1e-6) {
+        edge.points = candidate.points;
+        best = score;
+        bestStyleOverlap = next.styleOverlapLength;
+      }
+    }
+    bounds.set(edge, routeBounds(edge.points));
+  }
+}
+
+/** 同源或同目标连线复用干线，允许延伸已有通道接入平行分支。 */
+export function mergeSharedRoutes(view, subset = view.edges) {
+  const affected = new Set(subset), nodes = new Map(view.nodes.map((n) => [n.id, n]));
+  if (!affected.size) return;
+  const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
+  const cost = (edges) => { const m = routeLengthAndCrossings(edges, true); return m.length + STUB * m.bends; };
+  let viewCost;
+  const length = (pts) => pts.slice(1).reduce((sum, p, i) => sum + Math.abs(p[0] - pts[i][0]) + Math.abs(p[1] - pts[i][1]), 0);
+  for (const role of ['from', 'to']) {
+    const groups = new Map();
+    for (const e of view.edges) {
+      if (e.custom || e.fromSide || e.toSide || e.from === e.to || !e.points?.length) continue;
+      const key = e[role] + '|' + edgeStyleKey(e);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(e);
+    }
+    for (const edges of groups.values()) {
+      if (edges.length < 2 || !edges.some((e) => affected.has(e))) continue;
+      let groupCost = cost(edges);
+      for (const edge of edges.filter((e) => affected.has(e)).sort((a, b) => b.points.length - a.points.length)) {
+        const q = role === 'from' ? edge.points : edge.points.slice().reverse();
+        let best = null, gain = 0;
+        const originalLength = length(edge.points);
+        // 共用端点且样式相同的边可以汇流；其他边逐对检查，避免每个候选都重算全图交叉。
+        const conflicts = new Map();
+        // 只比较邻近的少量分支，避免大扇出在拖动松手时全组两两枚举。
+        const end = (e) => role === 'from' ? e.points.at(-1) : e.points[0];
+        const distance = (e) => Math.abs(end(e)[0] - end(edge)[0]) + Math.abs(end(e)[1] - end(edge)[1]);
+        const donors = edges.filter((e) => e !== edge).sort((a, b) => distance(a) - distance(b)).slice(0, 8);
+        for (const donor of donors) {
+          const p = role === 'from' ? donor.points : donor.points.slice().reverse();
+          const before = cost([donor, edge]);
+          for (let i = 1; i < p.length; i++) for (let j = 1; j < q.length; j++) {
+            const ph = Math.abs(p[i][1] - p[i - 1][1]) < 0.5, qh = Math.abs(q[j][1] - q[j - 1][1]) < 0.5;
+            if (ph === qh) continue;
+            const at = ph ? [q[j][0], p[i][1]] : [p[i][0], q[j][1]];
+            // 允许延伸共用通道，但接入点必须落在原分支上。
+            if (![0, 1].every((axis) => at[axis] >= Math.min(q[j - 1][axis], q[j][axis]) - 1e-6 &&
+                at[axis] <= Math.max(q[j - 1][axis], q[j][axis]) + 1e-6)) continue;
+            let points = collapse([...p.slice(0, i), at, ...q.slice(j)]);
+            if (role === 'to') points.reverse();
+            const next = before - cost([donor, { ...edge, points }]);
+            if (next <= gain + 0.5 || length(points) > originalLength + 0.5 ||
+                pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) ||
+                pathCrossesBody(points, nodes.get(edge.from)) || pathCrossesBody(points, nodes.get(edge.to))) continue;
+            const candidate = { ...edge, points }, box = routeBounds(points);
+            if (view.edges.some((other) => {
+              if (other === edge || !boundsMeet(box, bounds.get(other)) || canShareTrunk(edge, other)) return false;
+              const trial = routeLengthAndCrossings([candidate, other]);
+              if (trial.overlapLength <= 0.5 && !trial.crossings) return false;
+              if (!conflicts.has(other)) conflicts.set(other, routeLengthAndCrossings([edge, other]));
+              const old = conflicts.get(other);
+              return trial.overlapLength > old.overlapLength + 0.5 || trial.crossings > old.crossings;
+            })) continue;
+            best = points; gain = next;
+          }
+        }
+        if (!best) continue;
+        const next = cost(edges.map((e) => e === edge ? { ...e, points: best } : e));
+        // 同目标汇流也不能拆散其他同源组已有的干线。
+        if (next >= groupCost - 0.5) continue;
+        viewCost ??= cost(view.edges);
+        const total = cost(view.edges.map((e) => e === edge ? { ...e, points: best } : e));
+        if (total < viewCost - 0.5) {
+          edge.points = best; groupCost = next; viewCost = total;
+          bounds.set(edge, routeBounds(best));
+        }
+      }
     }
   }
 }

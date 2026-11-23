@@ -269,7 +269,9 @@ fileInput?.addEventListener('change', async () => {
     hint(`${t('session.importFailed')}：文件不是合法 JSON`);
     return;
   }
-  const r = await api.importSession(payload);
+  const ok = await confirmDialog({ title: '导入会话', message: '导入会覆盖同名的本地标注、布局和书签。确定继续吗？' });
+  if (!ok) return;
+  const r = await api.importSession(payload).catch((error) => ({ ok: false, error: error.message }));
   if (!r || !r.ok) {
     hint(`${t('session.importFailed')}：${r?.error || ''}`);
     return;

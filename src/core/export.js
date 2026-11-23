@@ -1,3 +1,4 @@
+import { edgeCaption, isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
 /**
  * 导出：Excel 多 sheet / 单文件 HTML / SVG
  */
@@ -13,7 +14,7 @@ export function buildSVGFromLayout(laid) {
   const W = laid.width + pad * 2;
   const H = laid.height + pad * 2;
   const out = [];
-  const C = { direct: '#9A9890', macro: '#D85A30', fnptr: '#7F77DD', unknown: '#C9C7BE' };
+  const C = { direct: '#2C2C2A', var: '#2C2C2A', added: '#D9303E' };
 
   out.push(
     `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${-pad} ${-pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
@@ -30,20 +31,21 @@ export function buildSVGFromLayout(laid) {
 
   for (const e of laid.edges) {
     const d = roundedPathD(e.points, 7);
-    const c = C[e.kind] || C.direct;
-    const dash = e.kind !== 'direct' ? ' stroke-dasharray="5 3"' : '';
+    const style = e.change === 'added' ? 'added' : isDataEdge(e) ? 'var' : 'direct';
+    const c = C[style];
+    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
     out.push(
-      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in C ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 
   for (const n of laid.nodes) {
-    out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.name)}">`);
+    out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.displayName || n.name)}">`);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="#fff" stroke="#B5D4F4" stroke-width="1"/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${{existing:'#CCFFCC',modified:'#FFFF99',added:'#FFCCFF',deleted:'#BFBFBF'}[n.change] || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.name)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? '外部符号' : `${n.file}:${n.line}`)}</text>`
@@ -100,15 +102,20 @@ export async function exportHtml(model, outPath, opts = {}) {
     },
     nodes: laid.nodes.map((n) => ({
       id: n.id,
-      name: n.name,
+      name: n.displayName || n.name,
       file: n.file,
       line: n.line,
+      change: n.change,
+      detectedChange: n.detectedChange,
+      statusSource: n.statusSource,
       fanIn: (model._index.inAdj.get(n.id) || []).length,
       fanOut: (model._index.outAdj.get(n.id) || []).length,
     })),
     edges: laid.edges.map((e) => ({
       from: e.from,
       to: e.to,
+      dataEdge: isDataEdge(e),
+      caption: edgeCaption(e, id => model._index.byId.get(id)?.name || id),
       callee: e.callee,
       kind: e.kind,
       line: e.line,
@@ -204,11 +211,13 @@ function select(id){
   const info = document.getElementById('info');
   if (!id) { info.textContent = '点击图中节点查看'; document.querySelectorAll('path').forEach(p => p.classList.remove('hit')); return; }
   const n = DATA.nodes.find(x => x.id === id);
-  const out = DATA.edges.filter(e => e.from === id);
-  const inc = DATA.edges.filter(e => e.to === id);
+  const out = DATA.edges.filter(e => !e.dataEdge && e.from === id);
+  const inc = DATA.edges.filter(e => !e.dataEdge && e.to === id);
+  const data = DATA.edges.filter(e => e.dataEdge && (e.from === id || e.to === id));
   const chip = e => e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : '';
   info.innerHTML = '<div style="font-weight:500;font-size:13px;color:#2C2C2A;margin-bottom:2px">' + escHtml(n.name) + '</div>' +
     '<div style="margin-bottom:8px">' + escHtml(n.file) + ':' + n.line + ' · ↑' + n.fanIn + ' ↓' + n.fanOut + '</div>' +
+    (data.length ? '<div>数据流向</div>' + data.map(e => '<div>' + escHtml(e.caption) + '</div>').join('') : '') +
     (out.length ? '<div style="margin-bottom:2px">调用：</div>' + out.map(e => '<div>→ ' + escHtml(e.callee) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '') +
     (inc.length ? '<div style="margin-top:6px;margin-bottom:2px">被调用：</div>' + inc.map(e => '<div>← ' + escHtml((DATA.nodes.find(x => x.id === e.from) || {}).name) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '');
   document.querySelectorAll('path[data-from]').forEach(p => {

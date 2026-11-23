@@ -296,25 +296,26 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
         let j = i - 1;
         while (j >= 0 && tokens[j].t !== 'id') j--;
         const recv = j >= 0 ? tokens[j].v : null;
-        const table = recv ? ctx.fnptr.get(recv) : null;
-        if (table && table[member.v]) {
+        const table = recv ? ctx.fnptr?.get(recv) : null;
+        if (table && Object.hasOwn(table, member.v)) {
           out.push({
             callee: table[member.v],
             kind: 'fnptr',
-            line: member.line,
+            line: member.line, col: member.col,
             cond: member.cond,
             via: `${recv}.${member.v}`,
-            macroChain: macroChain.slice(),
+            macroChain: (member.macroOrigins || macroChain).slice(),
           });
         } else {
           out.push({
             callee: null,
+            receiver: recv,
             member: member.v,
             kind: 'unknown',
-            line: member.line,
+            line: member.line, col: member.col,
             cond: member.cond,
             via: recv ? `${recv}.${member.v}` : member.v,
-            macroChain: macroChain.slice(),
+            macroChain: (member.macroOrigins || macroChain).slice(),
           });
         }
         i += 2;
@@ -326,17 +327,22 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (KEYWORDS.has(tk.v)) continue;
 
     // 宏调用：展开后继续扫
-    if (ctx.macros.has(tk.v) && !macroChain.includes(tk.v)) {
-      const m = ctx.macros.get(tk.v);
+    const m = ctx.macros.get(tk.v);
+    if (m && !macroChain.includes(tk.v)) {
       if (m.params === null) {
-        const expanded = expandSeq([tk], ctx.macros);
+        // 对象宏也可能是函数别名：展开时必须带上调用括号和实参，
+        // 否则只剩一个裸函数名，递归扫描无法识别调用。
+        const call = tokens[i + 1]?.v === '(' ? collectArgs(tokens, i + 1) : null;
+        const next = call?.[0] ? call[1] : i + 1;
+        const expanded = expandSeq(tokens.slice(i, next).map((t) => ({ ...t, macroOrigins: t.macroOrigins || [] })), ctx.macros);
         scanCalls(expanded, ctx, out, [...macroChain, tk.v]);
+        i = next - 1;
         continue;
       }
       if (tokens[i + 1] && tokens[i + 1].v === '(') {
         const [args, next] = collectArgs(tokens, i + 1);
         if (args) {
-          const expanded = expandSeq(tokens.slice(i, next), ctx.macros);
+          const expanded = expandSeq(tokens.slice(i, next).map((t) => ({ ...t, macroOrigins: t.macroOrigins || [] })), ctx.macros);
           scanCalls(expanded, ctx, out, [...macroChain, tk.v]);
           i = next - 1;
           continue;
@@ -348,13 +354,14 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (tokens[i + 1] && tokens[i + 1].v === '(') {
       const prev = tokens[i - 1];
       if (prev && (prev.v === '.' || prev.v === '->')) continue;
+      const origins = tk.macroOrigins || macroChain;
       out.push({
         callee: tk.v,
-        kind: macroChain.length ? 'macro' : 'direct',
-        line: tk.line,
+        kind: origins.length ? 'macro' : 'direct',
+        line: tk.line, col: tk.col,
         cond: tk.cond,
-        via: macroChain.length ? macroChain.join(' > ') : undefined,
-        macroChain: macroChain.slice(),
+        via: origins.length ? origins.join(' > ') : undefined,
+        macroChain: origins.slice(),
       });
     }
   }

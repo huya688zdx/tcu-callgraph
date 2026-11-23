@@ -5,10 +5,15 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { collectTaskEvidence, applyTaskEvidence } from './task-periods.js';
+import { assignCallGroups } from './call-sequence.js';
+import { taskDeclarations } from './task-declarations.js';
 import { lex } from './lexer.js';
-import { preprocess } from './preproc.js';
+import { fileMacroScope, preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
 import { parseDot, modelFromDot } from './dot.js';
+import { headerSymbols } from './header-symbols.js';
+import { callNestingTokens, hasNestedCall } from './detect-tasks.js';
 
 const SRC_EXT = /\.(c|cc|cpp)$/i;
 const HDR_EXT = /\.(h|hh|hpp)$/i;
@@ -156,23 +161,23 @@ function writeKind(tokens, i) {
   return null;
 }
 
-/** 扫描函数体里对全局变量的读写 */
-function scanVarAccess(bodyTokens, lookup) {
+/** 先按名字归并引用与首次出现的行号，等全局定义收齐后再解析变量身份。 */
+function variableMentions(bodyTokens) {
   const hits = new Map();
   for (let i = 0; i < bodyTokens.length; i++) {
     const t = bodyTokens[i];
     if (t.t !== 'id') continue;
-    const id = lookup(t.v);
-    if (!id) continue;
+    const name = t.v;
+    let rec = hits.get(name);
+    if (rec?.read && rec.write) continue;
     const prev = bodyTokens[i - 1];
     if (prev && (prev.v === '.' || prev.v === '->')) continue; // 成员名
     const next = bodyTokens[i + 1];
     if (next && next.v === '(') continue; // 函数调用
 
-    let rec = hits.get(id);
     if (!rec) {
-      rec = { id, name: t.v, line: t.line, read: false, write: false };
-      hits.set(id, rec);
+      rec = { name, line: t.line, read: false, write: false };
+      hits.set(name, rec);
     }
     const kind = writeKind(bodyTokens, i);
     if (kind === 'write') rec.write = true;
@@ -213,22 +218,22 @@ export function listSourceFiles(root) {
 }
 
 /**
- * 扫描源码文件清单（带大小与 mtime），供解析缓存算 key。
- * 比 listSourceFiles 多做一次 stat：解析本身要读整个文件，多这一次 stat 可以忽略，
- * 但 mtime 是判断「文件到底变没变」最可靠的低成本信号。
+ * 一次扫描取得路径、大小与 mtime，供解析缓存和冷启动共用。
  */
-export function scanSources(root) {
+export function scanSources(root, warnings = []) {
   const out = [];
   for (const abs of listSourceFiles(root)) {
+    const rel = path.relative(root, abs).replace(/\\/g, '/');
     let st;
     try {
       st = fs.statSync(abs);
-    } catch {
-      continue; // 扫描期间被删 / 无权限，交给 buildIndex 自己记 warning
+    } catch (err) {
+      warnings.push({ file: rel, error: `读取失败：${err.message}` });
+      continue;
     }
     out.push({
       abs,
-      rel: path.relative(root, abs).replace(/\\/g, '/'),
+      rel,
       bytes: st.size,
       mtimeMs: Math.round(st.mtimeMs),
       isHeader: HDR_EXT.test(abs),
@@ -256,6 +261,7 @@ export function rebuildIndex(model) {
     byName.get(fn.name).push(fn);
   }
   for (const ex of externals) byId.set(ex.id, ex);
+  for (const symbol of model.headerSymbols || []) byId.set(symbol.id, symbol);
   for (const v of model.variables || []) byId.set(v.id, v);
 
   const outAdj = new Map();
@@ -290,36 +296,42 @@ export function rebuildIndex(model) {
  * @param {string} root 工程根目录
  * @returns {object} model
  */
-export function buildIndex(root, sourceFiles = null) {
+export function buildIndex(root, sourceFiles = null, scan = null) {
   const t0 = Date.now();
   // 比较时仅替换文件来源，符号身份和层级仍相对于总代码目录。
-  const files = sourceFiles ? [...sourceFiles] : listSourceFiles(root).map((abs) => [path.relative(root, abs).replace(/\\/g, '/'), abs]);
-  const headers = files.filter(([rel]) => HDR_EXT.test(rel));
-  const sources = files.filter(([rel]) => !HDR_EXT.test(rel));
+  const files = scan?.files ?? (sourceFiles
+    ? [...sourceFiles].map(([rel, abs]) => ({ rel, abs, isHeader: HDR_EXT.test(rel) }))
+    : listSourceFiles(root).map((abs) => ({ rel: path.relative(root, abs).replace(/\\/g, '/'), abs, isHeader: HDR_EXT.test(abs) })));
+  const headers = files.filter((file) => file.isHeader);
+  const sources = files.filter((file) => !file.isHeader);
 
-  const macros = new Map();
   const parsed = [];
   const includes = [];
-  const warnings = [];
+  const warnings = [...(scan?.warnings ?? [])];
+  const macros = new Map();
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
   const macroDefs = new Map();
   const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-  /** 把头文件解析后的宏表并回全局表（含 #undef 带来的删除效果） */
-  const mergeMacros = (target, snap) => {
-    for (const name of [...target.keys()]) if (!snap.has(name)) target.delete(name);
-    for (const [name, def] of snap) target.set(name, def);
-  };
+  const functions = [];
+  const functionRecords = [];
+  const fnptrTables = new Map();
+  const seenFnId = new Set();
+  const varById = new Map();
 
-  const parseFile = (rel, abs, isHeader) => {
+  const parseFile = ({ rel, abs, isHeader, bytes }) => {
     let buf;
     try {
-      const size = fs.statSync(abs).size;
+      const size = bytes ?? fs.statSync(abs).size;
       if (size > MAX_FILE_BYTES) {
         warnings.push({ file: rel, error: `文件过大（${(size / 1048576).toFixed(1)} MB），已跳过` });
         return;
       }
       buf = fs.readFileSync(abs);
+      if (buf.length > MAX_FILE_BYTES) {
+        warnings.push({ file: rel, error: `文件过大（${(buf.length / 1048576).toFixed(1)} MB），已跳过` });
+        return;
+      }
     } catch (err) {
       // 单个文件读失败（权限 / 被占用 / 扫描期间被删）不应让整次索引失败
       warnings.push({ file: rel, error: `读取失败：${err.message}` });
@@ -334,40 +346,58 @@ export function buildIndex(root, sourceFiles = null) {
       return;
     }
     const src = decodeSource(buf);
-    const toks = lex(src, rel);
-    // 每个文件一份宏表快照：本文件的 #define/#undef 只作用于本文件，
-    // 避免 a.c 里定义的宏泄漏到 b.c；头文件解析完再并回全局表，
-    // 保证「头文件 → 源文件」这一方向的累积仍然成立。
-    const fileMacros = new Map(macros);
-    const { tokens, includes: inc } = preprocess(toks, fileMacros, rel);
-    if (isHeader) mergeMacros(macros, fileMacros);
-    // 本文件自己定义的宏进入清单（继承来的头文件宏不算，避免重复）
-    for (const def of fileMacros.values()) if (def.file === rel) macroDefs.set(def.name, def);
+    const original = lex(src, rel);
+    const taskDefs = taskDeclarations(src, original);
+    const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
+    const fileMacros = fileMacroScope(macros);
+    const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
+    for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
-    parsed.push({ abs, rel, tokens, macros: fileMacros, isHeader, bytes: src.length });
-  };
-
-  // 先头文件（宏定义先入表），再源文件
-  for (const [rel, abs] of headers) parseFile(rel, abs, true);
-  for (const [rel, abs] of sources) parseFile(rel, abs, false);
-
-  const functions = [];
-  const fnptrTables = new Map();
-  const seenFnId = new Set();
-
-  for (const p of parsed) {
-    for (const fn of findFunctions(p.tokens, p.rel)) {
+    for (const fn of findFunctions(tokens, rel)) {
+      if (taskDefs.names.has(fn.name)) fn.taskDeclaration = true;
       fn.id = `${fn.file}::${fn.name}`;
       // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
-      fn.bodyTokens = p.tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      const calls = [];
+      scanCalls(body, { macros: fileMacros }, calls);
+      for (const call of calls) {
+        call.macroDefinitions = (call.macroChain || []).map((name) => {
+          const def = fileMacros.get(name);
+          return def ? `header::${def.file}::${name}` : null;
+        }).filter(Boolean);
+      }
+      const deferred = calls.length > 1 && calls.some((c) => c.kind === 'unknown');
+      if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
+      const nesting = deferred ? callNestingTokens(body) : null;
+      assignCallGroups(body, calls);
+      functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body),
+        taskEvidence: collectTaskEvidence(fn, body) });
       functions.push(fn);
     }
-    for (const [name, map] of findFnPtrTables(p.tokens)) {
+    for (const [name, map] of findFnPtrTables(tokens)) {
       fnptrTables.set(name, { ...map });
     }
-  }
+    for (const v of findGlobalVars(tokens, rel)) {
+      // static 变量按文件区分；普通全局变量跨文件同名即同一个
+      v.id = v.isStatic ? `var::${rel}::${v.name}` : `var::${v.name}`;
+      v.kind = 'var';
+      v.params = [];
+      const prev = varById.get(v.id);
+      // extern 只是声明，真实定义优先
+      if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
+    }
+    if (isHeader) for (const [name, def] of fileMacros.changes) {
+      if (def) macros.set(name, def);
+      else macros.delete(name);
+    }
+    parsed.push({ rel, isHeader, bytes: src.length, macroChanges: isHeader ? fileMacros.changes : null });
+  };
+
+  // 每个文件只词法分析一次。宏按头文件顺序生效，跨文件符号在定义收齐后绑定。
+  for (const file of headers) parseFile(file);
+  for (const file of sources) parseFile(file);
 
   const byId = new Map();
   const byName = new Map();
@@ -376,21 +406,7 @@ export function buildIndex(root, sourceFiles = null) {
     if (!byName.has(fn.name)) byName.set(fn.name, []);
     byName.get(fn.name).push(fn);
   }
-
-  // 全局 / 静态变量：作为独立节点参与绘图，函数读写它们时连虚线
   const variables = [];
-  const varById = new Map();
-  for (const p of parsed) {
-    for (const v of findGlobalVars(p.tokens, p.rel)) {
-      // static 变量按文件区分；普通全局变量跨文件同名即同一个
-      v.id = v.isStatic ? `var::${p.rel}::${v.name}` : `var::${v.name}`;
-      v.kind = 'var';
-      v.params = [];
-      const prev = varById.get(v.id);
-      // extern 只是声明，真实定义优先
-      if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
-    }
-  }
   for (const v of varById.values()) {
     variables.push(v);
     byId.set(v.id, v);
@@ -401,15 +417,13 @@ export function buildIndex(root, sourceFiles = null) {
     if (!all || !all.length) return `ext::${name}`;
     const local = all.filter((f) => f.file === fromFile);
     if (local.length === 1) return local[0].id;
-    if (all.length === 1) return all[0].id;
+    if (local.length > 1) return `ext::${name}`;
     const nonStatic = all.filter((f) => !f.isStatic);
     if (nonStatic.length === 1) return nonStatic[0].id;
-    return (local[0] || all[0]).id;
+    return `ext::${name}`;
   };
 
   const edges = [];
-  // 每个函数用它所属文件的宏快照展开，避免跨文件互相污染
-  const macrosByFile = new Map(parsed.map((p) => [p.rel, p.macros]));
 
   // 变量名 → 节点：优先本文件的 static，其次同名全局
   const varByName = new Map();
@@ -426,36 +440,48 @@ export function buildIndex(root, sourceFiles = null) {
     return (glob || list[0]).id;
   };
 
-  for (const fn of functions) {
-    const raw = [];
-    scanCalls(fn.bodyTokens, { macros: macrosByFile.get(fn.file) || macros, fnptr: fnptrTables }, raw);
-    for (const c of raw) {
-      if (!c.callee) continue;
+  for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
+    const edgeStart = edges.length;
+    for (const call of calls) {
+      const table = call.receiver ? fnptrTables.get(call.receiver) : null;
+      const callee = call.callee || (table && Object.hasOwn(table, call.member) ? table[call.member] : null);
+      if (!callee) continue;
       edges.push({
         from: fn.id,
-        to: resolveCallee(c.callee, fn.file),
-        callee: c.callee,
-        kind: c.kind,
-        line: c.line,
-        cond: c.cond,
-        via: c.via,
-        macroChain: c.macroChain,
+        to: resolveCallee(callee, fn.file),
+        callee,
+        kind: call.kind === 'unknown' ? 'fnptr' : call.kind,
+        line: call.line, col: call.col, orderGroup: call.orderGroup,
+        cond: call.cond,
+        via: call.via,
+        macroChain: call.macroChain,
+        macroDefinitions: call.macroDefinitions,
       });
     }
-    // 全局变量读写：画成虚线，同时记录方向供数据流分析
-    const access = scanVarAccess(fn.bodyTokens, (n) => lookupVar(fn.file, n));
-    fn.varAccess = access;
-    for (const a of access) {
+    const resolvedCalls = edges.slice(edgeStart);
+    if (nesting && resolvedCalls.length > 1 && hasNestedCall(nesting, resolvedCalls)) fn.hasNestedCalls = true;
+    // 未绑定的成员调用不会形成边，清除其占用的序号，同时保留嵌套实参的先后次序。
+    const groups = [...new Set(resolvedCalls.map(e => e.orderGroup))].sort((a, b) => a - b);
+    const ordinal = new Map(groups.map((group, index) => [group, index + 1]));
+    for (const edge of resolvedCalls) edge.orderGroup = ordinal.get(edge.orderGroup);
+    applyTaskEvidence(fn, taskEvidence, byName);
+    fn.varAccess = [];
+    for (const mention of mentions) {
+      const id = lookupVar(fn.file, mention.name);
+      if (!id) continue;
+      const { name, line, read, write } = mention;
+      fn.varAccess.push({ id, name, line, read, write });
       edges.push({
         from: fn.id,
-        to: a.id,
-        callee: a.name,
+        to: id,
+        callee: name,
         kind: 'var',
-        line: a.line,
-        via: a.write ? (a.read ? '读写' : '写') : '读',
+        line,
+        via: write ? (read ? '读写' : '写') : '读',
       });
     }
   }
+  functionRecords.length = 0;
 
   // 数据流索引：变量 → 写它的函数 / 读它的函数
   const varWriters = new Map();
@@ -503,6 +529,26 @@ export function buildIndex(root, sourceFiles = null) {
   }
 
   const allNodes = new Map([...byId, ...externals]);
+  const callsByMacro = new Map();
+  for (const e of edges.filter((edge) => edge.kind !== 'var')) for (const id of e.macroDefinitions || []) {
+    if (!callsByMacro.has(id)) callsByMacro.set(id, []);
+    callsByMacro.get(id).push(e);
+  }
+  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.filter((e) => e.kind !== 'var').map((e) => e.callee)]), macros, callsByMacro);
+  for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
+    const id = symbol.targetIds[i];
+    if (!allNodes.has(id) && id.startsWith('ext::')) {
+      const node = { id, name: id.slice(5), file: '<external>', line: 0, external: true, params: [] };
+      externals.set(id, node);
+      allNodes.set(id, node);
+    }
+  }
+  for (const symbol of symbols) allNodes.set(symbol.id, symbol);
+  const headerEdges = symbols.flatMap((symbol) => [
+    ...symbol.targetIds.map((to) => ({ from: symbol.id, to, callee: allNodes.get(to)?.name || to,
+      kind: 'macro', line: symbol.line, via: symbol.name, headerReference: true })),
+    ...(callsByMacro.get(symbol.id) || []).map((e) => ({ ...e, to: symbol.id, callee: symbol.name, headerReference: true })),
+  ]);
 
   const model = {
     root,
@@ -511,6 +557,8 @@ export function buildIndex(root, sourceFiles = null) {
     elapsedMs: Date.now() - t0,
     files: parsed.map((p) => ({ rel: p.rel, isHeader: p.isHeader, bytes: p.bytes })),
     functions,
+    headerSymbols: symbols,
+    headerEdges,
     variables,
     externals: [...externals.values()],
     edges,
@@ -525,7 +573,7 @@ export function buildIndex(root, sourceFiles = null) {
 }
 
 /** 统一入口：目录走 C 源码解析，.dot/.gv 文件走 DOT 解析，单个 .c 索引所在目录并聚焦该文件 */
-export function loadModel(target) {
+export function loadModel(target, scan = null) {
   const st = fs.statSync(target);
   if (st.isFile()) {
     const ext = path.extname(target).toLowerCase();
@@ -535,13 +583,13 @@ export function loadModel(target) {
     }
     if (SRC_EXT.test(ext) || HDR_EXT.test(ext)) {
       const dir = path.dirname(target);
-      const model = buildIndex(dir);
+      const model = buildIndex(dir, null, scan);
       model.focusFile = path.relative(dir, target).replace(/\\/g, '/');
       return model;
     }
     throw new Error(`不支持的文件类型: ${ext}（支持 .c / .h / .dot / .gv 或目录）`);
   }
-  return buildIndex(target);
+  return buildIndex(target, null, scan);
 }
 
 /** 统计画像 */
@@ -694,12 +742,22 @@ export function tarjan(model) {
 /**
  * 取子图：以 rootId 为中心，向下 down 层、向上 up 层
  */
-export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {}) {
-  const { byId, outAdj, inAdj } = model._index;
+export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, includeVariables = true, allowedIds = null } = {}) {
+  let { byId, outAdj, inAdj } = model._index;
   if (!byId.has(rootId)) return { nodes: [], edges: [] };
+
+  // 仅选中头文件宏时加入定义映射，普通函数调用深度保持原来的语义。
+  const header = byId.get(rootId);
+  if (header.headerSymbol) {
+    outAdj = new Map(outAdj);
+    inAdj = new Map(inAdj);
+    outAdj.set(rootId, (model.headerEdges || []).filter((e) => e.from === rootId));
+    inAdj.set(rootId, (model.headerEdges || []).filter((e) => e.to === rootId));
+  }
 
   const nodes = new Map();
   const edges = [];
+  let truncated = false;
   const seenCall = new Set();
   // 同一对节点之间的多次调用合并成一条边，调用次数与行号记在 calls 里，
   // 避免画出并排的多条平行边
@@ -721,7 +779,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
     const callKey = `${e.from}|${e.to}|${e.line}|${e.kind}`;
     if (seenCall.has(callKey)) return;
     seenCall.add(callKey);
-    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}`;
+    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}|${e.kind === 'dataflow' ? 'dataflow' : 'access'}`;
     let m = byPair.get(pairKey);
     if (!m) {
       m = { ...e, calls: [] };
@@ -740,14 +798,28 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   const walk = (adj, depth) => {
     let frontier = [rootId];
+    // 两个方向分别记录已遍历节点：互相调用的节点可能已在另一方向中入图，
+    // 仍须沿本方向继续查找它的上层/下层，不能用共享 nodes 提前截断。
+    const visited = new Set(frontier);
     for (let d = 0; d < depth; d++) {
       const next = [];
       for (const id of frontier) {
         for (const e of adj.get(id) || []) {
+          // 在遍历时排除变量，避免变量占满节点名额，或沿共享变量拉入无调用关系的函数。
+          if (!includeVariables && e.kind === 'var') continue;
           const other = adj === outAdj ? e.to : e.from;
+          if (!byId.has(other)) continue;
+          if (allowedIds && !allowedIds.has(other)) continue;
+          if (!nodes.has(other) && nodes.size >= maxNodes) {
+            truncated = true;
+            continue;
+          }
+          addNode(other);
           addEdge(e);
-          if (nodes.size >= maxNodes) continue;
-          if (addNode(other)) next.push(other);
+          if (!visited.has(other)) {
+            visited.add(other);
+            next.push(other);
+          }
         }
       }
       frontier = next;
@@ -760,6 +832,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400 } = {
 
   return {
     root: rootId,
+    truncated,
     nodes: [...nodes.values()],
     edges: edges.filter((e) => nodes.has(e.from) && nodes.has(e.to)),
   };
@@ -770,13 +843,15 @@ export function search(model, q, limit = 30) {
   const query = q.trim().toLowerCase();
   if (!query) return [];
   const scored = [];
-  for (const fn of model.functions) {
+  for (const fn of [...model.functions, ...(model.headerSymbols || [])]) {
     const name = fn.name.toLowerCase();
+    const targets = (fn.targetNames || []).join(' ').toLowerCase();
     const file = fn.file.toLowerCase();
     let score = 0;
     if (name === query) score = 100;
     else if (name.startsWith(query)) score = 80;
     else if (name.includes(query)) score = 60;
+    else if (targets.includes(query)) score = 50;
     else if (file.includes(query)) score = 20;
     if (score) scored.push({ fn, score });
   }

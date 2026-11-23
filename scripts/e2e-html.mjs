@@ -68,8 +68,11 @@ try {
   await gui.evaluate(`(async()=>{
     const {setThemeColor}=await import('/lib/state.js');
     setThemeColor('bg','#E1E8F0');setThemeColor('edge.var','#447788');
+    await (await import('/lib/panels.js')).loadVars();
+    (await import('/lib/hooks.js')).hooks.toggleVar('var::g_gearCtx', true);
   })()`);
-  await move(gui, 'group', 0, 60);
+  await gui.waitFor("__cg.view.edges.some(e => e.kind === 'var' && e.to === 'var::g_gearCtx')");
+  await move(gui, 'group', -30, 0);
   await gui.evaluate(`(async()=>{
     const {state}=await import('/lib/state.js'); const {renderDetail,renderVars}=await import('/lib/panels.js');
     state.selected='can.c::Can_SendGearStatus'; state.ctxBox={kind:'file',id:'can.c'};
@@ -83,18 +86,26 @@ try {
     cam.k=0.25;const small=buildSVG();cam.k=4;const large=buildSVG();
     cam.k=k;edge.change=change;return small===large;
   })()`), true, 'SVG 标题和删除标记不随画布缩放变化');
+  await gui.evaluate(`(async()=>{
+    await document.fonts.ready;
+    (await import('/lib/camera.js')).stopCamAnim();
+    (await import('/lib/render.js')).resize();
+  })()`);
   const baseline = await gui.evaluate(geometry);
-  const canvas = await gui.evaluate(`({w:cv.clientWidth,h:cv.clientHeight,png:cv.toDataURL()})`);
+  const canvas = await gui.evaluate(`({w:cv.clientWidth,h:cv.clientHeight,width:cv.width,height:cv.height,png:cv.toDataURL()})`);
   const panel = await gui.evaluate(`['detail','vars','edges'].map(id=>document.getElementById(id).textContent)`);
   const guiExports = await exportsFrom(gui);
   assert.equal(await gui.evaluate(geometry), baseline, '导出 SVG 不修改手动布局和分组框');
   const html = await gui.evaluate(`(async()=>{const {buildStandaloneHtml}=await import('/lib/html.js');return await buildStandaloneHtml()})()`);
   const file = path.join(temp, 'callgraph.html'); fs.writeFileSync(file, html);
   const expected = [];
-  for (const [kind, dx, dy] of [['node',10,30], ['node',-5,20], ['group',0,80]]) {
-    await move(gui, kind, dx, dy); expected.push(await gui.evaluate(geometry));
+  const moves = [['node',10,30], ['node',-5,20], ['group',-28,0]];
+  for (const [kind, dx, dy] of moves) {
+    await move(gui, kind, dx, dy);
+    const moved = await gui.evaluate(geometry);
+    assert.notEqual(moved, expected.at(-1) ?? baseline, '每次拖动都应有可撤销的位移');
+    expected.push(moved);
   }
-  assert.notEqual(expected[0], baseline, 'GUI 确实发生移动');
   await server.close(); // 本地服务关闭后才打开导出页，证明运行时完全离线。
   offline = await launchCdp({ url: pathToFileURL(file).href, width: 1310, height: 1000 });
   await offline.waitFor('window.__cg?.view?.nodes?.length>0');
@@ -103,19 +114,22 @@ try {
   const bar = await offline.evaluate('document.querySelector("header").getBoundingClientRect().height');
   await offline.send('Emulation.setDeviceMetricsOverride', { width: canvas.w + 310,
     height: canvas.h + bar, deviceScaleFactor: 1, mobile: false });
-  await offline.waitFor(`cv.clientHeight===${canvas.h}`);
+  await offline.waitFor(`cv.width===${canvas.width} && cv.height===${canvas.height}`);
   // 尺寸改变后保留同一世界坐标中心，以相同画布大小比较绘制像素。
-  await offline.evaluate(`(async()=>{Object.assign(__cg.cam,__EXPORT.snapshot.cam);
-    (await import('https://callgraph.invalid/lib/render.js')).draw()})()`);
+  await offline.evaluate(`(async()=>{
+    await document.fonts.ready;
+    Object.assign(__cg.cam,__EXPORT.snapshot.cam);
+    (await import('https://callgraph.invalid/lib/render.js')).resize();
+  })()`);
   assert.equal(await offline.evaluate(geometry), baseline, '手动布局和全部折线原样导出');
-  assert.equal(await offline.evaluate('cv.toDataURL()'), canvas.png, 'GUI 与 HTML 的画布像素完全相同');
+  assert.ok(await offline.evaluate('cv.toDataURL()') === canvas.png, 'GUI 与 HTML 的画布像素完全相同');
   assert.deepEqual(await offline.evaluate(`['detail','vars','edges'].map(id=>document.getElementById(id).textContent)`), panel,
     '右侧详情、未入图常量、类型及读写计数和调用关系一致');
   assert.equal(await offline.evaluate(`!![...document.querySelectorAll('.var-row')].find(r=>r.dataset.id==='var::g_ops_cvt')`), true);
   assert.deepEqual(await exportsFrom(offline, true), guiExports, 'GUI 与离线 HTML 使用相同命名、PNG 底色和 SVG 样式');
   await offline.screenshot('out/html-export/initial.png');
   let i = 0;
-  for (const [kind, dx, dy] of [['node',10,30], ['node',-5,20], ['group',0,80]]) {
+  for (const [kind, dx, dy] of moves) {
     await move(offline, kind, dx, dy);
     assert.equal(await offline.evaluate(geometry), expected[i++], '相同拖动产生相同布局与正交路线');
   }

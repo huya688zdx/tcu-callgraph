@@ -9,6 +9,7 @@ import { pushHistory, undo, redo } from './history.js';
 import { buildSVG } from './svg.js';
 import { buildPNG, saveExport } from './export.js';
 import './interact.js';
+import './ui-select.js';
 
 const saved = window.__EXPORT.snapshot;
 // 导出时的主题色先落回 THEME，离线页与原界面所见一致（file:// 下没有原 localStorage）

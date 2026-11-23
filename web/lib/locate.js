@@ -24,7 +24,7 @@ const findNode = (id) => (state.view ? state.view.nodes.find((n) => n.id === id)
 export async function locateNode(id) {
   let n = findNode(id);
   if (!n) {
-    await hooks.loadView(id);
+    await hooks.addFunction(id);
     n = findNode(id);
   }
   if (!n) return false;

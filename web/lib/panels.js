@@ -3,12 +3,16 @@
  */
 import { t } from '../i18n.js';
 import { els, state, esc, shortFile } from './state.js';
+import { isDataEdge } from './edge-flow.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
-import { showMenuSections } from './ctxmenu.js';
+import { showMenuSections, hideMenu } from './ctxmenu.js';
 import { locateNode, locateBox } from './locate.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
+import { showExpansion, previewAddition } from './expand.js';
+import { setNodeName } from './node-name.js';
+import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
 async function loadStats() {
   const d = await api.stats();
   const s = d.stats;
@@ -34,14 +38,40 @@ async function loadStats() {
 // ---------------- 全局变量 / 常量 ----------------
 
 let varList = null;
+let varsLoading = false;
+let varsError = '';
+let varsSeq = 0;
+
+export function resetVars() {
+  varsSeq++;
+  varList = null;
+  varsLoading = false;
+  varsError = '';
+  varQuery = '';
+  collapsedFiles.clear();
+  renderVars();
+}
 
 async function loadVars() {
-  try {
-    varList = (await api.vars()).list || [];
-  } catch {
-    varList = [];
-  }
+  if (varsLoading || varList) return;
+  const seq = ++varsSeq;
+  varsLoading = true;
+  varsError = '';
   renderVars();
+  try {
+    const result = await api.vars();
+    if (seq !== varsSeq) return;
+    if (!Array.isArray(result?.list)) throw new Error(result?.error || t('vars.failed'));
+    varList = result.list;
+  } catch (err) {
+    if (seq !== varsSeq) return;
+    varsError = String(err.message || err);
+  } finally {
+    if (seq === varsSeq) {
+      varsLoading = false;
+      renderVars();
+    }
+  }
 }
 
 /** 当前视图里出现过的文件（变量面板按它过滤） */
@@ -77,8 +107,14 @@ export function renderVars() {
   if (!el) return;
   const v = state.view;
   const ctx = state.ctxBox;
-  if (!varList || !v || !ctx) {
+  if (!v || !ctx) {
     el.innerHTML = `<div class="empty">${t('vars.hint')}</div>`;
+    return;
+  }
+  if (!varList) {
+    el.innerHTML = `<div class="empty">${esc(varsError || t('vars.onDemand'))}</div>
+      <button type="button" data-load-vars ${varsLoading ? 'disabled' : ''}>${t(varsLoading ? 'vars.loading' : 'vars.load')}</button>`;
+    el.querySelector('[data-load-vars]').addEventListener('click', () => loadVars());
     return;
   }
 
@@ -206,36 +242,68 @@ function renderTree() {
   el.appendChild(frag);
 }
 
-/** 当前勾选的所有函数 id（文件树支持多选） */
-function checkedIds() {
-  // 尚未展开的文件没有函数行，仍保留它们的勾选，不能把懒加载误当成取消。
-  const ids = new Set(state.roots);
-  for (const cb of document.querySelectorAll('#tree input[type=checkbox]')) {
-    if (cb.checked) ids.add(cb.dataset.id);
-    else ids.delete(cb.dataset.id);
-  }
-  return [...ids];
-}
+let shownOnly = false;
+const shownFilter = document.getElementById('shownFunctions');
 
-let selectTimer = null;
-
-/** 勾选变化后统一重新加载：多个函数同时作为入口；全不勾则回到默认入口 */
-function applyTreeSelection() {
-  clearTimeout(selectTimer);
-  // 连续勾选时合并成一次请求，避免连点几下就闪几次
-  selectTimer = setTimeout(() => {
-    const ids = checkedIds();
-    hooks.loadView(ids.length ? ids : null, { incremental: !!ids.length });
-  }, 120);
-}
-
-/** 视图切换后回填勾选状态，保证树和画布一致 */
-export function syncTreeSelection(ids) {
-  const set = new Set(ids || []);
-  document.querySelectorAll('#tree input[type=checkbox]').forEach((c) => {
-    c.checked = set.has(c.dataset.id);
+/** 视图切换后同步已加入数量、函数状态与当前筛选。 */
+export function syncTreeSelection() {
+  const shown = new Set(state.view?.nodes.map((n) => n.id) || []);
+  document.querySelectorAll('#tree .tn.fn').forEach((row) => {
+    row.classList.toggle('shown', shown.has(row.dataset.fnid));
   });
+  document.querySelectorAll('[data-add-function]').forEach((button) => {
+    const label = shown.has(button.dataset.addFunction) ? '函数操作' : '选择添加方式';
+    button.textContent = shown.has(button.dataset.addFunction) ? '操作 ▾' : '添加 ▾';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+  });
+  if (shownFilter) shownFilter.querySelector('span').textContent = (state.view?.nodes || []).filter((n) => n.kind !== 'var').length;
+  if (shownOnly) renderShownFunctions();
 }
+
+/** 一个明确的添加入口，先选单函数或预览调用关系。 */
+function addFunctionButton(id) {
+  if (id.startsWith('var::')) return '';
+  const shown = state.view?.nodes.some((n) => n.id === id);
+  const label = shown ? '函数操作' : '选择添加方式';
+  return `<button type="button" class="add-function" data-add-function="${esc(id)}" title="${label}" aria-label="${label}" aria-haspopup="menu" aria-expanded="false" ${window.__EXPORT ? 'hidden' : ''}>${shown ? '操作' : '添加'} ▾</button>`;
+}
+
+async function removeShownFunction(id) {
+  try { await hooks.removeFunction(id); }
+  catch (error) { alert(error.message || '移出画布失败'); }
+}
+
+async function addSingleFunction(id) {
+  try {
+    const view = await hooks.addFunction(id);
+    if (!view?.nodes.some((node) => node.id === id)) throw new Error('未能加入函数，请重试');
+    await locateNode(id);
+  } catch (error) { alert(error.message || '加入函数失败'); }
+}
+
+function openFunctionAddMenu(button) {
+  if (button.getAttribute('aria-expanded') === 'true') { hideMenu(); return; }
+  const id = button.dataset.addFunction;
+  const shown = state.view?.nodes.some((node) => node.id === id);
+  const rect = button.getBoundingClientRect();
+  showMenuSections(rect.left, rect.bottom + 4, id.split('::').pop(), [{ items: [
+    { value: 'single', label: shown ? '定位此函数（已在图中）' : '仅添加此函数' },
+    { value: 'relations', label: '添加调用关系…' },
+    ...(shown && !state.at && !state.view?.comparison ? [{ value: 'remove', label: '移出画布' }] : []),
+  ] }], (value) => {
+    if (value === 'remove') return removeShownFunction(id);
+    if (value === 'single') return shown ? locateNode(id) : addSingleFunction(id);
+    return previewAddition({ id });
+  }, button);
+}
+
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-add-function]');
+  if (!button) return;
+  event.stopPropagation();
+  openFunctionAddMenu(button);
+}, true);
 
 /** 展开某一行的所有祖先目录（并可选展开它自己） */
 function expandRow(row, includeSelf = false) {
@@ -271,7 +339,7 @@ function flashRow(row) {
  */
 export function revealInTree(kind, id) {
   let row = null;
-  populateTreeFiles.get(kind === 'fn' ? id.split('::')[0] : id)?.();
+  populateTreeFiles.get(kind === 'fn' ? (id.startsWith('header::') ? id.split('::')[1] : id.split('::')[0]) : id)?.();
   if (kind === 'fn') {
     row = document.querySelector(`#tree .tn.fn[data-fnid="${CSS.escape(id)}"]`);
   } else {
@@ -304,10 +372,15 @@ function openTreeMenu(ev, kind, payload) {
   ev.stopPropagation();
   const items = [];
   if (kind === 'fn') {
+    items.push({ value: 'expand', label: 'expand.menu' });
     items.push({ value: 'dataflow', label: 'menu.dataflow' });
     if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
     items.push({ value: 'locate', label: 'locate.canvasFn' });
-    items.push({ value: 'toggle', label: payload.checked ? 'tree.unselect' : 'tree.select' });
+    if (!window.__EXPORT) {
+      items.push({ value: 'single', label: '仅添加此函数' });
+      items.push({ value: 'relations', label: '添加调用关系…' });
+      if (!state.at && !state.view?.comparison && state.view?.nodes.some((n) => n.id === payload.id)) items.push({ value: 'remove', label: '移出画布' });
+    }
   } else if (kind === 'file') {
     items.push({ value: 'locate', label: 'locate.canvasFile' });
   } else {
@@ -319,18 +392,15 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     [{ id: 'locate', label: 'menu.locate', items }],
     (v) => {
+      if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (v === 'locate') {
         if (kind === 'fn') locateNode(payload.id);
         else locateBox(kind === 'file' ? 'file' : 'dir', payload.id, payload.fnIds || []);
-      } else if (v === 'toggle') {
-        const cb = document.querySelector(`#tree input[data-id="${CSS.escape(payload.id)}"]`);
-        if (cb) {
-          cb.checked = !cb.checked;
-          applyTreeSelection();
-        }
-      }
+      } else if (v === 'single') return addSingleFunction(payload.id);
+      else if (v === 'relations') return previewAddition({ id: payload.id, name: payload.label });
+      else if (v === 'remove') return removeShownFunction(payload.id);
     }
   );
 }
@@ -340,7 +410,7 @@ function buildTreeNode(node, depth) {
   const row = document.createElement('div');
   row.className = 'tn ' + node.type;
   row.dataset.path = node.path == null ? '' : node.path;
-  row.style.paddingLeft = depth * 12 + 'px';
+  row.style.paddingLeft = depth * 8 + 4 + 'px';
 
   const hasKids =
     (node.children && node.children.length) || (node.functions && node.functions.length);
@@ -365,24 +435,21 @@ function buildTreeNode(node, depth) {
   const populateFunctions = () => {
     if (populated) return;
     populated = true;
-    const selected = new Set(state.roots);
     for (const f of node.functions || []) {
       const fr = document.createElement('div');
       fr.className = 'tn fn';
       fr.dataset.fnid = f.id;
-      fr.style.paddingLeft = (depth + 1) * 12 + 'px';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.dataset.id = f.id;
-      cb.checked = selected.has(f.id);
+      fr.style.paddingLeft = (depth + 1) * 8 + 18 + 'px';
       const lab = document.createElement('span');
       lab.className = 'nm';
       lab.textContent = f.name;
       lab.title = `${node.path}:${f.line}`;
-      fr.appendChild(cb);
       fr.appendChild(lab);
+      fr.insertAdjacentHTML('beforeend', addFunctionButton(f.id));
+      fr.classList.toggle('shown', !!state.view?.nodes.some((n) => n.id === f.id));
+      fr.addEventListener('click', () => searchPick(f.id, fr.querySelector('[data-add-function]')));
       fr.addEventListener('contextmenu', (ev) =>
-        openTreeMenu(ev, 'fn', { id: f.id, label: f.name, checked: cb.checked })
+        openTreeMenu(ev, 'fn', { id: f.id, label: f.name })
       );
       kids.appendChild(fr);
     }
@@ -407,76 +474,85 @@ function buildTreeNode(node, depth) {
     tw.textContent = open ? '▸' : '▾';
   });
 
-  // 多选：勾选变化只做汇总，不再互斥
-  kids.addEventListener('change', (ev) => {
-    if (ev.target.tagName !== 'INPUT') return;
-    applyTreeSelection();
-  });
-
   return wrap;
 }
 
 let searchTimer;
 els.search.addEventListener('input', () => {
   clearTimeout(searchTimer);
+  searchSeq++;
+  syncSearchMode();
+  hideMenu();
+  if (shownOnly) { runSearch(); return; }
   searchTimer = setTimeout(runSearch, 140);
 });
 
 /** 搜索请求序号：快速输入时只认最后一次，避免慢响应覆盖新结果 */
 let searchSeq = 0;
 
+shownFilter?.addEventListener('click', () => {
+  shownOnly = !shownOnly;
+  shownFilter.setAttribute('aria-pressed', String(shownOnly));
+  hideMenu();
+  runSearch();
+});
+
+function renderFunctionResults(list) {
+  els.results.innerHTML = list.length ? list.map((f) => `<li data-id="${esc(f.id)}" title="${esc(t('search.itemHint'))}">
+    <div class="search-summary"><div class="fn">${esc(f.displayName || f.name)}</div>${addFunctionButton(f.id)}</div>
+    <div class="meta">${esc(shortFile(f.file || ''))}:${f.line || ''}${Number.isInteger(f.inCount) ? ` · ↑${f.inCount} ↓${f.outCount}` : ''}</div>
+    </li>`).join('') : `<li class="empty">${shownOnly ? '当前没有符合条件的已加入函数' : t('empty.noMatch')}</li>`;
+}
+
+function renderShownFunctions() {
+  const q = els.search.value.trim().toLowerCase();
+  renderFunctionResults((state.view?.nodes || []).filter((n) => n.kind !== 'var' &&
+    (!q || `${n.name} ${n.displayName || ''} ${n.file || ''}`.toLowerCase().includes(q))));
+}
+
+function syncSearchMode() {
+  const searching = !!els.search.value.trim();
+  const tree = document.getElementById('tree');
+  if (tree) tree.hidden = searching || shownOnly;
+  els.results.hidden = !searching && !shownOnly;
+  const section = els.results.closest('.tree-sec');
+  if (section) {
+    section.scrollTop = 0;
+    section.querySelector('h3').textContent = shownOnly ? '已加入函数' : searching ? '搜索结果' : t('panel.files');
+  }
+}
+
 async function runSearch() {
   const my = ++searchSeq;
   const q = els.search.value.trim();
+  syncSearchMode();
+  if (shownOnly) { renderShownFunctions(); return; }
   if (!q) {
-    els.results.innerHTML = `<li class="empty">${t('empty.search')}</li>`;
+    els.results.innerHTML = '';
     return;
   }
   const list = await api.search(q);
   if (my !== searchSeq) return; // 已经有更新的搜索，丢弃这次的结果
-  if (!list.length) {
-    els.results.innerHTML = `<li class="empty">${t('empty.noMatch')}</li>`;
-    return;
-  }
-  els.results.innerHTML = list
-    .map(
-      (f) => `<li data-id="${esc(f.id)}" title="${esc(t('search.itemHint'))}">
-        <div class="fn">${esc(f.name)}</div>
-        <div class="meta">${esc(shortFile(f.file))}:${f.line} · ↑${f.inCount} ↓${f.outCount}</div>
-      </li>`
-    )
-    .join('');
+  renderFunctionResults(list);
 }
 
-/**
- * 搜索结果的去向：单击只往画布里加入（已在画布就高亮定位），绝不整幅替换；
- * 想单独看某个函数用双击。单击延迟 250ms 是为了等双击事件，避免先加载两次。
- */
-let pickTimer;
-function searchPick(id) {
+/** 点击名称只定位或选择添加方式，不隐式展开和替换画布。 */
+function searchPick(id, button) {
   const inView = state.view && state.view.nodes.some((n) => n.id === id);
   if (inView) return locateNode(id);
-  hooks.loadView([...state.roots, id], { incremental: true });
+  if (button && !window.__EXPORT) openFunctionAddMenu(button);
 }
 
 els.results.addEventListener('click', (e) => {
   const li = e.target.closest('li[data-id]');
   if (!li) return;
-  clearTimeout(pickTimer);
-  pickTimer = setTimeout(() => searchPick(li.dataset.id), 250);
-});
-
-els.results.addEventListener('dblclick', (e) => {
-  const li = e.target.closest('li[data-id]');
-  if (!li) return;
-  clearTimeout(pickTimer);
-  hooks.loadView(li.dataset.id);
+  searchPick(li.dataset.id, li.querySelector('[data-add-function]'));
 });
 
 els.search.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     const first = els.results.querySelector('li[data-id]');
-    if (first) searchPick(first.dataset.id);
+    if (first) searchPick(first.dataset.id, first.querySelector('[data-add-function]'));
   }
 });
 
@@ -510,8 +586,7 @@ function comparisonDetail(node) {
       return v.reason || v.text || v.name || JSON.stringify(v);
     }).map(esc).join(' · ') || '—';
   };
-  return `<div class="detail-meta">${t('compare.change')}: ${esc(t(`change.${node.change || 'existing'}`))}</div>
-    <div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
+  return `<div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
     <div class="detail-meta">${t('compare.locationAfter')}: ${esc(location('after'))}</div>
     ${node.reasons ? `<div class="detail-meta">${t('compare.reasons')}: ${describe(node.reasons)}</div>` : ''}
     ${node.impact ? `<div class="detail-meta">${t('compare.impact')}</div>` : ''}
@@ -524,12 +599,14 @@ async function renderDetail(id) {
   const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
   const isFn = !!target && target.kind !== 'var';
   syncDetailSections(isFn);
-  if (state.view?.comparison && target?.kind === 'var') {
+  if (target?.kind === 'var') {
     if (els.secDetail) els.secDetail.style.display = '';
     if (els.secEdges) els.secEdges.style.display = 'none';
     els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
       <div class="detail-meta">${esc(target.file || '')}:${target.line || ''}</div>
-      ${comparisonDetail(target)}`;
+      ${statusControl(target)}
+      ${state.view?.comparison ? comparisonDetail(target) : ''}`;
+    bindStatusControl(els.detail, target);
     els.edges.innerHTML = '';
     return;
   }
@@ -550,14 +627,23 @@ async function renderDetail(id) {
 
   // 节点只展示身份信息：标注已经改成「连线标签」，挂在连线上而不是函数上
   els.detail.innerHTML = `
-    <div class="detail-title">${esc(n.name)}</div>
+    <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${statusControl(target)}
+    ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
+      <label>${t('name.title')} <select data-node-name ${state.at > 0 || state.view?.comparison ? 'disabled' : ''}>
+        <option value="default" ${!target.nameModeOverride ? 'selected' : ''}>${t('name.default')}（${t(target.nameMode === 'target' ? 'name.target' : 'name.alias')}）</option>
+        <option value="alias" ${target.nameModeOverride === 'alias' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
+        <option value="target" ${target.nameModeOverride === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
+      </select></label>` : ''}
     ${state.view?.comparison ? comparisonDetail(n) : ''}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
+  els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
+  bindStatusControl(els.detail, target);
 
-  const inE = d.inEdges || [];
-  const outE = d.outEdges || [];
+  const inE = (d.inEdges || []).filter(e => !isDataEdge(e));
+  const outE = (d.outEdges || []).filter(e => !isDataEdge(e));
   const item = (e, dir) => {
     const other = dir === 'in' ? e.from : e.to;
     const nm = e.callee || other.split('::')[1] || other;
@@ -566,7 +652,8 @@ async function renderDetail(id) {
     else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">${t('edge.chipFnptr')}${e.via ? ':' + esc(e.via) : ''}</span>`;
     else if (e.kind === 'manual') chip = `<span class="chip manual">${t('edge.chipManual')}</span>`;
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
-    return `<div class="edge-item">${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span> ${chip}${cond}</div>`;
+    const status = e.change && e.change !== 'existing' ? ` · ${statusLabel(e.change)}` : '';
+    return `<div class="edge-item call-relation"><span>${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
   };
 
   els.edges.innerHTML =

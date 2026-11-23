@@ -229,6 +229,15 @@ export function parseDot(src) {
         continue;
       }
 
+      // 端口只影响连线位置，不是节点名称。
+      const skipPort = () => {
+        for (let i = 0; i < 2 && is(':'); i++) {
+          p++;
+          if (peek()?.t === 'id') p++;
+        }
+      };
+      skipPort();
+
       // 链式边
       let chained = false;
       while (is('->') || is('--')) {
@@ -237,6 +246,7 @@ export function parseDot(src) {
         const target = next();
         if (!target) break;
         parts.push(target);
+        skipPort();
         chained = true;
       }
 
@@ -320,13 +330,14 @@ export function modelFromDot(dot, fileLabel = '<dot>') {
     const from = idMap.get(e.from) || `dot::${e.from}`;
     const to = idMap.get(e.to) || `dot::${e.to}`;
     const label = typeof e.label === 'string' ? e.label : '';
-    const isMacro = /via/i.test(label) || e.attrs.style === 'dashed';
+    const isMacro = /\bvia\b/i.test(label);
+    const dashed = String(e.attrs.style || '').split(',').some(style => style.trim() === 'dashed');
     const isFnptr = /fnptr/i.test(label);
     edges.push({
       from,
       to,
       callee: e.to,
-      kind: isFnptr ? 'fnptr' : isMacro ? 'macro' : 'direct',
+      kind: isFnptr ? 'fnptr' : isMacro ? 'macro' : dashed ? 'dataflow' : 'direct',
       line: 0,
       cond: e.attrs.condition || undefined,
       via: label || undefined,

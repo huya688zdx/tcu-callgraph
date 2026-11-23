@@ -1,3 +1,4 @@
+import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
 /**
  * 服务端 SVG 导出：与 web/lib/svg.js 的画布样式保持一致。
  *
@@ -13,7 +14,9 @@ import { roundedPathD } from './routing.js';
 import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
 
 const COLORS = {
-  direct: '#9A9890',
+  added: '#D9303E',
+  direct: '#2C2C2A',
+  var: '#2C2C2A',
   macro: '#D85A30',
   fnptr: '#7F77DD',
   manual: '#639922',
@@ -151,10 +154,11 @@ export function exportSvg(view, { title = '' } = {}) {
   for (const e of v.edges || []) {
     if (!Array.isArray(e.points) || e.points.length < 2) continue;
     const d = roundedPathD(e.points, 7);
-    const c = COLORS[e.kind] || COLORS.direct;
-    const dash = e.kind === 'macro' || e.kind === 'fnptr' ? ' stroke-dasharray="5 3"' : '';
+    const style = e.change === 'added' ? 'added' : isDataEdge(e) ? 'var' : 'direct';
+    const c = COLORS[style];
+    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
     out.push(
-      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash} marker-end="url(#mk-${e.kind in COLORS ? e.kind : 'direct'})" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
   }
 
@@ -173,7 +177,7 @@ export function exportSvg(view, { title = '' } = {}) {
       `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="#3A3A36" stroke-width="1"${n.kind === 'var' ? '' : ' stroke-dasharray="5 3"'}/>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.name)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line)}</text>`

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { loadModel, stats } from '../src/core/index.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import { parseDot } from '../src/core/dot.js';
+import { buildIndex, loadModel, stats } from '../src/core/index.js';
+import { detectTasks } from '../src/core/detect-tasks.js';
 
 const SAMPLE = path.join(import.meta.dirname, '..', 'samples', 'tcu');
 
@@ -134,4 +138,80 @@ test('stats(samples/tcu)：计数口径自洽，cycleGroups 稳定', () => {
     [['gear.c::Gear_Apply', 'gear.c::Gear_Retry']]
   );
   assert.equal(st.cycles, 1);
+});
+
+
+test('恒假分支不修改宏，跨文件 static 不解析为调用目标', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-review-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), 'static void helper(void) {} void real_target(void) {}');
+  fs.writeFileSync(path.join(dir, 'b.c'), 'static void helper(void) {}');
+  fs.writeFileSync(path.join(dir, 'c.c'), '#define CALL real_target\n#if 0\n#undef CALL\n#define CALL wrong_target\n#endif\nvoid entry(void) { CALL(); helper(); }');
+  const edges = loadModel(dir).edges.filter((e) => e.from === 'c.c::entry');
+  assert.ok(edges.some((e) => e.to === 'a.c::real_target'));
+  assert.ok(edges.some((e) => e.to === 'ext::helper'));
+});
+
+test('DOT 端口不产生节点，引号内冒号保留', () => {
+  const graph = parseDot('digraph { a:ne -> "b:c":port:sw; }');
+  assert.deepEqual([...graph.nodes.keys()], ['a', 'b:c']);
+  assert.deepEqual(graph.edges.map(({ from, to }) => [from, to]), [['a', 'b:c']]);
+});
+
+test('紧凑索引保留头文件宏的生效顺序、文件内 undef 和嵌套调用判断', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-scopes-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const files = new Map([
+    ['a.h', '#define CALL first\nstatic void early(void) { CALL(); }\n'],
+    ['b.h', '#undef CALL\n#define CALL second\nstatic void late(void) { CALL(); }\n'],
+    ['a.c', '#undef CALL\nvoid isolated(void) { CALL(); }\n'],
+    ['b.c', 'void first(void) {}\nvoid second(void) {}\n' +
+      'int inner(void) { return 0; }\nvoid outer(int n) {}\n' +
+      'void inherited(void) { CALL(); outer(inner()); }\n'],
+  ]);
+  const sources = new Map();
+  for (const [name, source] of files) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, source);
+    sources.set(name, file);
+  }
+  const model = buildIndex(dir, sources);
+  const target = (from) => model._index.outAdj.get(from)[0].to;
+  assert.equal(target('a.h::early'), 'b.c::first');
+  assert.equal(target('b.h::late'), 'b.c::second');
+  assert.equal(target('a.c::isolated'), 'ext::CALL');
+  assert.equal(target('b.c::inherited'), 'b.c::second');
+  assert.ok(model.functions.every((fn) => !Object.hasOwn(fn, 'bodyTokens')));
+  assert.deepEqual(detectTasks(model, 'b.c::inherited').skipped.map(({ from }) => from), ['b.c::inherited']);
+});
+
+test('单次词法分析后绑定在后续文件中定义的函数指针和全局变量', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-deferred-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'caller.c'), `
+static int local_count = 0;
+void entry(void) {
+  later = 3;
+  local_count += later;
+  outer(ops.tick());
+}
+void unknown_member(void) { outer(unknown.tick()); entry(); }
+void unknown_field(void) { ops.toString(); }
+`);
+  fs.writeFileSync(path.join(dir, 'table.c'), `
+int later = 0;
+int local_count = 0;
+void outer(int value) {}
+int tick(void) { return 1; }
+const Ops ops = { .tick = tick };
+`);
+  const model = loadModel(dir);
+  const entry = model._index.byId.get('caller.c::entry');
+  const edges = model._index.outAdj.get(entry.id);
+  assert.ok(edges.some((e) => e.kind === 'fnptr' && e.to === 'table.c::tick' && e.via === 'ops.tick'));
+  assert.equal(entry.hasNestedCalls, true);
+  assert.equal(model._index.byId.get('caller.c::unknown_member').hasNestedCalls, undefined);
+  assert.ok(!model._index.outAdj.get('caller.c::unknown_field')?.some((e) => e.kind === 'fnptr'));
+  assert.deepEqual(entry.varAccess.map(({ id, read, write }) => [id, read, write]),
+    [['var::later', true, true], ['var::caller.c::local_count', true, true]]);
 });

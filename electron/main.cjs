@@ -80,19 +80,21 @@ function stopServer() {
     let timer;
     const done = () => {
       clearTimeout(timer);
+      c.off('exit', done);
       stopping = false;
       resolve();
     };
     c.once('exit', done);
+    // 断开 IPC 后由服务终止当前源码扫描。服务无响应时再强制退出。
+    timer = setTimeout(() => { c.kill(); done(); }, 2000);
+    timer.unref();
     try {
-      c.kill();
+      if (c.connected) c.disconnect();
+      else c.kill();
     } catch {
+      c.kill();
       done();
-      return;
     }
-    // 兜底：万一 exit 事件没来，2s 后继续，不让切工程卡死
-    timer = setTimeout(done, 2000);
-    if (timer.unref) timer.unref();
   });
 }
 
@@ -128,7 +130,7 @@ async function startTargetNow(target) {
       // 数据库放在 Electron 的 userData 目录。只有主进程能拿到这个路径，
       // 解析跑在子进程里，所以必须用环境变量传过去，否则打包后两边指向不同目录，
       // 症状是「标注保存了但重启就没了」。
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
+      env: { ...process.env, CALLGRAPH_DB: '', ELECTRON_RUN_AS_NODE: '1', CALLGRAPH_USER_DATA: app.getPath('userData') },
       stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     });
   } catch (err) {

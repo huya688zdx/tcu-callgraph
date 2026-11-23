@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { loadModel, subgraph } from '../src/core/index.js';
+import { loadModel, subgraph, rebuildIndex } from '../src/core/index.js';
 
 // 手写最小 model：a -> b -> d，a -> c -> d，便于精确验证层数边界
 function chainModel() {
@@ -23,6 +23,18 @@ function chainModel() {
 }
 
 const idsOf = (res) => res.nodes.map((n) => n.id).sort();
+
+test('纯调用子图：变量不占节点限额，也不通过共享变量引入其他函数', () => {
+  const model = chainModel();
+  model.variables = Array.from({ length: 100 }, (_, i) => ({ id: `var::v${i}`, kind: 'var' }));
+  model.edges.unshift(...model.variables.map((v) => ({ from: 'a', to: v.id, kind: 'var', line: 0 })));
+  rebuildIndex(model);
+  const result = subgraph(model, 'a', { down: 2, maxNodes: 4, includeVariables: false });
+  assert.deepEqual(idsOf(result), ['a', 'b', 'c', 'd']);
+  assert.ok(result.edges.every((e) => e.kind !== 'var'));
+  const variable = subgraph(model, 'var::v0', { up: 1, includeVariables: false });
+  assert.ok(!variable.nodes.some((n) => n.id === 'a'));
+});
 
 test('subgraph：down:0 只返回 root，且不带任何边', () => {
   const res = subgraph(chainModel(), 'a', { down: 0 });
@@ -49,6 +61,35 @@ test('subgraph：up 沿入边展开调用者', () => {
   assert.deepEqual(idsOf(res), ['b', 'c', 'd']);
   assert.equal(res.edges.length, 2);
   for (const e of res.edges) assert.equal(e.to, 'd');
+});
+
+test('subgraph：向上只保留通向起点的调用链，不展开调用者的旁支', () => {
+  const model = chainModel();
+  const result = subgraph(model, 'b', { up: 2, down: 0 });
+  assert.deepEqual(idsOf(result), ['a', 'b']);
+  assert.deepEqual(result.edges.map((e) => [e.from, e.to]), [['a', 'b']], 'a 的另一个分支 c 不应入图');
+  const both = subgraph(model, 'b', { up: 2, down: 1 });
+  assert.deepEqual(idsOf(both), ['a', 'b', 'd']);
+  assert.ok(!both.edges.some((e) => e.from === 'c'), '不能通过下层 d 反向引入 c');
+});
+
+test('subgraph：上下方向独立遍历，互相调用不截断上层链，满额度仍保留已有节点间的边', () => {
+  const model = chainModel();
+  model.edges = [
+    { from: 'a', to: 'b', kind: 'direct', line: 1 },
+    { from: 'b', to: 'a', kind: 'direct', line: 2 },
+    { from: 'c', to: 'b', kind: 'direct', line: 3 },
+    { from: 'c', to: 'd', kind: 'direct', line: 4 },
+  ];
+  rebuildIndex(model);
+  const result = subgraph(model, 'a', { up: 2, down: 1, maxNodes: 3 });
+  assert.deepEqual(idsOf(result), ['a', 'b', 'c']);
+  assert.deepEqual(result.edges.map((e) => [e.from, e.to]).sort(), [['a', 'b'], ['b', 'a'], ['c', 'b']]);
+  assert.equal(result.truncated, false, '旁支 d 从未遍历，不应触发截断');
+  const capped = subgraph(model, 'a', { up: 2, down: 1, maxNodes: 2 });
+  assert.deepEqual(idsOf(capped), ['a', 'b']);
+  assert.equal(capped.edges.length, 2);
+  assert.equal(capped.truncated, true);
 });
 
 test('subgraph：maxNodes 截断后所有边端点仍在节点集合内', () => {

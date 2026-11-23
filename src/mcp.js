@@ -332,7 +332,7 @@ const TOOLS = [
   {
     name: 'cg_export_svg',
     description:
-      '导出当前视图为 SVG 文件（矢量图，和界面同布局同配色）。root 不填时自动挑入口。返回写入的文件路径。',
+      '导出当前视图为 SVG 文件（矢量图，按查询参数生成布局，使用固定配色，不读取浏览器自定义主题）。root 不填时自动挑入口。返回写入的文件路径。',
     access: 'export',
     inputSchema: {
       type: 'object',

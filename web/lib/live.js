@@ -3,7 +3,7 @@
  *
  * 1. 监听 SSE（/api/stream）：AI 通过 MCP 写入（标注 / 删除 / 布局 / 切工程）后
  *    服务端广播 change 事件，页面立即刷新画面——用户不用手动刷新。
- *    只响应 actor=ai：用户自己的写操作界面已就地处理，若也跟着刷新，
+ *    工程切换同步到其他页面，其他操作只响应 actor=ai：若用户自己的写操作也刷新，
  *    重复刷新会打断用户正在进行的拖拽。
  * 2. 上报页面视图状态（POST /api/page）：入口、深度、选中项。
  *    AI 用 cg_page 工具读取，对齐「用户正在看什么」再动手改。
@@ -12,13 +12,14 @@
  * 「过去」和「现在」搅在一起；只弹提示，让用户自己决定何时回到最新。
  */
 import { state, cam, els, edgeKey } from './state.js';
-import { api } from './api.js';
+import { api, clientId } from './api.js';
 import { hooks } from './hooks.js';
 import { loadStats, renderVars, renderDetail } from './panels.js';
 import { draw } from './render.js';
 import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
+import { syncProjectLabel } from './projects.js';
 
 // ---------------- SSE 监听 ----------------
 
@@ -88,13 +89,15 @@ if (es) {
     } catch {
       return;
     }
-    if (!m || m.actor !== 'ai') return;
+    if (!m) return;
     if (m.op === 'project.switch') {
+      if (m.clientId === clientId) return;
       dirtyCount = 0;
-      hooks.reloadAll(); // 跨工程没有任何可保留的状态，整体重载
-      toast(`AI 切换了工程：${m.project || ''}`);
+      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast('工程切换后刷新失败，请手动刷新页面'));
+      toast(`已切换工程：${m.project || ''}`);
       return;
     }
+    if (m.actor !== 'ai') return;
     scheduleReload();
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror
@@ -113,6 +116,7 @@ export function savePage(force = false) {
   const page = {
     projectId: state.view.projectId,
     roots: state.roots,
+    expansions: state.expansions,
     up: state.up,
     down: state.down,
     group: state.group,
@@ -149,11 +153,15 @@ export async function restorePage(root = null, isCurrent = () => true) {
       Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
-      els.depth.value = String(state.down);
-      els.updepth.value = String(state.up);
       els.groupMode.checked = state.group;
     }
-    const view = await hooks.loadView(root || saved?.roots || null, { nav: false });
+    const view = await hooks.loadView(root || saved?.roots || null, { nav: false, expansions: saved?.expansions || [] });
+    // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
+    // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
+    // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
+    if (state.view?.comparison) {
+      state.up = 0; state.down = 0;
+    }
     if (saved && view && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;

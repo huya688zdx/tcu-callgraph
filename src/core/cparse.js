@@ -46,30 +46,12 @@ export function getParser() {
   return parserPromise;
 }
 
-/** 文件级解析缓存：key 为绝对路径 */
-const treeCache = new Map();
-
+/** 语法树归本次分析所有，由调用方在读取完成后释放。 */
 export async function parseFile(abs, rel, src) {
   const text = src ?? fs.readFileSync(abs, 'utf8');
-  const hit = treeCache.get(abs);
-  if (hit?.src === text) return hit;
   const parser = await getParser();
   const tree = parser.parse(text);
-  const rec = { tree, root: tree.rootNode, src: text, rel };
-  if (hit) hit.tree.delete();
-  treeCache.set(abs, rec);
-  return rec;
-}
-
-export function clearParseCache() {
-  for (const rec of treeCache.values()) {
-    try {
-      rec.tree.delete();
-    } catch {
-      /* ignore */
-    }
-  }
-  treeCache.clear();
+  return { tree, root: tree.rootNode, src: text, rel };
 }
 
 // ---------------- AST 小工具 ----------------
@@ -233,7 +215,7 @@ function baseIdentifier(n) {
 
 /**
  * 收集一个函数体里对全局变量的读写
- * 返回值：{ writes, reads }，都是 Map<变量名, { lines:Set, fields:Set, indirect:bool }>
+ * 返回值：{ writes, reads }，都是 Map<变量名, { lines:Set, fields:Set, whole:bool, indirect:bool }>
  *
  * 判定口径：
  *   write      赋值左值（= 为纯写；+= 之类与 ++ -- 先读旧值，算读写）
@@ -280,11 +262,12 @@ export function collectAccesses(fnNode, isGlobal, { bindings = new Map(), resolv
   const touch = (map, name, node, extra = {}) => {
     let rec = map.get(name);
     if (!rec) {
-      rec = { lines: new Set(), fields: new Set(), indirect: false };
+      rec = { lines: new Set(), fields: new Set(), whole: false, indirect: false };
       map.set(name, rec);
     }
     rec.lines.add(node.startPosition.row + 1);
     if (extra.field) rec.fields.add(extra.field);
+    else rec.whole = true;
     if (extra.indirect) rec.indirect = true;
   };
 
@@ -292,8 +275,20 @@ export function collectAccesses(fnNode, isGlobal, { bindings = new Map(), resolv
     const base = baseIdentifier(node);
     if (!base || base.type !== 'identifier') return;
     const name = base.text;
-    const fieldNode = node.type === 'field_expression' ? node.childForFieldName('field') : null;
-    const field = fieldNode ? fieldNode.text : null;
+    const parts = [];
+    let part = node;
+    while (part) {
+      if (part.type === 'field_expression') {
+        const fieldNode = part.childForFieldName('field');
+        if (fieldNode) parts.unshift(fieldNode.text);
+        part = part.childForFieldName('argument');
+      } else if (part.type === 'subscript_expression' || part.type === 'pointer_expression') {
+        part = part.childForFieldName('argument');
+      } else if (part.type === 'parenthesized_expression' || part.type === 'cast_expression') {
+        part = part.namedChildren[part.namedChildren.length - 1];
+      } else break;
+    }
+    const field = parts.length ? parts.join('.') : null;
 
     if (locals.has(name)) {
       // 只把解引用算作目标访问；p = 0 或转传 p 不会读写 *p。

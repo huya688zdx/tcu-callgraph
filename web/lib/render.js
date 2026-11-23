@@ -4,42 +4,333 @@
  */
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
+import { isDataEdge, edgeDirection } from './edge-flow.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
+import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
+import { routeBounds } from '/core/routing.js';
 
-/**
- * 下一帧重绘（去重）。
- * flash 高亮的动画尾巴不能直接 requestAnimationFrame(() => draw())：
- * draw() 在拖拽时每帧都会被调用，每次调用都新开一条 rAF 链，
- * 1.3s 的高亮期内能叠出上百条并发全量重绘。这里保证同一时刻只有一条链。
- */
-let rafPending = false;
-let recentAlpha = 0;
+// 选中动画使用独立画布，箭头和虚线移动时保留主画布上的文字、标签与连线。
+let animationFrame = 0;
+let recentTimer = 0;
+let recentLayers = null;
+let collectingEffects = false;
+let effects = [];
+let effectCamera = null;
+let recentDamage = null;
+let lastGlowPaint = 0;
+let panOrigin = null;
+const effectRects = [];
+const GLOW_INTERVAL = 32;
+const RECENT_HIGHLIGHT_MS = 6000;
+const RECENT_COLOR = '#E69A16';
+const scene = document.createElement('canvas');
+const sceneCtx = scene.getContext('2d');
+const effectCanvas = document.createElement('canvas');
+effectCanvas.id = 'cvEffects';
+effectCanvas.setAttribute('aria-hidden', 'true');
+Object.assign(effectCanvas.style, {
+  position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none',
+});
+effectCanvas.width = effectCanvas.height = 0;
+const effectCtx = effectCanvas.getContext('2d');
+const nodeNames = new WeakMap();
+
+function sizeScene(canvas) {
+  if (scene.width === canvas.width && scene.height === canvas.height) return;
+  scene.width = canvas.width;
+  scene.height = canvas.height;
+}
+
+function releaseScene() {
+  if (scene.width || scene.height) scene.width = scene.height = 0;
+}
+
+function viewport(width, height) {
+  const pad = 36;
+  return { left: (-cam.x - pad) / cam.k, right: (width - cam.x + pad) / cam.k,
+    top: (-cam.y - pad) / cam.k, bottom: (height - cam.y + pad) / cam.k };
+}
+
+function boxVisible(box, area, width = box.w) {
+  return box.x <= area.right && box.x + width >= area.left &&
+    box.y <= area.bottom && box.y + box.h >= area.top;
+}
+
+const groupPaintWidth = (box) => Math.max(box.w, 26 * String(box.label).length + 30);
+
+function panCanvas(dx, dy, contentBounds) {
+  const { cv } = els;
+  const view = state.view;
+  // 只有全部对象已画在当前画布内才可平移位图。底部状态文字在松手时恢复。
+  if (!panOrigin && contentBounds && view?.nodes.length && !recentLayers) {
+    const b = contentBounds();
+    if (b.x * cam.k + cam.x >= 8 && b.y * cam.k + cam.y >= 8 &&
+        (b.x + b.w) * cam.k + cam.x <= cv.clientWidth - 8 &&
+        (b.y + b.h) * cam.k + cam.y <= cv.clientHeight - 24 &&
+        [...(view.groups || []), ...(view.containers || [])].every((g) =>
+          (g.x + groupPaintWidth(g)) * cam.k + cam.x <= cv.clientWidth - 8)) {
+      panOrigin = { x: cam.x, y: cam.y };
+      cv.style.clipPath = 'inset(0 0 22px)';
+    }
+  }
+  cam.x += dx;
+  cam.y += dy;
+  if (panOrigin) {
+    const shift = `${cam.x - panOrigin.x}px ${cam.y - panOrigin.y}px`;
+    cv.style.translate = effectCanvas.style.translate = shift;
+  } else draw({ geometryUnchanged: true });
+}
+
+function finishPan() {
+  if (panOrigin) draw({ geometryUnchanged: true });
+}
+
+function pathVisible(points, area) {
+  for (let i = 1; i < points.length; i++) {
+    const [x1, y1] = points[i - 1], [x2, y2] = points[i];
+    if (Math.min(x1, x2) <= area.right && Math.max(x1, x2) >= area.left &&
+        Math.min(y1, y2) <= area.bottom && Math.max(y1, y2) >= area.top) return true;
+  }
+  return false;
+}
+
+function screenRect(box, padding, camera = cam, dpr = window.devicePixelRatio || 1) {
+  const { cv } = els, { x: cx, y: cy, k } = camera;
+  const x = Math.max(0, Math.floor((box.x * k + cx - padding) * dpr));
+  const y = Math.max(0, Math.floor((box.y * k + cy - padding) * dpr));
+  const right = Math.min(cv.width, Math.ceil(((box.x + box.w) * k + cx + padding) * dpr));
+  const bottom = Math.min(cv.height, Math.ceil(((box.y + box.h) * k + cy + padding) * dpr));
+  return right > x && bottom > y ? { x, y, right, bottom } : null;
+}
+
+function addRecentDamage(box, padding) {
+  const rect = screenRect(box, padding);
+  if (!rect) return;
+  if (!recentDamage) recentDamage = rect;
+  else {
+    recentDamage.x = Math.min(recentDamage.x, rect.x);
+    recentDamage.y = Math.min(recentDamage.y, rect.y);
+    recentDamage.right = Math.max(recentDamage.right, rect.right);
+    recentDamage.bottom = Math.max(recentDamage.bottom, rect.bottom);
+  }
+}
 
 export function pulseAdded(nodes, edges) {
-  state.recent = nodes.length || edges.length ? {
+  clearTimeout(recentTimer);
+  const count = nodes.length + edges.length;
+  const now = performance.now();
+  const recent = count ? {
     nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
-    started: performance.now(), until: performance.now() + 6000,
+    started: now, until: now + RECENT_HIGHLIGHT_MS, animated: count === 1,
   } : null;
+  state.recent = recent;
+  if (recent) recentTimer = setTimeout(() => {
+    if (state.recent !== recent) return;
+    state.recent = null;
+    if (!document.hidden) draw({ geometryUnchanged: true });
+  }, RECENT_HIGHLIGHT_MS);
   draw();
 }
 function scheduleDraw() {
-  if (rafPending) return;
-  rafPending = true;
-  requestAnimationFrame(() => {
-    rafPending = false;
-    draw();
+  if (animationFrame || document.hidden || (!recentDamage && !effects.length && !state.flash)) return;
+  animationFrame = requestAnimationFrame((now) => {
+    animationFrame = 0;
+    if (recentLayers && (!state.recent || now >= state.recent.until)) { draw({ geometryUnchanged: true }); return; }
+    if (recentDamage && now - lastGlowPaint >= GLOW_INTERVAL) {
+      drawRecentFrame(now);
+      lastGlowPaint = now;
+    }
+    if (effects.length || state.flash) drawEffects(now);
+    scheduleDraw();
   });
 }
 
-function resize() {
+function drawRecentFrame(now, region = recentDamage) {
+  const { ctx } = els;
+  const { x, y, right, bottom } = region;
+  const w = right - x, h = bottom - y;
+  const blit = (canvas) => ctx.drawImage(canvas, x, y, w, h, x, y, w, h);
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(x, y, w, h);
+  blit(recentLayers.background.canvas);
+  ctx.globalAlpha = (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
+    Math.min(1, (state.recent.until - now) / 700);
+  blit(recentLayers.glow.canvas);
+  ctx.globalAlpha = 1;
+  blit(scene);
+  ctx.restore();
+}
+
+// 金色光晕夹在分组背景与文字、箭头之间。只在画面变化时生成，呼吸动画只改变透明度。
+function prepareRecentLayers(view, area) {
+  const { ctx, cv } = els;
+  const edges = view.edges.filter((e) => state.recent.edges.has(edgeKey(e)) && pathVisible(edgePoints(e), area));
+  const nodes = view.nodes.filter((n) => state.recent.nodes.has(n.id) && boxVisible(n, area));
+  if (!edges.length && !nodes.length) { recentLayers = null; return; }
+  const layer = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = cv.width; canvas.height = cv.height;
+    return canvas.getContext('2d');
+  };
+  if (!recentLayers || recentLayers.glow.canvas.width !== cv.width || recentLayers.glow.canvas.height !== cv.height) {
+    recentLayers = { background: layer(), glow: layer() };
+  }
+  const { background, glow } = recentLayers;
+  background.clearRect(0, 0, cv.width, cv.height);
+  background.drawImage(cv, 0, 0);
+  glow.clearRect(0, 0, cv.width, cv.height);
+  glow.save();
+  glow.setTransform(ctx.getTransform());
+  glow.strokeStyle = glow.shadowColor = RECENT_COLOR;
+  glow.lineWidth = 7 / cam.k;
+  glow.shadowBlur = 10;
+  for (const e of edges) {
+    const { minX, minY, maxX, maxY } = routeBounds(e.points);
+    addRecentDamage({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, 36);
+    glow.setLineDash(isDataEdge(e) ? [7, 4] : []);
+    glow.beginPath(); strokeRounded(glow, e.points); glow.stroke();
+  }
+  const gap = 5 / cam.k;
+  glow.lineWidth = 3 / cam.k;
+  glow.shadowBlur = 12;
+  glow.setLineDash([]);
+  for (const n of nodes) {
+    addRecentDamage(n, 36);
+    roundRect(glow, n.x - gap, n.y - gap, n.w + gap * 2, n.h + gap * 2, 10);
+    glow.stroke();
+  }
+  glow.restore();
+  ctx.save();
+  ctx.resetTransform();
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.restore();
+}
+
+function recordBoxEffect(box, dash, width, radius = 8, color = THEME.node.selected) {
+  if (screenRect(box, width * cam.k / 2 + 4)) effects.push({ kind: 'box', box, dash, width, radius, color });
+}
+
+function markEffectArea(box, padding) {
+  const rect = screenRect(box, padding, effectCamera, effectCamera.dpr);
+  if (rect) effectRects.push(rect);
+}
+
+function markEffectOutline({ x, y, w, h }, radius, padding) {
+  const r = Math.min(radius, w / 2, h / 2);
+  markEffectArea({ x, y, w, h: r }, padding);
+  markEffectArea({ x, y: y + h - r, w, h: r }, padding);
+  markEffectArea({ x, y: y + r, w: 0, h: h - 2 * r }, padding);
+  markEffectArea({ x: x + w, y: y + r, w: 0, h: h - 2 * r }, padding);
+}
+
+function releaseEffectCanvas() {
+  if (!effectCanvas.width) return;
+  effectCanvas.remove();
+  effectCanvas.width = effectCanvas.height = 0;
+  effectRects.length = 0;
+}
+
+function compositeEffects(ctx) {
+  if (effectCanvas.width) ctx.drawImage(effectCanvas, 0, 0);
+}
+
+function drawEffects(now) {
+  if (state.flash && now >= state.flash.until) state.flash = null;
+  if (!effects.length && !state.flash) { releaseEffectCanvas(); return; }
+  const { cv } = els;
+  if (effectCanvas.width !== cv.width || effectCanvas.height !== cv.height) {
+    effectCanvas.width = cv.width;
+    effectCanvas.height = cv.height;
+    effectRects.length = 0;
+  }
+  if (!effectCanvas.isConnected) cv.after(effectCanvas);
+  const ctx = effectCtx, c = effectCamera;
+  // 基础画布保留连线和文字。每帧只擦除上次的流动标记与虚线轮廓。
+  for (const { x, y, right, bottom } of effectRects) ctx.clearRect(x, y, right - x, bottom - y);
+  effectRects.length = 0;
+  ctx.save();
+  ctx.setTransform(c.dpr, 0, 0, c.dpr, 0, 0);
+  ctx.translate(c.x, c.y);
+  ctx.scale(c.k, c.k);
+  const flash = state.flash;
+  if (flash) {
+    const box = { x: flash.box.x - 2, y: flash.box.y - 2, w: flash.box.w + 4, h: flash.box.h + 4 };
+    markEffectOutline(box, 16, 4);
+    roundRect(ctx, box.x, box.y, box.w, box.h, 16);
+    ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.9 * Math.min(1, (flash.until - now) / flash.dur));
+    ctx.lineWidth = 3 / c.k;
+    ctx.stroke();
+  }
+  for (const effect of effects) {
+    ctx.save();
+    if (effect.kind === 'box') {
+      const b = effect.box;
+      markEffectOutline(b, effect.radius, effect.width * c.k / 2 + 2);
+      roundRect(ctx, b.x, b.y, b.w, b.h, effect.radius);
+      ctx.strokeStyle = effect.color;
+      ctx.lineWidth = effect.width;
+      ctx.setLineDash(effect.dash);
+      ctx.lineDashOffset = -now * 0.024 / c.k;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = effect.color || flowPulseColor(THEME.node.selected);
+      const path = effect.path;
+      if (!path.length) { ctx.restore(); continue; }
+      const scale = Math.min(1, 1 / c.k);
+      const spacing = Math.min(Math.max(90, 20 / c.k), path.length);
+      // 所有连线每秒前进 80 个画布单位，长线只增加标记数量。
+      for (let distance = (now * 0.08) % spacing; distance < path.length; distance += spacing) {
+        const [x, y, dx, dy] = flowPointAt(path, distance);
+        if (x < c.area.left || x > c.area.right || y < c.area.top || y > c.area.bottom) continue;
+        ctx.save();
+        // 固定放在前进方向右侧，相向重合时各走一侧。
+        const mx = x - dy * 5 * scale, my = y + dx * 5 * scale;
+        markEffectArea({ x: mx, y: my, w: 0, h: 0 }, 9 * c.k * scale + 2);
+        ctx.translate(mx, my);
+        ctx.rotate(Math.atan2(dy, dx));
+        ctx.scale(scale, scale);
+        ctx.beginPath();
+        ctx.moveTo(5, 0);
+        ctx.lineTo(-3, -3);
+        ctx.lineTo(-1, 0);
+        ctx.lineTo(-3, 3);
+        ctx.closePath();
+        ctx.strokeStyle = '#1F2937'; ctx.lineWidth = 2; ctx.stroke();
+        ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 1; ctx.stroke();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+function syncCanvasSize() {
+  const { cv } = els;
   const dpr = window.devicePixelRatio || 1;
-  const w = els.cv.clientWidth;
-  const h = els.cv.clientHeight;
-  els.cv.width = Math.round(w * dpr);
-  els.cv.height = Math.round(h * dpr);
+  const w = Math.round(cv.clientWidth * dpr), h = Math.round(cv.clientHeight * dpr);
+  if (cv.width === w && cv.height === h) return false;
+  cv.width = w;
+  cv.height = h;
+  return true;
+}
+
+function resize() {
+  syncCanvasSize();
   draw();
 }
+
+// 工具栏内容换行也会改变画布高度，窗口尺寸可能保持不变。
+new ResizeObserver(() => { if (syncCanvasSize()) draw(); }).observe(els.cv);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+  } else if (state.view) draw({ geometryUnchanged: true });
+});
 
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -94,20 +385,32 @@ function neighborSet() {
   return set;
 }
 
-function draw() {
+function draw({ geometryUnchanged = false } = {}) {
+  cancelAnimationFrame(animationFrame);
+  animationFrame = 0;
+  recentDamage = null;
+  effects = [];
+  collectingEffects = false;
   const { ctx, cv } = els;
+  if (panOrigin) {
+    panOrigin = null;
+    cv.style.clipPath = '';
+    cv.style.translate = effectCanvas.style.translate = '';
+  }
+  if (!cv.width || !cv.height) { recentLayers = null; releaseScene(); releaseEffectCanvas(); return; }
   const dpr = window.devicePixelRatio || 1;
   const W = cv.width / dpr;
   const H = cv.height / dpr;
   const now = performance.now();
   if (state.recent && now >= state.recent.until) state.recent = null;
-  recentAlpha = state.recent ? (0.45 + 0.35 * Math.sin((now - state.recent.started) / 220)) *
-    Math.min(1, (state.recent.until - now) / 700) : 0;
+  if (state.flash && now >= state.flash.until) state.flash = null;
+  if (!state.recent?.animated || !state.view?.nodes.length) recentLayers = null;
 
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
   const v = state.view;
+  if (!geometryUnchanged) state.pairFlow?.refresh?.(v);
   const moving = state.moveTarget;
   if (moving && (moving.view !== v ||
       !(moving.kind === 'edge' ? v.edges : moving.kind === 'node' ? v.nodes : moving.kind === 'file' ? v.groups : v.containers)?.includes(moving.item) ||
@@ -123,6 +426,8 @@ function draw() {
     v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
   );
   if (!v) {
+    releaseScene();
+    releaseEffectCanvas();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
     ctx.textAlign = 'center';
@@ -135,6 +440,8 @@ function draw() {
   ctx.scale(cam.k, cam.k);
 
   if (!v.nodes.length) {
+    releaseScene();
+    releaseEffectCanvas();
     ctx.restore();
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
@@ -142,29 +449,58 @@ function draw() {
     ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
     return;
   }
+  collectingEffects = true;
+  const area = viewport(W, H);
 
-  if (v.containers) for (const c of v.containers) drawContainer(ctx, c);
+  // 标题可以比文件框宽，视口判断要包含标题可能占到的范围。
+  const groupVisible = (box) => boxVisible(box, area, groupPaintWidth(box));
+  for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c);
+  for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g);
 
-  if (v.groups) {
-    for (const g of v.groups) drawGroup(ctx, g);
-  }
+  if (state.recent?.animated) prepareRecentLayers(v, area);
 
   const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
     : state.selectedEdge ? edgeKey(state.selectedEdge) : null;
-  const focusedEdge = focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
-  const focusedEdges = new Set(state.multiSelection?.edges
+  const focusedEdge = state.selectedEdge && edgeKey(state.selectedEdge) === focusedKey && v.edges.includes(state.selectedEdge)
+    ? state.selectedEdge : focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
+  const trace = state.pairFlow?.result;
+  const tracedColors = new Map((trace?.edgeIndices || []).map(index => [v.edges[index], state.pairFlow.colors.get(index)]));
+  const tracedEdges = new Set(tracedColors.keys());
+  const flowingEdges = new Set((trace?.flowEdgeIndices || []).map(index => v.edges[index]));
+  const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.edges
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
-  for (const e of v.edges) {
-    if (focusedEdges.has(e)) continue;
-    const related = selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
-      : state.selected && (e.from === state.selected || e.to === state.selected);
-    drawEdge(ctx, e, related, false, !!focusedEdges.size);
+  const dim = focusedEdges.size || state.selected || selectedNodes?.size;
+  const related = [];
+  if (dim) {
+    sizeScene(cv);
+    sceneCtx.clearRect(0, 0, cv.width, cv.height);
+    sceneCtx.save();
+    sceneCtx.setTransform(ctx.getTransform());
   }
-  // 高亮最后画，避免共用干线上的其他边盖住它。
-  for (const e of focusedEdges) drawEdge(ctx, e, false, true, true);
+  for (const e of v.edges) {
+    if (focusedEdges.has(e) || !pathVisible(edgePoints(e), area)) continue;
+    if (!focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
+      : state.selected && (e.from === state.selected || e.to === state.selected))) related.push(e);
+    else drawEdge(dim ? sceneCtx : ctx, e, false, false);
+  }
+  // 背景连线画完再整体淡化一次。数十条调用共线时，透明度不会叠加成一条黑线。
+  if (dim) {
+    sceneCtx.restore();
+    ctx.save();
+    ctx.resetTransform();
+    ctx.globalAlpha = focusedEdges.size ? 0.22 : 0.26;
+    ctx.drawImage(scene, 0, 0);
+    ctx.restore();
+  }
+  for (const e of related) drawEdge(ctx, e, true, false);
+  for (const e of focusedEdges) {
+    if (!pathVisible(edgePoints(e), area)) continue;
+    const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || e === focusedEdge;
+    drawEdge(ctx, e, false, true, tracedColors.get(e), animated);
+  }
 
   if (state.linkFrom && state.linkPos) {
     const a = state.linkFrom;
@@ -194,23 +530,26 @@ function draw() {
   }
 
   const nb = neighborSet();
-  for (const n of v.nodes) drawNode(ctx, n, nb, focusedNodes);
+  for (const n of v.nodes) if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes);
+  for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
+    const node = v.nodes.find(n => n.id === id);
+    if (!node || !boxVisible(node, area)) continue;
+    const gap = 5 / cam.k;
+    recordBoxEffect({ x: node.x - gap, y: node.y - gap, w: node.w + gap * 2, h: node.h + gap * 2 },
+      [6 / cam.k, 4 / cam.k], 2.5 / cam.k, 10, '#7C3AED');
+    ctx.save(); ctx.fillStyle = '#7C3AED'; ctx.font = `bold ${12 / cam.k}px ${FONT}`;
+    ctx.textAlign = 'left'; ctx.fillText(String(index + 1), node.x + 4 / cam.k, node.y - 9 / cam.k); ctx.restore();
+  }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
-  drawEdgeLabels(ctx, v);
+  drawEdgeLabels(ctx, v, { onAnimatedBox: recordBoxEffect, focusedEdges: tracedEdges,
+    visible: (box) => boxVisible(box, area), reuse: geometryUnchanged });
 
-  // 双击解锁的对象用持续的实线光圈标明，区别于普通单击选择。
-  if (state.moveTarget && state.moveTarget.kind !== 'edge') {
+  // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
+  if (state.moveTarget && !state.dragBox && !['edge', 'node'].includes(state.moveTarget.kind)) {
     const b = state.moveTarget.item, gap = 4 / cam.k;
-    ctx.save();
-    ctx.setLineDash([]);
-    ctx.strokeStyle = THEME.node.selected;
-    ctx.lineWidth = 2 / cam.k;
-    ctx.shadowColor = THEME.node.selected;
-    ctx.shadowBlur = 6;
-    roundRect(ctx, b.x - gap, b.y - gap, b.w + gap * 2, b.h + gap * 2, 10);
-    ctx.stroke();
-    ctx.restore();
+    recordBoxEffect({ x: b.x - gap, y: b.y - gap, w: b.w + gap * 2, h: b.h + gap * 2 },
+      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, state.moveTarget.kind === 'dir' ? 14 : 12);
   }
 
   if (state.dragBox && state.dragMoved) {
@@ -236,32 +575,23 @@ function draw() {
     ctx.restore();
   }
 
-  // 点击标题后的短暂高亮：框住刚点中的那个层级，避免「点了没反应」的错觉
-  if (state.flash) {
-    const f = state.flash;
-    const left = f.until - performance.now();
-    if (left <= 0) {
-      state.flash = null;
-    } else {
-      const a = Math.min(1, left / f.dur);
-      ctx.save();
-      roundRect(ctx, f.box.x - 2, f.box.y - 2, f.box.w + 4, f.box.h + 4, 16);
-      ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.9 * a);
-      ctx.lineWidth = 3 / cam.k;
-      ctx.stroke();
-      ctx.restore();
-      scheduleDraw();
-    }
-  }
-  if (state.recent || focusedEdges.size || state.multiSelection ||
-      v.nodes.some((n) => n.id === state.selected && n.kind === 'var')) scheduleDraw();
-
   ctx.restore();
 
   ctx.fillStyle = '#B4B2A9';
   ctx.font = `11px ${FONT}`;
   ctx.textAlign = 'left';
   ctx.fillText(`${v.nodes.length} / ${v.edges.length}  ·  ${Math.round(cam.k * 100)}%`, 12, H - 12);
+  collectingEffects = false;
+  if (recentLayers) {
+    sizeScene(cv);
+    sceneCtx.clearRect(0, 0, scene.width, scene.height);
+    sceneCtx.drawImage(cv, 0, 0);
+    drawRecentFrame(now, { x: 0, y: 0, right: cv.width, bottom: cv.height });
+    lastGlowPaint = now;
+  } else if (!dim) releaseScene();
+  effectCamera = { ...cam, dpr, area };
+  drawEffects(now);
+  scheduleDraw();
 }
 
 function drawContainer(ctx, c) {
@@ -329,83 +659,63 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-function drawEdge(ctx, e, related, selected, focused = false) {
+function drawEdge(ctx, e, related, selected, traceColor = null, animated = true) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
-  // 原有=黑、新增=红；删除沿用原色，另在中央画 X
-  const color = selected
-    ? THEME.node.selected
-    : e.change === 'added'
+  // 连线只按黑 / 红区分状态；选中只加粗，删除另在中央画 X。
+  const color = traceColor ? traceColor : e.change === 'added'
     ? THEME.edge.added
-    : e.kind === 'var'
+    : isDataEdge(e)
     ? THEME.edge.var
     : THEME.edge.call;
-  if (recentAlpha && state.recent.edges.has(edgeKey(e))) {
-    ctx.save();
-    ctx.beginPath();
-    strokeRounded(ctx, pts);
-    ctx.strokeStyle = '#E69A16';
-    ctx.globalAlpha = recentAlpha;
-    ctx.lineWidth = 7 / cam.k;
-    ctx.shadowColor = '#E69A16';
-    ctx.shadowBlur = 10;
-    if (e.kind === 'var') ctx.setLineDash([7, 4]);
-    ctx.stroke();
-    ctx.restore();
-  }
   ctx.save();
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
+  const recent = state.recent;
+  // 增加节点时用节点边框提示位置。单独增加多条关系时用静态线条提示。
+  if (recent && !recent.animated && !recent.nodes.size && recent.edges.has(edgeKey(e))) {
+    ctx.strokeStyle = hexToRgba(RECENT_COLOR, 0.45);
+    ctx.lineWidth = Math.max(3.4, 2 / cam.k);
+    ctx.stroke();
+  }
+  if (traceColor) {
+    ctx.strokeStyle = '#FFFFFF'; ctx.lineWidth = 6 * Math.min(1, 1 / cam.k); ctx.globalAlpha = 0.9; ctx.stroke();
+  }
+
   ctx.strokeStyle = color;
-  ctx.lineWidth = selected ? 2.6 : related ? 2.4 : 1.4;
-  ctx.globalAlpha = focused && !selected ? 0.22 : state.selected && !related && !selected ? 0.26 : 1;
+  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.6 : related ? 2.4 : 1.4;
+  ctx.globalAlpha = 1;
   // 变量访问=虚线，函数调用=实线
-  if (e.kind === 'var') ctx.setLineDash([7, 4]);
+  if (isDataEdge(e)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  if (selected) {
-    ctx.save();
-    ctx.beginPath();
-    strokeRounded(ctx, pts);
-    ctx.shadowColor = THEME.node.hover;
-    if (state.multiSelection) {
-      // 多选用整条线的呼吸光晕，与单选的方向脉冲区分。
-      const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 320);
-      ctx.strokeStyle = THEME.node.hover;
-      ctx.lineWidth = (5 + 2 * pulse) / cam.k;
-      ctx.globalAlpha = 0.18 + 0.22 * pulse;
-      ctx.shadowBlur = 3 + 3 * pulse;
-      if (e.kind === 'var') ctx.setLineDash([7, 4]);
-    } else {
-      ctx.strokeStyle = '#8BD8FF';
-      ctx.lineWidth = 3 / cam.k;
-      ctx.setLineDash([12 / cam.k, 30 / cam.k]);
-      // 负偏移让亮段沿 from → to 移动，与箭头保持同向。
-      ctx.lineDashOffset = -performance.now() * 0.08 / cam.k;
-      ctx.shadowBlur = 5;
+  const direction = edgeDirection(e);
+  const drawDirection = (a, b, reverse) => {
+    if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
+      const path = flowPath(reverse ? pts.toReversed() : pts);
+      if (path.length) {
+        effects.push({ kind: 'edge', path, color: flowPulseColor(color) });
+      }
     }
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  const a = pts[pts.length - 2];
-  const b = pts[pts.length - 1];
-  let dx = b[0] - a[0];
-  let dy = b[1] - a[1];
-  const len = Math.hypot(dx, dy) || 1;
-  dx /= len;
-  dy /= len;
-  const s = 6;
-  ctx.beginPath();
-  ctx.moveTo(b[0], b[1]);
-  ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
-  ctx.lineTo(b[0] - s * dx + s * 0.55 * dy, b[1] - s * dy - s * 0.55 * dx);
-  ctx.closePath();
-  ctx.fillStyle = color;
-  ctx.fill();
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    const s = 6;
+    ctx.beginPath();
+    ctx.moveTo(b[0], b[1]);
+    ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
+    ctx.lineTo(b[0] - s * dx + s * 0.55 * dy, b[1] - s * dy - s * 0.55 * dx);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+  };
+  if (direction === 'forward' || direction === 'both') drawDirection(pts.at(-2), pts.at(-1), false);
+  if (direction === 'reverse' || direction === 'both') drawDirection(pts[1], pts[0], true);
 
   if (selected && !state.multiSelection && !state.view?.comparison &&
       state.moveTarget?.kind === 'edge' && state.moveTarget.item === e) {
@@ -472,21 +782,9 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const hover = state.hover === n.id;
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const edgeRelated = focusedNodes?.has(n.id);
+  const recentlyAdded = state.recent && !state.recent.animated && state.recent.nodes.has(n.id);
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
-
-  if (recentAlpha && state.recent.nodes.has(n.id)) {
-    ctx.save();
-    const gap = 5 / cam.k;
-    roundRect(ctx, x - gap, y - gap, w + gap * 2, h + gap * 2, 10);
-    ctx.strokeStyle = '#E69A16';
-    ctx.globalAlpha = recentAlpha;
-    ctx.lineWidth = 3 / cam.k;
-    ctx.shadowColor = '#E69A16';
-    ctx.shadowBlur = 12;
-    ctx.stroke();
-    ctx.restore();
-  }
 
   ctx.save();
   ctx.globalAlpha = dimmed ? 0.3 : 1;
@@ -499,26 +797,33 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
-  ctx.lineWidth = dropTarget ? 2.6 : selected || edgeRelated ? 2.4 : hover ? 1.6 : 1;
+  ctx.lineWidth = dropTarget ? 2.6 : selected || edgeRelated ? 2.4
+    : recentlyAdded ? Math.max(1.6, 1 / cam.k) : hover ? 1.6 : 1;
   ctx.strokeStyle = dropTarget
     ? '#639922'
     : selected || edgeRelated
     ? THEME.node.selected
+    : recentlyAdded
+    ? RECENT_COLOR
     : hover
     ? THEME.node.hover
     : n.external
     ? THEME.node.externalBorder
+    : isVar
+    ? THEME.node.varBorder
     : THEME.node.border;
-  // 变量用实线框，选中时呼吸发光；函数保留流动虚线框。
-  ctx.setLineDash(isVar ? [] : [5, 3]);
-  if (!isVar && selected && allNodes) ctx.lineDashOffset = -performance.now() * 0.04 / cam.k;
-  ctx.save();
-  if (isVar && selected) {
-    ctx.shadowColor = THEME.node.hover;
-    ctx.shadowBlur = 3 + 8 * (0.5 + 0.5 * Math.sin(performance.now() / 320));
+  // 函数框/变量框各自的虚实线型，样式面板可调；选中时的流动虚线只在虚线开启时有效
+  ctx.setLineDash((isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
+  const animated = collectingEffects && selected && !state.dragNode && ((allNodes && n.id === state.selected) ||
+    state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
+  const dash = ctx.getLineDash();
+  if (animated && dash.length) recordBoxEffect(n, dash, ctx.lineWidth, 8, ctx.strokeStyle);
+  else ctx.stroke();
+  if (animated && !dash.length) {
+    const gap = 4 / cam.k;
+    recordBoxEffect({ x: x - gap, y: y - gap, w: w + gap * 2, h: h + gap * 2 },
+      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, 10);
   }
-  ctx.stroke();
-  ctx.restore();
   ctx.setLineDash([]);
 
   if (n.note) {
@@ -538,15 +843,20 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     ctx.textBaseline = 'middle';
 
     // 函数名统一带 ()，变量名不带，便于一眼区分
-    let label = isVar ? n.name || n.id : `${n.name || n.id}()`;
+    const name = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
     const maxW = w - 18;
-    if (ctx.measureText(label).width > maxW) {
-      while (label.length > 1 && ctx.measureText(label + '…').width > maxW) {
-        label = label.slice(0, -1);
+    const font = ctx.font;
+    let saved = nodeNames.get(n);
+    if (!saved || saved.name !== name || saved.font !== font || saved.width !== maxW) {
+      let label = name;
+      if (ctx.measureText(label).width > maxW) {
+        while (label.length > 1 && ctx.measureText(label + '…').width > maxW) label = label.slice(0, -1);
+        label += '…';
       }
-      label += '…';
+      saved = { name, font, width: maxW, label };
+      nodeNames.set(n, saved);
     }
-    ctx.fillText(label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
+    ctx.fillText(saved.label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
 
     if (cam.k >= 0.62) {
       ctx.font = `10.5px ${FONT}`;
@@ -576,6 +886,9 @@ export {
   roundRect,
   updateGroups,
   draw,
+  compositeEffects,
+  panCanvas,
+  finishPan,
   drawContainer,
   drawGroup,
   strokeRounded,

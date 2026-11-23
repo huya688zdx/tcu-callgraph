@@ -4,17 +4,23 @@
  */
 import { t } from '../i18n.js';
 import { els, esc } from './state.js';
+let menuAnchor = null;
 
 export function hideMenu() {
   if (!els.ctxMenu) return;
+  menuAnchor?.setAttribute('aria-expanded', 'false');
+  menuAnchor = null;
   els.ctxMenu.classList.remove('show');
   els.ctxMenu.innerHTML = '';
 }
 
-function place(el, x, y) {
+function place(el, x, y, anchor = null) {
+  menuAnchor = anchor;
+  menuAnchor?.setAttribute('aria-expanded', 'true');
   el.style.left = `${x}px`;
   el.style.top = `${y}px`;
   el.classList.add('show');
+  el.scrollTop = 0;
   const r = el.getBoundingClientRect();
   if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
   if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
@@ -47,9 +53,10 @@ export function showMenu(x, y, title, items, current, onPick) {
 /**
  * 分组菜单：sections = [{ id, label, items: [{ value, label, color?, active? }] }]
  */
-export function showMenuSections(x, y, title, sections, onPick) {
+export function showMenuSections(x, y, title, sections, onPick, anchor = null) {
   const el = els.ctxMenu;
   if (!el) return;
+  hideMenu();
   const html = [`<div class="title">${esc(title)}</div>`];
   sections.forEach((sec, si) => {
     if (sec.label) html.push(`<div class="sec-title">${esc(t(sec.label))}</div>`);
@@ -63,7 +70,7 @@ export function showMenuSections(x, y, title, sections, onPick) {
     }
   });
   el.innerHTML = html.join('');
-  place(el, x, y);
+  place(el, x, y, anchor);
   el.onclick = (ev) => {
     const btn = ev.target.closest('button');
     if (!btn) return;
@@ -73,3 +80,21 @@ export function showMenuSections(x, y, title, sections, onPick) {
     if (it && onPick) onPick(it.value, sec.id);
   };
 }
+
+document.addEventListener('pointerdown', (event) => {
+  if (!els.ctxMenu?.contains(event.target) && !menuAnchor?.contains(event.target)) hideMenu();
+}, true);
+document.addEventListener('focusin', (event) => {
+  if (!els.ctxMenu?.contains(event.target) && !menuAnchor?.contains(event.target)) hideMenu();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && els.ctxMenu?.classList.contains('show')) {
+    event.preventDefault();
+    event.stopPropagation();
+    hideMenu();
+  }
+}, true);
+document.addEventListener('scroll', (event) => {
+  if (!els.ctxMenu?.contains(event.target)) hideMenu();
+}, true);
+window.addEventListener('resize', hideMenu);

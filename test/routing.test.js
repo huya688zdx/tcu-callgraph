@@ -1,7 +1,102 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { routeEdges, routeOverlapConflicts } from '../src/core/routing.js';
-import { improveEdgeRoutes } from '../src/core/layout-metrics.js';
+import { routeEdges, routeOverlapConflicts, pathBlockedByNodes } from '../src/core/routing.js';
+import { improveEdgeRoutes, mergeSharedRoutes } from '../src/core/layout-metrics.js';
+import { exportSvg } from '../src/core/export-svg.js';
+import { buildSVGFromLayout } from '../src/core/export.js';
+
+test('不同样式只豁免同端口的短引线，远处的短重叠也要计入', () => {
+  const call = { from: 's', to: 'a', points: [[0, 0], [0, 40], [40, 40], [40, 80]] };
+  const ref = { from: 's', to: 'b', kind: 'var', points: [[0, 0], [10, 0], [10, 40], [20, 40], [20, 70]] };
+  assert.equal(routeOverlapConflicts([call, ref]).length, 10);
+  ref.points = [[0, 0], [0, 15], [-10, 15]];
+  assert.equal(routeOverlapConflicts([call, ref]).length, 0);
+});
+
+test('局部重布拆开同文件重合的直线，保留另一条手工路径及两端的函数位置', () => {
+  const nodes = ['a', 'b'].map((id, i) => ({ id, file: 'f.c', x: 40 + i * 300, y: 100, w: 120, h: 44 }));
+  const saved = { from: 'a', to: 'b', custom: true, points: [[160, 122], [340, 122]] };
+  const edge = { from: 'a', to: 'b', change: 'added', points: structuredClone(saved.points) };
+  const view = { nodes, edges: [saved, edge], width: 520, height: 250 };
+  const before = structuredClone(view);
+  assert.ok(routeOverlapConflicts(view.edges).length > 100);
+  improveEdgeRoutes(view, [edge], () => false);
+  assert.deepEqual(saved, before.edges[0]);
+  assert.deepEqual(nodes, before.nodes);
+  assert.equal(routeOverlapConflicts(view.edges).length, 0);
+  assert.ok(!pathBlockedByNodes(edge.points, nodes, new Set(['a', 'b'])));
+});
+
+test('同端点同线型的重复调用按各自指定的连接面布线', () => {
+  const nodes = [{ id: 'a', x: 20, y: 40, w: 120, h: 44 }, { id: 'b', x: 400, y: 220, w: 120, h: 44 }];
+  const edges = [{ from: 'a', to: 'b', kind: 'direct', fromSide: 'right', toSide: 'left' },
+    { from: 'a', to: 'b', kind: 'fnptr', fromSide: 'bottom', toSide: 'top' }];
+  routeEdges(nodes, edges);
+  assert.deepEqual(edges.map((e) => [e.points[0], e.points.at(-1)]),
+    [[[140, 62], [400, 242]], [[80, 84], [460, 220]]]);
+});
+
+test('ELK 已有的同源调用通道合并，函数指针调用使用相同的可见线型', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+  const edges = [
+    { from: 's', to: 'a', kind: 'direct', points: [[150, 40], [150, 100], [350, 100], [350, 300]] },
+    { from: 's', to: 'b', kind: 'fnptr', points: [[150, 40], [150, 120], [550, 120], [550, 300]] },
+  ];
+  const positions = structuredClone(nodes);
+  mergeSharedRoutes({ nodes, edges });
+  assert.equal(edges[0].points[1][1], edges[1].points[1][1], '平行横线应共用同一根干线');
+  assert.deepEqual(edges.map((e) => e.points.at(-1)), [[350, 300], [550, 300]], '各目标箭头保留');
+  assert.deepEqual(nodes, positions);
+  const paths = exportSvg({ nodes, edges }).match(/<path[^>]*data-from="s"[^>]*>/g);
+  assert.ok(paths.every((p) => p.includes('mk-direct') && !p.includes('stroke-dasharray')), '导出也统一为函数调用实线');
+  const cliPaths = buildSVGFromLayout({ nodes, edges, width: 700, height: 700 }).match(/<path[^>]*data-from="s"[^>]*>/g);
+  assert.ok(cliPaths.every((p) => p.includes('mk-direct') && !p.includes('stroke-dasharray')), '命令行导出与画布相同');
+});
+
+test('汇流不合并虚实线、不同颜色，也不覆盖手工折线', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+  const edges = ['direct', 'var', 'direct', 'direct'].map((kind, i) => ({ from: 's', to: i ? 'b' : 'a', kind,
+    ...(kind === 'var' ? { via: '写' } : {}),
+    change: i === 2 ? 'added' : 'existing', custom: i === 3,
+    points: [[150, 40], [150, 100 + i * 20], [i ? 550 : 350, 100 + i * 20], [i ? 550 : 350, 300]] }));
+  const before = structuredClone(edges);
+  mergeSharedRoutes({ nodes, edges });
+  assert.deepEqual(edges, before);
+  assert.match(exportSvg({ nodes, edges }), /stroke-dasharray="7 4"[^>]*mk-var/);
+});
+
+test('平行干线末端错开时延伸公共通道，接入分支且避开阻挡节点', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 500, w: 100, h: 40 }, { id: 'b', x: 500, y: 600, w: 100, h: 40 }];
+  const edges = [
+    { from: 's', to: 'a', kind: 'direct', points: [[150, 40], [150, 100], [650, 100], [650, 400], [350, 400], [350, 500]] },
+    { from: 's', to: 'b', kind: 'direct', points: [[150, 40], [150, 100], [670, 100], [670, 450], [550, 450], [550, 600]] },
+  ];
+  const before = structuredClone({ nodes, edges });
+  mergeSharedRoutes({ nodes, edges });
+  assert.deepEqual(edges[1].points, [[150, 40], [150, 100], [650, 100], [650, 450], [550, 450], [550, 600]]);
+  assert.deepEqual(nodes, before.nodes);
+  assert.deepEqual(edges.map(e => e.points.at(-1)), before.edges.map(e => e.points.at(-1)));
+  before.nodes.push({ id: 'block', x: 640, y: 410, w: 20, h: 20 });
+  mergeSharedRoutes(before);
+  assert.equal(pathBlockedByNodes(before.edges[1].points, before.nodes, new Set(['s', 'b'])), false);
+  assert.deepEqual(before.edges[1].points.at(-1), [550, 600]);
+});
+
+test('公共前缀已经被第三条入边共用时，不得制造组外的虚假连接', () => {
+  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 }, { id: 'c', x: 0, y: 180, w: 100, h: 40 },
+    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+  const edges = [
+    { from: 's', to: 'b', kind: 'direct', points: [[150, 40], [150, 250], [550, 250], [550, 300]] },
+    { from: 's', to: 'a', kind: 'direct', points: [[150, 40], [150, 100], [350, 100], [350, 300]] },
+    { from: 'c', to: 'a', kind: 'direct', points: [[100, 200], [350, 200], [350, 300]] },
+  ];
+  assert.equal(routeOverlapConflicts(edges).length, 0);
+  mergeSharedRoutes({ nodes, edges });
+  assert.equal(routeOverlapConflicts(edges).length, 0, '不能把 s→b 与 c→a 合并成不存在的 c→b');
+});
 
 test('跨层级连线下方无遮挡时，从下方出线一次转弯进入目标', () => {
   const nodes = [

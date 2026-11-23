@@ -2,19 +2,19 @@
  * 入口：视图加载、删除、工具栏与快捷键、启动
  * 具体职责已拆到 lib/ 下的模块
  */
-import { applyI18n } from './i18n.js';
+import { applyI18n, t } from './i18n.js';
 import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
 import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
 import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, loadVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { loadStats, loadTree, resetVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
 import { buildStandaloneHtml } from './lib/html.js';
-import { upgradeSelect } from './lib/ui-select.js';
+import './lib/ui-select.js';
 // 样式设置面板：恢复已存主题并接好「样式」按钮，纯副作用导入
 import './lib/appearance.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
@@ -26,8 +26,9 @@ import './lib/timeline.js';
 import './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
-import { restorePage } from './lib/live.js';
+import { restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
+import { clearPairFlow } from './lib/pair-flow.js';
 
 /**
  * 加载视图
@@ -41,23 +42,30 @@ const NAV_MAX = 30;
 
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false } = opts;
-  const previous = incremental && !state.at && state.view?.nodes?.length ? state.view : null;
+  const previous = incremental && !state.at && state.view ? state.view : null;
+  if (state.pairFlow) clearPairFlow();
   stopCamAnim();
-  // 记录跳转前的入口与视角，供 Ctrl+Z 回退
-  if (nav && state.view && state.roots.length) {
-    navStack.push({ roots: [...state.roots], cam: { x: cam.x, y: cam.y, k: cam.k } });
-    if (navStack.length > NAV_MAX) navStack.shift();
-  }
+  // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
+  const prior = nav && state.view && state.roots.length ? {
+    roots: [...state.roots], expansions: structuredClone(state.expansions), cam: { ...cam },
+    up: state.up, down: state.down, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+  } : null;
   const seq = ++viewSeq;
   clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
+  const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
+  const up = opts.exact ? 0 : opts.up ?? state.up;
+  const down = opts.exact ? 0 : opts.down ?? state.down;
+  const vars = opts.vars ?? [...state.vars];
+  const hiddenVars = opts.hiddenVars ?? [...state.hiddenVars];
   const data = await api.view({
     roots,
-    up: state.up,
-    down: state.down,
+    expansions,
+    up,
+    down,
     group: state.group,
-    vars: [...state.vars],
-    hiddenVars: [...state.hiddenVars],
+    vars,
+    hiddenVars,
     at: state.at,
     previous,
   });
@@ -66,7 +74,16 @@ async function loadView(rootId, opts = {}) {
     console.warn(data?.error || '读取视图失败，保留当前画面');
     return;
   }
+  if (prior) {
+    navStack.push(prior);
+    if (navStack.length > NAV_MAX) navStack.shift();
+  }
+  state.up = up; state.down = down;
+  state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
+  // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
+  if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = data;
+  state.expansions = data.expansions || [];
   syncComparison(data.comparison);
   state.root = data.root;
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
@@ -77,72 +94,151 @@ async function loadView(rootId, opts = {}) {
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';
+  if (data.truncated && !data.comparison) els.rootName.textContent += ` · ${t('compare.truncated')}`;
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
-  if (!previous) fit();
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
+  for (const n of previous?.layoutSlots?.nodes || []) {
+    const restored = data.nodes.find((item) => item.id === n.id && item.x === n.x && item.y === n.y);
+    if (restored && !oldNodes.has(n.id)) oldNodes.set(n.id, n);
+  }
   const oldEdges = new Set((previous?.edges || []).map(edgeKey));
+  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const rearranged = addedNodes.length > 0;
+  if (!previous || rearranged) fit({ paint: false });
   const common = data.nodes.filter((n) => oldNodes.has(n.id));
-  // ELK 扩展层间通道可能整体平移文件框，用共同节点的中位偏移稳住屏幕位置。
-  if (common.length) for (const axis of ['x', 'y']) {
+  // 新增节点已完整排版并适配；其余增量刷新继续稳住已有画面。
+  if (!rearranged && common.length) for (const axis of ['x', 'y']) {
     const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
     cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
   }
-  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   constrainCam();
   const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
+  if (previous && !rearranged) revealAdded(addedNodes, addedEdges);
   pulseAdded(addedNodes, addedEdges);
-  if (previous) revealAdded(addedNodes, addedEdges);
   renderDetail(null);
   renderLabelPanel();
   history.stack = [];
   history.idx = -1;
   pushHistory();
-  return data;
+  // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
+  await savePage(true).catch((error) => console.warn('保存视图范围失败：', error));
+  return seq === viewSeq ? data : undefined;
 }
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
+hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } = {}) => {
+  const shown = new Set(state.view?.nodes.map((n) => n.id));
+  const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => includeShown || !shown.has(id));
+  if (!ids.length) return state.view;
+  const projectId = state.view?.projectId;
+  if (restoreHidden && !state.at && !state.view?.comparison) {
+    const hidden = (await Promise.all(ids.filter((id) => !shown.has(id))
+      .map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
+    if (state.view?.projectId !== projectId) return;
+    if (hidden.length) {
+      const result = await api.del({ nodes: hidden, restore: true, projectId });
+      if (!result?.ok) throw new Error(result?.error || '重新加入失败');
+    }
+  }
+  const selected = state.selected;
+  const expanded = new Set(state.expansions.map((scope) => scope.root));
+  const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
+    .map((id) => ({ root: id, up: 0, down: 0 }))];
+  const view = await loadView(state.roots, { incremental: true, expansions });
+  if (view && selected && view.nodes.some((n) => n.id === selected)) {
+    state.selected = selected;
+    await renderDetail(selected);
+    draw();
+  }
+  return view;
+};
+hooks.removeFunction = async (id) => {
+  if (state.at || state.view?.comparison || !state.view?.nodes.some((n) => n.id === id)) return;
+  state.selected = id;
+  state.selectedEdge = null;
+  state.selectedLabel = null;
+  await deleteSelection();
+};
 hooks.renderDetail = renderDetail;
+hooks.syncComparison = syncComparison;
 // live.js 收到 AI 改动推送后用它刷新画面（保留视角）；函数声明有提升，这里可以先引用
 hooks.reloadKeepCam = reloadKeepCam;
+let comparisonPage = null;
+hooks.applyComparison = async (roots) => {
+  if (!comparisonPage) comparisonPage = {
+    view: structuredClone(state.view), roots: [...state.roots], expansions: structuredClone(state.expansions),
+    vars: [...state.vars], hiddenVars: [...state.hiddenVars], up: state.up, down: state.down,
+    cam: { ...cam }, nav: [...navStack], deleted: [...deleteStack],
+  };
+  state.at = 0;
+  state.expansions = [];
+  state.vars = new Set(roots.filter((id) => id.startsWith('var::')));
+  state.hiddenVars.clear();
+  navStack.length = 0;
+  await loadView(roots, { nav: false, incremental: true, exact: true, expansions: [] });
+  if (!state.view?.comparison) throw new Error('比较结果已准备，画布加载失败，请重试');
+  // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
+  // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
+  state.up = 0; state.down = 0;
+  resetVars();
+  await Promise.all([loadStats(), loadTree()]);
+};
+hooks.restoreComparison = async () => {
+  if (!comparisonPage) return hooks.reloadAll();
+  const saved = comparisonPage;
+  comparisonPage = null;
+  state.view = saved.view;
+  state.roots = saved.roots;
+  state.expansions = saved.expansions;
+  state.vars = new Set(saved.vars);
+  state.hiddenVars = new Set(saved.hiddenVars);
+  state.up = saved.up; state.down = saved.down;
+  Object.assign(cam, saved.cam);
+  navStack.splice(0, navStack.length, ...saved.nav);
+  deleteStack.splice(0, deleteStack.length, ...saved.deleted);
+  resetVars();
+  await loadView(saved.roots, { nav: false, incremental: true, expansions: saved.expansions });
+  await Promise.all([loadStats(), loadTree()]);
+};
 
 /** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
 hooks.applyBookmark = async (b) => {
   state.at = 0;
-  state.up = Number(b.up) || 0;
-  state.down = Number(b.down) || 3;
+  state.up = Number.isInteger(b.up) ? b.up : 1;
+  state.down = Number.isInteger(b.down) ? b.down : 1;
   state.group = !!b.group;
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
 
-  els.depth.value = String(state.down);
-  els.updepth.value = String(state.up);
   els.groupMode.checked = state.group;
 
   const roots = (b.roots || []).filter(Boolean);
-  await loadView(roots.length ? roots : null);
-  await loadVars();
+  await loadView(roots.length ? roots : null, { expansions: b.expansions || [] });
 };
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async () => {
+  comparisonPage = null;
   const seq = ++viewSeq;
   state.view = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.roots = [];
+  state.expansions = [];
   state.root = null;
   state.at = 0;
   state.vars.clear();
   state.hiddenVars.clear();
+  state.ctxBox = null;
+  resetVars();
   navStack.length = 0;
   deleteStack.length = 0;
   await loadStats();
   await loadTree();
-  await loadVars();
   await restorePage(null, () => seq === viewSeq);
 };
 
@@ -159,14 +255,18 @@ hooks.toggleVar = (id, on) => {
 };
 
 async function postDelete(body) {
-  await api.del(body);
+  const result = await api.del(body);
+  if (!result?.ok) throw new Error(result?.error || '移出画布失败');
 }
 
 /** 回退到上一个视图（入口 + 视角一起还原） */
 async function navigateBack() {
-  const prev = navStack.pop();
+  const prev = navStack.at(-1);
   if (!prev) return false;
-  await loadView(prev.roots.length ? prev.roots : null, { nav: false });
+  const view = await loadView(prev.roots.length ? prev.roots : null, { nav: false, expansions: prev.expansions || [],
+    up: prev.up, down: prev.down, vars: prev.vars, hiddenVars: prev.hiddenVars });
+  if (!view) return false;
+  navStack.pop();
   cam.x = prev.cam.x;
   cam.y = prev.cam.y;
   cam.k = prev.cam.k;
@@ -191,19 +291,15 @@ async function deleteSelection() {
     body = { edges: [edgeKey(state.selectedEdge)] };
   } else if (state.selected) {
     body = { nodes: [state.selected] };
+  } else if (state.moveTarget?.kind === 'file' && state.moveTarget.view === v) {
+    // 文件框只隐藏当前框内节点，沿用单节点删除的存档与撤销。
+    body = { nodes: v.nodes.filter(n => n.group === state.moveTarget.item.id).map(n => n.id) };
+    if (!body.nodes.length) return;
   } else {
     return;
   }
 
-  // 删掉的正是当前入口时，把它从入口集合里摘掉；全删空则回退到自动选择
-  if (body.nodes && body.nodes.length) {
-    const rest = state.roots.filter((id) => !body.nodes.includes(id));
-    if (rest.length !== state.roots.length) {
-      state.roots = rest;
-      state.root = rest[0] || null;
-    }
-  }
-
+  // 保留查找入口作为范围锚点；隐藏入口也不自动选入其他函数，撤销时仍能恢复原图。
   await postDelete(body);
   // 记下删除时所在的入口集合：换视图后不能拿这条记录去恢复（见 canRestoreDelete）
   deleteStack.push({ ...body, roots: state.roots.join('+'), at: Date.now() });
@@ -213,6 +309,7 @@ async function deleteSelection() {
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.hover = null;
+  if (state.moveTarget?.kind === 'file') { state.moveTarget = null; state.ctxBox = null; }
   await reloadKeepCam();
   renderDetail(null);
   renderLabelPanel();
@@ -265,7 +362,7 @@ window.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selected || state.selectedEdge || state.selectedLabel) {
+    if (state.selected || state.selectedEdge || state.selectedLabel || state.moveTarget?.kind === 'file') {
       e.preventDefault();
       deleteSelection();
     }
@@ -273,35 +370,18 @@ window.addEventListener('keydown', (e) => {
 });
 
 window.addEventListener('keydown', (e) => {
+  if (document.querySelector('.modal.show')) return;
   if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA') return;
   if (e.key === 'f' || e.key === 'F') fit();
-});
-
-// 范围下拉换成自定义样式（原 select 展开列表是系统绘制，无法定制）；change 仍派发在原 select 上
-upgradeSelect(els.depth);
-upgradeSelect(els.updepth);
-
-// 范围是界面习惯：记到服务端 setting 表，重启后从 /api/ui-prefs 恢复（见启动段）
-const saveUiPrefs = () => api.setUiPrefs({ down: state.down, up: state.up }).catch(() => {});
-
-els.depth.addEventListener('change', () => {
-  state.down = Number(els.depth.value);
-  saveUiPrefs();
-  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
-});
-els.updepth.addEventListener('change', () => {
-  state.up = Number(els.updepth.value);
-  saveUiPrefs();
-  loadView(state.roots.length ? state.roots : state.root, { incremental: true });
 });
 
 els.groupMode.addEventListener('change', () => {
   state.group = els.groupMode.checked;
   state.selectedEdge = null;
-  loadView(state.root);
+  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 els.resetLayout.addEventListener('click', () => {
-  loadView(state.roots.length ? state.roots : state.root);
+  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
@@ -354,27 +434,28 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
-const initialPanels = Promise.all([loadStats(), loadTree(), loadVars()]);
-// 先恢复上次记住的范围再拉首屏：loadView 用 state.down/up 决定展开多少层。
-// 拿不到（老服务端 / 网络失败）就落在 HTML 里的默认 3 / 0，行为同以前。
+// 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {
   const seq = viewSeq;
   try {
     const p = await api.uiPrefs();
     if (seq === viewSeq && Number.isInteger(p?.down)) {
       state.down = p.down;
-      els.depth.value = String(p.down);
+      state.addDepths.down = p.down;
     }
     if (seq === viewSeq && Number.isInteger(p?.up)) {
       state.up = p.up;
-      els.updepth.value = String(p.up);
+      state.addDepths.up = p.up;
     }
   } catch {
     /* 服务端没有该接口或暂时不可达：用默认值 */
   }
-  await initialPanels;
+  await Promise.all([loadStats(), loadTree()]);
   await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
-})();
+  if (!state.view) throw new Error('未能加载视图');
+})().catch((error) => {
+  if (confirm(`启动失败：${error.message}\n是否刷新页面重试？`)) location.reload();
+});
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
 window.__cg = {

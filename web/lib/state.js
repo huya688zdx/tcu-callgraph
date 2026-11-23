@@ -6,8 +6,6 @@ const els = {
   cv: document.getElementById('cv'),
   ctx: document.getElementById('cv').getContext('2d'),
   search: document.getElementById('search'),
-  depth: document.getElementById('depth'),
-  updepth: document.getElementById('updepth'),
   resetLayout: document.getElementById('resetLayout'),
   groupMode: document.getElementById('groupMode'),
   stats: document.getElementById('stats'),
@@ -31,6 +29,10 @@ const state = {
   root: null,
   /** 当前所有入口函数（文件树多选时会有多个） */
   roots: [],
+  /** 右键按函数添加的局部查找范围，独立于顶部默认层数。 */
+  expansions: [],
+  /** 新添加函数的调用关系查找层数，不改动已有画布范围。 */
+  addDepths: { up: 1, down: 1 },
   /** 当前点选的框：{ kind:'file'|'dir', id } —— 右侧变量面板按它过滤 */
   ctxBox: null,
   /** 手动勾选要显示在图里的全局变量 id */
@@ -41,14 +43,16 @@ const state = {
   at: 0,
   selected: null,
   hover: null,
-  down: 3,
-  up: 0,
+  down: 1,
+  up: 1,
   group: true,
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
   selectedLabel: null,
   /** Ctrl+A 选择同类型、同样式的组件，保存匹配的节点 / 连线 / 标签集合。 */
   multiSelection: null,
+  /** Ctrl 点选的两个端点及当前画布的连线路径，不写入工程模型。 */
+  pairFlow: null,
   /** 双击后才允许移动节点、层级或调整连线；普通单击不解锁。 */
   moveTarget: null,
   dragSeg: null,
@@ -86,16 +90,20 @@ export const THEME = {
   bg: '#F7F6F2',
   edge: {
     call: '#2C2C2A', // 函数调用
-    var: '#2C2C2A', // 变量访问（虚线）
+    var: '#2C2C2A', // 变量访问
     added: '#D9303E', // 新增边
     manual: '#639922', // 手动连线预览
+    selPulse: true, // 选中线柔光呼吸（样式面板可关）
   },
   node: {
     border: '#3A3A36', // 函数框描边
+    varBorder: '#3A3A36', // 变量框描边
     externalBorder: '#D3D1C7', // 外部符号描边
     external: '#FAFAF7', // 外部符号底色
     selected: '#185FA5', // 选中高亮
     hover: '#378ADD', // 悬停高亮
+    fnDash: true, // 函数框虚线（关 = 实线）
+    varDash: false, // 变量框虚线（开 = 虚线）
   },
   /** 变更分类底色：既存 / 变更 / 追加 / 删除（画布右键分类菜单与图例同源） */
   fill: {
@@ -129,7 +137,9 @@ function syncThemeSideEffects() {
   chip('lg-call', THEME.edge.call);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
-  chip('lg-del', THEME.edge.call); // 删除边沿用调用色，只加 X 标记
+  // 删除边沿用调用色、中央带 X：图例里画的是 SVG，所以走 color 而不是 border
+  const delChip = document.getElementById('lg-del');
+  if (delChip) delChip.style.color = THEME.edge.call;
 }
 
 /** 设置单个颜色（'fill.existing' 这类路径）。非法值拒绝，返回是否成功 */
@@ -148,11 +158,27 @@ export function setThemeColor(path, value) {
   return true;
 }
 
-/** 批量应用（启动恢复 / 离线快照）：只认合法的十六进制色，缺项保持默认 */
+/** 设置布尔型主题项（框/线的虚实开关）。类型不符拒绝，返回是否成功 */
+export function setThemeFlag(path, value) {
+  const keys = path.split('.');
+  let obj = THEME;
+  for (let i = 0; i < keys.length - 1; i++) {
+    obj = obj[keys[i]];
+    if (!obj || typeof obj !== 'object') return false;
+  }
+  const last = keys[keys.length - 1];
+  if (typeof obj[last] !== 'boolean' || typeof value !== 'boolean') return false;
+  obj[last] = value;
+  syncThemeSideEffects();
+  return true;
+}
+
+/** 批量应用（启动恢复 / 离线快照）：颜色与布尔开关各走各的校验，缺项保持默认 */
 export function applyTheme(saved = {}, prefix = '') {
   for (const [key, value] of Object.entries(saved || {})) {
     const path = prefix + key;
     if (value && typeof value === 'object') applyTheme(value, path + '.');
+    else if (typeof value === 'boolean') setThemeFlag(path, value);
     else setThemeColor(path, value);
   }
 }

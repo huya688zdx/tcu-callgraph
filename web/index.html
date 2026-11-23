@@ -10,6 +10,17 @@
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; }
+  .pair-flow-bar { font-size:12px; }
+  .pair-flow-bar[hidden] { display:none; }
+  .pair-flow-heading { color:#2C2C2A; font-weight:600; overflow-wrap:anywhere; line-height:1.6; }
+  .pair-flow-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .pair-flow-hint { color:#666; margin-top:8px; font-size:11px; line-height:1.6; }
+  .pair-flow-bar details { margin-top:10px; }
+  .pair-flow-bar summary { cursor:pointer; color:#5F5E5A; }
+  .pair-flow-path { padding:10px 0; overflow-wrap:anywhere; line-height:1.8; border-bottom:1px solid #EFEEE9; }
+  .pair-flow-path:last-child { border-bottom:0; padding-bottom:0; }
+  .pair-flow-path strong, .pair-flow-path small { display:block; color:#888780; font-size:11px; font-weight:400; }
+  .pair-flow-arrow { font-weight:700; font-size:16px; }
   body {
     font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
     font-size: 13px; color: #2C2C2A; background: #F7F6F2;
@@ -78,10 +89,9 @@
   button.primary { background: #185FA5; color: #fff; border-color: #185FA5; }
   button.primary:hover { background: #0C447C; }
   :root { --chev-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' fill='none' stroke='%23888780' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
-  /* 范围下拉的自定义样式：原生 select 的展开列表是系统绘制的，由 ui-select.js 换成下面的结构 */
-  .fsel { position: relative; }
+  .fsel { display: inline-block; position: relative; }
   .fsel select { display: none; }
-  .fsel-btn { display: flex; align-items: center; gap: 7px; }
+  .fsel-btn { display: inline-flex; align-items: center; gap: 7px; }
   .fsel-btn::after {
     content: ''; width: 10px; height: 10px; flex: 0 0 auto;
     background: var(--chev-down) center / 100% no-repeat;
@@ -89,13 +99,12 @@
   }
   .fsel.open .fsel-btn::after { transform: rotate(180deg); }
   .fsel-pop {
-    position: absolute; top: calc(100% + 6px); left: 0; z-index: 40; min-width: 100%;
+    position: fixed; z-index: 10000; overflow: auto; max-width: calc(100vw - 12px);
     padding: 5px; background: #fff; border: 1px solid #DEDDD6; border-radius: 10px;
     box-shadow: 0 8px 24px #0000001A; display: none;
   }
-  .fsel.open .fsel-pop { display: block; animation: popIn .16s ease; }
   .fsel-pop button { display: block; width: 100%; height: 32px; border: 0; border-radius: 6px; text-align: left; }
-  .fsel-pop button:hover { background: #F1EFE8; }
+  .fsel-pop button:hover, .fsel-pop button.focus { background: #F1EFE8; }
   .fsel-pop button.on { background: #E6F1FB; color: #185FA5; font-weight: 500; }
   @keyframes popIn { from { opacity: 0; transform: translateY(-4px); } }
   .hint { color: #888780; font-size: 11.5px; white-space: nowrap; }
@@ -105,7 +114,7 @@
   aside { background: #fff; overflow: auto; }
   #left { grid-area: left; border-right: 1px solid rgba(0,0,0,.08); display: flex; flex-direction: column; overflow: hidden; }
   #right { grid-area: right; border-left: 1px solid rgba(0,0,0,.08); }
-  #right[data-mode="dataflow"] > .sec:not(#secDataflow) { display: none !important; }
+  #right[data-mode="dataflow"] > .sec:not(#secDataflow):not(#pairFlowBar) { display: none !important; }
   main { grid-area: main; position: relative; overflow: hidden; }
   canvas { display: block; width: 100%; height: 100%; cursor: default; }
   canvas.panning { cursor: grabbing; }
@@ -166,6 +175,14 @@
   .edge-item { font-size: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(0,0,0,.08); }
   .edge-item:last-child { border: 0; }
   .edge-item b { font-weight: 500; }
+  .search-summary, .call-relation { display: flex; align-items: center; gap: 6px; }
+  .add-function { flex: 0 0 auto; margin-left: auto; height: 24px; padding: 0 7px; color: #185FA5; font-size: 11.5px; }
+  .add-function[hidden] { display: none; }
+  .settings-note { margin: 8px 0; color: #888780; font-size: 12px; line-height: 1.6; }
+  #addFunctionsModal { width: 620px; }
+  .function-pick { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid #EEEDE8; cursor: pointer; }
+  .function-pick span { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+  .function-pick small { color: #888780; }
   .empty { color: #B4B2A9; font-size: 12px; padding: 8px 0; }
 
   /* ---- 连线标签面板 ---- */
@@ -255,15 +272,24 @@
   }
   #legend span { display: inline-flex; align-items: center; white-space: nowrap; }
   #legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; margin-right: 5px; flex: 0 0 auto; }
+  /* 删除图例画的是「线 + 中央 X」的小 SVG，颜色由主题同步写到 color（currentColor） */
+  #legend #lg-del { border-top: 0; height: auto; color: #2C2C2A; display: inline-flex; align-items: center; }
   #legend em { font-style: normal; }
 
   /* 文件区自己滚：aside 固定占满一列，避免 aside 与 tree-sec 两条滚动条叠在一起 */
   .tree-sec { flex: 1 1 0; min-height: 0; overflow: auto; }
-  #tree { font-size: 12.5px; user-select: none; }
+  .tree-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+  .tree-heading h3 { margin: 0; }
+  #shownFunctions { height: 23px; padding: 0 7px; font-size: 11px; color: #6F736A; border-color: #E5E7E1; border-radius: 6px; }
+  #shownFunctions span { margin-left: 3px; font-variant-numeric: tabular-nums; }
+  #shownFunctions[aria-pressed="true"] { background: #E6F1FB; border-color: #B5D4F4; color: #185FA5; }
+  #tree { font-size: 12.5px; line-height: 18px; user-select: none; }
   .tn {
-    display: flex; align-items: center; gap: 3px; padding: 2px 4px;
+    display: flex; align-items: center; gap: 4px; min-height: 25px; padding: 2px 6px;
     border-radius: 5px; cursor: pointer; white-space: nowrap;
   }
+  .tn.dir .nm { color: #444740; font-weight: 600; }
+  .tn.file .nm { color: #444740; font-weight: 500; }
   .tn:hover { background: #F1EFE8; }
   .tn.hl { background: #FDF0C8; box-shadow: inset 0 0 0 1px #EFC35A; border-radius: 4px; }
   #vars { max-height: 260px; overflow-y: auto; overflow-x: hidden; margin: -2px -2px 0; padding: 0 2px; }
@@ -313,10 +339,12 @@
   .var-file .tw { width: 9px; font-size: 7px; color: #A8A69C; line-height: 1; }
   .var-file .cnt { margin-left: auto; color: #C9C6BC; font-size: 10px; flex: 0 0 auto; }
   .var-file .fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .tn .tw { width: 12px; flex: 0 0 12px; color: #888780; font-size: 10px; text-align: center; }
-  .tn .nm { overflow: hidden; text-overflow: ellipsis; }
-  .tn.fn .nm { color: #5F5E5A; }
-  .tn.fn input { margin: 0 1px 0 0; width: 13px; height: 13px; cursor: pointer; }
+  .tn .tw { width: 10px; flex: 0 0 10px; color: #999D94; font-size: 9px; text-align: center; }
+  .tn .nm { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .tn.fn .nm { color: #6F736A; font-size: 11.5px; font-weight: 400; }
+  .tn.fn.shown .nm { color: #185FA5; }
+  .tn.fn .add-function { height: 21px; padding: 0 5px; border-radius: 5px; border-color: #E5E7E1; background: transparent; color: #697C8E; font-size: 10.5px; }
+  .tn.fn .add-function:hover, .tn.fn .add-function[aria-expanded="true"] { background: #E6F1FB; border-color: #B5D4F4; color: #185FA5; }
   .results-list { list-style: none; margin: 0 0 6px; padding: 0; }
   .results-list:empty { display: none; }
   .results-list li { padding: 5px 6px; border-radius: 6px; cursor: pointer; background: #F7F6F2; margin-bottom: 3px; }
@@ -332,6 +360,11 @@
     display: none;
     z-index: 1000;
     min-width: 150px;
+    max-width: min(36rem, calc(100vw - 16px));
+    max-height: calc(100vh - 16px);
+    overflow: auto;
+    overflow-wrap: anywhere;
+    overscroll-behavior: contain;
     padding: 4px;
     background: #fff;
     border: 1px solid #D3D1C7;
@@ -400,6 +433,17 @@
     color: #888780; cursor: pointer; padding: 0 4px;
   }
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  #expandForm { display: grid; gap: 14px; }
+  #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
+  #expandForm label { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #2C2C2A; }
+  #expandForm input {
+    height: 30px; padding: 0 9px; font-size: 12.5px; flex: 0 0 auto;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 8px; background: #fff; color: #2C2C2A;
+  }
+  #expandForm input:focus { outline: none; border-color: #185FA5; }
+  #expandForm input { width: 64px; text-align: center; }
+  #expandForm p { margin: 0; color: #888780; font-size: 12px; line-height: 1.6; }
+  #expandMessage { font-size: 12px; color: #A32D2D; margin-right: auto; align-self: center; }
   .call-order-row { display: grid; grid-template-columns: 18px 90px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px dashed #E8E7E1; cursor: pointer; }
   .call-order-row input { margin: 0; }
   .call-order-number { font-size: 12px; }
@@ -427,19 +471,54 @@
 
   .session-foot { border-top: 0; padding-top: 0; background: #fff; }
   .session-foot .hint { font-size: 11.5px; color: #5F5E5A; }
-  /* 样式设置：每行 = 名称 + 与画布同款的小预览 + 取色器 */
-  .style-sec + .style-sec { border-top: 1px solid #F1EFE8; margin-top: 10px; padding-top: 6px; }
-  .style-sec h3 { margin: 4px 0 2px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
-  .style-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; cursor: pointer; }
-  .style-row .sl { flex: 1; font-size: 12.5px; }
-  .sw { flex: 0 0 auto; }
-  .sw-line { width: 30px; border-top: 3px solid #000; }
-  .sw-line.dash { border-top-style: dashed; }
-  .sw-box { width: 30px; height: 18px; border-radius: 5px; border: 1px solid rgba(0,0,0,.25); display: inline-block; }
-  .style-row input[type=color] {
-    width: 40px; height: 26px; padding: 1px 2px; border: 1px solid rgba(0,0,0,.16);
-    border-radius: 6px; background: #fff; cursor: pointer;
+  .compare-pick-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  .compare-pick-row { display:flex; align-items:flex-start; gap:10px; padding:10px 4px; border-bottom:1px solid #eee; cursor:pointer; }
+  .compare-pick-row small { display:block; color:#777; margin-top:3px; overflow-wrap:anywhere; }
+  #compareSelectModal .modal-foot { display:flex; gap:10px; flex-wrap:wrap; }
+  #comparePickCount { flex:1; font-size:12px; }
+  /* 样式设置：两列紧凑网格；点色样弹应用内调色板（预设网格 + 自定义入口），不直接弹系统调色盘 */
+  #styleModal { width: 520px; }
+  .style-sec { padding: 6px 2px 2px; }
+  .style-sec + .style-sec { border-top: 1px solid #F1EFE8; margin-top: 4px; }
+  .style-sec h3 { margin: 0 0 4px; font-size: 11px; font-weight: 600; color: #A8A69C; letter-spacing: .05em; }
+  .style-rows { display: grid; grid-template-columns: 1fr 1fr; column-gap: 16px; }
+  .style-row {
+    display: flex; align-items: center; gap: 8px; height: 27px;
+    padding: 0 5px; border-radius: 6px; font-size: 12px;
   }
+  .style-row:hover { background: #F5F4EF; }
+  .style-row .sl { flex: 1; color: #2C2C2A; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sw-wrap { position: relative; width: 30px; height: 18px; flex: 0 0 auto; cursor: pointer; border-radius: 4px; }
+  .sw-wrap:hover { box-shadow: 0 0 0 2px #B5D4F4; }
+  .sw { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .sw-box { border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.18); }
+  .sw-picker { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; border: 0; padding: 0; }
+  /* 虚实线型开关：直接画成实线/虚线图形的小按钮 */
+  .seg { display: inline-flex; gap: 3px; flex: 0 0 auto; }
+  .seg button {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 18px; padding: 0; cursor: pointer;
+    border: 1px solid rgba(0,0,0,.16); border-radius: 4px; background: #fff; color: #5F5E5A;
+  }
+  .seg button.on { border-color: #185FA5; background: #E6F1FB; color: #185FA5; }
+  .seg button:hover:not(.on) { background: #F1EFE8; }
+  .seg svg { display: block; }
+  /* 应用内调色板弹出层 */
+  .pal-pop {
+    position: fixed; z-index: 60; padding: 8px;
+    background: #fff; border: 1px solid #DEDDD6; border-radius: 10px;
+    box-shadow: 0 8px 24px #00000026;
+  }
+  .pal-grid { display: grid; grid-template-columns: repeat(6, 22px); gap: 5px; }
+  .pal-chip { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,.15); }
+  .pal-chip:hover { box-shadow: inset 0 0 0 1px rgba(0,0,0,.15), 0 0 0 2px #B5D4F4; }
+  .pal-chip.cur { box-shadow: inset 0 0 0 2px #fff; outline: 2px solid #185FA5; outline-offset: 1px; }
+  .pal-custom {
+    display: block; width: 100%; margin-top: 7px; padding: 5px 0 0;
+    border: 0; border-top: 1px solid #F1EFE8; background: none;
+    font-size: 11.5px; color: #5F5E5A; cursor: pointer; text-align: center;
+  }
+  .pal-custom:hover { color: #185FA5; }
   .ai-hint { margin: 2px 0 10px; color: #888780; font-size: 12px; }
   .ai-level {
     display: flex; align-items: flex-start; gap: 9px;
@@ -603,7 +682,7 @@
             <button id="exportXlsx" data-i18n="btn.xlsx">Excel</button>
           </div>
         </details>
-        <button id="styleBtn" data-i18n="btn.style" title="调整画布、连线与函数框的颜色样式">样式</button>
+        <button id="styleBtn" data-i18n="btn.style" title="调整默认显示名称与画布样式">设置</button>
         <button id="aiBtn" title="AI 客户端（MCP）访问权限" data-i18n-title="btn.ai">AI 访问</button>
         <details class="tool-menu" id="helpMenu">
           <summary data-i18n="toolbar.help">操作说明</summary>
@@ -614,6 +693,7 @@
             <p><span>缩放范围</span><kbd>50%–200% · 大图支持整图预览</kbd></p>
             <p><span>平移画布</span><kbd>拖拽空白处</kbd></p>
             <p><span>查看函数 / 变量详情</span><kbd>单击节点</kbd></p>
+            <p><span>追踪两个节点间已有的连线路径</span><kbd>Ctrl+依次点击两个节点 · Esc 清除</kbd></p>
             <p><span>搜索结果加入画布</span><kbd>单击 · 双击单独打开</kbd></p>
             <p><span>移动函数 / 变量</span><kbd>双击选中后拖动</kbd></p>
             <p><span>整体移动文件 / 目录</span><kbd>双击标题选中后拖动</kbd></p>
@@ -633,19 +713,6 @@
     </div>
     <div class="view-row" aria-label="视图与编辑工具">
       <div class="tool-group">
-        <span class="tool-label" data-i18n="toolbar.scope">范围</span>
-        <select id="depth" aria-label="向下展开层数">
-          <option value="1" data-i18n="depth.down1">向下 1 层</option>
-          <option value="2" data-i18n="depth.down2">向下 2 层</option>
-          <option value="3" selected data-i18n="depth.down3">向下 3 层</option>
-          <option value="5" data-i18n="depth.down5">向下 5 层</option>
-          <option value="9" data-i18n="depth.downAll">向下全部</option>
-        </select>
-        <select id="updepth" aria-label="向上展开层数">
-          <option value="0" selected data-i18n="depth.up0">向上 0 层</option>
-          <option value="1" data-i18n="depth.up1">向上 1 层</option>
-          <option value="2" data-i18n="depth.up2">向上 2 层</option>
-        </select>
         <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
       </div>
       <div class="tool-group">
@@ -659,7 +726,7 @@
       <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
     </div>
     <div class="sec tree-sec">
-      <h3 data-i18n="panel.files">文件</h3>
+      <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数">已加入 <span>0</span></button></div>
       <ul id="results" class="results-list"></ul>
       <div id="tree"><div class="empty" data-i18n="tree.loading">加载中…</div></div>
     </div>
@@ -674,9 +741,9 @@
     <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
-      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
+      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var" title="写入函数 → 变量 → 读取函数，双箭头表示读写">数据流向</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
-      <span><i id="lg-del" style="border-color:#2C2C2A"></i><em data-i18n="legend.deleted">删除</em></span>
+      <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>
     <div id="tooltip"></div>
     <div id="ctxMenu" class="ctx-menu"></div>
@@ -734,9 +801,28 @@
     </div>
   </div>
 
+  <div id="compareSelectModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareSelectTitle" style="width:min(900px,94vw)">
+    <div class="modal-head"><h2 id="compareSelectTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
+    <div class="modal-body">
+      <p class="hint">解析已完成。勾选要加入的函数或变量，原图中的节点会保留；取消不会改变当前画面。</p>
+      <p class="hint" id="comparePickRetainWarning" role="status"></p>
+      <div class="compare-pick-tools">
+        <input id="comparePickSearch" type="search" placeholder="搜索名称或文件路径" aria-label="搜索比较结果">
+        <select id="comparePickType" aria-label="对象类型"><option value="all">函数和变量</option><option value="fn">只看函数</option><option value="var">只看变量</option></select>
+        <select id="comparePickChange" aria-label="变更分类"><option value="changed">直接变更</option><option value="all">全部（含影响和上下文）</option><option value="modified">修改</option><option value="added">新增</option><option value="deleted">删除</option><option value="existing">未修改</option></select>
+        <button id="comparePickChanged" type="button">勾选直接变更</button><button id="comparePickClear" type="button">清空选择</button>
+      </div>
+      <details><summary id="comparePickWarningCount">解析提示与文件映射</summary><pre id="comparePickWarnings" style="white-space:pre-wrap;max-height:150px;overflow:auto"></pre></details>
+      <div id="comparePickList" style="max-height:42vh;overflow:auto"></div>
+      <div class="compare-pick-tools"><button id="comparePickPrev" type="button">上一页</button><span id="comparePickPage"></span><button id="comparePickNext" type="button">下一页</button></div>
+      <div id="comparePickError" class="detail-meta" role="alert" style="color:#A32D2D"></div>
+    </div>
+    <div class="modal-foot"><span id="comparePickCount" role="status"></span><button id="comparePickApply" class="primary" type="button" disabled>加入当前图</button><button id="comparePickCancel" type="button">取消</button></div>
+  </div>
+
   <div id="styleModal" class="modal">
     <div class="modal-head">
-      <h2 data-i18n="style.title">样式设置</h2>
+      <h2 data-i18n="style.title">显示与样式设置</h2>
       <button class="modal-close" data-close="styleModal">&times;</button>
     </div>
     <div class="modal-body" id="styleBody"></div>
@@ -744,6 +830,44 @@
       <span class="hint" data-i18n="style.hint">改动即时生效，自动保存到本机</span>
       <button id="styleReset" data-i18n="style.reset">恢复默认</button>
     </div>
+  </div>
+
+  <div id="expandModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="expandTitle">
+    <div class="modal-head">
+      <h2 id="expandTitle" data-i18n="expand.title">函数层级查找</h2>
+      <button class="modal-close" data-close="expandModal">&times;</button>
+    </div>
+    <div class="modal-body">
+      <form id="expandForm">
+        <strong id="expandFunction"></strong>
+        <label><span data-i18n="expand.direction">查找方向</span>
+          <select id="expandDirection">
+            <option value="down" data-i18n="expand.down">向下：查找被调用函数</option>
+            <option value="up" data-i18n="expand.up">向上：查找调用者</option>
+          </select>
+        </label>
+        <label><span data-i18n="expand.depth">查找层数</span>
+          <input id="expandDepth" type="number" min="1" max="20" step="1" value="1" required>
+        </label>
+        <p data-i18n="expand.hint">在当前画布中加入所选方向的调用关系，层数可选 1–20。向上一层只加入直接调用者，不展开它们的其他分支；没有调用者时保留原图。</p>
+      </form>
+    </div>
+    <div class="modal-foot">
+      <span id="expandMessage" role="status" aria-live="polite"></span>
+      <button id="expandApply" class="primary" type="submit" form="expandForm" data-i18n="expand.apply">查找并加入画布</button>
+    </div>
+  </div>
+
+  <div id="addFunctionsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="addFunctionsTitle">
+    <div class="modal-head"><h2 id="addFunctionsTitle">选择要添加的调用关系</h2><button class="modal-close" data-close="addFunctionsModal">&times;</button></div>
+    <div class="modal-body">
+      <strong id="addFunctionsTarget"></strong>
+      <p id="addFunctionsScope" class="settings-note"></p>
+      <p class="settings-note">只加入勾选的函数，并连接它们与画布中已有函数的关系。未勾选的函数不会加入。</p>
+      <label><input id="addFunctionsAll" type="checkbox" checked> 全选待添加函数</label>
+      <div id="addFunctionsList"></div>
+    </div>
+    <div class="modal-foot"><span id="addFunctionsMessage" role="status"></span><button id="addFunctionsApply" class="primary" disabled>确认添加</button><button id="addFunctionsCancel">取消</button></div>
   </div>
 
   <div id="callOrderModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="callOrderTitle">

@@ -99,6 +99,7 @@ async function save() {
     r = await api.saveBookmark({
       name,
       roots: state.roots,
+      expansions: state.expansions,
       up: state.up,
       down: state.down,
       group: state.group,

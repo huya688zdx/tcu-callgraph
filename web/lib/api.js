@@ -3,12 +3,15 @@
  */
 import { state } from './state.js';
 
+// 页面标识用于识别延迟到达的自身切换广播，不依赖请求是否已经结束。
+export const clientId = crypto.randomUUID();
+
 const get = (url) => fetch(url).then((r) => r.json());
 
 const post = (url, body) =>
   fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json',
+    headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId,
       ...((body.projectId ?? state.view?.projectId) == null ? {} :
         { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }) },
     body: JSON.stringify(body),
@@ -31,8 +34,9 @@ const guardWrite = (name) => {
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
-  view({ root, roots, up = 0, down = 3, group = true, vars, hiddenVars, at = 0, previous = null }) {
+  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null, preview = false }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
+    if (preview) q.set('preview', '1');
     // 支持多入口：勾选多个函数时一起入图
     const list = (roots && roots.length ? roots : root ? [root] : []).filter(Boolean);
     if (list.length === 1) q.set('root', list[0]);
@@ -40,16 +44,20 @@ export const api = {
     if (vars && vars.length) q.set('vars', vars.join(','));
     if (hiddenVars && hiddenVars.length) q.set('novars', hiddenVars.join(','));
     if (at > 0) q.set('at', String(at));
-    if (!previous) return get('/api/view?' + q);
+    const bodyRoots = q.toString().length > 6000 ? list : null;
+    if (bodyRoots) { for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key); }
+    if (!previous && !expansions.length && !bodyRoots) return get('/api/view?' + q);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
-    return post('/api/view?' + q, { projectId: previous.projectId, previous: {
+    return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId, ...(bodyRoots ? { roots: bodyRoots, vars: vars || [], hiddenVars: hiddenVars || [] } : {}), expansions, previous: previous ? {
       projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
-      edges: previous.edges.map(({ from, to, kind, line, change, points }) => ({ from, to, kind, line, change, points })),
+      edges: previous.edges.map(({ from, to, kind, line, change, points, custom, fromSide, toSide }) =>
+        ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
-    } });
+      layoutSlots: previous.layoutSlots,
+    } : null });
   },
-  stats: () => get('/api/stats'),
+  stats: () => get('/api/stats?summary=1'),
   /** 当前工程身份（名字、路径、指纹是否变过） */
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */
@@ -59,6 +67,9 @@ export const api = {
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
   compare: (body) => post('/api/compare', body),
+  applyComparison: (body) => post('/api/compare/apply', body),
+  comparisonStatus: (body) => post('/api/compare/status', body),
+  cancelComparison: (previewId) => post('/api/compare/cancel', { previewId }),
   exitComparison: () => post('/api/compare/exit', {}),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */
   events: ({ limit = 50, before = 0, ops = [], q = '' } = {}) => {
@@ -93,6 +104,8 @@ export const api = {
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir)),
+  pairDataflow: (a, b) => post('/api/dataflow/pair', { a, b, projectId: state.view?.projectId,
+    comparisonId: state.view?.comparison?.id }),
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
