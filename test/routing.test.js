@@ -58,6 +58,7 @@ test('汇流不合并虚实线、不同颜色，也不覆盖手工折线', () =>
   const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
     { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
   const edges = ['direct', 'var', 'direct', 'direct'].map((kind, i) => ({ from: 's', to: i ? 'b' : 'a', kind,
+    ...(kind === 'var' ? { via: '写' } : {}),
     change: i === 2 ? 'added' : 'existing', custom: i === 3,
     points: [[150, 40], [150, 100 + i * 20], [i ? 550 : 350, 100 + i * 20], [i ? 550 : 350, 300]] }));
   const before = structuredClone(edges);

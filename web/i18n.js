@@ -59,7 +59,7 @@ const dict = {
     'vars.noMatch': '没有匹配的变量',
     'panel.edges': '调用关系',
     'legend.call': '函数调用',
-    'legend.var': '变量访问',
+    'legend.var': '数据流向',
     'legend.added': '新增',
     'legend.deleted': '删除',
     'node.variable': '变量',

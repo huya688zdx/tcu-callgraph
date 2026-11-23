@@ -1,3 +1,5 @@
+import { edgeDirection } from './edge-flow.js';
+
 /** 只在当前可见节点和已有连线中找最短连接路径，不读取源码、不推测隐藏关系。 */
 export function traceVisiblePaths(view, a, b, limit = 24) {
   const nodes = new Map(view.nodes.map(n => [n.id, n])), adjacency = new Map();
@@ -25,10 +27,20 @@ export function traceVisiblePaths(view, a, b, limit = 24) {
   while (stack.length && paths.length < limit) {
     const path = stack.pop();
     if (path.id === a) {
-      const ids = path.nodes.toReversed(), steps = path.steps.toReversed();
+      const ids = path.nodes.toReversed(), steps = path.steps.toReversed().map(s => ({ ...s }));
       const versions = view.comparison ? ['before', 'after'].filter(v => steps.every(s =>
         !view.edges[s.edge].versions?.length || view.edges[s.edge].versions.includes(v))) : undefined;
-      paths.push({ nodes: ids, steps, versions, mixed: steps.some(s => s.forward) && steps.some(s => !s.forward) });
+      const directed = steps.filter(s => edgeDirection(view.edges[s.edge]) !== 'both');
+      for (const step of directed) {
+        if (edgeDirection(view.edges[step.edge]) === 'reverse') step.forward = !step.forward;
+      }
+      // 双向边可顺着路径任一方向通过，不会独自产生换向点。
+      for (const step of steps) {
+        if (edgeDirection(view.edges[step.edge]) === 'both') step.forward = directed[0]?.forward ?? true;
+      }
+      const unknown = directed.some(s => edgeDirection(view.edges[s.edge]) === 'unknown');
+      paths.push({ nodes: ids, steps, versions, mixed: unknown || versions?.length === 0 ||
+        directed.some(s => s.forward) && directed.some(s => !s.forward) });
     } else {
       for (const parent of parents.get(path.id) || []) stack.push({ id: parent.from,
         nodes: [...path.nodes, parent.from], steps: [...path.steps, { edge: parent.edge, forward: parent.forward }] });
@@ -42,7 +54,7 @@ export function traceVisiblePaths(view, a, b, limit = 24) {
 
 /** 路径使用连线下标，结构/顺序变化后重新查找；拖动和缩放无需重新遍历。 */
 export const visibleGraphKey = view => JSON.stringify([view.nodes.map(n => n.id),
-  view.edges.map(e => [e.from, e.to, e.kind, e.versions])]);
+  view.edges.map(e => [e.from, e.to, e.kind, e.via, e.versions])]);
 
 /** 最短路径中共用边的正反向一致，按方向赋色可同时保留连续段和换向边界。 */
 export function pathEdgeColors(paths) {

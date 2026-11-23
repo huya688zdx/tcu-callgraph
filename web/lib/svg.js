@@ -1,3 +1,5 @@
+import { isDataEdge, svgMarkers } from './edge-flow.js';
+import { periodSubtitle } from './period-text.js';
 /**
  * 导出：SVG 构建与下载
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
@@ -52,7 +54,7 @@ function buildSVG() {
     ['red', THEME.edge.added],
   ]) {
     out.push(
-      `<marker id="mk-${name}" viewBox="-6 -3.3 6 6.6" refX="0" refY="0" markerWidth="6" markerHeight="6.6" markerUnits="userSpaceOnUse" orient="auto"><path d="M0 0L-6 3.3L-6 -3.3Z" fill="${c}"/></marker>`
+      `<marker id="mk-${name}" viewBox="-6 -3.3 6 6.6" refX="0" refY="0" markerWidth="6" markerHeight="6.6" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L-6 3.3L-6 -3.3Z" fill="${c}"/></marker>`
     );
   }
   out.push('</defs>');
@@ -89,12 +91,12 @@ function buildSVG() {
     const e = v.edges[i];
     const d = (e.points || []).map(([x, y], j) => `${j ? 'L' : 'M'}${x} ${y}`).join(' ');
     // 与画布 drawEdge 相同：新增=红，变量访问=自己的线色（虚线），其余=调用色
-    const c = e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call;
+    const c = e.change === 'added' ? THEME.edge.added : isDataEdge(e) ? THEME.edge.var : THEME.edge.call;
     // 虚实与画布 drawEdge 相同：按类型走主题开关
-    const dash = (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash) ? ' stroke-dasharray="7 4"' : '';
-    const mk = e.change === 'added' ? 'mk-red' : e.kind === 'var' ? 'mk-var' : 'mk-dark';
+    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
+    const mk = e.change === 'added' ? 'mk-red' : isDataEdge(e) ? 'mk-var' : 'mk-dark';
     out.push(
-      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash} marker-end="url(#${mk})" data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
+      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash}${svgMarkers(e, mk)} data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
     if (e.change === 'deleted' && e.points?.length > 1) {
       const i = Math.max(1, Math.floor(e.points.length / 2));
@@ -130,7 +132,7 @@ function buildSVG() {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 8).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(label)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(sub)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(periodSubtitle(n) || sub)}</text>`
     );
     out.push('</g>');
   }

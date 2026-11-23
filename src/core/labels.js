@@ -44,6 +44,16 @@ const PRESETS = new Set(['task', 'conn', 'call', 'custom']);
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+/** 自动序号仅作为显示层，不进入可编辑标签或覆盖手工标注。 */
+export function displayEdgeLabels(edge, labels, caller) {
+  if (edge.from !== caller || !edge.callNumbers?.length || labels.some(l => l.preset === 'call')) return labels;
+  const numbers = edge.callNumbers;
+  const summary = numbers.slice(0, 4).join('、') + (numbers.length > 4 ? '…' : '');
+  const label = normalizeLabel({ preset: 'call', text: LABEL_PRESETS.call.text + summary });
+  if (edge.versions?.length) label.note = edge.versions.includes('after') ? '修改后' : '修改前';
+  return [...labels, { ...label, auto: true }];
+}
+
 /** 标签显示文字：结合点的文字永远由编号推导，避免文字和编号对不上 */
 export function labelText(label) {
   if (!label) return '';

@@ -172,6 +172,28 @@
   .swatches { display: flex; gap: 6px; }
   .sw { width: 22px; height: 22px; border-radius: 6px; cursor: pointer; border: 2px solid transparent; }
   .sw.on { border-color: #2C2C2A; }
+  .sequence-list { margin: 12px 0; }
+  .sequence-list h4, .sequence-list p { margin: 0 0 5px; }
+  .sequence-list p, .sequence-list small { color: #657784; font-size: 11px; }
+  .sequence-list ol { margin: 4px 0; padding-left: 28px; font-size: 12px; }
+  .sequence-list li { padding: 3px 0; overflow-wrap: anywhere; }
+  .sequence-list li::marker { color: #185fa5; font-weight: 600; }
+  #taskList { max-height: 190px; overflow-y: auto; }
+  #taskCount { color: #657784; font-weight: 500; }
+  .task-entry { display: grid; grid-template-columns: minmax(0,1fr) auto; width: 100%; height: auto; text-align: left; padding: 5px 4px; gap: 2px 6px; border: 0; border-radius: 4px; }
+  .task-entry:hover, .task-entry:focus-visible { background: #edf4f8; }
+  .task-entry b, .task-entry small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-entry b { font-weight: 500; }
+  .task-entry strong { font-size: 11px; color: #124b71; }
+  .task-entry small { grid-column: 1 / -1; color: #657784; }
+  .period-impact { margin: 12px 0; padding: 10px; background: #edf4f8; border-radius: 6px; }
+  .period-impact h4, .period-impact h5 { margin: 0 0 5px; }
+  .period-impact h5 { margin-top: 8px; font-weight: 500; color: #465866; }
+  .period-row { display: flex; gap: 8px; margin-bottom: 4px; font-size: 12px; overflow-wrap: anywhere; }
+  .period-row strong { color: #124b71; white-space: nowrap; }
+  .period-impact button { margin-top: 7px; }
+  .df-relation .df-periods { display: block; flex-basis: 100%; margin-left: 22px; font-size: 11px; color: #465866; }
+  .df-periods b { color: #874c09; }
   .edge-item { font-size: 12px; padding: 5px 0; border-bottom: 1px dashed rgba(0,0,0,.08); }
   .edge-item:last-child { border: 0; }
   .edge-item b { font-weight: 500; }
@@ -725,6 +747,10 @@
     <div class="sec sec-search">
       <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
     </div>
+    <section class="sec task-sec" aria-label="自动识别的 TASK">
+      <h3>自动识别的 TASK <span id="taskCount"></span></h3>
+      <div id="taskList"><div class="empty">正在读取任务…</div></div>
+    </section>
     <div class="sec tree-sec">
       <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数">已加入 <span>0</span></button></div>
       <ul id="results" class="results-list"></ul>
@@ -741,7 +767,7 @@
     <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
-      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var">变量访问</em></span>
+      <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var" title="写入函数 → 变量 → 读取函数，双箭头表示读写">数据流向</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
       <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
     </div>

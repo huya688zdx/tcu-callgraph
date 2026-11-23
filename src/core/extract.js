@@ -301,7 +301,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
           out.push({
             callee: table[member.v],
             kind: 'fnptr',
-            line: member.line,
+            line: member.line, col: member.col,
             cond: member.cond,
             via: `${recv}.${member.v}`,
             macroChain: (member.macroOrigins || macroChain).slice(),
@@ -312,7 +312,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
             receiver: recv,
             member: member.v,
             kind: 'unknown',
-            line: member.line,
+            line: member.line, col: member.col,
             cond: member.cond,
             via: recv ? `${recv}.${member.v}` : member.v,
             macroChain: (member.macroOrigins || macroChain).slice(),
@@ -358,7 +358,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
       out.push({
         callee: tk.v,
         kind: origins.length ? 'macro' : 'direct',
-        line: tk.line,
+        line: tk.line, col: tk.col,
         cond: tk.cond,
         via: origins.length ? origins.join(' > ') : undefined,
         macroChain: origins.slice(),

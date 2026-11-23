@@ -330,13 +330,14 @@ export function modelFromDot(dot, fileLabel = '<dot>') {
     const from = idMap.get(e.from) || `dot::${e.from}`;
     const to = idMap.get(e.to) || `dot::${e.to}`;
     const label = typeof e.label === 'string' ? e.label : '';
-    const isMacro = /via/i.test(label) || e.attrs.style === 'dashed';
+    const isMacro = /\bvia\b/i.test(label);
+    const dashed = String(e.attrs.style || '').split(',').some(style => style.trim() === 'dashed');
     const isFnptr = /fnptr/i.test(label);
     edges.push({
       from,
       to,
       callee: e.to,
-      kind: isFnptr ? 'fnptr' : isMacro ? 'macro' : 'direct',
+      kind: isFnptr ? 'fnptr' : isMacro ? 'macro' : dashed ? 'dataflow' : 'direct',
       line: 0,
       cond: e.attrs.condition || undefined,
       via: label || undefined,

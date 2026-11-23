@@ -1,3 +1,4 @@
+import { edgeCaption, isDataEdge } from './edge-flow.js';
 /**
  * 画布交互：命中测试、拖拽移动、连线、折线手柄、滚轮平移与缩放
  * 事件在模块加载时一次性绑定
@@ -584,7 +585,7 @@ function handlePointerMove(e) {
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
       : hits.length > 1 ? esc(t('edge.chooseAtPoint', { n: hits.length }))
-      : `<b>${esc(hoveredEdge.from.split('::').pop())} → ${esc(hoveredEdge.to.split('::').pop())}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
+      : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
     if (n || hits.length === 1) {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>状态：${statusLabel(target.change)}${target.statusSource === 'manual' ? '（手动）' : ''}`;
@@ -723,8 +724,8 @@ const nodeSelectionType = (n) => JSON.stringify([
   n.kind === 'var' ? THEME.node.varDash : THEME.node.fnDash,
 ]);
 const edgeSelectionType = (e) => JSON.stringify([
-  e.kind, (e.kind === 'var' ? THEME.edge.varDash : THEME.edge.callDash) ? 'dashed' : 'solid',
-  e.change === 'added' ? THEME.edge.added : e.kind === 'var' ? THEME.edge.var : THEME.edge.call,
+  e.kind, isDataEdge(e) ? 'dashed' : 'solid',
+  e.change === 'added' ? THEME.edge.added : isDataEdge(e) ? THEME.edge.var : THEME.edge.call,
   e.change === 'deleted',
 ]);
 const labelSelectionType = (l) => JSON.stringify([

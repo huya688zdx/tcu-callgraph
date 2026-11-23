@@ -5,6 +5,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { collectTaskEvidence, applyTaskEvidence } from './task-periods.js';
+import { assignCallGroups } from './call-sequence.js';
+import { taskDeclarations } from './task-declarations.js';
 import { lex } from './lexer.js';
 import { fileMacroScope, preprocess } from './preproc.js';
 import { findFunctions, findFnPtrTables, scanCalls } from './extract.js';
@@ -343,11 +346,15 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
       return;
     }
     const src = decodeSource(buf);
+    const original = lex(src, rel);
+    const taskDefs = taskDeclarations(src, original);
+    const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
     const fileMacros = fileMacroScope(macros);
-    const { tokens, includes: inc } = preprocess(lex(src, rel), fileMacros, rel);
+    const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
     for (const fn of findFunctions(tokens, rel)) {
+      if (taskDefs.names.has(fn.name)) fn.taskDeclaration = true;
       fn.id = `${fn.file}::${fn.name}`;
       // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
       if (seenFnId.has(fn.id)) continue;
@@ -364,7 +371,9 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
       const deferred = calls.length > 1 && calls.some((c) => c.kind === 'unknown');
       if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
       const nesting = deferred ? callNestingTokens(body) : null;
-      functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body) });
+      assignCallGroups(body, calls);
+      functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body),
+        taskEvidence: collectTaskEvidence(fn, body) });
       functions.push(fn);
     }
     for (const [name, map] of findFnPtrTables(tokens)) {
@@ -431,7 +440,7 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
     return (glob || list[0]).id;
   };
 
-  for (const { fn, calls, nesting, mentions } of functionRecords) {
+  for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
     const edgeStart = edges.length;
     for (const call of calls) {
       const table = call.receiver ? fnptrTables.get(call.receiver) : null;
@@ -442,14 +451,20 @@ export function buildIndex(root, sourceFiles = null, scan = null) {
         to: resolveCallee(callee, fn.file),
         callee,
         kind: call.kind === 'unknown' ? 'fnptr' : call.kind,
-        line: call.line,
+        line: call.line, col: call.col, orderGroup: call.orderGroup,
         cond: call.cond,
         via: call.via,
         macroChain: call.macroChain,
         macroDefinitions: call.macroDefinitions,
       });
     }
-    if (nesting && edges.length - edgeStart > 1 && hasNestedCall(nesting, edges.slice(edgeStart))) fn.hasNestedCalls = true;
+    const resolvedCalls = edges.slice(edgeStart);
+    if (nesting && resolvedCalls.length > 1 && hasNestedCall(nesting, resolvedCalls)) fn.hasNestedCalls = true;
+    // 未绑定的成员调用不会形成边，清除其占用的序号，同时保留嵌套实参的先后次序。
+    const groups = [...new Set(resolvedCalls.map(e => e.orderGroup))].sort((a, b) => a - b);
+    const ordinal = new Map(groups.map((group, index) => [group, index + 1]));
+    for (const edge of resolvedCalls) edge.orderGroup = ordinal.get(edge.orderGroup);
+    applyTaskEvidence(fn, taskEvidence, byName);
     fn.varAccess = [];
     for (const mention of mentions) {
       const id = lookupVar(fn.file, mention.name);
@@ -764,7 +779,7 @@ export function subgraph(model, rootId, { up = 0, down = 2, maxNodes = 400, incl
     const callKey = `${e.from}|${e.to}|${e.line}|${e.kind}`;
     if (seenCall.has(callKey)) return;
     seenCall.add(callKey);
-    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}`;
+    const pairKey = e.comparison ? `${e.from}|${e.to}|${e.change}|${e.kind === 'var' ? e.via : ''}|${e.cond || ''}` : `${e.from}|${e.to}|${e.kind === 'dataflow' ? 'dataflow' : 'access'}`;
     let m = byPair.get(pairKey);
     if (!m) {
       m = { ...e, calls: [] };
