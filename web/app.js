@@ -87,6 +87,7 @@ async function loadView(rootId, opts = {}) {
   syncComparison(data.comparison);
   state.root = data.root;
   state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
+  state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
@@ -230,6 +231,7 @@ hooks.reloadAll = async () => {
   comparisonPage = null;
   const seq = ++viewSeq;
   state.view = null;
+  state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
@@ -311,6 +313,7 @@ async function deleteSelection() {
   deleteStack.push({ ...body, roots: state.roots.join('+'), at: Date.now() });
   if (deleteStack.length > 30) deleteStack.shift();
 
+  state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
@@ -353,17 +356,17 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     if (state.view?.comparison) { navigateBack(); return; }
     if (e.shiftKey) {
-      redo();
+      if (redo()) renderLabelPanel();
     } else if (canRestoreDelete()) {
       // 优先恢复刚删掉的函数 / 连线（20 秒内有效，可逐次回退）
       restoreLastDelete();
     } else if (history.idx > 0) {
-      undo();
+      if (undo()) renderLabelPanel();
     } else if (navStack.length) {
       // 当前视图内已无可撤销的操作，退回上一次跳转（双击下钻 / 勾选函数）
       navigateBack();
     } else {
-      undo();
+      if (undo()) renderLabelPanel();
     }
     return;
   }

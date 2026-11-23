@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { launchServer } from '../scripts/lib/server.mjs';
+import { loadModel, subgraph } from '../src/core/index.js';
 import { graphOf, layoutElk } from '../src/core/layout-elk.js';
 import { routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { pathCrossesBody } from '../src/core/routing.js';
@@ -248,4 +249,55 @@ test('删除最后节点后恢复空图快照中的坐标', async (t) => {
   assert.equal((await post('/api/delete', { nodes: [before.root], restore: true })).status, 200);
   const restored = await (await post('/api/view?root=main.c::main&up=0&down=0', { previous: empty })).json();
   assert.deepEqual(restored.nodes.map((n) => [n.id, n.x, n.y]), before.nodes.map((n) => [n.id, n.x, n.y]));
+});
+
+test('多文件分层视图紧凑且接近 1:1，缩短相连函数距离并保持端口与无重叠', async () => {
+  const tcuModel = loadModel('samples/tcu');
+  const tick = tcuModel.functions.find((f) => f.name === 'SysTick_Handler');
+  const tcuGraph = subgraph(tcuModel, tick.id, { up: 0, down: 5, maxNodes: 600 });
+  const tcuView = await layoutElk(tcuGraph.nodes.map(({ bodyTokens, ...r }) => r), tcuGraph.edges, { group: true });
+  const tcuAspect = tcuView.width / tcuView.height;
+  assert.ok(tcuAspect >= 0.55 && tcuAspect <= 1.8, `tcu/SysTick_Handler aspect=${tcuAspect.toFixed(2)}`);
+  assert.deepEqual(tcuView.edges.map(({ points, ...e }) => e), tcuGraph.edges);
+  assertMidpointPorts(tcuView);
+
+  const demoModel = loadModel('samples/demo');
+  const mainFn = demoModel.functions.find((f) => f.name === 'main');
+  const demoGraph = subgraph(demoModel, mainFn.id, { up: 1, down: 5, maxNodes: 600 });
+  const demoView = await layoutElk(demoGraph.nodes.map(({ bodyTokens, ...r }) => r), demoGraph.edges, { group: true });
+  const demoAspect = demoView.width / demoView.height;
+  const byId = new Map(demoView.nodes.map((n) => [n.id, n]));
+  let distSum = 0, distCnt = 0;
+  for (const e of demoView.edges) {
+    if (e.from === e.to) continue;
+    const a = byId.get(e.from), b = byId.get(e.to);
+    distSum += Math.hypot(a.x + a.w / 2 - (b.x + b.w / 2), a.y + a.h / 2 - (b.y + b.h / 2));
+    distCnt++;
+  }
+  assert.ok(demoAspect >= 0.6 && demoAspect <= 1.6, `demo/main aspect=${demoAspect.toFixed(2)}`);
+  assert.ok(demoView.width * demoView.height < 3.2e6, `demo/main area=${Math.round(demoView.width * demoView.height)}`);
+  assert.ok(distSum / distCnt < 400, `demo/main avgDist=${Math.round(distSum / distCnt)}`);
+  assert.deepEqual(demoView.edges.map(({ points, ...e }) => e), demoGraph.edges);
+  assertMidpointPorts(demoView);
+});
+
+test('存在目录层时，跨文件显式 callNumbers 调用同文件多个目标仍保持调用序单调', async () => {
+  const nodes = [
+    { id: 'a/main.c::main', name: 'main', file: 'a/main.c', kind: 'fn' },
+    { id: 'a.c::n0', name: 'n0', file: 'a.c', kind: 'fn' },
+    { id: 'a.c::n1', name: 'n1', file: 'a.c', kind: 'fn' },
+    { id: 'a.c::n2', name: 'n2', file: 'a.c', kind: 'fn' },
+    { id: 'group/a.c::n3', name: 'n3', file: 'group/a.c', kind: 'fn' },
+    { id: 'd.c::n6', name: 'n6', file: 'd.c', kind: 'fn' },
+  ];
+  const edges = [
+    { from: 'a/main.c::main', to: 'a.c::n0', line: 1, kind: 'direct', callNumbers: ['1'] },
+    { from: 'a/main.c::main', to: 'a.c::n1', line: 2, kind: 'direct', callNumbers: ['2'] },
+    { from: 'a/main.c::main', to: 'a.c::n2', line: 3, kind: 'direct', callNumbers: ['3'] },
+    { from: 'd.c::n6', to: 'a.c::n1', line: 4, kind: 'direct' },
+  ];
+  const view = await layoutElk(nodes, edges, { rootLabel: 'p' });
+  const axis = view.layoutDirection === 'RIGHT' ? 'y' : 'x';
+  const pos = new Map(view.nodes.map((n) => [n.id, n[axis]]));
+  assert.ok(pos.get('a.c::n0') < pos.get('a.c::n1') && pos.get('a.c::n1') < pos.get('a.c::n2'));
 });

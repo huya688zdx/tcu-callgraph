@@ -3,6 +3,7 @@
  */
 import { state, nodeById, edgeKey } from './state.js';
 import { api } from './api.js';
+import { hooks } from './hooks.js';
 import { draw, pulseAdded } from './render.js';
 import { rerouteScope } from './geometry.js';
 const history = { stack: [], idx: -1, limit: 60, frozen: false };
@@ -104,7 +105,9 @@ function applySnapshot(str) {
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.hover = null;
+  state.hoverRelation = null;
   draw();
+  hooks.renderDetail?.(null);
   persistLabelDiff(before);
   for (const n of v.nodes) if (n.headerSymbol && beforeNames.has(n.id) && beforeNames.get(n.id) !== (n.nameModeOverride || null)) {
     const patch = { nodeId: n.id, projectId: v.projectId, data: { nameMode: n.nameModeOverride || null } };
@@ -138,21 +141,23 @@ function persistLabelDiff(before) {
 }
 
 function undo() {
-  if (state.view?.comparison) return;
-  if (history.idx <= 0) return;
+  if (state.view?.comparison) return false;
+  if (history.idx <= 0) return false;
   history.idx--;
   history.frozen = true;
   applySnapshot(history.stack[history.idx]);
   history.frozen = false;
+  return true;
 }
 
 function redo() {
-  if (state.view?.comparison) return;
-  if (history.idx >= history.stack.length - 1) return;
+  if (state.view?.comparison) return false;
+  if (history.idx >= history.stack.length - 1) return false;
   history.idx++;
   history.frozen = true;
   applySnapshot(history.stack[history.idx]);
   history.frozen = false;
+  return true;
 }
 
 async function saveLayout() {

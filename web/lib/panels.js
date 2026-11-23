@@ -2,14 +2,15 @@
  * 侧栏面板：统计 / 文件树 / 搜索结果 / 节点详情
  */
 import { t } from '../i18n.js';
-import { els, state, esc, shortFile } from './state.js';
+import { els, state, esc, shortFile, edgeKey } from './state.js';
 import { edgeCaption, isDataEdge } from './edge-flow.js';
 import { formatPeriod, periodSubtitle } from './period-text.js';
 import { LABEL_PRESETS } from '/core/labels.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections, hideMenu } from './ctxmenu.js';
-import { locateNode, locateBox } from './locate.js';
+import { locateNode, locateBox, peekNode } from './locate.js';
+import { draw } from './render.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 import { showExpansion, previewAddition } from './expand.js';
@@ -36,7 +37,7 @@ async function loadStats() {
     `<details class="stat-more"><summary>详细解析指标</summary>${metrics}</details>`;
 }
 
-els.stats.addEventListener('click', (event) => {
+els.stats?.addEventListener('click', (event) => {
   const row = event.target.closest('[data-task-id]');
   if (row) searchPick(row.dataset.taskId, row.querySelector('[data-add-function]'));
 });
@@ -600,14 +601,29 @@ function comparisonDetail(node) {
 
 async function renderDetail(id) {
   clearDataflow();
+  state.hoverRelation = null;
   const my = ++detailSeq;
   const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
   const isFn = !!target && target.kind !== 'var';
   syncDetailSections(isFn);
+  const inViewIds = new Set((state.view?.nodes || []).map((n) => n.id));
   const dataEdges = target ? state.view.edges.filter(e => isDataEdge(e) && (e.from === id || e.to === id)) : [];
   const names = dataEdges.length ? new Map(state.view.nodes.map(n => [n.id, n.displayName || n.name])) : null;
+  const dataDir = (e) => {
+    if (e.kind === 'var') {
+      if (e.via === '读写') return 'both';
+      if (e.via === '读') return e.from === id ? 'in' : 'out';
+      if (e.via === '写') return e.from === id ? 'out' : 'in';
+      return '';
+    }
+    return e.from === id ? 'out' : 'in';
+  };
   const dataDirections = dataEdges.length ? `<div class="detail-directions"><b>画布中的变量读写方向</b>
-    ${dataEdges.map(e => `<div>${esc(edgeCaption(e, nodeId => names.get(nodeId) || nodeId))}</div>`).join('')}</div>` : '';
+    ${dataEdges.map(e => {
+      const peerId = e.from === id ? e.to : e.from;
+      const dir = dataDir(e);
+      return `<div class="df-dir-item${inViewIds.has(peerId) ? ' in-view' : ''}" data-peer-id="${esc(peerId)}" data-edge-key="${esc(edgeKey(e))}"${dir ? ` data-rel-dir="${dir}"` : ''}>${esc(edgeCaption(e, nodeId => names.get(nodeId) || nodeId))}</div>`;
+    }).join('')}</div>` : '';
   if (target?.kind === 'var') {
     if (els.secDetail) els.secDetail.style.display = '';
     if (els.secEdges) els.secEdges.style.display = 'none';
@@ -657,13 +673,15 @@ async function renderDetail(id) {
   const item = (e, dir) => {
     const other = dir === 'in' ? e.from : e.to;
     const nm = e.callee || other.split('::')[1] || other;
+    const inView = inViewIds.has(other);
     let chip = '';
     if (e.kind === 'macro') chip = `<span class="chip macro">${t('edge.chipMacro')}${e.via ? ':' + esc(e.via) : ''}</span>`;
     else if (e.kind === 'fnptr') chip = `<span class="chip fnptr">${t('edge.chipFnptr')}${e.via ? ':' + esc(e.via) : ''}</span>`;
     else if (e.kind === 'manual') chip = `<span class="chip manual">${t('edge.chipManual')}</span>`;
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
     const status = e.change && e.change !== 'existing' ? ` · ${statusLabel(e.change)}` : '';
-    return `<div class="edge-item call-relation"><span>${dir === 'in' ? '←' : '→'} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
+    const arrow = `<span class="rel-dir ${dir}">${dir === 'in' ? '←' : '→'}</span>`;
+    return `<div class="edge-item call-relation${inView ? ' in-view' : ''}"${inView ? ` data-peer-id="${esc(other)}" data-rel-dir="${dir}" data-edge-key="${esc(edgeKey(e))}" title="点击定位到画布中的该函数"` : ''}><span>${arrow} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
   };
 
   els.edges.innerHTML =
@@ -675,5 +693,30 @@ async function renderDetail(id) {
         ? `<div style="font-size:11.5px;color:#888780;margin:8px 0 4px">${t('edge.calls')} (${outE.length})</div>` +
           outE.map((e) => item(e, 'out')).join('')
         : '') || `<div class="empty">${t('empty.noEdges')}</div>`;
+}
+
+function setHoverRelation(next) {
+  const cur = state.hoverRelation;
+  if ((cur?.peerId || null) === (next?.peerId || null) &&
+      (cur?.dir || null) === (next?.dir || null) &&
+      (cur?.edgeKey || null) === (next?.edgeKey || null)) return;
+  state.hoverRelation = next;
+  draw({ geometryUnchanged: true });
+}
+
+for (const panel of [els.edges, els.detail]) {
+  if (!panel) continue;
+  panel.addEventListener('click', (event) => {
+    if (!state.selected) return;
+    if (event.target.closest('button, select, input, a')) return;
+    const row = event.target.closest('[data-peer-id].in-view');
+    if (row) peekNode(row.dataset.peerId);
+  });
+  panel.addEventListener('mouseover', (event) => {
+    if (!state.selected) { setHoverRelation(null); return; }
+    const row = event.target.closest('[data-peer-id].in-view');
+    setHoverRelation(row ? { peerId: row.dataset.peerId, dir: row.dataset.relDir || null, edgeKey: row.dataset.edgeKey || null } : null);
+  });
+  panel.addEventListener('mouseleave', () => setHoverRelation(null));
 }
 export { loadStats, loadTree, loadVars, renderTree, buildTreeNode, runSearch, renderDetail };

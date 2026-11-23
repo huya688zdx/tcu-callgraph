@@ -1,7 +1,7 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
 import { textWidth, routeScore, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
-import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
+import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
@@ -231,10 +231,21 @@ function seedInteractive(graph, previous, initial) {
   walk(graph);
 }
 
-/** 以走线为主，兼顾画布比例与占用面积。 */
+/** 以走线为主，兼顾相连节点紧凑度、1:1 画布比例与占用面积。 */
 function quality(view) {
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  let distSum = 0, edgeCnt = 0;
+  for (const e of view.edges) {
+    if (e.from === e.to) continue;
+    const a = byId.get(e.from), b = byId.get(e.to);
+    if (!a || !b) continue;
+    distSum += Math.hypot(a.x + a.w / 2 - (b.x + b.w / 2), a.y + a.h / 2 - (b.y + b.h / 2));
+    edgeCnt++;
+  }
+  const avgDist = edgeCnt ? distSum / edgeCnt : 0;
+  const aspect = Math.max(1, view.width) / Math.max(1, view.height);
   return routeScore(view.edges) +
-    16 * Math.log(view.width / view.height) ** 2 + Math.sqrt(view.width * view.height) / 200;
+    140 * Math.log(aspect) ** 2 + Math.sqrt(view.width * view.height) / 40 + avgDist * 0.22;
 }
 
 function validLayout(view) {
@@ -248,7 +259,343 @@ function validLayout(view) {
     if (!boxes[i].id.startsWith(boxes[j].id + '/') && !boxes[j].id.startsWith(boxes[i].id + '/') &&
         overlap(boxes[i], boxes[j])) return false;
   }
-  return view.edges.every((e) => !pathBlockedByNodes(e.points, view.nodes, new Set([e.from, e.to])));
+  const inside = (child, parent) => child.x >= parent.x - 1 && child.y >= parent.y - 1 &&
+    child.x + child.w <= parent.x + parent.w + 1 && child.y + child.h <= parent.y + parent.h + 1;
+  const groupById = new Map(view.groups.map((g) => [g.id, g]));
+  for (const n of view.nodes) {
+    if (!n.group) continue;
+    const g = groupById.get(n.group);
+    if (!g || !inside(n, g)) return false;
+  }
+  const boxById = new Map(boxes.map((b) => [b.id, b]));
+  for (const b of boxes) {
+    const slash = b.id.lastIndexOf('/');
+    if (slash > 0) {
+      const parent = boxById.get(b.id.slice(0, slash));
+      if (parent && !inside(b, parent)) return false;
+    }
+  }
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  const onPort = (n, p) => n && p && [[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h],
+    [n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.5);
+  return view.edges.every((e) => {
+    const pts = e.points;
+    if (!pts || pts.length < 2) return false;
+    if (!onPort(byId.get(e.from), pts[0]) || !onPort(byId.get(e.to), pts.at(-1))) return false;
+    if (e.from === e.to) {
+      if (Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]) <= 0.5) return false;
+      if (new Set(pts.map((p) => p[0])).size <= 1 || new Set(pts.map((p) => p[1])).size <= 1) return false;
+    }
+    return !pathBlockedByNodes(pts, view.nodes, new Set([e.from, e.to])) &&
+      !view.nodes.some((n) => pathCrossesBody(pts, n));
+  });
+}
+
+function finalizeCandidate(view) {
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  improveEdgeRoutes(view, view.edges, (e) => byId.get(e.from)?.file !== byId.get(e.to)?.file);
+  mergeSharedRoutes(view);
+  return view;
+}
+
+/** 保护基准布局已成立的同级显式调用顺序与跨顶层容器数据流向。 */
+function preservesSemanticOrder(baseline, candidate, edges) {
+  const posMap = (view, axis) => new Map(view.nodes.map((n) => [n.id, n[axis]]));
+  const topBoxOf = (n) => (n?.file || 'unknown').split('/')[0];
+  const nodeById = new Map(baseline.nodes.map((n) => [n.id, n]));
+  const baseCross = posMap(baseline, baseline.layoutDirection === 'RIGHT' ? 'y' : 'x');
+  const candCross = posMap(candidate, candidate.layoutDirection === 'RIGHT' ? 'y' : 'x');
+  const byCaller = new Map();
+  for (const e of edges) {
+    if (e.from === e.to || e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
+    if (!e.callNumbers?.length && !e.orderGroup) continue;
+    let rec = byCaller.get(e.from);
+    if (!rec) { rec = { targets: new Map(), explicit: false }; byCaller.set(e.from, rec); }
+    if (e.callNumbers?.length) rec.explicit = true;
+    const prev = rec.targets.get(e.to);
+    const rank = callRank(e);
+    if (prev === undefined || rank < prev) rec.targets.set(e.to, rank);
+  }
+  const hasDirs = (candidate.containers || []).length > 0;
+  for (const { targets, explicit } of byCaller.values()) {
+    if (targets.size < 2) continue;
+    const ordered = [...targets.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
+    const sameFile = new Set(ordered.map((id) => nodeById.get(id)?.file)).size === 1;
+    const distinctTop = new Set(ordered.map((id) => topBoxOf(nodeById.get(id)))).size === ordered.length;
+    const shouldCheck = (sameFile && explicit) || (!hasDirs && (sameFile || distinctTop) &&
+      ordered.every((id) => !(nodeById.get(id)?.file || '').includes('/')));
+    if (!shouldCheck) continue;
+    const mono = (pos) => ordered.every((id, i) => !i || pos.get(ordered[i - 1]) < pos.get(id));
+    if (mono(baseCross) && !mono(candCross)) return false;
+  }
+
+  const baseMain = posMap(baseline, baseline.layoutDirection === 'RIGHT' ? 'x' : 'y');
+  const candMain = posMap(candidate, candidate.layoutDirection === 'RIGHT' ? 'x' : 'y');
+  const writers = new Map(), readers = new Map();
+  for (const e of edges) {
+    if (e.kind === 'var') {
+      if (e.via === '读') {
+        if (!readers.has(e.to)) readers.set(e.to, []);
+        readers.get(e.to).push(e.from);
+      } else if (e.via === '写') {
+        if (!writers.has(e.to)) writers.set(e.to, []);
+        writers.get(e.to).push(e.from);
+      }
+    } else if (e.kind === 'df-write') {
+      if (!writers.has(e.to)) writers.set(e.to, []);
+      writers.get(e.to).push(e.from);
+    } else if (e.kind === 'df-read') {
+      if (!readers.has(e.from)) readers.set(e.from, []);
+      readers.get(e.from).push(e.to);
+    }
+  }
+  if (!hasDirs) {
+    for (const [varId, ws] of writers) {
+      const rs = readers.get(varId);
+      if (!rs) continue;
+      const vTop = topBoxOf(nodeById.get(varId));
+      for (const w of ws) for (const r of rs) {
+        if (w === r) continue;
+        const wTop = topBoxOf(nodeById.get(w)), rTop = topBoxOf(nodeById.get(r));
+        if (wTop === vTop || vTop === rTop || wTop === rTop) continue;
+        if (baseMain.get(w) < baseMain.get(varId) && baseMain.get(varId) < baseMain.get(r)) {
+          if (!(candMain.get(w) < candMain.get(varId) && candMain.get(varId) < candMain.get(r))) return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+/** 自底向上逐层紧凑排布：文件框自适应方向/散点网格化 + 跨框邻近微调 + 正交路由。 */
+async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
+  const order = modelOrder(sized, edges);
+  const root = { id: '', label: '', children: new Map(), leafNodes: [] };
+  let boxCount = 0;
+  for (const n of sized) {
+    const parts = (n.file || 'unknown').split('/');
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const key = parts.slice(0, i + 1).join('/');
+      if (!cur.children.has(key)) {
+        cur.children.set(key, { id: key, label: parts[i], fileGroup: i === parts.length - 1, children: new Map(), leafNodes: [] });
+        boxCount++;
+      }
+      cur = cur.children.get(key);
+    }
+    cur.leafNodes.push(n);
+  }
+  if (boxCount < 2) return null;
+
+  async function layoutBox(box, depth, dirOverride = null, hints = null) {
+    const childItems = [];
+    for (const child of box.children.values()) {
+      childItems.push({ id: 'box:' + child.id, isBox: true, ref: child, width: child.w, height: child.h, ord: child.minOrd });
+    }
+    for (const n of box.leafNodes) {
+      childItems.push({ id: n.id, isBox: false, ref: n, width: n.w, height: n.h, ord: order.get(n.id) ?? 0 });
+    }
+    box.minOrd = Math.min(...childItems.map((c) => c.ord), 0);
+
+    const memberOf = new Map();
+    const mapDesc = (b, ownerId) => {
+      for (const n of b.leafNodes) memberOf.set(n.id, ownerId);
+      for (const c of b.children.values()) mapDesc(c, ownerId);
+    };
+    for (const item of childItems) {
+      if (item.isBox) mapDesc(item.ref, item.id);
+      else memberOf.set(item.id, item.id);
+    }
+
+    const agg = new Map();
+    for (const e of edges) {
+      const s = memberOf.get(flowSource(e)), t = memberOf.get(flowTarget(e));
+      if (!s || !t || s === t) continue;
+      const key = s + '->' + t;
+      const prev = agg.get(key), rank = callRank(e);
+      if (!prev) agg.set(key, { s, t, count: 1, rank });
+      else { prev.count++; prev.rank = Math.min(prev.rank, rank); }
+    }
+
+    if (hints) childItems.sort((a, b) => (hints.get(a.id) ?? 0) - (hints.get(b.id) ?? 0) || a.ord - b.ord);
+    else childItems.sort((a, b) => a.ord - b.ord);
+
+    const isRoot = depth === 0;
+    const sidePad = isRoot ? ROOT_PAD : 14;
+    if (childItems.length === 1) {
+      const item = childItems[0];
+      box.w = item.width + sidePad * 2;
+      box.h = item.height + TOP_PADDING + sidePad;
+      box.relPos = new Map([[item.id, { x: sidePad, y: TOP_PADDING }]]);
+      box.usedDir = dirOverride || (box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : isRoot ? rootDir : dirDir);
+      return;
+    }
+    const pad = isRoot ? `[top=${TOP_PADDING},left=${ROOT_PAD},bottom=${ROOT_PAD},right=${ROOT_PAD}]` : `[top=${TOP_PADDING},left=14,bottom=14,right=14]`;
+    const gap = box.fileGroup ? 16 : 30;
+    const layerGap = box.fileGroup ? 28 : 44;
+
+    const runDir = async (dir) => {
+      if (agg.size === 0 && childItems.length > 1) {
+        return elk.layout({
+          id: 'g:' + box.id,
+          layoutOptions: {
+            'elk.algorithm': 'rectpacking',
+            'elk.padding': pad,
+            'elk.spacing.nodeNode': String(gap),
+            'elk.aspectRatio': '1.15',
+          },
+          children: childItems.map((it) => ({ id: it.id, width: it.width, height: it.height })),
+          edges: [],
+        });
+      }
+      const aggList = [...agg.values()].sort((a, b) => a.rank - b.rank || b.count - a.count);
+      return elk.layout({
+        id: 'g:' + box.id,
+        layoutOptions: {
+          'elk.algorithm': 'layered',
+          'elk.direction': dir,
+          'elk.padding': pad,
+          'elk.spacing.nodeNode': String(gap),
+          'elk.layered.spacing.nodeNodeBetweenLayers': String(layerGap),
+          'elk.spacing.componentComponent': String(box.fileGroup ? 18 : 28),
+          'elk.aspectRatio': '1.0',
+          'elk.layered.compaction.postCompaction.strategy': 'EDGE_LENGTH',
+          'elk.layered.compaction.connectedComponents': 'true',
+          'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+          'elk.layered.considerModelOrder.strategy': hints ? 'PREFER_NODES' : 'NODES_AND_EDGES',
+          'elk.layered.thoroughness': '7',
+          'elk.randomSeed': '1',
+        },
+        children: childItems.map((it) => ({ id: it.id, width: it.width, height: it.height })),
+        edges: aggList.map((a, idx) => ({
+          id: 'ae' + idx, sources: [a.s], targets: [a.t],
+          layoutOptions: { 'elk.layered.priority.shortness': String(Math.min(10, a.count)) },
+        })),
+      });
+    };
+
+    let best, usedDir;
+    if (dirOverride) {
+      usedDir = dirOverride;
+      best = await runDir(dirOverride);
+    } else if (box.fileGroup && fileDir === 'AUTO' && agg.size > 0) {
+      const [r1, r2] = await Promise.all([runDir('RIGHT'), runDir('DOWN')]);
+      const boxScore = (r) => Math.abs(Math.log(Math.max(1, r.width) / Math.max(1, r.height) / 1.15)) +
+        Math.sqrt(r.width * r.height) / 2000;
+      if (boxScore(r1) <= boxScore(r2)) { best = r1; usedDir = 'RIGHT'; } else { best = r2; usedDir = 'DOWN'; }
+    } else {
+      usedDir = box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : isRoot ? rootDir : dirDir;
+      best = await runDir(usedDir);
+    }
+    box.w = best.width;
+    box.h = best.height;
+    box.relPos = new Map(best.children.map((c) => [c.id, { x: c.x, y: c.y }]));
+    box.usedDir = usedDir;
+  }
+
+  async function pass1(box, depth) {
+    await Promise.all([...box.children.values()].map((child) => pass1(child, depth + 1)));
+    await layoutBox(box, depth);
+  }
+  await pass1(root, 0);
+
+  const absPos = new Map();
+  const computeAbs = (box, ox, oy) => {
+    for (const child of box.children.values()) {
+      const p = box.relPos.get('box:' + child.id);
+      computeAbs(child, ox + p.x, oy + p.y);
+    }
+    for (const n of box.leafNodes) {
+      const p = box.relPos.get(n.id);
+      absPos.set(n.id, { x: ox + p.x + n.w / 2, y: oy + p.y + n.h / 2 });
+    }
+  };
+  computeAbs(root, 0, 0);
+
+  async function pass2(box, depth) {
+    const prevW = box.w, prevH = box.h;
+    const childChanged = (await Promise.all([...box.children.values()].map((child) => pass2(child, depth + 1)))).some(Boolean);
+    if (box.fileGroup && box.leafNodes.length > 1) {
+      const ids = new Set(box.leafNodes.map((n) => n.id));
+      const intraOrder = new Map();
+      for (const e of edges) {
+        if (!ids.has(e.to) || e.from === e.to) continue;
+        if (e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
+        if (!e.callNumbers?.length && !e.orderGroup) continue;
+        if (!intraOrder.has(e.from)) intraOrder.set(e.from, new Set());
+        intraOrder.get(e.from).add(e.to);
+      }
+      const hasExplicitOrder = [...intraOrder.values()].some((targets) => targets.size >= 2);
+      if (!hasExplicitOrder) {
+        const vertical = box.usedDir === 'DOWN';
+        const hints = new Map();
+        let hasExternal = false;
+        for (const n of box.leafNodes) {
+          let sum = 0, cnt = 0;
+          for (const e of edges) {
+            const peer = e.from === n.id ? e.to : e.to === n.id ? e.from : null;
+            if (!peer || ids.has(peer)) continue;
+            const pt = absPos.get(peer);
+            if (pt) { sum += vertical ? pt.x : pt.y; cnt++; hasExternal = true; }
+          }
+          const self = absPos.get(n.id);
+          hints.set(n.id, cnt ? sum / cnt : (vertical ? self.x : self.y));
+        }
+        if (hasExternal) await layoutBox(box, depth, box.usedDir, hints);
+      }
+    } else if (!box.fileGroup && childChanged) {
+      await layoutBox(box, depth, box.usedDir);
+    }
+    return Math.abs(box.w - prevW) > 0.5 || Math.abs(box.h - prevH) > 0.5;
+  }
+  if (edges.length) await pass2(root, 0);
+
+  const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h, layoutDirection: rootDir };
+  const flatten = (box, ox, oy, depth) => {
+    for (const child of box.children.values()) {
+      const p = box.relPos.get('box:' + child.id);
+      const x = ox + p.x, y = oy + p.y;
+      const entry = { id: child.id, label: child.label, x, y, w: child.w, h: child.h, depth };
+      (child.fileGroup ? view.groups : view.containers).push(entry);
+      flatten(child, x, y, depth + 1);
+    }
+    for (const n of box.leafNodes) {
+      const p = box.relPos.get(n.id);
+      view.nodes.push({ ...n, x: ox + p.x, y: oy + p.y, group: n.file || 'unknown' });
+    }
+  };
+  flatten(root, 0, 0, 1);
+
+  // 克隆边送入路由器，避免写入临时属性破坏输出契约。
+  const routed = edges.map((e) => ({ ...e }));
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  view.edges = routed;
+  routeEdges(view.nodes, routed);
+  improveEdgeRoutes(view, routed, (e) => byId.get(e.from)?.file !== byId.get(e.to)?.file);
+  const bad = routed.filter((e) => e.blocked ||
+    pathBlockedByNodes(e.points, view.nodes, new Set([e.from, e.to])) ||
+    pathCrossesBody(e.points, byId.get(e.from)) || pathCrossesBody(e.points, byId.get(e.to)));
+  if (bad.length) improveEdgeRoutes(view, bad, () => true);
+  mergeSharedRoutes(view);
+  view.edges = edges.map((e, i) => ({ ...e, points: routed[i].points }));
+
+  let minX = 0, minY = 0, maxX = view.width, maxY = view.height;
+  for (const e of view.edges) for (const [x, y] of e.points || []) {
+    minX = Math.min(minX, x - ROOT_PAD);
+    minY = Math.min(minY, y - ROOT_PAD);
+    maxX = Math.max(maxX, x + ROOT_PAD);
+    maxY = Math.max(maxY, y + ROOT_PAD);
+  }
+  if (minX < 0 || minY < 0) {
+    const dx = -minX, dy = -minY;
+    for (const b of [...view.nodes, ...view.groups, ...view.containers]) { b.x += dx; b.y += dy; }
+    for (const e of view.edges) e.points = e.points.map(([x, y]) => [x + dx, y + dy]);
+    maxX += dx;
+    maxY += dy;
+  }
+  view.width = maxX;
+  view.height = maxY;
+  return view;
 }
 
 export async function layoutElk(nodes, edges, { group = true, rootLabel = '', previous = null } = {}) {
@@ -352,19 +699,33 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
   };
   let view = await generate(direction);
   if (!previous) {
-    let score = validLayout(view) ? quality(view) : Infinity;
-    const consider = (candidate) => {
-      if (!validLayout(candidate)) return;
+    // 全部候选统一在整理干线后校验和评分，避免纵向/分层候选因未合并干线而被过早淘汰。
+    const baseline = finalizeCandidate(view);
+    view = baseline;
+    let score = validLayout(baseline) ? quality(baseline) : Infinity;
+    const consider = (candidate, checkSemantic = false) => {
+      if (!candidate || !validLayout(candidate)) return;
+      if (checkSemantic && !preservesSemanticOrder(baseline, candidate, edges)) return;
       const next = quality(candidate);
       if (next < score) { view = candidate; score = next; }
     };
-    // 比较完整横向、纵向布局，保留综合质量更好的结果。
-    consider(await generate('DOWN'));
-    // 先确定区块位置，再简化连线，避免局部换线反过来改变整图的布局方向。
-    const byId = new Map(view.nodes.map((n) => [n.id, n]));
-    improveEdgeRoutes(view, view.edges, (e) => byId.get(e.from).file !== byId.get(e.to).file);
+    const downTask = generate('DOWN').then(finalizeCandidate);
+    const buConfigs = edges.length
+      ? [
+          { rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' },
+          { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO' },
+          { rootDir: 'DOWN', dirDir: 'DOWN', fileDir: 'AUTO' },
+        ]
+      : [{ rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' }];
+    const buTasks = group && sized.length <= 120 && edges.length <= 240
+      ? buConfigs.map((cfg) => bottomUpCandidate(sized, edges, cfg))
+      : [];
+    const [downView, ...buViews] = await Promise.all([downTask, ...buTasks]);
+    consider(downView);
+    for (const cand of buViews) consider(cand, true);
+  } else {
+    mergeSharedRoutes(view);
   }
-  mergeSharedRoutes(view);
   if (!group) for (const n of view.nodes) delete n.group;
   if (group && rootLabel) {
     for (const box of [...view.containers, ...view.groups]) box.depth++;

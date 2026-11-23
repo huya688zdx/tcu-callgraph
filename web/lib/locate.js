@@ -37,6 +37,15 @@ export async function locateNode(id) {
   return true;
 }
 
+/** 只把视图中的邻居节点移到视野中央并闪一下，保留当前选中函数和关系上下文。 */
+export function peekNode(id) {
+  const n = findNode(id);
+  if (!n) return false;
+  focusBox(n, 140);
+  flash(n);
+  return true;
+}
+
 /**
  * 定位到文件框 / 目录容器
  * @param {'file'|'dir'} kind

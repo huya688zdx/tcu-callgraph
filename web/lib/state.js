@@ -43,6 +43,8 @@ const state = {
   at: 0,
   selected: null,
   hover: null,
+  /** 右侧详情面板悬停某条调用/变量关系时高亮画布对应连线：{ peerId, dir } */
+  hoverRelation: null,
   down: 1,
   up: 1,
   group: true,

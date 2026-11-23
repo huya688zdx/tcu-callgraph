@@ -9,6 +9,7 @@ import { periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, mergeFlowStreams } from './flow-geometry.js';
+import { CALLER_COLOR, CALLEE_COLOR, BIDIR_COLOR, mixHex, classifySelectionRelations } from './relation-focus.js';
 
 // 选中动画使用独立画布，箭头和虚线移动时保留主画布上的文字、标签与连线。
 let animationFrame = 0;
@@ -25,8 +26,6 @@ const RECENT_HIGHLIGHT_MS = 2600;
 const RECENT_RIPPLE_MS = 850;
 const RECENT_COLOR = '#0284C7';
 const SELECTED_EDGE_COLOR = '#0284C7';
-const DIM_EDGE_COLOR = '#D6D4CC';
-const DIM_ADDED_COLOR = '#F0C2C6';
 const effectCanvas = document.createElement('canvas');
 effectCanvas.id = 'cvEffects';
 effectCanvas.setAttribute('aria-hidden', 'true');
@@ -36,6 +35,11 @@ Object.assign(effectCanvas.style, {
 effectCanvas.width = effectCanvas.height = 0;
 const effectCtx = effectCanvas.getContext('2d');
 const nodeNames = new WeakMap();
+const reducedMotionMedia = typeof window !== 'undefined' ? window.matchMedia?.('(prefers-reduced-motion: reduce)') : null;
+const prefersReducedMotion = () => !!reducedMotionMedia?.matches;
+reducedMotionMedia?.addEventListener?.('change', () => {
+  if (state.view) draw({ geometryUnchanged: true });
+});
 
 function markDirtyPixels(x0, y0, x1, y1) {
   const ix0 = Math.max(0, Math.floor(x0)), iy0 = Math.max(0, Math.floor(y0));
@@ -169,6 +173,9 @@ function drawEffects(now) {
   if (state.flash && now >= state.flash.until) state.flash = null;
   if (now >= (state.recent?.rippleUntil ?? 0) && effects.some((effect) => effect.kind === 'ripple')) {
     effects = effects.filter((effect) => effect.kind !== 'ripple');
+  }
+  if (prefersReducedMotion() && !state.pairFlow && effects.some((effect) => effect.kind === 'stream')) {
+    effects = effects.filter((effect) => effect.kind !== 'stream');
   }
   if (!effects.length && !state.flash) { releaseEffectCanvas(); return; }
   const { cv } = els;
@@ -442,8 +449,6 @@ function draw({ geometryUnchanged = false } = {}) {
 
   // 标题可以比文件框宽，视口判断要包含标题可能占到的范围。
   const groupVisible = (box) => boxVisible(box, area, groupPaintWidth(box));
-  for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c);
-  for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g);
 
   const labelSplit = state.selectedLabel?.lastIndexOf('#') ?? -1;
   const focusedKey = labelSplit > 0 ? state.selectedLabel.slice(0, labelSplit)
@@ -458,15 +463,52 @@ function draw({ geometryUnchanged = false } = {}) {
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
+  const relations = !focusedEdges.size && !selectedNodes?.size && state.selected
+    ? classifySelectionRelations(v, state.selected) : null;
+  let activeBoxes = relations?.activeBoxes || null;
+  if (!activeBoxes && (focusedNodes?.size || selectedNodes?.size)) {
+    const activeIds = focusedNodes?.size ? focusedNodes : selectedNodes;
+    activeBoxes = new Set();
+    for (const n of v.nodes) {
+      if (!activeIds.has(n.id) || !n.group) continue;
+      activeBoxes.add(n.group);
+      const parts = n.group.split('/');
+      for (let i = 1; i < parts.length; i++) activeBoxes.add(parts.slice(0, i).join('/'));
+    }
+  }
+  for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c, !!(activeBoxes && !c.root && !activeBoxes.has(c.id)));
+  for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g, !!(activeBoxes && !activeBoxes.has(g.id)));
+
   const dim = Boolean(focusedEdges.size || state.selected || selectedNodes?.size);
+  const hoverRel = relations ? state.hoverRelation : null;
+  const matchesHover = (e, role) => {
+    if (!hoverRel) return false;
+    if (hoverRel.edgeKey) return edgeKey(e) === hoverRel.edgeKey;
+    const peer = e.from === state.selected ? e.to : e.from;
+    if (peer !== hoverRel.peerId) return false;
+    return !hoverRel.dir || hoverRel.dir === role || role === 'both' || e.from === e.to;
+  };
   const related = [];
+  const emphasized = [];
   for (const e of v.edges) {
     if (focusedEdges.has(e) || !pathVisible(edgePoints(e), area)) continue;
-    if (!focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
-      : state.selected && (e.from === state.selected || e.to === state.selected))) related.push(e);
-    else drawEdge(ctx, e, false, false, null, false, dim);
+    if (relations ? relations.edgeRoles.has(e)
+      : !focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
+        : state.selected && (e.from === state.selected || e.to === state.selected))) {
+      const role = relations?.edgeRoles.get(e);
+      if (hoverRel && matchesHover(e, role)) emphasized.push(e);
+      else related.push(e);
+    } else drawEdge(ctx, e, false, false, null, false, dim);
   }
-  for (const e of related) drawEdge(ctx, e, true, false);
+  const hasEmphasized = emphasized.length > 0;
+  for (const e of related) {
+    const role = relations?.edgeRoles.get(e);
+    drawEdge(ctx, e, true, false, null, true, false, role ? { role, emphasized: false, subdued: hasEmphasized } : null);
+  }
+  for (const e of emphasized) {
+    const role = relations?.edgeRoles.get(e);
+    drawEdge(ctx, e, true, false, null, true, false, { role, emphasized: true, subdued: false });
+  }
   for (const e of focusedEdges) {
     if (!pathVisible(edgePoints(e), area)) continue;
     const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || state.multiSelection.trunk || e === focusedEdge;
@@ -506,7 +548,7 @@ function draw({ geometryUnchanged = false } = {}) {
   }
 
   const nb = neighborSet();
-  for (const n of v.nodes) if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes);
+  for (const n of v.nodes) if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null);
   for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
     const node = v.nodes.find(n => n.id === id);
     if (!node || !boxVisible(node, area)) continue;
@@ -518,7 +560,12 @@ function draw({ geometryUnchanged = false } = {}) {
   }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
-  drawEdgeLabels(ctx, v, { onAnimatedBox: recordBoxEffect, focusedEdges: tracedEdges,
+  const activeLabelEdges = tracedEdges.size ? tracedEdges
+    : focusedEdges.size ? focusedEdges
+    : relations?.edgeRoles.size ? new Set(relations.edgeRoles.keys())
+    : selectedNodes?.size ? new Set([...related, ...emphasized])
+    : null;
+  drawEdgeLabels(ctx, v, { onAnimatedBox: recordBoxEffect, focusedEdges: activeLabelEdges,
     visible: (box) => boxVisible(box, area), reuse: geometryUnchanged });
 
   // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
@@ -563,8 +610,9 @@ function draw({ geometryUnchanged = false } = {}) {
   scheduleDraw();
 }
 
-function drawContainer(ctx, c) {
+function drawContainer(ctx, c, dimmed = false) {
   ctx.save();
+  if (dimmed) ctx.globalAlpha = 0.32;
   roundRect(ctx, c.x, c.y, c.w, c.h, 14);
   ctx.fillStyle = hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
   ctx.fill();
@@ -596,8 +644,9 @@ function drawContainer(ctx, c) {
   ctx.restore();
 }
 
-function drawGroup(ctx, g) {
+function drawGroup(ctx, g, dimmed = false) {
   ctx.save();
+  if (dimmed) ctx.globalAlpha = 0.32;
   roundRect(ctx, g.x, g.y, g.w, g.h, 12);
   ctx.fillStyle = hexToRgba(THEME.container.fill, 0.45);
   ctx.fill();
@@ -628,22 +677,30 @@ function strokeRounded(ctx, pts) {
   for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
 }
 
-function drawEdge(ctx, e, related, selected, traceColor = null, animated = true, dimmed = false) {
+function drawEdge(ctx, e, related, selected, traceColor = null, animated = true, dimmed = false, relationMeta = null) {
   const pts = edgePoints(e);
   if (!pts || pts.length < 2) return;
 
   // 背景淡化连线直接使用不透明的预混浅色：共线几十条也不会叠加变深，且彻底省掉全屏离屏画布拷贝。
+  const hasRole = Boolean(related && relationMeta?.role);
+  const roleColor = hasRole
+    ? relationMeta.role === 'in' ? CALLER_COLOR : relationMeta.role === 'both' ? BIDIR_COLOR : CALLEE_COLOR
+    : null;
   const baseColor = traceColor ? traceColor : e.change === 'added'
     ? THEME.edge.added
     : isDataEdge(e)
     ? THEME.edge.var
     : THEME.edge.call;
   const color = dimmed
-    ? (e.change === 'added' ? DIM_ADDED_COLOR : DIM_EDGE_COLOR)
+    ? mixHex(THEME.bg, baseColor, e.change === 'added' ? 0.16 : 0.09)
     : selected && !traceColor && e.change !== 'added'
     ? SELECTED_EDGE_COLOR
+    : hasRole && e.change !== 'added'
+    ? roleColor
     : baseColor;
+  const invK = Math.max(1, 1 / cam.k);
   ctx.save();
+  if (relationMeta?.subdued) ctx.globalAlpha = 0.42;
   ctx.beginPath();
   strokeRounded(ctx, pts);
 
@@ -657,11 +714,19 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     ctx.lineWidth = (traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
     ctx.globalAlpha = traceColor ? 0.9 : 1;
     ctx.stroke();
+  } else if (hasRole) {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.min(18, (relationMeta.emphasized ? 6.8 : 5.6) * invK);
+    ctx.stroke();
   }
 
   ctx.strokeStyle = color;
-  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.5 : related ? 2.2 : 1.4;
-  ctx.globalAlpha = 1;
+  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.5
+    : hasRole ? Math.min(10, (relationMeta.emphasized ? 3.4 : 2.6) * invK)
+    : related ? 2.2 : 1.4;
+  ctx.globalAlpha = relationMeta?.subdued ? 0.42 : 1;
   // 变量访问=虚线，函数调用=实线（极小缩放下的淡化背景线省去虚线切分以降低核显负载）
   if (isDataEdge(e) && (!dimmed || cam.k >= 0.45)) ctx.setLineDash([7, 4]);
   ctx.stroke();
@@ -670,9 +735,15 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
   const direction = edgeDirection(e);
   const biOffset = direction === 'both' ? 2.5 : 0;
   const drawDirection = (a, b, reverse) => {
-    if (collectingEffects && selected && animated && (traceColor || THEME.edge.selPulse)) {
-      const pulseColor = traceColor ? flowPulseColor(traceColor) : e.change === 'added' ? '#FF4D6D' : '#0284C7';
-      const tailColor = hexToRgba(pulseColor, 0.38);
+    const showPulse = collectingEffects && (
+      (selected && animated && (traceColor || (THEME.edge.selPulse && !prefersReducedMotion()))) ||
+      (hasRole && e.change !== 'deleted' && relationMeta.role !== 'neutral' && !relationMeta.subdued && THEME.edge.selPulse && !prefersReducedMotion())
+    );
+    if (showPulse) {
+      const pulseColor = traceColor ? flowPulseColor(traceColor)
+        : e.change === 'added' ? '#FF4D6D'
+        : hasRole ? roleColor : '#0284C7';
+      const tailColor = hexToRgba(pulseColor, hasRole ? 0.34 : 0.38);
       rawFlowStreams.push({
         pts: reverse ? pts.toReversed() : pts,
         color: pulseColor,
@@ -685,7 +756,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     const len = Math.hypot(dx, dy) || 1;
     dx /= len;
     dy /= len;
-    const s = selected ? 6.8 : 6;
+    const s = hasRole ? Math.min(20, (relationMeta.emphasized ? 8.4 : 7.2) * invK) : selected ? 6.8 : 6;
     ctx.beginPath();
     ctx.moveTo(b[0], b[1]);
     ctx.lineTo(b[0] - s * dx - s * 0.55 * dy, b[1] - s * dy + s * 0.55 * dx);
@@ -754,7 +825,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
 /**
  * @param {Set<string>|null} nb 选中节点的邻接集合（draw 时统一算好传进来；为空表示没有选中）
  */
-function drawNode(ctx, n, nb = null, focusedNodes = null) {
+function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
   const allNodes = !!state.multiSelection?.nodes;
@@ -763,11 +834,22 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
   const edgeRelated = focusedNodes?.has(n.id);
   const recentlyAdded = state.recent?.nodes.has(n.id);
+  const role = !selected && nodeRoles?.get(n.id);
+  const isHoverPeer = state.hoverRelation?.peerId === n.id;
+  const invK = Math.max(1, 1 / cam.k);
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
 
   ctx.save();
-  ctx.globalAlpha = dimmed ? 0.3 : 1;
+  ctx.globalAlpha = dimmed ? 0.22 : 1;
+
+  if (selected && !allNodes) {
+    const ringGap = Math.min(8, 3 * invK);
+    roundRect(ctx, x - ringGap, y - ringGap, w + ringGap * 2, h + ringGap * 2, 10);
+    ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.24);
+    ctx.lineWidth = Math.min(7, 2.8 * invK);
+    ctx.stroke();
+  }
 
   roundRect(ctx, x, y, w, h, 8);
   // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除）。
@@ -778,7 +860,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
   ctx.fill();
 
   if (recentlyAdded) ctx.globalAlpha = 1;
-  ctx.lineWidth = recentlyAdded ? 2.4 : dropTarget ? 2.6 : selected || edgeRelated ? 2.4 : hover ? 1.6 : 1;
+  ctx.lineWidth = recentlyAdded ? 2.4
+    : dropTarget ? 2.6
+    : selected || edgeRelated ? Math.min(6, 2.6 * invK)
+    : role ? Math.min(5.5, (isHoverPeer ? 3.2 : 2.2) * invK)
+    : hover ? 1.6 : 1;
   ctx.strokeStyle = recentlyAdded
     ? RECENT_COLOR
     : dropTarget
@@ -787,6 +873,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
     ? THEME.node.selected
     : hover
     ? THEME.node.hover
+    : role
+    ? (role === 'in' ? CALLER_COLOR : role === 'both' ? BIDIR_COLOR : role === 'out' ? CALLEE_COLOR : THEME.node.selected)
     : n.external
     ? THEME.node.externalBorder
     : isVar
@@ -805,7 +893,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
       [5 / cam.k, 4 / cam.k], 1.5 / cam.k, 10);
   }
   ctx.setLineDash([]);
-  ctx.globalAlpha = dimmed ? 0.3 : 1;
+  ctx.globalAlpha = dimmed ? 0.22 : 1;
 
   if (n.note) {
     // 旧数据里还留着备注的节点：只保留一个小圆点做提示（备注面板已下线）

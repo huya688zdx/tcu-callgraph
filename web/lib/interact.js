@@ -231,6 +231,7 @@ const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
 function selectEdge(edge, trunkGroup = null) {
   if (state.pairFlow) clearPairFlow();
   state.moveTarget = null;
+  state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = edge;
   state.selectedLabel = null;
@@ -385,6 +386,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   const lb = hitLabel(worldPos(e));
   if (lb && !comparing) {
     state.moveTarget = null;
+    state.hoverRelation = null;
     const anchor = labelAnchor(lb.edge);
     state.selected = null;
     state.selectedEdge = lb.edge;
@@ -436,6 +438,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     els.tooltip.style.opacity = '0';
     // 点层级/文件标题 = 切换右侧变量面板的范围
     state.ctxBox = { kind: title.kind === 'file' ? 'file' : 'dir', id: title.box.id };
+    state.hoverRelation = null;
     state.selected = null;
     state.selectedEdge = null;
     state.selectedLabel = null;

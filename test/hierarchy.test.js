@@ -34,3 +34,24 @@ test('层级移动不能与其他同级框重叠', () => {
   assert.equal(moveHierarchy(drag, 440, 0), false);
   assert.deepEqual(view, before);
 });
+
+test('同级框位于 ELK 根容器边距边界时仍允许拖动另一文件框', () => {
+  const view = {
+    width: 400,
+    height: 220,
+    containers: [{ id: '', root: true, depth: 1, x: 0, y: 0, w: 400, h: 220 }],
+    groups: [
+      { id: 'edge.c', depth: 2, x: 24, y: 32, w: 120, h: 100 },
+      { id: 'main.c', depth: 2, x: 200, y: 60, w: 140, h: 110 },
+    ],
+    nodes: [
+      { id: 'e', group: 'edge.c', x: 34, y: 64, w: 90, h: 40 },
+      { id: 'm', group: 'main.c', x: 210, y: 92, w: 90, h: 40 },
+    ],
+    edges: [],
+  };
+  const drag = beginHierarchyMove(view, { kind: 'file', box: view.groups[1] });
+  assert.equal(moveHierarchy(drag, -30, 0), true);
+  assert.deepEqual([view.groups[1].x, view.nodes[1].x], [170, 180]);
+  assert.deepEqual([view.containers[0].x, view.containers[0].y], [0, 0]);
+});

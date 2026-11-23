@@ -59,11 +59,11 @@ export function moveHierarchy(drag, dx, dy, tolerance = 0) {
     for (const n of drag.nodes) { n.x += tx; n.y += ty; }
     for (const ancestor of drag.ancestors) {
       const b = ancestor.box, children = drag.boxes.filter((c) => inside(ancestor, c)).map((c) => c.box);
-      const pad = b.root ? 40 : 14;
+      const pad = b.root ? 24 : 10;
       const right = Math.max(b.x + b.w, ...children.map((c) => c.x + c.w + pad));
       const bottom = Math.max(b.y + b.h, ...children.map((c) => c.y + c.h + pad));
       b.x = Math.min(b.x, ...children.map((c) => c.x - pad));
-      b.y = Math.min(b.y, ...children.map((c) => c.y - 40));
+      b.y = Math.min(b.y, ...children.map((c) => c.y - 32));
       b.w = right - b.x;
       b.h = bottom - b.y;
     }

@@ -58,6 +58,7 @@ function renderPanel() {
 
 export function clearPairFlow({ paint = true } = {}) {
   state.pairFlow = null;
+  state.hoverRelation = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
   if (paint) draw();
 }
@@ -70,6 +71,7 @@ export function pickPairFlow(id) {
   const ids = prior?.ids.length === 1 ? [...prior.ids, id] : [id];
   const pair = { ids, result: null, view };
   state.pairFlow = pair;
+  state.hoverRelation = null;
   state.selected = null; state.selectedEdge = null; state.selectedLabel = null;
   state.moveTarget = null; state.multiSelection = null;
   state.recent = null; state.flash = null;
