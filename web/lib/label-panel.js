@@ -17,9 +17,11 @@ import { els, state, esc, edgeKey } from './state.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 import { api } from './api.js';
-import { CONN_PREFIX, LABEL_PRESETS, LABELS_MAX } from '/core/labels.js';
+import { CONN_PREFIX, LABEL_PRESETS, LABELS_MAX, visibleCallOrderMap } from '/core/labels.js';
 import {
   edgeLabels,
+  visibleEdgeLabels,
+  promoteAutoLabel,
   applyLabels,
   persistLabels,
   makeLabel,
@@ -121,13 +123,34 @@ async function removeLabel(edge, id) {
   }
 }
 
-/** 添加一条：固定模式下结合点先挑编号（connPick 状态） */
+/** 添加或更新一条标签：固定模式下结合点先挑编号（connPick 状态）；コール順 若已有则直接更新序号 */
 let connPick = false; // 展开编号选择
 async function addLabel(edge, preset, num) {
-  if (edgeLabels(edge).length >= LABELS_MAX) return;
+  const current = edgeLabels(edge);
+  if (preset === 'call') {
+    const existingCall = current.find((l) => l.preset === 'call');
+    if (existingCall) {
+      if (num !== undefined) existingCall.text = `${LABEL_PRESETS.call.text}${num}`;
+      state.selectedLabel = `${edgeKey(edge)}#${existingCall.id}`;
+      draw();
+      renderLabelPanel();
+      if (num !== undefined) await commit(edge);
+      return;
+    }
+    const promoted = promoteAutoLabel(edge);
+    if (promoted) {
+      if (num !== undefined) promoted.text = `${LABEL_PRESETS.call.text}${num}`;
+      state.selectedLabel = `${edgeKey(edge)}#${promoted.id}`;
+      draw();
+      renderLabelPanel();
+      await commit(edge);
+      return;
+    }
+  }
+  if (current.length >= LABELS_MAX) return;
   const label = makeLabel(preset, edge, num !== undefined ? { num } : {});
   if (!label) return;
-  applyLabels(edge, [...edgeLabels(edge), label]);
+  applyLabels(edge, [...current, label]);
   state.selectedLabel = `${edgeKey(edge)}#${label.id}`;
   connPick = false;
   draw();
@@ -138,6 +161,33 @@ async function addLabel(edge, preset, num) {
   } catch (error) {
     alert(`标签未保存：${error.message}`);
   }
+}
+
+/** 一键把当前连线起点函数在画布中的全部可见被调函数标上 コール順1..K（仅图中，首次调用） */
+async function applyCallerVisibleCallOrders(edge) {
+  const view = state.view;
+  if (!view || !edge?.from) return;
+  const orders = visibleCallOrderMap(view, edge.from);
+  if (!orders.size) return;
+  const projectId = view.projectId;
+  for (const { order, edge: targetEdge } of orders.values()) {
+    const list = edgeLabels(targetEdge).slice();
+    const existing = list.find((l) => l.preset === 'call');
+    const text = `${LABEL_PRESETS.call.text}${order}`;
+    if (existing) {
+      existing.text = text;
+      applyLabels(targetEdge, list);
+    } else if (list.length < LABELS_MAX) {
+      const created = makeLabel('call', targetEdge, { num: order });
+      applyLabels(targetEdge, [...list, created]);
+    }
+    await persistLabels(targetEdge, projectId);
+  }
+  const ownCall = edgeLabels(edge).find((l) => l.preset === 'call');
+  if (ownCall) state.selectedLabel = `${edgeKey(edge)}#${ownCall.id}`;
+  draw();
+  renderLabelPanel();
+  pushHistory();
 }
 
 // ---- 自动检测 ----
@@ -160,7 +210,25 @@ async function runDetect() {
   for (const s of (r.suggestions || []).filter((s) => s.kind === 'task')) {
     (byKey.has(s.edgeKey) ? inView : offView).push(s);
   }
-  detectResult = { inView, offView };
+  // 同时给出当前函数在画布内的コール順建议（仅限图中可见函数、首次调用 1..K）
+  if (from && state.view) {
+    const orders = visibleCallOrderMap(state.view, from);
+    if (orders.size >= 2) {
+      for (const { order, edge: e } of orders.values()) {
+        inView.push({
+          kind: 'call',
+          preset: 'call',
+          edgeKey: edgeKey(e),
+          from: e.from,
+          to: e.to,
+          line: e.line,
+          text: `${LABEL_PRESETS.call.text}${order}`,
+          evidence: `图中第 ${order} 个被调函数 (${nodeName(e.to)})`,
+        });
+      }
+    }
+  }
+  detectResult = { inView, offView: [] };
   renderLabelPanel();
 }
 
@@ -182,6 +250,16 @@ async function applyDetect() {
       if (!target) continue;
       const labels = edgeLabels(target);
       if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
+      if (s.preset === 'call') {
+        const prevCall = labels.find((l) => l.preset === 'call');
+        if (prevCall) {
+          prevCall.text = s.text;
+          applyLabels(target, labels);
+          await persistLabels(target, projectId);
+          applied++;
+          continue;
+        }
+      }
       const label = makeLabel(s.preset, target, { num: s.num });
       if (s.text) label.text = s.text;
       if (s.note) label.note = s.note;
@@ -235,10 +313,16 @@ export function renderLabelPanel() {
   sec.style.display = '';
   if (els.secVars) els.secVars.style.display = 'none';
 
-  const labels = edgeLabels(edge);
-  const sel = selectedId();
-  const selLabel = labels.find((l) => l.id === sel) || null;
-  if (sel && labels.length && !selLabel) state.selectedLabel = `${edgeKey(edge)}#${labels[0].id}`;
+  const labels = visibleEdgeLabels(edge, state.view);
+  let sel = selectedId();
+  let selLabel = labels.find((l) => l.id === sel) || null;
+  if (!selLabel && labels.length) {
+    selLabel = labels[0];
+    sel = selLabel.id;
+    state.selectedLabel = `${edgeKey(edge)}#${sel}`;
+  }
+  const callerOrders = edge.from && state.view ? visibleCallOrderMap(state.view, edge.from) : new Map();
+  const maxOrder = Math.max(callerOrders.size, 1);
 
   const trunkHits = state.trunkHits?.length > 1 && state.trunkHits.includes(edge) ? state.trunkHits : null;
   const allTrunk = Boolean(state.multiSelection?.trunk && trunkHits);
@@ -262,8 +346,8 @@ export function renderLabelPanel() {
           (l) => `
       <div class="lbl-row${sel === l.id ? ' on' : ''}" data-id="${esc(l.id)}">
         <span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span>
-        <span class="lbl-row-txt">${esc(l.note ? l.note : l.preset === 'conn' ? t('label.num') + ' ' + l.num : '')}</span>
-        <button class="lbl-row-del" data-del="${esc(l.id)}" title="${t('label.delete')}">✕</button>
+        <span class="lbl-row-txt">${esc(l.note ? l.note : l.auto ? '图中自动顺序（点击可编辑/拖动）' : l.preset === 'conn' ? t('label.num') + ' ' + l.num : '')}</span>
+        ${l.auto ? '' : `<button class="lbl-row-del" data-del="${esc(l.id)}" title="${t('label.delete')}">✕</button>`}
       </div>`
         )
         .join('')
@@ -273,16 +357,28 @@ export function renderLabelPanel() {
   let editor = '';
   if (selLabel) {
     const isConn = selLabel.preset === 'conn';
+    const isCall = selLabel.preset === 'call';
+    const isTask = selLabel.preset === 'task';
     const seg = PRESET_UI.map(
       (p) => `<button class="lbl-seg${selLabel.preset === p.id ? ' on' : ''}" data-preset="${p.id}" title="${esc(t(p.desc))}">${p.id === 'conn' ? '結合点' : p.id === 'call' ? 'コール順' : 'TASK'}</button>`
     ).join('');
+    const quickCallNums = isCall
+      ? `<div class="lbl-picknum">${Array.from({ length: Math.min(12, Math.max(maxOrder, 4)) }, (_, i) => i + 1)
+          .map((n) => `<button type="button" class="lbl-num${selLabel.text === `${LABEL_PRESETS.call.text}${n}` ? ' on' : ''}" data-quick-text="${esc(`${LABEL_PRESETS.call.text}${n}`)}">${n}</button>`)
+          .join('')}</div>`
+      : '';
+    const quickTaskPeriods = isTask
+      ? `<div class="lbl-picknum">${['1ms', '2ms', '5ms', '10ms', '20ms', '50ms', '100ms', 'Init']
+          .map((p) => `<button type="button" class="lbl-num${selLabel.text === `TASK:${p}` ? ' on' : ''}" data-quick-text="TASK:${p}">${p}</button>`)
+          .join('')}</div>`
+      : '';
     editor = `
     <div class="lbl-editor">
       <div class="lbl-segs">${seg}</div>
       ${
         isConn
           ? `<div class="field"><label>${t('label.num')}</label><input id="lblNum" type="number" min="1" max="999" value="${selLabel.num}"></div>`
-          : `<div class="field"><label>${t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>`
+          : `<div class="field"><label>${t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>${quickCallNums}${quickTaskPeriods}`
       }
       <div class="field">
         <label>${t('label.note')}</label>
@@ -302,19 +398,19 @@ export function renderLabelPanel() {
           <span class="lbl-aa" style="color:${esc(selLabel.color)}">Aa</span>
         </div>
       </div>
-      <div class="lbl-actions">
-        <button id="lblDelete">${t('label.delete')}</button>
-      </div>
+      ${selLabel.auto ? '' : `<div class="lbl-actions"><button id="lblDelete">${t('label.delete')}</button></div>`}
     </div>`;
   }
 
   // ---- 添加区：结合点在固定模式下先挑编号 ----
+  const autoCallOrder = callerOrders.get(edge.to)?.order;
   let addArea = `
     <div class="lbl-adds">
       <button class="lbl-add" data-add="task">+ TASK</button>
-      <button class="lbl-add" data-add="call">+ コール順</button>
+      <button class="lbl-add" data-add="call">+ コール順${autoCallOrder ? autoCallOrder : ''}</button>
       <button class="lbl-add${connPick ? ' on' : ''}" data-add="conn">+ 結合点</button>
-    </div>`;
+    </div>
+    ${callerOrders.size >= 2 ? `<button type="button" class="lbl-add lbl-detect" id="lblBatchCallOrder" style="margin-top:4px">一键保存 ${esc(nodeName(edge.from))} 的图中コール順 (1..${callerOrders.size})</button>` : ''}`;
   if (connPick && connMode === 'fixed') {
     const nums = connChoices(state.view, edge);
     addArea += `<div class="lbl-picknum">${nums
@@ -397,11 +493,35 @@ export function renderLabelPanel() {
   });
 
   if (selLabel) {
+    const ensureEditableTarget = () => {
+      if (selLabel.auto) {
+        const promoted = promoteAutoLabel(edge, selLabel);
+        if (promoted) {
+          selLabel = promoted;
+          state.selectedLabel = `${edgeKey(edge)}#${promoted.id}`;
+          return promoted;
+        }
+      }
+      return edgeLabels(edge).find((l) => l.id === selLabel.id);
+    };
+
+    box.querySelectorAll('[data-quick-text]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const target = ensureEditableTarget();
+        if (!target) return;
+        target.text = btn.dataset.quickText;
+        draw();
+        renderLabelPanel();
+        await commit(edge);
+      });
+    });
+
     box.querySelectorAll('.lbl-segs [data-preset]').forEach((btn) => {
       btn.addEventListener('click', async () => {
-        const next = switchPreset(selLabel, btn.dataset.preset, edge);
+        const currentTarget = ensureEditableTarget() || selLabel;
+        const next = switchPreset(currentTarget, btn.dataset.preset, edge);
         if (!next) return;
-        const labels2 = edgeLabels(edge).map((l) => (l.id === selLabel.id ? next : l));
+        const labels2 = edgeLabels(edge).map((l) => (l.id === currentTarget.id ? next : l));
         applyLabels(edge, labels2);
         draw();
         renderLabelPanel();
@@ -414,7 +534,7 @@ export function renderLabelPanel() {
     if (numEl) {
       numEl.addEventListener('change', () => {
         const n = Math.max(1, Math.min(999, Number(numEl.value) || 1));
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (!target) return;
         target.num = n;
         target.text = CONN_PREFIX + n;
@@ -427,7 +547,7 @@ export function renderLabelPanel() {
     const textEl = box.querySelector('#lblText');
     if (textEl) {
       textEl.addEventListener('input', () => {
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (target) {
           target.text = textEl.value;
           draw();
@@ -439,7 +559,7 @@ export function renderLabelPanel() {
     const noteEl = box.querySelector('#lblNote');
     if (noteEl) {
       noteEl.addEventListener('input', () => {
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (target) {
           target.note = noteEl.value;
           draw();
@@ -451,7 +571,7 @@ export function renderLabelPanel() {
     const borderEl = box.querySelector('#lblBorder');
     if (borderEl) {
       borderEl.addEventListener('input', () => {
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (target) {
           target.border = borderEl.value;
           draw();
@@ -462,7 +582,7 @@ export function renderLabelPanel() {
     const noBorderEl = box.querySelector('#lblNoBorder');
     if (noBorderEl) {
       noBorderEl.addEventListener('change', () => {
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (!target) return;
         target.border = noBorderEl.checked ? null : LABEL_PRESETS.task.border;
         if (borderEl) {
@@ -476,7 +596,7 @@ export function renderLabelPanel() {
     const colorEl = box.querySelector('#lblColor');
     if (colorEl) {
       colorEl.addEventListener('input', () => {
-        const target = edgeLabels(edge).find((l) => l.id === selLabel.id);
+        const target = ensureEditableTarget();
         if (target) {
           target.color = colorEl.value;
           const aa = box.querySelector('.lbl-aa');
@@ -488,6 +608,7 @@ export function renderLabelPanel() {
     }
     box.querySelector('#lblDelete')?.addEventListener('click', () => removeLabel(edge, selLabel.id));
   }
+  box.querySelector('#lblBatchCallOrder')?.addEventListener('click', () => applyCallerVisibleCallOrders(edge));
 
   box.querySelectorAll('[data-add]').forEach((btn) => {
     btn.addEventListener('click', async () => {

@@ -24,6 +24,7 @@ import {
   labelText,
   normalizeLabel,
   normalizeLabels,
+  visibleCallOrderMap,
   displayEdgeLabels,
   labelBoxSize,
   placeEdgeLabels,
@@ -80,6 +81,34 @@ export function edgeLabels(edge) {
   return edge.labels;
 }
 
+/** 这条线在画布和标签面板中可见的整组标签（含自动计算的图中コール順，选中/编辑/拖动时自动转正落库） */
+export function visibleEdgeLabels(edge, view = state.view) {
+  return displayEdgeLabels(edge, edgeLabels(edge), view);
+}
+
+/** 将一条自动コール順标签就地升级为该连线的正式标签（用于点击编辑或拖动定位） */
+export function promoteAutoLabel(edge, autoLabel = null, view = state.view) {
+  const existing = edgeLabels(edge);
+  const found = existing.find((l) => l.preset === 'call');
+  if (found) return found;
+  const candidate = autoLabel || visibleEdgeLabels(edge, view).find((l) => l.auto);
+  if (!candidate) return null;
+  const id = freshId(existing);
+  const promoted = normalizeLabel({
+    id,
+    preset: 'call',
+    text: candidate.text,
+    note: candidate.note,
+    border: candidate.border ?? null,
+    color: candidate.color || LABEL_PRESETS.call.color,
+    dx: candidate.dx || 0,
+    dy: candidate.dy || 0,
+  });
+  if (!promoted) return null;
+  applyLabels(edge, [...existing, promoted]);
+  return edge.labels.find((l) => l.id === promoted.id) || edge.labels.at(-1);
+}
+
 /**
  * 算出当前视图里所有标签的矩形，写回 edge._lbs 供命中测试复用。
  * 同一条线的多条标签由 placeEdgeLabels 交替放线的两侧并互相避让；
@@ -95,7 +124,7 @@ export function labelLayout(view = state.view, reuse = false) {
   const labeled = [];
   for (const e of view.edges) {
     e._lbs = null;
-    const labels = displayEdgeLabels(e, edgeLabels(e), view);
+    const labels = visibleEdgeLabels(e, view);
     if (labels.length) labeled.push({ e, labels });
   }
   const paths = labeled.length ? view.edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
@@ -114,7 +143,7 @@ export function labelLayout(view = state.view, reuse = false) {
     const own = [];
     labels.forEach((label, i) => {
       if (!rects[i]) return;
-      if (!label.auto) own.push({ id: label.id, rect: rects[i] });
+      own.push({ id: label.id, rect: rects[i] });
       placed.push(rects[i]);
       out.push({ edge: e, label, rect: rects[i] });
     });
@@ -128,7 +157,6 @@ export function labelLayout(view = state.view, reuse = false) {
 export function hitLabel(p, view = state.view) {
   const items = labelLayout(view, true);
   for (let i = items.length - 1; i >= 0; i--) {
-    if (items[i].label.auto) continue;
     const { rect: r } = items[i];
     if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
       return items[i];
@@ -144,8 +172,9 @@ export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible
   for (const { edge, label, rect } of items) {
     if (visible && !visible(rect)) continue;
     const key = `${edgeKey(edge)}#${label.id}`;
-    const selected = !label.auto &&
-      (state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key);
+    const selected = state.multiSelection?.labels
+      ? state.multiSelection.labels.has(key)
+      : state.selectedLabel === key;
     ctx.save();
     if (focusedEdges?.size && !focusedEdges.has(edge)) ctx.globalAlpha = 0.22;
     ctx.textAlign = 'center';
@@ -228,10 +257,15 @@ export function makeLabel(preset, edge, { num } = {}) {
     });
   }
   if (preset === 'call') {
+    const orders = edge?.from && state.view ? visibleCallOrderMap(state.view, edge.from) : null;
+    const order = (Number.isFinite(Number(num)) && Number(num) > 0 ? Math.trunc(Number(num)) : null) ||
+      orders?.get(edge?.to)?.order ||
+      (edge?.callNumbers?.length ? parseInt(edge.callNumbers[0], 10) : null) ||
+      1;
     return normalizeLabel({
       id,
       preset: 'call',
-      text: LABEL_PRESETS.call.text,
+      text: `${LABEL_PRESETS.call.text}${order}`,
       border: null,
       color: LABEL_PRESETS.call.color,
     });
@@ -333,6 +367,16 @@ export async function afterConnDelete(view = state.view) {
  */
 export function dragLabelTo(edge, label, center) {
   if (!label) return false;
+  if (label.auto) {
+    const promoted = promoteAutoLabel(edge, label);
+    if (promoted) {
+      Object.assign(label, promoted);
+      delete label.auto;
+      if (state.selectedLabel === `${edgeKey(edge)}#auto`) {
+        state.selectedLabel = `${edgeKey(edge)}#${promoted.id}`;
+      }
+    }
+  }
   const anchor = labelAnchor(edge);
   if (!anchor) return false;
   const view = state.view;

@@ -7,7 +7,7 @@ import { loadModel } from '../src/core/index.js';
 import { pairDataflow, comparisonPairDataflow } from '../src/core/pair-dataflow.js';
 import { compareProjects } from '../src/core/compare.js';
 import { launchServer } from '../scripts/lib/server.mjs';
-import { flowPulseColor, flowPath, flowPointAt } from '../web/lib/flow-geometry.js';
+import { flowPulseColor, flowPath, flowPointAt, mergeFlowStreams } from '../web/lib/flow-geometry.js';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-pair-'));
@@ -133,6 +133,15 @@ test('流动标记按距离匀速前进，折弯和反向重合保留各自方�
   assert.deepEqual(flowPointAt(short, 40), [40, 0, 1, 0]);
   assert.deepEqual(flowPointAt(reverse, 60), [40, 0, -1, 0]);
   assert.equal(flowPath([[0, 0], [0, 0]]).length, 0);
+
+  const merged = mergeFlowStreams([
+    { pts: [[0, 100], [400, 100], [400, 200]], color: '#0284C7', tailColor: 'rgba(2,132,199,0.4)' },
+    { pts: [[0, 100], [260, 100], [260, 300]], color: '#0284C7', tailColor: 'rgba(2,132,199,0.4)' },
+    { pts: [[120, 100], [400, 100], [400, 200]], color: '#0284C7', tailColor: 'rgba(2,132,199,0.4)' },
+  ]);
+  assert.equal(merged.length, 1);
+  // 三条分支共用的水平干线 [0,100]->[400,100] 以及垂直分支 [400,100]->[400,200] 均去重为单条流动段
+  assert.equal(merged[0].segments.length, 3);
 });
 
 test('两点路径查询有界：分支很多时限制路径数量，过深链路明确提示截断', async () => {

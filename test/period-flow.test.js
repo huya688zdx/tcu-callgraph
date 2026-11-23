@@ -63,17 +63,21 @@ test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用
   assert.deepEqual(traceVisiblePaths(view, 'write', 'read').paths[0].nodes, ['write', 'v', 'read']);
 });
 
-test('SVG 显示多条调用边的自动顺序，保存的手工调用标签优先', () => {
+test('SVG 显示图中多条调用边的首次调用顺序，保存的手工调用标签优先，不展示自动周期副标题', () => {
   const svg = exportSvg({
-    root: 'outer', nodes: [{ id: 'A', name: 'A', x: 0, y: 0, w: 100, h: 48,
-      taskEntry: true, taskPeriods: [{ us: 10000 }] }],
+    root: 'outer', nodes: [
+      { id: 'A', name: 'A', file: 'main.c', line: 10, x: 0, y: 0, w: 100, h: 48, taskEntry: true, taskPeriods: [{ us: 10000 }] },
+      { id: 'B', name: 'B', file: 'main.c', line: 20, x: 260, y: 0, w: 100, h: 48 },
+      { id: 'C', name: 'C', file: 'main.c', line: 30, x: 260, y: 80, w: 100, h: 48 },
+    ],
     edges: [
       { from: 'A', to: 'B', kind: 'direct', callNumbers: ['1'], points: [[10, 30], [250, 30]] },
       { from: 'A', to: 'C', kind: 'direct', callNumbers: ['2'], points: [[10, 110], [250, 110]],
         labels: [{ preset: 'call', text: 'コール順7' }, { preset: 'task', text: 'TASK:2ms' }] },
     ],
   });
-  assert.match(svg, /TASK · 10 ms/);
+  assert.doesNotMatch(svg, /周期待确认/);
+  assert.match(svg, /main\.c:10/);
   assert.match(svg, /コール順1</);
   assert.doesNotMatch(svg, /コール順2</);
   assert.match(svg, /コール順7/);
@@ -141,8 +145,13 @@ test('OSEK TASK 定义自动入表，无调用者也显示，保留真实函数�
   const groups = callSequence(model, caller);
   assert.deepEqual(groups.map(g => g.map(c => c.name)), [['A'],['B'],['A'],['B'],['C'],['C','A','B']]);
   const numbers = callNumbers(groups);
-  assert.deepEqual(numbers.get('tasks.c::A'), ['1','3','6*']);
-  assert.deepEqual(numbers.get('tasks.c::B'), ['2','4','6*']);
+  assert.deepEqual(numbers.get('tasks.c::A'), ['1']);
+  assert.deepEqual(numbers.get('tasks.c::B'), ['2']);
+  assert.deepEqual(numbers.get('tasks.c::C'), ['3']);
+  const partial = callNumbers(groups, new Set(['tasks.c::B', 'tasks.c::C']));
+  assert.deepEqual(partial.get('tasks.c::B'), ['1']);
+  assert.deepEqual(partial.get('tasks.c::C'), ['2']);
+  assert.equal(partial.has('tasks.c::A'), false);
 });
 
 test('注册的 RTOS 任务按显式毫秒间隔显示，原始 tick 保留待确认', t => {

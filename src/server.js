@@ -581,7 +581,7 @@ function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edg
   };
 }
 
-function callOrderForEdges(model, comparison) {
+function callOrderForEdges(model, comparison, visibleNodes = null) {
   const orders = new Map();
   return (e) => {
     if (!CALL_KINDS.has(e.kind) || e.headerReference) return undefined;
@@ -589,7 +589,7 @@ function callOrderForEdges(model, comparison) {
     const orderKey = version + ':' + e.from;
     if (!orders.has(orderKey)) {
       const source = comparison ? comparison[version + 'Model'] : model;
-      orders.set(orderKey, callNumbers(callSequence(source, e.from)));
+      orders.set(orderKey, callNumbers(callSequence(source, e.from), visibleNodes));
     }
     return orders.get(orderKey).get(e.to);
   };
@@ -802,6 +802,12 @@ async function buildView(
     ...recommendations(clean, viewEdges),
   };
   clean = withTaskPeriods(clean, model, COMPARISON);
+  const visibleNodes = new Set(clean.map((n) => n.id));
+  const getCallOrder = callOrderForEdges(model, COMPARISON, visibleNodes);
+  for (const e of viewEdges) {
+    const numbers = getCallOrder(e);
+    if (numbers) e.callNumbers = numbers;
+  }
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
@@ -812,10 +818,7 @@ async function buildView(
     n.change = COMPARISON ? n.change || 'existing' : (ov && ov.change) || 'existing';
     n.kind = n.kind === 'var' ? 'var' : 'fn';
   }
-  const getCallOrder = callOrderForEdges(model, COMPARISON);
   for (const e of laid.edges) {
-    const numbers = getCallOrder(e);
-    if (numbers) e.callNumbers = numbers;
     const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = COMPARISON ? e.change || 'existing' : (ov && ov.change) || 'existing';

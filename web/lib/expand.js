@@ -39,35 +39,14 @@ function pickRow(node, { checked = false, varId, chips = [], description = '' } 
 
 const chip = (text, style = '') => `<span class="chip${style ? ' ' + style : ''}">${esc(text)}</span>`;
 const pickGroup = (title, rows) => rows ? `<section class="function-pick-group"><h3>${title}</h3>${rows}</section>` : '';
-const periodChip = (contexts) => {
-  const period = periodText(contexts);
-  return period ? chip(period === formatPeriod(null) ? period : `周期 ${period}`) : '';
-};
-
-function periodImpact(current, other) {
-  const known = periods => new Set((periods || []).map(c => c.us).filter(us => us > 0));
-  const own = known(current), peer = known(other);
-  if (!own.size || !peer.size) return '';
-  return own.size === peer.size && [...own].every(us => peer.has(us))
-    ? chip('同周期') : chip('跨周期影响', 'cross-period');
-}
 
 function renderRecommendations(fn, view, dataflow, shown, callsByNode) {
   const rec = view.recommendations || {};
   const hidden = new Set(rec.hiddenIds || []);
   if (hidden.has(fn.id)) return;
-  const chains = (rec.taskChains || []).filter(chain => !chain.path.some(id => hidden.has(id)));
-  const taskIds = new Set();
-  const taskRows = chains.map(chain => {
-    const rows = chain.nodes.filter(node => !shown.has(node.id) && !taskIds.has(node.id)).map(node => {
-      taskIds.add(node.id);
-      return pickRow(node, { checked: true });
-    });
-    return `<div class="function-pick-context" title="${esc(chain.source)}">${chip(`TASK · ${formatPeriod(chain.us)}`)} ${esc(chain.nodes.map(node => node.name).join(' → '))}</div>${rows.join('')}`;
-  }).join('');
   const target = view.nodes.find(node => node.id === fn.id && node.kind !== 'var');
-  const targetRow = target && !shown.has(fn.id) && !taskIds.has(fn.id)
-    ? pickRow(target, { checked: true, chips: [chip('目标函数'), periodChip(rec.target?.taskPeriods)] }) : '';
+  const targetRow = target && !shown.has(fn.id)
+    ? pickRow(target, { checked: true, chips: [chip('目标函数')] }) : '';
 
   const peerIds = new Set();
   const dataRows = (dataflow?.vars || []).filter(v => !hidden.has(v.id)).map(v => {
@@ -78,22 +57,19 @@ function renderRecommendations(fn, view, dataflow, shown, callsByNode) {
     const rows = peers.map(peer => {
       peerIds.add(peer.id);
       return pickRow(peer, { varId: v.id, chips: [
-        chip(writes ? '读变量' : '写变量'), periodChip(peer.taskPeriods) || chip('周期待确认'),
-        periodImpact(dataflow.fn?.taskPeriods || rec.target?.taskPeriods, peer.taskPeriods),
+        chip(writes ? '读变量' : '写变量'),
         shown.has(peer.id) ? chip('已在画布') : '',
-      ] });
+      ].filter(Boolean) });
     }).join('');
     return `<div class="function-pick-context"><b>${esc(v.name)}</b> ${chip(`目标函数${writes ? '写' : '读'}${version}`)}</div>${rows}`;
   }).join('');
 
   const calls = new Map();
-  const relatedPeriods = new Map(rec.relatedPeriods || []);
-  const canAdd = id => id !== fn.id && !shown.has(id) && !taskIds.has(id) && !peerIds.has(id) && !hidden.has(id);
+  const canAdd = id => id !== fn.id && !shown.has(id) && !peerIds.has(id) && !hidden.has(id);
   const addCall = (node, relation) => {
     if (!canAdd(node.id)) return;
     if (!calls.has(node.id)) calls.set(node.id, { node, descriptions: [] });
-    const order = node.callNumbers?.length ? ` · ${LABEL_PRESETS.call.text}${node.callNumbers.join('、')}` : '';
-    calls.get(node.id).descriptions.push(relation + order);
+    calls.get(node.id).descriptions.push(relation);
   };
   for (const node of rec.callSequence?.callees || []) addCall(node, '被调函数');
   const positions = { before: '前序调用', after: '后序调用', same: '同组或交错调用' };
@@ -102,19 +78,17 @@ function renderRecommendations(fn, view, dataflow, shown, callsByNode) {
   }
   for (const node of view.nodes) {
     if (node.kind !== 'var' && !calls.has(node.id)) {
-      addCall({ ...node, taskPeriods: relatedPeriods.get(node.id) }, callsByNode.get(node.id)?.join('；') || '查找范围内');
+      addCall(node, callsByNode.get(node.id)?.join('；') || '查找范围内');
     }
   }
   const callRows = [...calls.values()].map(({ node, descriptions }) => pickRow(node, {
-    checked: !chains.length && !peerIds.size,
-    chips: [periodChip(node.taskPeriods)].filter(Boolean),
+    checked: !peerIds.size,
     description: descriptions.join('；'),
   })).join('');
 
   pickList.innerHTML = targetRow +
-    pickGroup('所属 TASK 周期溯源链', taskRows) +
-    pickGroup('共享变量与读写影响函数', dataRows) +
-    pickGroup('先后调用顺序', callRows);
+    pickGroup('共享变量与读写关联函数', dataRows) +
+    pickGroup('调用与被调函数', callRows);
 }
 
 /** 仅预览候选范围；确认时用零层范围加入勾选函数，避免未勾选分支再次展开。 */
@@ -143,10 +117,8 @@ export async function previewAddition(fn, depths = state.addDepths) {
     const names = new Map(view.nodes.map((node) => [node.id, node.name]));
     const existingEdges = new Set(previewView.edges.map(edgeKey));
     const callsByNode = new Map();
-    for (const [i, edge] of view.edges.entries()) {
-      const order = view.recommendations?.edgeOrders?.[i];
-      const suffix = order?.length ? ` · ${LABEL_PRESETS.call.text}${order.join('、')}` : '';
-      const label = `${names.get(edge.from) || edge.from} → ${names.get(edge.to) || edge.to}${suffix}`;
+    for (const edge of view.edges) {
+      const label = `${names.get(edge.from) || edge.from} → ${names.get(edge.to) || edge.to}`;
       for (const id of new Set([edge.from, edge.to])) {
         if (!callsByNode.has(id)) callsByNode.set(id, []);
         callsByNode.get(id).push(label);
