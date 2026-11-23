@@ -8,19 +8,32 @@ import path from 'node:path';
 import { stats } from './index.js';
 import { layoutElk } from './layout-elk.js';
 import { roundedPathD } from './routing.js';
+import { callNumbers, callSequence } from './call-sequence.js';
+import { withTaskPeriods } from './task-periods.js';
+import { layoutExportEdgeLabels } from './export-svg.js';
+import { LABEL_PRESETS, labelSvg } from './labels.js';
+import { periodSubtitle } from '../../web/lib/period-text.js';
 
 export function buildSVGFromLayout(laid) {
   const pad = 24;
-  const W = laid.width + pad * 2;
-  const H = laid.height + pad * 2;
+  const labels = layoutExportEdgeLabels(laid);
+  let minX = 0, minY = 0, maxX = laid.width, maxY = laid.height;
+  for (const { rect } of labels) {
+    minX = Math.min(minX, rect.x);
+    minY = Math.min(minY, rect.y);
+    maxX = Math.max(maxX, rect.x + rect.w);
+    maxY = Math.max(maxY, rect.y + rect.h);
+  }
+  const W = maxX - minX + pad * 2;
+  const H = maxY - minY + pad * 2;
   const out = [];
   const C = { direct: '#2C2C2A', var: '#2C2C2A', added: '#D9303E' };
 
   out.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${-pad} ${-pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="${minX - pad} ${minY - pad} ${W} ${H}" font-family="Segoe UI, Microsoft YaHei, sans-serif">`
   );
   out.push(`<title>TCU 调用关系图</title>`);
-  out.push(`<rect x="${-pad}" y="${-pad}" width="${W}" height="${H}" fill="#F7F6F2"/>`);
+  out.push(`<rect x="${minX - pad}" y="${minY - pad}" width="${W}" height="${H}" fill="#F7F6F2"/>`);
   out.push('<defs>');
   for (const [k, c] of Object.entries(C)) {
     out.push(
@@ -40,6 +53,7 @@ export function buildSVGFromLayout(laid) {
   }
 
   for (const n of laid.nodes) {
+    const period = periodSubtitle(n);
     out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.displayName || n.name)}">`);
     out.push(
       `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${{existing:'#CCFFCC',modified:'#FFFF99',added:'#FFCCFF',deleted:'#BFBFBF'}[n.change] || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
@@ -48,11 +62,12 @@ export function buildSVGFromLayout(laid) {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? '外部符号' : `${n.file}:${n.line}`)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || (n.external ? '外部符号' : `${n.file}:${n.line}`))}</text>`
     );
     out.push('</g>');
   }
 
+  for (const { label, rect } of labels) out.push(labelSvg(label, rect));
   out.push('</svg>');
   return out.join('\n');
 }
@@ -76,8 +91,21 @@ function inlineJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
+async function layoutForExport(model, { root, ...opts }) {
+  const functions = model.functions.some(n => n.kind !== 'var' && !n.headerSymbol && !n.taskPeriods)
+    ? withTaskPeriods(model.functions, model).map((n, i) => model.functions[i].taskPeriods ? model.functions[i] : n)
+    : model.functions;
+  const orders = new Map();
+  const edges = model.edges.map(e => {
+    if (Object.hasOwn(e, 'callNumbers') || e.headerReference || !['direct', 'macro', 'fnptr'].includes(e.kind)) return e;
+    if (!orders.has(e.from)) orders.set(e.from, callNumbers(callSequence(model, e.from)));
+    return { ...e, callNumbers: orders.get(e.from).get(e.to) };
+  });
+  return { ...await layoutElk(functions, edges, { group: false, ...opts }), root };
+}
+
 export async function exportSvg(model, outPath, opts = {}) {
-  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
+  const laid = await layoutForExport(model, opts);
   const svg = buildSVGFromLayout(laid);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, svg, 'utf8');
@@ -86,7 +114,7 @@ export async function exportSvg(model, outPath, opts = {}) {
 
 /** 单文件 HTML：内嵌 SVG 与数据，双击即可离线查看 */
 export async function exportHtml(model, outPath, opts = {}) {
-  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
+  const laid = await layoutForExport(model, opts);
   const svg = buildSVGFromLayout(laid);
   const S = stats(model);
 
@@ -105,6 +133,7 @@ export async function exportHtml(model, outPath, opts = {}) {
       name: n.displayName || n.name,
       file: n.file,
       line: n.line,
+      period: periodSubtitle(n),
       change: n.change,
       detectedChange: n.detectedChange,
       statusSource: n.statusSource,
@@ -121,6 +150,7 @@ export async function exportHtml(model, outPath, opts = {}) {
       line: e.line,
       via: e.via,
       cond: e.cond,
+      callOrder: e.callNumbers?.length ? LABEL_PRESETS.call.text + e.callNumbers.join('、') : '',
     })),
     macros: model.macros
       .filter((m) => m.raw && m.raw.trim())
@@ -214,9 +244,11 @@ function select(id){
   const out = DATA.edges.filter(e => !e.dataEdge && e.from === id);
   const inc = DATA.edges.filter(e => !e.dataEdge && e.to === id);
   const data = DATA.edges.filter(e => e.dataEdge && (e.from === id || e.to === id));
-  const chip = e => e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : '';
+  const chip = e => (e.callOrder ? '<span class="chip">' + escHtml(e.callOrder) + '</span>' : '') +
+    (e.kind === 'macro' ? '<span class="chip m">宏' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : e.kind === 'fnptr' ? '<span class="chip f">指针' + (e.via ? ':' + escHtml(e.via) : '') + '</span>' : '');
   info.innerHTML = '<div style="font-weight:500;font-size:13px;color:#2C2C2A;margin-bottom:2px">' + escHtml(n.name) + '</div>' +
     '<div style="margin-bottom:8px">' + escHtml(n.file) + ':' + n.line + ' · ↑' + n.fanIn + ' ↓' + n.fanOut + '</div>' +
+    (n.period ? '<div><span class="chip">' + escHtml(n.period) + '</span></div>' : '') +
     (data.length ? '<div>数据流向</div>' + data.map(e => '<div>' + escHtml(e.caption) + '</div>').join('') : '') +
     (out.length ? '<div style="margin-bottom:2px">调用：</div>' + out.map(e => '<div>→ ' + escHtml(e.callee) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '') +
     (inc.length ? '<div style="margin-top:6px;margin-bottom:2px">被调用：</div>' + inc.map(e => '<div>← ' + escHtml((DATA.nodes.find(x => x.id === e.from) || {}).name) + ' <span style="color:#B4B2A9">:' + e.line + '</span> ' + chip(e) + '</div>').join('') : '');

@@ -30,8 +30,7 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 export const edgeStyleKey = (e) => `${e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 
 export function canShareTrunk(a, b) {
-  return (a.from === b.from || a.to === b.to || (a.from === b.to && a.to === b.from)) &&
-    edgeStyleKey(a) === edgeStyleKey(b);
+  return edgeStyleKey(a) === edgeStyleKey(b);
 }
 
 const samePort = (p, q) => Math.abs(p[0] - q[0]) < 0.5 && Math.abs(p[1] - q[1]) < 0.5;
@@ -81,7 +80,7 @@ function overlapWithRouted(edge, routed) {
   return length;
 }
 
-/** 逐对统计共线长度。布局评分只计不同线型的遮盖，局部几何检查也可包含同线型。 */
+/** 逐对统计不同样式边的共线遮盖。 */
 export function routeOverlapConflicts(edges, { differentStylesOnly = false } = {}) {
   let length = 0, styleLength = 0;
   const hits = new Map(), byEdge = new Map();

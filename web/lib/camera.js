@@ -20,7 +20,7 @@ function contentBounds() {
     : { x: 0, y: 0, w: 1, h: 1 };
 }
 
-const fittedZoom = (b) => Math.min(2, Math.max(1, els.cv.clientWidth - 64) / b.w, Math.max(1, els.cv.clientHeight - 64) / b.h);
+const fittedZoom = (b) => Math.min(2, Math.max(1, els.cv.clientWidth - 28) / b.w, Math.max(1, els.cv.clientHeight - 28) / b.h);
 /** 通常 50%–200%；大图允许缩至整图适配比例，再往下就停止。 */
 function zoomLimits() { return { min: Math.min(0.5, fittedZoom(contentBounds())), max: 2 }; }
 function clampZoom(k) { const { min, max } = zoomLimits(); return Math.min(max, Math.max(min, k)); }
@@ -152,12 +152,38 @@ function focusBox(box, pad = 90) {
   });
 }
 
-/** 新内容在视野外时才平移或适度缩小，保留原有缩放作为上限。 */
+/** 新节点居中，直接邻居参与计算缩放。仅新增连线时按需移动视角。 */
 function revealAdded(nodes, edges) {
-  const points = nodes.length ? nodes.flatMap((n) => [[n.x, n.y], [n.x + n.w, n.y + n.h]]) :
-    edges.flatMap((e) => e.points || []);
+  const W = els.cv.clientWidth, H = els.cv.clientHeight;
+  if (!W || !H) return;
+  if (nodes.length) {
+    const bounds = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+    const include = ({ x, y, w, h }) => {
+      bounds.x0 = Math.min(bounds.x0, x);
+      bounds.y0 = Math.min(bounds.y0, y);
+      bounds.x1 = Math.max(bounds.x1, x + w);
+      bounds.y1 = Math.max(bounds.y1, y + h);
+    };
+    for (const node of nodes) include(node);
+    const added = { ...bounds };
+    const ids = new Set(nodes.map((n) => n.id));
+    const neighbors = new Set();
+    for (const { from, to } of state.view.edges) {
+      if (ids.has(from) && !ids.has(to)) neighbors.add(to);
+      if (ids.has(to) && !ids.has(from)) neighbors.add(from);
+    }
+    for (const node of state.view.nodes) if (neighbors.has(node.id)) include(node);
+    const { x0, y0, x1, y1 } = bounds.x1 - bounds.x0 > W * 2.2 || bounds.y1 - bounds.y0 > H * 2.2 ? added : bounds;
+    const spanW = Math.max(180, x1 - x0), spanH = Math.max(120, y1 - y0);
+    const pad = 72;
+    const k = clampZoom(Math.min(1.15, Math.max(0.6, Math.min((W - pad * 2) / spanW, (H - pad * 2) / spanH))));
+    const addCx = (added.x0 + added.x1) / 2, addCy = (added.y0 + added.y1) / 2;
+    animateCam({ x: W / 2 - addCx * k, y: H / 2 - addCy * k, k }, 340);
+    return;
+  }
+  const points = edges.flatMap((e) => e.points || []);
   if (!points.length) return;
-  const W = els.cv.clientWidth, H = els.cv.clientHeight, pad = 40;
+  const pad = 40;
   if (points.every(([x, y]) => x * cam.k + cam.x >= pad && x * cam.k + cam.x <= W - pad &&
       y * cam.k + cam.y >= pad && y * cam.k + cam.y <= H - pad)) return;
   const x0 = Math.min(...points.map((p) => p[0])), x1 = Math.max(...points.map((p) => p[0]));
@@ -166,10 +192,6 @@ function revealAdded(nodes, edges) {
   const shift = (lo, hi, origin, size) => lo * k + origin < pad ? pad - lo * k :
     hi * k + origin > size - pad ? size - pad - hi * k : origin;
   const target = { x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k };
-  if (nodes.length + edges.length === 1) animateCam(target);
-  else {
-    stopCamAnim();
-    Object.assign(cam, target);
-  }
+  animateCam(target, 300);
 }
 export { contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };

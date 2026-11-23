@@ -6,6 +6,7 @@ import { isDataEdge, svgMarkers } from './edge-flow.js';
 import { t } from '../i18n.js';
 import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
+import { periodSubtitle } from './period-text.js';
 import { labelSvg } from '/core/labels.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
@@ -120,8 +121,9 @@ function buildSVG() {
     if (n.note) {
       out.push(`<circle cx="${(n.x + 8).toFixed(1)}" cy="${(n.y + 8).toFixed(1)}" r="3.2" fill="#EF9F27"/>`);
     }
-    // 函数名带 ()、变量名不带；副标题：变量=类型，函数=文件:行号（与画布相同）
+    // 副标题与画布一致，优先显示周期。
     const label = isVar ? n.name || n.id : `${n.displayName || n.name || n.id}()`;
+    const period = periodSubtitle(n);
     const sub = n.external
       ? t('node.external')
       : isVar
@@ -131,7 +133,7 @@ function buildSVG() {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 8).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(label)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(sub)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || sub)}</text>`
     );
     out.push('</g>');
   }

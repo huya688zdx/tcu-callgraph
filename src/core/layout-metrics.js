@@ -159,18 +159,52 @@ export function improveEdgeRoutes(view, subset, simplify = () => true) {
   }
 }
 
-/** 同源或同目标连线复用干线，允许延伸已有通道接入平行分支。 */
+const samePoint = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.5;
+const segmentAxis = (a, b) => Math.abs(a[1] - b[1]) < 1e-6 ? 0 : Math.abs(a[0] - b[0]) < 1e-6 ? 1 : -1;
+
+// 短交叠也可接入同一走廊，前提是吸附后的折点接上同向的垂直分支。
+function joinsBranch(q, j, p, i, axis, coord) {
+  const sameDirection = (q[j + 1][axis] - q[j][axis]) * (p[i + 1][axis] - p[i][axis]) > 0;
+  return [0, 1].some((end) => {
+    const donorEnd = sameDirection ? end : 1 - end;
+    const branch = p[i + (donorEnd ? 2 : -1)];
+    return branch && Math.abs(q[j + end][axis] - p[i + donorEnd][axis]) < 0.5 &&
+      Math.abs(branch[axis] - p[i + donorEnd][axis]) < 0.5 &&
+      (q[j + (end ? 2 : -1)][1 - axis] - coord) * (branch[1 - axis] - coord) > 0;
+  });
+}
+
+/** 汇合同端点分支，并吸附同样式的平行走廊。 */
 export function mergeSharedRoutes(view, subset = view.edges) {
   const affected = new Set(subset), nodes = new Map(view.nodes.map((n) => [n.id, n]));
   if (!affected.size) return;
   const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
   const cost = (edges) => { const m = routeLengthAndCrossings(edges, true); return m.length + STUB * m.bends; };
+  const replacementCost = (edge, points) => cost(view.edges.map((e) => e === edge ? { ...e, points } : e));
+  const automatic = view.edges.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2);
   let viewCost;
   const length = (pts) => pts.slice(1).reduce((sum, p, i) => sum + Math.abs(p[0] - pts[i][0]) + Math.abs(p[1] - pts[i][1]), 0);
+  const clearsNodes = (edge, points) => !pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) &&
+    !pathCrossesBody(points, nodes.get(edge.from)) && !pathCrossesBody(points, nodes.get(edge.to));
+  const addsConflict = (edge) => {
+    // 每条原线路的冲突只计算一次，其他边在其候选比较期间保持不变。
+    const conflicts = new Map();
+    const others = view.edges.filter((other) => !canShareTrunk(edge, other));
+    return (points) => {
+      const candidate = { ...edge, points }, box = routeBounds(points);
+      return others.some((other) => {
+        if (!boundsMeet(box, bounds.get(other))) return false;
+        const trial = routeLengthAndCrossings([candidate, other]);
+        if (!trial.overlapLength && !trial.crossings) return false;
+        if (!conflicts.has(other)) conflicts.set(other, routeLengthAndCrossings([edge, other]));
+        const old = conflicts.get(other);
+        return trial.overlapLength > old.overlapLength + 1e-6 || trial.crossings > old.crossings;
+      });
+    };
+  };
   for (const role of ['from', 'to']) {
     const groups = new Map();
-    for (const e of view.edges) {
-      if (e.custom || e.fromSide || e.toSide || e.from === e.to || !e.points?.length) continue;
+    for (const e of automatic) {
       const key = e[role] + '|' + edgeStyleKey(e);
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(e);
@@ -182,12 +216,11 @@ export function mergeSharedRoutes(view, subset = view.edges) {
         const q = role === 'from' ? edge.points : edge.points.slice().reverse();
         let best = null, gain = 0;
         const originalLength = length(edge.points);
-        // 共用端点且样式相同的边可以汇流；其他边逐对检查，避免每个候选都重算全图交叉。
-        const conflicts = new Map();
+        const conflicts = addsConflict(edge);
         // 只比较邻近的少量分支，避免大扇出在拖动松手时全组两两枚举。
         const end = (e) => role === 'from' ? e.points.at(-1) : e.points[0];
         const distance = (e) => Math.abs(end(e)[0] - end(edge)[0]) + Math.abs(end(e)[1] - end(edge)[1]);
-        const donors = edges.filter((e) => e !== edge).sort((a, b) => distance(a) - distance(b)).slice(0, 8);
+        const donors = edges.filter((e) => e !== edge).sort((a, b) => distance(a) - distance(b)).slice(0, 20);
         for (const donor of donors) {
           const p = role === 'from' ? donor.points : donor.points.slice().reverse();
           const before = cost([donor, edge]);
@@ -201,18 +234,8 @@ export function mergeSharedRoutes(view, subset = view.edges) {
             let points = collapse([...p.slice(0, i), at, ...q.slice(j)]);
             if (role === 'to') points.reverse();
             const next = before - cost([donor, { ...edge, points }]);
-            if (next <= gain + 0.5 || length(points) > originalLength + 0.5 ||
-                pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) ||
-                pathCrossesBody(points, nodes.get(edge.from)) || pathCrossesBody(points, nodes.get(edge.to))) continue;
-            const candidate = { ...edge, points }, box = routeBounds(points);
-            if (view.edges.some((other) => {
-              if (other === edge || !boundsMeet(box, bounds.get(other)) || canShareTrunk(edge, other)) return false;
-              const trial = routeLengthAndCrossings([candidate, other]);
-              if (trial.overlapLength <= 0.5 && !trial.crossings) return false;
-              if (!conflicts.has(other)) conflicts.set(other, routeLengthAndCrossings([edge, other]));
-              const old = conflicts.get(other);
-              return trial.overlapLength > old.overlapLength + 0.5 || trial.crossings > old.crossings;
-            })) continue;
+            if (next <= gain + 0.5 || length(points) > originalLength + Math.max(96, next * 1.25) ||
+                !clearsNodes(edge, points) || conflicts(points)) continue;
             best = points; gain = next;
           }
         }
@@ -221,12 +244,76 @@ export function mergeSharedRoutes(view, subset = view.edges) {
         // 同目标汇流也不能拆散其他同源组已有的干线。
         if (next >= groupCost - 0.5) continue;
         viewCost ??= cost(view.edges);
-        const total = cost(view.edges.map((e) => e === edge ? { ...e, points: best } : e));
+        const total = replacementCost(edge, best);
         if (total < viewCost - 0.5) {
           edge.points = best; groupCost = next; viewCost = total;
           bounds.set(edge, routeBounds(best));
         }
       }
     }
+  }
+
+  const corridors = new Map();
+  for (const edge of automatic) {
+    if (edge.points.length < 3) continue;
+    const style = edgeStyleKey(edge);
+    if (!corridors.has(style)) corridors.set(style, []);
+    corridors.get(style).push(edge);
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    let changed = false;
+    for (const edges of corridors.values()) for (const edge of edges) {
+      if (!affected.has(edge) || edge.points.length < 4) continue;
+      const conflicts = addsConflict(edge);
+      // 逐段尝试吸附到平行主干走廊，使一条边的水平段和垂直段都能分别并入对应干线。
+      for (let j = 1; j <= edge.points.length - 3; j++) {
+        const q = edge.points;
+        const axis = segmentAxis(q[j], q[j + 1]);
+        if (axis < 0) continue;
+        const normal = 1 - axis;
+        const lo = Math.min(q[j][axis], q[j + 1][axis]), hi = Math.max(q[j][axis], q[j + 1][axis]);
+        const coords = new Set();
+        let best = null, bestCost = Infinity;
+        for (const donor of edges) {
+          if (donor === edge || donor.points.length < 3 || !boundsMeet(bounds.get(edge), bounds.get(donor), 65)) continue;
+          const p = donor.points;
+          const sameStart = p.length >= 4 && samePoint(q[0], p[0]);
+          const sameEnd = p.length >= 4 && samePoint(q.at(-1), p.at(-1));
+          for (let i = 0; i < p.length - 1; i++) {
+            const coord = p[i][normal], distance = Math.abs(coord - q[j][normal]);
+            if (distance <= 0.5 || distance > 64 || coords.has(coord) || segmentAxis(p[i], p[i + 1]) !== axis) continue;
+            const overlap = Math.min(hi, Math.max(p[i][axis], p[i + 1][axis])) -
+              Math.max(lo, Math.min(p[i][axis], p[i + 1][axis]));
+            const portBend = (sameStart && j === 1 && i === 1) ||
+              (sameEnd && j === q.length - 3 && i === p.length - 3);
+            if (overlap < 16 && !portBend && !joinsBranch(q, j, p, i, axis, coord)) continue;
+            coords.add(coord);
+            const shifted = q.slice();
+            shifted[j] = [...q[j]];
+            shifted[j + 1] = [...q[j + 1]];
+            shifted[j][normal] = shifted[j + 1][normal] = coord;
+            const points = collapse(shifted);
+            if (points.length < 2 || !samePoint(points[0], q[0]) || !samePoint(points.at(-1), q.at(-1)) ||
+                points.some((pt, idx) => idx > 0 && segmentAxis(points[idx - 1], pt) < 0) ||
+                !clearsNodes(edge, points) || conflicts(points)) continue;
+            viewCost ??= cost(view.edges);
+            const total = replacementCost(edge, points);
+            if (total < viewCost - 0.5 && total < bestCost) {
+              best = points;
+              bestCost = total;
+            }
+          }
+        }
+        if (best) {
+          const prevLen = edge.points.length;
+          edge.points = best;
+          viewCost = bestCost;
+          bounds.set(edge, routeBounds(best));
+          changed = true;
+          if (edge.points.length < prevLen) j = Math.max(0, j - 1);
+        }
+      }
+    }
+    if (!changed) break;
   }
 }

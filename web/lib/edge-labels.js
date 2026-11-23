@@ -24,6 +24,7 @@ import {
   labelText,
   normalizeLabel,
   normalizeLabels,
+  displayEdgeLabels,
   labelBoxSize,
   placeEdgeLabels,
   clampLabelCenter,
@@ -94,12 +95,11 @@ export function labelLayout(view = state.view, reuse = false) {
   const labeled = [];
   for (const e of view.edges) {
     e._lbs = null;
-    if (e.labels?.length || e.label || (e.labels && !Array.isArray(e.labels))) labeled.push(e);
+    const labels = displayEdgeLabels(e, edgeLabels(e), view);
+    if (labels.length) labeled.push({ e, labels });
   }
   const paths = labeled.length ? view.edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
-  for (const e of labeled) {
-    const labels = edgeLabels(e);
-    if (!labels.length) continue;
+  for (const { e, labels } of labeled) {
     const items = labels.map((label) => ({ label, size: labelSizeOf(label) }));
     const bounds = routeBounds(e.points);
     const rects = placeEdgeLabels({
@@ -114,12 +114,11 @@ export function labelLayout(view = state.view, reuse = false) {
     const own = [];
     labels.forEach((label, i) => {
       if (!rects[i]) return;
-      e._lbs = own;
-      own.push({ id: label.id, rect: rects[i] });
+      if (!label.auto) own.push({ id: label.id, rect: rects[i] });
       placed.push(rects[i]);
       out.push({ edge: e, label, rect: rects[i] });
     });
-    if (!own.length) e._lbs = null;
+    if (own.length) e._lbs = own;
   }
   layouts.set(view, { nodes: view.nodes, edges: view.edges, items: out });
   return out;
@@ -129,6 +128,7 @@ export function labelLayout(view = state.view, reuse = false) {
 export function hitLabel(p, view = state.view) {
   const items = labelLayout(view, true);
   for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i].label.auto) continue;
     const { rect: r } = items[i];
     if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
       return items[i];
@@ -144,7 +144,8 @@ export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible
   for (const { edge, label, rect } of items) {
     if (visible && !visible(rect)) continue;
     const key = `${edgeKey(edge)}#${label.id}`;
-    const selected = state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key;
+    const selected = !label.auto &&
+      (state.multiSelection?.labels ? state.multiSelection.labels.has(key) : state.selectedLabel === key);
     ctx.save();
     if (focusedEdges?.size && !focusedEdges.has(edge)) ctx.globalAlpha = 0.22;
     ctx.textAlign = 'center';

@@ -14,7 +14,7 @@ import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
 import { callSequence, callNumbers } from './core/call-sequence.js';
-import { projectTasks, withTaskPeriods } from './core/task-periods.js';
+import { projectTasks, taskPeriods, withTaskPeriods } from './core/task-periods.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import { normalizeExpansions } from './core/expansion.js';
@@ -530,6 +530,71 @@ function sendFile(res, file, headers) {
  */
 const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
 
+const CALL_KINDS = new Set(['direct', 'macro', 'fnptr']);
+
+function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edges) {
+  const sourceModel = comparison?.afterModel || model;
+  const periods = taskPeriods(sourceModel);
+  const { byId, inAdj, outAdj } = sourceModel._index;
+  const nodeInfo = (id) => {
+    const fn = byId.get(id);
+    return fn ? { id, name: fn.name, file: fn.file, line: fn.line } : { id, name: id };
+  };
+  const candidate = (id) => ({ ...nodeInfo(id), taskPeriods: periods.get(id) || [] });
+  // 从目标反向广搜一次，得到每个任务到目标的最短调用链。
+  const next = new Map([[root, null]]);
+  const queue = [root];
+  for (let i = 0; i < queue.length; i++) {
+    for (const e of inAdj.get(queue[i]) || []) {
+      if (!CALL_KINDS.has(e.kind) || next.has(e.from)) continue;
+      next.set(e.from, e.to);
+      queue.push(e.from);
+    }
+  }
+  const taskChains = projectTasks(sourceModel).filter(task => next.has(task.id)).map(task => {
+    const path = [];
+    for (let id = task.id; id != null; id = next.get(id)) path.push(id);
+    return { taskId: task.id, taskName: task.name, us: task.us, source: task.source, path, nodes: path.map(nodeInfo) };
+  });
+  const directCalls = (outAdj.get(root) || []).filter(e => CALL_KINDS.has(e.kind));
+  const numbers = callNumbers(callSequence(sourceModel, root));
+  const callees = [...new Set(directCalls.map(e => e.to))].map(id => ({
+    ...candidate(id), callNumbers: numbers.get(id) || [],
+  })).sort((a, b) => (parseInt(a.callNumbers[0], 10) || Infinity) - (parseInt(b.callNumbers[0], 10) || Infinity));
+  const callers = [...new Set((inAdj.get(root) || []).filter(e => CALL_KINDS.has(e.kind)).map(e => e.from))].slice(0, 8);
+  const siblings = callers.flatMap(callerId => {
+    const orders = callNumbers(callSequence(sourceModel, callerId));
+    const target = orders.get(root);
+    if (!target?.length) return [];
+    return [...orders].filter(([id]) => id !== root).map(([id, callNumbers]) => {
+      const position = parseInt(callNumbers.at(-1), 10) < parseInt(target[0], 10) ? 'before'
+        : parseInt(callNumbers[0], 10) > parseInt(target.at(-1), 10) ? 'after' : 'same';
+      return { ...candidate(id), callerId, callerName: nodeInfo(callerId).name, callNumbers, position };
+    });
+  });
+  return {
+    target: { id: root, name: model._index.byId.get(root)?.name || root, taskPeriods: periods.get(root) || [] },
+    taskChains, callSequence: { callees, siblings }, hiddenIds: Object.keys(hiddenNodes),
+    // 周边建议沿用预览节点与边的精简协议，周期和序号单独返回。
+    relatedPeriods: nodes.filter(node => periods.has(node.id)).map(node => [node.id, periods.get(node.id)]),
+    edgeOrders: edges.map(callOrderForEdges(model, comparison)),
+  };
+}
+
+function callOrderForEdges(model, comparison) {
+  const orders = new Map();
+  return (e) => {
+    if (!CALL_KINDS.has(e.kind) || e.headerReference) return undefined;
+    const version = comparison && !e.versions?.includes('after') ? 'before' : 'after';
+    const orderKey = version + ':' + e.from;
+    if (!orders.has(orderKey)) {
+      const source = comparison ? comparison[version + 'Model'] : model;
+      orders.set(orderKey, callNumbers(callSequence(source, e.from)));
+    }
+    return orders.get(orderKey).get(e.to);
+  };
+}
+
 async function buildView(
   rootIds,
   up,
@@ -573,6 +638,9 @@ async function buildView(
     nodes: [...nodeMap.values()],
     edges: edgeList,
   };
+  const recommendations = (nodes, edges) => g.root ? {
+    recommendations: previewRecommendations(g.root, model, COMPARISON, viewOverlay.deleted.nodes, nodes, edges),
+  } : {};
   // 局部范围补当前已显示节点之间的关系，不带入邻接函数。
   const allowedIds = new Set(nodeMap.keys());
   for (const scope of varSel.expansions || []) {
@@ -604,7 +672,7 @@ async function buildView(
   );
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
   if (!clean.length) {
-    if (varSel.preview) return { nodes: [], edges: [], projectId, truncated };
+    if (varSel.preview) return { nodes: [], edges: [], projectId, truncated, ...recommendations([], []) };
     const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
       : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
     return { ...emptyLayout, root: g.root, roots,
@@ -731,6 +799,7 @@ async function buildView(
     edges: viewEdges.map(({ from, to, kind, line, change }) => ({ from, to, kind, line, change })),
     projectId,
     truncated,
+    ...recommendations(clean, viewEdges),
   };
   clean = withTaskPeriods(clean, model, COMPARISON);
   const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
@@ -743,17 +812,10 @@ async function buildView(
     n.change = COMPARISON ? n.change || 'existing' : (ov && ov.change) || 'existing';
     n.kind = n.kind === 'var' ? 'var' : 'fn';
   }
-  const orders = new Map();
+  const getCallOrder = callOrderForEdges(model, COMPARISON);
   for (const e of laid.edges) {
-    if (['direct', 'macro', 'fnptr'].includes(e.kind) && !e.headerReference) {
-      const version = COMPARISON && !e.versions?.includes('after') ? 'before' : 'after';
-      const orderKey = version + ':' + e.from;
-      if (!orders.has(orderKey)) {
-        const source = COMPARISON ? COMPARISON[version + 'Model'] : model;
-        orders.set(orderKey, callNumbers(callSequence(source, e.from)));
-      }
-      e.callNumbers = orders.get(orderKey).get(e.to);
-    }
+    const numbers = getCallOrder(e);
+    if (numbers) e.callNumbers = numbers;
     const ov = viewOverlay.edges?.[edgeKeyOf(e)];
     // 原有 / 新增 / 删除
     e.change = COMPARISON ? e.change || 'existing' : (ov && ov.change) || 'existing';
@@ -1625,15 +1687,21 @@ const server = http.createServer(async (req, res) => {
       const id = u.searchParams.get('id');
       const fn = MODEL._index.byId.get(id);
       if (!fn) return json(res, { error: 'not found' }, 404);
+      const getCallOrder = callOrderForEdges(MODEL, COMPARISON);
+      const detailEdge = (e) => ({
+        ...(COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e))
+          : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
+        callNumbers: getCallOrder(e),
+      });
       return json(res, {
         node: { ...(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn), bodyTokens: undefined },
         callSequence: callSequence(COMPARISON?.afterModel || MODEL, id),
         ...(COMPARISON ? { previousCallSequence: callSequence(COMPARISON.beforeModel, id) } : {}),
         hidden: !COMPARISON && !!overlay.deleted.nodes[id],
         inEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.to === id) : MODEL._index.inAdj.get(id) || [])
-          .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
+          .map(detailEdge),
         outEdges: (fn.headerSymbol ? (MODEL.headerEdges || []).filter((e) => e.from === id) : MODEL._index.outAdj.get(id) || [])
-          .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e)) : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
+          .map(detailEdge),
         overlay: overlay.nodes?.[id] || {},
       });
     }
@@ -1668,8 +1736,14 @@ const server = http.createServer(async (req, res) => {
         await ensureAnalysis(model);
         if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
       }
+      const source = COMPARISON?.afterModel || MODEL;
       return (COMPARISON ? comparisonDataflow(COMPARISON, fnId, dir) : dataflowFor(MODEL, fnId, dir))
-        .then((r) => json(res, r))
+        .then((r) => {
+          const periods = taskPeriods(source);
+          if (r.fn) r.fn.taskPeriods = periods.get(r.fn.id) || [];
+          for (const v of r.vars) for (const peer of v.peers) peer.taskPeriods = periods.get(peer.id) || [];
+          return json(res, r);
+        })
         .catch((err) => {
           console.error('[数据流]', err);
           json(res, { ok: false, error: String(err.message || err) }, 500);
@@ -1726,6 +1800,8 @@ const server = http.createServer(async (req, res) => {
       }
       g.nodes = g.nodes.map((n) => withMacroName(n, overlay, macroNameDefault()));
       g.nodes = withTaskPeriods(g.nodes, MODEL, COMPARISON);
+      const getCallOrder = callOrderForEdges(MODEL, COMPARISON);
+      g.edges = g.edges.map(e => ({ ...e, callNumbers: getCallOrder(e) }));
       const byId = new Map(g.nodes.map((n) => [n.id, n]));
       const outAdj = new Map();
       const inAdj = new Map();
@@ -1743,7 +1819,7 @@ const server = http.createServer(async (req, res) => {
       };
       const out = path.join(OUT, `view-${randomUUID()}.html`);
       res.on('close', () => fs.unlink(out, () => {}));
-      await exportHtml(tmp, out);
+      await exportHtml(tmp, out, { root: g.root });
       return sendFile(res, out, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Disposition': 'attachment; filename="callgraph.html"',

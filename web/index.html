@@ -27,7 +27,7 @@
   }
   #app {
     display: grid; height: 100vh;
-    grid-template-columns: 250px minmax(0, 1fr) 310px;
+    grid-template-columns: 216px minmax(0, 1fr) 256px;
     grid-template-rows: auto minmax(0, 1fr);
     grid-template-areas: "top top top" "left main right";
   }
@@ -35,9 +35,7 @@
     grid-area: top; min-width: 0; position: relative; z-index: 30;
     background: #fff; border-bottom: 1px solid rgba(0,0,0,.1);
   }
-  .top-row, .view-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 14px; }
-  .top-row { min-height: 58px; }
-  .view-row { gap: 12px; padding-top: 7px; padding-bottom: 7px; background: #FAFAF8; border-top: 1px solid #EFEEE9; }
+  .top-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: 42px; padding: 5px 12px; }
   .brand { flex: 0 1 auto; max-width: 250px; min-width: 150px; font-weight: 600; font-size: 14px; }
   .brand small { display: block; margin-top: 3px; color: #888780; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #projectBtn { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
@@ -72,7 +70,7 @@
   .help-popover p + p { border-top: 1px solid #F1EFE8; }
   .help-popover kbd { font: inherit; color: #5F5E5A; white-space: nowrap; }
   @media (max-width: 1100px) {
-    .top-row, .view-row { gap: 8px; padding-left: 10px; padding-right: 10px; }
+    .top-row { gap: 8px; padding-left: 10px; padding-right: 10px; }
     .tool-group + .tool-group { padding-left: 8px; }
   }
   input[type=search] {
@@ -121,8 +119,8 @@
   canvas.over-node { cursor: move; }
   canvas.linking { cursor: crosshair; }
 
-  .sec { padding: 12px 14px; border-bottom: 1px solid rgba(0,0,0,.07); }
-  .sec h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
+  .sec { padding: 8px 10px; border-bottom: 1px solid rgba(0,0,0,.07); }
+  .sec h3 { margin: 0 0 5px; font-size: 12px; font-weight: 500; color: #5F5E5A; }
   .df-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
   .df-heading h3 { margin: 0; }
   .df-heading button { height: 26px; font-size: 11.5px; }
@@ -146,6 +144,15 @@
   .df-error { color: #A32D2D; font-size: 12px; overflow-wrap: anywhere; }
   .stat-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12.5px; }
   .stat-row span:last-child { color: #185FA5; font-variant-numeric: tabular-nums; }
+  .task-list-head { font-size: 12.5px; font-weight: 600; color: #124B71; margin-bottom: 4px; }
+  .task-list { list-style: none; margin: 0 0 6px; padding: 0; max-height: 22vh; overflow: auto; }
+  .task-row { display: flex; align-items: center; gap: 4px; min-height: 28px; cursor: pointer; }
+  .task-row:hover { background: #F4F8FB; }
+  .task-row .chip, .task-row small { flex: none; }
+  .task-name { min-width: 0; height: auto; padding: 2px 0; border: 0; background: transparent; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+  .stat-more { color: #5F5E5A; font-size: 11.5px; }
+  .stat-more summary { cursor: pointer; }
+  #stats { max-height: 38vh; overflow: auto; }
   .chip {
     display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 11px;
     background: #E6F1FB; color: #0C447C; margin: 2px 3px 2px 0;
@@ -162,6 +169,9 @@
 
   .detail-title { font-size: 14px; font-weight: 500; margin-bottom: 4px; word-break: break-all; }
   .detail-meta { color: #888780; font-size: 12px; margin-bottom: 10px; }
+  .detail-period, .detail-directions { margin-bottom: 10px; color: #124B71; overflow-wrap: anywhere; }
+  .detail-period small { display: block; margin-top: 3px; }
+  .detail-directions { font-size: 12px; line-height: 1.6; }
   .field { margin-bottom: 10px; }
   .field label { display: block; font-size: 11.5px; color: #5F5E5A; margin-bottom: 4px; }
   .field textarea, .field input[type=text] {
@@ -181,9 +191,16 @@
   .settings-note { margin: 8px 0; color: #888780; font-size: 12px; line-height: 1.6; }
   #addFunctionsModal { width: 620px; }
   .function-pick { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid #EEEDE8; cursor: pointer; }
-  .function-pick span { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
-  .function-pick small { color: #888780; }
-  .empty { color: #B4B2A9; font-size: 12px; padding: 8px 0; }
+  .function-pick-info { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+  .function-pick small { color: #5F5E5A; }
+  .function-pick-chips { display: flex; flex-wrap: wrap; gap: 2px; }
+  .function-pick-group { margin-top: 12px; border: 1px solid #E6E9EC; border-radius: 8px; padding: 0 10px; }
+  .function-pick-group h3 { margin: 0 -10px; padding: 8px 10px; border-radius: 8px 8px 0 0; background: #F0F5FA; color: #124B71; font-size: 13px; }
+  .function-pick-context { padding: 6px 0; overflow-wrap: anywhere; }
+  .function-pick-group .function-pick:last-child { border-bottom: 0; }
+  .chip.cross-period { color: #8A370C; background: #FCE9D9; font-weight: 600; }
+  #addFunctionsMessage { flex: 1; align-self: center; color: #5F5E5A; font-size: 12px; }
+  .empty { color: #B4B2A9; font-size: 12px; padding: 3px 0; }
 
   /* ---- 连线标签面板 ---- */
   .detail-hint { color: #888780; font-size: 11.5px; line-height: 1.6; }
@@ -264,10 +281,10 @@
     transition: opacity .12s; max-width: 320px; line-height: 1.5; z-index: 10;
   }
   #legend {
-    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
-    display: flex; gap: 14px; align-items: center;
-    background: rgba(255, 255, 255, 0.94); padding: 6px 14px; border-radius: 20px;
-    border: 1px solid rgba(0, 0, 0, 0.08); font-size: 11.5px; color: #5F5E5A;
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px; align-items: center;
+    background: rgba(255, 255, 255, 0.94); padding: 4px 11px; border-radius: 20px;
+    border: 1px solid rgba(0, 0, 0, 0.08); font-size: 11px; color: #5F5E5A;
     pointer-events: none; z-index: 5;
   }
   #legend span { display: inline-flex; align-items: center; white-space: nowrap; }
@@ -285,7 +302,7 @@
   #shownFunctions[aria-pressed="true"] { background: #E6F1FB; border-color: #B5D4F4; color: #185FA5; }
   #tree { font-size: 12.5px; line-height: 18px; user-select: none; }
   .tn {
-    display: flex; align-items: center; gap: 4px; min-height: 25px; padding: 2px 6px;
+    display: flex; align-items: center; gap: 4px; min-height: 22px; padding: 2px 6px;
     border-radius: 5px; cursor: pointer; white-space: nowrap;
   }
   .tn.dir .nm { color: #444740; font-weight: 600; }
@@ -670,6 +687,12 @@
       <button id="projectBtn" title="切换工程" data-i18n-title="btn.project">工程</button>
       <span id="compareSummary" hidden></span>
       <button id="compareExit" hidden data-i18n="compare.exit">退出比较</button>
+      <div class="tool-group">
+        <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
+      </div>
+      <div class="tool-group">
+        <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n="btn.reset">重新排版</button>
+      </div>
       <div class="top-actions" aria-label="工程工具">
         <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
@@ -711,28 +734,17 @@
         </details>
       </div>
     </div>
-    <div class="view-row" aria-label="视图与编辑工具">
-      <div class="tool-group">
-        <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
-      </div>
-      <div class="tool-group">
-        <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n="btn.reset">重新排版</button>
-      </div>
-    </div>
   </header>
 
   <aside id="left">
     <div class="sec sec-search">
       <input id="search" type="search" aria-label="搜索函数" data-i18n-ph="search.placeholder" placeholder="搜索函数名，回车定位…" autocomplete="off">
     </div>
+    <div class="sec" id="stats"></div>
     <div class="sec tree-sec">
       <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数">已加入 <span>0</span></button></div>
       <ul id="results" class="results-list"></ul>
       <div id="tree"><div class="empty" data-i18n="tree.loading">加载中…</div></div>
-    </div>
-    <div class="sec">
-      <h3 data-i18n="panel.overview">工程概览</h3>
-      <div id="stats"></div>
     </div>
   </aside>
 
@@ -863,7 +875,7 @@
     <div class="modal-body">
       <strong id="addFunctionsTarget"></strong>
       <p id="addFunctionsScope" class="settings-note"></p>
-      <p class="settings-note">只加入勾选的函数，并连接它们与画布中已有函数的关系。未勾选的函数不会加入。</p>
+      <p class="settings-note">勾选关联函数可同时加入它与目标函数共享的变量。</p>
       <label><input id="addFunctionsAll" type="checkbox" checked> 全选待添加函数</label>
       <div id="addFunctionsList"></div>
     </div>

@@ -5,8 +5,35 @@ import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes } from '.
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
-const TOP_PADDING = 40;
+const TOP_PADDING = 32;
+const ROOT_PAD = 24;
+const BOX_PAD = 10;
+const NODE_GAP = 18;
+const LAYER_GAP = 36;
+const MODEL_ORDER = 'elk.layered.considerModelOrder.strategy';
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
+const isReverseFlow = (e) => (e.kind === 'var' && e.via === '读') || e.kind === 'df-read';
+const flowSource = (e) => isReverseFlow(e) ? e.to : e.from;
+const flowTarget = (e) => isReverseFlow(e) ? e.from : e.to;
+const callRank = (e) => (e.callNumbers?.length ? parseInt(e.callNumbers[0], 10) : e.orderGroup || e.line) || 0;
+
+function modelOrder(nodes, edges) {
+  const readers = new Set(), callers = new Set(), incoming = new Map();
+  for (const e of edges) {
+    if (isReverseFlow(e)) readers.add(e.from);
+    if (e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
+    if (e.from !== e.to) callers.add(e.from);
+    incoming.set(e.to, Math.min(incoming.get(e.to) ?? Infinity, callRank(e)));
+  }
+  const ranked = nodes.map((n) => ({
+    id: n.id,
+    role: n.taskEntry ? 0 : n.kind === 'var' ? 2 : readers.has(n.id) && !callers.has(n.id) ? 3 : 1,
+    call: incoming.get(n.id) ?? 0,
+    period: (n.taskPeriods || []).reduce((min, { us }) => Number.isInteger(us) && us > 0 ? Math.min(min, us) : min, Infinity),
+  }));
+  ranked.sort((a, b) => a.role - b.role || a.call - b.call || a.period - b.period);
+  return new Map(ranked.map(({ id }, i) => [id, i]));
+}
 
 // ELK 会把共用逻辑端口的边排成干线。每一面按收发方向和线型设口，
 // 同组调用可以先汇集再分支，调用记录仍各自保留完整的端点与路径。
@@ -27,21 +54,27 @@ function fixedPorts(nodes, edges, faces, separateStyles) {
   };
   const pairs = edges.map((e, i) => {
     const style = separateStyles ? edgeStyleKey(e) : '';
-    return [port(e.from, faces[i][0], 'out', style), port(e.to, faces[i][1], 'in', style)];
+    const reverse = isReverseFlow(e);
+    return [port(flowSource(e), faces[i][reverse ? 1 : 0], 'out', style),
+      port(flowTarget(e), faces[i][reverse ? 0 : 1], 'in', style)];
   });
   return { ports, pairs };
 }
 
-export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true, wrap = false) {
+export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true) {
   const root = { id: 'root', children: [], layoutOptions: {
     'elk.algorithm': 'layered', 'elk.direction': direction, 'elk.edgeRouting': 'ORTHOGONAL',
     'elk.hierarchyHandling': 'INCLUDE_CHILDREN', 'elk.json.edgeCoords': 'ROOT',
-    'elk.padding': `[top=${TOP_PADDING},left=40,bottom=40,right=40]`, 'elk.aspectRatio': '1',
-    'elk.spacing.nodeNode': '26', 'elk.layered.spacing.nodeNodeBetweenLayers': '52',
+    'elk.padding': `[top=${TOP_PADDING},left=${ROOT_PAD},bottom=${ROOT_PAD},right=${ROOT_PAD}]`,
+    'elk.spacing.nodeNode': String(NODE_GAP),
+    'elk.layered.spacing.nodeNodeBetweenLayers': String(LAYER_GAP),
+    'elk.spacing.edgeNode': '12', 'elk.spacing.edgeEdge': '8',
     'elk.layered.mergeEdges': 'false', 'elk.layered.mergeHierarchyEdges': 'false',
     'elk.randomSeed': '1',
-    'elk.layered.wrapping.strategy': wrap ? 'MULTI_EDGE' : 'OFF',
+    [MODEL_ORDER]: 'NODES_AND_EDGES',
+    'elk.layered.wrapping.strategy': 'OFF',
   } };
+  const order = modelOrder(nodes, edges);
   const boxes = new Map([['', root]]);
   const fixed = faces && fixedPorts(nodes, edges, faces, separateStyles);
   for (const n of nodes) {
@@ -51,8 +84,8 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
       const key = parts.slice(0, i + 1).join('/');
       if (!boxes.has(key)) {
         const box = { id: 'box:' + key, label: parts[i], fileGroup: i === parts.length - 1,
-          children: [], layoutOptions: { 'elk.padding': `[top=${TOP_PADDING},left=14,bottom=14,right=14]`,
-            ...(wrap ? { 'elk.layered.wrapping.strategy': 'MULTI_EDGE', 'elk.aspectRatio': '1' } : {}) } };
+          children: [], layoutOptions: { 'elk.padding': `[top=${TOP_PADDING},left=${BOX_PAD},bottom=${BOX_PAD},right=${BOX_PAD}]`,
+            [MODEL_ORDER]: 'NODES_AND_EDGES' } };
         parent.children.push(box);
         boxes.set(key, box);
       }
@@ -68,9 +101,45 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
     }
     parent.children.push(node);
   }
-  root.edges = edges.map((e, i) => ({ id: 'e' + i,
-    sources: [fixed ? fixed.pairs[i][0] : e.from], targets: [fixed ? fixed.pairs[i][1] : e.to] }));
+  const sortChildren = (parent) => {
+    for (const child of parent.children) if (child.children) {
+      sortChildren(child);
+      order.set(child.id, order.get(child.children[0].id));
+    }
+    parent.children.sort((a, b) => order.get(a.id) - order.get(b.id));
+  };
+  sortChildren(root);
+  root.edges = edges.map((e, index) => ({ index, source: flowSource(e), target: flowTarget(e), rank: callRank(e) }))
+    .sort((a, b) => order.get(a.source) - order.get(b.source) || a.rank - b.rank || order.get(a.target) - order.get(b.target))
+    .map(({ index, source, target }) => ({ id: 'e' + index,
+      sources: [fixed ? fixed.pairs[index][0] : source], targets: [fixed ? fixed.pairs[index][1] : target] }));
   return root;
+}
+
+function layoutGraph(graph) {
+  const vertical = graph.layoutOptions['elk.direction'] === 'DOWN';
+  const walkBoxes = (parent) => {
+    for (const child of parent.children || []) {
+      if (!child.children) continue;
+      // elkjs 0.12 的 INCLUDE_CHILDREN 子图开启 considerModelOrder 会在内部比较同层节点时越界；
+      // 子框内统一关闭 MODEL_ORDER，改用横切轴上的初始相对坐标 + semiInteractive 传递已排好的同层先后顺序。
+      child.layoutOptions[MODEL_ORDER] = 'NONE';
+      child.layoutOptions['elk.layered.crossingMinimization.semiInteractive'] = 'true';
+      let across = 0;
+      for (const item of child.children) {
+        const options = item.layoutOptions ||= {};
+        if (!options['elk.position']) {
+          item.x = vertical ? across : 0;
+          item.y = vertical ? 0 : across;
+          options['elk.position'] = `(${item.x},${item.y})`;
+        }
+        across += ((vertical ? item.width : item.height) || 160) + NODE_GAP;
+      }
+      walkBoxes(child);
+    }
+  };
+  walkBoxes(graph);
+  return elk.layout(graph);
 }
 
 export function converted(result, originals, edges) {
@@ -88,10 +157,15 @@ export function converted(result, originals, edges) {
     }
   };
   walk(result, 0, 0, 1);
-  view.edges = result.edges.map((e, i) => {
+  const routed = new Map(result.edges.map((e) => [e.id, e]));
+  view.edges = edges.map((edge, i) => {
+    const e = routed.get('e' + i);
+    if (!e) throw new Error(`ELK 缺少连线 e${i}`);
     if (e.sections?.length !== 1) throw new Error(`连线 ${e.id} 不是单段路径，需单独检查，不能拼接伪造折线`);
     const s = e.sections[0];
-    return { ...edges[i], points: [s.startPoint, ...(s.bendPoints || []), s.endPoint].map((p) => [p.x, p.y]) };
+    const points = [s.startPoint, ...(s.bendPoints || []), s.endPoint].map((p) => [p.x, p.y]);
+    if (isReverseFlow(edge)) points.reverse();
+    return { ...edge, points };
   });
   return view;
 }
@@ -100,6 +174,7 @@ export function facesOf(view) {
   const nodes = new Map(view.nodes.map((n) => [n.id, n]));
   const sideOf = (n, p) => [['NORTH', Math.abs(p[1] - n.y)], ['SOUTH', Math.abs(p[1] - n.y - n.h)],
     ['WEST', Math.abs(p[0] - n.x)], ['EAST', Math.abs(p[0] - n.x - n.w)]].sort((a, b) => a[1] - b[1])[0][0];
+  // 端口面沿用存储顺序；读取边的收发角色由 fixedPorts 按实际流向分配。
   return view.edges.map((e) => e.from === e.to ? ['EAST', 'SOUTH'] :
     [sideOf(nodes.get(e.from), e.points[0]), sideOf(nodes.get(e.to), e.points.at(-1))]);
 }
@@ -125,13 +200,13 @@ function seedInteractive(graph, previous, initial) {
     const peer = edge && anchors.get(edge.from === n.id ? edge.to : edge.from);
     const occupied = [...anchors.values()].filter((a) => a.file === n.file);
     const [flow, flowSize, across, acrossSize] = vertical ? ['y', 'h', 'x', 'w'] : ['x', 'w', 'y', 'h'];
-    const at = peer ? edge.from === n.id ? peer[flow] - n[flowSize] - 52 : peer[flow] + peer[flowSize] + 52 :
-      vertical ? Math.min(...occupied.map((a) => a.y)) : box.x + 14;
+    const at = peer ? edge.from === n.id ? peer[flow] - n[flowSize] - LAYER_GAP : peer[flow] + peer[flowSize] + LAYER_GAP :
+      vertical ? Math.min(...occupied.map((a) => a.y)) : box.x + BOX_PAD;
     const slots = [Math.min(...occupied.map((a) => a[across])),
-      ...occupied.map((a) => a[across] + a[acrossSize] + 26)].sort((a, b) => a - b);
-    const free = slots.find((slot) => occupied.every((a) => at + n[flowSize] + 26 <= a[flow] ||
-      a[flow] + a[flowSize] + 26 <= at || slot + n[acrossSize] + 26 <= a[across] ||
-      a[across] + a[acrossSize] + 26 <= slot));
+      ...occupied.map((a) => a[across] + a[acrossSize] + NODE_GAP)].sort((a, b) => a - b);
+    const free = slots.find((slot) => occupied.every((a) => at + n[flowSize] + NODE_GAP <= a[flow] ||
+      a[flow] + a[flowSize] + NODE_GAP <= at || slot + n[acrossSize] + NODE_GAP <= a[across] ||
+      a[across] + a[acrossSize] + NODE_GAP <= slot));
     const p = { ...n, [flow]: at, [across]: free };
     fresh.set(n.id, p);
     anchors.set(n.id, p);
@@ -146,7 +221,7 @@ function seedInteractive(graph, previous, initial) {
     });
     for (const n of parent.children || []) {
       const p = old.get(n.id) || fresh.get(n.id);
-      n.x = p.x - ox - (vertical ? parent === graph ? 40 : 14 : 0);
+      n.x = p.x - ox - (vertical ? parent === graph ? ROOT_PAD : BOX_PAD : 0);
       // 输出坐标已含标题留白；参考坐标要扣掉，避免每次增量排版再累加一次。
       n.y = p.y - oy - TOP_PADDING;
       (n.layoutOptions ||= {})['elk.position'] = `(${n.x},${n.y})`;
@@ -156,10 +231,10 @@ function seedInteractive(graph, previous, initial) {
   walk(graph);
 }
 
-/** 同时衡量走线与真实画布比例，不靠加空白凑正方形。 */
+/** 以走线为主，兼顾画布比例与占用面积。 */
 function quality(view) {
   return routeScore(view.edges) +
-    160 * Math.log(view.width / view.height) ** 2 + Math.sqrt(view.width * view.height) / 200;
+    16 * Math.log(view.width / view.height) ** 2 + Math.sqrt(view.width * view.height) / 200;
 }
 
 function validLayout(view) {
@@ -237,8 +312,8 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
       mergeSharedRoutes(view, addedEdges);
     }
     for (const e of addedEdges) for (const [x, y] of e.points) {
-      view.width = Math.max(view.width, x + 40);
-      view.height = Math.max(view.height, y + 40);
+      view.width = Math.max(view.width, x + ROOT_PAD);
+      view.height = Math.max(view.height, y + ROOT_PAD);
     }
     for (const c of view.containers) if (c.root) {
       c.w = Math.max(c.w, view.width);
@@ -252,9 +327,9 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     return view;
   }
   let rightFaces;
-  const generate = async (dir, wrap = false) => {
+  const generate = async (dir) => {
     let first, faces;
-    if (!previous && dir === 'DOWN' && !wrap && rightFaces) {
+    if (!previous && dir === 'DOWN' && rightFaces) {
       // 横纵候选各自重新摆位和布线。无折行时只把分层方向上的端口提示转到纵向，
       // 省去一次只为推断端口而做的完整 ELK 布局。自递归仍固定用右、下两个口。
       const transpose = { EAST: 'SOUTH', WEST: 'NORTH', NORTH: 'WEST', SOUTH: 'EAST' };
@@ -262,18 +337,18 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     } else if (!edges.length && !previous) {
       faces = [];
     } else {
-      first = converted(await elk.layout(graphOf(sized, edges, dir, null, false, group, wrap)), sized, edges);
+      first = converted(await layoutGraph(graphOf(sized, edges, dir, null, false, group)), sized, edges);
       faces = facesOf(first);
-      if (dir === 'RIGHT' && !wrap) rightFaces = faces;
+      if (dir === 'RIGHT') rightFaces = faces;
     }
     if (previous) {
       const priorFaces = facesOf(previous);
       const oldFaces = new Map(previous.edges.map((e, i) => [edgeKey(e), priorFaces[i]]));
       edges.forEach((e, i) => { if (oldFaces.has(edgeKey(e))) faces[i] = oldFaces.get(edgeKey(e)); });
     }
-    const graph = graphOf(sized, edges, dir, faces, true, group, wrap);
+    const graph = graphOf(sized, edges, dir, faces, true, group);
     if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
-    return { ...converted(await elk.layout(graph), sized, edges), layoutDirection: dir };
+    return { ...converted(await layoutGraph(graph), sized, edges), layoutDirection: dir };
   };
   let view = await generate(direction);
   if (!previous) {
@@ -285,10 +360,6 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     };
     // 比较完整横向、纵向布局，保留综合质量更好的结果。
     consider(await generate('DOWN'));
-    // 只有比例仍明显失衡才额外尝试折行；复杂图不支持折行时保留已验证的候选。
-    if (Math.abs(Math.log(view.width / view.height)) > Math.log(1.8)) {
-      try { consider(await generate('DOWN', true)); } catch { /* 当前图不适用 ELK 折行。 */ }
-    }
     // 先确定区块位置，再简化连线，避免局部换线反过来改变整图的布局方向。
     const byId = new Map(view.nodes.map((n) => [n.id, n]));
     improveEdgeRoutes(view, view.edges, (e) => byId.get(e.from).file !== byId.get(e.to).file);

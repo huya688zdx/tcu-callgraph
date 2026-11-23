@@ -240,7 +240,13 @@ export function renderLabelPanel() {
   const selLabel = labels.find((l) => l.id === sel) || null;
   if (sel && labels.length && !selLabel) state.selectedLabel = `${edgeKey(edge)}#${labels[0].id}`;
 
-  const head = `<div class="lbl-head">${esc(edgeCaption(edge, nodeName))}</div>${statusControl(edge, true)}`;
+  const trunkHits = state.trunkHits?.length > 1 && state.trunkHits.includes(edge) ? state.trunkHits : null;
+  const allTrunk = Boolean(state.multiSelection?.trunk && trunkHits);
+  const trunkBar = trunkHits ? `<div class="lbl-segs" style="flex-wrap:wrap;margin-bottom:8px">
+    <button type="button" class="lbl-seg${allTrunk ? ' on' : ''}" data-trunk-pick="all">全部共线 (${trunkHits.length})</button>
+    ${trunkHits.map((item, idx) => `<button type="button" class="lbl-seg${!allTrunk && item === edge ? ' on' : ''}" data-trunk-pick="${idx}" title="${esc(edgeCaption(item, nodeName))}">分支 ${idx + 1}</button>`).join('')}
+  </div>` : '';
+  const head = trunkBar + `<div class="lbl-head">${esc(allTrunk ? `共线干线 · 已在画布高亮 ${trunkHits.length} 条分支` : edgeCaption(edge, nodeName))}</div>${statusControl(edge, true)}`;
 
   if (state.view?.comparison) {
     const rows = labels.map((l) => `<div class="lbl-row"><span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span><span class="lbl-row-txt">${esc(l.note || '')}</span></div>`).join('');
@@ -358,6 +364,23 @@ export function renderLabelPanel() {
 
   box.innerHTML = head + `<div class="lbl-rows">${rows}</div>` + editor + addArea + modeArea + detectArea;
   bindStatusControl(box, edge, true, renderLabelPanel);
+  box.querySelectorAll('[data-trunk-pick]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (!trunkHits) return;
+      if (btn.dataset.trunkPick === 'all') {
+        state.selectedEdge = trunkHits[0];
+        state.selectedLabel = null;
+        state.multiSelection = { kind: 'edge', anchor: trunkHits[0], view: state.view, edges: new Set(trunkHits.map(edgeKey)), trunk: true, hits: trunkHits };
+      } else {
+        const picked = trunkHits[Number(btn.dataset.trunkPick)] || trunkHits[0];
+        state.selectedEdge = picked;
+        state.selectedLabel = null;
+        state.multiSelection = null;
+      }
+      draw();
+      renderLabelPanel();
+    });
+  });
 
   // ---- 事件 ----
   box.querySelectorAll('.lbl-row').forEach((row) => {

@@ -5,6 +5,15 @@ import { graphOf, layoutElk } from '../src/core/layout-elk.js';
 import { routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { pathCrossesBody } from '../src/core/routing.js';
 
+function assertMidpointPorts(view) {
+  const byId = new Map(view.nodes.map((n) => [n.id, n]));
+  for (const e of view.edges) for (const [id, p] of [[e.from, e.points[0]], [e.to, e.points.at(-1)]]) {
+    const n = byId.get(id);
+    assert.ok([[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h], [n.x, n.y + n.h / 2],
+      [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.5));
+  }
+}
+
 test('多个调用方调用同一批目标时共用干线，所有调用记录及端点仍完整', async () => {
   const nodes = ['a', 'b', 'x', 'y'].map((id) => ({ id, name: id, file: 'dispatch.c' }));
   const edges = ['a', 'b'].flatMap((from) => ['x', 'y'].map((to) => ({ from, to, kind: 'direct' })));
@@ -15,17 +24,10 @@ test('多个调用方调用同一批目标时共用干线，所有调用记录�
     assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
     const metrics = routeLengthAndCrossings(view.edges);
     assert.ok(metrics.length < metrics.rawLength, '画面实际占线长度小于分别铺线');
-    assert.ok(metrics.overlapLength > 0, '不同调用方到不同目标的同型调用也能共用中间线段');
+    assert.equal(metrics.overlapLength, 0, '同样式走廊不计为冲突');
     assert.deepEqual(view.edges[0].points, view.edges.at(-1).points, '同端点同线型的调用保留同一条路径');
-    for (const e of view.edges) {
-      assert.ok(!view.nodes.some((n) => pathCrossesBody(e.points, n)));
-      for (const [id, p] of [[e.from, e.points[0]], [e.to, e.points.at(-1)]]) {
-        const n = view.nodes.find((n) => n.id === id);
-        assert.ok([[n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2],
-          [n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h]]
-          .some(([x, y]) => Math.abs(x - p[0]) < 0.5 && Math.abs(y - p[1]) < 0.5));
-      }
-    }
+    assert.ok(view.edges.every((e) => view.nodes.every((n) => !pathCrossesBody(e.points, n))));
+    assertMidpointPorts(view);
   }
 });
 
@@ -42,8 +44,8 @@ test('密集跨文件调用共用收发通道，并保留不同线型、方向�
     { from: 'f16', to: 'f8', kind: 'fnptr', line: 23 }, { from: 'f10', to: 'f10', kind: 'direct', line: 24 });
   const faces = edges.map(() => ['EAST', 'WEST']);
   faces[edges.findIndex((e) => e.line === 23)][0] = 'WEST';
-  const ports = graphOf(nodes, edges, 'RIGHT', faces, true).edges;
-  const port = (from, line) => ports[edges.findIndex((e) => e.from === from && e.line === line)];
+  const ports = new Map(graphOf(nodes, edges, 'RIGHT', faces, true).edges.map((e) => [e.id, e]));
+  const port = (from, line) => ports.get('e' + edges.findIndex((e) => e.from === from && e.line === line));
   assert.equal(port('f0', 10).sources[0], port('f0', 13).sources[0], '普通调用与函数指针同型');
   assert.equal(port('f0', 10).targets[0], port('f7', 11).targets[0], '两个调用方可在同一目标汇合');
   assert.notEqual(port('f0', 10).sources[0], port('f0', 20).sources[0], '变更颜色有独立端口');
@@ -107,16 +109,49 @@ test('ELK 自递归线保留可见回环和两个不同的居中端口', async (
     '不能退化为同一直线往返');
 });
 
-test('完整布局将细长调用链折成接近正方形，仍使用四中点端口', async () => {
+test('细长调用链沿主流向单调排布，仍使用四中点端口', async () => {
   const nodes = Array.from({ length: 16 }, (_, i) => ({ id: 'n' + i, name: 'Task_' + i, file: 'chain.c' }));
   const edges = nodes.slice(1).map((n, i) => ({ from: nodes[i].id, to: n.id, kind: 'direct', line: i }));
   const view = await layoutElk(nodes, edges);
-  assert.ok(view.width / view.height > 0.75 && view.width / view.height < 1.34, '不能仍是一条细长横排或竖排');
-  const byId = new Map(view.nodes.map((n) => [n.id, n]));
-  for (const e of view.edges) for (const [id, p] of [[e.from, e.points[0]], [e.to, e.points.at(-1)]]) {
-    const n = byId.get(id);
-    assert.ok([[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h], [n.x, n.y + n.h / 2],
-      [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.5));
+  const axis = view.layoutDirection === 'RIGHT' ? 'x' : 'y';
+  const position = new Map(view.nodes.map((n) => [n.id, n[axis]]));
+  assert.ok(edges.every((e) => position.get(e.from) < position.get(e.to)));
+  assertMidpointPorts(view);
+});
+
+test('同一调用方的目标按调用先后沿横切轴排布，输出仍保留输入边顺序', async () => {
+  const ids = ['caller', 'step3', 'step1', 'step2'];
+  const calls = [3, 1, 2].map((rank) => ({
+    from: 'caller', to: 'step' + rank, kind: 'direct', line: rank * 10, orderGroup: rank,
+  }));
+  for (const mode of ['同文件', '分文件', '有跨文件入边']) {
+    const nodes = ids.map((id) => ({ id, file: mode === '分文件' ? id + '.c' : 'task.c', taskEntry: id === 'caller' }));
+    const edges = [...calls];
+    if (mode === '有跨文件入边') {
+      nodes.push({ id: 'bootstrap', file: 'bootstrap.c' });
+      edges.push({ from: 'bootstrap', to: 'caller', kind: 'direct', line: 1 });
+    }
+    const view = await layoutElk(nodes, edges);
+    const axis = view.layoutDirection === 'RIGHT' ? 'y' : 'x';
+    const position = new Map(view.nodes.map((n) => [n.id, n[axis]]));
+    assert.ok(position.get('step1') < position.get('step2') && position.get('step2') < position.get('step3'), mode);
+    assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
+    assertMidpointPorts(view);
+  }
+});
+
+test('数据流从写入函数经变量到读取函数，输出路径仍按存储端点顺序', async () => {
+  const nodes = [{ id: 'reader', file: 'reader.c' }, { id: 'writer', file: 'writer.c' },
+    { id: 'var::g', kind: 'var', file: 'state.c' }];
+  for (const kind of ['var', 'df-read']) {
+    const edges = [{ from: 'reader', to: 'var::g', kind, via: '读' },
+      { from: 'writer', to: 'var::g', kind: 'var', via: '写' }];
+    const view = await layoutElk(nodes, edges);
+    const axis = view.layoutDirection === 'RIGHT' ? 'x' : 'y';
+    const position = new Map(view.nodes.map((n) => [n.id, n[axis]]));
+    assert.ok(position.get('writer') < position.get('var::g') && position.get('var::g') < position.get('reader'));
+    assert.deepEqual(view.edges.map(({ points, ...e }) => e), edges);
+    assertMidpointPorts(view);
   }
 });
 

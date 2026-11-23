@@ -124,6 +124,21 @@ export function normalizeLabels(raw) {
   return out;
 }
 
+export function displayEdgeLabels(edge, labels = [], viewOrCaller) {
+  if (!edge.callNumbers?.length || labels.some(l => l.preset === 'call')) return labels;
+  if (typeof viewOrCaller === 'string') {
+    if (edge.from !== viewOrCaller) return labels;
+  } else if (edge.from !== viewOrCaller?.root && edge.callNumbers.length === 1) {
+    const calls = viewOrCaller?.edges?.filter(e => e.from === edge.from &&
+      ['direct', 'macro', 'fnptr'].includes(e.kind));
+    if ((calls?.length || 0) < 2) return labels;
+  }
+  const summary = edge.callNumbers.slice(0, 4).join('、') + (edge.callNumbers.length > 4 ? '…' : '');
+  const label = normalizeLabel({ preset: 'call', text: LABEL_PRESETS.call.text + summary });
+  if (edge.versions?.length === 1) label.note = edge.versions.includes('after') ? '修改后' : '修改前';
+  return [...labels, { ...label, auto: true }];
+}
+
 /** 下一张结合点的编号：同一画面内取最小未占用值 */
 export function nextConnNumber(labels = []) {
   const used = new Set();

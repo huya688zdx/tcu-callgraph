@@ -11,7 +11,29 @@ import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
-import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
+import { displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
+import { periodSubtitle } from '../../web/lib/period-text.js';
+
+export function layoutExportEdgeLabels(view) {
+  const placed = [];
+  const edges = view.edges || [];
+  for (const e of edges) {
+    const rawLabels = e.labels?.length ? e.labels : e.label ? [e.label] : [];
+    const labels = displayEdgeLabels(e, rawLabels, view);
+    if (!labels.length) continue;
+    const rects = placeEdgeLabels({
+      items: labels.map(label => ({ label, size: labelBoxSize(label, estimateTextWidth) })),
+      pts: e.points || [],
+      nodes: view.nodes || [],
+      others: placed.map(entry => entry.rect),
+      otherPaths: edges.filter(other => other !== e).map(other => other.points || []),
+    });
+    labels.forEach((label, i) => {
+      if (rects[i]) placed.push({ label, rect: rects[i] });
+    });
+  }
+  return placed;
+}
 
 const COLORS = {
   added: '#D9303E',
@@ -81,28 +103,12 @@ export function exportSvg(view, { title = '' } = {}) {
     }
   }
   // 连线标签：先算位置（与画布同一套规则，一线多条交替放两侧），再把它们计入画布范围
-  const labelRects = [];
-  {
-    for (const e of v.edges || []) {
-      const labels = e.labels && e.labels.length ? e.labels : e.label ? [e.label] : [];
-      if (!labels.length) continue;
-      const rects = placeEdgeLabels({
-        items: labels.map((label) => ({ label, size: labelBoxSize(label, (t, font) => estimateTextWidth(t, font)) })),
-        pts: e.points || [],
-        nodes: v.nodes || [],
-        others: labelRects.map((entry) => entry.rect),
-        otherPaths: (v.edges || []).filter((other) => other !== e).map((other) => other.points || []),
-      });
-      labels.forEach((label, i) => {
-        const rect = rects[i];
-        if (!rect) return;
-        labelRects.push({ label, rect });
-        minX = Math.min(minX, rect.x);
-        minY = Math.min(minY, rect.y);
-        maxX = Math.max(maxX, rect.x + rect.w);
-        maxY = Math.max(maxY, rect.y + rect.h);
-      });
-    }
+  const labelRects = layoutExportEdgeLabels(v);
+  for (const { rect } of labelRects) {
+    minX = Math.min(minX, rect.x);
+    minY = Math.min(minY, rect.y);
+    maxX = Math.max(maxX, rect.x + rect.w);
+    maxY = Math.max(maxY, rect.y + rect.h);
   }
   const ox = -pad - Math.min(0, minX);
   const oy = -pad - Math.min(0, minY);
@@ -165,6 +171,7 @@ export function exportSvg(view, { title = '' } = {}) {
   for (const { label, rect } of labelRects) out.push(labelSvg(label, rect));
 
   for (const n of v.nodes || []) {
+    const period = periodSubtitle(n);
     out.push(`<g data-id="${esc(n.id)}">`);
     // 与画布保持一致：按变更分类上色；自定义颜色只认 #RRGGBB
     const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
@@ -180,7 +187,7 @@ export function exportSvg(view, { title = '' } = {}) {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || (n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line))}</text>`
     );
     out.push('</g>');
   }

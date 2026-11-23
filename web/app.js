@@ -99,25 +99,31 @@ async function loadView(rootId, opts = {}) {
   syncTreeSelection(state.roots);
   renderVars();
   const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
-  for (const n of previous?.layoutSlots?.nodes || []) {
-    const restored = data.nodes.find((item) => item.id === n.id && item.x === n.x && item.y === n.y);
-    if (restored && !oldNodes.has(n.id)) oldNodes.set(n.id, n);
-  }
   const oldEdges = new Set((previous?.edges || []).map(edgeKey));
   const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
-  const rearranged = addedNodes.length > 0;
-  if (!previous || rearranged) fit({ paint: false });
-  const common = data.nodes.filter((n) => oldNodes.has(n.id));
-  // 新增节点已完整排版并适配；其余增量刷新继续稳住已有画面。
-  if (!rearranged && common.length) for (const axis of ['x', 'y']) {
-    const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
-    cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
-  }
-  constrainCam();
   const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  if (previous && !rearranged) revealAdded(addedNodes, addedEdges);
+  const common = data.nodes.filter((n) => oldNodes.has(n.id));
+  if (!previous) {
+    fit({ paint: false });
+    constrainCam();
+  } else {
+    // 先按共同节点的位移锚定当前镜头起点，避免重排瞬间旧节点在屏幕上跳变，再平滑移向新增节点。
+    if (common.length) {
+      for (const axis of ['x', 'y']) {
+        const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
+        cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
+      }
+    } else if (!previous.nodes.length) {
+      fit({ paint: false });
+    }
+    constrainCam();
+    if (addedNodes.length || addedEdges.length) {
+      revealAdded(addedNodes, addedEdges);
+      if (addedNodes.length === 1 && addedNodes[0].kind !== 'var') state.selected = addedNodes[0].id;
+    }
+  }
   pulseAdded(addedNodes, addedEdges);
-  renderDetail(null);
+  renderDetail(state.selected).catch((error) => console.warn('读取节点详情失败：', error));
   renderLabelPanel();
   history.stack = [];
   history.idx = -1;
@@ -148,7 +154,7 @@ hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } 
   const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
     .map((id) => ({ root: id, up: 0, down: 0 }))];
   const view = await loadView(state.roots, { incremental: true, expansions });
-  if (view && selected && view.nodes.some((n) => n.id === selected)) {
+  if (view && !state.selected && selected && view.nodes.some((n) => n.id === selected)) {
     state.selected = selected;
     await renderDetail(selected);
     draw();

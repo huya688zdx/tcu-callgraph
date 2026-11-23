@@ -117,24 +117,38 @@ function hitEdge(e) {
   return hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0] || null;
 }
 
-function pickEdgeAt(e, onPick, useSelection = false) {
+function pickEdgeAt(e, onPick, useSelection = false, prevMulti = null) {
   const view = state.view, hits = hitEdges(e);
   if (!hits.length) return false;
-  if (useSelection && hits.includes(state.selectedEdge)) onPick(state.selectedEdge);
-  else if (hits.length === 1) onPick(hits[0]);
-  else {
-    const kinds = { direct: '函数调用', fnptr: '函数指针', macro: '宏调用', manual: '手工连接',
-      var: '变量访问', 'df-read': '读取变量', 'df-write': '写入变量' };
-    const items = hits.map((edge) => ({
-      value: edge,
-      label: [edge.from + ' → ' + edge.to, kinds[edge.kind] || edge.kind,
-        edge.line > 0 && 'L' + edge.line, edge.change && edge.change !== 'existing' && statusLabel(edge.change)].filter(Boolean).join(' · '),
-    }));
-    els.tooltip.style.opacity = '0';
-    showMenu(e.clientX + 8, e.clientY + 8, t('edge.chooseAtPoint', { n: hits.length }), items, state.selectedEdge,
-      (edge) => { if (state.view === view && view.edges.includes(edge)) onPick(edge); });
-    els.ctxMenu.querySelector('button')?.focus({ preventScroll: true });
+  if (hits.length === 1) {
+    state.trunkHits = null;
+    onPick(hits[0]);
+    return true;
   }
+  if (useSelection) {
+    const target = hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0];
+    state.trunkHits = hits;
+    onPick(target);
+    return true;
+  }
+  // 点击共线干线绝不弹窗：首次点击直接在画布高亮经过该干线的全部连线与两端节点；
+  // 连续点击同一干线时，在「全部共线分支 → 第 1 条 → 第 2 条 …」之间顺滑循环切换。
+  const hitKeys = new Set(hits.map(edgeKey));
+  const sameTrunk = (list) => list?.length === hits.length && list.every((ed) => hitKeys.has(edgeKey(ed)));
+  state.trunkHits = hits;
+  if (prevMulti?.trunk && sameTrunk(prevMulti.hits)) {
+    onPick(hits[0]);
+  } else if (!prevMulti?.trunk && sameTrunk(state.prevTrunkHits) && hits.includes(state.selectedEdge)) {
+    const idx = hits.indexOf(state.selectedEdge);
+    if (idx + 1 < hits.length) {
+      onPick(hits[idx + 1]);
+    } else {
+      onPick(hits[0], hits);
+    }
+  } else {
+    onPick(hits[0], hits);
+  }
+  state.prevTrunkHits = hits;
   return true;
 }
 
@@ -214,13 +228,20 @@ let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
-function selectEdge(edge) {
+function selectEdge(edge, trunkGroup = null) {
   if (state.pairFlow) clearPairFlow();
   state.moveTarget = null;
-  state.multiSelection = null;
   state.selected = null;
   state.selectedEdge = edge;
   state.selectedLabel = null;
+  state.multiSelection = trunkGroup?.length > 1 ? {
+    kind: 'edge',
+    anchor: edge,
+    view: state.view,
+    edges: new Set(trunkGroup.map(edgeKey)),
+    trunk: true,
+    hits: trunkGroup,
+  } : null;
   draw();
   renderDetail(null);
   renderLabelPanel();
@@ -345,6 +366,7 @@ els.cv.addEventListener('contextmenu', (e) => {
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  const prevMulti = state.multiSelection;
   if (state.multiSelection) { state.multiSelection = null; draw(); }
   hideMenu();
   stopCamAnim();
@@ -448,7 +470,9 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  if (pickEdgeAt(e, selectEdge)) return;
+  if (pickEdgeAt(e, selectEdge, false, prevMulti)) return;
+  state.trunkHits = null;
+  state.prevTrunkHits = null;
   const editing = state.moveTarget;
   state.moveTarget = null;
   state.panning = true;
@@ -584,7 +608,7 @@ function handlePointerMove(e) {
     els.tooltip.innerHTML = n
       ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${moveReady('node', n) ? '可拖动 · Esc 退出移动' : '双击选中后可拖动'}${state.view?.comparison ? '' : '<br><span style="opacity:.5;font-size:11px">Shift+拖拽 可连到其他函数</span>'}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? '可拖动 · Shift 暂停吸附 · Esc 退出' : '双击标题选中后可整体拖动'}`
-      : hits.length > 1 ? esc(t('edge.chooseAtPoint', { n: hits.length }))
+      : hits.length > 1 ? `<b>共线干线（${hits.length} 条分支）</b><br>点击在画布高亮全部走向 · 连续点击逐条切换`
       : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? '比较连线 · 可调整状态' : moveReady('edge', hoveredEdge) ? '拖动线段调形 · 拖动端点重连' : '双击选中后可调整连线'}`;
     if (n || hits.length === 1) {
       const target = n || hoveredEdge;

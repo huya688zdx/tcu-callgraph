@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { routeEdges, routeOverlapConflicts, pathBlockedByNodes } from '../src/core/routing.js';
-import { improveEdgeRoutes, mergeSharedRoutes } from '../src/core/layout-metrics.js';
+import { improveEdgeRoutes, mergeSharedRoutes, routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
 
@@ -75,27 +75,48 @@ test('平行干线末端错开时延伸公共通道，接入分支且避开阻�
     { from: 's', to: 'b', kind: 'direct', points: [[150, 40], [150, 100], [670, 100], [670, 450], [550, 450], [550, 600]] },
   ];
   const before = structuredClone({ nodes, edges });
-  mergeSharedRoutes({ nodes, edges });
-  assert.deepEqual(edges[1].points, [[150, 40], [150, 100], [650, 100], [650, 450], [550, 450], [550, 600]]);
+  mergeSharedRoutes({ nodes, edges }, [edges[1]]);
+  assert.deepEqual(edges[1].points, [[150, 40], [150, 100], [650, 100], [650, 400], [550, 400], [550, 600]]);
   assert.deepEqual(nodes, before.nodes);
   assert.deepEqual(edges.map(e => e.points.at(-1)), before.edges.map(e => e.points.at(-1)));
   before.nodes.push({ id: 'block', x: 640, y: 410, w: 20, h: 20 });
-  mergeSharedRoutes(before);
+  mergeSharedRoutes(before, [before.edges[1]]);
   assert.equal(pathBlockedByNodes(before.edges[1].points, before.nodes, new Set(['s', 'b'])), false);
   assert.deepEqual(before.edges[1].points.at(-1), [550, 600]);
 });
 
-test('公共前缀已经被第三条入边共用时，不得制造组外的虚假连接', () => {
-  const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 }, { id: 'c', x: 0, y: 180, w: 100, h: 40 },
-    { id: 'a', x: 300, y: 300, w: 100, h: 40 }, { id: 'b', x: 500, y: 300, w: 100, h: 40 }];
+test('不同起点和终点的同样式边可共线，跨样式共线计入冲突', () => {
+  const a = { from: 's1', to: 't1', kind: 'direct', points: [[20, 40], [20, 100], [320, 100], [320, 300]] };
+  const b = { from: 's2', to: 't2', kind: 'direct', points: [[80, 40], [80, 100], [380, 100], [380, 300]] };
+  assert.equal(routeOverlapConflicts([a, b]).length, 0);
+  for (const style of [{ kind: 'var' }, { change: 'added' }]) {
+    assert.equal(routeOverlapConflicts([a, { ...b, ...style }]).length, 240);
+  }
+});
+
+test('平行走廊吸附到同样式干线，保留不同节点的四个端口中点', () => {
+  const nodes = [{ id: 's1', x: 0, y: 0, w: 40, h: 40 }, { id: 's2', x: 60, y: 0, w: 40, h: 40 },
+    { id: 't1', x: 300, y: 300, w: 40, h: 40 }, { id: 't2', x: 360, y: 300, w: 40, h: 40 }];
   const edges = [
-    { from: 's', to: 'b', kind: 'direct', points: [[150, 40], [150, 250], [550, 250], [550, 300]] },
-    { from: 's', to: 'a', kind: 'direct', points: [[150, 40], [150, 100], [350, 100], [350, 300]] },
-    { from: 'c', to: 'a', kind: 'direct', points: [[100, 200], [350, 200], [350, 300]] },
+    { from: 's1', to: 't1', kind: 'direct', points: [[20, 40], [20, 100], [320, 100], [320, 300]] },
+    { from: 's2', to: 't2', kind: 'direct', points: [[80, 40], [80, 130], [380, 130], [380, 300]] },
   ];
-  assert.equal(routeOverlapConflicts(edges).length, 0);
-  mergeSharedRoutes({ nodes, edges });
-  assert.equal(routeOverlapConflicts(edges).length, 0, '不能把 s→b 与 c→a 合并成不存在的 c→b');
+  const original = structuredClone(edges);
+  const endpoints = (edges) => edges.map((e) => [e.points[0], e.points.at(-1)]);
+  const before = routeLengthAndCrossings(edges).length;
+  mergeSharedRoutes({ nodes, edges }, [edges[0]]);
+  assert.deepEqual(edges[0].points, [[20, 40], [20, 130], [320, 130], [320, 300]]);
+  assert.deepEqual(edges[1], original[1]);
+  assert.deepEqual(endpoints(edges), endpoints(original));
+  assert.equal(routeLengthAndCrossings(edges).length, before - 240);
+
+  for (const style of [{ kind: 'var' }, { kind: 'direct', change: 'added' }]) {
+    const parallel = structuredClone(original);
+    const protectedEdge = { from: 'other', to: 'elsewhere', custom: true, points: [[30, 130], [70, 130]], ...style };
+    mergeSharedRoutes({ nodes, edges: [...parallel, protectedEdge] }, [parallel[0]]);
+    assert.deepEqual(parallel, original, '吸附不得遮盖其他样式的走线');
+    assert.equal(routeOverlapConflicts([...parallel, protectedEdge]).length, 0);
+  }
 });
 
 test('跨层级连线下方无遮挡时，从下方出线一次转弯进入目标', () => {

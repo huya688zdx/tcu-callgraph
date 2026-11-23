@@ -5,16 +5,18 @@ import { parseDot, modelFromDot } from '../src/core/dot.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { callSequence, callNumbers } from '../src/core/call-sequence.js';
 import { projectTasks, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { edgeCaption, svgMarkers } from '../web/lib/edge-flow.js';
 import { traceVisiblePaths } from '../web/lib/visible-paths.js';
+import { launchServer } from '../scripts/lib/server.mjs';
 
 const dot = contents => modelFromDot(parseDot(`digraph G { ${contents} }`));
 
 test('局部视图保留完整工程中的多个任务，且不沿变量访问或数据流传递周期', () => {
-  const model = loadModel(new URL('../samples/demo', import.meta.url).pathname);
+  const model = loadModel(fileURLToPath(new URL('../samples/demo', import.meta.url)));
   const node = model.functions.find(f => f.name === 'Diag_Report');
   const [report] = withTaskPeriods([node], model);
   assert.deepEqual(report.taskPeriods.map(c => c.task), ['main.c::App_Task10ms', 'main.c::App_Task100ms']);
@@ -61,18 +63,65 @@ test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用
   assert.deepEqual(traceVisiblePaths(view, 'write', 'read').paths[0].nodes, ['write', 'v', 'read']);
 });
 
-test('SVG 只绘制已保存的连线标签，即使调用边带有解析出的序号', () => {
+test('SVG 显示多条调用边的自动顺序，保存的手工调用标签优先', () => {
   const svg = exportSvg({
-    root: 'A', nodes: [],
+    root: 'outer', nodes: [{ id: 'A', name: 'A', x: 0, y: 0, w: 100, h: 48,
+      taskEntry: true, taskPeriods: [{ us: 10000 }] }],
     edges: [
       { from: 'A', to: 'B', kind: 'direct', callNumbers: ['1'], points: [[10, 30], [250, 30]] },
       { from: 'A', to: 'C', kind: 'direct', callNumbers: ['2'], points: [[10, 110], [250, 110]],
         labels: [{ preset: 'call', text: 'コール順7' }, { preset: 'task', text: 'TASK:2ms' }] },
     ],
   });
-  assert.doesNotMatch(svg, /コール順[12]/);
+  assert.match(svg, /TASK · 10 ms/);
+  assert.match(svg, /コール順1</);
+  assert.doesNotMatch(svg, /コール順2</);
   assert.match(svg, /コール順7/);
   assert.match(svg, /TASK:2ms/);
+});
+
+test('添加预览提供最短任务链、同级调用顺序和跨周期变量关系', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-preview-'));
+  fs.writeFileSync(path.join(root, 'flow.c'), [
+    'int shared;',
+    'void early(void) {} void late(void) {}',
+    'void first(void) {} void second(void) {}',
+    'void work(void) { shared = 1; first(); second(); }',
+    'void step(void) { early(); work(); late(); }',
+    'void App_Task10ms(void) { step(); }',
+    'int sample(void) { return shared; }',
+    'void App_Task2ms(void) { sample(); }',
+  ].join('\n'));
+  const srv = await launchServer({ target: root });
+  t.after(async () => { await srv.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const get = async url => (await fetch(srv.baseUrl + url)).json();
+  const id = name => `flow.c::${name}`;
+  const { tasks } = await get('/api/stats?summary=1&tasks=1');
+  assert.deepEqual(tasks.map(task => task.us), [2000, 10000]);
+  const viewUrl = `/api/view?root=${id('work')}&up=0&down=0`;
+  const preview = await get(viewUrl + '&preview=1');
+  assert.deepEqual(preview.nodes.map(n => n.id), [id('work')]);
+  const { target, taskChains, callSequence } = preview.recommendations;
+  assert.deepEqual(target.taskPeriods.map(c => c.us), [10000]);
+  assert.deepEqual(taskChains.map(c => c.path), [[id('App_Task10ms'), id('step'), id('work')]]);
+  assert.deepEqual(callSequence.callees.map(c => [c.name, c.callNumbers]), [['first', ['1']], ['second', ['2']]]);
+  assert.deepEqual(callSequence.siblings.map(c => [c.name, c.position, c.callNumbers]),
+    [['early', 'before', ['1']], ['late', 'after', ['3']]]);
+  assert.equal((await fetch(srv.baseUrl + '/api/node?id=var::shared')).status, 404);
+
+  const flow = await get(`/api/dataflow?fn=${id('work')}&dir=both`);
+  assert.deepEqual(flow.fn.taskPeriods.map(c => c.us), [10000]);
+  const shared = flow.vars.find(v => v.name === 'shared' && v.mode === 'write');
+  assert.deepEqual(shared.peers.map(p => [p.id, p.taskPeriods.map(c => c.us)]), [[id('sample'), [2000]]]);
+  const response = await fetch(srv.baseUrl + viewUrl + '&vars=' + encodeURIComponent(shared.id), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expansions: [{ root: id('sample'), up: 0, down: 0 }] }),
+  });
+  assert.equal(response.status, 200);
+  const view = await response.json();
+  assert.deepEqual(traceVisiblePaths(view, id('work'), id('sample')).paths[0].nodes,
+    [id('work'), shared.id, id('sample')]);
 });
 
 test('OSEK TASK 定义自动入表，无调用者也显示，保留真实函数、周期与源码行', async t => {
