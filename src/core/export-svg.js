@@ -1,5 +1,4 @@
 import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
-import { periodSubtitle } from '../../web/lib/period-text.js';
 /**
  * 服务端 SVG 导出：与 web/lib/svg.js 的画布样式保持一致。
  *
@@ -12,7 +11,7 @@ import { periodSubtitle } from '../../web/lib/period-text.js';
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
-import { displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
+import { placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
 
 const COLORS = {
   added: '#D9303E',
@@ -85,7 +84,7 @@ export function exportSvg(view, { title = '' } = {}) {
   const labelRects = [];
   {
     for (const e of v.edges || []) {
-      const labels = displayEdgeLabels(e, e.labels?.length ? e.labels : e.label ? [e.label] : [], v.root);
+      const labels = e.labels && e.labels.length ? e.labels : e.label ? [e.label] : [];
       if (!labels.length) continue;
       const rects = placeEdgeLabels({
         items: labels.map((label) => ({ label, size: labelBoxSize(label, (t, font) => estimateTextWidth(t, font)) })),
@@ -181,7 +180,7 @@ export function exportSvg(view, { title = '' } = {}) {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(periodSubtitle(n) || (n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line))}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line)}</text>`
     );
     out.push('</g>');
   }

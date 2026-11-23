@@ -22,7 +22,6 @@ import {
   LABEL_PRESETS,
   CONN_PREFIX,
   labelText,
-  displayEdgeLabels,
   normalizeLabel,
   normalizeLabels,
   labelBoxSize,
@@ -87,20 +86,19 @@ export function edgeLabels(edge) {
  */
 export function labelLayout(view = state.view, reuse = false) {
   if (!view) return [];
-  const caller = state.selected || view.root;
   const cached = layouts.get(view);
-  if (reuse && cached?.edges === view.edges && cached.nodes === view.nodes && cached.caller === caller) return cached.items;
+  if (reuse && cached?.edges === view.edges && cached.nodes === view.nodes) return cached.items;
 
   const placed = [];
   const out = [];
   const labeled = [];
   for (const e of view.edges) {
     e._lbs = null;
-    if ((e.from === caller && e.callNumbers?.length) || e.labels?.length || e.label || (e.labels && !Array.isArray(e.labels))) labeled.push(e);
+    if (e.labels?.length || e.label || (e.labels && !Array.isArray(e.labels))) labeled.push(e);
   }
   const paths = labeled.length ? view.edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
   for (const e of labeled) {
-    const labels = displayEdgeLabels(e, edgeLabels(e), caller);
+    const labels = edgeLabels(e);
     if (!labels.length) continue;
     const items = labels.map((label) => ({ label, size: labelSizeOf(label) }));
     const bounds = routeBounds(e.points);
@@ -116,16 +114,14 @@ export function labelLayout(view = state.view, reuse = false) {
     const own = [];
     labels.forEach((label, i) => {
       if (!rects[i]) return;
-      if (!label.auto) {
-        e._lbs = own;
-        own.push({ id: label.id, rect: rects[i] });
-      }
+      e._lbs = own;
+      own.push({ id: label.id, rect: rects[i] });
       placed.push(rects[i]);
       out.push({ edge: e, label, rect: rects[i] });
     });
     if (!own.length) e._lbs = null;
   }
-  layouts.set(view, { nodes: view.nodes, edges: view.edges, caller, items: out });
+  layouts.set(view, { nodes: view.nodes, edges: view.edges, items: out });
   return out;
 }
 
@@ -133,7 +129,6 @@ export function labelLayout(view = state.view, reuse = false) {
 export function hitLabel(p, view = state.view) {
   const items = labelLayout(view, true);
   for (let i = items.length - 1; i >= 0; i--) {
-    if (items[i].label.auto) continue;
     const { rect: r } = items[i];
     if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
       return items[i];

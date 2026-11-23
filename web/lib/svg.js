@@ -1,5 +1,4 @@
 import { isDataEdge, svgMarkers } from './edge-flow.js';
-import { periodSubtitle } from './period-text.js';
 /**
  * 导出：SVG 构建与下载
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
@@ -132,7 +131,7 @@ function buildSVG() {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 8).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(label)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(periodSubtitle(n) || sub)}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(sub)}</text>`
     );
     out.push('</g>');
   }

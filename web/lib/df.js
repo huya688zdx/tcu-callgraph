@@ -1,7 +1,6 @@
 /** 公共变量关系只在右侧查询和选择，正式加入时沿用服务端 ELK 排版。 */
 import { t } from '../i18n.js';
 import { state, esc, edgeKey } from './state.js';
-import { periodText } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 
@@ -46,18 +45,12 @@ function renderResults(error = '') {
       const search = `${v.name} ${v.file} ${peer.name} ${peer.file}`.toLowerCase();
       const variableVersion = versionLabel(v.version);
       const peerVersion = versionLabel(peer.version);
-      const writer = mode === 'write' ? v.fnTaskPeriods : peer.taskPeriods;
-      const reader = mode === 'write' ? peer.taskPeriods : v.fnTaskPeriods;
-      const outputPeriod = periodText(writer);
-      const inputPeriod = periodText(reader);
-      const crosses = writer?.some(w => w.us && reader?.some(r => r.us && r.us !== w.us));
       const hint = state.view?.comparison ? t('compare.addToCanvas') : t('df.toggleHint');
       return `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
         <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
         <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
         ${line ? `<span class="df-access-line">:${line}</span>` : ''}
         <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
-        <span class="df-periods">${crosses ? '<b>可能跨周期</b> · ' : ''}写入 ${outputPeriod || '待确认'} → 读取 ${inputPeriod || '待确认'}</span>
         ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
       </label>`;
     }).join('');

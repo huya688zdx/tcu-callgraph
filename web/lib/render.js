@@ -5,7 +5,6 @@
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { isDataEdge, edgeDirection } from './edge-flow.js';
-import { periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, flowPath, flowPointAt } from './flow-geometry.js';
@@ -857,11 +856,9 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
       saved = { name, font, width: maxW, label };
       nodeNames.set(n, saved);
     }
-    const period = periodSubtitle(n);
-    const showSubtitle = cam.k >= 0.62 || (period && cam.k >= 0.4);
-    ctx.fillText(saved.label, cx, y + (showSubtitle ? h / 2 - 8 : h / 2));
+    ctx.fillText(saved.label, cx, y + (cam.k >= 0.62 ? h / 2 - 8 : h / 2));
 
-    if (showSubtitle) {
+    if (cam.k >= 0.62) {
       ctx.font = `10.5px ${FONT}`;
       ctx.fillStyle = '#888780';
       const sub = n.external
@@ -869,11 +866,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null) {
         : isVar
         ? n.typeText || t('node.variable')
         : `${shortFile(n.file)}:${n.line}`;
-      if (period) {
-        ctx.fillStyle = '#124B71';
-        ctx.font = `600 11px ${FONT}`;
-      }
-      ctx.fillText(period || sub, cx, y + h / 2 + 10, maxW);
+      ctx.fillText(sub, cx, y + h / 2 + 10);
     }
   }
 
