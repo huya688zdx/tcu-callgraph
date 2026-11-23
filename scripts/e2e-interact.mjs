@@ -222,7 +222,75 @@ await drag(edgeFixture.x,edgeFixture.y,edgeFixture.x,edgeFixture.y+35,{steps:4})
 const shapedEdge = await evaluate(`(()=>{const e=__cg.view.edges[0],p=e.points;return e.custom&&p.length===6&&p[0][0]===220&&p[0][1]===122&&p.at(-1)[0]===400&&p.at(-1)[1]===122&&p.some(q=>q[1]===157)&&p.every((q,i)=>!i||q[0]===p[i-1][0]||q[1]===p[i-1][1])})()`);
 console.log(`  单击不能误拖: ${lockedEdge}；双击已解锁: ${editingEdge}；直线调形成功且保持正交: ${shapedEdge}`);
 if (!lockedEdge || !editingEdge || !shapedEdge) ok=false;
-await evaluate(`(async()=>{const {state,cam}=await import('/lib/state.js');state.view=__edgeBackup.view;state.selectedEdge=null;state.selectedLabel=null;state.moveTarget=null;Object.assign(cam,__edgeBackup.cam);delete window.__edgeBackup;(await import('/lib/render.js')).draw()})()`);
+// 高亮须可见并在到期后清除，期间的动画帧复用已绘制的文字和标签。
+const pulse = await evaluate(`(async () => {
+  const {state, els} = await import('/lib/state.js');
+  const {draw, pulseAdded} = await import('/lib/render.js');
+  state.selected = state.selectedEdge = state.moveTarget = null;
+  draw();
+  const original = els.cv.toDataURL();
+  pulseAdded(state.view.nodes, state.view.edges);
+  const lit = els.cv.toDataURL() !== original;
+  const measure = els.ctx.measureText;
+  let calls = 0;
+  els.ctx.measureText = function (...args) { calls++; return measure.apply(this, args); };
+  try {
+    for (let i = 0; i < 3; i++) await new Promise(requestAnimationFrame);
+  } finally {
+    els.ctx.measureText = measure;
+  }
+  state.recent.until = performance.now() - 1;
+  for (let i = 0; state.recent && i < 5; i++) await new Promise(requestAnimationFrame);
+  return { lit, calls, cleared: !state.recent && els.cv.toDataURL() === original };
+})()`);
+console.log('\n[测试4] 批量新增高亮', pulse);
+if (!pulse.lit || pulse.calls !== 0 || !pulse.cleared) ok = false;
+
+// 共线处列出逐条调用。用足够多的记录覆盖菜单滚动和背景线反复叠色的情况。
+const bundlePoint = await evaluate(`(async () => {
+  const {state, cam, els} = await import('/lib/state.js');
+  const nodes = __edgeBackup.view.nodes.slice(0, 4).map((n, i) => ({
+    ...n, x: i < 2 ? 30 : 420, y: [50, 166, 110, 226][i], w: 110, h: 44,
+  }));
+  const edges = Array.from({length: 40}, (_, i) => ({
+    from: nodes[0].id, to: nodes[2].id, kind: 'direct', line: 10 + i,
+    points: [[140,72],[201,72],[201,132],[420,132]],
+  }));
+  edges.push({from:nodes[1].id, to:nodes[3].id, kind:'fnptr', line:90,
+    points:[[140,188],[201,188],[201,132],[323,132],[323,248],[420,248]]});
+  state.view = {...state.view, nodes, edges, groups:[], containers:[]};
+  Object.assign(cam, {x:20, y:45, k:1});
+  (await import('/lib/render.js')).draw();
+  const rect = els.cv.getBoundingClientRect();
+  return {x:rect.left + cam.x + 250, y:rect.top + cam.y + 132};
+})()`);
+await cdp.send('Input.dispatchMouseEvent', {type:'mouseMoved', ...bundlePoint});
+const bundleHint = await evaluate("document.getElementById('tooltip').textContent.includes('41 条关系')");
+await click(bundlePoint.x, bundlePoint.y);
+const menu = await evaluate(`(async () => {
+  const el = document.getElementById('ctxMenu');
+  el.scrollTop = el.scrollHeight;
+  await new Promise(requestAnimationFrame);
+  const buttons = el.querySelectorAll('button'), last = buttons[buttons.length - 1];
+  const result = {count:buttons.length, scrolled:el.scrollTop > 0 && el.classList.contains('show'),
+    label:last?.textContent.includes('函数指针') && last.textContent.includes('L90')};
+  last?.click();
+  return result;
+})()`);
+const focus = await evaluate(`(async () => {
+  const {state, cam, els} = await import('/lib/state.js');
+  const selected = state.selectedEdge === state.view.edges.at(-1);
+  state.selectedEdge = null;
+  state.selected = state.view.nodes[1].id;
+  (await import('/lib/render.js')).draw();
+  const alpha = (y) => els.ctx.getImageData((360 + cam.x) * devicePixelRatio,
+    (y + cam.y) * devicePixelRatio, 1, 1).data[3];
+  return { selected, other:alpha(132), related:alpha(248) };
+})()`);
+console.log('\n[测试5] 共线处选择调用', {bundleHint, menu, focus});
+if (!bundleHint || menu.count !== 41 || !menu.scrolled || !menu.label || !focus.selected ||
+    focus.other <= 0 || focus.other > 68 || focus.related < 200) ok = false;
+await evaluate(`(async()=>{const {state,cam}=await import('/lib/state.js');state.view=__edgeBackup.view;state.selected=null;state.selectedEdge=null;state.selectedLabel=null;state.moveTarget=null;Object.assign(cam,__edgeBackup.cam);delete window.__edgeBackup;(await import('/lib/render.js')).draw()})()`);
 
 try {
   const shot = await cdp.screenshot(path.join(ROOT, 'out', 'interact.png'));

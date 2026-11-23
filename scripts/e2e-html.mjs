@@ -68,7 +68,10 @@ try {
   await gui.evaluate(`(async()=>{
     const {setThemeColor}=await import('/lib/state.js');
     setThemeColor('bg','#E1E8F0');setThemeColor('edge.var','#447788');
+    await (await import('/lib/panels.js')).loadVars();
+    (await import('/lib/hooks.js')).hooks.toggleVar('var::g_gearCtx', true);
   })()`);
+  await gui.waitFor("__cg.view.edges.some(e => e.kind === 'var' && e.to === 'var::g_gearCtx')");
   await move(gui, 'group', 0, 60);
   await gui.evaluate(`(async()=>{
     const {state}=await import('/lib/state.js'); const {renderDetail,renderVars}=await import('/lib/panels.js');

@@ -360,6 +360,11 @@
     display: none;
     z-index: 1000;
     min-width: 150px;
+    max-width: min(36rem, calc(100vw - 16px));
+    max-height: calc(100vh - 16px);
+    overflow: auto;
+    overflow-wrap: anywhere;
+    overscroll-behavior: contain;
     padding: 4px;
     background: #fff;
     border: 1px solid #D3D1C7;

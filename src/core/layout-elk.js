@@ -1,13 +1,36 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
 import { textWidth, routeScore, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
-import { routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
+import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
 const TOP_PADDING = 40;
-const styleKey = (e) => `${e.kind === 'var' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}`;
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
+
+// ELK 会把共用逻辑端口的边排成干线。每一面按收发方向和线型设口，
+// 同组调用可以先汇集再分支，调用记录仍各自保留完整的端点与路径。
+function fixedPorts(nodes, edges, faces, separateStyles) {
+  const ports = new Map();
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  let nextPort = 0;
+  const port = (node, side, role, style) => {
+    if (!ports.has(node)) ports.set(node, new Map());
+    const list = ports.get(node);
+    const key = JSON.stringify([side, role, style]);
+    if (!list.has(key)) {
+      let id;
+      do { id = 'port:' + nextPort++; } while (nodeIds.has(id));
+      list.set(key, { id, side });
+    }
+    return list.get(key).id;
+  };
+  const pairs = edges.map((e, i) => {
+    const style = separateStyles ? edgeStyleKey(e) : '';
+    return [port(e.from, faces[i][0], 'out', style), port(e.to, faces[i][1], 'in', style)];
+  });
+  return { ports, pairs };
+}
 
 export function graphOf(nodes, edges, direction, faces, separateStyles = false, group = true, wrap = false) {
   const root = { id: 'root', children: [], layoutOptions: {
@@ -20,6 +43,7 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
     'elk.layered.wrapping.strategy': wrap ? 'MULTI_EDGE' : 'OFF',
   } };
   const boxes = new Map([['', root]]);
+  const fixed = faces && fixedPorts(nodes, edges, faces, separateStyles);
   for (const n of nodes) {
     const parts = group ? (n.file || 'unknown').split('/') : [];
     let parent = root;
@@ -35,18 +59,17 @@ export function graphOf(nodes, edges, direction, faces, separateStyles = false, 
       parent = boxes.get(key);
     }
     const node = { id: n.id, width: n.w, height: n.h };
-    if (faces) {
+    if (fixed) {
       node.layoutOptions = { 'elk.portConstraints': 'FIXED_POS' };
-      // 按样式区分逻辑端口，坐标仍严格只有四个中点；防止引擎把不同样式当作同一超边。
-      const styles = separateStyles ? [...new Set(edges.filter((e) => e.from === n.id || e.to === n.id).map(styleKey))] : [''];
-      node.ports = styles.flatMap((style) => [['NORTH', n.w / 2, 0], ['SOUTH', n.w / 2, n.h], ['WEST', 0, n.h / 2], ['EAST', n.w, n.h / 2]]
-        .map(([side, x, y]) => ({ id: n.id + ':' + side + ':' + style, x, y, width: 0, height: 0, layoutOptions: { 'elk.port.side': side } })));
+      const centers = { NORTH: [n.w / 2, 0], SOUTH: [n.w / 2, n.h], WEST: [0, n.h / 2], EAST: [n.w, n.h / 2] };
+      node.ports = Array.from(fixed.ports.get(n.id)?.values() || [], ({ id, side }) => ({
+        id, x: centers[side][0], y: centers[side][1], width: 0, height: 0, layoutOptions: { 'elk.port.side': side },
+      }));
     }
     parent.children.push(node);
   }
   root.edges = edges.map((e, i) => ({ id: 'e' + i,
-    sources: [faces ? e.from + ':' + faces[i][0] + ':' + (separateStyles ? styleKey(e) : '') : e.from],
-    targets: [faces ? e.to + ':' + faces[i][1] + ':' + (separateStyles ? styleKey(e) : '') : e.to] }));
+    sources: [fixed ? fixed.pairs[i][0] : e.from], targets: [fixed ? fixed.pairs[i][1] : e.to] }));
   return root;
 }
 
@@ -208,10 +231,11 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
         [...files].some((file) => file.startsWith(c.id + '/'))).map((c) => ({ ...c })) : [],
     };
     const addedEdges = view.edges.filter((e) => !e.points);
-    if (addedEdges.length) routeEdges(view.nodes, addedEdges, {
-      existing: collectSegments(view.edges.filter((e) => e.points)),
-    });
-    if (addedEdges.length) mergeSharedRoutes(view, addedEdges);
+    if (addedEdges.length) {
+      routeEdges(view.nodes, addedEdges, { existing: collectSegments(view.edges.filter((e) => e.points)) });
+      improveEdgeRoutes(view, addedEdges, () => false);
+      mergeSharedRoutes(view, addedEdges);
+    }
     for (const e of addedEdges) for (const [x, y] of e.points) {
       view.width = Math.max(view.width, x + 40);
       view.height = Math.max(view.height, y + 40);
@@ -227,9 +251,21 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     }
     return view;
   }
+  let rightFaces;
   const generate = async (dir, wrap = false) => {
-    const first = converted(await elk.layout(graphOf(sized, edges, dir, null, false, group, wrap)), sized, edges);
-    const faces = facesOf(first);
+    let first, faces;
+    if (!previous && dir === 'DOWN' && !wrap && rightFaces) {
+      // 横纵候选各自重新摆位和布线。无折行时只把分层方向上的端口提示转到纵向，
+      // 省去一次只为推断端口而做的完整 ELK 布局。自递归仍固定用右、下两个口。
+      const transpose = { EAST: 'SOUTH', WEST: 'NORTH', NORTH: 'WEST', SOUTH: 'EAST' };
+      faces = rightFaces.map(([a, b], i) => edges[i].from === edges[i].to ? ['EAST', 'SOUTH'] : [transpose[a], transpose[b]]);
+    } else if (!edges.length && !previous) {
+      faces = [];
+    } else {
+      first = converted(await elk.layout(graphOf(sized, edges, dir, null, false, group, wrap)), sized, edges);
+      faces = facesOf(first);
+      if (dir === 'RIGHT' && !wrap) rightFaces = faces;
+    }
     if (previous) {
       const priorFaces = facesOf(previous);
       const oldFaces = new Map(previous.edges.map((e, i) => [edgeKey(e), priorFaces[i]]));
@@ -239,8 +275,9 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
     return { ...converted(await elk.layout(graph), sized, edges), layoutDirection: dir };
   };
-  let view = await generate(direction), score = previous ? 0 : quality(view);
+  let view = await generate(direction);
   if (!previous) {
+    let score = validLayout(view) ? quality(view) : Infinity;
     const consider = (candidate) => {
       if (!validLayout(candidate)) return;
       const next = quality(candidate);
@@ -254,7 +291,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     }
     // 先确定区块位置，再简化连线，避免局部换线反过来改变整图的布局方向。
     const byId = new Map(view.nodes.map((n) => [n.id, n]));
-    improveEdgeRoutes(view, view.edges.filter((e) => byId.get(e.from).file !== byId.get(e.to).file));
+    improveEdgeRoutes(view, view.edges, (e) => byId.get(e.from).file !== byId.get(e.to).file);
   }
   mergeSharedRoutes(view);
   if (!group) for (const n of view.nodes) delete n.group;

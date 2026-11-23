@@ -20,6 +20,7 @@ function place(el, x, y, anchor = null) {
   el.style.left = `${x}px`;
   el.style.top = `${y}px`;
   el.classList.add('show');
+  el.scrollTop = 0;
   const r = el.getBoundingClientRect();
   if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
   if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
@@ -93,5 +94,7 @@ document.addEventListener('keydown', (event) => {
     hideMenu();
   }
 }, true);
-document.addEventListener('scroll', hideMenu, true);
+document.addEventListener('scroll', (event) => {
+  if (!els.ctxMenu?.contains(event.target)) hideMenu();
+}, true);
 window.addEventListener('resize', hideMenu);
