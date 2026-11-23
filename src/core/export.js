@@ -1,12 +1,10 @@
 import { edgeCaption, isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
-import { periodSubtitle } from '../../web/lib/period-text.js';
 /**
  * 导出：Excel 多 sheet / 单文件 HTML / SVG
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { withTaskPeriods } from './task-periods.js';
 import { stats } from './index.js';
 import { layoutElk } from './layout-elk.js';
 import { roundedPathD } from './routing.js';
@@ -50,7 +48,7 @@ export function buildSVGFromLayout(laid) {
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(periodSubtitle(n) || (n.external ? '外部符号' : `${n.file}:${n.line}`))}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="10.5" fill="#888780">${esc(n.external ? '外部符号' : `${n.file}:${n.line}`)}</text>`
     );
     out.push('</g>');
   }
@@ -78,15 +76,8 @@ function inlineJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
-function layoutForExport(model, opts) {
-  // 服务端子图已携带从全工程推得的周期，CLI 从完整模型计算。
-  const nodes = model.functions.some(n => Array.isArray(n.taskPeriods))
-    ? model.functions : withTaskPeriods(model.functions, model);
-  return layoutElk(nodes, model.edges, { group: false, ...opts });
-}
-
 export async function exportSvg(model, outPath, opts = {}) {
-  const laid = await layoutForExport(model, opts);
+  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
   const svg = buildSVGFromLayout(laid);
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, svg, 'utf8');
@@ -95,7 +86,7 @@ export async function exportSvg(model, outPath, opts = {}) {
 
 /** 单文件 HTML：内嵌 SVG 与数据，双击即可离线查看 */
 export async function exportHtml(model, outPath, opts = {}) {
-  const laid = await layoutForExport(model, opts);
+  const laid = await layoutElk(model.functions, model.edges, { group: false, ...opts });
   const svg = buildSVGFromLayout(laid);
   const S = stats(model);
 

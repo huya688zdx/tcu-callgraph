@@ -6,10 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { callSequence, callNumbers } from '../src/core/call-sequence.js';
-import { displayEdgeLabels } from '../src/core/labels.js';
 import { projectTasks, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
-import { periodCaption, periodSubtitle } from '../web/lib/period-text.js';
 import { edgeCaption, svgMarkers } from '../web/lib/edge-flow.js';
 import { traceVisiblePaths } from '../web/lib/visible-paths.js';
 
@@ -20,11 +18,11 @@ test('局部视图保留完整工程中的多个任务，且不沿变量访问�
   const node = model.functions.find(f => f.name === 'Diag_Report');
   const [report] = withTaskPeriods([node], model);
   assert.deepEqual(report.taskPeriods.map(c => c.task), ['main.c::App_Task10ms', 'main.c::App_Task100ms']);
-  assert.equal(periodCaption(report), '10 ms / 100 ms');
+  assert.deepEqual(report.taskPeriods.map(c => c.us), [10000, 100000]);
   const m = dot('Task_1s -> a; a -> b; b -> a; a -> reader [style=dashed]; Delay_5ms -> reader;');
   const nodes = withTaskPeriods(m.functions, m);
-  assert.equal(periodCaption(nodes.find(n => n.name === 'b')), '1 s');
-  assert.equal(periodCaption(nodes.find(n => n.name === 'reader')), '');
+  assert.deepEqual(nodes.find(n => n.name === 'b').taskPeriods.map(c => c.us), [1000000]);
+  assert.deepEqual(nodes.find(n => n.name === 'reader').taskPeriods, []);
 });
 
 test('修改前后独立分析周期，保留并列的调用边与数据流边', () => {
@@ -34,7 +32,8 @@ test('修改前后独立分析周期，保留并列的调用边与数据流边',
   assert.deepEqual(edges.map(e => e.kind).sort(), ['dataflow', 'macro']);
   const [g] = withTaskPeriods([{ id: 'dot::g', versions: ['before', 'after'] }], after,
     { beforeModel: before, afterModel: after });
-  assert.equal(periodCaption(g), '250 µs → 10 ms');
+  assert.deepEqual(g.previousTaskPeriods.map(c => c.us), [250]);
+  assert.deepEqual(g.taskPeriods.map(c => c.us), [10000]);
 });
 
 test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用原始端点', () => {
@@ -62,6 +61,20 @@ test('读写数据的箭头、两点路径与 SVG 标记一致，标注仍使用
   assert.deepEqual(traceVisiblePaths(view, 'write', 'read').paths[0].nodes, ['write', 'v', 'read']);
 });
 
+test('SVG 只绘制已保存的连线标签，即使调用边带有解析出的序号', () => {
+  const svg = exportSvg({
+    root: 'A', nodes: [],
+    edges: [
+      { from: 'A', to: 'B', kind: 'direct', callNumbers: ['1'], points: [[10, 30], [250, 30]] },
+      { from: 'A', to: 'C', kind: 'direct', callNumbers: ['2'], points: [[10, 110], [250, 110]],
+        labels: [{ preset: 'call', text: 'コール順7' }, { preset: 'task', text: 'TASK:2ms' }] },
+    ],
+  });
+  assert.doesNotMatch(svg, /コール順[12]/);
+  assert.match(svg, /コール順7/);
+  assert.match(svg, /TASK:2ms/);
+});
+
 test('OSEK TASK 定义自动入表，无调用者也显示，保留真实函数、周期与源码行', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-tasks-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -72,7 +85,6 @@ test('OSEK TASK 定义自动入表，无调用者也显示，保留真实函数�
   const model = loadModel(root);
   const tasks = projectTasks(model);
   assert.deepEqual(tasks.map(t => [t.name,t.us,t.line]), [['Control_10ms',10000,5],['Background',null,6]]);
-  assert.equal(periodSubtitle(withTaskPeriods([model.functions.find(f => f.name === 'Background')],model)[0]), 'TASK · 周期待确认');
   assert.ok(!model.functions.some(f => f.name === 'TASK'));
   const [leaf] = withTaskPeriods([model.functions.find(f => f.name === 'A')], model);
   assert.deepEqual(leaf.taskPeriods.map(c => c.us), [10000, null]);
@@ -82,10 +94,6 @@ test('OSEK TASK 定义自动入表，无调用者也显示，保留真实函数�
   const numbers = callNumbers(groups);
   assert.deepEqual(numbers.get('tasks.c::A'), ['1','3','6*']);
   assert.deepEqual(numbers.get('tasks.c::B'), ['2','4','6*']);
-  const edge = { from: caller, callNumbers: numbers.get('tasks.c::B') };
-  assert.equal(displayEdgeLabels(edge, [], caller)[0].text, 'コール順2、4、6*');
-  assert.deepEqual(displayEdgeLabels(edge, [], 'another caller'), []);
-  assert.equal(displayEdgeLabels(edge, [{ preset:'call', text:'已标注' }], caller).length, 1);
 });
 
 test('注册的 RTOS 任务按显式毫秒间隔显示，原始 tick 保留待确认', t => {
