@@ -25,6 +25,7 @@ const CALL_RANK = { direct: 3, macro: 2, fnptr: 1 };
 
 const shortName = (id) => String(id).split('::').pop();
 const edgeKeyOf = (e) => `${e.from}->${e.to}:${e.line}`;
+const NO_CALLEE = { v: '' };
 
 /** 名字里能提出周期就是任务函数；只有 Task/cyclic 字样而无周期的也算（周期留空） */
 function taskPeriodOf(name) {
@@ -51,6 +52,19 @@ export function hasNestedCall(tokens, calls) {
     } else if (tokens[i].v === ')' && stack.pop()) enclosingCalls--;
   }
   return false;
+}
+
+/** 成员调用要等函数指针表齐全后匹配，保留括号及其前的名字供调用顺序检测。 */
+export function callNestingTokens(tokens) {
+  const result = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.v === '(') {
+      const prev = tokens[i - 1];
+      result.push(prev?.t === 'id' ? prev : NO_CALLEE, token);
+    } else if (token.v === ')') result.push(token);
+  }
+  return result;
 }
 
 /**

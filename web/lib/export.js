@@ -1,6 +1,7 @@
 /** GUI 与离线 HTML 共用的文件命名、保存和 PNG 底色。 */
 import { state, els, THEME } from './state.js';
 import { api } from './api.js';
+import { compositeEffects, finishPan } from './render.js';
 
 export function exportName(extension, project) {
   const view = state.view;
@@ -39,10 +40,12 @@ export async function saveExport(extension, blob) {
 }
 
 export function buildPNG() {
+  finishPan();
   const canvas = document.createElement('canvas');
   canvas.width = els.cv.width; canvas.height = els.cv.height;
   const ctx = canvas.getContext('2d');
   ctx.fillStyle = THEME.bg; ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(els.cv, 0, 0);
+  compositeEffects(ctx);
   return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
 }
