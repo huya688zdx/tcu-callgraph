@@ -22,7 +22,7 @@ const post = (url, body) =>
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels', 'viewEvent']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels', 'viewEvent', 'manualNodes']);
 const guardWrite = (name) => {
   if (state.view?.comparison && WRITE_OPS.has(name)) return Promise.resolve({ ok: false, error: '比较视图仅供查看' });
   if (state.at > 0 && WRITE_OPS.has(name)) {
@@ -116,6 +116,9 @@ export const api = {
   del: (body) => guardWrite('del') || post('/api/delete', body),
   /** 手动布局存档 */
   layout: (body) => guardWrite('layout') || post('/api/layout', body),
+  /** 手工添加 / 永久删除文件内的函数或变量（即使源码中不存在） */
+  addManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes', body),
+  deleteManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes/delete', body),
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir)),
@@ -124,6 +127,22 @@ export const api = {
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
+  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试与对话 */
+  aiConfig: () => get('/api/ai/config'),
+  saveAiConfig: (body) => post('/api/ai/config', body),
+  aiModels: (body) => post('/api/ai/models', body),
+  aiTest: (body) => post('/api/ai/test', body),
+  aiChat: (body, signal) =>
+    fetch('/api/ai/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Callgraph-Client': clientId,
+        ...(state.view?.projectId == null ? {} : { 'X-Callgraph-Project': String(state.view.projectId) }),
+      },
+      body: JSON.stringify(body),
+      signal,
+    }),
   /** 上报并保存当前页面状态，AI 经 cg_page 工具读取；退出时等待保存结果。 */
   reportPage: (body) => post('/api/page', body),
   savedPage: () => get('/api/page?saved=1'),

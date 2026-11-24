@@ -57,6 +57,11 @@ export function normalizeGraphIR(rawModel, meta = {}) {
 
 /** 将解析器生成的读写索引投影为普通图上的变量节点与边。 */
 export function applyDataflow(model, df) {
+  const manualVars = (model.variables || []).filter((v) => v.manual && !df.byId.has(v.id));
+  for (const v of manualVars) {
+    df.defs.push(v);
+    df.byId.set(v.id, v);
+  }
   model.variables = df.defs.map((d) => ({ ...d, kind: 'var', params: [] }));
   model.edges = model.edges.filter((e) => e.kind !== 'var');
   for (const fn of model.functions) {

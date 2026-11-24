@@ -57,6 +57,7 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
   const sources = [];
   let failedFiles = 0;
   for (const f of model.files) {
+    if (f.manual) continue;
     try {
       sources.push({ ...f, src: decodeSource(model._sourceBuffers?.get(f.rel) ??
         fs.readFileSync(model._sourceFiles?.get(f.rel) || path.join(model.root, f.rel))) });

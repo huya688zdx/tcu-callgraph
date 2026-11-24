@@ -9,7 +9,7 @@ import { buildDataflowIndex } from '../src/core/dataflow.js';
 import { projectTasks, taskPeriods, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
-import { nodePeriodBadge } from '../web/lib/period-text.js';
+import { canvasPeriodBadge, nodePeriodBadge } from '../web/lib/period-text.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 
 function project(t, files) {
@@ -316,14 +316,17 @@ ISR(ExternalVector) { interruptValue = 1; }
   assert.deepEqual(varNode('exposed').taskPeriods.map(c => c.us), [2000, 10000]);
   assert.deepEqual(nodePeriodBadge(varNode('exposed')), { text: '⚡2↔10ms', tier: 'cross-hazard' });
   assert.deepEqual(nodePeriodBadge(varNode('guarded')), { text: '🔒2↔10ms', tier: 'cross-safe' });
+  assert.deepEqual(canvasPeriodBadge(varNode('exposed')), { text: '⚡2↔10ms', tier: 'cross-hazard' });
+  assert.equal(canvasPeriodBadge(view.nodes.find(node => node.name === 'App_Task2ms')), null);
   assert.equal(nodePeriodBadge({ taskPeriods: [{ us: null }] }), null);
   const svg = exportSvg(view);
   assert.match(svg, />shared\.c:2<\/text>/);
-  assert.match(svg, /data-period-badge="fast"/);
+  assert.doesNotMatch(svg, /data-period-badge="(?:fast|mid|slow|isr|multi)"/);
   assert.match(svg, /data-period-badge="cross-hazard"/);
   assert.match(svg, /data-period-badge="cross-safe"/);
   assert.doesNotMatch(svg, /周期待确认/);
   const cliSvg = buildSVGFromLayout(view);
   assert.match(cliSvg, />shared\.c:2<\/text>/);
+  assert.doesNotMatch(cliSvg, /data-period-badge="(?:fast|mid|slow|isr|multi)"/);
   assert.match(cliSvg, /data-period-badge="cross-safe"/);
 });

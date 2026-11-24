@@ -37,6 +37,7 @@ function snapshotView() {
       color: n.color,
       note: n.note,
       external: n.external,
+      manual: n.manual,
       // 语义字段必须一起快照：否则 undo 后变量节点会变回函数（kind 丢失）、
       // 变更分类颜色全部回落成「既存」
       kind: n.kind,
@@ -160,12 +161,13 @@ function redo() {
   return true;
 }
 
-async function saveLayout() {
+async function saveLayout(patch = {}) {
   if (state.view?.comparison) return;
   await api.layout({
     root: layoutRootKey(),
-    manual: collectManual(),
+    addManual: collectManual(),
     mode: state.group ? 'group' : 'flat',
+    ...patch,
   });
 }
 
@@ -177,7 +179,13 @@ async function addManualEdge(from, to) {
   if (state.view?.comparison) return;
   const a = nodeById(from);
   const b = nodeById(to);
-  if (!a || !b) return;
+  if (!a || !b || from === to) return;
+  // 若两端之间已有行号 0 的手工边或变量读写边，直接选中已有边，避免键冲突。
+  const existing = state.view.edges.find((ed) => ed.from === from && ed.to === to && (ed.manual || ed.line === 0));
+  if (existing) {
+    hooks.selectEdge?.(existing);
+    return;
+  }
   const e = {
     from,
     to,
@@ -192,7 +200,7 @@ async function addManualEdge(from, to) {
   pulseAdded([], [e]);
   await api.layout({
     root: layoutRootKey(),
-    manual: collectManual(),
+    addManual: [{ from, to }],
     mode: state.group ? 'group' : 'flat',
   });
   pushHistory();

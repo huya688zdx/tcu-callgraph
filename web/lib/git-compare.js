@@ -47,6 +47,7 @@ function renderStatus() {
     gitUnavailable: t('git.unavailable'),
     notRepository: t('git.notRepo'),
     statusUnavailable: t('git.statusUnavailable'),
+    statusTimeout: t('git.statusTimeout'),
   };
   repoMessage.textContent = repo.isRepo ? '' : reasons[repo.reason] ?? t('git.statusUnavailable');
   repoMessage.hidden = repo.isRepo;

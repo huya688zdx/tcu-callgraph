@@ -12,7 +12,7 @@ import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
  */
 import { roundedPathD } from './routing.js';
 import { deletedEdgeMarkSvg, displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
-import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from '../../web/lib/period-text.js';
+import { canvasPeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function layoutExportEdgeLabels(view) {
   const placed = [];
@@ -193,10 +193,17 @@ export function exportSvg(view, { title = '' } = {}) {
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
     );
+    const subtitle = period || (n.external
+      ? EXTERNAL_LABEL
+      : n.manual
+      ? (n.kind === 'var' ? (n.typeText || '手工变量') : '手工函数')
+      : n.kind === 'var'
+      ? (n.typeText || '变量')
+      : `${shortFile(n.file)}:${n.line}`);
     out.push(
-      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || (n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line))}</text>`
+      `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(subtitle)}</text>`
     );
-    const badge = !v.comparison && !period && nodePeriodBadge(n);
+    const badge = !v.comparison && !period && canvasPeriodBadge(n);
     if (badge) out.push(periodBadgeSvg(n, badge, esc));
     out.push('</g>');
   }

@@ -64,6 +64,7 @@ const state = {
   dragEnd: null,
   dragNode: null,
   dragBox: null,
+  resizeBox: null,
   dragLabel: null,
   dragStart: null,
   dragMoved: false,
@@ -74,6 +75,7 @@ const state = {
   last: null,
   linkFrom: null,
   linkPos: null,
+  linkMode: null,
   /** 点击标题后的短暂高亮：{ box, until, dur } */
   flash: null,
   /** 本次新加入的节点和连线，呼吸提示到期后自动清除。 */

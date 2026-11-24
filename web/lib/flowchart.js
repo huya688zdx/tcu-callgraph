@@ -15,7 +15,7 @@ const branchColors = { ON: ['#dcfce7', '#15803d'], OFF: ['#fef3c7', '#b45309'] }
 let ui, context, graph, trail = [], expand = false, request = 0, drag;
 let camera = { x: 0, y: 0, zoom: 1, fitting: true };
 
-export const canOpenFlowchart = node => !!ui && !node.external && node.kind !== 'var' && !node.headerSymbol;
+export const canOpenFlowchart = node => !!ui && !node.external && !node.manual && node.kind !== 'var' && !node.headerSymbol;
 
 function macroText(macro) {
   const params = macro.params ? `(${macro.params.join(', ')})` : '';
