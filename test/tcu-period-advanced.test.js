@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadModel } from '../src/core/index.js';
+import { buildDataflowIndex } from '../src/core/dataflow.js';
 import { projectTasks, taskPeriods, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
@@ -74,9 +75,12 @@ void App_Task10ms(void) { Mixed(); }
   assert.deepEqual(nodePeriodBadge(mixed), { text: 'ISR·5ms·10ms', tier: 'multi', multi: true });
 });
 
-test('全局 tick 按唯一递增源推导主循环周期，与调用者周期取 LCM', t => {
+test('全局 tick 按唯一写者推导主循环周期，与调用者周期取 LCM', async t => {
   const demo = loadModel(fileURLToPath(new URL('../samples/demo', import.meta.url)));
-  assert.deepEqual(periodsFor(demo, 'Nvm_Save').map(c => c.us), [1000000]);
+  await buildDataflowIndex(demo);
+  // App_Init 也会重置 g_tick；只能确认 Nvm_Save 可由 100ms 任务调用。
+  assert.deepEqual(periodsFor(demo, 'Nvm_Save').map(c => c.us), [100000]);
+  assert.equal(periodsFor(demo, 'Nvm_Save')[0].dividers, undefined);
   assert.deepEqual(periodsFor(demo, 'Diag_Report').map(c => [c.task, c.us]),
     [['main.c::App_Task10ms', 10000], ['main.c::App_Task100ms', 100000]]);
 
@@ -91,9 +95,75 @@ void App_Task5ms(void) { if ((tick % 4) == 0) { InTask(); FasterPath(); } }
 int main(void) { for (;;) if (tick % 3 == 0) Timed(); }
 `, 'tcu-schedule.json': JSON.stringify({ tickUs: 2000 }) });
   const model = loadModel(root);
+  await buildDataflowIndex(model);
   assert.deepEqual(periodsFor(model, 'Timed').map(c => [c.task, c.us]), [['rates.c::Tick', 6000]]);
   assert.deepEqual(periodsFor(model, 'InTask').map(c => c.us), [40000]);
   assert.deepEqual(periodsFor(model, 'FasterPath').map(c => c.us), [2000]);
+});
+
+test('ISR 自增和其他函数读 tick 时均须验证全工程写者，静态和局部同名按作用域区分', async t => {
+  const root = project(t, {
+    'timer.c': `
+unsigned shared;
+unsigned escaped;
+unsigned clean;
+unsigned bounded;
+void A(void) {} void B(void) {} void C(void) {} void D(void) {} void E(void) {} void F(void) {}
+void ISR_1ms(void) {
+  ++shared;
+  if (shared % 4 == 0) A();
+  ++clean;
+  if (clean % 4 == 0) B();
+  ++escaped;
+  if (escaped % 4 == 0) C();
+  if (++bounded >= 7) { bounded = 0; F(); }
+}
+void App_Task2ms(void) {
+  if (shared % 4 == 0) D();
+  if (clean % 4 == 0) E();
+}
+`,
+    'reset.c': `
+extern unsigned escaped;
+static unsigned clean;
+void reset(void) { extern unsigned shared; shared = 0; clean = 0; }
+void unknown(unsigned *);
+void may_reset(void) { unknown(&escaped); }
+`,
+    'locals.c': 'void shadow(void) { unsigned clean; clean = 0; }',
+  });
+  const model = loadModel(root);
+  const rates = name => periodsFor(model, name).map(c => [c.us, Boolean(c.dividers)]);
+  assert.deepEqual(rates('B'), [[1000, false]], '尚未取得 AST 写者证据');
+  await buildDataflowIndex(model);
+  for (const name of ['A', 'C']) assert.deepEqual(rates(name), [[1000, false]], name);
+  assert.deepEqual(rates('D'), [[2000, false]], '跨函数共享 tick 也没有可靠的分频');
+  for (const name of ['B', 'E']) assert.deepEqual(rates(name), [[4000, true]], name);
+  assert.deepEqual(rates('F'), [[7000, true]], '阈值分支内自己的合法清零');
+});
+
+test('缺少变量定义、地址从 ISR 逃逸、或有额外条件写入时仅保留入口周期', async t => {
+  const root = project(t, { 'timer.c': `
+extern unsigned unresolved;
+unsigned escaped = 0;
+unsigned conditional = 0;
+void unknown(unsigned *);
+void Before(void) {} void After(void) {} void Reset(void) {}
+void ISR_1ms(void) {
+  ++unresolved;
+  if (unresolved % 5 == 0) Before();
+  ++escaped;
+  unknown(&escaped);
+  if (escaped % 5 == 0) After();
+  ++conditional;
+  if ((conditional = Flag())) {}
+  if (conditional % 5 == 0) Reset();
+}` });
+  const model = loadModel(root);
+  await buildDataflowIndex(model);
+  for (const name of ['Before', 'After', 'Reset']) {
+    assert.deepEqual(periodsFor(model, name).map(c => [c.us, c.dividers]), [[1000, undefined]], name);
+  }
 });
 
 test('静态调度表读取位置宏、指定初始化、微秒字段与独立任务定义', t => {

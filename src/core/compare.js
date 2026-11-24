@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { buildIndex, rebuildIndex } from './index.js';
 import { comparisonFiles } from './compare-files.js';
+import { isScheduleFile, readScheduleFiles } from './tcu-schedule.js';
 import { buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { getParser } from './parsers/registry.js';
 import { fingerprint } from './parsers/builtin-comparison.js';
@@ -135,7 +136,7 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
   const snapshots = options.snapshots;
   const { baseFiles, beforeFiles, afterFiles, mappings } = snapshots || comparisonFiles(projectPath, beforePath, afterPath);
   const scope = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
-  if (!snapshots && !scope.size) throw new Error('对照目录中没有可解析的 C 文件');
+  if (!snapshots && !scope.size) throw new Error('对照目录中没有可解析的 C 文件或调度配置');
   if (!snapshots && !baseFiles.size) throw new Error('请先打开包含完整 C 源码的总代码目录');
   const withOverrides = (overrides) => {
     if (snapshots) return overrides;
@@ -146,22 +147,31 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
     }
     return new Map([...files].sort(([a], [b]) => a.localeCompare(b)));
   };
-  const beforeModel = await buildIndex(projectPath, withOverrides(beforeFiles), null, options);
-  const afterModel = await buildIndex(projectPath, withOverrides(afterFiles), null, options);
-  for (const m of [beforeModel, afterModel]) {
-    if (m.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${m.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
-    if (!snapshots && !m.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${m.root}`);
-    if (m.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
-    const df = await buildDataflowIndex(m);
+  const sameSources = snapshots ? snapshots.sameSources === true : [...scope].every(isScheduleFile);
+  const buildSide = async (overrides, reuse) => {
+    const sources = new Map(), schedules = new Map();
+    for (const [rel, abs] of withOverrides(overrides)) {
+      (isScheduleFile(rel) ? schedules : sources).set(rel, abs);
+    }
+    // 同一份 C/H 只分析一次；调度目录、来源映射和按模型缓存的周期仍按版本独立。
+    const model = reuse ? { ...reuse, _sourceFiles: sources } : await buildIndex(projectPath, sources, null, options);
+    model.scheduleConfig = readScheduleFiles(schedules);
+    if (model.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${model.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
+    if (!snapshots && !model.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${model.root}`);
+    if (model.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
+    const df = await buildDataflowIndex(model);
     if (df.failedFiles) throw new Error('部分源码分析失败，无法发布不完整的比较结果');
-  }
+    return model;
+  };
+  const beforeModel = await buildSide(beforeFiles);
+  const afterModel = await buildSide(afterFiles, sameSources && beforeModel);
   const parser = getParser(beforeModel.parserId);
   const fingerprint = parser.fingerprint || ((value) => value.trim());
   const { macroChanges, macroDetails, macrosIn, changedExpansion } = parser.compareMacros?.(beforeModel, afterModel)
     ?? { macroChanges: [], macroDetails: [], macrosIn: () => new Set(), changedExpansion: () => new Set() };
   const definitionsOf = parser.compareDefinitions || definitionsFromGraph;
   const beforeDefs = await definitionsOf(beforeModel, macrosIn, fingerprint);
-  const afterDefs = await definitionsOf(afterModel, macrosIn, fingerprint);
+  const afterDefs = sameSources ? beforeDefs : await definitionsOf(afterModel, macrosIn, fingerprint);
   const beforePeriods = taskPeriods(beforeModel), afterPeriods = taskPeriods(afterModel);
   const points = new Map();
   const addPoint = (point) => points.set(point.id, { point, seeds: new Set() });
@@ -173,6 +183,9 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
       beforeValue: m.before, afterValue: m.after, summary: macroReason(m) });
   }
   const warnings = [...beforeModel.warnings, ...afterModel.warnings].map((w) => `${w.file}：${w.error}`);
+  for (const [version, model] of [['before', beforeModel], ['after', afterModel]]) {
+    for (const w of model.scheduleConfig.warnings) warnings.push(`${version}/${w.file}：${w.error}`);
+  }
   for (const mapping of mappings) if (mapping.source !== mapping.target) warnings.push(`${mapping.version}/${mapping.source} → ${mapping.target}`);
   for (const file of new Set([...beforeDefs.other.keys(), ...afterDefs.other.keys()])) {
     const a = beforeDefs.other.get(file) || fingerprint(''), b = afterDefs.other.get(file) || fingerprint('');

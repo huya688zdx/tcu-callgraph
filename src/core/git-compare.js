@@ -7,6 +7,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { compareProjects, fingerprint } from './compare.js';
 import { decodeSource, listSourceFiles } from './index.js';
+import { addScheduleBytes, isScheduleFile, listScheduleFiles } from './tcu-schedule.js';
 
 const run = promisify(execFile);
 const sourceExtension = /\.(c|h)$/i;
@@ -58,7 +59,7 @@ async function locateRepo(projectPath) {
 function projectSource(repo, file) {
   if (!file?.startsWith(repo.projectPrefix)) return null;
   const relative = file.slice(repo.projectPrefix.length);
-  if (!sourceExtension.test(relative) || relative.includes('\\')) return null;
+  if ((!sourceExtension.test(relative) && !isScheduleFile(relative)) || relative.includes('\\')) return null;
   const parts = relative.split('/');
   if (parts.some(part => !part || part.startsWith('.') || part === 'node_modules')) return null;
   // Git 历史可能来自其他平台，避免 Windows 别名和设备路径进入临时目录。
@@ -211,9 +212,11 @@ async function workingFiles(repo, includeUntracked) {
     : [];
   const names = [...new Set([...tracked.keys(), ...untracked.map(file => projectSource(repo, file)).filter(Boolean)])].sort();
   const hash = createHash('sha256');
+  let configBytes = 0;
   for (const file of names) {
     const data = await diskSource(repo, file);
     if (data === null) continue;
+    if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, data.length);
     files.set(file, data);
     hash.update(JSON.stringify([file, data.length])).update(data);
   }
@@ -247,9 +250,9 @@ async function changedFiles(repo, before, after, baseSha, targetRef, targetSha) 
   return [...result.values()].sort((a, b) => a.file.localeCompare(b.file));
 }
 
-async function fetchBlobs(repo, objects) {
+async function fetchBlobs(repo, before, after) {
   const blobs = new Map();
-  const ids = [...new Set(objects)].filter(id => typeof id === 'string');
+  const ids = [...new Set([...before.values(), ...after.values()])].filter(id => typeof id === 'string');
   if (!ids.length) return blobs;
   const check = await git(repo.repoRoot, ['cat-file', '--batch-check'], { input: ids.join('\n') + '\n' });
   const entries = singleLine(check).split('\n').map((line, i) => {
@@ -261,6 +264,13 @@ async function fetchBlobs(repo, objects) {
     return { id, size };
   });
   if (entries.length !== ids.length) throw new Error('Git 返回的源码对象不完整');
+  const sizes = new Map(entries.map(({ id, size }) => [id, size]));
+  for (const files of [before, after]) {
+    let configBytes = 0;
+    for (const [file, object] of files) {
+      if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, typeof object === 'string' ? sizes.get(object) : object.length);
+    }
+  }
   for (let i = 0; i < entries.length;) {
     const batch = [];
     let totalBytes = 0;
@@ -294,7 +304,7 @@ async function materialize(directory, entries, blobs) {
     await mkdir(path.dirname(target), { recursive: true });
     await writeFile(target, bytes, { flag: 'wx' });
     files.set(relative, target);
-    buffers.set(relative, bytes);
+    if (!isScheduleFile(relative)) buffers.set(relative, bytes);
   }
   return { files, buffers };
 }
@@ -338,25 +348,34 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
     includeUntracked, changedFiles: changes, worktreeFingerprint: worktree?.fingerprint ?? null,
     noSourceChanges: !changes.length, importFacts: emptyFacts(), commentOnlyFiles: [],
   };
+  const analyze = () => analyzeGitSnapshot(repo, before, after, metadata, compareOptions);
   if (!changes.length && !compareOptions.allowEmptyRefresh) {
     return { projectPath: repo.root, git: metadata, summary: emptySummary(), roots: [], candidates: [],
-      changePoints: [], impactIds: [], macroChanges: [], macroDetails: [], warnings: [], mappings: [], totalNodes: 0 };
+      changePoints: [], impactIds: [], macroChanges: [], macroDetails: [], warnings: [], mappings: [], totalNodes: 0,
+      ...(compareOptions.deferUnchangedAnalysis ? { analyze } : {}) };
   }
+  return analyze();
+}
 
+/** 两个版本各自固定源码及调度配置，延迟分析也使用首次读取的工作区缓冲与 Git 对象。 */
+async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions) {
+  const changes = metadata.changedFiles;
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'callgraph-git-'));
   try {
     const beforePath = path.join(temporary, 'before'), afterPath = path.join(temporary, 'after');
-    const blobs = await fetchBlobs(repo, [...before.values(), ...after.values()]);
+    const blobs = await fetchBlobs(repo, before, after);
     await Promise.all([mkdir(beforePath), mkdir(afterPath)]);
     const beforeSnapshot = await materialize(beforePath, before, blobs);
     const afterSnapshot = await materialize(afterPath, after, blobs);
+    const sameSources = beforeSnapshot.buffers.size === afterSnapshot.buffers.size &&
+      [...beforeSnapshot.buffers].every(([name, bytes]) => afterSnapshot.buffers.get(name)?.equals(bytes));
     const comparison = await compareProjects(repo.root, beforePath, afterPath, {
       ...compareOptions,
-      snapshots: { beforeFiles: beforeSnapshot.files, afterFiles: afterSnapshot.files, mappings: [] },
+      snapshots: { beforeFiles: beforeSnapshot.files, afterFiles: afterSnapshot.files, mappings: [], sameSources },
     });
     metadata.importFacts = importFacts(comparison);
     const semanticFiles = new Set(comparison.changePoints.map(point => point.file));
-    metadata.commentOnlyFiles = changes.filter(({ file, status }) => status === 'modified' && !semanticFiles.has(file) &&
+    metadata.commentOnlyFiles = changes.filter(({ file, status }) => status === 'modified' && sourceExtension.test(file) && !semanticFiles.has(file) &&
       fingerprint(decodeSource(beforeSnapshot.buffers.get(file))) === fingerprint(decodeSource(afterSnapshot.buffers.get(file))))
       .map(({ file }) => file);
     retainSnapshot(comparison.beforeModel, beforeSnapshot.buffers);
@@ -391,7 +410,8 @@ export async function watchGitProject(projectPath, signal, onChange) {
     poll.unref();
   }
   function scan() {
-    return JSON.stringify(listSourceFiles(repo.root).filter(file => sourceExtension.test(file)).sort().flatMap(file => {
+    const files = [...listSourceFiles(repo.root).filter(file => sourceExtension.test(file)), ...listScheduleFiles(repo.root).values()];
+    return JSON.stringify(files.sort().flatMap(file => {
       try {
         const s = fs.lstatSync(file, { bigint: true });
         return s.isFile() ? [[file, String(s.mtimeNs), String(s.ctimeNs), String(s.size)]] : [];

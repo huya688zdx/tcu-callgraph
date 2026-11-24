@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { createMcpServer } from '../src/mcp.js';
@@ -64,6 +65,8 @@ test('initialize 返回协议版本与当前权限', async () => {
   assert.match(r.body.result.instructions, /readonly/);
   assert.match(r.body.result.instructions, /cg_source.*C 源码/);
   assert.match(r.body.result.instructions, /コール順1/);
+  assert.match(r.body.result.instructions, /cg_trace_to_task/);
+  assert.match(r.body.result.instructions, /既有调用及读写关系保持 existing 黑线/);
 });
 
 test('tools/list 按权限过滤：readonly 不含写工具，readwrite 全量，off 为空', async () => {
@@ -80,6 +83,7 @@ test('tools/list 按权限过滤：readonly 不含写工具，readwrite 全量�
   assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_export_svg'), 'readonly 应有导出工具');
   assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_view'), 'readonly 应有读工具');
   assert.ok(ro.body.result.tools.some((t) => t.name === 'cg_source'));
+  assert.ok(['cg_trace_to_task', 'cg_changes'].every(name => ro.body.result.tools.some(t => t.name === name)));
   assert.ok(!ro.body.result.tools.some((t) => ['cg_compose_view', 'cg_apply_task_labels'].includes(t.name)));
 
   const rw = await mcpLevel('readwrite').handlePost(rpc('tools/list', {}));
@@ -250,6 +254,80 @@ test('e2e：比较模式的 cg_source 读取映射后的修改和新增源码', 
   assert.equal(source.startLine, 3);
   const range = await callTool(base, 'cg_source', { file: 'added.c', startLine: 1, endLine: 1 });
   assert.equal(range.source, added, range.error);
+});
+
+test('e2e：AI 用 Git 快照组图，保留完整入口链与真实增删颜色，退出恢复原画布', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compose-snapshot-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3 }));
+  const file = path.join(directory, 'sched.c');
+  const before = [
+    'void gone(void) {}', 'void target(void) { gone(); }',
+    ...Array.from({ length: 7 }, (_, i) => 'void hop' + i + '(void) { ' + (i ? 'hop' + (i - 1) : 'target') + '(); }'),
+    'TASK(Previous) { hop6(); }', 'ISR(Tick) { target(); }', 'void idle(void) {}',
+  ].join('\n');
+  fs.writeFileSync(file, before);
+  const git = (...args) => execFileSync('git', args, { cwd: directory, windowsHide: true });
+  git('init', '-q');
+  git('add', 'sched.c');
+  git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline');
+  fs.writeFileSync(file, before.replaceAll('gone', 'fresh').replace('TASK(Previous)', 'TASK(Control)'));
+  const { baseUrl: base, close } = await launchServer({ target: directory });
+  t.after(close);
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const id = name => 'sched.c::' + name;
+  const compose = args => callTool(base, 'cg_compose_view', { mode: 'replace', ...args });
+  const original = await compose({ roots: [id('idle')] });
+  const current = await callTool(base, 'cg_trace_to_task', { id: id('target') });
+  assert.equal(current.totalTasks, 2);
+  assert.equal(current.upstreamChains.find(c => c.taskId === id('Control')).path.length, 9);
+  const changes = await callTool(base, 'cg_changes', { id: id('target'), traceLimit: 1 });
+  assert.equal(changes.trace.upstreamTasks.length, 1);
+  const snapshotId = changes.snapshotId;
+  assert.equal((await compose({ snapshotId, changedFunctionIds: ['missing'] })).ok, false);
+  assert.equal((await callTool(base, 'cg_project', {})).comparison, null);
+  const result = await compose({ snapshotId, changedFunctionIds: [id('target')], selected: id('target') });
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.untracedIds, []);
+  assert.equal(result.eventId, null);
+  assert.deepEqual(result.page.roots.sort(), [id('Control'), id('Previous'), id('Tick')]);
+  const view = await postJson(base, '/api/view?down=0&up=0', result.page);
+  const states = Object.fromEntries(view.nodes.map(n => [n.name, n.change]));
+  assert.deepEqual([states.Control, states.Previous, states.Tick, states.hop4, states.target, states.fresh, states.gone],
+    ['added', 'deleted', 'existing', 'existing', 'modified', 'added', 'deleted']);
+  assert.equal(view.edges.find(e => e.from === id('hop0') && e.to === id('target')).change, 'existing');
+  assert.equal(view.edges.find(e => e.to === id('fresh')).change, 'added');
+  assert.equal(view.edges.find(e => e.to === id('gone')).change, 'deleted');
+  const removed = await callTool(base, 'cg_source', { id: id('gone') });
+  assert.equal(removed.traceVersion, 'before');
+  const append = await compose({ mode: 'add', snapshotId, changedFunctionIds: [id('idle')] });
+  assert.deepEqual(append.untracedIds, [id('idle')]);
+  assert.ok(append.page.revision > result.page.revision);
+  const stale = await postJson(base, '/api/page', result.page);
+  assert.equal(stale.ok, false);
+  assert.deepEqual((await (await fetch(base + '/api/page?saved=1')).json()).page.roots, append.page.roots);
+  const exit = await postJson(base, '/api/compare/exit', {});
+  assert.equal(exit.ok, true, exit.error);
+  assert.deepEqual((await callTool(base, 'cg_page', {})).page, original.page);
+  assert.equal((await compose({ snapshotId, changedFunctionIds: [id('target')] })).ok, false);
+});
+
+test('e2e：自动补齐的 TASK 链超过 80 项时，保留画布并允许显式选段', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-long-task-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true, maxRetries: 3 }));
+  const chain = ['void f0(void) {}'];
+  for (let i = 1; i < 80; i++) chain.push('void f' + i + '(void) { f' + (i - 1) + '(); }');
+  chain.push('TASK(Entry) { f79(); }');
+  fs.writeFileSync(path.join(directory, 'long.c'), chain.join('\n'));
+  const { baseUrl: base, close } = await launchServer({ target: directory });
+  t.after(close);
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const compose = data => callTool(base, 'cg_compose_view', { mode: 'replace', ...data });
+  const before = await callTool(base, 'cg_page', {});
+  const rejected = await compose({ changedFunctionIds: ['long.c::f0'] });
+  assert.match(rejected.error, /80/);
+  assert.deepEqual(await callTool(base, 'cg_page', {}), before);
+  const part = await compose({ changedFunctionIds: [], functionIds: ['long.c::Entry', 'long.c::f79'] });
+  assert.equal(part.ok, true, part.error);
 });
 
 test('e2e：追加入口独立展开，原入口保留原深度', async (t) => {
@@ -439,62 +517,93 @@ test('e2e：initialize → tools/call 全链路，写操作带 actor=ai，SVG �
   }
 });
 
-test('e2e：cg_annotate 框色受固定四色约束（非法拒、大小写归一、null 清除、导入清洗）', async () => {
-  const prevEnv = process.env.CALLGRAPH_MCP;
-  process.env.CALLGRAPH_MCP = 'readwrite';
+test('e2e：AI 按节点与关系独立着色，手工框色和会话导入兼容', async (t) => {
   const srv = await launchServer({ target: 'samples/tcu' });
-  try {
-    const base = srv.baseUrl;
-    const call = async (name, args, id) =>
-      await (
-        await fetch(base + '/mcp', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: rpc('tools/call', { name, arguments: args }, id),
-        })
-      ).json();
-    const nodeColor = async () => {
-      const v = await (await fetch(base + '/api/view?root=main.c::main')).json();
-      const n = v.nodes.find((x) => x.id === 'main.c::main');
-      return n ? n.color ?? null : 'missing';
-    };
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const nodeId = 'main.c::Task_10ms';
+  const edgeKey = 'main.c::SysTick_Handler->' + nodeId;
+  const annotate = (target, data) => callTool(base, 'cg_annotate', { ...target, data });
+  const view = () => callTool(base, 'cg_view', { root: 'main.c::SysTick_Handler', down: 1 });
+  const nodeOf = v => v.nodes.find(n => n.id === nodeId);
+  const edgeOf = v => v.edges.find(e => e.to === nodeId);
 
-    // 1) 规则外的颜色被拒，报错里给出四色清单
-    const denied = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: '#FF0000' } }, 1);
-    assert.equal(denied.result.isError, true, '非法颜色应返回错误');
-    assert.match(denied.result.content[0].text, /#CCFFCC/);
-    assert.equal(await nodeColor(), null, '被拒的写入不该落库');
-
-    // 2) 合法颜色（小写）归一成白名单大写
-    const ok = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: '#ffff99' } }, 2);
-    assert.equal(ok.result.isError, undefined);
-    assert.equal(await nodeColor(), '#FFFF99');
-
-    // 3) null 清除，回落 change 分类色
-    const clear = await call('cg_annotate', { nodeId: 'main.c::main', data: { color: null } }, 3);
-    assert.equal(clear.result.isError, undefined);
-    assert.equal(await nodeColor(), null);
-
-    // 4) .cgx 会话导入：规则外的颜色丢弃，合法的保留
-    const imp = await (
-      await fetch(base + '/api/session/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          format: 'tcu-callgraph-session',
-          version: 1,
-          overlay: { nodes: { 'main.c::main': { color: 'rebeccapurple', note: 'x' } } },
-          bookmarks: [],
-        }),
-      })
-    ).json();
-    assert.equal(imp.ok, true, '单条脏色不该让整个导入失败');
-    assert.equal(await nodeColor(), null, '导入的非法颜色应被丢弃');
-  } finally {
-    if (prevEnv === undefined) delete process.env.CALLGRAPH_MCP;
-    else process.env.CALLGRAPH_MCP = prevEnv;
-    await srv.close();
+  for (const color of ['#ff0000', '#ffff99', null]) {
+    assert.equal((await annotate({ nodeId }, { color })).ok, false);
   }
+  assert.equal((await annotate({ edgeKey }, { change: 'modified', note: '不应写入' })).ok, false);
+  assert.equal((await annotate({ edgeKey }, { color: '#D9303E' })).ok, false);
+  assert.equal((await postJson(base, '/api/overlay', { nodeId, data: { color: '#ffccff' } })).ok, true);
+  assert.equal((await annotate({ nodeId }, { note: '人工框色仍有效' })).ok, true);
+  assert.equal(nodeOf(await view()).color, '#FFCCFF');
+  assert.equal((await annotate({ nodeId }, { change: 'modified' })).ok, true);
+  const changed = await view();
+  assert.equal(nodeOf(changed).change, 'modified');
+  assert.equal(nodeOf(changed).color, undefined);
+  assert.equal(edgeOf(changed).change, 'existing');
+  for (const change of ['added', 'deleted', 'existing', null]) {
+    assert.equal((await annotate({ edgeKey }, { change })).ok, true);
+    assert.equal(edgeOf(await view()).change, change ?? 'existing');
+  }
+  const imp = await postJson(base, '/api/session/import', {
+    format: 'tcu-callgraph-session', version: 1,
+    overlay: { nodes: { [nodeId]: { color: 'rebeccapurple' }, 'main.c::SysTick_Handler': { color: '#CCFFCC' } } },
+  });
+  assert.equal(imp.ok, true);
+  const imported = await view();
+  assert.equal(nodeOf(imported).color, undefined);
+  assert.equal(imported.nodes.find(n => n.id === 'main.c::SysTick_Handler').color, '#CCFFCC');
+});
+
+test('e2e：MCP 拒绝单条和批量标签改色，变量关系按画布键和实际源码行着色', async t => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(srv.close);
+  const base = srv.baseUrl;
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const root = 'main.c::SysTick_Handler';
+  const edgeKey = root + '->main.c::Task_10ms';
+  const task = { preset: 'task', text: 'TASK:10ms', note: 'main.c:16' };
+  const write = args => callTool(base, 'cg_annotate', args);
+  assert.equal((await write({ edgeKey, data: { label: { ...task, border: null } } })).ok, false);
+  assert.equal((await write({ edgeKey, data: { labels: [{ preset: 'conn', color: '#2C2C2A' }] } })).ok, false);
+  const batch = await callTool(base, 'cg_apply_task_labels', { items: [
+    { ...task, edgeKey }, { edgeKey, preset: 'call', order: 1, border: '#C0392B' },
+  ] });
+  assert.equal(batch.ok, false);
+  const events = await (await fetch(base + '/api/events?detail=1')).json();
+  assert.ok(!events.events.some(event => event.actor === 'ai'));
+  assert.equal((await write({ edgeKey, data: { label: { ...task, border: '#2c2c2a' } } })).ok, true);
+
+  const source = await callTool(base, 'cg_source', { id: root });
+  const access = source.varAccess.find(a => a.name === 'g_tick');
+  const pair = root + '->' + access.id;
+  for (const [key, change] of [[pair + ':' + access.line, 'added'], [pair + ':0', 'existing']]) {
+    assert.equal((await write({ edgeKey: key, data: { change } })).ok, true);
+    const view = await (await fetch(base + '/api/view?' + new URLSearchParams({ root, vars: access.id }))).json();
+    assert.equal(view.edges.find(e => e.kind === 'var' && e.to === access.id).change, change);
+    const detail = await callTool(base, 'cg_node', { id: root });
+    assert.equal(detail.outEdges.find(e => e.to === access.id).change, change);
+  }
+  const orphans = await (await fetch(base + '/api/orphans')).json();
+  assert.ok(!orphans.annotations.some(a => a.id === pair + ':0'));
+
+  // 旧版 MCP 把变量边写在真实行号上。用画布键继续编辑，仍能保留原有备注与标签。
+  const caller = 'main.c::Task_100ms';
+  const oldAccess = (await callTool(base, 'cg_source', { id: caller })).varAccess.find(a => a.name === 'g_gearCtx');
+  const oldPair = caller + '->' + oldAccess.id;
+  const originalKey = oldPair + ':' + oldAccess.line;
+  assert.equal((await postJson(base, '/api/session/import', {
+    format: 'tcu-callgraph-session', version: 1,
+    overlay: { edges: { [originalKey]: { note: '保留旧备注', labels: [{ preset: 'conn', num: 7 }] } } },
+  })).ok, true);
+  assert.equal((await write({ edgeKey: oldPair + ':0', data: { change: 'added' } })).ok, true);
+  const legacyView = await (await fetch(base + '/api/view?' + new URLSearchParams({ root: caller, vars: oldAccess.id }))).json();
+  const visible = legacyView.edges.find(e => e.to === oldAccess.id);
+  assert.equal(visible.change, 'added');
+  assert.equal(visible.label.num, 7);
+  const saved = await (await fetch(base + '/api/events?detail=1')).json();
+  assert.equal(saved.events.find(e => e.target === originalKey && e.op === 'edge.annotate').after.note, '保留旧备注');
 });
 
 test('e2e：默认权限 readonly——写工具被拒、读与导出可用', async () => {

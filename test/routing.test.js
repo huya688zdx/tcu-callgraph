@@ -67,6 +67,32 @@ test('汇流不合并虚实线、不同颜色，也不覆盖手工折线', () =>
   assert.match(exportSvg({ nodes, edges }), /stroke-dasharray="7 4"[^>]*mk-var/);
 });
 
+test('导出保留定义的四色、既有调用的黑线和删除关系的中央标记', () => {
+  const nodes = [undefined, 'modified', 'added', 'deleted'].map((change, i) => ({
+    id: String(i), x: 120 * i, y: 0, w: 90, h: 40, change,
+  }));
+  const points = [[0, 40], [0, 50], [100, 50], [100, 80]];
+  const edges = [
+    { from: '0', to: '1', change: 'existing', kind: 'direct', points },
+    { from: '0', to: '2', change: 'added', kind: 'direct', points },
+    { from: '0', to: '3', change: 'deleted', kind: 'var', via: '写', points },
+  ];
+  for (const build of [exportSvg, buildSVGFromLayout]) {
+    const svg = build({ nodes, edges, width: 480, height: 160 });
+    for (const [i, color] of ['#CCFFCC', '#FFFF99', '#FFCCFF', '#BFBFBF'].entries()) {
+      assert.match(svg, new RegExp(`<g data-id="${i}"[^>]*>\\s*<rect [^>]*fill="${color}"`));
+    }
+    const paths = svg.match(/<path[^>]*data-from="0"[^>]*>/g);
+    assert.match(paths[0], /stroke="#2C2C2A"/);
+    assert.doesNotMatch(paths[0], /stroke-dasharray/);
+    assert.match(paths[1], /stroke="#D9303E"/);
+    assert.match(paths[2], /stroke="#2C2C2A"[^>]*stroke-dasharray/);
+    assert.equal(svg.match(/class="deleted-edge-mark"/g)?.length, 1);
+    // 全长 140，弧长中点是 (60, 50)，与中间线段的中点 (50, 50) 不同。
+    assert.match(svg, /class="deleted-edge-mark" d="M55 45L65 55M65 45L55 55"[^>]*stroke="#2C2C2A"/);
+  }
+});
+
 test('平行干线末端错开时延伸公共通道，接入分支且避开阻挡节点', () => {
   const nodes = [{ id: 's', x: 100, y: 0, w: 100, h: 40 },
     { id: 'a', x: 300, y: 500, w: 100, h: 40 }, { id: 'b', x: 500, y: 600, w: 100, h: 40 }];

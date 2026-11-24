@@ -78,6 +78,7 @@ function render() {
       <ul>
         <li>${t('ai.rule.source')}</li>
         <li>${t('ai.rule.functions')}</li>
+        <li>${t('ai.rule.colors')}</li>
         <li>${t('ai.rule.labels')}</li>
         <li>${t('ai.rule.history')}</li>
       </ul>

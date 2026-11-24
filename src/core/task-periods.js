@@ -72,18 +72,30 @@ function dividerCondition(parts, constant) {
 /** 按 C 语句确定分频分支范围，调用位置区分同一行的条件调用和无条件调用。 */
 function schedulingEvidence(fn, tokens, fileMacros, calls) {
   const increments = new Map();
+  const incrementLines = new Map();
   const writes = new Map();
   const dividers = [];
   const locals = new Set(fn.params || []);
   const staticLocals = new Set();
+  const shadowed = new Set();
   const resets = new Map();
   const callSites = new Set(calls.map(c => `${c.line}:${c.col}`));
   const guardAccess = tokens.some(t => irqOff.test(t.v) || enter.test(t.v)) ? new Map() : null;
   let bypass = false;
-  const recordIncrement = counter => increments.set(counter, (increments.get(counter) || 0) + 1);
+  let blockDepth = 0;
+  const recordIncrement = (counter, lines) => {
+    increments.set(counter, (increments.get(counter) || 0) + 1);
+    incrementLines.set(counter, lines);
+  };
   const recordWrite = counter => writes.set(counter, (writes.get(counter) || 0) + 1);
   const numberAt = (parts, index) => numericConstant(parts, name => fileMacros?.get(name, tokens[index].line), fn.file);
   const value = i => tokens[i]?.v;
+  const recordWrites = (first, last) => {
+    for (let k = first; k < last; k++) {
+      if (tokens[k].t !== 'id' || ['.', '->'].includes(value(k - 1))) continue;
+      if (counterWrites.has(value(k + 1)) || ['++', '--'].includes(value(k - 1))) recordWrite(value(k));
+    }
+  };
   const visit = (i, end, depth, guards, locks, jumps) => {
     while (i < end) i = statement(i, end, depth, guards, locks, jumps);
   };
@@ -125,21 +137,24 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
     if (op === '{') {
       const close = matchBrace(tokens, i);
       if (close < 0) return end;
+      blockDepth++;
       visit(i + 1, close, depth, guards, locks, jumps);
+      blockDepth--;
       return close + 1;
     }
     if (['if', 'for', 'while', 'switch'].includes(op) && value(i + 1) === '(') {
       const [args, start] = collectArgs(tokens, i + 1);
       recordAccess(i + 2, Math.min(start - 1, end), guards, locks);
+      recordWrites(i + 2, Math.min(start - 1, end));
       let gate = op === 'if' && args.length === 1 ? dividerCondition(args[0], p => numberAt(p, i)) : null;
       if (gate?.reset) {
-        recordWrite(gate.counter);
         const close = value(start) === '{' ? matchBrace(tokens, start) : start;
         // 清零必须是进入该分支后执行的首条语句。
         const reset = close > start && value(start + 1) === gate.counter && value(start + 2) === '=' &&
           numberAt([value(start + 3)], start) === 0 && value(start + 4) === ';';
-        if (reset && !depth && !bypass) {
-          recordIncrement(gate.counter);
+        if (reset && !depth && !bypass && !tokens[i].cond) {
+          const increment = args[0].find(t => t.v === gate.counter);
+          recordIncrement(gate.counter, [increment.line, tokens[start + 1].line]);
           resets.set(gate.counter, gate.divider);
         }
         else gate = null;
@@ -175,6 +190,7 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
       if (value(next) !== 'while' || value(next + 1) !== '(') return next;
       const [, after] = collectArgs(tokens, next + 1);
       recordAccess(next + 2, Math.min(after - 1, end), guards, locks);
+      recordWrites(next + 2, Math.min(after - 1, end));
       mergeLocks(locks, locks, ...loopJumps.break);
       return value(after) === ';' ? after + 1 : after;
     }
@@ -192,20 +208,17 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
     const declaration = lhs.length >= 2 && id.test(lhs.at(-1)) &&
       lhs.every(word => id.test(word) || word === '*') && !['return', 'goto', 'case'].includes(lhs[0]);
     if (declaration) {
+      // 内层同名声明可能与分频条件指向不同对象，不能用函数范围的名称配对。
+      if (depth || blockDepth || locals.has(lhs.at(-1))) shadowed.add(lhs.at(-1));
       locals.add(lhs.at(-1));
       if (lhs.includes('static')) staticLocals.add(lhs.at(-1));
-    } else {
-      for (let k = i; k < stop; k++) {
-        if (tokens[k].t !== 'id' || ['.', '->'].includes(value(k - 1))) continue;
-        if (counterWrites.has(value(k + 1)) || ['++', '--'].includes(value(k - 1))) {
-          recordWrite(value(k));
-        }
-      }
-    }
-    if (!depth && !bypass) {
-      if (parts.length === 2 && parts[0] === '++' && id.test(parts[1])) recordIncrement(parts[1]);
-      if (parts.length === 2 && parts[1] === '++' && id.test(parts[0])) recordIncrement(parts[0]);
-      if (parts[1] === '+=' && id.test(parts[0]) && numberAt(parts.slice(2), i) === 1) recordIncrement(parts[0]);
+      // 初始化表达式也可能给已有计数器赋值。
+      recordWrites(i + lhs.length + 1, stop);
+    } else recordWrites(i, stop);
+    if (!depth && !bypass && !tokens[i].cond) {
+      if (parts.length === 2 && parts[0] === '++' && id.test(parts[1])) recordIncrement(parts[1], [tokens[i + 1].line]);
+      if (parts.length === 2 && parts[1] === '++' && id.test(parts[0])) recordIncrement(parts[0], [tokens[i].line]);
+      if (parts[1] === '+=' && id.test(parts[0]) && numberAt(parts.slice(2), i) === 1) recordIncrement(parts[0], [tokens[i].line]);
     }
     if (parts.some(word => ['return', 'goto'].includes(word))) bypass = true;
     recordAccess(i, stop, guards, locks);
@@ -243,9 +256,9 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
   visit(0, tokens.length, 0, [], new Map());
   const bindLocal = gate => ({ ...gate, local: locals.has(gate.counter) });
   const counterIncrements = [...increments].filter(([counter, count]) =>
-    count === 1 && writes.get(counter) === (resets.has(counter) ? 2 : 1) &&
+    count === 1 && !shadowed.has(counter) && writes.get(counter) === (resets.has(counter) ? 2 : 1) &&
     (!locals.has(counter) || staticLocals.has(counter)))
-    .map(([counter]) => bindLocal({ counter, resetDivider: resets.get(counter) }));
+    .map(([counter]) => bindLocal({ counter, lines: incrementLines.get(counter), resetDivider: resets.get(counter) }));
   const callDividers = dividers.map(({ line, col, gates }) => ({ line, col, gates: gates.map(({ version, ...gate }) => bindLocal(gate)) }));
   const criticalAccess = guardAccess && [...guardAccess].flatMap(([name, lines]) => {
     const guarded = [...lines].filter(([, protectedLine]) => protectedLine).map(([line]) => line);
@@ -379,11 +392,13 @@ export function projectTasks(model) {
     const interval = taskDelays.length
       ? delayInterval(fn, loopDelays.length ? loopDelays : taskDelays, macros, cmsisMillis.has(fn.file))
       : fn.delayInterval;
-    const origin = fn.taskRegistration || (fn.taskDeclaration ? `TASK(${name}) 定义`
+    const origin = fn.taskRegistration || (fn.isrDeclaration ? `中断入口声明 · ${name}` : fn.taskDeclaration ? `TASK(${name}) 定义`
       : loopDelays.length ? '循环任务' : '入口函数名');
     const nominal = interval?.us ?? (Number.isSafeInteger(value) && value > 0 ? value : null);
     const priority = rows.reduce((max, row) => Math.max(max, row.priority || 0), 0);
     const selected = rows.filter(row => (row.priority || 0) === priority);
+    const evidence = selected.length || fn.taskRegistration || fn.isrDeclaration || fn.taskDeclaration || loopDelays.length
+      ? 'source' : 'name-hint';
     const seen = new Set();
     for (const row of selected.length ? selected : [{ us: nominal, source: interval ? origin + ' · ' + interval.evidence : origin }]) {
       const us = row.us ?? nominal;
@@ -391,7 +406,7 @@ export function projectTasks(model) {
       const key = `${entryKind}:${us}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      tasks.push({ id: fn.id, name: fn.name, file: fn.file, line: fn.line, us, kind: entryKind, source: row.source });
+      tasks.push({ id: fn.id, name: fn.name, file: fn.file, line: fn.line, us, kind: entryKind, source: row.source, evidence });
     }
   }
   tasks.sort((a, b) => (a.us ?? Infinity) - (b.us ?? Infinity) || a.id.localeCompare(b.id));
@@ -407,8 +422,14 @@ function lcm(a, b) {
 const contextOrder = (a, b) => (a.us ?? Infinity) - (b.us ?? Infinity) || a.task.localeCompare(b.task);
 const contextKey = c => `${c.task}:${c.kind}:${c.us}`;
 
+/** 只有全局计数器的分频需要全工程写者证据，局部静态计数不触发按需 AST。 */
+export function needsCounterAnalysis(model) {
+  return !model._df && model.functions.some(fn => fn.callDividers?.some(site => site.gates.some(g => !g.local)));
+}
+
 export function taskPeriods(model) {
-  if (cache.has(model)) return cache.get(model);
+  const cached = cache.get(model);
+  if (cached && cached.df === model._df) return cached.contexts;
   const collected = new Map();
   const tasks = projectTasks(model);
   const byEntry = new Map();
@@ -417,10 +438,25 @@ export function taskPeriods(model) {
     byEntry.get(task.id).push(task);
   }
   const tickOwners = new Map();
+  const ownIncrements = new Map();
+  const df = model._df;
+  const complete = df?.fnAccess && !df.failedFiles && !model.warnings?.length &&
+    model.functions.every(fn => df.fnAccess.has(fn.id));
   const gatesByFn = new Map();
   for (const fn of model.functions) {
     for (const inc of fn.counterIncrements || []) {
-      if (!inc.variable || inc.resetDivider) continue;
+      if (!inc.local) {
+        if (!complete || !inc.variable) continue;
+        const writers = df.writers.get(inc.variable);
+        const write = df.fnAccess.get(fn.id)?.writes.get(inc.variable);
+        const definition = df.byId.get(inc.variable);
+        // 只认实际绑定的变量和完整写者集，未解析的取地址写入也会打断分频。
+        if (!definition || definition.isExtern || writers?.size !== 1 || !writers.has(fn.id) ||
+            !write || write.indirect || !inc.lines || [...write.lines].some(line => !inc.lines.includes(line))) continue;
+      }
+      if (!ownIncrements.has(fn.id)) ownIncrements.set(fn.id, []);
+      ownIncrements.get(fn.id).push(inc);
+      if (inc.local || inc.resetDivider) continue;
       if (!tickOwners.has(inc.variable)) tickOwners.set(inc.variable, []);
       tickOwners.get(inc.variable).push(fn.id);
     }
@@ -457,7 +493,7 @@ export function taskPeriods(model) {
         let us = source?.us, tick;
         const evidence = [];
         for (const gate of gates) {
-          const own = fn.counterIncrements?.some(inc => inc.counter === gate.counter && inc.local === gate.local &&
+          const own = ownIncrements.get(fn.id)?.some(inc => inc.counter === gate.counter && inc.local === gate.local &&
             (!inc.resetDivider || gate.reset));
           const owner = !own && !gate.local && ticks.get(gate.variable);
           const basis = own ? source?.us : owner?.us;
@@ -510,7 +546,7 @@ export function taskPeriods(model) {
     }
     return [id, [...unique.values()].sort(contextOrder)];
   }));
-  cache.set(model, contexts);
+  cache.set(model, { df, contexts });
   return contexts;
 }
 

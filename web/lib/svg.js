@@ -7,7 +7,7 @@ import { t } from '../i18n.js';
 import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
 import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from './period-text.js';
-import { labelSvg } from '/core/labels.js';
+import { deletedEdgeMarkSvg, labelSvg } from '/core/labels.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
@@ -99,11 +99,7 @@ function buildSVG() {
     out.push(
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash}${svgMarkers(e, mk)} data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
-    if (e.change === 'deleted' && e.points?.length > 1) {
-      const i = Math.max(1, Math.floor(e.points.length / 2));
-      const a = e.points[i - 1], b = e.points[i], x = (a[0] + b[0]) / 2, y = (a[1] + b[1]) / 2, s = 5;
-      out.push(`<path d="M${x - s} ${y - s}L${x + s} ${y + s}M${x + s} ${y - s}L${x - s} ${y + s}" stroke="${c}" stroke-width="2.2"/>`);
-    }
+    if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 
   for (const n of v.nodes) {

@@ -107,7 +107,7 @@ function sourceLocations(root, unit, files) {
 function fingerprintAST(node) {
   const hash = createHash('sha256');
   for (const n of walk(node)) hash.update(JSON.stringify([
-    n.kind, n.name, n.opcode, n.value, n.castKind, n.referencedDecl?.name, typeOf(n),
+    n.kind, n.name, n.opcode, n.isPostfix, n.value, n.castKind, n.referencedDecl?.name, typeOf(n),
     children(n).length, n.array_filler?.length,
   ]));
   return hash.digest('hex');

@@ -406,10 +406,12 @@ export function collectAccesses(fnNode, isGlobal, { bindings = new Map(), resolv
       }
       case 'declaration': {
         // 局部声明：收集变量名与「指向全局」的别名
+        const blockExtern = n.namedChildren.some(c => c.type === 'storage_class_specifier' && c.text === 'extern');
         for (const d of n.namedChildren.filter((c) => DECL_NODES.has(c.type))) {
           const nm = declaratorName(d);
           if (!nm) continue;
-          locals.add(nm);
+          if (blockExtern) locals.delete(nm);
+          else locals.add(nm);
           aliases.delete(nm);
           if (d.type === 'init_declarator' && d.childForFieldName('declarator')?.type === 'pointer_declarator') {
             const init = d.childForFieldName('value');

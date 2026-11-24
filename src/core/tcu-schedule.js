@@ -5,6 +5,11 @@ import { matchBrace } from './extract.js';
 
 const MAX_CONFIG_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
+export function addScheduleBytes(total, size) {
+  if (size > MAX_CONFIG_BYTES) throw new Error('调度配置超过 8 MiB');
+  if (size > MAX_TOTAL_BYTES - total) throw new Error('调度配置累计超过 32 MiB');
+  return total + size;
+}
 const scheduleName = /sched|task|cyclic|period|rate|table/i;
 const periodField = /period|interval|cycle|rate|tick|^(?:ms|us)$/i;
 const identifier = /^[A-Za-z_]\w*$/;
@@ -202,13 +207,11 @@ function arxmlSchedule(runnables, events) {
   });
 }
 
-export function scheduleConfig(model) {
-  if (model.scheduleConfig) return model.scheduleConfig;
-  const rows = [];
-  const runnables = [], events = [];
-  const warnings = [];
-  let tickUs, bytes = 0;
-  const pending = typeof model.root === 'string' && model.root ? [model.root] : [];
+export const isScheduleFile = file => file === 'tcu-schedule.json' || /\.(?:oil|arxml)$/i.test(file);
+
+export function listScheduleFiles(root) {
+  const files = new Map();
+  const pending = typeof root === 'string' && root ? [root] : [];
   while (pending.length) {
     const dir = pending.pop();
     let entries;
@@ -216,42 +219,50 @@ export function scheduleConfig(model) {
     for (const entry of entries) {
       if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
       const abs = path.join(dir, entry.name);
-      const file = path.relative(model.root, abs).split(path.sep).join('/');
-      const ext = path.extname(file).toLowerCase();
-      if (!['.oil', '.arxml'].includes(ext) && file !== 'tcu-schedule.json') {
-        if (entry.isDirectory()) pending.push(abs);
-        continue;
-      }
-      try {
-        const stat = fs.statSync(abs);
-        if (!entry.isFile() || !stat.isFile()) throw new Error('调度配置必须是普通文件');
-        if (stat.size > MAX_CONFIG_BYTES) throw new Error('调度配置超过 8 MiB');
-        if (stat.size > MAX_TOTAL_BYTES - bytes) throw new Error('调度配置累计超过 32 MiB');
-        bytes += stat.size;
-        const text = fs.readFileSync(abs, 'utf8').replace(/^\uFEFF/, '');
-        if (ext === '.oil') {
-          for (const row of oilSchedule(text, file)) rows.push(row);
-        } else if (ext === '.arxml') {
-          const fileRunnables = [], fileEvents = [];
-          collectArxml(text, file, fileRunnables, fileEvents);
-          for (const runnable of fileRunnables) runnables.push(runnable);
-          for (const event of fileEvents) events.push(event);
-        } else {
-          const config = JSON.parse(text);
-          if (validUs(config?.tickUs)) tickUs = config.tickUs;
-          for (const task of Array.isArray(config?.tasks) ? config.tasks : []) {
-            if (!task || typeof task.name !== 'string') continue;
-            const us = task.periodUs ?? (typeof task.periodMs === 'number' ? Math.round(task.periodMs * 1000) : NaN);
-            if (!validUs(us) && task.kind !== 'isr') continue;
-            rows.push({ name: task.name, file: task.file, us: validUs(us) ? us : null, kind: task.kind,
-              source: file, priority: 2 });
-          }
+      const file = path.relative(root, abs).split(path.sep).join('/');
+      if (isScheduleFile(file)) files.set(file, abs);
+      else if (entry.isDirectory()) pending.push(abs);
+    }
+  }
+  return files;
+}
+
+export function readScheduleFiles(files) {
+  const rows = [], runnables = [], events = [], warnings = [];
+  let tickUs, bytes = 0;
+  for (const [file, abs] of files) {
+    const ext = path.extname(file).toLowerCase();
+    try {
+      const stat = fs.lstatSync(abs);
+      if (!stat.isFile()) throw new Error('调度配置必须是普通文件');
+      bytes = addScheduleBytes(bytes, stat.size);
+      const text = fs.readFileSync(abs, 'utf8').replace(/^\uFEFF/, '');
+      if (ext === '.oil') {
+        for (const row of oilSchedule(text, file)) rows.push(row);
+      } else if (ext === '.arxml') {
+        const fileRunnables = [], fileEvents = [];
+        collectArxml(text, file, fileRunnables, fileEvents);
+        for (const runnable of fileRunnables) runnables.push(runnable);
+        for (const event of fileEvents) events.push(event);
+      } else {
+        const config = JSON.parse(text);
+        if (validUs(config?.tickUs)) tickUs = config.tickUs;
+        for (const task of Array.isArray(config?.tasks) ? config.tasks : []) {
+          if (!task || typeof task.name !== 'string') continue;
+          const us = task.periodUs ?? (typeof task.periodMs === 'number' ? Math.round(task.periodMs * 1000) : NaN);
+          if (!validUs(us) && task.kind !== 'isr') continue;
+          rows.push({ name: task.name, file: task.file, us: validUs(us) ? us : null, kind: task.kind,
+            source: file, priority: 2 });
         }
-      } catch (error) {
-        warnings.push({ file, error: error.message });
       }
+    } catch (error) {
+      warnings.push({ file, error: error.message });
     }
   }
   for (const row of arxmlSchedule(runnables, events)) rows.push(row);
-  return (model.scheduleConfig = { rows, tickUs, warnings });
+  return { rows, tickUs, warnings };
+}
+
+export function scheduleConfig(model) {
+  return model.scheduleConfig ??= readScheduleFiles(listScheduleFiles(model.root));
 }

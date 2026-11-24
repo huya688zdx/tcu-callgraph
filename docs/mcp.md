@@ -71,12 +71,11 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 
 配套的 `cg_page` 工具读取「用户正在看什么」：入口函数、展开深度、布局模式、选中的节点/连线、
 是否在回看历史。页面状态变化后上报 `POST /api/page`，最新的普通工程视图按工程保存。
-AI 组图会另记一条 `view.compose` 事件。可使用画布返回键恢复上一个视图，使用时间轴恢复历史标注。
+普通工程的 AI 组图会另记一条 `view.compose` 事件。可使用画布返回键恢复上一个视图，使用时间轴恢复历史标注。比较组图保存在当前比较会话中，退出比较可恢复原画布。
 
 ## 工具清单
 
-前缀 `cg_`。所有写操作在时间轴里以 `actor=ai` 记录，与人工改动可区分、可恢复；
-时间轴界面上 AI 的事件带紫色「AI」徽标。
+工具名使用 `cg_` 前缀。写入普通工程的画布和标注变更在时间轴以 `actor=ai` 记录，界面显示紫色「AI」徽标。
 
 ### 读
 | 工具 | 说明 |
@@ -88,8 +87,9 @@ AI 组图会另记一条 `view.compose` 事件。可使用画布返回键恢复�
 | `cg_search` | 按函数名搜索，拿函数 id |
 | `cg_detect_tasks` | 服务端扫源码找 TASK 周期 / コール順 建议（带证据，不落库） |
 | `cg_view` | 取视图：带坐标的节点 + 路由后的连线 + 分组框（与界面同一份数据） |
-| `cg_node` | 单函数详情：签名、入出边、已有标注 |
-| `cg_source` | 读取当前工程的源码片段。按函数 ID 查询时附带任务周期、调用边和全局变量读写 |
+| `cg_node` / `cg_source` | 查看函数详情或源码。按函数 ID 查询时附带上游 TASK / ISR 入口与调用链 |
+| `cg_trace_to_task` | 沿工程已解析的调用关系反向查找 TASK / ISR。每个可达入口提供一条最短证据链，可分页 |
+| `cg_changes` | 已应用目录或 Git 比较时读取该比较的变更分类。普通 Git 工程默认比较 HEAD 与工作区 |
 | `cg_vars` / `cg_shared_vars` | 全局变量清单 / 多函数共享的变量 |
 | `cg_dataflow` | 数据流分析（dir=in/out） |
 | `cg_orphans` | 失效标注清单 |
@@ -99,9 +99,9 @@ AI 组图会另记一条 `view.compose` 事件。可使用画布返回键恢复�
 | 工具 | 说明 |
 | --- | --- |
 | `cg_switch` | 切换工程（按 id 或路径） |
-| `cg_compose_view` | 精选入口、函数和全局变量，替换或追加到当前画布 |
+| `cg_compose_view` | 精选入口、函数和全局变量，或用 `changedFunctionIds` 将修改函数及其入口路径加入当前画布 |
 | `cg_apply_task_labels` | 批量写 TASK、コール順 或 結合点 标签，默认保留其他类型的标签 |
-| `cg_annotate` | 节点/连线标注：note、color（**固定四色** #CCFFCC/#FFFF99/#FFCCFF/#BFBFBF，即既存/変更/追加/削除，非法值拒收）、tag、change(既存/変更/追加/削除)、labels（**一线多条**连线标签数组，整组替换；结合点编号不给自动分配，note=第二行说明小字） |
+| `cg_annotate` | 用 `change` 标注节点四态或连线三态，用 `note` 说明依据。连线的 `labels` 整组替换，TASK、結合点与コール順使用各自预设的边框和文字色 |
 | `cg_delete` | 隐藏/恢复函数与连线（不动源码）；clear=true 全部恢复 |
 | `cg_save_layout` | 保存手工连线（节点与路径由 ELK 排版） |
 
@@ -116,20 +116,24 @@ AI 组图会另记一条 `view.compose` 事件。可使用画布返回键恢复�
 
 ## AI 组图与标注
 
-1. 先用 `cg_page` 对齐当前画布，再用 `cg_source` 核实实际 C 代码。`cg_node`、`cg_dataflow` 和 `cg_detect_tasks` 可辅助确认调用关系、周期和数据流。
-2. 用 `cg_compose_view` 筛选核心函数和相关全局变量，通常选 5–40 个函数。提交前核对 ID。
-3. 用 `cg_apply_task_labels` 写标签。TASK 文字带周期，如 `10ms TASK`，`note` 写源码文件、行号和依据。每个调用方按核实过的执行顺序从 `コール順1` 连续编号。遇到执行顺序不明的分支或表达式，只写有依据的标签。
-4. 节点分类遵循固定语义。`existing` 为既存绿，`modified` 为変更黄，`added` 为追加粉，`deleted` 为削除灰。
+1. 先用 `cg_page` 确认画布，用 `cg_changes` 读取变更及比较基准。当前模型中的修改函数用 `cg_trace_to_task` 回溯，读取 `upstreamTasks` 和 `upstreamChains`。尚未入图的 Git 快照用 `cg_changes({ snapshotId, id })` 回溯，同样的入口与路径位于结果的 `trace` 内。每个入口对应一条从 TASK / ISR 到目标的最短路径，路径内保留中间函数。
+2. 在比较中，用 `version` 分别回溯函数实际存在的 `before` 和 `after` 版本，再用同版本的 `cg_source` 对照调度定义和各段调用的文件、行号。多个周期可达同一函数时逐个报告。缺少入口、间接调用目标待核实，或 `traceTruncated` 提示结果受限时，说明证据边界。普通无调用方函数只能作为回溯线索。
+3. 用 `cg_compose_view` 的 `changedFunctionIds` 提交修改函数。比较模式按前后版本各自的调用图补齐入口路径，共用节点只显示一次。直接新增或删除的调用、变量读写关系也会补齐另一端。可再用 `vars` 指定其余所需的全局变量。向已有画面追加时传 `mode: "add"`。比较会话内的组图只作用于该比较画布。
+   在普通 Git 工程，从 `cg_changes` 取 `snapshotId`，将它连同 `mode: "replace"` 和 `changedFunctionIds` 传给 `cg_compose_view`。这会在临时比较画布显示该快照计算的节点与连线状态，包括已删除的关系。退出比较即可恢复普通工程画布。
+4. 按变更证据独立判断节点与连线。节点自身定义未变用既存绿 `#CCFFCC`，定义实质修改用黄 `#FFFF99`，新增用粉 `#FFCCFF`，删除用灰 `#BFBFBF`。连线按调用或变量读写关系的前后差异分类，既有用黑 `#2C2C2A`，新增用红 `#D9303E`，删除用黑线加 ✕。调用画实线，变量访问画虚线。例如只改被调函数中的运算时，该函数为黄色，上游未改的 TASK 仍为绿色，两者间既有调用仍为黑线。
+5. 用 `cg_apply_task_labels` 写入有证据的调度周期。TASK 文字含周期，如 `10ms TASK`，`note` 写文件、行号和依据。同一调用方按已确认的执行顺序从 `コール順1` 连续编号，未知周期、条件分支或顺序在说明中列出。TASK 用黑框黑字，結合点用红框红字，コール順 用无框黑字。
 
 ### 参数和服务端校验
 
 | 工具 | 参数与校验 |
 | --- | --- |
-| `cg_source` → `GET /api/source` | 传 `{ id }` 或 `{ file, startLine, endLine }`。行号从 1 开始，每次最多返回 250 行，超出部分用 `truncated` 提示。只允许当前工程内已索引的源码文件，解析后的实际路径也必须位于工程根目录内。按 ID 查询时返回 `taskPeriods`、`calls` 和 `varAccess`。 |
-| `cg_compose_view` → `POST /api/mcp-compose` | 传 `mode: "replace"` 或 `"add"`，可选 `roots`、`functionIds`、`up`、`down`、`vars`、`selected` 和 `reason`。`roots` 与 `functionIds` 合计提交 1–80 项，深度必须为 0–5 的整数。服务端校验所有传入 ID，拒绝外部虚拟节点，并返回无效 ID 列表。 |
+| `cg_source` → `GET /api/source` | 传 `{ id }` 或 `{ file, startLine, endLine }`。行号从 1 开始，每次最多 250 行，超出用 `truncated` 提示。仅可读取当前工程或比较版本中已索引的源码。按 ID 查询还返回 `taskPeriods`、`calls`、`varAccess` 及上游回溯结果。 |
+| `cg_trace_to_task` → `GET /api/trace-to-task` | 传函数 `id`，用 `offset` 和 `limit` 翻页。比较中可用 `version` 指定 `before` 或 `after`。默认查 `after`，已删除的函数查 `before`。每次回溯只使用一个版本的边。 |
+| `cg_changes` → `GET /api/mcp-changes` | 首次可传 Git 的 `baseRef`、`targetRef`。后续带 `snapshotId` 和 `offset` 从同一快照继续读变更。查询指定函数时，`trace.nextOffset` 对应下一次请求的 `traceOffset`。状态字段 `detectedChange` 给出自动判断，`change` 包含比较中已有的人工调整。 |
+| `cg_compose_view` → `POST /api/mcp-compose` | `roots`、`functionIds`、`changedFunctionIds` 合计提交 1–80 项，可指定 `snapshotId`、`vars`、`selected`、`reason`。额外展开深度 `up`、`down` 取 0–5 的整数。自动加入的完整入口链超过 80 个函数时，按入口分批显式提交所选 `functionIds` 并传 `changedFunctionIds: []`。 |
 | `cg_apply_task_labels` → `POST /api/mcp-task-labels` | 传 `{ items, merge? }`，每条含 `edgeKey`、`preset`，可带 `text`、`order`、`note`。`from->to` 会解析为画布采用的真实边，给出 `:line` 可指定具体调用。TASK 文字必填，样式取自预设。コール順 接受正整数 `order` 或 `コール順N`，同一调用方的批内或已有可见标签重号时整批拒绝。`merge: false` 会替换本批涉及的边上的整组标签。 |
 
-画布更新及标签变更以 `actor: "ai"` 写入时间轴。标注摘要显示实际标签文字，重复提交相同的标注不会产生新事件。
+标注事件的摘要显示实际标签文字，重复提交相同的标注不会产生新事件。
 
 ## 架构说明
 

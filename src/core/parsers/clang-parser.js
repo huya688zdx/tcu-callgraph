@@ -11,6 +11,7 @@ import { children, fnRef, functionModel, functionSignature, pointerExpression, p
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
 import { lex } from '../lexer.js';
+import { fingerprint } from '../source-fingerprint.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
 import { applyTaskEvidence, collectTaskEvidence } from '../task-periods.js';
 import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
@@ -305,5 +306,6 @@ export const clangParser = {
   available: (options = {}) => typeof options.execClang === 'function'
     ? { ok: true, version: 'injected', reason: null } : detectClang(options.clangBin),
   cacheKey: clangCacheKey,
+  fingerprint,
   parse: parseClang,
 };

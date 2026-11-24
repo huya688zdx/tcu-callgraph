@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
 import { getParser, collectDefinitions, collectFunctions, declaratorName } from '../cparse.js';
 import { lex } from '../lexer.js';
+import { fingerprint } from '../source-fingerprint.js';
 import { expandSeq } from '../preproc.js';
 import { analysisSources } from './builtin-dataflow.js';
 
-export const fingerprint = (text) => createHash('sha256').update(JSON.stringify(lex(text).flatMap((t) =>
-  t.t === 'preproc' ? lex(t.v.slice(1)).map((p) => [p.t, p.v]) : [[t.t, t.v]]))).digest('hex');
+export { fingerprint };
 const unionKeys = (a, b) => new Set([...a.keys(), ...b.keys()]);
 const earlyExits = new Set(['return_statement', 'break_statement', 'continue_statement', 'goto_statement']);
 const loops = new Set(['for_statement', 'while_statement', 'do_statement']);

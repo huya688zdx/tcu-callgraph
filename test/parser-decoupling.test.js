@@ -225,6 +225,33 @@ test('工程比较直接复用 Clang 图，编译前后两个独立源码映射'
   assert.equal(result.model._index.byId.get(fn('Read')).change, 'modified');
 });
 
+test('Clang 比较忽略排版和注释，前后置自增互换会影响共享变量的读取者', async t => {
+  const { dir } = project(t), before = temporary(t), after = temporary(t);
+  const source = fs.readFileSync(path.join(dir, 'fixture.c'), 'utf8');
+  const old = source.replace('g_state.count = x;', 'g_state.count=x++;');
+  const updated = old.replace('g_state.count=x++;', 'g_state.count=++x;')
+    .replace('int Read(void) { return g_state.count; }', 'int Read(void){return/**/g_state.count;}');
+  fs.writeFileSync(path.join(before, 'fixture.c'), old);
+  fs.writeFileSync(path.join(after, 'fixture.c'), updated);
+  const result = await compareProjects(dir, before, after, {
+    parserId: 'clang-ast', parserOptions: { execClang: file => {
+      // 等长替换保留原夹具的定义范围；按版本提供 Clang 对自增表达式的表示。
+      const ast = JSON.parse(fs.readFileSync(astFile, 'utf8'));
+      const body = ast.inner.find(n => n.name === 'Enter_A').inner.find(n => n.kind === 'CompoundStmt');
+      const rhs = body.inner[0].inner[1];
+      delete rhs.castKind;
+      Object.assign(rhs, { kind: 'UnaryOperator', opcode: '++', isPostfix: fs.readFileSync(file, 'utf8').includes('g_state.count=x++;') });
+      return ast;
+    } },
+  });
+  const writer = result.model._index.byId.get(fn('Enter_A'));
+  const reader = result.model._index.byId.get(fn('Read'));
+  assert.equal(writer.change, 'modified');
+  assert.equal(reader.change, 'existing');
+  assert.equal(reader.impactRole, 'dataflow_impact');
+  assert.ok(reader.impactChainIds.includes(writer.id));
+});
+
 test('双目录与 Git 比较分析编译数据库未登记的新 C 文件，失败时拒绝发布', async t => {
   const { dir } = project(t);
   const before = temporary(t), after = temporary(t);

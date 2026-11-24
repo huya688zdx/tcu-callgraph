@@ -11,7 +11,7 @@ import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
-import { displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
+import { deletedEdgeMarkSvg, displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
 import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function layoutExportEdgeLabels(view) {
@@ -55,6 +55,11 @@ const CHANGE_FILL = {
 
 /** 只接受 #RRGGBB：标注里的自定义颜色会被浏览器直接打开，必须挡掉注入 */
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+export function exportNodeFill(node) {
+  if (HEX_COLOR.test(node.color || '')) return node.color;
+  return node.external ? '#FAFAF7' : CHANGE_FILL[node.change] || CHANGE_FILL.existing;
+}
 
 const esc = (s) =>
   String(s)
@@ -173,6 +178,7 @@ export function exportSvg(view, { title = '' } = {}) {
     out.push(
       `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
+    if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 
   for (const { label, rect } of labelRects) out.push(labelSvg(label, rect));
@@ -180,13 +186,7 @@ export function exportSvg(view, { title = '' } = {}) {
   for (const n of v.nodes || []) {
     const period = periodSubtitle(n);
     out.push(`<g data-id="${esc(n.id)}">`);
-    // 与画布保持一致：按变更分类上色；自定义颜色只认 #RRGGBB
-    const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
-    const fill =
-      custom ||
-      (n.external
-        ? '#FAFAF7'
-        : CHANGE_FILL[n.change] || CHANGE_FILL.existing);
+    const fill = exportNodeFill(n);
     out.push(
       `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="#3A3A36" stroke-width="1"${n.kind === 'var' ? '' : ' stroke-dasharray="5 3"'}/>`
     );

@@ -9,9 +9,10 @@ import { stats } from './index.js';
 import { layoutElk } from './layout-elk.js';
 import { roundedPathD } from './routing.js';
 import { callNumbers, callSequence } from './call-sequence.js';
-import { withTaskPeriods } from './task-periods.js';
-import { layoutExportEdgeLabels } from './export-svg.js';
-import { LABEL_PRESETS, labelSvg } from './labels.js';
+import { needsCounterAnalysis, withTaskPeriods } from './task-periods.js';
+import { buildDataflowIndex } from './dataflow.js';
+import { exportNodeFill, layoutExportEdgeLabels } from './export-svg.js';
+import { deletedEdgeMarkSvg, LABEL_PRESETS, labelSvg } from './labels.js';
 import { nodePeriodBadge, periodBadgeSvg, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function buildSVGFromLayout(laid) {
@@ -50,13 +51,14 @@ export function buildSVGFromLayout(laid) {
     out.push(
       `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
     );
+    if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 
   for (const n of laid.nodes) {
     const period = periodSubtitle(n);
     out.push(`<g data-id="${esc(n.id)}" data-name="${esc(n.displayName || n.name)}">`);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${{existing:'#CCFFCC',modified:'#FFFF99',added:'#FFCCFF',deleted:'#BFBFBF'}[n.change] || '#fff'}" stroke="#B5D4F4" stroke-width="1"/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(exportNodeFill(n))}" stroke="#B5D4F4" stroke-width="1"/>`
     );
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 - 7).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" font-size="12.5" font-weight="500" fill="#2C2C2A">${esc(n.displayName || n.name)}</text>`
@@ -98,6 +100,7 @@ export function publicNode({ sourceText, semanticFingerprint, bodyTokens, ...nod
 }
 
 async function layoutForExport(model, { root, ...opts }) {
+  if (needsCounterAnalysis(model)) await buildDataflowIndex(model);
   const functions = model.functions.some(n => n.kind !== 'var' && !n.headerSymbol && !n.taskPeriods)
     ? withTaskPeriods(model.functions, model).map((n, i) => model.functions[i].taskPeriods ? model.functions[i] : n)
     : model.functions;
@@ -181,7 +184,7 @@ aside h2{font-size:12px;font-weight:500;color:#5F5E5A;margin:0 0 8px}
 .kv{display:flex;justify-content:space-between;padding:3px 0}
 .kv b{font-weight:500;color:#185FA5}
 .hint{color:#B4B2A9;font-size:11.5px;line-height:1.6}
-.hit{opacity:.18}
+.hit,.hit + .deleted-edge-mark{opacity:.18}
 .on rect{stroke:#185FA5!important;stroke-width:2.4!important}
 .chip{display:inline-block;padding:1px 6px;border-radius:20px;font-size:10.5px;background:#E6F1FB;color:#0C447C;margin-right:4px}
 .chip.m{background:#FAECE7;color:#993C1D}

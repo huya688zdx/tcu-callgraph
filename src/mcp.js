@@ -26,9 +26,10 @@ const SERVER_INFO = { name: 'tcu-callgraph', version: '0.2.0' };
 const AI_INSTRUCTIONS = [
   'AI 绘图与标注强制规范',
   '1. 写入前先用 cg_page 对齐当前画布，再用 cg_source 读实际 C 源码。结合 cg_search、cg_node、cg_dataflow 和 cg_detect_tasks 核对函数、调用关系、周期及变量读写。',
-  '2. 使用 cg_compose_view 精选与用户目标直接相关的控制链、周期任务或变量数据流。通常选择 5–40 个核心函数，每次最多提交 80 个函数。',
+  '2. 变更分析先用 cg_changes 取快照，以相同 snapshotId 和函数 id 查看 trace。已入图的版本也可用 cg_trace_to_task。核对每个 TASK / ISR 的路径、命名推断和间接调用，按分页提示续查，有缺口须说明。用 cg_compose_view 传 snapshotId、changedFunctionIds，在同一比较中显示各入口、中间调用和直接增删关系。每次最多 80 个函数。',
   '3. 用 cg_apply_task_labels 写标签。只在有周期或调度证据的调用线上写 TASK，文字带周期，note 记录文件行号和依据。按同一调用方在源码中的实际执行顺序从 コール順1 连续编号，禁止重号。分支或求值顺序不明时说明已知范围。',
-  '4. 节点分类遵守四色语义：existing（既存绿）、modified（変更黄）、added（追加粉）、deleted（削除灰）。',
+  '4. 节点按定义源码分类。未改的 TASK、调用方、被调用方和仅受影响者均为 existing（既存绿），自身定义修改为 modified（変更黄），新增为 added（追加粉），删除为 deleted（削除灰）。',
+  '5. 连线按关系在两个版本中是否存在独立分类。既有调用及读写关系保持 existing 黑线，新增关系才用 added 红线，删除关系用 deleted 黑线加 ✕。函数变黄不改变既有线色。比较视图直接使用自动分类；普通工程用 cg_annotate 写已核实的 change，标签用预设样式。',
 ].join('\n');
 
 export const ACCESS_LEVELS = ['off', 'readonly', 'readwrite'];
@@ -52,9 +53,11 @@ const rpcResult = (id, result) => ({ jsonrpc: '2.0', id, result });
 /** 桥接 GET：URLSearchParams 已编码好 */
 async function get(ctx, pathAndQuery) {
   const res = await ctx.fetchImpl(`${ctx.baseUrl}${pathAndQuery}`, ctx.projectId === undefined ? undefined : {
-    headers: { 'X-Callgraph-Project': String(ctx.projectId) },
+    headers: { 'X-Callgraph-Project': String(ctx.projectId),
+      ...(ctx.sessionRevision === undefined ? {} : { 'X-Callgraph-Session': String(ctx.sessionRevision) }) },
   });
-  return res.json();
+  const payload = await res.json();
+  return res.ok === false ? { ...payload, ok: false, status: res.status } : payload;
 }
 
 /** 桥接 POST：写操作统一带 actor:'ai'，时间轴据此区分 AI 与人工改动 */
@@ -94,6 +97,39 @@ async function downloadTo(ctx, pathAndQuery, outPath, fallbackExt) {
   const buf = Buffer.from(await res.arrayBuffer());
   const target = await ctx.writeOut(n.name, buf, ctx.sessionRevision);
   return { ok: true, path: target, bytes: buf.length };
+}
+
+const labelSchema = {
+  type: 'object', required: ['preset'], additionalProperties: false,
+  properties: {
+    preset: { enum: ['task', 'conn', 'call'] }, text: { type: 'string', maxLength: 40 },
+    note: { type: 'string', maxLength: 80 }, order: { type: 'integer', minimum: 1 },
+    num: { type: 'integer', minimum: 1 }, id: { type: 'string' }, dx: { type: 'number' }, dy: { type: 'number' },
+  },
+};
+const annotationText = { note: { type: ['string', 'null'] }, tag: { type: ['string', 'null'] } };
+const nodeAnnotation = {
+  type: 'object', additionalProperties: false, properties: {
+    ...annotationText, change: { enum: ['existing', 'modified', 'added', 'deleted', null] },
+    nameMode: { enum: ['alias', 'target', null] },
+  },
+};
+const edgeAnnotation = {
+  type: 'object', additionalProperties: false, properties: {
+    ...annotationText, change: { enum: ['existing', 'added', 'deleted', null] },
+    label: { anyOf: [labelSchema, { type: 'null' }] },
+    labels: { type: ['array', 'null'], items: labelSchema, maxItems: 8 },
+  },
+};
+const tracePage = {
+  offset: { type: 'integer', minimum: 0, default: 0 },
+  limit: { type: 'integer', minimum: 1, maximum: 100, default: 32 },
+};
+const traceVersion = { type: 'string', enum: ['before', 'after'], description: '比较快照版本，默认修改后，删除的函数默认修改前' };
+function queryFields(args, fields) {
+  const q = new URLSearchParams();
+  for (const key of fields) if (args[key] !== undefined) q.set(key, args[key]);
+  return q;
 }
 
 const TOOLS = [
@@ -176,7 +212,7 @@ const TOOLS = [
   },
   {
     name: 'cg_node',
-    description: '单个函数的详情：签名、文件行号、入边出边、已有标注。',
+    description: '函数详情、直接入边出边、标注，以及可达的上游 TASK / ISR 及代表路径。',
     access: 'read',
     inputSchema: {
       type: 'object',
@@ -187,7 +223,7 @@ const TOOLS = [
   },
   {
     name: 'cg_source',
-    description: '读取已索引的 C 源码。传函数 id 或项目内的相对文件路径与行范围。最多返回 250 行，函数查询同时返回周期、调用和变量访问。行号从 1 开始。',
+    description: '按函数 id 或相对路径和行范围读取 C 源码，最多 250 行。按函数读还返回周期、调用、变量访问和上游 TASK / ISR 路径。',
     access: 'read',
     inputSchema: {
       type: 'object',
@@ -197,14 +233,37 @@ const TOOLS = [
         file: { type: 'string', description: '来自 cg_tree 的项目相对路径' },
         startLine: { type: 'integer', minimum: 1 },
         endLine: { type: 'integer', minimum: 1 },
+        version: traceVersion,
       },
       oneOf: [{ required: ['id'] }, { required: ['file', 'startLine', 'endLine'] }],
     },
     run: (a, ctx) => {
       const q = new URLSearchParams();
-      for (const key of ['id', 'file', 'startLine', 'endLine']) if (a[key] !== undefined) q.set(key, a[key]);
+      for (const key of ['id', 'file', 'startLine', 'endLine', 'version']) if (a[key] !== undefined) q.set(key, a[key]);
       return get(ctx, '/api/source?' + q);
     },
+  },
+  {
+    name: 'cg_trace_to_task',
+    description: '从指定函数反向遍历当前解析器的调用图。每个已识别的 TASK / ISR 入口返回一条完整最短路径和逐边证据。nextOffset 可续查，无已识别入口时返回 no-task。',
+    access: 'read',
+    inputSchema: { type: 'object', additionalProperties: false, required: ['id'], properties: {
+      id: { type: 'string' }, version: traceVersion, ...tracePage,
+    } },
+    run: (a, ctx) => get(ctx, '/api/trace-to-task?' + queryFields(a, ['id', 'version', 'offset', 'limit'])),
+  },
+  {
+    name: 'cg_changes',
+    description: '读取当前已应用的目录/Git 比较，普通工程默认比较 HEAD 与工作区。列出定义变更和关系变更；传 id 可查看其所有相邻关系、两端状态及该函数在快照中的入口路径。detectedChange 是自动结果，change 含用户在比较中的手动调整。按 nextOffset 翻页。',
+    access: 'read',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {
+      id: { type: 'string', description: '聚焦的函数或变量 ID' },
+      snapshotId: { type: 'string', description: '翻页或聚焦时沿用首次响应的快照 ID' },
+      baseRef: { type: 'string', description: '普通工程的 Git 基准，默认 HEAD' },
+      targetRef: { type: 'string', description: '普通工程的 Git 目标，支持 WORKTREE、INDEX 或提交引用' },
+      ...tracePage, version: traceVersion, traceOffset: tracePage.offset, traceLimit: tracePage.limit,
+    } },
+    run: (a, ctx) => get(ctx, '/api/mcp-changes?' + queryFields(a, ['id', 'snapshotId', 'baseRef', 'targetRef', 'offset', 'limit', 'version', 'traceOffset', 'traceLimit'])),
   },
   {
     name: 'cg_vars',
@@ -281,7 +340,7 @@ const TOOLS = [
   },
   {
     name: 'cg_compose_view',
-    description: '将精选的入口函数、相关函数和全局变量推送到用户画布，实际调用边随视图显示。先使用 cg_page、cg_node 和 cg_source 核实，通常选择 5–40 个核心函数，总数最多 80。',
+    description: '将精选的函数和变量推送到画布。分析变更时用 changedFunctionIds 自动补齐每个入口的一条完整证据链；无入口返回提示，超出 80 个函数须分批选链。比较中的组图只作用于当前比较。',
     access: 'write',
     inputSchema: {
       type: 'object',
@@ -289,8 +348,10 @@ const TOOLS = [
       required: ['mode'],
       properties: {
         mode: { type: 'string', enum: ['replace', 'add'] },
+        snapshotId: { type: 'string', description: '沿用 cg_changes 的快照并按比较结果自动着色。首次进入该 Git 快照用 replace' },
         roots: { type: 'array', items: { type: 'string' }, maxItems: 80, description: '入口函数 ID，和 functionIds 合计提交 1–80 项' },
         functionIds: { type: 'array', items: { type: 'string' }, maxItems: 80 },
+        changedFunctionIds: { type: 'array', items: { type: 'string' }, maxItems: 80, description: '已核实的变更函数，服务端补齐解析到的上游 TASK / ISR 路径' },
         up: { type: 'integer', minimum: 0, maximum: 5, default: 0 },
         down: { type: 'integer', minimum: 0, maximum: 5, description: '提供精选 functionIds 时默认 0，否则默认 1' },
         vars: { type: 'array', items: { type: 'string' }, description: 'cg_vars 返回的全局变量 id' },
@@ -332,38 +393,21 @@ const TOOLS = [
   {
     name: 'cg_annotate',
     description:
-      '给函数节点或连线写标注。data 支持的键：note(备注文字)、' +
-      'color(底色，只能是固定四色：#CCFFCC=既存绿 / #FFFF99=変更黄 / #FFCCFF=追加粉 / #BFBFBF=削除灰，传 null 清除，别的值会被拒绝)、' +
-      'tag(分类标签)、change(既存 existing / 変更 modified / 追加 added / 削除 deleted——底色规则由它驱动，按规则改框色优先用它)、' +
-      'labels(连线标签数组，整组替换。优先用 cg_apply_task_labels 保留其他标签；' +
-      '每条 {preset:"task"|"conn"|"call", text, note, num, dx, dy}。TASK 须填写周期与源码依据，コール順 禁止重号。传 null 清空全部；' +
-      '旧字段 label=单条仍兼容=整组替换成这一条)。' +
-      '标注会实时推送到用户打开的页面上（无需刷新），并记入时间轴。',
+      '给节点或连线写备注或经核实的 change。节点按自身定义使用四色分类，连线只接受 existing、added、deleted，null 可清除分类。' +
+      '既有关系保持黑线，新增关系用红线，删除关系用黑线加 ✕。标签按预设配色，优先用 cg_apply_task_labels。修改会推送到画布并记入时间轴。',
     access: 'write',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         nodeId: { type: 'string', description: '函数 / 变量节点 id（与 edgeKey 二选一）' },
         edgeKey: { type: 'string', description: '连线 key，格式 "from->to:行号"' },
-        data: {
-          type: 'object',
-          description: '标注内容',
-          properties: {
-            color: {
-              enum: ['#CCFFCC', '#FFFF99', '#FFCCFF', '#BFBFBF', null],
-              description: '底色固定四色（既存/変更/追加/削除），null=清除回落 change 分类色',
-            },
-            change: {
-              enum: ['existing', 'modified', 'added', 'deleted', null],
-              description: '变更分类：既存/変更/追加/削除',
-            },
-            labels: {
-              type: 'array',
-              description: '连线标签整组替换（一线多条）；元素 {preset, text, note, border, color, num, dx, dy}',
-            },
-          },
-        },
+        data: { type: 'object' },
       },
+      oneOf: [
+        { required: ['nodeId'], not: { required: ['edgeKey'] }, properties: { data: nodeAnnotation } },
+        { required: ['edgeKey'], not: { required: ['nodeId'] }, properties: { data: edgeAnnotation } },
+      ],
       required: ['data'],
     },
     run: (a, ctx) => {

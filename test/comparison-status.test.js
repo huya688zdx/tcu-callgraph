@@ -32,6 +32,8 @@ test('弹窗状态覆盖与节点/变量状态：保留自动结果，刷新可�
   assert.deepEqual([value.change,value.detectedChange,value.statusSource],['existing','modified','manual']);
   const changed=await post('/api/compare/status',{comparisonId:id,nodeId:'main.c::target',change:'modified'});
   assert.equal(changed.ok,true);
+  const aiReset=await post('/api/compare/status',{comparisonId:id,nodeId:'main.c::target',change:null,actor:'ai'});
+  assert.equal(aiReset.ok,false);
   assert.equal(changed.target.detectedChange,'existing');
   assert.equal(changed.comparison.summary.functions.modified,2);
   assert.equal((await get('/api/node?id=main.c::target')).node.change,'modified');
@@ -72,6 +74,8 @@ test('同一位置的不同版本连线可独立调整，导出只用黑红，�
 test('无效弹窗状态在发布之前拒绝',async t=>{
   const {get,post,prepare}=await setup(t);
   const p=await prepare();
+  const aiOverride=await post('/api/compare/apply',{previewId:p.preview.id,selectedIds:['main.c::caller'],actor:'ai',statusOverrides:{'main.c::caller':'added'}});
+  assert.equal(aiOverride.ok,false);
   const result=await post('/api/compare/apply',{previewId:p.preview.id,selectedIds:['main.c::caller'],statusOverrides:{missing:'modified'}});
   assert.equal(result.ok,false);
   assert.equal((await get('/api/project')).comparison,null);

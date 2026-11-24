@@ -54,7 +54,7 @@ function scheduleReload() {
 async function flushReload() {
   flushTimer = null;
   if (!dirtyCount || applyingCompose) return;
-  if (state.view?.comparison) return;
+  if (state.view?.comparison && !pendingCompose) { dirtyCount = 0; return; }
   if (state.at > 0) {
     // 回看历史：画面是过去的重放，不能就地刷新，改完的量记在提示里
     const n = dirtyCount;
@@ -73,7 +73,8 @@ async function flushReload() {
   const compose = pendingCompose;
   pendingCompose = null;
   try {
-    if (compose && compose.page.projectId === state.view?.projectId) {
+    if (compose && compose.page.projectId === state.view?.projectId &&
+        compose.page.comparisonId === state.view?.comparison?.id) {
       const { page, reason } = compose;
       applyingCompose = true;
       // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
@@ -119,7 +120,9 @@ if (es) {
     if (restoring || !state.view?.projectId) return;
     try {
       const { page } = await api.savedPage();
-      if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
+      if (page?.projectId === state.view?.projectId && page.comparisonId !== state.view?.comparison?.id) {
+        await hooks.reloadAll();
+      } else if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
           page.revision > (pendingCompose?.page.revision ?? 0)) {
         pendingCompose = { page };
         scheduleReload();
@@ -176,6 +179,7 @@ export function savePage(force = false) {
       (!force && isInteracting())) return pendingSave.catch(() => {});
   const page = {
     projectId: state.view.projectId,
+    comparisonId: state.view.comparison?.id ?? null,
     revision: state.at && pendingCompose?.page.projectId === state.view.projectId ? pendingCompose.page.revision : pageRevision,
     roots: state.roots,
     expansions: state.expansions,
@@ -238,7 +242,7 @@ export async function restorePage(root = null, isCurrent = () => true) {
     // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
     // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
     // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
-    if (state.view?.comparison) {
+    if (state.view?.comparison && !saved?.comparisonId) {
       state.up = 0; state.down = 0;
     }
     if (saved && view && state.view === view) {

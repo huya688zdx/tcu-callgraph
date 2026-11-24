@@ -17,7 +17,9 @@ import { exportXlsx } from './core/export-xlsx.js';
 import { exportHtml, publicNode } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
 import { callSequence, callNumbers } from './core/call-sequence.js';
-import { projectTasks, taskPeriods, withTaskPeriods } from './core/task-periods.js';
+import { needsCounterAnalysis, projectTasks, taskPeriods, withTaskPeriods } from './core/task-periods.js';
+import { traceToTasks } from './core/task-trace.js';
+import { readChangeQuery, changesPage } from './core/mcp-changes.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import { normalizeExpansions } from './core/expansion.js';
@@ -28,6 +30,7 @@ import { externalDependenciesCurrent, fileKey, findCompileCommands } from './cor
 import { scheduleConfig } from './core/tcu-schedule.js';
 import { diffParserModels } from './core/parsers/ir.js';
 import {
+  LABEL_PRESETS,
   normalizeLabel,
   normalizeLabels,
   nextConnNumber,
@@ -67,6 +70,8 @@ let sessionRevision = 0;
 let COMPARISON = null;
 let comparisonPreview = null;
 let comparisonBase = null;
+const readSnapshots = new WeakMap();
+let latestSnapshotRequest = 0;
 let gitWatch;
 const comparisonMetadata = ({ macroChanges, macroDetails, changePoints, impactIds }) =>
   ({ macroChanges, macroDetails, changePoints, impactIds });
@@ -465,17 +470,25 @@ function indexSourceEdges(edges) {
     const key = edgeKeyOf(edge);
     if (!exact.has(key)) exact.set(key, edge);
     const pair = `${edge.from}->${edge.to}`;
+    // 普通画布将变量读写合并到行号 0；同时接受模型查询返回的真实行号。
+    if (edge.kind === 'var') exact.set(pair + ':0', edge);
     const prev = pairs.get(pair);
     if (!prev || (callRank[edge.kind] ?? 0) > (callRank[prev.kind] ?? 0)) pairs.set(pair, edge);
   }
   return { exact, pairs };
 }
 
-function mcpEdgeIndex() {
-  const edges = MODEL.edges;
+function sourceEdgeIndex(model) {
+  const edges = model.edges;
   // 数据流分析重建边数组时，新的引用会自动触发索引重建。
-  if (!mcpSourceEdgeIndexes.has(edges)) mcpSourceEdgeIndexes.set(edges, indexSourceEdges(edges));
-  const source = mcpSourceEdgeIndexes.get(edges);
+  if (!mcpSourceEdgeIndexes.has(edges)) {
+    mcpSourceEdgeIndexes.set(edges, indexSourceEdges([...edges, ...(model.headerEdges || [])]));
+  }
+  return mcpSourceEdgeIndexes.get(edges);
+}
+
+function mcpEdgeIndex() {
+  const source = sourceEdgeIndex(MODEL);
   const manual = new Map();
   for (const slot of Object.values(overlay.layout || {})) {
     for (const edge of slot?.manual || []) {
@@ -488,11 +501,29 @@ function mcpEdgeIndex() {
   return { exact, resolve: key => exact(key) || source.pairs.get(key) || manual.get(`${key}:0`) };
 }
 
+// 普通图上同一函数和变量之间只有一条读写线。沿用前端的键以兼容已保存的标注。
+const canvasEdgeKey = edge => edge.kind === 'var' ? `${edge.from}->${edge.to}:0` : edgeKeyOf(edge);
+
+function annotationEdgeKey(edges, edge, model) {
+  const canvasKey = canvasEdgeKey(edge);
+  if (edge.kind !== 'var' || edges?.[canvasKey]) return canvasKey;
+  // 旧版 MCP 可能已经在真实行号保存备注和标签。读写都复用同一条记录。
+  const source = edge.line === 0 ? sourceEdgeIndex(model).exact.get(canvasKey) : edge;
+  const sourceKey = source && edgeKeyOf(source);
+  return sourceKey && edges?.[sourceKey] ? sourceKey : canvasKey;
+}
+
 function normalizeAiLabel(raw) {
   if (!isPlainObject(raw) || !['task', 'call', 'conn'].includes(raw.preset)) {
     throw new Error('标签 preset 必须是 task / call / conn');
   }
   const { preset, order, note, num, id, dx, dy } = raw;
+  for (const key of ['border', 'color']) {
+    const supplied = typeof raw[key] === 'string' ? raw[key].toUpperCase() : raw[key];
+    if (supplied !== undefined && supplied !== LABEL_PRESETS[preset][key]) {
+      throw new Error(`${preset} 标签的 ${key} 由预设决定，请省略自定义配色`);
+    }
+  }
   let { text } = raw;
   if (text !== undefined && (typeof text !== 'string' || text.length > LABEL_MAX_TEXT)) {
     throw new Error(`标签文字最多 ${LABEL_MAX_TEXT} 字`);
@@ -530,7 +561,8 @@ function checkAiCallOrders(index, updates) {
   for (const [key, annotation] of Object.entries(overlay.edges)) {
     if (updates.has(key)) continue;
     const edge = index.resolve(key);
-    if (!edge || updates.has(edgeKeyOf(edge)) || overlay.deleted.edges[key] || overlay.deleted.edges[edgeKeyOf(edge)] ||
+    if (!edge || (edge.kind === 'var' && key !== annotationEdgeKey(overlay.edges, edge, MODEL)) ||
+        updates.has(canvasEdgeKey(edge)) || overlay.deleted.edges[key] || overlay.deleted.edges[canvasEdgeKey(edge)] ||
         overlay.deleted.nodes[edge.from] || overlay.deleted.nodes[edge.to]) continue;
     for (const label of normalizeLabels(annotation.labels ?? annotation.label)) {
       if (pending.has(JSON.stringify([edge.from, callLabelOrder(label.text)]))) {
@@ -540,13 +572,70 @@ function checkAiCallOrders(index, updates) {
   }
 }
 
+function getMcpChangeSnapshot(snapshotId) {
+  if (COMPARISON && snapshotId === COMPARISON.id) return { id: COMPARISON.id, comparison: COMPARISON };
+  const snapshot = readSnapshots.get(MODEL);
+  if (!COMPARISON && snapshot && snapshot.id === snapshotId && snapshot.revision === sessionRevision) return snapshot;
+  throw new Error('查询快照已失效，请重新调用 cg_changes');
+}
+
+async function readMcpChanges(q, req) {
+  const query = readChangeQuery(q);
+  const hasRefs = q.has('baseRef') || q.has('targetRef');
+  let snapshot, requestId;
+  if (q.has('snapshotId') || COMPARISON) {
+    snapshot = getMcpChangeSnapshot(q.get('snapshotId') ?? COMPARISON.id);
+    const git = snapshot.comparison.git;
+    if (hasRefs && (!git || ['baseRef', 'targetRef'].some(k => q.has(k) && q.get(k) !== git[k]))) {
+      throw new Error('指定的 Git 引用与当前比较快照不符');
+    }
+  } else {
+    requestId = ++latestSnapshotRequest;
+    const model = MODEL;
+    if (model.parserId === 'dot') throw new Error('Git 源码变更查询需要打开 C 工程');
+    const comparison = await compareGitProject(scanRootFor(root), {
+      baseRef: q.get('baseRef') ?? undefined, targetRef: q.get('targetRef') ?? undefined,
+    }, { parserId: model.parserId, parserOptions: parserOptionsFor(model.parserId),
+      allowEmptyRefresh: !!query.id, deferUnchangedAnalysis: true });
+    if (!currentSession(req) || MODEL !== model || mcpAccess() === 'off') throw new Error('工程或访问权限已改变');
+    if (requestId !== latestSnapshotRequest) throw new Error('较新的 Git 查询已开始，请使用最新查询的快照');
+    snapshot = { id: randomUUID(), comparison, revision: sessionRevision };
+  }
+  if (query.id && snapshot.comparison.analyze) {
+    // 空差分列表无需重建全图；只有随后查询函数上下文时才解析当时保存的源码。
+    snapshot.pending ??= snapshot.comparison.analyze();
+    try {
+      const analyzed = await snapshot.pending;
+      if (!currentSession(req) || mcpAccess() === 'off') throw new Error('工程或访问权限已改变');
+      getMcpChangeSnapshot(snapshot.id);
+      snapshot.comparison = analyzed;
+    } finally { delete snapshot.pending; }
+  }
+  const result = changesPage(snapshot.comparison, query);
+  if (requestId !== undefined) readSnapshots.set(MODEL, snapshot);
+  return { ok: true, source: COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
+    comparisonId: COMPARISON?.id ?? null, ...result };
+}
+
+// 比较的合并图含两个版本的边；在一个确定版本内回溯，防止拼出从未存在的路径。
+function traceContext(id, version = null) {
+  if (version != null && (!COMPARISON || !['before', 'after'].includes(version))) {
+    throw new Error('version 仅在比较模式下可选 before 或 after');
+  }
+  if (!COMPARISON) return { model: MODEL, traceVersion: 'current' };
+  const deleted = !COMPARISON.afterModel._index.byId.has(id) && COMPARISON.beforeModel._index.byId.has(id);
+  const traceVersion = version ?? (deleted ? 'before' : 'after');
+  return { model: COMPARISON[traceVersion + 'Model'], traceVersion };
+}
+
 async function readMcpSource(q) {
   const id = q.get('id');
   if (q.has('id') === ['file', 'startLine', 'endLine'].some((key) => q.has(key))) {
     throw new Error('请传函数 id，或同时传 file、startLine、endLine');
   }
   const comparison = COMPARISON;
-  const model = comparison?.afterModel || MODEL;
+  const activeModel = MODEL;
+  const { model, traceVersion } = traceContext(id, q.get('version'));
   const fn = id ? model._index.byId.get(id) : null;
   if (q.has('id') && (!fn?.endLine || fn.external || fn.kind === 'var')) {
     throw new Error(`无法找到函数源码：${id}`);
@@ -580,7 +669,7 @@ async function readMcpSource(q) {
   if (startLine > lines.length) throw new Error('起始行超出源码文件范围');
   const endLine = Math.min(requestedEndLine, startLine + 249, lines.length);
   if (fn && !comparison) await ensureAnalysis(model);
-  if (switching || COMPARISON !== comparison || model !== (COMPARISON?.afterModel || MODEL)) {
+  if (switching || COMPARISON !== comparison || activeModel !== MODEL) {
     throw new Error('工程已切换，请重新调用');
   }
   return {
@@ -588,17 +677,65 @@ async function readMcpSource(q) {
     requestedEndLine, truncated: endLine < requestedEndLine,
     source: lines.slice(startLine - 1, endLine).join('\n'),
     taskPeriods: fn ? taskPeriods(model).get(id) || [] : [],
+    traceVersion, ...(fn ? traceToTasks(model, id) : {}),
     calls: fn ? (model._index.outAdj.get(id) || []).filter((edge) => edge.kind !== 'var')
       .map((edge) => ({ ...edge, edgeKey: edgeKeyOf(edge) })) : [],
     varAccess: fn?.varAccess || [],
   };
 }
 
+function changedFunctionScope(model, comparison, changes, isNode) {
+  const taskRoots = new Set(), functionIds = new Set(changes), variableIds = new Set();
+  const untracedIds = [], untracedVersions = [], omittedRelationTargets = new Set();
+  const sides = comparison
+    ? [['after', comparison.afterModel], ['before', comparison.beforeModel]]
+    : [['current', model]];
+  for (const id of new Set(changes)) {
+    let reached = false;
+    // 两侧独立寻路。比较图中存在的边可能分属不同版本。
+    for (const [version, side] of sides) {
+      if (!side._index.byId.has(id)) continue;
+      const trace = traceToTasks(side, id, { limit: 81 });
+      if (trace.traceTruncated) throw new Error('入口过多，请按版本分页选链，分批传 functionIds 和 changedFunctionIds: []');
+      if (!trace.totalTasks) untracedVersions.push({ id, version });
+      for (const chain of trace.upstreamChains) {
+        reached = true;
+        taskRoots.add(chain.taskId);
+        for (const fn of chain.path) {
+          if (!isNode(fn)) throw new Error('入口路径包含已隐藏或无效的函数：' + fn);
+          functionIds.add(fn);
+        }
+        const hidden = chain.edges.find(edge => overlay.deleted.edges[edge.edgeKey]);
+        if (hidden) throw new Error('入口路径包含已隐藏的调用线：' + hidden.edgeKey);
+      }
+    }
+    if (!reached) untracedIds.push(id);
+    if (!comparison) continue;
+    for (const adjacency of [model._index.inAdj, model._index.outAdj]) {
+      for (const edge of adjacency.get(id) || []) {
+        if (edge.change !== 'added' && edge.change !== 'deleted') continue;
+        const other = edge.from === id ? edge.to : edge.from;
+        if (!isNode(other) || overlay.deleted.edges[edgeKeyOf(edge)]) omittedRelationTargets.add(other);
+        else if (model._index.byId.get(other).kind === 'var') variableIds.add(other);
+        else functionIds.add(other);
+      }
+    }
+  }
+  return { taskRoots, functionIds, variableIds,
+    details: { untracedIds, untracedVersions, omittedRelationTargets: [...omittedRelationTargets] } };
+}
+
 function composeMcpView(p) {
+  // 所有检查在切换画布前完成，失败时不改变工程、预览或时间轴。
+  const comparison = p.snapshotId === undefined ? COMPARISON : getMcpChangeSnapshot(p.snapshotId).comparison;
+  const entering = comparison && !COMPARISON;
+  if (entering && p.mode !== 'replace') throw new Error('首次按 Git 快照组图请使用 replace 打开比较');
+  if (entering && !comparison.model) throw new Error('该 Git 快照没有源码变更');
+  const model = comparison?.model || MODEL;
   const isNode = (id) => typeof id === 'string' && !id.startsWith('ext::') &&
-    !MODEL._index.byId.get(id)?.external && !overlay.deleted.nodes[id] && MODEL._index.byId.has(id);
+    !model._index.byId.get(id)?.external && !overlay.deleted.nodes[id] && model._index.byId.has(id);
   const isFn = (id) => {
-    const node = MODEL._index.byId.get(id);
+    const node = model._index.byId.get(id);
     return isNode(id) && node.kind !== 'var' && !node.headerSymbol;
   };
   const ids = (value, key) => {
@@ -607,12 +744,17 @@ function composeMcpView(p) {
     }
     return value;
   };
-  const { mode, up = 0, down = p.functionIds === undefined ? 1 : 0, selected = null } = p;
-  const roots = ids(p.roots === undefined ? [] : p.roots, 'roots');
-  const functions = ids(p.functionIds === undefined ? [] : p.functionIds, 'functionIds');
-  const vars = ids(p.vars === undefined ? [] : p.vars, 'vars');
+  const { mode, up = 0, selected = null } = p;
+  let roots = ids(p.roots === undefined ? [] : p.roots, 'roots');
+  let functions = ids(p.functionIds === undefined ? [] : p.functionIds, 'functionIds');
+  const changes = p.changedFunctionIds === undefined
+    ? [...roots, ...functions].filter(id => ['modified', 'added', 'deleted'].includes(
+      comparison ? model._index.byId.get(id)?.change : overlay.nodes[id]?.change))
+    : ids(p.changedFunctionIds, 'changedFunctionIds');
+  const down = p.down ?? (p.functionIds === undefined && !changes.length ? 1 : 0);
+  let vars = ids(p.vars === undefined ? [] : p.vars, 'vars');
   if (!['replace', 'add'].includes(mode)) throw new Error('mode 必须是 replace 或 add');
-  if (roots.length + functions.length > 80 || !roots.length && !functions.length) {
+  if (roots.length + functions.length + (p.changedFunctionIds?.length || 0) > 80 || !roots.length && !functions.length && !changes.length) {
     throw new Error('每次提交 1–80 个函数，请筛选核心调用链');
   }
   if (![up, down].every((n) => Number.isInteger(n) && n >= 0 && n <= 5)) {
@@ -622,16 +764,24 @@ function composeMcpView(p) {
     throw new Error('reason 必须是最多 240 字的文字');
   }
   const invalid = new Set([
-    ...[...roots, ...functions].filter((id) => !isFn(id)),
-    ...vars.filter((id) => !isNode(id) || MODEL._index.byId.get(id).kind !== 'var'),
+    ...[...roots, ...functions, ...changes].filter((id) => !isFn(id)),
+    ...vars.filter((id) => !isNode(id) || model._index.byId.get(id).kind !== 'var'),
     ...(p.selected !== undefined && !isNode(selected) ? [selected] : []),
   ]);
   if (invalid.size) throw Object.assign(new Error(`以下 ID 无效、类型不符、为外部节点或已隐藏：${[...invalid].join('、')}`),
     { invalidIds: [...invalid] });
 
+  const scope = changedFunctionScope(model, comparison, changes, isNode);
+  if (changes.length) {
+    roots = [...new Set([...scope.taskRoots, ...roots])];
+    const rootSet = new Set(roots);
+    functions = [...new Set([...functions, ...scope.functionIds])].filter(id => !rootSet.has(id));
+    if (roots.length + functions.length > 80) throw new Error('入口路径与变更关系涉及超过 80 个函数，请分批选链，显式传 changedFunctionIds: [] 与所选 functionIds');
+    vars = [...new Set([...vars, ...scope.variableIds])];
+  }
   const key = 'ui.last-view.' + PROJECT.id;
-  const saved = store.getSetting(key);
-  const before = pageState?.roots.length && !pageState.reviewing ? { ...saved, ...pageState } : saved;
+  const saved = COMPARISON ? COMPARISON.composedPage || { roots: COMPARISON.roots, up: 0, down: 0 } : store.getSetting(key);
+  const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
   const prior = mode === 'add' ? before : null;
   const keepRoots = Boolean(prior?.roots?.length);
   const allRoots = keepRoots ? prior.roots : [...new Set(roots)];
@@ -655,6 +805,29 @@ function composeMcpView(p) {
     selectedEdge: null, ctxBox: null, cam: prior?.cam ?? null, at: 0, reviewing: false, ts: Date.now(),
   };
   const reason = p.reason?.trim() ?? '';
+  if (comparison) {
+    const visible = [...new Set([...allRoots, ...expansions.map(scope => scope.root), ...page.vars])];
+    if (visible.length > 600) throw new Error('比较画布最多支持 600 个显式选择的节点');
+    if (entering) {
+      const nextStats = stats(model);
+      const nextOverlay = structuredClone(overlay);
+      const next = { ...comparison, id: p.snapshotId, statusOverrides: { nodes: new Map(), edges: new Map() }, totalNodes: model._index.byId.size };
+      comparisonBase = { MODEL, S, overlay, pageState };
+      COMPARISON = next;
+      MODEL = model;
+      S = nextStats;
+      overlay = nextOverlay;
+      comparisonPreview = null;
+      sessionRevision++;
+    }
+    page.comparisonId = COMPARISON.id;
+    page.revision = (COMPARISON.composedPage?.revision ?? 0) + 1;
+    COMPARISON.roots = visible;
+    COMPARISON.composedPage = page;
+    pageState = page;
+    broadcastChange(entering ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
+    return { ok: true, page, ...scope.details, eventId: null };
+  }
   store.transaction(() => {
     page.revision = store.appendEvent(PROJECT.id, {
       op: 'view.compose', actor: 'ai', target: roots[0] || functions[0], before,
@@ -664,7 +837,7 @@ function composeMcpView(p) {
   });
   pageState = page;
   broadcastChange('view.compose', 'ai', { page, reason });
-  return { ok: true, page, eventId: page.revision };
+  return { ok: true, page, ...scope.details, eventId: page.revision };
 }
 
 function applyMcpTaskLabels({ items, merge = true }) {
@@ -679,7 +852,7 @@ function applyMcpTaskLabels({ items, merge = true }) {
     const edge = index.resolve(item?.edgeKey);
     if (!edge) throw new Error(`找不到实际连线：${item?.edgeKey}`);
     const label = normalizeAiLabel(item);
-    const key = edgeKeyOf(edge);
+    const key = annotationEdgeKey(overlay.edges, edge, MODEL);
     if (!updates.has(key)) {
       const current = overlay.edges[key];
       updates.set(key, merge ? normalizeLabels(current?.labels ?? current?.label) : []);
@@ -938,7 +1111,8 @@ function legacyManualKeys(layout, root, mode, model) {
 const CALL_KINDS = new Set(['direct', 'macro', 'fnptr']);
 
 function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edges) {
-  const sourceModel = comparison?.afterModel || model;
+  const sourceModel = comparison ? (comparison.afterModel._index.byId.has(root)
+    ? comparison.afterModel : comparison.beforeModel) : model;
   const periods = taskPeriods(sourceModel);
   const { byId, inAdj, outAdj } = sourceModel._index;
   const nodeInfo = (id) => {
@@ -946,20 +1120,12 @@ function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edg
     return fn ? { id, name: fn.name, file: fn.file, line: fn.line } : { id, name: id };
   };
   const candidate = (id) => ({ ...nodeInfo(id), taskPeriods: periods.get(id) || [] });
-  // 从目标反向广搜一次，得到每个任务到目标的最短调用链。
-  const next = new Map([[root, null]]);
-  const queue = [root];
-  for (let i = 0; i < queue.length; i++) {
-    for (const e of inAdj.get(queue[i]) || []) {
-      if (!CALL_KINDS.has(e.kind) || next.has(e.from)) continue;
-      next.set(e.from, e.to);
-      queue.push(e.from);
-    }
-  }
-  const taskChains = projectTasks(sourceModel).filter(task => next.has(task.id)).map(task => {
-    const path = [];
-    for (let id = task.id; id != null; id = next.get(id)) path.push(id);
-    return { taskId: task.id, taskName: task.name, us: task.us, source: task.source, path, nodes: path.map(nodeInfo) };
+  // 预览只附第一页，入口较多时通过 trace-to-task 续查完整路径。
+  const trace = traceToTasks(sourceModel, root);
+  const taskChains = trace.upstreamChains.flatMap(({ path, taskId }, i) => {
+    const task = trace.upstreamTasks[i];
+    const nodes = path.map(nodeInfo);
+    return task.periods.map(({ us, source }) => ({ taskId, taskName: task.name, us, source, path, nodes }));
   });
   const isRealFn = (id) => !id.startsWith('ext::') && !byId.get(id)?.external;
   const directCalls = (outAdj.get(root) || []).filter(e => CALL_KINDS.has(e.kind) && isRealFn(e.to));
@@ -980,7 +1146,8 @@ function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edg
   });
   return {
     target: { id: root, name: model._index.byId.get(root)?.name || root, taskPeriods: periods.get(root) || [] },
-    taskChains, callSequence: { callees, siblings }, hiddenIds: Object.keys(hiddenNodes),
+    taskChains, taskChainTotal: trace.totalTasks, taskChainNextOffset: trace.nextOffset,
+    callSequence: { callees, siblings }, hiddenIds: Object.keys(hiddenNodes),
     // 周边建议沿用预览节点与边的精简协议，周期和序号单独返回。
     relatedPeriods: nodes.filter(node => periods.has(node.id)).map(node => [node.id, periods.get(node.id)]),
     edgeOrders: edges.map(callOrderForEdges(model, comparison)),
@@ -1015,7 +1182,8 @@ async function buildView(
   const projectId = PROJECT.id;
   const model = MODEL;
   const requestedRoots = Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [];
-  if (!COMPARISON && (varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')))) {
+  if (!COMPARISON && (varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')) ||
+      ((requestedRoots.length || varSel.expansions?.length) && needsCounterAnalysis(model)))) {
     await ensureAnalysis(model);
     if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
   }
@@ -1206,7 +1374,7 @@ async function buildView(
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
     .map((e) => COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e))
-      : { ...e, change: viewOverlay.edges?.[edgeKeyOf(e)]?.change || 'existing' });
+      : { ...e, change: viewOverlay.edges?.[annotationEdgeKey(viewOverlay.edges, e, model)]?.change || 'existing' });
   if (COMPARISON) clean = clean.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
   const macroNameMode = macroNameDefault();
   clean = clean.map((n) => withMacroName(n, viewOverlay, macroNameMode));
@@ -1238,7 +1406,7 @@ async function buildView(
     n.kind = n.kind === 'var' ? 'var' : 'fn';
   }
   for (const e of laid.edges) {
-    const ov = viewOverlay.edges?.[edgeKeyOf(e)];
+    const ov = viewOverlay.edges?.[COMPARISON ? edgeKeyOf(e) : annotationEdgeKey(viewOverlay.edges, e, model)];
     // 原有 / 新增 / 删除
     e.change = COMPARISON ? e.change || 'existing' : (ov && ov.change) || 'existing';
     // 连线标签（一线可多条）：统一在这里规整，前端与导出拿到的都是干净数据。
@@ -1309,11 +1477,14 @@ export const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (req.method === 'GET' && req.headers['x-callgraph-session'] !== undefined && !currentSession(req)) {
+      return sessionConflict(res);
+    }
     if (req.method === 'GET' && ['/api/export/xlsx', '/api/export/html'].includes(u.pathname) &&
         ((req.headers.origin && !LOCAL_ORIGIN.test(req.headers.origin)) || req.headers['sec-fetch-site'] === 'cross-site')) {
       return json(res, { ok: false, error: 'forbidden origin' }, 403);
     }
-    if (COMPARISON && ((req.method === 'POST' && /^\/api\/(overlay|delete|layout|orphans\/purge|bookmarks|session|restore|labels|mcp-compose|mcp-task-labels)/.test(u.pathname)) ||
+    if (COMPARISON && ((req.method === 'POST' && /^\/api\/(overlay|delete|layout|orphans\/purge|bookmarks|session|restore|labels|mcp-task-labels)/.test(u.pathname)) ||
         u.pathname === '/api/session/export')) {
       return json(res, { ok: false, error: '比较视图仅供查看，请退出比较后编辑普通工程' }, 409);
     }
@@ -1407,20 +1578,23 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
-    if (u.pathname === '/api/source' && req.method === 'GET') {
+    if (['/api/source', '/api/mcp-changes'].includes(u.pathname) && req.method === 'GET') {
       if ((req.headers.origin && !LOCAL_ORIGIN.test(req.headers.origin)) || req.headers['sec-fetch-site'] === 'cross-site') {
         return json(res, { ok: false, error: 'forbidden origin' }, 403);
       }
       if (mcpAccess() === 'off') return json(res, { ok: false, error: 'MCP 已禁用' }, 403);
-      if (switching || (req.headers['x-callgraph-project'] !== undefined &&
+      if (!currentSession(req) || (req.headers['x-callgraph-project'] !== undefined &&
           Number(req.headers['x-callgraph-project']) !== PROJECT.id)) {
         return json(res, { ok: false, error: '工程已切换，请重新调用' }, 409);
       }
       try {
-        const source = await readMcpSource(u.searchParams);
+        const source = u.pathname === '/api/source' ? await readMcpSource(u.searchParams) : await readMcpChanges(u.searchParams, req);
+        if (!currentSession(req)) return sessionConflict(res);
         if (mcpAccess() === 'off') return json(res, { ok: false, error: 'MCP 已禁用' }, 403);
         return json(res, source);
       } catch (err) {
+        if (!currentSession(req)) return sessionConflict(res);
+        if (mcpAccess() === 'off') return json(res, { ok: false, error: 'MCP 已禁用' }, 403);
         return bad(res, err.message);
       }
     }
@@ -1431,8 +1605,10 @@ export const server = http.createServer(async (req, res) => {
       try { payload = await readJson(req, res); } catch { return; }
       if (mcpAccess() !== 'readwrite') return json(res, { ok: false, error: '需要 MCP 读写权限' }, 403);
       try {
-        if (u.pathname === '/api/mcp-compose' && ((Array.isArray(payload.vars) && payload.vars.length) ||
-            (typeof payload.selected === 'string' && payload.selected.startsWith('var::'))) && MODEL.source !== 'dot') {
+        const needsVars = u.pathname === '/api/mcp-compose'
+          ? (Array.isArray(payload.vars) && payload.vars.length) || (typeof payload.selected === 'string' && payload.selected.startsWith('var::'))
+          : Array.isArray(payload.items) && payload.items.some(item => typeof item?.edgeKey === 'string' && item.edgeKey.includes('->var::'));
+        if (needsVars && !COMPARISON && payload.snapshotId === undefined && MODEL.source !== 'dot') {
           await ensureAnalysis(MODEL);
           if (!currentSession(req)) return sessionConflict(res);
         }
@@ -1474,14 +1650,17 @@ export const server = http.createServer(async (req, res) => {
         return readJson(req, res)
           .then((p) => {
             if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
+            if (p.comparisonId !== undefined && p.comparisonId !== (COMPARISON?.id ?? null)) return sessionConflict(res);
             const key = 'ui.last-view.' + PROJECT.id;
-            const revision = store.getSetting(key)?.revision ?? 0;
-            if (!COMPARISON && p.revision !== undefined && p.revision !== revision) {
+            const revision = COMPARISON ? COMPARISON.composedPage?.revision ?? 0 : store.getSetting(key)?.revision ?? 0;
+            if ((!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
             }
             const str = (v) => (typeof v === 'string' ? v : null);
             pageState = {
               ...viewSnapshot(p),
+              projectId: PROJECT.id,
+              ...(COMPARISON ? { comparisonId: COMPARISON.id } : {}),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
@@ -1490,17 +1669,19 @@ export const server = http.createServer(async (req, res) => {
               ts: Date.now(),
               revision,
             };
-            if ((pageState.roots.length || pageState.expansions.length || p.empty === true) && !pageState.reviewing && !COMPARISON) {
+            if ((pageState.roots.length || pageState.expansions.length || p.empty === true) && !pageState.reviewing) {
               const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
               const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
-              store.setSetting(key, { ...pageState, cam, ctxBox });
+              const saved = { ...pageState, cam, ctxBox };
+              if (!COMPARISON) store.setSetting(key, saved);
+              else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
             }
             json(res, { ok: true });
           })
           .catch((err) => { if (!res.headersSent) bad(res, err.message); });
       }
       return json(res, {
-        page: u.searchParams.has('saved') ? COMPARISON ? null : store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
+        page: u.searchParams.has('saved') ? COMPARISON ? COMPARISON.composedPage || null : store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
         project: PROJECT ? { id: PROJECT.id, name: PROJECT.name, path: root } : null,
         hint: pageState
           ? undefined
@@ -1743,6 +1924,7 @@ export const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       const p = await readJson(req, res);
       if (!COMPARISON || p.comparisonId !== COMPARISON.id) return json(res, { ok: false, error: '比较已切换，请刷新后重试' }, 409);
+      if (p.actor === 'ai') return bad(res, 'AI 请读取比较自动判定，人工状态调整仅供用户使用');
       if (p.change !== null && !CHANGE_STATES.includes(p.change)) return bad(res, '状态必须是未修改、修改、新增、删除，或恢复自动判断');
       const isNode = typeof p.nodeId === 'string';
       const isEdge = typeof p.edgeId === 'string';
@@ -1786,6 +1968,9 @@ export const server = http.createServer(async (req, res) => {
           }
           comparisonPreview = null;
         } else if (u.pathname.endsWith('/apply')) {
+          if (p.actor === 'ai' && (Object.keys(p.statusOverrides ?? {}).length || p.resetStatusIds?.length)) {
+            return bad(res, 'AI 请使用比较自动判定，人工状态调整仅供用户使用');
+          }
           const preview = comparisonPreview;
           if (!preview || p.previewId !== preview.id || preview.model !== MODEL || preview.projectId !== PROJECT.id) {
             return json(res, { ok: false, error: '比较预览已失效，请重新解析' }, 409);
@@ -2362,19 +2547,36 @@ export const server = http.createServer(async (req, res) => {
       return json(res, withReviewSnapshot(await buildView(roots, up, down, group, df, varSel, viewOverlay, previous)));
     }
 
+    if (u.pathname === '/api/trace-to-task' && req.method === 'GET') {
+      if (!currentSession(req) || (req.headers['x-callgraph-project'] !== undefined &&
+          Number(req.headers['x-callgraph-project']) !== PROJECT.id)) return sessionConflict(res);
+      const q = u.searchParams, id = q.get('id');
+      const offset = Number(q.get('offset') ?? 0), limit = Number(q.get('limit') ?? 32);
+      if (!id || !Number.isSafeInteger(offset) || offset < 0 ||
+          !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        return bad(res, '需要节点 id，offset 为非负整数，limit 为 1 至 100 的整数');
+      }
+      let context;
+      try { context = traceContext(id, q.get('version')); } catch (err) { return bad(res, err.message); }
+      if (!context.model._index.byId.has(id)) return json(res, { ok: false, error: '此版本找不到该节点' }, 404);
+      return json(res, { ok: true, id, traceVersion: context.traceVersion, ...traceToTasks(context.model, id, { offset, limit }) });
+    }
+
     if (u.pathname === '/api/node') {
       const id = u.searchParams.get('id');
       const fn = MODEL._index.byId.get(id);
       if (!fn) return json(res, { error: 'not found' }, 404);
+      const { model: traceModel, traceVersion } = traceContext(id);
       const getCallOrder = callOrderForEdges(MODEL, COMPARISON);
       const detailEdge = (e) => ({
         ...(COMPARISON ? comparisonStatus(e, COMPARISON.statusOverrides.edges, e.comparisonKey || edgeKeyOf(e))
-          : { ...e, change: overlay.edges?.[edgeKeyOf(e)]?.change || 'existing' }),
+          : { ...e, change: overlay.edges?.[annotationEdgeKey(overlay.edges, e, MODEL)]?.change || 'existing' }),
         callNumbers: getCallOrder(e),
       });
       const chain = new Set(fn.impactChainIds);
       return json(res, {
         node: publicNode(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn),
+        traceVersion, ...traceToTasks(traceModel, id),
         callSequence: callSequence(COMPARISON?.afterModel || MODEL, id),
         ...(COMPARISON ? { previousCallSequence: callSequence(COMPARISON.beforeModel, id),
           changePoints: COMPARISON.changePoints.filter(point => chain.has(point.id)),
@@ -2473,6 +2675,11 @@ export const server = http.createServer(async (req, res) => {
       const up = Number(u.searchParams.get('up') ?? 1);
       const down = Number(u.searchParams.get('down') ?? 1);
       if (!rootId) return json(res, { error: 'missing root' }, 400);
+      const model = MODEL, revision = sessionRevision;
+      if (!COMPARISON && needsCounterAnalysis(model)) {
+        await ensureAnalysis(model);
+        if (revision !== sessionRevision || MODEL !== model) return sessionConflict(res);
+      }
       const g = subgraph(MODEL, rootId, { up, down, maxNodes: 600 });
       if (COMPARISON) {
         g.nodes = g.nodes.map((n) => comparisonStatus(n, COMPARISON.statusOverrides.nodes, n.id));
@@ -2561,7 +2768,7 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/overlay' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((patch) => {
+        .then(async (patch) => {
           if (!isPlainObject(patch.data)) return bad(res, 'data 必须是对象');
           if (Object.keys(patch.data).some((key) => !['note', 'color', 'tag', 'change', 'nameMode', 'label', 'labels'].includes(key))) return bad(res, 'data 包含不支持的字段');
           if (patch.data.change !== undefined && ![null, 'existing', 'modified', 'added', 'deleted'].includes(patch.data.change)) return bad(res, 'change 不合法');
@@ -2573,13 +2780,26 @@ export const server = http.createServer(async (req, res) => {
           if (ai) {
             if (mcpAccess() !== 'readwrite') return json(res, { ok: false, error: '需要 MCP 读写权限' }, 403);
             if (!!patch.nodeId === !!patch.edgeKey) return bad(res, 'nodeId 与 edgeKey 必须二选一');
+            if (Object.hasOwn(patch.data, 'color')) return bad(res, 'AI 标注请用 change 分类，节点与连线的颜色由分类决定');
+            if (patch.edgeKey && patch.data.change === 'modified') return bad(res, '连线 change 只能是 existing / added / deleted，或 null 清除');
+            if (patch.edgeKey && patch.data.nameMode !== undefined) return bad(res, 'nameMode 只用于节点');
+            if (!MODEL._df && MODEL.source !== 'dot' && (patch.nodeId?.startsWith('var::') || patch.edgeKey?.includes('->var::'))) {
+              await ensureAnalysis(MODEL);
+              if (!currentSession(req)) return sessionConflict(res);
+              if (mcpAccess() !== 'readwrite') return json(res, { ok: false, error: '需要 MCP 读写权限' }, 403);
+            }
             if (patch.nodeId && !MODEL._index.byId.has(patch.nodeId)) return bad(res, `找不到节点：${patch.nodeId}`);
+            // 历史数据可能用独立的底色覆盖分类；明确改变分类时一并恢复按分类着色。
+            if (patch.nodeId && patch.data.change !== undefined) patch.data.color = null;
             if (patch.edgeKey) {
               aiEdges = mcpEdgeIndex();
               const edge = aiEdges.resolve(patch.edgeKey);
               if (!edge) return bad(res, `找不到实际连线：${patch.edgeKey}`);
-              patch.edgeKey = edgeKeyOf(edge);
+              patch.edgeKey = annotationEdgeKey(overlay.edges, edge, MODEL);
             }
+          } else if (patch.edgeKey?.includes('->var::')) {
+            const edge = sourceEdgeIndex(MODEL).exact.get(patch.edgeKey);
+            if (edge?.kind === 'var') patch.edgeKey = annotationEdgeKey(overlay.edges, edge, MODEL);
           }
           // 连线标签（一线可多条）：
           //   data.labels = 数组 → 整组替换（先读现有再合并提交，空数组=清空）
