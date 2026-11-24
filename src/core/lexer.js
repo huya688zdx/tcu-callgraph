@@ -24,7 +24,7 @@ const isDigit = (c) => c >= '0' && c <= '9';
  * @param {string} file
  * @returns {Array<{t:string,v:string,s:number,e:number,line:number,col:number,cond?:string}>}
  */
-export function lex(src, file = '') {
+export function lex(src, file = '', maxTokens = Infinity) {
   const tokens = [];
   const n = src.length;
   let i = 0;
@@ -33,6 +33,7 @@ export function lex(src, file = '') {
   let atLineStart = true;
 
   while (i < n) {
+    if (tokens.length >= maxTokens) throw new Error('词法标记超过数量上限');
     const c = src[i];
 
     if (c === '\n') {
@@ -188,9 +189,9 @@ export function lex(src, file = '') {
   return tokens;
 }
 
-/** 在 tokens 中从 openIdx（必须是 '('）开始配对括号，返回 [参数token数组的数组, 右括号后一位] */
+/** 拆分调用实参或花括号初始化列表，返回 [各项 token 数组, 闭合括号后一位]。 */
 export function collectArgs(tokens, openIdx) {
-  if (!tokens[openIdx] || tokens[openIdx].v !== '(') return [null, openIdx];
+  if (!['(', '{'].includes(tokens[openIdx]?.v)) return [null, openIdx];
   const args = [];
   let cur = [];
   let depth = 0;

@@ -44,6 +44,14 @@
   .top-actions { margin-left: auto; }
   .tool-group + .tool-group { padding-left: 12px; border-left: 1px solid #DEDDD6; }
   .tool-label { margin-right: 2px; font-size: 11px; color: #888780; }
+  .toolbar-select { max-width: 165px; color: #234361; background-color: #F6F9FC; }
+  .period-detail { margin: 8px 0; padding: 8px; border: 1px solid #D6E3F1; border-radius: 7px; background: #F6F9FC; overflow-wrap: anywhere; }
+  .period-detail ul { padding-inline-start: 16px; margin: 5px 0 0; }
+  .period-detail li + li { margin-top: 5px; }
+  .period-detail small { display: block; color: #5F5E5A; }
+  .period-warning { margin-top: 5px; color: #9A3412; font-weight: 600; }
+  .period-warning.guarded { color: #166534; }
+  .period-multi { color: #6D28D9; }
   header button:disabled { opacity: .4; cursor: default; }
   .tool-menu { position: relative; }
   .tool-menu summary {
@@ -545,6 +553,31 @@
     color: #888780; cursor: pointer; padding: 0 4px;
   }
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  #flowchartModal { width: min(1240px, 96vw); height: 90vh; max-height: 90vh; }
+  #flowchartModal .modal-head { gap: 12px; }
+  .flowchart-crumbs { display: flex; min-width: 0; gap: 8px; align-items: center; overflow: auto; white-space: nowrap; }
+  .flowchart-crumbs button { border: 0; background: transparent; color: #475569; }
+  .flowchart-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding: 9px 16px;
+    border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+  .flowchart-toolbar label { display: inline-flex; align-items: center; gap: 5px; }
+  .flowchart-toolbar [hidden], .flowchart-crumbs [hidden] { display: none; }
+  .flowchart-tools { display: flex; align-items: center; gap: 5px; margin-inline-start: auto; }
+  .flowchart-macros { padding: 6px 16px; font-size: 13px; border-bottom: 1px solid #e2e8f0; }
+  .flowchart-macros summary { cursor: pointer; }
+  #flowchartMacroList { max-height: 23vh; overflow: auto; }
+  .flowchart-macros pre { margin: 4px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; color: #5b21b6; }
+  #flowchartViewport { position: relative; flex: 1; min-height: 0; overflow: hidden; touch-action: none;
+    cursor: grab; background: #f8fafc radial-gradient(#d2dce8 1px, transparent 1px) 0 0 / 20px 20px; }
+  #flowchartViewport.panning { cursor: grabbing; }
+  #flowchartViewport svg { display: block; width: 100%; height: 100%; user-select: none; }
+  #flowchartViewport g[data-call] { cursor: pointer; }
+  #flowchartViewport g[data-call]:is(:hover, :focus-visible) rect { stroke-width: 3; stroke: #1d4ed8; }
+  #flowchartStatus { position: absolute; z-index: 1; inset: 12px auto auto 12px; max-width: calc(100% - 24px);
+    background: #fff; color: #334155; border: 1px solid #cbd5e1; padding: 8px 12px; border-radius: 8px; }
+  #flowchartCalls { position: absolute; inset: auto 16px 16px auto; z-index: 1; max-width: calc(100% - 32px);
+    max-height: 55%; overflow: auto; background: #fff; border: 1px solid #cbd5e1; padding: 10px; border-radius: 8px; }
+  #flowchartCalls button { margin: 4px; }
+  .flowchart-detail { margin: 6px 0; }
   #expandForm { display: grid; gap: 14px; }
   #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
   #expandForm label { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #2C2C2A; }
@@ -718,6 +751,16 @@
   .compare-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
   .compare-error { color: #A32D2D; font-size: 12px; white-space: pre-wrap; }
   #compareSummary { font-size: 12px; color: #5F5E5A; padding: 0 8px; }
+  .git-compare-options { display: grid; gap: 9px; }
+  .git-compare-options[hidden] { display: none; }
+  .git-compare-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .git-compare-buttons [aria-pressed="true"] { background: #E3EFFB; border-color: #185FA5; color: #124B71; }
+  .git-compare-files { max-height: 110px; overflow: auto; overflow-wrap: anywhere; margin: 4px 0; }
+  .git-compare-refs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .git-compare-refs input { box-sizing: border-box; width: 100%; grid-column: 1 / -1; }
+  #gitHead, #gitPickFacts { white-space: normal; overflow-wrap: anywhere; }
+  #compareError:empty { display: none; }
+  #gitCompareRefresh { background: #FEF0CA; border-color: #C68C24; color: #6D4300; }
 
   #timelineModal, #bookmarkModal { width: min(640px, calc(100% - 24px)); }
   .ev {
@@ -835,9 +878,16 @@
       <div class="brand"><span data-i18n="app.title">TCU 调用关系图 · ELK</span><small id="rootName"></small></div>
       <button id="projectBtn" title="切换工程" data-i18n-title="btn.project" data-i18n="timeline.kindProject">工程</button>
       <span id="compareSummary" hidden></span>
+      <button id="gitCompareRefresh" type="button" hidden data-i18n="git.refresh">检测到新代码改动 · 重新计算待导入函数</button>
       <button id="compareExit" hidden data-i18n="compare.exit">退出比较</button>
       <div class="tool-group">
-        <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
+        <input type="checkbox" id="groupMode" checked hidden>
+        <select id="layoutGroupSelect" class="toolbar-select" aria-label="布局分组" data-i18n-aria-label="toolbar.layoutGrouping">
+          <option value="file" data-i18n="btn.group">文件分组</option>
+          <option value="period" data-i18n="toolbar.layoutPeriod">周期泳道</option>
+          <option value="flat" data-i18n="toolbar.layoutFlat">平铺</option>
+        </select>
+        <select id="parserSelect" class="toolbar-select" aria-label="解析引擎" data-i18n-aria-label="toolbar.parser" data-i18n-title="toolbar.parser" hidden></select>
       </div>
       <div class="tool-group">
         <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n-title="toolbar.relayoutHint" data-i18n="btn.reset">重新排版</button>
@@ -938,6 +988,39 @@
 
   <div id="overlayMask" class="mask"></div>
 
+  <div id="flowchartModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="flowchartTitle">
+    <div class="modal-head">
+      <h2 id="flowchartTitle" data-i18n="flowchart.title">函数流程图</h2>
+      <nav id="flowchartCrumbs" class="flowchart-crumbs" data-i18n-aria-label="flowchart.navigation" aria-label="函数导航"></nav>
+      <button class="modal-close" type="button" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+    </div>
+    <div class="flowchart-toolbar">
+      <button id="flowchartBack" type="button" data-i18n="flowchart.back" hidden>← 返回上一函数</button>
+      <label><input id="flowchartExpand" type="checkbox"><span id="flowchartExpandLabel"></span></label>
+      <label id="flowchartVersionLabel" hidden><span data-i18n="flowchart.version">版本</span>
+        <select id="flowchartVersion">
+          <option value="after" data-i18n="flowchart.after">修改后</option>
+          <option value="before" data-i18n="flowchart.before">修改前</option>
+        </select>
+      </label>
+      <div class="flowchart-tools">
+        <button id="flowchartFit" type="button" data-i18n="flowchart.fit">适应窗口</button>
+        <button id="flowchartZoomOut" type="button" data-i18n-aria-label="flowchart.zoomOut" aria-label="缩小">−</button>
+        <button id="flowchartZoomIn" type="button" data-i18n-aria-label="flowchart.zoomIn" aria-label="放大">+</button>
+        <button id="flowchartExport" type="button" data-i18n="flowchart.export">导出 SVG</button>
+      </div>
+    </div>
+    <details id="flowchartMacros" class="flowchart-macros" hidden>
+      <summary data-i18n="flowchart.macros">宏定义对照</summary>
+      <div id="flowchartMacroList"></div>
+    </details>
+    <div id="flowchartViewport">
+      <div id="flowchartStatus" role="status" hidden></div>
+      <div id="flowchartCalls" hidden></div>
+      <div id="flowchartCanvas" style="width: 100%; height: 100%"></div>
+    </div>
+  </div>
+
   <div id="projectModal" class="modal">
     <div class="modal-head">
       <h2 data-i18n="project.title">选择工程</h2>
@@ -956,6 +1039,34 @@
       </div>
     </div>
     <div id="projectComparePane" class="compare-panel" hidden>
+      <div class="git-compare-buttons" role="group" aria-label="比较来源" data-i18n-aria-label="git.source">
+        <button id="gitCompareMode" type="button" aria-pressed="false" disabled data-i18n="git.mode">Git 变更检测</button>
+        <button id="directoryCompareMode" type="button" aria-pressed="true" data-i18n="git.directories">双目录对照 (before / after)</button>
+      </div>
+      <div id="gitRepoMessage" class="hint" role="status" hidden></div>
+      <section id="gitCompareOptions" class="git-compare-options" hidden>
+        <div id="gitHead" class="hint"></div>
+        <details id="gitWorkingDetails">
+          <summary id="gitWorkingSummary"></summary>
+          <ul id="gitWorkingFiles" class="git-compare-files"></ul>
+        </details>
+        <div class="git-compare-buttons" role="group" aria-label="Git 对比预设" data-i18n-aria-label="git.presets">
+          <button type="button" data-git-preset="worktree" data-i18n="git.presetWorktree">工作区未提交改动</button>
+          <button type="button" data-git-preset="index" data-i18n="git.presetIndex">暂存区改动</button>
+          <button type="button" data-git-preset="recent" data-i18n="git.presetRecent">最近一次提交</button>
+          <button type="button" data-git-preset="custom" data-i18n="git.presetCustom">自定义分支 / Commit</button>
+        </div>
+        <div class="git-compare-refs">
+          <div class="compare-row"><label for="gitBaseRef" data-i18n="git.base">基准引用</label><input id="gitBaseRef" value="HEAD" list="gitBaseSuggestions" spellcheck="false"></div>
+          <div class="compare-row"><label for="gitTargetRef" data-i18n="git.target">目标引用</label><input id="gitTargetRef" value="WORKTREE" list="gitTargetSuggestions" spellcheck="false"></div>
+        </div>
+        <datalist id="gitBaseSuggestions"></datalist>
+        <datalist id="gitTargetSuggestions"></datalist>
+        <label><input id="gitIncludeUntracked" type="checkbox" checked> <span data-i18n="git.includeUntracked">包含未跟踪的新增 .c/.h 文件</span></label>
+        <p id="gitAnalysisMessage" class="hint" role="status" hidden data-i18n="git.noChanges">所选 Git 范围内没有 C/H 代码变更。</p>
+        <div class="compare-actions"><button id="gitCompareStart" type="button" class="primary" data-i18n="git.analyze">分析 Git 变更并生成导入清单</button></div>
+      </section>
+      <div id="directoryCompareOptions" class="git-compare-options">
       <ol class="compare-guide">
         <li><b data-i18n="compare.guide.base">① 基底全量工程（总代码目录）</b><p data-i18n="compare.guide.baseHint">自动使用当前工程，补齐未修改文件中的上游调用方、TASK 周期入口与共享变量读取者。</p></li>
         <li><b data-i18n="compare.guide.paths">② 选择修改前和修改后目录（before / after）</b><p data-i18n="compare.guide.pathsHint">支持完整源码目录，也支持仅含改动 .c/.h 文件的局部目录。请保留文件在工程中的相对路径。</p></li>
@@ -975,11 +1086,12 @@
         <input id="compareAfterPath" type="text" data-i18n-ph="compare.afterPlaceholder" placeholder="选择修改后的源码目录（支持局部改动文件夹或完整目录）">
         <button type="button" data-compare-browse="after" data-i18n="compare.browse">浏览</button>
       </div>
-      <div id="compareError" class="compare-error" role="alert"></div>
       <div class="compare-actions">
         <button id="compareSwap" type="button" data-i18n="compare.swap">⇄ 交换前后目录</button>
         <button id="compareStart" type="button" class="primary" data-i18n="compare.start">开始比较</button>
       </div>
+      </div>
+      <div id="compareError" class="compare-error" role="alert"></div>
     </div>
     <div class="modal-foot session-foot" id="sessionTools">
       <button id="sessionExport" data-i18n="session.export">导出会话</button>
@@ -992,6 +1104,7 @@
   <div id="compareSelectModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="compareSelectTitle" style="width:min(900px,94vw)">
     <div class="modal-head"><h2 id="compareSelectTitle" data-i18n="compare.pickTitle">选择加入画布的比较结果</h2><button class="modal-close" type="button">&times;</button></div>
     <div class="modal-body">
+      <p class="hint" id="gitPickFacts" hidden></p>
       <p class="hint" id="comparePickRetainWarning" role="status"></p>
       <section id="comparePickFocus" class="compare-focus" aria-labelledby="comparePickFocusTitle" hidden>
         <h3 id="comparePickFocusTitle" data-i18n="compare.pickPoints">变更点与影响链</h3>

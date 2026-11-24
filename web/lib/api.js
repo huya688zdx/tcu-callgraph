@@ -34,9 +34,9 @@ const guardWrite = (name) => {
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
-  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null,
+  view({ root, roots, up = 1, down = 1, group = true, groupMode = group ? 'file' : 'flat', vars, hiddenVars, expansions = [], at = 0, previous = null,
     preview = false, empty = false, useSnapshot = false }) {
-    const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
+    const q = new URLSearchParams({ down, up, group: groupMode === 'flat' ? '0' : '1', groupMode });
     if (preview) q.set('preview', '1');
     if (empty) q.set('empty', '1');
     if (useSnapshot) q.set('useSnapshot', '1');
@@ -55,8 +55,8 @@ export const api = {
     return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId,
       ...(empty ? { empty: true } : {}), ...(useSnapshot ? { useSnapshot: true } : {}),
       roots: list, vars: vars || [], hiddenVars: hiddenVars || [], expansions, previous: previous ? {
-      projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
-      nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
+      projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection, groupMode: previous.groupMode,
+      nodes: previous.nodes.map(({ id, file, group, x, y, w, h }) => ({ id, file, group, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points, custom, fromSide, toSide }) =>
         ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
@@ -64,6 +64,8 @@ export const api = {
     } : null });
   },
   stats: () => get('/api/stats?summary=1'),
+  parsers: () => fetch('/api/parsers').then(response => response.ok ? response.json() : null).catch(() => null),
+  setParser: parserId => post('/api/parsers', { parserId }),
   /** 当前工程身份（名字、路径、指纹是否变过） */
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */
@@ -72,6 +74,7 @@ export const api = {
   removeProject: (id) => post('/api/projects/remove', { id }),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
+  gitStatus: () => get('/api/git/status'),
   compare: (body) => post('/api/compare', body),
   applyComparison: (body) => post('/api/compare/apply', body),
   comparisonStatus: (body) => post('/api/compare/status', body),
@@ -102,6 +105,11 @@ export const api = {
   tree: () => get('/api/tree'),
   search: (q) => get('/api/search?q=' + encodeURIComponent(q)),
   node: (id) => get('/api/node?id=' + encodeURIComponent(id)),
+  flowchart(id, { version, expandMacros, projectId, comparisonId }) {
+    const query = new URLSearchParams({ id, version, expandMacros: expandMacros ? '1' : '0',
+      projectId, comparisonId: comparisonId ?? '' });
+    return get('/api/flowchart?' + query);
+  },
   /** 节点 / 连线的标注与变更分类 */
   overlay: (body) => guardWrite('overlay') || post('/api/overlay', body),
   /** 删除 / 恢复函数与连线 */

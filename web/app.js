@@ -29,6 +29,9 @@ import './lib/ai-settings.js';
 import { acceptRestoredRevision, restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
 import { clearPairFlow } from './lib/pair-flow.js';
+import { syncFlowchart, wireFlowchart } from './lib/flowchart.js';
+
+wireFlowchart();
 
 /**
  * 加载视图
@@ -59,7 +62,7 @@ const NAV_MAX = 30;
 function currentViewSnapshot() {
   return {
     roots: [...state.roots], expansions: structuredClone(state.expansions),
-    up: state.up, down: state.down, group: state.group,
+    up: state.up, down: state.down, group: state.group, groupMode: state.groupMode,
     vars: [...state.vars], hiddenVars: [...state.hiddenVars],
     empty: !!state.view?.empty && !state.roots.length && !state.expansions.length,
   };
@@ -94,7 +97,10 @@ async function loadView(rootId, opts = {}) {
   const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
   const up = opts.exact ? 0 : opts.up ?? state.up;
   const down = opts.exact ? 0 : opts.down ?? state.down;
-  const group = opts.group ?? state.group;
+  const grouped = opts.group ?? state.group;
+  const groupedMode = opts.group == null && state.groupMode === 'period' ? 'period' : 'file';
+  const groupMode = opts.groupMode ?? (grouped ? groupedMode : 'flat');
+  const group = groupMode !== 'flat';
   const vars = new Set(opts.vars ?? state.vars);
   const hiddenVars = new Set(opts.hiddenVars ?? state.hiddenVars);
   const choices = opts.vars === undefined && opts.hiddenVars === undefined ? [...pendingVarChoices] : [];
@@ -111,7 +117,7 @@ async function loadView(rootId, opts = {}) {
       await restoreVariables([...restoreIds], state.view.projectId);
       if (seq !== viewSeq) return;
     }
-    data = await api.view({ roots, expansions, up, down, group, vars: [...vars], hiddenVars: [...hiddenVars],
+    data = await api.view({ roots, expansions, up, down, groupMode, vars: [...vars], hiddenVars: [...hiddenVars],
       at: state.at, previous, empty, useSnapshot: opts.useSnapshot ?? state.at > 0 });
   } catch (error) {
     if (seq !== viewSeq) return;
@@ -131,7 +137,9 @@ async function loadView(rootId, opts = {}) {
   const snapshot = data.reviewSnapshot;
   state.up = snapshot?.up ?? up; state.down = snapshot?.down ?? down;
   state.group = snapshot?.group ?? group;
+  state.groupMode = snapshot?.groupMode ?? (snapshot ? (state.group ? 'file' : 'flat') : groupMode);
   els.groupMode.checked = state.group;
+  els.layoutGroupSelect.value = state.groupMode;
   const visibleVars = new Set(data.nodes.filter((node) => node.kind === 'var').map((node) => node.id));
   state.vars = new Set([...(snapshot?.vars ?? vars)].filter((id) => visibleVars.has(id)));
   state.hiddenVars = new Set(snapshot?.hiddenVars ?? hiddenVars);
@@ -142,6 +150,7 @@ async function loadView(rootId, opts = {}) {
     priorView?.comparison?.id === data.comparison?.id ? state.selected : null;
   stopCamAnim();
   state.view = data;
+  syncFlowchart();
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
   state.roots = data.roots ?? (data.root ? [data.root] : roots);
@@ -271,6 +280,7 @@ hooks.restoreComparison = async () => {
   const saved = comparisonPage;
   comparisonPage = null;
   state.view = saved.view;
+  syncFlowchart();
   state.roots = saved.roots;
   state.expansions = saved.expansions;
   state.vars = new Set(saved.vars);
@@ -291,12 +301,14 @@ hooks.applyBookmark = async (b) => {
   pendingVarChoices.clear();
   state.up = Number.isInteger(b.up) ? b.up : 1;
   state.down = Number.isInteger(b.down) ? b.down : 1;
-  state.group = !!b.group;
+  state.groupMode = b.groupMode ?? (b.group === false ? 'flat' : 'file');
+  state.group = state.groupMode !== 'flat';
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
 
   els.groupMode.checked = state.group;
 
+  els.layoutGroupSelect.value = state.groupMode;
   const roots = (b.roots || []).filter(Boolean);
   await loadView(roots.length ? roots : null, { expansions: b.expansions || [] });
 };
@@ -308,6 +320,7 @@ hooks.reloadAll = async () => {
   const seq = ++viewSeq;
   if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = null;
+  syncFlowchart();
   state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
@@ -323,7 +336,7 @@ hooks.reloadAll = async () => {
   resetVars();
   navStack.length = 0;
   deleteStack.length = 0;
-  await loadStats();
+  await Promise.all([loadStats(), loadParsers()]);
   await loadTree();
   await restorePage(null, () => seq === viewSeq);
 };
@@ -354,6 +367,8 @@ function canEditCanvas() {
 function syncCanvasControls() {
   clearButton.disabled = canvasAction || !canEditCanvas();
   els.groupMode.disabled = !!state.at;
+  els.layoutGroupSelect.disabled = !!state.at;
+  els.parserSelect.disabled = parserBusy || !!state.at || !!state.view?.comparison || els.parserSelect.options.length < 2;
   els.resetLayout.disabled = !!state.at;
   emptyGuide.hidden = !!state.view?.nodes.length || !!state.view?.comparison;
   emptyGuideCompare.disabled = !!state.at;
@@ -411,7 +426,7 @@ async function removeFunctions(ids) {
     if (!empty && fnIds.length) {
       // 先验证缩小后的范围，仅隐藏仍会被展开带回来的函数。
       const preview = await api.view({ roots, expansions, vars, hiddenVars, up: prior.up, down: prior.down,
-        group: prior.group, preview: true });
+        groupMode: prior.groupMode, preview: true });
       if (seq !== viewSeq || state.at || projectId !== state.view?.projectId) return;
       if (!Array.isArray(preview?.nodes)) throw new Error(preview?.error || t('app.viewFailed'));
       const remaining = new Set(preview.nodes.map((node) => node.id));
@@ -596,11 +611,59 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'f' || e.key === 'F') fit();
 });
 
-els.groupMode.addEventListener('change', () => {
+async function changeGrouping(groupMode) {
   if (state.at) return;
   state.selectedEdge = null;
   state.selectedLabel = null;
-  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions, group: els.groupMode.checked });
+  try {
+    await loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions, groupMode });
+  } finally {
+    els.groupMode.checked = state.group;
+    els.layoutGroupSelect.value = state.groupMode;
+  }
+}
+els.layoutGroupSelect.addEventListener('change', () => changeGrouping(els.layoutGroupSelect.value).catch(reportCanvasError));
+els.groupMode.addEventListener('change', () => {
+  changeGrouping(els.groupMode.checked ? 'file' : 'flat').catch(reportCanvasError);
+});
+
+let parserBusy = false;
+let activeParser = '';
+let parserList = [];
+function renderParserSelect() {
+  const select = els.parserSelect;
+  select.replaceChildren(...parserList.map(({ id, name, available }) => {
+    const option = new Option(id === 'builtin' ? t('toolbar.parserBuiltin') : name || id, id);
+    option.disabled = available === false;
+    return option;
+  }));
+  select.hidden = !parserList.length;
+  select.value = activeParser;
+  syncCanvasControls();
+}
+async function loadParsers() {
+  const data = await api.parsers();
+  activeParser = data?.active || '';
+  parserList = Array.isArray(data?.parsers) ? data.parsers.filter(parser => typeof parser?.id === 'string' &&
+    (parser.id === 'dot') === (activeParser === 'dot')) : [];
+  renderParserSelect();
+}
+els.parserSelect.addEventListener('change', async () => {
+  const id = els.parserSelect.value;
+  if (parserBusy || !id || id === activeParser) return;
+  parserBusy = true;
+  syncCanvasControls();
+  try {
+    const result = await api.setParser(id);
+    if (!result?.ok) throw new Error(t('toolbar.parserFailed') + (result?.error ? ` · ${result.error}` : ''));
+    await hooks.reloadAll();
+  } catch (error) {
+    reportCanvasError(error);
+  } finally {
+    parserBusy = false;
+    els.parserSelect.value = activeParser;
+    syncCanvasControls();
+  }
 });
 els.resetLayout.addEventListener('click', () => {
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
@@ -638,7 +701,7 @@ for (const menu of toolMenus) {
   });
 }
 document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape') return;
+  if (event.key !== 'Escape' || document.querySelector('.modal.show')) return;
   for (const menu of toolMenus) {
     if (!menu.open) continue;
     menu.open = false;
@@ -674,6 +737,7 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 
 applyI18n();
 document.addEventListener('callgraph:langchange', () => {
+  renderParserSelect();
   renderTree(true);
   syncTreeSelection();
   runSearch().catch(() => {});
@@ -702,7 +766,7 @@ resize();
   } catch {
     /* 服务端没有该接口或暂时不可达：用默认值 */
   }
-  await Promise.all([loadStats(), loadTree()]);
+  await Promise.all([loadStats(), loadTree(), loadParsers()]);
   await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
   if (!state.view) throw new Error(t('app.noView'));
 })().catch((error) => {

@@ -5,8 +5,9 @@
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { isDataEdge, edgeDirection } from './edge-flow.js';
-import { periodSubtitle } from './period-text.js';
+import { nodePeriodBadge, periodBadgeBox, periodContainerStyle, PERIOD_COLORS, periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
+import { midAnchor } from '/core/labels.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, mergeFlowStreams } from './flow-geometry.js';
 import { CALLER_COLOR, CALLEE_COLOR, BIDIR_COLOR, mixHex, classifySelectionRelations } from './relation-focus.js';
@@ -634,13 +635,15 @@ function draw({ geometryUnchanged = false } = {}) {
 function drawContainer(ctx, c, dimmed = false) {
   ctx.save();
   if (dimmed) ctx.globalAlpha = 0.32;
+  const style = periodContainerStyle(c.kind);
   roundRect(ctx, c.x, c.y, c.w, c.h, 14);
-  ctx.fillStyle = hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
+  ctx.fillStyle = style?.body || hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
   ctx.fill();
-  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08));
+  ctx.strokeStyle = style?.border || hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08));
   ctx.lineWidth = 1.4;
-  // 层级框用实线（函数才是虚线）
+  if (style?.dashed) ctx.setLineDash([7, 5]);
   ctx.stroke();
+  ctx.setLineDash([]);
 
   // 标题做成带底色的胶囊，避免在大容器上完全看不见层级名
   const fs = Math.min(22, Math.max(12, 11 / cam.k));
@@ -652,13 +655,13 @@ function drawContainer(ctx, c, dimmed = false) {
   const bx = c.x + 6;
   const by = c.y + 4;
   roundRect(ctx, bx, by, tw + padX * 2, bh, bh / 2);
-  ctx.fillStyle = hexToRgba(THEME.container.stroke, 0.32);
+  ctx.fillStyle = style?.fill || hexToRgba(THEME.container.stroke, 0.32);
   ctx.fill();
-  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55);
+  ctx.strokeStyle = style?.border || hexToRgba(THEME.container.stroke, 0.55);
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  ctx.fillStyle = '#0C447C';
+  ctx.fillStyle = style?.ink || '#0C447C';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.fillText(label, bx + padX, by + bh / 2 + 0.5);
@@ -707,17 +710,13 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
   const roleColor = hasRole
     ? relationMeta.role === 'in' ? CALLER_COLOR : relationMeta.role === 'both' ? BIDIR_COLOR : CALLEE_COLOR
     : null;
-  const baseColor = traceColor ? traceColor : e.change === 'added'
+  const baseColor = e.change === 'added'
     ? THEME.edge.added
     : isDataEdge(e)
     ? THEME.edge.var
     : THEME.edge.call;
   const color = dimmed
     ? mixHex(THEME.bg, baseColor, e.change === 'added' ? 0.16 : 0.09)
-    : selected && !traceColor && e.change !== 'added'
-    ? SELECTED_EDGE_COLOR
-    : hasRole && e.change !== 'added'
-    ? roleColor
     : baseColor;
   const invK = Math.max(1, 1 / cam.k);
   ctx.save();
@@ -730,13 +729,16 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     ctx.lineWidth = Math.max(4.5, 3 / cam.k);
     ctx.stroke();
   }
+  // 变量访问的选中外圈也用虚线，避免连续色带填满线芯间隙。
+  if (isDataEdge(e) && (!dimmed || cam.k >= 0.45)) ctx.setLineDash([7, 4]);
   if (traceColor || selected) {
-    ctx.strokeStyle = traceColor ? '#FFFFFF' : hexToRgba(color, 0.18);
+    // 选中和路径追踪着色在外圈，保留线芯和箭头的变更状态。
+    ctx.strokeStyle = traceColor || hexToRgba(SELECTED_EDGE_COLOR, 0.54);
     ctx.lineWidth = (traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
     ctx.globalAlpha = traceColor ? 0.9 : 1;
     ctx.stroke();
   } else if (hasRole) {
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+    ctx.strokeStyle = hexToRgba(roleColor, 0.58);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.lineWidth = Math.min(18, (relationMeta.emphasized ? 6.8 : 5.6) * invK);
@@ -748,17 +750,15 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     : hasRole ? Math.min(10, (relationMeta.emphasized ? 3.4 : 2.6) * invK)
     : related ? 2.2 : 1.4;
   ctx.globalAlpha = relationMeta?.subdued ? 0.42 : 1;
-  // 变量访问=虚线，函数调用=实线（极小缩放下的淡化背景线省去虚线切分以降低核显负载）
-  if (isDataEdge(e) && (!dimmed || cam.k >= 0.45)) ctx.setLineDash([7, 4]);
   ctx.stroke();
   ctx.setLineDash([]);
 
   const direction = edgeDirection(e);
   const biOffset = direction === 'both' ? 2.5 : 0;
   const drawDirection = (a, b, reverse) => {
-    const showPulse = collectingEffects && (
+    const showPulse = collectingEffects && e.change !== 'deleted' && (
       (selected && animated && (traceColor || (THEME.edge.selPulse && !prefersReducedMotion()))) ||
-      (hasRole && e.change !== 'deleted' && relationMeta.role !== 'neutral' && !relationMeta.subdued && THEME.edge.selPulse && !prefersReducedMotion())
+      (hasRole && relationMeta.role !== 'neutral' && !relationMeta.subdued && THEME.edge.selPulse && !prefersReducedMotion())
     );
     if (showPulse) {
       const pulseColor = traceColor ? flowPulseColor(traceColor)
@@ -823,11 +823,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
 
   // 已删除的连线：在中央画一个黑色 X
   if (e.change === 'deleted') {
-    const mi = Math.max(1, Math.floor(pts.length / 2));
-    const p0 = pts[mi - 1];
-    const p1 = pts[Math.min(pts.length - 1, mi)];
-    const mx = (p0[0] + p1[0]) / 2;
-    const my = (p0[1] + p1[1]) / 2;
+    const { x: mx, y: my } = midAnchor(pts);
     const xs = 5 / cam.k;
     ctx.strokeStyle = color;
     ctx.lineWidth = 2.2 / cam.k;
@@ -1016,6 +1012,27 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     }
   }
 
+  if (!comparing && cam.k >= 0.4) {
+    const badge = nodePeriodBadge(n);
+    if (badge) {
+      const size = Math.max(10.5, 7.5 / cam.k);
+      ctx.font = `600 ${size}px ${FONT}`;
+      const box = periodBadgeBox(n, ctx.measureText(badge.text).width, size, recentlyAdded);
+      if (box) {
+        const { fill, ink } = PERIOD_COLORS[badge.tier];
+        roundRect(ctx, box.x, box.y, box.w, box.h, box.h / 2);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.strokeStyle = ink;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = ink;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(badge.text, box.x + box.w / 2, y, box.w - 10);
+      }
+    }
+  }
   if (recentlyAdded) {
     if (cam.k >= 0.35) {
       const bx = x + w - 28, by = y - 8, bw = 26, bh = 15;

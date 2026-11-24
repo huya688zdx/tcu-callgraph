@@ -444,6 +444,37 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSid
   return fallback?.points || null;
 }
 
+/** 多层障碍可能需要连续绕过几个拐角。沿障碍外缘的坐标网格搜索可达通道。 */
+function routeThroughGaps(a, b, sa, sb, nodes) {
+  const start = portAt(a, sa), end = portAt(b, sb);
+  const stub = (point, side) => point.map((v, i) => v + DIR[side][i] * (CLEAR + 1));
+  const first = stub(start, sa), last = stub(end, sb);
+  const skip = new Set([a.id, b.id]);
+  if (pathBlockedByNodes([start, first], nodes, skip) || pathBlockedByNodes([last, end], nodes, skip)) return null;
+  const ticks = (axis, size, i) => [...new Set([first[i], last[i],
+    ...nodes.flatMap(n => [n[axis] - CLEAR - 1, n[axis] + n[size] + CLEAR + 1])])].sort((x, y) => x - y);
+  const xs = ticks('x', 'w', 0), ys = ticks('y', 'h', 1);
+  const index = ([x, y]) => ys.indexOf(y) * xs.length + xs.indexOf(x);
+  const point = k => [xs[k % xs.length], ys[Math.floor(k / xs.length)]];
+  const source = index(first), target = index(last);
+  const parents = new Map([[source, -1]]), queue = [source];
+  for (let i = 0; i < queue.length && !parents.has(target); i++) {
+    const k = queue[i], x = k % xs.length, y = Math.floor(k / xs.length), p = point(k);
+    for (const [dx, dy] of Object.values(DIR)) {
+      const col = x + dx, row = y + dy, next = row * xs.length + col;
+      if (col < 0 || row < 0 || col >= xs.length || row >= ys.length || parents.has(next)) continue;
+      if (pathBlockedByNodes([p, point(next)], nodes)) continue;
+      parents.set(next, k);
+      queue.push(next);
+    }
+  }
+  if (!parents.has(target)) return null;
+  const points = [end];
+  for (let k = target; k !== -1; k = parents.get(k)) points.push(point(k));
+  points.push(start);
+  return collapse(points.reverse());
+}
+
 /** 直连通道被占时，沿所有节点包络之外绕行，避免退回穿过函数框。 */
 function routeOuterLane(p0, p1, a, b, sa, sb, ctx) {
   if (DIR[sa][1] !== 0 || DIR[sb][1] !== 0) return null;
@@ -531,7 +562,29 @@ export function collapse(pts) {
 
 // ---------------- 分类 ----------------
 
-function classify(e, a, b, hint) {
+const callKinds = new Set(['direct', 'macro', 'fnptr', 'manual']);
+const isCall = e => callKinds.has(e.kind);
+
+export function semanticFaces(e, a, b, direction, callNodes) {
+  if (!direction) return null;
+  const right = direction === 'RIGHT';
+  if (isCall(e)) {
+    if (right && b.x >= a.x + a.w - 4) return ['right', 'left'];
+    if (!right && b.y >= a.y + a.h - 4) return ['bottom', 'top'];
+  } else if ((e.kind === 'var' || e.kind?.startsWith('df-')) && (callNodes.has(e.from) || callNodes.has(e.to))) {
+    if (right && b.y >= a.y + a.h) return ['bottom', 'top'];
+    if (right && a.y >= b.y + b.h) return ['top', 'bottom'];
+    if (!right && b.x >= a.x + a.w) return ['right', 'left'];
+    if (!right && a.x >= b.x + b.w) return ['left', 'right'];
+  }
+  return null;
+}
+
+export function callEndpoints(edges) {
+  return new Set(edges.filter(isCall).flatMap(e => [e.from, e.to]));
+}
+
+function classify(e, a, b, hint, roles) {
   let sa = SIDES.has(e.fromSide) ? e.fromSide : null;
   let sb = SIDES.has(e.toSide) ? e.toSide : null;
   let g0;
@@ -552,8 +605,8 @@ function classify(e, a, b, hint) {
   }
   // 面提示（faceHints，交叉优化器给的初值）：优先级低于用户钉面，高于几何判定；
   // 不锁死——并面/母线照常运行，提示的价值由优化器实测交叉数裁决
-  sa = sa || (hint && SIDES.has(hint.from) ? hint.from : g0);
-  sb = sb || (hint && SIDES.has(hint.to) ? hint.to : g1);
+  sa = sa || (hint && SIDES.has(hint.from) ? hint.from : roles?.[0] || g0);
+  sb = sb || (hint && SIDES.has(hint.to) ? hint.to : roles?.[1] || g1);
   if (DIR[sa][1] !== 0 && DIR[sb][1] !== 0) {
     const span = DIR[sa][1] > 0 ? b.y - (a.y + a.h) : a.y - (b.y + b.h);
     return { sa, sb, type: span > LOOP_THRESHOLD ? 'long' : 'direct' };
@@ -1216,6 +1269,7 @@ export function routeEdges(nodes, edges, opts = {}) {
   ctx.placed.h.sort((u, v) => u.k - v.k);
   ctx.placed.v.sort((u, v) => u.k - v.k);
 
+  const callNodes = opts.callNodes || callEndpoints(edges);
   const autos = [];
   const preserved = new Set();
   const restoreCustom = new Set();
@@ -1266,9 +1320,10 @@ export function routeEdges(nodes, edges, opts = {}) {
       autos.push({ e, a, b, ...c });
       continue;
     }
-    const c = classify(e, a, b, opts.faceHints?.get(e));
+    const roles = semanticFaces(e, a, b, opts.layoutDirection, callNodes);
+    const c = classify(e, a, b, opts.faceHints?.get(e), roles);
     e.back = c.sa === 'top';
-    autos.push({ e, a, b, ...c });
+    autos.push({ e, a, b, roles, ...c });
   }
 
   // ---- 共线合并：同一对节点、相同类型的调用边（不同调用行）只布一条折线 ----
@@ -1368,7 +1423,7 @@ export function routeEdges(nodes, edges, opts = {}) {
         let major = null;
         for (const [s, c] of count) if (!major || c > count.get(major)) major = s;
         for (const it of list) {
-          if (it.straight) continue; // 能直接接通的线不为并面而绕弯。
+          if (it.straight || it.roles) continue; // 能直接接通的线不为并面而绕弯。
           if (it[sideKey] === major) continue;
           if (SIDES.has(it.e[pinnedKey])) continue; // 用户钉过面，不并
           const n = it[nodeKeyOf];
@@ -1506,7 +1561,9 @@ export function routeEdges(nodes, edges, opts = {}) {
     if (alt && !crossesEndpoints(alt, it.a, it.b)) {
       it.e.points = alt;
     } else {
-      it.e.blocked = true;
+      const path = opts.searchGaps && routeThroughGaps(it.a, it.b, it.sa, it.sb, nodes);
+      if (path) it.e.points = path;
+      else it.e.blocked = true;
     }
   }
 

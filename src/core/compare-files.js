@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { listSourceFiles } from './index.js';
+import { listScheduleFiles } from './tcu-schedule.js';
 
 const inside = (child, parent) => {
   const rel = path.relative(parent, child);
@@ -12,7 +13,8 @@ export function comparisonFiles(projectPath, beforePath, afterPath) {
       inside(projectPath, beforePath) || inside(projectPath, afterPath)) {
     throw new Error('before/after 不能互相包含，也不能包含总代码目录');
   }
-  const filesOf = (root) => new Map(listSourceFiles(root).map((abs) => [path.relative(root, abs).replace(/\\/g, '/'), abs]));
+  const filesOf = (root) => new Map([...listScheduleFiles(root),
+    ...listSourceFiles(root).map(abs => [path.relative(root, abs).split(path.sep).join('/'), abs])]);
   const baseFiles = new Map([...filesOf(projectPath)].filter(([, abs]) => !inside(abs, beforePath) && !inside(abs, afterPath)));
   const suffixes = new Map();
   for (const rel of baseFiles.keys()) {

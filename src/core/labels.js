@@ -281,6 +281,15 @@ export function labelBoxSize(label, measure) {
   };
 }
 
+/** 删除标记位于整条连线的弧长中点，浏览器和服务端 SVG 使用相同的图形。 */
+export function deletedEdgeMarkSvg(points, color) {
+  const center = midAnchor(points);
+  if (!center || !Number.isFinite(center.x) || !Number.isFinite(center.y)) return '';
+  const { x, y } = center;
+  const stroke = HEX.test(color) ? color : '#2C2C2A';
+  return `<path class="deleted-edge-mark" d="M${x - 5} ${y - 5}L${x + 5} ${y + 5}M${x + 5} ${y - 5}L${x - 5} ${y + 5}" fill="none" stroke="${stroke}" stroke-width="2.2"/>`;
+}
+
 /** 折线按弧长取中点，同时给出所在段的方向（用于确定「贴近线」的法线方向） */
 export function midAnchor(pts = []) {
   if (!Array.isArray(pts) || pts.length < 2) return null;

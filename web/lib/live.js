@@ -21,6 +21,7 @@ import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
 import { syncProjectLabel } from './projects.js';
+import { notifyGitChanged } from './git-compare.js';
 
 // ---------------- SSE 监听 ----------------
 
@@ -53,7 +54,7 @@ function scheduleReload() {
 async function flushReload() {
   flushTimer = null;
   if (!dirtyCount || applyingCompose) return;
-  if (state.view?.comparison) return;
+  if (state.view?.comparison && !pendingCompose) { dirtyCount = 0; return; }
   if (state.at > 0) {
     // 回看历史：画面是过去的重放，不能就地刷新，改完的量记在提示里
     const n = dirtyCount;
@@ -72,13 +73,14 @@ async function flushReload() {
   const compose = pendingCompose;
   pendingCompose = null;
   try {
-    if (compose && compose.page.projectId === state.view?.projectId) {
+    if (compose && compose.page.projectId === state.view?.projectId &&
+        compose.page.comparisonId === state.view?.comparison?.id) {
       const { page, reason } = compose;
       applyingCompose = true;
       // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
       const view = await hooks.loadView(page.roots, {
         nav: true, incremental: true, expansions: page.expansions || [],
-        up: page.up ?? 0, down: page.down ?? 0, group: page.group, empty: !!page.empty,
+        up: page.up ?? 0, down: page.down ?? 0, group: page.group, groupMode: page.groupMode, empty: !!page.empty,
         vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
       if (!view) throw new Error(t('live.composeFailed'));
@@ -118,7 +120,9 @@ if (es) {
     if (restoring || !state.view?.projectId) return;
     try {
       const { page } = await api.savedPage();
-      if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
+      if (page?.projectId === state.view?.projectId && page.comparisonId !== state.view?.comparison?.id) {
+        await hooks.reloadAll();
+      } else if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
           page.revision > (pendingCompose?.page.revision ?? 0)) {
         pendingCompose = { page };
         scheduleReload();
@@ -133,6 +137,10 @@ if (es) {
       return;
     }
     if (!m) return;
+    if (m.op === 'git.changed') {
+      notifyGitChanged(m);
+      return;
+    }
     if (m.op === 'project.switch') {
       if (m.clientId === clientId) return;
       dirtyCount = 0;
@@ -171,6 +179,7 @@ export function savePage(force = false) {
       (!force && isInteracting())) return pendingSave.catch(() => {});
   const page = {
     projectId: state.view.projectId,
+    comparisonId: state.view.comparison?.id ?? null,
     revision: state.at && pendingCompose?.page.projectId === state.view.projectId ? pendingCompose.page.revision : pageRevision,
     roots: state.roots,
     expansions: state.expansions,
@@ -178,6 +187,7 @@ export function savePage(force = false) {
     up: state.up,
     down: state.down,
     group: state.group,
+    groupMode: state.groupMode,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
     selected: state.selected,
@@ -214,10 +224,12 @@ export async function restorePage(root = null, isCurrent = () => true) {
     pageRevision = stored?.revision ?? 0;
     const saved = root ? null : stored;
     if (saved) {
-      Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
+      const groupMode = saved.groupMode ?? (saved.group === false ? 'flat' : 'file');
+      Object.assign(state, { up: saved.up, down: saved.down, groupMode, group: groupMode !== 'flat' });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
       els.groupMode.checked = state.group;
+      els.layoutGroupSelect.value = state.groupMode;
     }
     let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
     if (!root && !saved) {
@@ -230,7 +242,7 @@ export async function restorePage(root = null, isCurrent = () => true) {
     // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
     // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
     // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
-    if (state.view?.comparison) {
+    if (state.view?.comparison && !saved?.comparisonId) {
       state.up = 0; state.down = 0;
     }
     if (saved && view && state.view === view) {

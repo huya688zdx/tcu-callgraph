@@ -72,7 +72,7 @@ test('launchServer 起服务并回报真实端口', async () => {
     assert.ok(body.stats && body.stats.functions > 0, '应解析出函数');
     const compact = await (await fetch(srv.baseUrl + '/api/stats?summary=1')).json();
     const { cycleGroups, selfLoops, ...counts } = body.stats;
-    assert.deepEqual(compact, { stats: counts });
+    assert.deepEqual(compact, { stats: counts, parser: body.parser });
     assert.ok(body.macros.length && body.files.length, '原接口仍提供宏和文件细节');
   } finally {
     await srv.close();

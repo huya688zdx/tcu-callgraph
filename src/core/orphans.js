@@ -22,7 +22,14 @@ export function validNodeIds(model) {
 
 /** 当前模型里有效的连线 key 集合（与前端 edgeKey 一致） */
 export function validEdgeKeys(model) {
-  return new Set([...(model.edges || []), ...(model.headerEdges || [])].map((e) => `${e.from}->${e.to}:${e.line}`));
+  const keys = new Set();
+  for (const e of [...(model.edges || []), ...(model.headerEdges || [])]) {
+    const pair = `${e.from}->${e.to}`;
+    keys.add(`${pair}:${e.line}`);
+    // 普通画布合并变量读写，以行号 0 保存同一函数对该变量的标注。
+    if (e.kind === 'var') keys.add(pair + ':0');
+  }
+  return keys;
 }
 
 /**

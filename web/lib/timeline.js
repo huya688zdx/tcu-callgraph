@@ -286,7 +286,7 @@ async function reviewAt(eventId, ts) {
   if (changingReview || restoringSnapshot || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
   if (!state.at) {
     preReview = { roots: [...state.roots], expansions: structuredClone(state.expansions),
-      up: state.up, down: state.down, group: state.group, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+      up: state.up, down: state.down, group: state.group, groupMode: state.groupMode, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
       empty: !!state.view?.empty && !state.roots.length && !state.expansions.length, cam: { ...cam } };
   }
   const seq = ++reviewSeq;
