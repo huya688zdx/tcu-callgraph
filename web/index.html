@@ -114,6 +114,27 @@
   #right { grid-area: right; border-left: 1px solid rgba(0,0,0,.08); }
   #right[data-mode="dataflow"] > .sec:not(#secDataflow):not(#pairFlowBar) { display: none !important; }
   main { grid-area: main; position: relative; overflow: hidden; }
+  #canvasEmptyGuide {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: min(420px, calc(100% - 32px)); padding: 24px; text-align: center;
+    border: 1px solid #DEDCD1; border-radius: 16px; background: #FFF;
+    box-shadow: 0 8px 28px rgba(44, 44, 42, .09);
+  }
+  #canvasEmptyGuide h2 { margin: 0; font-size: 18px; }
+  #canvasEmptyGuide p { margin: 8px 0 16px; color: #585851; line-height: 1.6; }
+  .canvas-guide-actions, #multiSelectBar, #shownBatchBar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .canvas-guide-actions, #multiSelectBar { justify-content: center; }
+  #multiSelectBar {
+    position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+    width: max-content; max-width: calc(100% - 24px); padding: 6px 10px;
+    border: 1px solid #BDD7F6; border-radius: 24px; background: #F6FAFF;
+    color: #174A81; box-shadow: 0 4px 16px rgba(27, 67, 110, .14);
+  }
+  #shownBatchBar { margin: 4px 0 8px; }
+  #shownBatchBar button { padding-inline: 6px; font-size: 11px; }
+  #shownBatchSelect[aria-pressed="true"] { background: #E6F1FB; }
+  [data-batch-function] { flex: none; margin: 0 5px 0 0; }
+  #canvasEmptyGuide[hidden], #multiSelectBar[hidden], #shownBatchBar[hidden] { display: none; }
   canvas { display: block; width: 100%; height: 100%; cursor: default; }
   canvas.panning { cursor: grabbing; }
   canvas.over-node { cursor: move; }
@@ -820,6 +841,7 @@
       </div>
       <div class="tool-group">
         <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n-title="toolbar.relayoutHint" data-i18n="btn.reset">重新排版</button>
+        <button id="clearCanvas" type="button" disabled data-i18n="timeline.kindClearCanvas">清空画布</button>
       </div>
       <div class="top-actions" aria-label="工程工具" data-i18n-aria-label="toolbar.projectTools">
         <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
@@ -854,6 +876,7 @@
             <p><span data-i18n="help.reconnect">重新连接端点</span><kbd data-i18n="help.reconnectKeys">双击连线后拖动圆点</kbd></p>
             <p><span data-i18n="help.moveLabel">移动标签</span><kbd data-i18n="help.moveLabelKeys">直接拖动标签</kbd></p>
             <p><span data-i18n="help.manualEdge">手动连接节点</span><kbd data-i18n="help.manualEdgeKeys">Shift+拖动节点到目标</kbd></p>
+            <p><span data-i18n="help.multiSelect">选择多个节点</span><kbd data-i18n="help.multiSelectKeys">Shift+单击节点 / Shift+框选空白处</kbd></p>
             <p><span data-i18n="help.undo">撤销 / 回退视图</span><kbd>Ctrl+Z</kbd></p>
             <p><span data-i18n="help.selectAll">全选同类组件 / 退出全选</span><kbd>Ctrl+A / Esc</kbd></p>
             <p><span data-i18n="help.redo">重做修改</span><kbd>Ctrl+Shift+Z</kbd></p>
@@ -871,6 +894,11 @@
     <div class="sec" id="stats"></div>
     <div class="sec tree-sec">
       <div class="tree-heading"><h3 data-i18n="panel.files">文件</h3><button id="shownFunctions" type="button" aria-pressed="false" title="平铺显示当前画布中的全部函数" data-i18n-title="tree.shownHint"><span data-i18n="tree.shown">已加入</span> <span>0</span></button></div>
+      <div id="shownBatchBar" hidden>
+        <button id="shownBatchSelect" type="button" aria-pressed="false" data-i18n="tree.batchSelectAll">全选</button>
+        <button id="shownBatchRemove" type="button" disabled></button>
+        <button id="shownBatchClear" type="button" data-i18n="timeline.kindClearCanvas">清空画布</button>
+      </div>
       <ul id="results" class="results-list"></ul>
       <div id="tree"><div class="empty" data-i18n="tree.loading">加载中…</div></div>
     </div>
@@ -878,6 +906,19 @@
 
   <main>
     <canvas id="cv"></canvas>
+    <section id="canvasEmptyGuide" aria-labelledby="canvasEmptyTitle" hidden>
+      <h2 id="canvasEmptyTitle" data-i18n="canvas.emptyTitle">当前画布为空</h2>
+      <p data-i18n="canvas.emptyHint">从左侧文件树或搜索框选择函数加入画布，或通过「工程比较」自动生成变更影响图。</p>
+      <div class="canvas-guide-actions">
+        <button id="emptyGuideSearch" class="primary" type="button" data-i18n="canvas.emptySearch">🔍 搜索函数</button>
+        <button id="emptyGuideCompare" type="button" data-i18n="canvas.emptyCompare">⚖️ 工程比较</button>
+      </div>
+    </section>
+    <div id="multiSelectBar" hidden>
+      <span id="multiSelectCount" role="status"></span>
+      <button id="multiSelectRemove" class="primary" type="button" data-i18n="canvas.removeSelected">移出画布 (Del)</button>
+      <button id="multiSelectCancel" type="button" data-i18n="canvas.cancelSelection">取消选择</button>
+    </div>
     <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
@@ -1075,6 +1116,7 @@
         <button data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
         <button data-ops="bookmark.save,bookmark.delete" data-i18n="timeline.kindBookmark">书签</button>
         <button data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
+        <button data-ops="view.snapshot,view.clear" data-i18n="timeline.kindCanvas">画布</button>
       </div>
       <span class="tl-count" id="tlCount"></span>
     </div>

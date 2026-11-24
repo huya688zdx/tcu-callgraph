@@ -11,9 +11,11 @@
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { state } from './state.js';
+import { state, cam } from './state.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
+import { constrainCam } from './camera.js';
+import { draw } from './render.js';
 
 const btn = document.getElementById('timelineBtn');
 const listEl = document.getElementById('timelineList');
@@ -40,6 +42,8 @@ const OP_KIND = {
   'bookmark.save': 'Bookmark',
   'bookmark.delete': 'Bookmark',
   'view.compose': 'Compose',
+  'view.snapshot': 'Canvas',
+  'view.clear': 'ClearCanvas',
 };
 
 /** 面板状态：已加载的事件、过滤条件、翻页游标 */
@@ -133,6 +137,10 @@ function describe(e) {
       const caption = b.count == null ? t('timeline.compose') : t('timeline.composeCount', { n: b.count });
       return [caption, reason].filter(Boolean).join(' · ');
     }
+    case 'view.snapshot':
+      return [t('timeline.canvasCount', { n: b.count ?? 0 }), b.label].filter(Boolean).join(' · ');
+    case 'view.clear':
+      return t('timeline.kindClearCanvas');
     case 'orphan.purge':
       return t('timeline.orphanCount', { n: b.total || 0 });
     default:
@@ -147,7 +155,7 @@ function collapseEvents(events) {
     const day = dayKey(event.ts);
     const detail = describe(event);
     const previous = rows.at(-1);
-    if (previous && previous.day === day && previous.event.op === event.op &&
+    if (!event.op.startsWith('view.') && previous && previous.day === day && previous.event.op === event.op &&
         previous.event.target === event.target && previous.detail === detail) {
       previous.count++;
     } else {
@@ -175,7 +183,8 @@ function renderAll() {
     const category = t(`timeline.kind${kind}`);
     const target = e.target || '';
     const codeTarget = ['Node', 'Edge', 'Delete', 'Layout', 'Compose'].includes(kind);
-    const displayTarget = kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
+    const displayTarget = kind === 'Canvas' || kind === 'ClearCanvas' ? ''
+      : kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
       : kind === 'Compose' && !target.includes('::') ? '' : target;
     const { title, meta } = codeTarget
       ? formatTarget(displayTarget)
@@ -241,46 +250,114 @@ async function load({ append = false } = {}) {
   renderAll();
 }
 
-function showBar(ts) {
+let preReview = null;
+let reviewTime = 0;
+let reviewSeq = 0;
+let changingReview = false;
+let restoringSnapshot = false;
+
+function syncReviewControls() {
+  restoreBtn.disabled = changingReview || restoringSnapshot;
+  exitBtn.disabled = changingReview || restoringSnapshot;
+  document.dispatchEvent(new Event('cg:review-mode'));
+}
+
+function showBar() {
   if (!bar) return;
-  barText.textContent = `${t('timeline.reviewing')} · ${dayLabel(ts)} ${hhmm(ts)}`;
+  const time = `${dayLabel(reviewTime)} ${hhmm(reviewTime)}`;
+  const key = changingReview ? 'timeline.reviewLoading'
+    : state.view?.reviewSnapshot ? 'timeline.reviewSnapshot' : 'timeline.reviewOverlay';
+  barText.textContent = t(key, { time, n: state.view?.nodes.length || 0 });
   bar.classList.add('show');
+  syncReviewControls();
 }
 
 function hideBar() {
+  ++reviewSeq;
+  preReview = null;
+  reviewTime = 0;
+  changingReview = false;
   bar?.classList.remove('show');
+  syncReviewControls();
 }
 
 /** 进入回看：把 state.at 指到某个事件，重新拉一次视图 */
 async function reviewAt(eventId, ts) {
+  if (changingReview || restoringSnapshot || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (!state.at) {
+    preReview = { roots: [...state.roots], expansions: structuredClone(state.expansions),
+      up: state.up, down: state.down, group: state.group, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+      empty: !!state.view?.empty && !state.roots.length && !state.expansions.length, cam: { ...cam } };
+  }
+  const seq = ++reviewSeq;
+  const previousId = state.at;
+  const previousTime = reviewTime;
   state.at = eventId;
-  showBar(ts || Date.now());
+  reviewTime = ts || Date.now();
+  changingReview = true;
+  showBar();
   closeModal();
-  await hooks.loadView(state.roots.length ? state.roots : state.root, { nav: false });
-  if (listEl) {
-    listEl.querySelectorAll('.ev').forEach((r) => r.classList.toggle('on', Number(r.dataset.id) === eventId));
+  try {
+    const view = await hooks.loadView(preReview.roots, { ...preReview, nav: false, useSnapshot: true, fitOnLoad: true });
+    if (seq !== reviewSeq) return;
+    if (!view) throw new Error(t('app.viewFailed'));
+    changingReview = false;
+    showBar();
+    renderAll();
+  } catch (error) {
+    if (seq !== reviewSeq) return;
+    state.at = previousId;
+    reviewTime = previousTime;
+    changingReview = false;
+    if (state.at) showBar();
+    else hideBar();
+    alert(error.message || t('app.viewFailed'));
   }
 }
 
 async function exitReview() {
-  if (!state.at) return;
+  if (!state.at || changingReview || restoringSnapshot) return;
+  const saved = preReview;
+  const eventId = state.at;
+  const seq = ++reviewSeq;
+  changingReview = true;
+  syncReviewControls();
   state.at = 0;
-  hideBar();
-  await hooks.loadView(state.roots.length ? state.roots : state.root, { nav: false });
+  try {
+    const view = await hooks.loadView(saved.roots, { ...saved, nav: false });
+    if (seq !== reviewSeq) return;
+    if (!view) throw new Error(t('app.viewFailed'));
+    Object.assign(cam, saved.cam);
+    constrainCam();
+    draw();
+    hideBar();
+  } catch (error) {
+    if (seq !== reviewSeq) return;
+    state.at = eventId;
+    changingReview = false;
+    showBar();
+    alert(error.message || t('app.viewFailed'));
+  }
 }
 
 restoreBtn?.addEventListener('click', async () => {
-  if (!state.at) return;
-  restoreBtn.disabled = true;
+  if (!state.at || changingReview || restoringSnapshot) return;
+  const seq = reviewSeq;
+  restoringSnapshot = true;
+  syncReviewControls();
   try {
     const r = await api.restore(state.at);
-    if (r && r.ok) {
-      state.at = 0;
-      hideBar();
-      await hooks.reloadAll();
-    }
+    if (seq !== reviewSeq) return;
+    if (!r?.ok) throw new Error(r?.error || t('timeline.restoreFailed'));
+    state.at = 0;
+    hideBar();
+    if (r.restoredView) await hooks.restoreTimelineView(r.restoredView, r.eventId);
+    else await hooks.reloadAll();
+  } catch (error) {
+    alert(error.message || t('timeline.restoreFailed'));
   } finally {
-    restoreBtn.disabled = false;
+    restoringSnapshot = false;
+    syncReviewControls();
   }
 });
 
@@ -316,9 +393,9 @@ document.addEventListener('cg:review-blocked', () => {
   void bar.offsetWidth;
   bar.classList.add('blocked');
   if (barText) {
-    const prev = barText.textContent;
+    const eventId = state.at;
     barText.textContent = t('timeline.blocked');
-    setTimeout(() => (barText.textContent = prev), 1600);
+    setTimeout(() => { if (state.at === eventId && bar.classList.contains('show')) showBar(); }, 1600);
   }
 });
 
@@ -331,7 +408,7 @@ export function reloadTimeline() {
 document.addEventListener('callgraph:langchange', () => {
   setCount();
   renderAll();
-  if (state.at) showBar(tl.events.find(event => event.id === state.at)?.ts || Date.now());
+  if (state.at) showBar();
 });
 
 export { exitReview, reviewAt, hideBar };

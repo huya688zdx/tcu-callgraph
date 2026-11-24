@@ -3,6 +3,34 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { launchServer } from '../scripts/lib/server.mjs';
 
+test('显式空画布可通过 GET 与 POST 打开，切换工程后仍能恢复', async (t) => {
+  const srv = await launchServer();
+  t.after(() => srv.close());
+  const get = (url) => fetch(srv.baseUrl + url).then((r) => r.json());
+  const post = (url, body) => fetch(srv.baseUrl + url, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+  const project = await get('/api/project');
+  assert.equal(project.focusFile, null);
+  assert.equal((await get('/api/page?saved=1')).page, null);
+  assert.ok((await get('/api/view')).nodes.length > 0, '旧请求仍自动挑选入口');
+  const emptyView = { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260,
+    root: null, roots: [], expansions: [], empty: true, projectId: project.id };
+  assert.deepEqual(await get('/api/view?empty=1'), emptyView);
+  assert.deepEqual(await post('/api/view', { empty: true }), emptyView);
+  assert.ok((await get('/api/view?empty=1&root=main.c::main')).nodes.length > 0);
+
+  assert.equal((await post('/api/page', { projectId: project.id, roots: [], empty: true })).ok, true);
+  assert.equal((await post('/api/switch', { path: path.resolve('samples/tcu/main.c') })).ok, true);
+  assert.equal((await get('/api/project')).focusFile, 'main.c');
+  assert.equal((await get('/api/page?saved=1')).page, null);
+  assert.equal((await post('/api/switch', { path: project.path })).ok, true);
+  assert.equal((await get('/api/page')).page, null);
+  const saved = (await get('/api/page?saved=1')).page;
+  assert.equal(saved.empty, true);
+  assert.deepEqual(saved.roots, []);
+  assert.deepEqual(saved.expansions, []);
+});
+
 test('最近视图按工程保存，切回后恢复函数组合、选中项和视角', async (t) => {
   const srv = await launchServer(); t.after(() => srv.close());
   const get = (url) => fetch(srv.baseUrl + url).then((r) => r.json());

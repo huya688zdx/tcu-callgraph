@@ -62,3 +62,19 @@ test('切换语言写入本地存储并立即更新文案与语言事件', t => 
   assert.equal(getLang(), 'en');
   assert.deepEqual(events, ['ja', 'en']);
 });
+
+test('画布时间轴的动态类型和回看提示在三种语言下均可显示', t => {
+  t.after(() => setLang('zh-CN'));
+  for (const lang of SUPPORTED_LANGS) {
+    setLang(lang);
+    for (const key of ['timeline.kindCanvas', 'timeline.kindClearCanvas']) {
+      assert.notEqual(translate(key), key);
+    }
+    for (const key of ['timeline.reviewSnapshot', 'timeline.reviewOverlay']) {
+      const message = translate(key, { time: '10:20:30', n: 123 });
+      assert.match(message, /10:20:30/);
+      assert.match(message, /123/);
+      assert.doesNotMatch(message, /\{\w+\}/);
+    }
+  }
+});

@@ -41,7 +41,7 @@ let pageRevision = 0;
 
 /** 用户是否正在拖节点 / 拖连线 / 平移——此刻刷新会打断操作，稍后再试 */
 function isInteracting() {
-  return !!(state.dragBox || state.dragNode || state.dragSeg || state.dragLabel || state.dragStart || state.panning);
+  return !!(state.dragBox || state.dragNode || state.dragSeg || state.dragLabel || state.dragStart || state.panning || state.marquee);
 }
 
 function scheduleReload() {
@@ -78,7 +78,8 @@ async function flushReload() {
       // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
       const view = await hooks.loadView(page.roots, {
         nav: true, incremental: true, expansions: page.expansions || [],
-        up: page.up ?? 0, down: page.down ?? 0, vars: page.vars || [], hiddenVars: page.hiddenVars || [],
+        up: page.up ?? 0, down: page.down ?? 0, group: page.group, empty: !!page.empty,
+        vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
       if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
@@ -154,15 +155,26 @@ let lastSig = '';
 let restoring = true;
 let pendingSave = Promise.resolve();
 
+export function acceptRestoredRevision(revision) {
+  pageRevision = revision ?? pageRevision;
+  if (pendingCompose && pendingCompose.page.projectId === state.view?.projectId && pendingCompose.page.revision <= pageRevision) {
+    pendingCompose = null;
+    dirtyCount = 0;
+  }
+}
+
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */
 export function savePage(force = false) {
-  if (restoring || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId || !state.roots.length ||
+  if (restoring || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId ||
+      (!state.at && state.view.reviewSnapshot !== undefined) ||
+      (!state.view.empty && !state.roots.length && !state.expansions.length) ||
       (!force && isInteracting())) return pendingSave.catch(() => {});
   const page = {
     projectId: state.view.projectId,
     revision: state.at && pendingCompose?.page.projectId === state.view.projectId ? pendingCompose.page.revision : pageRevision,
     roots: state.roots,
     expansions: state.expansions,
+    empty: !!state.view.empty && !state.roots.length && !state.expansions.length,
     up: state.up,
     down: state.down,
     group: state.group,
@@ -207,7 +219,14 @@ export async function restorePage(root = null, isCurrent = () => true) {
       state.hiddenVars = new Set(saved.hiddenVars || []);
       els.groupMode.checked = state.group;
     }
-    const view = await hooks.loadView(root || saved?.roots || null, { nav: false, expansions: saved?.expansions || [] });
+    let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
+    if (!root && !saved) {
+      const project = await api.project().catch(() => null);
+      if (!isCurrent()) return;
+      empty = !project?.focusFile && !project?.comparison;
+    }
+    const view = await hooks.loadView(empty ? [] : root || saved?.roots || null,
+      { nav: false, empty, expansions: empty ? [] : saved?.expansions || [] });
     // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
     // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
     // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
@@ -226,6 +245,7 @@ export async function restorePage(root = null, isCurrent = () => true) {
       draw();
     }
   } finally { restoring = false; }
+  await savePage(true).catch(() => {});
 }
 
 // ---------------- 轻量提示条 ----------------

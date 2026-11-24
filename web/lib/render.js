@@ -415,9 +415,11 @@ function draw({ geometryUnchanged = false } = {}) {
         : moving.kind === 'node' ? state.selected !== moving.item.id
         : state.selected || state.selectedEdge || state.ctxBox?.kind !== moving.kind || state.ctxBox?.id !== moving.item.id))) state.moveTarget = null;
   if (state.multiSelection && (state.multiSelection.view !== v ||
-      state.multiSelection.anchor !== (state.selectedLabel || state.selectedEdge || state.selected))) {
+      (state.multiSelection.kind !== 'nodes' &&
+        state.multiSelection.anchor !== (state.selectedLabel || state.selectedEdge || state.selected)))) {
     state.multiSelection = null;
   }
+  document.dispatchEvent(new Event('cg:canvas-selection'));
   document.body.setAttribute(
     'data-draw',
     v ? `n${v.nodes.length},e${v.edges.length},k${Math.round(cam.k * 100)}` : 'null'
@@ -573,6 +575,19 @@ function draw({ geometryUnchanged = false } = {}) {
     : null;
   drawEdgeLabels(ctx, v, { onAnimatedBox: recordBoxEffect, focusedEdges: activeLabelEdges,
     visible: (box) => boxVisible(box, area), reuse: geometryUnchanged });
+
+  if (state.marquee?.view === v) {
+    const { x0, y0, x1, y1 } = state.marquee;
+    const rect = [Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)];
+    ctx.save();
+    ctx.fillStyle = 'rgba(37, 99, 235, .14)';
+    ctx.strokeStyle = '#2563EB';
+    ctx.lineWidth = 1 / cam.k;
+    ctx.setLineDash([5 / cam.k, 3 / cam.k]);
+    ctx.fillRect(...rect);
+    ctx.strokeRect(...rect);
+    ctx.restore();
+  }
 
   // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
   if (state.moveTarget && !state.dragBox && !['edge', 'node'].includes(state.moveTarget.kind)) {
@@ -872,12 +887,15 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   }
   ctx.globalAlpha = alpha;
 
-  if (selected && !allNodes) {
+  const batchSelected = selected && state.multiSelection?.kind === 'nodes';
+  if (selected && (!allNodes || batchSelected)) {
     const ringGap = Math.min(8, 3 * invK);
     roundRect(ctx, x - ringGap, y - ringGap, w + ringGap * 2, h + ringGap * 2, 10);
-    ctx.strokeStyle = hexToRgba(THEME.node.selected, 0.24);
+    ctx.strokeStyle = batchSelected ? '#2563EB' : hexToRgba(THEME.node.selected, 0.24);
     ctx.lineWidth = Math.min(7, 2.8 * invK);
+    if (batchSelected) ctx.setLineDash([5 * invK, 3 * invK]);
     ctx.stroke();
+    ctx.setLineDash([]);
   }
 
   roundRect(ctx, x, y, w, h, 8);

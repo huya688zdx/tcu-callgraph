@@ -260,6 +260,16 @@ const cnt = (v) => (Array.isArray(v) ? v.length : v && typeof v === 'object' ? O
 function briefOf(e) {
   const a = e.after || {};
   const brief = {};
+  if ((e.op === 'view.snapshot' || e.op === 'view.clear') && a.view) {
+    const { roots, expansions, vars, empty } = a.view;
+    return {
+      count: new Set([...roots, ...expansions.map(({ root }) => root)]).size,
+      roots: roots.length,
+      vars: vars.length,
+      empty: !!empty,
+      label: e.ctx?.label || '',
+    };
+  }
   // 会话导入的 after 是整份 overlay（回放要用），直接数节点会得出
   // 「导入后一共有多少个节点」，那不是用户想看的；改用随事件带的 summary
   if (e.op === 'session.import') {
@@ -318,7 +328,8 @@ function applyEvent(ov, e) {
     case 'node.annotate':
     case 'edge.annotate': {
       const bucket = e.op === 'node.annotate' ? ov.nodes : ov.edges;
-      const merged = { ...(bucket[e.target] || {}), ...after };
+      const { view, ...annotation } = after;
+      const merged = { ...(bucket[e.target] || {}), ...annotation };
       for (const k of Object.keys(merged)) if (merged[k] === null) delete merged[k];
       if (Object.keys(merged).length) bucket[e.target] = merged;
       else delete bucket[e.target];
@@ -561,6 +572,10 @@ export function openStore({ dbPath, userData } = {}) {
     ),
     eventList: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY ts DESC, seq DESC LIMIT ?'),
     eventUpTo: db.prepare('SELECT * FROM event WHERE project_id = ? AND id <= ? ORDER BY id ASC'),
+    eventViewsUpTo: db.prepare(
+      `SELECT json_extract(after, '$.view') AS view FROM event
+       WHERE project_id = ? AND id <= ? AND json_type(after, '$.view') = 'object' ORDER BY id ASC`
+    ),
     eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
     eventAnchor: db.prepare("SELECT id FROM event WHERE project_id = ? AND op = 'baseline' LIMIT 1"),
     eventDump: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY id ASC LIMIT ?'),
@@ -839,6 +854,13 @@ export function openStore({ dbPath, userData } = {}) {
       const ov = emptyOverlay();
       for (const e of api.eventsUpTo(projectId, eventId)) applyEvent(ov, e);
       return ov;
+    },
+
+    /** 取指定事件及其之前最近一次记录的画布参数。 */
+    viewAt(projectId, eventId) {
+      let view = null;
+      for (const row of q.eventViewsUpTo.iterate(projectId, eventId)) view = row.view;
+      return parse(view, null);
     },
 
     /** 整体替换：恢复到此 / 导入时用。写库和事件分开，调用方决定要不要记事件 */

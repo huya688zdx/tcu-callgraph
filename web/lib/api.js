@@ -22,7 +22,7 @@ const post = (url, body) =>
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels', 'viewEvent']);
 const guardWrite = (name) => {
   if (state.view?.comparison && WRITE_OPS.has(name)) return Promise.resolve({ ok: false, error: '比较视图仅供查看' });
   if (state.at > 0 && WRITE_OPS.has(name)) {
@@ -34,9 +34,12 @@ const guardWrite = (name) => {
 
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
-  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null, preview = false }) {
+  view({ root, roots, up = 1, down = 1, group = true, vars, hiddenVars, expansions = [], at = 0, previous = null,
+    preview = false, empty = false, useSnapshot = false }) {
     const q = new URLSearchParams({ down, up, group: group ? '1' : '0' });
     if (preview) q.set('preview', '1');
+    if (empty) q.set('empty', '1');
+    if (useSnapshot) q.set('useSnapshot', '1');
     // 支持多入口：勾选多个函数时一起入图
     const list = (roots && roots.length ? roots : root ? [root] : []).filter(Boolean);
     if (list.length === 1) q.set('root', list[0]);
@@ -44,11 +47,14 @@ export const api = {
     if (vars && vars.length) q.set('vars', vars.join(','));
     if (hiddenVars && hiddenVars.length) q.set('novars', hiddenVars.join(','));
     if (at > 0) q.set('at', String(at));
-    const bodyRoots = q.toString().length > 6000 ? list : null;
-    if (bodyRoots) { for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key); }
-    if (!previous && !expansions.length && !bodyRoots) return get('/api/view?' + q);
+    const hasComma = [...(list.length > 1 ? list : []), ...(vars || []), ...(hiddenVars || [])]
+      .some((id) => id.includes(','));
+    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return get('/api/view?' + q);
+    for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
-    return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId, ...(bodyRoots ? { roots: bodyRoots, vars: vars || [], hiddenVars: hiddenVars || [] } : {}), expansions, previous: previous ? {
+    return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId,
+      ...(empty ? { empty: true } : {}), ...(useSnapshot ? { useSnapshot: true } : {}),
+      roots: list, vars: vars || [], hiddenVars: hiddenVars || [], expansions, previous: previous ? {
       projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection,
       nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points, custom, fromSide, toSide }) =>
@@ -81,6 +87,7 @@ export const api = {
   },
   /** 恢复到历史某一刻（会追加一条 restore_point 事件） */
   restore: (eventId) => post('/api/restore', { eventId }),
+  recordViewEvent: (body) => guardWrite('viewEvent') || post('/api/view-event', body),
   /** 失效标注：库里指向已不存在的函数 / 连线的条目 */
   orphans: () => get('/api/orphans'),
   purgeOrphans: () => guardWrite('orphans') || post('/api/orphans/purge', {}),

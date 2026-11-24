@@ -123,7 +123,8 @@ function renderRecommendations(fn, view, dataflow, shown) {
   const siblingRows = [...siblings.values()].map(({ node, labels }) =>
     pickRow(node, { group: 'siblings', chips: [...labels].map(label => chip(label)) })).join('');
 
-  const sharedVars = (dataflow?.vars || []).filter(v => !hidden.has(v.id));
+  const canRestoreVars = !state.at && !state.view?.comparison;
+  const sharedVars = (dataflow?.vars || []).filter(v => canRestoreVars || !hidden.has(v.id));
   const accessByVariable = new Map();
   for (const v of sharedVars) {
     const key = `${v.version || ''}|${v.id}`;
@@ -272,10 +273,7 @@ pickApply?.addEventListener('click', async () => {
   const ids = [...new Set(selected.map(input => input.dataset.functionId))];
   const varIds = [...new Set(selected.map(input => input.dataset.varId).filter(Boolean))];
   const seq = previewSequence;
-  const originalView = previewView;
   const edges = missingEdges;
-  const vars = state.vars, hiddenVars = state.hiddenVars;
-  const varChanges = varIds.map(id => ({ id, included: vars.has(id), hidden: hiddenVars.has(id) }));
   pickApply.disabled = true;
   pickAll.disabled = true;
   pickControls.disabled = true;
@@ -283,23 +281,13 @@ pickApply?.addEventListener('click', async () => {
   pickMessage.textContent = t('expand.adding');
   try {
     const edgeIds = edges.flatMap((edge) => [edge.from, edge.to]);
-    for (const id of varIds) {
-      vars.add(id);
-      hiddenVars.delete(id);
-    }
     // 预览结果已经过滤了隐藏函数，无需为每个候选单独请求详情。
-    const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true, restoreHidden: false });
+    const view = await hooks.addFunction([...ids, ...edgeIds], { includeShown: true, restoreHidden: false, varIds });
     const visible = new Set(view?.nodes.map(node => node.id));
     if (!view || ![...ids, ...varIds].every(id => visible.has(id)) ||
         !edges.every(edge => view?.edges.some(item => edgeKey(item) === edgeKey(edge)))) throw new Error(t('common.addFailed'));
     if (seq === previewSequence) closeModal();
   } catch (error) {
-    if (state.view === originalView && state.vars === vars && state.hiddenVars === hiddenVars) {
-      for (const { id, included, hidden } of varChanges) {
-        if (!included) vars.delete(id);
-        if (hidden) hiddenVars.add(id);
-      }
-    }
     if (seq === previewSequence) {
       pickControls.disabled = false;
       pickList.inert = false;

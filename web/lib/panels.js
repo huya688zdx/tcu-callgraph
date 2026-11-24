@@ -8,7 +8,7 @@ import { periodCaption } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections, hideMenu } from './ctxmenu.js';
-import { locateNode, locateBox } from './locate.js';
+import { locateNode, locateBox, peekNode } from './locate.js';
 import { draw } from './render.js';
 import { analyseDataflow, clearDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
@@ -150,7 +150,7 @@ export function renderVars() {
   const functions = new Set(v.nodes.filter((n) => n.kind !== 'var').map((n) => n.id));
   const isInCanvas = (peer) => functions.has(varPeerId(peer));
   const rows = scope.map((x) => {
-    const checked = (state.vars.has(x.id) || inView.has(x.id)) && !state.hiddenVars.has(x.id);
+    const checked = inView.has(x.id);
     const linked = x.writers.some(isInCanvas) || x.readers.some(isInCanvas);
     const mutable = !x.isConst && x.writers.length > 0;
     return { x, checked, linked, mutable };
@@ -208,7 +208,7 @@ export function renderVars() {
     if (folded) continue;
     parts.push(`<label class="var-row" data-id="${esc(x.id)}" title="${esc(varTitle(x))}">
       <span class="var-name">
-        <input type="checkbox" aria-label="${esc(x.name)}" ${checked ? 'checked' : ''}>
+        <input type="checkbox" aria-label="${esc(x.name)}" ${checked ? 'checked' : ''} ${state.at ? 'disabled' : ''}>
         <span class="vn">${esc(x.name)}</span>
       </span>
       <span class="var-meta">
@@ -265,9 +265,10 @@ export function renderVars() {
     });
   });
   el.querySelectorAll('.var-row input').forEach((cb) => {
-    cb.addEventListener('change', () => {
+    cb.addEventListener('change', async () => {
       const id = cb.closest('.var-row').dataset.id;
-      hooks.toggleVar(id, cb.checked);
+      try { await hooks.toggleVar(id, cb.checked); }
+      catch (error) { alert(error.message || t('app.viewFailed')); }
     });
   });
 }
@@ -359,6 +360,12 @@ function renderTree(preserveExpansion = false) {
 
 let shownOnly = false;
 const shownFilter = document.getElementById('shownFunctions');
+const batchBar = document.getElementById('shownBatchBar');
+const selectShown = document.getElementById('shownBatchSelect');
+const removeShown = document.getElementById('shownBatchRemove');
+const clearShown = document.getElementById('shownBatchClear');
+const checkedFunctions = new Set();
+let checkedProjectId;
 
 /**视图切换后同步已加入数量、函数状态与当前筛选。 */
 export function syncTreeSelection() {
@@ -375,7 +382,7 @@ export function syncTreeSelection() {
     button.setAttribute('aria-haspopup', 'menu');
     button.hidden = !!window.__EXPORT;
   });
-  if (shownFilter) shownFilter.querySelector('span').textContent = (state.view?.nodes || []).filter((n) => n.kind !== 'var').length;
+  if (shownFilter) shownFilter.lastElementChild.textContent = (state.view?.nodes || []).filter((n) => n.kind !== 'var').length;
   if (shownOnly) renderShownFunctions();
 }
 
@@ -403,7 +410,7 @@ async function addSingleFunction(id) {
 
 async function openFunctionAlone(id) {
   try {
-    const view = await hooks.loadView(id);
+    const view = await (hooks.openFunctionAlone ?? hooks.loadView)(id);
     if (!view?.nodes.some((node) => node.id === id)) throw new Error(t('tree.openRetry'));
     if (view === state.view) locateNode(id);
   } catch (error) { alert(error.message || t('tree.openFailed')); }
@@ -422,8 +429,8 @@ function functionViewActions(id) {
   ];
 }
 
-function handleFunctionViewAction(value, id) {
-  if (value === 'locate' && inCanvas(id)) return locateNode(id);
+function handleFunctionViewAction(value, id, fromRelation = false) {
+  if (value === 'locate' && inCanvas(id)) return (fromRelation ? peekNode : locateNode)(id);
   if (value === 'single') return addSingleFunction(id);
   if (value === 'alone') return openFunctionAlone(id);
   if (value === 'relations') return previewAddition({ id });
@@ -433,10 +440,11 @@ function handleFunctionViewAction(value, id) {
 function openFunctionAddMenu(button) {
   if (button.getAttribute('aria-expanded') === 'true') { hideMenu(); return; }
   const id = button.dataset.addFunction;
+  const fromRelation = !!button.closest('#edges, #detail');
   const items = functionViewActions(id);
   const rect = button.getBoundingClientRect();
   showMenuSections(rect.left, rect.bottom + 4, id.split('::').pop(), [{ items }],
-    (value) => handleFunctionViewAction(value, id), button);
+    (value) => handleFunctionViewAction(value, id, fromRelation), button);
 }
 
 document.addEventListener('click', (event) => {
@@ -537,12 +545,12 @@ function openTreeMenu(ev, kind, payload) {
     ev.clientY,
     payload.label,
     [{ items }],
-    (v) => {
+    async (v) => {
       if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (kind === 'fn') return handleFunctionViewAction(v, payload.id);
-      return locateBox(kind, payload.id, v === 'alone' ? payload.fnIds : []);
+      if (await locateBox(kind, payload.id, v === 'alone' ? payload.fnIds : [])) renderVars();
     }
   );
 }
@@ -647,29 +655,76 @@ let searchSeq = 0;
 
 shownFilter?.addEventListener('click', () => {
   shownOnly = !shownOnly;
+  if (!shownOnly) checkedFunctions.clear();
   shownFilter.setAttribute('aria-pressed', String(shownOnly));
   hideMenu();
   runSearch();
 });
 
-function renderFunctionResults(list) {
+function renderFunctionResults(list, batch = false) {
   els.results.innerHTML = list.length ? list.map((f) => `<li data-id="${esc(f.id)}" title="${esc(t('search.itemHint'))}">
-    <div class="search-summary"><div class="fn">${esc(f.displayName || f.name)}</div>${addFunctionButton(f.id)}</div>
+    <div class="search-summary">
+      ${batch ? `<input type="checkbox" data-batch-function aria-label="${esc(t('tree.selectFunction', { name: f.displayName || f.name }))}"
+        ${checkedFunctions.has(f.id) ? 'checked' : ''}>` : ''}
+      <div class="fn">${esc(f.displayName || f.name)}</div>${addFunctionButton(f.id)}</div>
     <div class="meta">${esc(shortFile(f.file || ''))}:${f.line || ''}${Number.isInteger(f.inCount) ? ` · ↑${f.inCount} ↓${f.outCount}` : ''}</div>
     </li>`).join('') : `<li class="empty">${shownOnly ? t('tree.noShownMatch') : t('empty.noMatch')}</li>`;
 }
 
+function syncBatchControls() {
+  if (!batchBar || batchBar.hidden) return;
+  const checks = [...els.results.querySelectorAll('[data-batch-function]')];
+  const allChecked = checks.length > 0 && checks.every((check) => check.checked);
+  selectShown.disabled = !checks.length;
+  selectShown.setAttribute('aria-pressed', String(allChecked));
+  removeShown.disabled = !checkedFunctions.size;
+  removeShown.textContent = t('tree.removeChecked', { n: checkedFunctions.size });
+  clearShown.disabled = !state.view?.nodes.length;
+}
+
 function renderShownFunctions() {
   const q = els.search.value.trim().toLowerCase();
-  renderFunctionResults((state.view?.nodes || []).filter((n) => n.kind !== 'var' &&
-    (!q || `${n.name} ${n.displayName || ''} ${n.file || ''}`.toLowerCase().includes(q))));
+  const nodes = (state.view?.nodes || []).filter((n) => n.kind !== 'var');
+  const batch = !!batchBar && !window.__EXPORT && !state.at && !state.view?.comparison;
+  if (!batch || state.view?.projectId !== checkedProjectId) checkedFunctions.clear();
+  checkedProjectId = state.view?.projectId;
+  const ids = new Set(nodes.map((n) => n.id));
+  for (const id of checkedFunctions) if (!ids.has(id)) checkedFunctions.delete(id);
+  if (batchBar) batchBar.hidden = !batch;
+  renderFunctionResults(nodes.filter((n) => !q || `${n.name} ${n.displayName || ''} ${n.file || ''}`.toLowerCase().includes(q)), batch);
+  syncBatchControls();
 }
+
+selectShown?.addEventListener('click', () => {
+  const checked = selectShown.getAttribute('aria-pressed') !== 'true';
+  for (const check of els.results.querySelectorAll('[data-batch-function]')) {
+    const id = check.closest('li').dataset.id;
+    check.checked = checked;
+    if (checked) checkedFunctions.add(id);
+    else checkedFunctions.delete(id);
+  }
+  syncBatchControls();
+});
+removeShown?.addEventListener('click', () => {
+  hooks.removeFunctions([...checkedFunctions]).catch((error) => alert(error.message || t('common.removeFailed')));
+});
+clearShown?.addEventListener('click', () => {
+  hooks.clearCanvas().catch((error) => alert(error.message || t('common.removeFailed')));
+});
+els.results.addEventListener('change', (e) => {
+  if (!e.target.matches('[data-batch-function]')) return;
+  const id = e.target.closest('li').dataset.id;
+  if (e.target.checked) checkedFunctions.add(id);
+  else checkedFunctions.delete(id);
+  syncBatchControls();
+});
 
 function syncSearchMode() {
   const searching = !!els.search.value.trim();
   const tree = document.getElementById('tree');
   if (tree) tree.hidden = searching || shownOnly;
   els.results.hidden = !searching && !shownOnly;
+  if (batchBar && !shownOnly) batchBar.hidden = true;
   const section = els.results.closest('.tree-sec');
   if (section) {
     section.scrollTop = 0;
@@ -698,6 +753,7 @@ function searchPick(id, button) {
 }
 
 els.results.addEventListener('click', (e) => {
+  if (e.target.matches('[data-batch-function]')) return;
   const li = e.target.closest('li[data-id]');
   if (!li) return;
   searchPick(li.dataset.id, li.querySelector('[data-add-function]'));
@@ -922,7 +978,7 @@ for (const panel of [els.edges, els.detail]) {
     if (!state.selected) return;
     if (event.target.closest('button, select, input, a')) return;
     const row = event.target.closest('[data-peer-id].in-view');
-    if (row && inCanvas(row.dataset.peerId)) locateNode(row.dataset.peerId);
+    if (row) peekNode(row.dataset.peerId);
   });
   panel.addEventListener('mouseover', (event) => {
     if (!state.selected) { setHoverRelation(null); return; }

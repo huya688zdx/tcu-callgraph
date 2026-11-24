@@ -287,6 +287,9 @@ function resetDragState() {
   state.dragSeg = null;
   state.dragLabel = null;
   state.dragStart = null;
+  state.marquee = null;
+  state.linkFrom = null;
+  state.linkPos = null;
   state.panning = false;
   state.dragMoved = false;
   dragCache = null;
@@ -297,7 +300,7 @@ function resetDragState() {
 /** pointercancel / lostpointercapture：直接丢弃这次手势，不提交任何变更 */
 function cancelDrag() {
   const active =
-    state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom;
+    state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom || state.marquee;
   if (state.dragBox) cancelHierarchyMove(state.dragBox);
   if (state.dragSeg) {
     state.dragSeg.edge.points = state.dragSeg.original;
@@ -309,8 +312,6 @@ function cancelDrag() {
     dragCache?.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => [...p]); });
   }
   resetDragState();
-  state.linkFrom = null;
-  state.linkPos = null;
   state.panMoved = false;
   if (active) draw();
 }
@@ -396,11 +397,15 @@ els.cv.addEventListener('contextmenu', (e) => {
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
-  if (state.multiSelection && !state.multiSelection.trunk) { state.multiSelection = null; draw(); }
+  if (state.multiSelection && !state.multiSelection.trunk && (!e.shiftKey || state.multiSelection.kind !== 'nodes')) {
+    state.multiSelection = null;
+    draw();
+  }
   hideMenu();
   stopCamAnim();
   resetDragState(); // 兜底：上一次手势若没收到 pointerup/pointercancel，这里先清干净
   const comparing = Boolean(state.view?.comparison);
+  const editable = !comparing && !state.at;
   if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
     const node = hitTest(e);
     if (node) {
@@ -412,8 +417,18 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   // 标签先判：选中连线后中点的段手柄正好压在标签上，先给标签才拖得动
+  const n = hitTest(e);
+  if (n && e.shiftKey && editable) {
+    state.moveTarget = null;
+    state.linkFrom = n;
+    state.linkPos = worldPos(e);
+    state.dragStart = { x: e.clientX, y: e.clientY };
+    els.cv.classList.add('linking');
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
   const lb = hitLabel(worldPos(e));
-  if (lb && !comparing) {
+  if (lb && editable) {
     clearTrunk();
     state.multiSelection = null;
     state.moveTarget = null;
@@ -438,14 +453,14 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   const end = hitEnd(e);
-  if (end && !comparing) {
+  if (end && editable) {
     state.dragEnd = { edge: state.selectedEdge, which: end, pos: worldPos(e), hover: null };
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
 
   const seg = hitSegment(e);
-  if (seg && !comparing) {
+  if (seg && editable) {
     state.dragSeg = { ...seg, original: seg.edge.points.map((p) => [...p]), custom: seg.edge.custom,
       start: worldPos(e), origin: [...seg.edge.points[seg.index]] };
     state.dragStart = { x: e.clientX, y: e.clientY };
@@ -454,7 +469,6 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  const n = hitTest(e);
   if (n && !e.shiftKey && pickTrunkEndpoint(n.id)) return;
 
   // 只允许拖动已双击选中的层级；单击只切换右侧范围。
@@ -462,7 +476,7 @@ els.cv.addEventListener('pointerdown', (e) => {
   if (title) {
     clearTrunk();
     state.multiSelection = null;
-    if (moveReady(title.kind, title.box)) {
+    if (editable && moveReady(title.kind, title.box)) {
       pushHistory();
       state.dragBox = beginHierarchyMove(state.view, title);
       if (state.dragBox.crossing.length) state.dragBox.stationarySegments = collectSegments(state.dragBox.stationary);
@@ -485,18 +499,9 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  if (n && e.shiftKey && !comparing) {
-    state.moveTarget = null;
-    state.linkFrom = n;
-    state.linkPos = worldPos(e);
-    els.cv.classList.add('linking');
-    els.cv.setPointerCapture(e.pointerId);
-    return;
-  }
-
   if (n) {
     clearTrunk();
-    if (!moveReady('node', n)) { selectNode(n.id); return; }
+    if (!editable || !moveReady('node', n)) { selectNode(n.id); return; }
     state.dragNode = n;
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
     state.dragMoved = false;
@@ -509,6 +514,12 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   if (pickEdgeAt(e, selectEdge)) return;
+  if (e.shiftKey && editable && state.view?.nodes.length) {
+    const { x, y } = worldPos(e);
+    state.marquee = { x0: x, y0: y, x1: x, y1: y, view: state.view };
+    els.cv.setPointerCapture(e.pointerId);
+    return;
+  }
   const editing = state.moveTarget;
   state.moveTarget = null;
   state.panning = true;
@@ -521,6 +532,13 @@ els.cv.addEventListener('pointerdown', (e) => {
 });
 
 function handlePointerMove(e) {
+  if (state.marquee) {
+    const { x, y } = worldPos(e);
+    state.marquee.x1 = x;
+    state.marquee.y1 = y;
+    draw({ geometryUnchanged: true });
+    return;
+  }
   if (state.dragBox) {
     const drag = state.dragBox;
     if (drag.view !== state.view) { cancelDrag(); return; }
@@ -668,13 +686,21 @@ function flushPointerMove() {
 }
 
 els.cv.addEventListener('pointermove', (e) => {
-  if (!(state.panning || state.dragBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
+  if (!(state.panning || state.marquee || state.dragBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
     handlePointerMove(e);
     return;
   }
   pendingMove = { event: e, view: state.view };
   if (!moveFrame) moveFrame = requestAnimationFrame(flushPointerMove);
 });
+
+function selectNodes(nodes) {
+  if (state.pairFlow) clearPairFlow({ paint: false });
+  clearTrunk();
+  selectNode(null);
+  state.multiSelection = nodes.size ? { kind: 'nodes', nodes, view: state.view } : null;
+  draw({ geometryUnchanged: true });
+}
 
 els.cv.addEventListener('pointerup', (e) => {
   // 同一帧内松手也要应用最后的指针位置，再执行保存和收尾布线。
@@ -690,9 +716,21 @@ els.cv.addEventListener('pointerup', (e) => {
   const originalNodeRoutes = dragCache;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
+  const marquee = state.marquee;
   const panning = state.panning;
   const panMoved = state.panMoved;
   resetDragState();
+
+  if (marquee) {
+    if (marquee.view !== state.view || state.at) return;
+    const { x, y } = worldPos(e);
+    const left = Math.min(marquee.x0, x), right = Math.max(marquee.x0, x);
+    const top = Math.min(marquee.y0, y), bottom = Math.max(marquee.y0, y);
+    const nodes = state.view.nodes.filter((n) => n.x <= right && n.x + n.w >= left &&
+      n.y <= bottom && n.y + n.h >= top);
+    selectNodes(new Set(nodes.map((n) => n.id)));
+    return;
+  }
 
   if (dragBox) {
     if (dragBox.dx || dragBox.dy) {
@@ -756,6 +794,15 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (linkFrom) {
+    if (state.at || !state.view?.nodes.includes(linkFrom)) return;
+    if (Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) < 5) {
+      const nodes = new Set(state.multiSelection?.kind === 'nodes' ? state.multiSelection.nodes : []);
+      if (state.selected && state.selected !== linkFrom.id) nodes.add(state.selected);
+      if (nodes.has(linkFrom.id)) nodes.delete(linkFrom.id);
+      else nodes.add(linkFrom.id);
+      selectNodes(nodes);
+      return;
+    }
     const target = hitTest(e);
     if (target && target.id !== linkFrom.id) addManualEdge(linkFrom.id, target.id);
     draw();
@@ -797,6 +844,14 @@ const labelSelectionType = (l) => JSON.stringify([
 ]);
 
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && (state.marquee || state.multiSelection?.kind === 'nodes') && !document.querySelector('.modal.show')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.multiSelection = null;
+    cancelDrag();
+    draw();
+    return;
+  }
   if (/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable) return;
   if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'a') {
     e.preventDefault();
@@ -847,7 +902,7 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault();
       clearTrunk();
       selectNode(null);
-    } else if (state.multiSelection && (e.key === 'Delete' || e.key === 'Backspace')) {
+    } else if (state.multiSelection && state.multiSelection.kind !== 'nodes' && (e.key === 'Delete' || e.key === 'Backspace')) {
       // 全选只用于查看；避免旧的单选删除逻辑误删其中一个组件。
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -856,7 +911,7 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 els.cv.addEventListener('dblclick', (e) => {
-  if (e.ctrlKey || e.metaKey) { e.preventDefault(); return; }
+  if (e.ctrlKey || e.metaKey || e.shiftKey || state.at) { e.preventDefault(); return; }
   const n = hitTest(e);
   if (n) {
     if (activeTrunk()?.some((edge) => edge.from === n.id || edge.to === n.id)) return;

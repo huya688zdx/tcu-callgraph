@@ -22,11 +22,11 @@ import './lib/interact.js';
 import { clearDataflow } from './lib/df.js';
 // 工程切换与时间轴面板同样自带事件注册
 import './lib/projects.js';
-import './lib/timeline.js';
+import { hideBar, reloadTimeline } from './lib/timeline.js';
 import './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
-import { restorePage, savePage } from './lib/live.js';
+import { acceptRestoredRevision, restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
 import { clearPairFlow } from './lib/pair-flow.js';
 
@@ -35,54 +35,111 @@ import { clearPairFlow } from './lib/pair-flow.js';
  * @param {string|string[]|null} rootId 单个函数 id、多个函数 id（文件树多选）、或 null（默认入口）
  */
 let viewSeq = 0;
+const pendingVarChoices = new Map();
+const varRestores = new Map();
+
+const varRestoreKey = (projectId, id) => `${projectId}:${id}`;
+
+function restoreVariables(ids, projectId) {
+  const keys = ids.map((id) => varRestoreKey(projectId, id));
+  const missing = ids.filter((id, i) => !varRestores.has(keys[i]));
+  if (missing.length) {
+    const request = postDelete({ nodes: missing, restore: true, projectId }).finally(() => {
+      for (const id of missing) varRestores.delete(varRestoreKey(projectId, id));
+    });
+    for (const id of missing) varRestores.set(varRestoreKey(projectId, id), request);
+  }
+  return Promise.all(new Set(keys.map((key) => varRestores.get(key))));
+}
 
 /** 视图跳转历史（双击下钻 / 树里勾选 / 搜索结果），Ctrl+Z 逐级回退 */
 const navStack = [];
 const NAV_MAX = 30;
 
+function currentViewSnapshot() {
+  return {
+    roots: [...state.roots], expansions: structuredClone(state.expansions),
+    up: state.up, down: state.down, group: state.group,
+    vars: [...state.vars], hiddenVars: [...state.hiddenVars],
+    empty: !!state.view?.empty && !state.roots.length && !state.expansions.length,
+  };
+}
+
+function rememberView(prior) {
+  navStack.push(prior);
+  if (navStack.length > NAV_MAX) navStack.shift();
+}
+
+function recordViewEvent(op = 'view.snapshot') {
+  if (!state.view?.projectId || state.at || state.view.comparison) return;
+  api.recordViewEvent({ op, projectId: state.view.projectId, view: currentViewSnapshot() })
+    .then((result) => {
+      if (!result?.ok) throw new Error(result?.error || t('app.viewFailed'));
+      return reloadTimeline();
+    })
+    .catch((error) => console.warn(t('app.viewEventFailed'), error));
+}
+
 async function loadView(rootId, opts = {}) {
   const { nav = true, incremental = false, fitOnLoad = !incremental } = opts;
+  const startedSelected = state.selected;
   const previous = incremental && !state.at && state.view ? state.view : null;
   if (state.pairFlow) clearPairFlow();
   stopCamAnim();
   // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
-  const prior = nav && state.view && state.roots.length ? {
-    roots: [...state.roots], expansions: structuredClone(state.expansions), cam: { ...cam },
-    up: state.up, down: state.down, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
-  } : null;
+  const prior = opts.prior ?? (nav && state.view && !state.at ? { ...currentViewSnapshot(), cam: { ...cam } } : null);
   const seq = ++viewSeq;
   clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
   const up = opts.exact ? 0 : opts.up ?? state.up;
   const down = opts.exact ? 0 : opts.down ?? state.down;
-  const vars = opts.vars ?? [...state.vars];
-  const hiddenVars = opts.hiddenVars ?? [...state.hiddenVars];
-  const data = await api.view({
-    roots,
-    expansions,
-    up,
-    down,
-    group: state.group,
-    vars,
-    hiddenVars,
-    at: state.at,
-    previous,
-  });
+  const group = opts.group ?? state.group;
+  const vars = new Set(opts.vars ?? state.vars);
+  const hiddenVars = new Set(opts.hiddenVars ?? state.hiddenVars);
+  const choices = opts.vars === undefined && opts.hiddenVars === undefined ? [...pendingVarChoices] : [];
+  const addVars = opts.addVars || [];
+  const restoreIds = new Set();
+  for (const [id, on] of [...addVars.map((id) => [id, true]), ...choices]) {
+    if (on) { vars.add(id); hiddenVars.delete(id); restoreIds.add(id); }
+    else { vars.delete(id); hiddenVars.add(id); restoreIds.delete(id); }
+  }
+  const empty = opts.empty ?? (!roots.length && !expansions.length && !!state.view?.empty && !state.view.comparison);
+  let data;
+  try {
+    if (restoreIds.size && !state.at && state.view && !state.view.comparison) {
+      await restoreVariables([...restoreIds], state.view.projectId);
+      if (seq !== viewSeq) return;
+    }
+    data = await api.view({ roots, expansions, up, down, group, vars: [...vars], hiddenVars: [...hiddenVars],
+      at: state.at, previous, empty, useSnapshot: opts.useSnapshot ?? state.at > 0 });
+  } catch (error) {
+    if (seq !== viewSeq) return;
+    pendingVarChoices.clear();
+    renderVars();
+    throw error;
+  }
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
+  pendingVarChoices.clear();
   if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
+    renderVars();
+    if (choices.length || addVars.length) throw new Error(data?.error || t('app.viewFailed'));
     console.warn(data?.error || t('app.viewFailed'));
     return;
   }
-  if (prior) {
-    navStack.push(prior);
-    if (navStack.length > NAV_MAX) navStack.shift();
-  }
-  state.up = up; state.down = down;
-  state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
+  if (prior) rememberView(prior);
+  const snapshot = data.reviewSnapshot;
+  state.up = snapshot?.up ?? up; state.down = snapshot?.down ?? down;
+  state.group = snapshot?.group ?? group;
+  els.groupMode.checked = state.group;
+  const visibleVars = new Set(data.nodes.filter((node) => node.kind === 'var').map((node) => node.id));
+  state.vars = new Set([...(snapshot?.vars ?? vars)].filter((id) => visibleVars.has(id)));
+  state.hiddenVars = new Set(snapshot?.hiddenVars ?? hiddenVars);
   // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
   if (state.pairFlow) clearPairFlow({ paint: false });
   const priorView = state.view;
+  const selected = incremental && priorView?.projectId === data.projectId &&
+    priorView?.comparison?.id === data.comparison?.id ? state.selected : null;
   stopCamAnim();
   state.view = data;
   state.expansions = data.expansions || [];
@@ -90,10 +147,12 @@ async function loadView(rootId, opts = {}) {
   state.roots = data.roots ?? (data.root ? [data.root] : roots);
   state.root = data.root || state.roots[0] || null;
   state.hoverRelation = null;
-  state.selected = null;
+  state.selected = data.nodes.some((node) => node.id === selected) ? selected : null;
   state.selectedEdge = null;
   state.selectedLabel = null;
   state.multiSelection = null;
+  state.marquee = null;
+  if (!incremental && (empty || data.empty)) state.ctxBox = null;
   state.trunkHits = null;
   state.prevTrunkHits = null;
   state.trunkFocusNode = null;
@@ -108,7 +167,7 @@ async function loadView(rootId, opts = {}) {
   const keepCam = !fitOnLoad && Boolean(priorView?.nodes.length);
   const oldNodes = new Map((keepCam ? priorView.nodes : []).map((n) => [n.id, n]));
   const oldEdges = new Set((keepCam ? priorView.edges : []).map(edgeKey));
-  const addedNodes = keepCam ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const addedNodes = keepCam || opts.selectAdded ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   const addedEdges = keepCam ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
   if (!keepCam) {
     fit({ paint: false });
@@ -123,8 +182,10 @@ async function loadView(rootId, opts = {}) {
     }
     if (addedNodes.length || addedEdges.length) {
       revealAdded(addedNodes, addedEdges);
-      if (addedNodes.length === 1 && addedNodes[0].kind !== 'var') state.selected = addedNodes[0].id;
     }
+  }
+  if (opts.selectAdded && !startedSelected && !selected && addedNodes.length === 1 && addedNodes[0].kind !== 'var') {
+    state.selected = addedNodes[0].id;
   }
   pulseAdded(addedNodes, addedEdges);
   renderDetail(state.selected).catch((error) => console.warn(t('common.detailError'), error));
@@ -132,6 +193,7 @@ async function loadView(rootId, opts = {}) {
   history.stack = [];
   history.idx = -1;
   pushHistory();
+  if (opts.recordOp) recordViewEvent(opts.recordOp);
   // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
   await savePage(true).catch((error) => console.warn(t('app.scopeSaveFailed'), error));
   return seq === viewSeq ? data : undefined;
@@ -139,41 +201,43 @@ async function loadView(rootId, opts = {}) {
 
 // 面板与交互模块通过钩子回调入口，避免循环依赖
 hooks.loadView = loadView;
-hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } = {}) => {
+hooks.openFunctionAlone = (id) => {
+  if (state.at || canvasAction) return;
+  return loadView(id, { recordOp: 'view.snapshot' });
+};
+hooks.addFunction = async (root, { includeShown = false, restoreHidden = true, varIds = [] } = {}) => {
+  if (state.at || canvasAction) return;
   const shown = new Set(state.view?.nodes.map((n) => n.id));
   const ids = [...new Set(Array.isArray(root) ? root : [root])].filter((id) => includeShown || !shown.has(id));
-  if (!ids.length) return state.view;
+  if (!ids.length && !varIds.length) return state.view;
   const projectId = state.view?.projectId;
   if (restoreHidden && !state.at && !state.view?.comparison) {
     const hidden = (await Promise.all(ids.filter((id) => !shown.has(id))
       .map(async (id) => (await api.node(id)).hidden ? id : null))).filter(Boolean);
-    if (state.view?.projectId !== projectId) return;
+    if (state.view?.projectId !== projectId || state.at || canvasAction) return;
     if (hidden.length) {
       const result = await api.del({ nodes: hidden, restore: true, projectId });
       if (!result?.ok) throw new Error(result?.error || t('app.readdFailed'));
     }
   }
-  const selected = state.selected;
+  if (state.view?.projectId !== projectId || state.at || canvasAction) return;
   const expanded = new Set(state.expansions.map((scope) => scope.root));
   const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
     .map((id) => ({ root: id, up: 0, down: 0 }))];
-  const view = await loadView(state.roots, { incremental: true, expansions });
-  if (view && view === state.view && !state.selected && !state.selectedEdge && !state.pairFlow &&
-      selected && view.nodes.some((n) => n.id === selected)) {
-    state.selected = selected;
-    state.selectedEdge = null;
-    state.selectedLabel = null;
-    await renderDetail(selected);
-    draw();
-  }
-  return view;
+  return loadView(state.roots, { incremental: true, selectAdded: true, expansions,
+    addVars: varIds, recordOp: 'view.snapshot' });
 };
-hooks.removeFunction = async (id) => {
-  if (state.at || state.view?.comparison || !state.view?.nodes.some((n) => n.id === id)) return;
-  state.selected = id;
-  state.selectedEdge = null;
-  state.selectedLabel = null;
-  await deleteSelection();
+hooks.removeFunction = (id) => removeFunctions([id]);
+hooks.removeFunctions = removeFunctions;
+hooks.clearCanvas = clearCanvas;
+hooks.canReview = () => !canvasAction;
+hooks.restoreTimelineView = async (snapshot, revision) => {
+  acceptRestoredRevision(revision);
+  navStack.length = 0;
+  deleteStack.length = 0;
+  const view = await loadView(snapshot.roots, { ...snapshot, nav: false, empty: !!snapshot.empty });
+  if (!view) throw new Error(t('app.viewFailed'));
+  await loadStats();
 };
 hooks.renderDetail = renderDetail;
 hooks.syncComparison = syncComparison;
@@ -181,12 +245,14 @@ hooks.syncComparison = syncComparison;
 hooks.reloadKeepCam = reloadKeepCam;
 let comparisonPage = null;
 hooks.applyComparison = async (roots) => {
+  pendingVarChoices.clear();
   if (!comparisonPage) comparisonPage = {
     view: structuredClone(state.view), roots: [...state.roots], expansions: structuredClone(state.expansions),
     vars: [...state.vars], hiddenVars: [...state.hiddenVars], up: state.up, down: state.down,
     cam: { ...cam }, nav: [...navStack], deleted: [...deleteStack],
   };
   state.at = 0;
+  hideBar();
   state.expansions = [];
   state.vars = new Set(roots.filter((id) => id.startsWith('var::')));
   state.hiddenVars.clear();
@@ -200,6 +266,7 @@ hooks.applyComparison = async (roots) => {
   await Promise.all([loadStats(), loadTree()]);
 };
 hooks.restoreComparison = async () => {
+  pendingVarChoices.clear();
   if (!comparisonPage) return hooks.reloadAll();
   const saved = comparisonPage;
   comparisonPage = null;
@@ -213,13 +280,15 @@ hooks.restoreComparison = async () => {
   navStack.splice(0, navStack.length, ...saved.nav);
   deleteStack.splice(0, deleteStack.length, ...saved.deleted);
   resetVars();
-  await loadView(saved.roots, { nav: false, incremental: true, expansions: saved.expansions });
+  await loadView(saved.roots, { nav: false, incremental: true, expansions: saved.expansions,
+    empty: !!saved.view?.empty && !saved.roots.length && !saved.expansions.length });
   await Promise.all([loadStats(), loadTree()]);
 };
 
 /** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
 hooks.applyBookmark = async (b) => {
-  state.at = 0;
+  if (state.at) return;
+  pendingVarChoices.clear();
   state.up = Number.isInteger(b.up) ? b.up : 1;
   state.down = Number.isInteger(b.down) ? b.down : 1;
   state.group = !!b.group;
@@ -234,6 +303,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async () => {
+  pendingVarChoices.clear();
   comparisonPage = null;
   const seq = ++viewSeq;
   if (state.pairFlow) clearPairFlow({ paint: false });
@@ -246,6 +316,7 @@ hooks.reloadAll = async () => {
   state.expansions = [];
   state.root = null;
   state.at = 0;
+  hideBar();
   state.vars.clear();
   state.hiddenVars.clear();
   state.ctxBox = null;
@@ -259,14 +330,9 @@ hooks.reloadAll = async () => {
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
 hooks.toggleVar = (id, on) => {
-  if (on) {
-    state.vars.add(id);
-    state.hiddenVars.delete(id);
-  } else {
-    state.vars.delete(id);
-    state.hiddenVars.add(id);
-  }
-  reloadKeepCam();
+  if (state.at || canvasAction) { renderVars(); return; }
+  pendingVarChoices.set(id, on);
+  return reloadKeepCam();
 };
 
 async function postDelete(body) {
@@ -274,30 +340,139 @@ async function postDelete(body) {
   if (!result?.ok) throw new Error(result?.error || t('common.removeFailed'));
 }
 
+const clearButton = document.getElementById('clearCanvas');
+const emptyGuide = document.getElementById('canvasEmptyGuide');
+const emptyGuideCompare = document.getElementById('emptyGuideCompare');
+const selectBar = document.getElementById('multiSelectBar');
+const selectCount = document.getElementById('multiSelectCount');
+let canvasAction = false;
+
+function canEditCanvas() {
+  return !state.at && state.view?.reviewSnapshot === undefined && !state.view?.comparison && !!state.view?.nodes.length;
+}
+
+function syncCanvasControls() {
+  clearButton.disabled = canvasAction || !canEditCanvas();
+  els.groupMode.disabled = !!state.at;
+  els.resetLayout.disabled = !!state.at;
+  emptyGuide.hidden = !!state.view?.nodes.length || !!state.view?.comparison;
+  emptyGuideCompare.disabled = !!state.at;
+  const count = state.multiSelection?.kind === 'nodes' ? state.multiSelection.nodes.size : 0;
+  selectBar.hidden = !count || !canEditCanvas();
+  if (!selectBar.hidden) selectCount.textContent = t('canvas.selectedCount', { n: count });
+}
+
+document.addEventListener('cg:canvas-selection', syncCanvasControls);
+document.addEventListener('cg:review-mode', () => {
+  syncCanvasControls();
+  syncTreeSelection();
+});
+
+function reportCanvasError(error) {
+  alert(error.message || t('common.removeFailed'));
+}
+
+async function clearCanvas() {
+  if (canvasAction || !canEditCanvas()) return;
+  const prior = { ...currentViewSnapshot(), cam: { ...cam }, composition: true, lastDelete: deleteStack.at(-1) };
+  canvasAction = true;
+  syncCanvasControls();
+  try {
+    const seq = viewSeq + 1;
+    await loadView([], { nav: false, prior, empty: true, expansions: [], vars: [], hiddenVars: [],
+      recordOp: 'view.clear' });
+    if (seq === viewSeq && navStack.at(-1) !== prior) throw new Error(t('app.viewFailed'));
+  } finally {
+    canvasAction = false;
+    syncCanvasControls();
+  }
+}
+
+async function removeFunctions(ids) {
+  if (canvasAction || !canEditCanvas()) return;
+  const selected = new Set(ids);
+  const shown = state.view.nodes.filter((node) => selected.has(node.id)).map((node) => node.id);
+  if (!shown.length) return;
+  const varIds = new Set(shown.filter((id) => id.startsWith('var::')));
+  const fnIds = shown.filter((id) => !varIds.has(id));
+  const removed = new Set(shown);
+  const prior = { ...currentViewSnapshot(), cam: { ...cam }, composition: true, lastDelete: deleteStack.at(-1) };
+  const roots = prior.roots.filter((id) => !removed.has(id));
+  const expansions = prior.expansions.filter((scope) => !removed.has(scope.root));
+  const vars = prior.vars.filter((id) => !varIds.has(id));
+  const hiddenVars = [...new Set([...prior.hiddenVars, ...varIds])];
+  const empty = !roots.length && !expansions.length;
+  const projectId = state.view.projectId;
+  const seq = viewSeq;
+  let deleted = [];
+  canvasAction = true;
+  syncCanvasControls();
+  try {
+    if (!empty && fnIds.length) {
+      // 先验证缩小后的范围，仅隐藏仍会被展开带回来的函数。
+      const preview = await api.view({ roots, expansions, vars, hiddenVars, up: prior.up, down: prior.down,
+        group: prior.group, preview: true });
+      if (seq !== viewSeq || state.at || projectId !== state.view?.projectId) return;
+      if (!Array.isArray(preview?.nodes)) throw new Error(preview?.error || t('app.viewFailed'));
+      const remaining = new Set(preview.nodes.map((node) => node.id));
+      const childIds = fnIds.filter((id) => remaining.has(id));
+      if (childIds.length) {
+        await postDelete({ nodes: childIds, projectId });
+        deleted = childIds;
+      }
+    }
+    if (seq !== viewSeq || state.at || projectId !== state.view?.projectId) return;
+    const entry = { ...prior, deleted };
+    await loadView(roots, { nav: false, incremental: true, empty, expansions, vars, hiddenVars,
+      prior: entry, recordOp: 'view.snapshot' });
+    if (!navStack.includes(entry)) {
+      if (seq + 1 === viewSeq) throw new Error(t('app.viewFailed'));
+      return;
+    }
+    if (deleted.length) loadStats().catch(() => {});
+    deleted = [];
+  } finally {
+    canvasAction = false;
+    syncCanvasControls();
+    if (deleted.length && !state.at && !state.view?.comparison && projectId === state.view?.projectId) {
+      await postDelete({ nodes: deleted, projectId, restore: true });
+    }
+  }
+}
+
 /** 回退到上一个视图（入口 + 视角一起还原） */
 async function navigateBack() {
   const prev = navStack.at(-1);
-  if (!prev) return false;
-  const view = await loadView(prev.roots.length ? prev.roots : null, { nav: false, expansions: prev.expansions || [],
-    up: prev.up, down: prev.down, vars: prev.vars, hiddenVars: prev.hiddenVars });
-  if (!view) return false;
-  navStack.pop();
-  cam.x = prev.cam.x;
-  cam.y = prev.cam.y;
-  cam.k = prev.cam.k;
-  constrainCam();
-  draw();
-  return true;
+  if (!prev || canvasAction) return false;
+  canvasAction = true;
+  syncCanvasControls();
+  try {
+    if (prev.deleted?.length) await postDelete({ nodes: prev.deleted, restore: true });
+    const view = await loadView(prev.roots, { ...prev, nav: false, recordOp: 'view.snapshot' });
+    if (!view) return false;
+    navStack.pop();
+    Object.assign(cam, prev.cam);
+    constrainCam();
+    draw();
+    if (prev.deleted?.length) loadStats().catch(() => {});
+    return true;
+  } finally {
+    canvasAction = false;
+    syncCanvasControls();
+  }
 }
 
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
 async function reloadKeepCam() {
-  await loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true });
+  return loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true });
 }
 
 async function deleteSelection() {
   const v = state.view;
-  if (!v || v.comparison) return;
+  if (!v || v.comparison || state.at || canvasAction) return;
+  if (state.multiSelection?.kind === 'nodes' && state.multiSelection.nodes.size) {
+    return removeFunctions(state.multiSelection.nodes);
+  }
   // 选中标签时 Delete 只删标签，不删整条连线
   if (!state.selected && state.selectedEdge && state.selectedLabel && (await deleteSelectedLabel())) return;
   let body = null;
@@ -314,33 +489,60 @@ async function deleteSelection() {
     return;
   }
 
-  // 保留查找入口作为范围锚点；隐藏入口也不自动选入其他函数，撤销时仍能恢复原图。
-  await postDelete(body);
-  // 记下删除时所在的入口集合：换视图后不能拿这条记录去恢复（见 canRestoreDelete）
-  deleteStack.push({ ...body, roots: state.roots.join('+'), at: Date.now() });
-  if (deleteStack.length > 30) deleteStack.shift();
+  const ids = new Set(body.nodes);
+  const variables = v.nodes.filter((node) => node.kind === 'var' && ids.has(node.id));
+  canvasAction = true;
+  syncCanvasControls();
+  try {
+    await Promise.allSettled(variables.map(({ id }) => varRestores.get(varRestoreKey(v.projectId, id))));
+    // 保留原入口作为范围锚点，以便撤销时恢复原图。
+    await postDelete({ ...body, projectId: v.projectId });
+    if (state.view?.projectId !== v.projectId || state.at || state.view?.comparison) return;
+    const varChoices = variables.map(({ id }) => ({ id, included: state.vars.delete(id), hidden: state.hiddenVars.has(id) }));
+    for (const { id } of varChoices) {
+      pendingVarChoices.delete(id);
+      state.hiddenVars.add(id);
+    }
+    deleteStack.push({ ...body, varChoices, roots: v.roots.join('+'), at: Date.now() });
+    if (deleteStack.length > 30) deleteStack.shift();
 
-  state.hoverRelation = null;
-  state.selected = null;
-  state.selectedEdge = null;
-  state.selectedLabel = null;
-  state.hover = null;
-  if (state.moveTarget?.kind === 'file') { state.moveTarget = null; state.ctxBox = null; }
-  await reloadKeepCam();
-  renderDetail(null);
-  renderLabelPanel();
-  pushHistory();
-  loadStats();
+    state.hoverRelation = null;
+    state.selected = null;
+    state.selectedEdge = null;
+    state.selectedLabel = null;
+    state.hover = null;
+    if (state.moveTarget?.kind === 'file') state.moveTarget = null;
+    await reloadKeepCam();
+    if (body.nodes) recordViewEvent();
+    loadStats();
+  } finally {
+    canvasAction = false;
+    syncCanvasControls();
+  }
 }
 
 async function restoreLastDelete() {
-  const rec = deleteStack.pop();
+  const rec = deleteStack.at(-1);
   if (!rec) return false;
-  await postDelete({ nodes: rec.nodes || [], edges: rec.edges || [], restore: true });
-  await reloadKeepCam();
-  pushHistory();
-  loadStats();
-  return true;
+  const projectId = state.view.projectId;
+  canvasAction = true;
+  syncCanvasControls();
+  try {
+    await postDelete({ nodes: rec.nodes || [], edges: rec.edges || [], restore: true, projectId });
+    if (state.view?.projectId !== projectId || state.at || state.view?.comparison) return false;
+    for (const { id, included, hidden } of rec.varChoices || []) {
+      if (included) state.vars.add(id);
+      if (!hidden) state.hiddenVars.delete(id);
+    }
+    if (!await reloadKeepCam()) return false;
+    deleteStack.pop();
+    if (rec.nodes) recordViewEvent();
+    loadStats();
+    return true;
+  } finally {
+    canvasAction = false;
+    syncCanvasControls();
+  }
 }
 
 /**
@@ -361,26 +563,29 @@ window.addEventListener('keydown', (e) => {
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault();
-    if (state.view?.comparison) { navigateBack(); return; }
+    if (state.at || canvasAction) return;
+    if (state.view?.comparison) { navigateBack().catch(reportCanvasError); return; }
+    const prior = navStack.at(-1);
     if (e.shiftKey) {
       if (redo()) renderLabelPanel();
-    } else if (canRestoreDelete()) {
+    } else if (canRestoreDelete() && (!prior?.composition || prior.lastDelete !== deleteStack.at(-1))) {
       // 优先恢复刚删掉的函数 / 连线（20 秒内有效，可逐次回退）
-      restoreLastDelete();
+      restoreLastDelete().catch(reportCanvasError);
     } else if (history.idx > 0) {
       if (undo()) renderLabelPanel();
     } else if (navStack.length) {
       // 当前视图内已无可撤销的操作，退回上一次跳转（双击下钻 / 勾选函数）
-      navigateBack();
+      navigateBack().catch(reportCanvasError);
     } else {
       if (undo()) renderLabelPanel();
     }
     return;
   }
   if (e.key === 'Delete' || e.key === 'Backspace') {
-    if (state.selected || state.selectedEdge || state.selectedLabel || state.moveTarget?.kind === 'file') {
+    if (state.selected || state.selectedEdge || state.selectedLabel || state.moveTarget?.kind === 'file' ||
+        state.multiSelection?.kind === 'nodes') {
       e.preventDefault();
-      deleteSelection();
+      deleteSelection().catch(reportCanvasError);
     }
   }
 });
@@ -392,13 +597,24 @@ window.addEventListener('keydown', (e) => {
 });
 
 els.groupMode.addEventListener('change', () => {
-  state.group = els.groupMode.checked;
+  if (state.at) return;
   state.selectedEdge = null;
   state.selectedLabel = null;
-  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
+  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions, group: els.groupMode.checked });
 });
 els.resetLayout.addEventListener('click', () => {
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
+});
+clearButton.addEventListener('click', () => clearCanvas().catch(reportCanvasError));
+document.getElementById('multiSelectRemove').addEventListener('click', () => deleteSelection().catch(reportCanvasError));
+document.getElementById('multiSelectCancel').addEventListener('click', () => {
+  state.multiSelection = null;
+  draw();
+});
+document.getElementById('emptyGuideSearch').addEventListener('click', () => els.search.focus());
+emptyGuideCompare.addEventListener('click', () => {
+  document.getElementById('projectBtn').click();
+  document.getElementById('projectModeCompare').click();
 });
 
 // interact.js 先完成命中检测和点选，普通单击选中节点后退出双点路径。
@@ -465,6 +681,7 @@ document.addEventListener('callgraph:langchange', () => {
   renderVars();
   if (document.getElementById('secDataflow').hidden) renderDetail(state.selected).catch(() => {});
   renderLabelPanel();
+  syncCanvasControls();
   draw();
 });
 window.addEventListener('resize', () => { constrainCam(); resize(); });

@@ -351,6 +351,30 @@ const ANNOTATION_OPS = new Set(['node.annotate', 'edge.annotate']);
 const hasAnnotationValue = (value) => Array.isArray(value) ? value.length > 0 :
   typeof value === 'string' ? value.trim().length > 0 : value != null;
 
+const stringArray = (value) => Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [];
+
+function viewSnapshot(view) {
+  return {
+    roots: stringArray(view.roots),
+    expansions: normalizeExpansions(view.expansions),
+    up: Math.max(0, Number(view.up) || 0),
+    down: Math.max(0, Number(view.down) || 0),
+    group: !!view.group,
+    vars: stringArray(view.vars),
+    hiddenVars: stringArray(view.hiddenVars),
+    empty: !!view.empty,
+  };
+}
+
+function currentViewSnapshot() {
+  return pageState && !pageState.reviewing && !COMPARISON ? viewSnapshot(pageState) : undefined;
+}
+
+function emptyCanvasView() {
+  return { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260,
+    root: null, roots: [], expansions: [], empty: true, projectId: PROJECT.id };
+}
+
 /** 从持久化状态比较，避免仅因 updatedAt 改变产生事件。调用方负责事务和广播。 */
 function writeAnnotation(kind, target, patch, actor) {
   const { updatedAt, ...previous } = store.getAnnotation(PROJECT.id, kind, target);
@@ -362,7 +386,7 @@ function writeAnnotation(kind, target, patch, actor) {
   const annotation = store.setAnnotation(PROJECT.id, kind, target, patch);
   store.appendEvent(PROJECT.id, {
     op: `${kind}.annotate`, target, actor,
-    before: pickKeys(previous, keys), after: pickKeys(next, keys),
+    before: pickKeys(previous, keys), after: { ...pickKeys(next, keys), view: currentViewSnapshot() },
   });
   return annotation;
 }
@@ -370,7 +394,7 @@ function writeAnnotation(kind, target, patch, actor) {
 function timelineEvent({ before, after, ...event }, withPayload) {
   if (ANNOTATION_OPS.has(event.op)) {
     const brief = event.brief = {};
-    const data = after || {};
+    const { view, ...data } = after || {};
     for (const key of ['note', 'tag', 'change', 'nameMode']) {
       if (hasAnnotationValue(data[key])) brief[key] = String(data[key]).slice(0, key === 'note' ? 80 : 40);
     }
@@ -586,7 +610,7 @@ function composeMcpView(p) {
   store.transaction(() => {
     page.revision = store.appendEvent(PROJECT.id, {
       op: 'view.compose', actor: 'ai', target: roots[0] || functions[0], before,
-      after: { ...page, count: roots.length + functions.length, rootCount: roots.length, reason },
+      after: { ...page, count: roots.length + functions.length, rootCount: roots.length, reason, view: viewSnapshot(page) },
     });
     store.setSetting(key, page);
   });
@@ -932,13 +956,13 @@ async function buildView(
 ) {
   const projectId = PROJECT.id;
   const model = MODEL;
-  if (!COMPARISON && (varSel.want?.length || dfNode)) {
+  const requestedRoots = Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [];
+  if (!COMPARISON && (varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')))) {
     await ensureAnalysis(model);
     if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
   }
   // 多个入口各自取子图，并将旧占位入口迁移为工程内定义。
-  const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [])
-    .map((id) => remapLegacyExt(id, model)).filter(Boolean);
+  const roots = requestedRoots.map((id) => remapLegacyExt(id, model)).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
   const nodeMap = new Map();
   const edgeList = [];
@@ -999,21 +1023,14 @@ async function buildView(
       !(e.kind === 'var' && (skipVars.has(e.to) || skipVars.has(e.from)))
   );
   let clean = alive.map(({ bodyTokens, ...rest }) => rest);
-  if (!clean.length) {
-    if (varSel.preview) return { nodes: [], edges: [], projectId, truncated, ...recommendations([], []),
-      ...(COMPARISON ? { comparison: comparisonInfo() } : {}) };
-    const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
-      : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
-    return { ...emptyLayout, root: g.root, roots,
-      empty: true, projectId, expansions: varSel.expansions || [], comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
-  }
   // 右侧面板里勾选的全局变量：补节点 + 视图内函数对它的引用边
   if (wantVars.size) {
     const ids = new Set(clean.map((n) => n.id));
     const df = MODEL._df;
     for (const id of wantVars) {
-      if (ids.has(id) || viewOverlay.deleted.nodes[id]) continue;
-      const def = (df && df.byId.get(id)) || MODEL._index.byId.get(id);
+      if (ids.has(id) || skipVars.has(id) || viewOverlay.deleted.nodes[id]) continue;
+      const indexed = model._index.byId.get(id);
+      const def = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
       if (!def) continue;
       clean.push({
         ...(COMPARISON ? def : {}),
@@ -1065,6 +1082,15 @@ async function buildView(
         pushVarEdge(e.from, e.to, e.via || '变量');
       }
     }
+  }
+
+  if (!clean.length) {
+    if (varSel.preview) return { nodes: [], edges: [], projectId, truncated, ...recommendations([], []),
+      ...(COMPARISON ? { comparison: comparisonInfo() } : {}) };
+    const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
+      : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
+    return { ...emptyLayout, root: g.root, roots,
+      empty: true, projectId, expansions: cleanExpansions, comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
 
   // 数据流（按需展开）：把相关的函数也拉进视图，否则只有连线看不到两端
@@ -1164,6 +1190,7 @@ async function buildView(
     }
   }
   return { ...laid, root: g.root, roots, expansions: cleanExpansions, truncated, layoutEngine: 'elk', projectId, macroNameMode,
+    ...(!roots.length && !cleanExpansions.length ? { empty: true } : {}),
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -1359,14 +1386,8 @@ const server = http.createServer(async (req, res) => {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
             }
             const str = (v) => (typeof v === 'string' ? v : null);
-            const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
             pageState = {
-              roots: strArr(p.roots),
-              up: Math.max(0, Number(p.up) || 0),
-              down: Math.max(0, Number(p.down) || 0),
-              group: !!p.group,
-              vars: strArr(p.vars),
-              expansions: normalizeExpansions(p.expansions),
+              ...viewSnapshot(p),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
@@ -1375,10 +1396,10 @@ const server = http.createServer(async (req, res) => {
               ts: Date.now(),
               revision,
             };
-            if (pageState.roots.length && !pageState.reviewing && !COMPARISON) {
+            if ((pageState.roots.length || pageState.expansions.length || p.empty === true) && !pageState.reviewing && !COMPARISON) {
               const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
               const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
-              store.setSetting(key, { ...pageState, hiddenVars: strArr(p.hiddenVars), cam, ctxBox });
+              store.setSetting(key, { ...pageState, cam, ctxBox });
             }
             json(res, { ok: true });
           })
@@ -1391,6 +1412,36 @@ const server = http.createServer(async (req, res) => {
           ? undefined
           : '还没有页面连上来过：打开应用页面后，这里会返回用户当前正在看的视图',
       });
+    }
+
+    if (u.pathname === '/api/view-event' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
+      if (COMPARISON || pageState?.reviewing || p.reviewing === true || Number(p.at) > 0) {
+        return json(res, { ok: true, ignored: true });
+      }
+      if (p.revision !== undefined && p.revision !== (store.getSetting('ui.last-view.' + PROJECT.id)?.revision ?? 0)) {
+        return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
+      }
+      if (!['view.snapshot', 'view.clear'].includes(p.op) || !isPlainObject(p.view)) {
+        return bad(res, '画布事件需要 view.snapshot 或 view.clear，以及视图参数');
+      }
+      let view;
+      try { view = viewSnapshot(p.view); } catch (err) { return bad(res, err.message); }
+      if (p.label !== undefined && typeof p.label !== 'string') return bad(res, 'label 必须是文字');
+      const label = p.label?.trim() ?? '';
+      const latest = store.latestEventId(PROJECT.id);
+      if (isDeepStrictEqual(view, store.viewAt(PROJECT.id, latest))) {
+        return json(res, { ok: true, deduplicated: true });
+      }
+      const eventId = store.appendEvent(PROJECT.id, {
+        op: p.op, actor: 'user', target: label || view.roots[0] || '', after: { view },
+        ctx: label ? { label } : null,
+      });
+      broadcastChange(p.op, 'user');
+      return json(res, { ok: true, eventId });
     }
 
     // 自动挑入口函数（/api/view 与 /api/export/svg 共用）：优先入度为 0 的函数
@@ -1478,6 +1529,7 @@ const server = http.createServer(async (req, res) => {
         id: PROJECT.id,
         name: PROJECT.name,
         path: root,
+        focusFile: MODEL.focusFile || null,
         fingerprint: fp,
         scannedFingerprint: PROJECT.prevFingerprint || PROJECT.fingerprint,
         changed: !!PROJECT.prevFingerprint && PROJECT.prevFingerprint !== fp,
@@ -1932,24 +1984,33 @@ const server = http.createServer(async (req, res) => {
           const latest = store.latestEventId(PROJECT.id);
           if (at > latest) return bad(res, 'eventId 超出范围');
           const restored = store.overlayAt(PROJECT.id, at);
+          const restoredView = store.viewAt(PROJECT.id, at);
+          let restoredPage;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
-          store.transaction(() => {
+          const eventId = store.transaction(() => {
             store.replaceOverlay(PROJECT.id, restored);
-            store.appendEvent(PROJECT.id, {
+            const eventId = store.appendEvent(PROJECT.id, {
               op: 'restore_point',
               target: `event#${at}`,
-              after: restored,
+              after: restoredView ? { ...restored, view: restoredView } : restored,
               actor: p.actor === 'ai' ? 'ai' : 'user',
             });
+            if (restoredView) {
+              restoredPage = { ...restoredView, projectId: PROJECT.id, selected: null, selectedEdge: null,
+                reviewing: false, at: 0, ts: Date.now(), revision: eventId };
+              store.setSetting('ui.last-view.' + PROJECT.id, restoredPage);
+            }
+            return eventId;
           });
           // 同步内存镜像，后续请求直接读到恢复后的状态
+          if (restoredPage) pageState = restoredPage;
           overlay.nodes = restored.nodes;
           overlay.edges = restored.edges;
           overlay.deleted = restored.deleted;
           overlay.layout = restored.layout;
           broadcastChange('restore_point', p.actor === 'ai' ? 'ai' : 'user');
-          json(res, { ok: true, eventId: store.latestEventId(PROJECT.id) });
+          json(res, { ok: true, eventId, ...(restoredView ? { restoredView } : {}) });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
@@ -1975,6 +2036,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/view') {
+      const at = Number(u.searchParams.get('at') || 0);
+      let emptyRequested = u.searchParams.get('empty') === '1';
+      let useSnapshot = u.searchParams.get('useSnapshot') === '1';
       let previous = null;
       let expansions = [];
       let bodyRoots = null;
@@ -1983,6 +2047,8 @@ const server = http.createServer(async (req, res) => {
         if (!guardWrite(req, res)) return;
         let body;
         try { body = await readJson(req, res); } catch { return; }
+        emptyRequested ||= body.empty === true;
+        useSnapshot ||= body.useSnapshot === true;
         try { expansions = normalizeExpansions(body.expansions); } catch (err) { return bad(res, err.message); }
         if (body.projectId != null && body.projectId !== PROJECT.id) return json(res, { error: '工程已切换，请重试' }, 409);
         if (body.roots !== undefined) {
@@ -1990,10 +2056,14 @@ const server = http.createServer(async (req, res) => {
           bodyRoots = body.roots;
         }
         for (const key of ['vars', 'hiddenVars']) if (body[key] !== undefined &&
-          (!Array.isArray(body[key]) || body[key].length > 600 || body[key].some((id) => typeof id !== 'string'))) return bad(res, `${key} 必须是最多 600 项的标识数组`);
+          (!Array.isArray(body[key]) || body[key].some((id) => typeof id !== 'string'))) return bad(res, `${key} 必须是标识数组`);
         bodyVars = body.vars;
         bodyHiddenVars = body.hiddenVars;
-        if (body.previous == null && !body.expansions?.length && !bodyRoots?.length) return bad(res, '缺少增量布局、局部展开或入口参数');
+        if (body.previous == null && !expansions.length && !bodyRoots?.length && !bodyVars?.length &&
+            !bodyHiddenVars?.length && !u.searchParams.has('root') && !u.searchParams.has('roots') &&
+            !emptyRequested && !(at > 0 && useSnapshot)) {
+          return bad(res, '缺少增量布局、局部展开或入口参数');
+        }
         previous = body.previous;
         if (previous != null) {
           for (const snapshot of [previous, previous.layoutSlots].filter(item => item != null)) {
@@ -2033,20 +2103,42 @@ const server = http.createServer(async (req, res) => {
       const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions,
         preview: u.searchParams.get('preview') === '1' };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
-      const at = Number(u.searchParams.get('at') || 0);
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
+      const reviewSnapshot = at > 0 && useSnapshot ? store.viewAt(PROJECT.id, at) : undefined;
+      const withReviewSnapshot = (view) => reviewSnapshot === undefined ? view : { ...view, reviewSnapshot };
       const viewOverlay = at > 0 ? store.overlayAt(PROJECT.id, at) : overlay;
+      if (reviewSnapshot) {
+        const histRoots = reviewSnapshot.empty ? [] : reviewSnapshot.roots;
+        const histVars = { want: reviewSnapshot.vars || [], skip: reviewSnapshot.hiddenVars || [],
+          expansions: reviewSnapshot.empty ? [] : reviewSnapshot.expansions || [] };
+        if (!histRoots?.length && !histVars.expansions.length && !histVars.want.length) {
+          return json(res, withReviewSnapshot(emptyCanvasView()));
+        }
+        const view = await buildView(histRoots, reviewSnapshot.up, reviewSnapshot.down, reviewSnapshot.group,
+          null, histVars, viewOverlay);
+        return json(res, withReviewSnapshot(view));
+      }
       if (!roots.length) {
         if (COMPARISON) return json(res, await buildView(COMPARISON.roots, 0, 0, group, null, varSel, viewOverlay, previous));
+        if (expansions.length) {
+          return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
+        }
+        if (emptyRequested) {
+          return json(res, withReviewSnapshot(varSel.want.length || previous
+            ? await buildView([], up, down, group, df, varSel, viewOverlay, previous) : emptyCanvasView()));
+        }
         if (!MODEL.functions.length && !MODEL.headerSymbols?.length) {
-          return json(res, {
+          if (varSel.want.length) {
+            return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
+          }
+          return json(res, withReviewSnapshot({
             nodes: [],
             edges: [],
             width: 480,
             height: 260,
             root: null,
             empty: true,
-          });
+          }));
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile
@@ -2059,10 +2151,10 @@ const server = http.createServer(async (req, res) => {
         const pick = entries[0] || [...pool].sort((a, b) => deg(b.id) - deg(a.id))[0] || MODEL.functions[0] || MODEL.headerSymbols?.[0];
         return json(
           res,
-          await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous)
+          withReviewSnapshot(await buildView([pick.id], up, down, group, df, varSel, viewOverlay, previous))
         );
       }
-      return json(res, await buildView(roots, up, down, group, df, varSel, viewOverlay, previous));
+      return json(res, withReviewSnapshot(await buildView(roots, up, down, group, df, varSel, viewOverlay, previous)));
     }
 
     if (u.pathname === '/api/node') {
@@ -2244,7 +2336,7 @@ const server = http.createServer(async (req, res) => {
                 manual: patch.manual ? before.manual : undefined,
               },
               after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual,
-                clearedLegacyManual: migrated.length ? migrated : undefined },
+                clearedLegacyManual: migrated.length ? migrated : undefined, view: currentViewSnapshot() },
               actor: patch.actor === 'ai' ? 'ai' : 'user',
             });
             return slot;
@@ -2481,8 +2573,8 @@ const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
         .then((p) => {
-          const nodeIds = p.nodes === undefined ? [] : p.nodes;
-          const edgeKeys = p.edges === undefined ? [] : p.edges;
+          let nodeIds = p.nodes === undefined ? [] : p.nodes;
+          let edgeKeys = p.edges === undefined ? [] : p.edges;
           // 必须是字符串数组：否则 for...of 会把字符串按字符拆开写进 overlay
           if (!Array.isArray(nodeIds) || nodeIds.some((x) => typeof x !== 'string')) {
             return bad(res, 'nodes 必须是字符串数组');
@@ -2494,20 +2586,28 @@ const server = http.createServer(async (req, res) => {
             // 一次性恢复所有被删除的函数与连线
             store.transaction(() => {
               store.clearDeleted(PROJECT.id);
-              store.appendEvent(PROJECT.id, { op: 'delete.clear', actor: p.actor === 'ai' ? 'ai' : 'user' });
+              const view = currentViewSnapshot();
+              store.appendEvent(PROJECT.id, {
+                op: 'delete.clear', after: view ? { view } : null, actor: p.actor === 'ai' ? 'ai' : 'user',
+              });
             });
             overlay.deleted = { nodes: {}, edges: {} };
             broadcastChange('delete.clear', p.actor === 'ai' ? 'ai' : 'user');
             return json(res, { ok: true, nodes: 0, edges: 0 });
           }
           const restore = !!p.restore;
+          if (restore) {
+            nodeIds = nodeIds.filter((id) => Object.hasOwn(overlay.deleted.nodes, id));
+            edgeKeys = edgeKeys.filter((key) => Object.hasOwn(overlay.deleted.edges, key));
+            if (!nodeIds.length && !edgeKeys.length) return json(res, { ok: true, nodes: 0, edges: 0 });
+          }
           const counts = store.transaction(() => {
             const counts = store.setDeleted(PROJECT.id, { nodes: nodeIds, edges: edgeKeys }, restore);
             store.appendEvent(PROJECT.id, {
               op: restore ? 'delete.restore' : 'delete',
               target: nodeIds.length === 1 && !edgeKeys.length ? nodeIds[0] : null,
               // 回放要区分节点和边，不能只留一个拼接字符串
-              after: { nodes: nodeIds, edges: edgeKeys },
+              after: { nodes: nodeIds, edges: edgeKeys, view: currentViewSnapshot() },
               actor: p.actor === 'ai' ? 'ai' : 'user',
             });
             return counts;

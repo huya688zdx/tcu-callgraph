@@ -12,6 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { launchServer } from '../scripts/lib/server.mjs';
+import { openStore } from '../src/core/store.js';
 
 const jsonPost = (base, p, body) =>
   fetch(base + p, {
@@ -34,6 +35,95 @@ const stateOf = (view) => ({
     }))
     .sort((a, b) => (a.id < b.id ? -1 : 1)),
   edges: (view.edges || []).map((e) => e.key || `${e.from}->${e.to}`).sort(),
+});
+
+test('时间轴回看并恢复历史画布，同时保留该时刻的标注', async (t) => {
+  const srv = await launchServer();
+  const base = srv.baseUrl;
+  const get = (url) => fetch(base + url).then((r) => r.json());
+  const post = (url, body) => jsonPost(base, url, body);
+  t.after(() => srv.close());
+  const project = await get('/api/project');
+  const legacyAt = (await get('/api/events?limit=1')).latest;
+  const main = 'main.c::main';
+  const gear = 'gear.c::Gear_Apply';
+  const tick = 'main.c::SysTick_Handler';
+  const cleared = { roots: [], expansions: [], up: 0, down: 0, group: false, vars: [], hiddenVars: [], empty: true };
+  const viewA = { ...cleared, roots: [main], empty: false };
+  const viewB = { ...viewA, roots: [gear, tick], group: true,
+    expansions: [gear, main].map((root) => ({ root, up: 0, down: 0 })) };
+  const record = async (view, op = 'view.snapshot', label) => {
+    const result = await post('/api/view-event', { op, view, label });
+    assert.equal(result.ok, true);
+    assert.ok(result.eventId > 0);
+    return result.eventId;
+  };
+  const review = (id) => get(`/api/view?root=${gear}&up=1&down=1&group=1&at=${id}&useSnapshot=1`);
+  const nodeIds = (view) => view.nodes.map((node) => node.id).sort();
+
+  const legacy = await review(legacyAt);
+  assert.equal(legacy.reviewSnapshot, null);
+  assert.equal(legacy.root, gear);
+  const atA = await record(viewA);
+  assert.equal((await post('/api/view-event', { op: 'view.snapshot', view: viewA })).deduplicated, true);
+  assert.equal((await post('/api/page', { projectId: project.id, ...viewA })).ok, true);
+  assert.equal((await post('/api/overlay', { nodeId: main, data: { note: '当时的备注' } })).ok, true);
+  const annotationAt = (await get('/api/events?limit=1')).latest;
+  const atB = await record(viewB, 'view.snapshot', '三个函数');
+  const atClear = await record(cleared, 'view.clear');
+  assert.equal((await post('/api/page', { projectId: project.id, ...cleared })).ok, true);
+  assert.equal((await post('/api/page', { projectId: project.id, ...viewA, at: atA })).ok, true);
+  assert.equal((await post('/api/view-event', { op: 'view.snapshot', view: viewA })).ignored, true);
+  assert.equal((await get('/api/page?saved=1')).page.empty, true);
+
+  const events = (await get('/api/events?detail=1')).events;
+  const annotation = events.find((event) => event.id === annotationAt);
+  assert.deepEqual(annotation.after, { note: '当时的备注', view: viewA });
+  assert.deepEqual(events.find((event) => event.id === atB).brief,
+    { count: 3, roots: 2, vars: 0, empty: false, label: '三个函数' });
+  const store = openStore({ dbPath: project.db });
+  try {
+    assert.equal(store.viewAt(project.id, legacyAt), null);
+    assert.deepEqual(store.viewAt(project.id, atA), viewA);
+    assert.deepEqual(store.viewAt(project.id, atB), viewB);
+    assert.deepEqual(store.viewAt(project.id, atClear), cleared);
+    assert.deepEqual(store.overlayAt(project.id, annotationAt).nodes[main], { note: '当时的备注' });
+  } finally {
+    store.close();
+  }
+
+  const a = await review(atA);
+  assert.deepEqual(a.reviewSnapshot, viewA);
+  assert.deepEqual(nodeIds(a), [main]);
+  assert.equal(a.nodes[0].note, undefined);
+  const annotated = await review(annotationAt);
+  assert.deepEqual(annotated.reviewSnapshot, viewA);
+  assert.equal(annotated.nodes[0].note, '当时的备注');
+  const b = await review(atB);
+  assert.deepEqual(b.reviewSnapshot, viewB);
+  assert.deepEqual(nodeIds(b), [gear, main, tick].sort());
+  const postReview = await post(`/api/view?at=${atB}`, { useSnapshot: true });
+  assert.deepEqual(postReview.reviewSnapshot, viewB);
+  assert.deepEqual(stateOf(postReview), stateOf(b));
+  const empty = await review(atClear);
+  assert.deepEqual(empty.reviewSnapshot, cleared);
+  assert.deepEqual(empty.nodes, []);
+  assert.equal(empty.empty, true);
+
+  const restored = await post('/api/restore', { eventId: atA });
+  assert.equal(restored.ok, true);
+  assert.deepEqual(restored.restoredView, viewA);
+  const saved = (await get('/api/page?saved=1')).page;
+  for (const key of Object.keys(viewA)) assert.deepEqual(saved[key], viewA[key]);
+  assert.equal(saved.reviewing, false);
+  assert.equal(saved.at, 0);
+  assert.equal(saved.selected, null);
+  assert.equal(saved.selectedEdge, null);
+  assert.equal((await post('/api/page', { ...cleared, revision: 0 })).ok, false, '旧上报不能覆盖恢复后的画布');
+  const replayedRestore = await review(restored.eventId);
+  assert.deepEqual(replayedRestore.reviewSnapshot, viewA);
+  assert.deepEqual(stateOf(replayedRestore), stateOf(a));
+  assert.equal((await get(`/api/view?root=${main}&up=0&down=0`)).nodes[0].note, undefined);
 });
 
 test('回放一致性：写满一圈后 at=最新 的视图与当前状态逐字段相同', async (t) => {
