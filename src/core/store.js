@@ -349,16 +349,20 @@ function applyEvent(ov, e) {
       ov.deleted = { nodes: {}, edges: {} };
       return;
     }
-    case 'layout.save': {
+    case 'layout.save':
+    case 'layout.clear': {
+      for (const key of after.clearedLegacyManual || []) {
+        if (ov.layout[key]) ov.layout[key].manual = [];
+      }
+      if (e.op === 'layout.clear') {
+        delete ov.layout[e.target];
+        return;
+      }
       const slot = ov.layout[e.target] || { nodes: {}, edges: {}, manual: [] };
       if (after.nodes) Object.assign(slot.nodes, after.nodes);
       if (after.edges) Object.assign(slot.edges, after.edges);
       if (after.manual) slot.manual = after.manual;
       ov.layout[e.target] = slot;
-      return;
-    }
-    case 'layout.clear': {
-      delete ov.layout[e.target];
       return;
     }
     case 'orphan.purge': {

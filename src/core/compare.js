@@ -4,7 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { buildIndex, rebuildIndex } from './index.js';
 import { comparisonFiles } from './compare-files.js';
-import { getParser, collectDefinitions, collectFunctions } from './cparse.js';
+import { getParser, collectDefinitions, collectFunctions, declaratorName } from './cparse.js';
 import { analysisSources, buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { lex } from './lexer.js';
 import { expandSeq } from './preproc.js';
@@ -35,6 +35,23 @@ function reference(node) {
   }
   if (node.type === 'subscript_expression' || node.type === 'pointer_expression') return reference(argument);
   if (node.type === 'parenthesized_expression' || node.type === 'cast_expression') return reference(node.namedChildren.at(-1));
+  return null;
+}
+
+function localTarget(node) {
+  let partial = false;
+  while (node) {
+    if (node.type === 'identifier') return { name: node.text, partial };
+    if (node.type === 'parenthesized_expression') {
+      node = node.namedChildren.at(-1);
+      continue;
+    }
+    // 通过指针访问成员时，写入不会改变指针变量本身。
+    if (node.type !== 'subscript_expression' &&
+        (node.type !== 'field_expression' || node.childForFieldName('operator')?.text !== '.')) break;
+    partial = true;
+    node = node.childForFieldName('argument');
+  }
   return null;
 }
 
@@ -119,9 +136,11 @@ function functionWrites(fn, model, id, findMacros) {
     const field = name => node.childForFieldName(name);
     const scope = node.type === 'compound_statement' || node.type === 'for_statement' ? new Map() : shadowed;
     if (node.type === 'declaration') for (const child of node.childrenForFieldName('declarator')) {
-      if (child.type !== 'identifier') continue;
-      if (!scope.has(child.text)) scope.set(child.text, locals.get(child.text));
-      locals.set(child.text, []);
+      if (child.type !== 'identifier' && child.type !== 'array_declarator') continue;
+      const name = declaratorName(child);
+      if (!name) continue;
+      if (!scope.has(name)) scope.set(name, locals.get(name));
+      locals.set(name, []);
     }
     if (node.type === 'assignment_expression' || node.type === 'update_expression' || node.type === 'init_declarator') {
       const target = field('left') || field('argument') || field('declarator');
@@ -129,18 +148,23 @@ function functionWrites(fn, model, id, findMacros) {
       const assigns = field('operator')?.text === '=';
       const sources = [value];
       if (!assigns) sources.push(target);
-      else for (let part = target; part; part = part.childForFieldName('argument')) {
+      else for (let part = target; part; part = part.type === 'parenthesized_expression'
+        ? part.namedChildren.at(-1) : part.childForFieldName('argument')) {
         sources.push(part.childForFieldName('index'));
       }
-      if (node.type !== 'init_declarator') record(target, node, guards, sources);
-      if (target?.type === 'identifier') {
-        const previous = locals.get(target.text) || [];
-        if (node.type === 'init_declarator') {
-          if (!scope.has(target.text)) scope.set(target.text, locals.get(target.text));
-          locals.set(target.text, [effect(node, guards, [value])]);
-        } else if (locals.has(target.text)) {
+      if (node.type === 'init_declarator') {
+        const name = target?.type === 'identifier' || target?.type === 'array_declarator' ? declaratorName(target) : null;
+        if (name) {
+          if (!scope.has(name)) scope.set(name, locals.get(name));
+          locals.set(name, [effect(node, guards, [value])]);
+        }
+      } else {
+        record(target, node, guards, sources);
+        const local = localTarget(target);
+        if (local && locals.has(local.name)) {
           const next = effect(node, guards, sources);
-          locals.set(target.text, guards.length ? [...previous, next] : [next]);
+          // 成员和下标写入只更新对象的一部分，保留先前的依赖。
+          locals.set(local.name, local.partial || guards.length ? [...locals.get(local.name), next] : [next]);
         }
       }
     } else if (node.type === 'call_expression') {

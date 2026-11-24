@@ -835,6 +835,24 @@ function sendFile(res, file, headers) {
  */
 const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
 
+// 旧存档的外部占位节点若已有真实定义，优先绑定到生产源码。
+function remapLegacyExt(id, model) {
+  if (typeof id !== 'string' || !id.startsWith('ext::')) return id;
+  const list = model._index?.byName?.get(id.slice(5));
+  if (!list?.length) return null;
+  const prod = list.find((f) => !/(^|\/)(tests?|unit|stubs?|mocks?|host|sim)(\/|_|-)/i.test(f.file));
+  return (prod || list[0]).id;
+}
+
+const remapLayoutRoot = (root, model) => root.split('+').map((id) => remapLegacyExt(id, model) ?? id).join('+');
+
+function legacyManualKeys(layout, root, mode, model) {
+  const suffix = `::${mode}`;
+  const canonicalKey = layoutKey(root, mode);
+  return Object.keys(layout).filter((key) => key !== canonicalKey && key.endsWith(suffix) &&
+    layout[key]?.manual?.length && layoutKey(remapLayoutRoot(key.slice(0, -suffix.length), model), mode) === canonicalKey);
+}
+
 const CALL_KINDS = new Set(['direct', 'macro', 'fnptr']);
 
 function previewRecommendations(root, model, comparison, hiddenNodes, nodes, edges) {
@@ -918,22 +936,17 @@ async function buildView(
     await ensureAnalysis(model);
     if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
   }
-  // 支持多个入口（文件树多选）：各自取子图后合并节点与边；自动迁移旧存档中的 ext:: 节点为真实工程内定义并丢弃无源码的外部虚拟节点
-  const remapLegacyExt = (id) => {
-    if (typeof id !== 'string' || !id.startsWith('ext::')) return id;
-    const name = id.slice(5);
-    const list = MODEL._index?.byName?.get(name);
-    if (!list?.length) return null;
-    const prod = list.filter((f) => !/(^|\/)(tests?|unit|stubs?|mocks?|host|sim)(\/|_|-)/i.test(f.file));
-    return (prod[0] || list[0]).id;
-  };
-  const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : []).map(remapLegacyExt).filter(Boolean);
+  // 多个入口各自取子图，并将旧占位入口迁移为工程内定义。
+  const roots = (Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [])
+    .map((id) => remapLegacyExt(id, model)).filter(Boolean);
   const perRoot = Math.max(120, Math.floor(600 / Math.max(1, roots.length)));
   const nodeMap = new Map();
   const edgeList = [];
   const seenEdge = new Set();
   let truncated = false;
-  const cleanExpansions = (varSel.expansions || []).map((s) => ({ ...s, root: remapLegacyExt(s.root) })).filter((s) => s.root);
+  const cleanExpansions = normalizeExpansions((varSel.expansions || [])
+    .map((s) => ({ ...s, root: remapLegacyExt(s.root, model) }))
+    .filter((s) => model._index.byId.has(s.root) && model._index.byId.get(s.root).kind !== 'var'));
   const scopes = [...roots.map((root) => ({ root, up, down })), ...cleanExpansions];
   for (const scope of scopes) {
     const part = subgraph(MODEL, scope.root, { up: scope.up, down: scope.down,
@@ -1083,13 +1096,15 @@ async function buildView(
 
   // 只恢复手工关系，旧固定坐标和折线不再参与排版。
   const mode = group ? 'group' : 'flat';
-  const slot = viewOverlay.layout?.[layoutKey(roots.join('+'), mode)] || {};
+  const layout = viewOverlay.layout || {};
+  const layoutRoot = roots.join('+');
+  const manual = layout[layoutKey(layoutRoot, mode)]?.manual;
   const byId = new Map(clean.map((n) => [n.id, n]));
   // 比较模式的 roots 是「保留+选中」的合集，和存手工关系时的原视图槽位键对不上；
   // 改为从全部槽位按「两端都在当前图上」找回，按端点对去重，保证手工关系仍可见。
   const manualPool = COMPARISON
-    ? Object.values(viewOverlay.layout || {}).flatMap((s) => s?.manual || [])
-    : slot.manual || [];
+    ? Object.values(layout).flatMap((s) => s?.manual || [])
+    : manual?.length ? manual : legacyManualKeys(layout, layoutRoot, mode, model).flatMap((key) => layout[key].manual);
   const seenManual = new Set();
   for (const m of manualPool) {
     const mk = `${m.from}\u0000${m.to}`;
@@ -1148,7 +1163,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, expansions: varSel.expansions || [], truncated, layoutEngine: 'elk', projectId, macroNameMode,
+  return { ...laid, root: g.root, roots, expansions: cleanExpansions, truncated, layoutEngine: 'elk', projectId, macroNameMode,
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
 
@@ -1969,7 +1984,6 @@ const server = http.createServer(async (req, res) => {
         let body;
         try { body = await readJson(req, res); } catch { return; }
         try { expansions = normalizeExpansions(body.expansions); } catch (err) { return bad(res, err.message); }
-        expansions = expansions.filter((e) => MODEL._index.byId.has(e.root) && MODEL._index.byId.get(e.root).kind !== 'var');
         if (body.projectId != null && body.projectId !== PROJECT.id) return json(res, { error: '工程已切换，请重试' }, 409);
         if (body.roots !== undefined) {
           if (!Array.isArray(body.roots) || body.roots.length > 600 || body.roots.some((id) => typeof id !== 'string')) return bad(res, 'roots 必须是最多 600 项的标识数组');
@@ -2204,8 +2218,10 @@ const server = http.createServer(async (req, res) => {
           if (patch.edges !== undefined && !isPlainObject(patch.edges)) return bad(res, 'edges 必须是对象');
           if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
           const mode = patch.mode === 'group' ? 'group' : 'flat';
-          const rootId = String(patch.root || '');
+          const rootId = remapLayoutRoot(String(patch.root || ''), MODEL);
           const key = layoutKey(rootId, mode);
+          const migrated = patch.clear || patch.manual !== undefined
+            ? legacyManualKeys(overlay.layout || {}, rootId, mode, MODEL) : [];
           const slot = store.transaction(() => {
             const before = store.getLayout(PROJECT.id, rootId, mode);
             const slot = store.saveLayout(PROJECT.id, rootId, mode, {
@@ -2214,6 +2230,10 @@ const server = http.createServer(async (req, res) => {
               manual: patch.manual,
               clear: !!patch.clear,
             });
+            // 手工线是整组替换，清空旧别名的连线以免之后又被回退读取。
+            for (const legacyKey of migrated) {
+              store.saveLayout(PROJECT.id, legacyKey.slice(0, -mode.length - 2), mode, { manual: [] });
+            }
             // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
             store.appendEvent(PROJECT.id, {
               op: patch.clear ? 'layout.clear' : 'layout.save',
@@ -2223,13 +2243,15 @@ const server = http.createServer(async (req, res) => {
                 edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
                 manual: patch.manual ? before.manual : undefined,
               },
-              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual },
+              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual,
+                clearedLegacyManual: migrated.length ? migrated : undefined },
               actor: patch.actor === 'ai' ? 'ai' : 'user',
             });
             return slot;
           });
           overlay.layout = overlay.layout || {};
           overlay.layout[key] = slot;
+          for (const legacyKey of migrated) overlay.layout[legacyKey].manual = [];
           broadcastChange(patch.clear ? 'layout.clear' : 'layout.save', patch.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true });
         })

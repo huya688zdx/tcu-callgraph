@@ -22,3 +22,47 @@ test('最近视图按工程保存，切回后恢复函数组合、选中项和�
     assert.deepEqual(saved[key], page[key]);
   }
 });
+
+test('旧视图入口和展开范围迁移为真实函数，手工连线按迁移后的入口保存', async (t) => {
+  const srv = await launchServer(); t.after(() => srv.close());
+  const get = (url) => fetch(srv.baseUrl + url).then((r) => r.json());
+  const post = (url, body) => fetch(srv.baseUrl + url, { method: 'POST',
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+  const project = await get('/api/project');
+  const root = 'gear.c::Gear_Apply';
+  const legacyRoot = 'ext::Gear_Apply';
+  const secondRoot = 'main.c::main';
+  const key = `${root}+${secondRoot}::group`;
+  const legacyKey = `${legacyRoot}+${secondRoot}::group`;
+  const existing = { from: root, to: secondRoot };
+  const added = { from: secondRoot, to: root };
+  const group = '?group=1&up=0&down=0';
+  const legacyExpansions = [{ root: 'ext::SysTick_Handler', up: 0, down: 0 }];
+  const manualOf = (view) => view.edges.filter(e => e.manual).map(({ from, to }) => ({ from, to }));
+  const reload = (at = 0) => post(`/api/view${group}&at=${at}`, { projectId: project.id, roots: [root, secondRoot] });
+  const latestEvent = async () => (await get('/api/events?limit=1')).latest;
+
+  assert.equal((await post('/api/session/import', { format: 'tcu-callgraph-session', version: 1,
+    overlay: { layout: { [legacyKey]: { manual: [existing] }, [key]: { nodes: { [root]: { x: 1, y: 2 } } } } },
+  })).ok, true);
+  const view = await post('/api/view' + group, {
+    projectId: project.id, roots: [legacyRoot, secondRoot], expansions: legacyExpansions,
+  });
+  assert.equal(view.root, root);
+  assert.deepEqual(view.roots, [root, secondRoot]);
+  assert.deepEqual(view.expansions, [{ root: 'main.c::SysTick_Handler', up: 0, down: 0 }]);
+  assert.ok(view.nodes.some(n => n.id === 'main.c::SysTick_Handler'));
+  assert.deepEqual(manualOf(await reload()), [existing]);
+  const importedAt = await latestEvent();
+
+  assert.deepEqual(await post('/api/layout', { root: `${legacyRoot}+${secondRoot}`, mode: 'group', manual: [existing, added] }), { ok: true });
+  const saved = await get('/api/session/export?events=0');
+  assert.deepEqual(saved.overlay.layout[key].manual, [existing, added]);
+  assert.deepEqual(saved.overlay.layout[legacyKey].manual, []);
+  assert.deepEqual(manualOf(await reload()), [existing, added]);
+
+  assert.deepEqual(await post('/api/layout', { root: `${root}+${secondRoot}`, mode: 'group', manual: [] }), { ok: true });
+  assert.deepEqual(manualOf(await reload()), [], '清空后旧槽位里的连线不应重新出现');
+  assert.deepEqual(manualOf(await reload(await latestEvent())), [], '回放清空后的状态也不应恢复旧连线');
+  assert.deepEqual(manualOf(await reload(importedAt)), [existing]);
+});

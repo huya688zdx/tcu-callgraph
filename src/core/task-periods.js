@@ -137,8 +137,8 @@ function delayInterval(fn, delays, macros, cmsisMillis) {
   // 明确的循环预算优先于分支中的等待，例如诊断暂停时的 tick 延时。
   const budgets = intervals.filter(delay => delay.budget && delay.us);
   const values = budgets.length ? budgets : intervals;
-  const first = values[0];
-  return first?.us && values.every(delay => delay.us === first.us) ? first : null;
+  // 多次等待可能顺序执行，参数相同也不足以确定循环周期。
+  return values.length === 1 && values[0].us ? values[0] : null;
 }
 
 /** 完整任务清单不受当前视图深度、检测建议条数或是否存在调用者限制。 */

@@ -87,8 +87,8 @@ async function loadView(rootId, opts = {}) {
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
-  state.root = data.root;
-  state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
+  state.roots = data.roots ?? (data.root ? [data.root] : roots);
+  state.root = data.root || state.roots[0] || null;
   state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
@@ -97,7 +97,7 @@ async function loadView(rootId, opts = {}) {
   state.trunkHits = null;
   state.prevTrunkHits = null;
   state.trunkFocusNode = null;
-  const rootNode = data.nodes.find((n) => n.id === data.root);
+  const rootNode = data.nodes.find((n) => n.id === state.root);
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';

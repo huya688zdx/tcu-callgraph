@@ -405,6 +405,44 @@ int Fixed(void) { return g_fixed; }
   }
 });
 
+test('局部聚合对象的成员赋值、下标赋值和更新传播到全局写入及读者', async (t) => {
+  const before = `
+struct S { int v; int values[2]; };
+typedef struct S *SPtr;
+int g, g_array, g_update, g_fixed;
+void Write(void) {
+  struct S s;
+  s.v = 1;
+  s.values[0] = 0;
+  g = s.v;
+  int a[2];
+  (a)[0] = 3;
+  a[1] = 0;
+  g_array = a[0];
+  struct S updated = {0};
+  (updated.v)++;
+  g_update = updated.v;
+  struct S indirect = {0};
+  SPtr ptr = &indirect;
+  ptr->v = 5;
+  g_fixed = ptr != 0;
+}
+int Read(void) { return g; }
+int ReadArray(void) { return g_array; }
+int ReadUpdate(void) { return g_update; }
+int ReadFixed(void) { return g_fixed; }
+`;
+  const after = before.replace('s.v = 1', 's.v = 2')
+    .replace('(a)[0] = 3', '(a)[0] = 4').replace('(updated.v)++', '(updated.v)--')
+    .replace('ptr->v = 5', 'ptr->v = 6');
+  const result = await compareProjects(...sourceComparison(t, before, after));
+  const point = result.changePoints.find(p => p.id === 'work.c::Write');
+  assert.deepEqual(new Set(point.affectedIds), new Set([
+    'work.c::Write', 'var::g', 'var::g_array', 'var::g_update',
+    'work.c::Read', 'work.c::ReadArray', 'work.c::ReadUpdate',
+  ]));
+});
+
 test('同一函数使用多个变更宏时，按各自的写入追踪影响链', async (t) => {
   const before = `
 #define SCALE 10

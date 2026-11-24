@@ -199,6 +199,23 @@ void workerB(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
   });
 });
 
+test('循环内顺序执行的两次相同延时不推断为单次延时周期', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-sequential-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'worker.c'), `
+void worker(void) {
+  while (1) {
+    step1();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    step2();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+`);
+  const tasks = projectTasks(loadModel(root));
+  assert.deepEqual(tasks.map(({ name, us }) => [name, us]), [['worker', null]]);
+});
+
 test('纯 C 周期识别支持 RTOS 注册、循环工作函数、毫秒宏和调度表', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-c-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
