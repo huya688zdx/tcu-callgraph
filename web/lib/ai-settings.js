@@ -77,6 +77,7 @@ function render() {
       <h3>${t('ai.rules')}</h3>
       <ul>
         <li>${t('ai.rule.source')}</li>
+        <li>${t('ai.rule.encoding')}</li>
         <li>${t('ai.rule.functions')}</li>
         <li>${t('ai.rule.colors')}</li>
         <li>${t('ai.rule.labels')}</li>
@@ -93,7 +94,8 @@ function render() {
       const key = button.dataset.aiCopy;
       const status = button.closest('.ai-section').querySelector('[role="status"]');
       try {
-        await navigator.clipboard.writeText(key === 'config' ? config : t(PROMPTS[Number(key)].text));
+        const content = key === 'config' ? config : [t(PROMPTS[Number(key)].text), t('ai.rule.encoding')].join('\n');
+        await navigator.clipboard.writeText(content);
         status.textContent = t('ai.copied');
       } catch {
         status.textContent = t('ai.clipboardError');

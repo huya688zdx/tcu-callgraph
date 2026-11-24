@@ -60,6 +60,11 @@ export function collectDataflow(units, records, defs, resolveVariable, callTarge
       return isArray(node) ? [...targets, ...refer(node, context)] : targets;
     }
     if (node.kind === 'ConditionalOperator') return [...pointers(left, context), ...pointers(right, context)];
+    // 指针加整数（两种顺序）或减整数仍指向同一对象；两个指针相减的结果是整数。
+    if (node.kind === 'BinaryOperator' && ['+', '-'].includes(node.opcode) && typeOf(node).includes('*')) {
+      const pointer = typeOf(base).includes('*') ? base : left;
+      return pointers(pointer, context);
+    }
     return isArray(node) ? refer(node, context) : [];
   }
 

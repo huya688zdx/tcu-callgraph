@@ -47,7 +47,36 @@ function definitionsFromGraph(model, _findMacros, fingerprint) {
       new Map(accessFields(r, model._df.byId.get(varId)).map((field) =>
         [field, [{ signature: expanded.get(id)?.value, inputs }]]))])));
   }
-  return { raw, expanded, writes, other: new Map(), rawWrites: new Map() };
+  const other = new Map();
+  for (const [file, declarations] of Map.groupBy(model.enumDeclarations || [], d => d.file)) {
+    other.set(file, JSON.stringify(declarations.map(d => d.hash).sort()));
+  }
+  return { raw, expanded, writes, other, rawWrites: new Map() };
+}
+
+function enumChangePoints(before, after) {
+  const groups = model => Map.groupBy(model.enumConstants || [], item => item.id);
+  const old = groups(before), now = groups(after), points = [];
+  // 同一个头文件在不同编译单元可得到不同值。集合相同也可能是两个单元的值对调。
+  const values = items => items?.map(item => item.value).sort().join(' / ') ?? null;
+  const byUnit = items => new Map(items.flatMap(item => item.units.map(unit => [unit, item.value])));
+  for (const id of unionKeys(old, now)) {
+    let beforeValue = values(old.get(id)), afterValue = values(now.get(id));
+    if (beforeValue === afterValue) {
+      if (old.get(id).length < 2) continue;
+      const a = byUnit(old.get(id)), b = byUnit(now.get(id));
+      const changed = [...a.keys()].filter(unit => b.has(unit) && a.get(unit) !== b.get(unit)).sort();
+      if (!changed.length) continue;
+      const describe = side => changed.map(unit => `${unit}=${side.get(unit)}`).join(' / ');
+      beforeValue = describe(a);
+      afterValue = describe(b);
+    }
+    const { name, file } = (now.get(id) || old.get(id))[0];
+    points.push({ id, name, file, kind: 'enum', beforeValue, afterValue,
+      change: beforeValue === null ? 'added' : afterValue === null ? 'deleted' : 'modified',
+      summary: `枚举值变化：${name} (${beforeValue ?? '—'} → ${afterValue ?? '—'})` });
+  }
+  return points;
 }
 
 function changedWrites(before, after) {
@@ -175,6 +204,7 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
   const beforePeriods = taskPeriods(beforeModel), afterPeriods = taskPeriods(afterModel);
   const points = new Map();
   const addPoint = (point) => points.set(point.id, { point, seeds: new Set() });
+  for (const point of enumChangePoints(beforeModel, afterModel)) addPoint(point);
   const bodyText = (value) => value ?? '—';
   const macroReason = (m) => `宏/LSB 展开变化: ${m.name} (${bodyText(m.before)} → ${bodyText(m.after)})`;
   for (const m of macroDetails) {
@@ -215,6 +245,12 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
       const oldExpanded = beforeDefs.expanded.get(id), newExpanded = afterDefs.expanded.get(id);
       let change = a ? b ? 'existing' : 'deleted' : 'added';
       let macroImpact = false, macroNames = [];
+      const enumIds = new Set([...Object.keys(a?.enumUses || {}), ...Object.keys(b?.enumUses || {})]);
+      const enumChanges = [...enumIds].filter(key => points.has(key) && a?.enumUses?.[key] !== b?.enumUses?.[key]);
+      for (const key of enumChanges) {
+        points.get(key).seeds.add(id);
+        reasons.push(points.get(key).point.summary);
+      }
       if (a && b && kind !== 'external') {
         if (oldRaw && newRaw && oldRaw.value !== newRaw.value) {
           change = 'modified'; reasons.push('定义修改');
@@ -225,7 +261,7 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
         if (oldRaw && newRaw && oldExpanded && newExpanded && oldExpanded.value !== newExpanded.value) {
           const names = change === 'existing' ? macrosIn(newRaw.text) : changedExpansion(newRaw.text);
           const macros = macroDetails.filter(m => names.has(m.name));
-          macroImpact = change === 'existing' || macros.length > 0;
+          macroImpact = (change === 'existing' && !enumChanges.length) || macros.length > 0;
           macroNames = macros.map(m => m.name);
           if (macroImpact) reasons.push(...(macros.length ? macros.map(macroReason) : ['宏展开变化（宏定义来源待核对）']));
           for (const m of macros) points.get(m.id).seeds.add(id);
@@ -239,7 +275,8 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
       const periodImpact = !!(a && b) && periodBefore.join() !== periodAfter.join();
       const node = { ...(b || a), kind: kind === 'external' ? 'fn' : kind, change, reasons,
         macroImpact, macroNames, periodImpact, periodBefore, periodAfter, periods: { before: periodBefore, after: periodAfter },
-        impact: macroImpact || periodImpact, context: false, impactChainIds: new Set(),
+        impact: macroImpact || periodImpact || !!enumChanges.length,
+        ...(enumChanges.length && { impactRole: 'dataflow_impact' }), context: false, impactChainIds: new Set(),
         locations: { before: location(a), after: location(b) }, versions: [a && 'before', b && 'after'].filter(Boolean) };
       merged.set(id, node);
       if (kind !== 'external' && (change !== 'existing' || (macroImpact && !macroNames.length))) addDefinitionPoint(node, reasons[0]);

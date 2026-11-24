@@ -154,8 +154,19 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
     .map(file => dependencyStamp(file) || { file });
   const df = collectDataflow(units, functionRecords, defs, resolveVariable, callTargets);
   df.failedFiles = failedFiles;
+  const enumConstants = new Map(), enumDeclarations = new Map();
+  for (const unit of units) {
+    for (const item of unit.enumById.values()) {
+      if (!item.id) continue;
+      const key = JSON.stringify([item.id, item.value]);
+      if (!enumConstants.has(key)) enumConstants.set(key, { ...item, units: [] });
+      enumConstants.get(key).units.push(unit.unit.rel);
+    }
+    for (const item of unit.enumDeclarations) enumDeclarations.set(JSON.stringify([item.file, item.hash]), item);
+  }
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
     edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings,
+    enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
     fnptrTables: [...tables].map(([id, { slots }]) => ({
       id, name: defs.get(id).name, file: defs.get(id).file,
       map: Object.fromEntries([...slots].map(([slot, to]) => [slot, (functions.get(to) || externals.get(to)).name])),

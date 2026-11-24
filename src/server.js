@@ -6,7 +6,8 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { fork } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
-import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex, decodeSource } from './core/index.js';
+import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
+import { sourceDecoder } from './core/source-files.js';
 import { layoutElk } from './core/layout-elk.js';
 import { buildFlowchart, isFlowchartFunction } from './core/flowchart.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
@@ -665,7 +666,11 @@ async function readMcpSource(q) {
     }
     source = fs.readFileSync(realFile);
   }
-  const lines = decodeSource(source).split(/\r\n|\n|\r/);
+  const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
+  let decoded;
+  try { decoded = decoder.decode(source.subarray(decoder.bomLength)); }
+  catch { throw new Error(`${file} 含无效的 ${decoder.encoding} 字节，请核对原文件编码`); }
+  const lines = decoded.split(/\r\n|\n|\r/);
   if (lines.at(-1) === '') lines.pop();
   if (startLine > lines.length) throw new Error('起始行超出源码文件范围');
   const endLine = Math.min(requestedEndLine, startLine + 249, lines.length);
@@ -675,7 +680,7 @@ async function readMcpSource(q) {
   }
   return {
     ok: true, id: fn?.id ?? null, name: fn?.name ?? null, file, startLine, endLine,
-    requestedEndLine, truncated: endLine < requestedEndLine,
+    requestedEndLine, truncated: endLine < requestedEndLine, sourceEncoding: decoder.encoding,
     source: lines.slice(startLine - 1, endLine).join('\n'),
     taskPeriods: fn ? taskPeriods(model).get(id) || [] : [],
     traceVersion, ...(fn ? traceToTasks(model, id) : {}),

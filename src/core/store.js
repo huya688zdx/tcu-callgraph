@@ -211,7 +211,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v18-counter-write-sites\0');
+  h.update('analyzed-model-v19-counter-call-sites\0');
   if (parserKey !== 'builtin') h.update(`parser\u0000${parserKey}\n`);
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {

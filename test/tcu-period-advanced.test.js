@@ -75,6 +75,31 @@ void App_Task10ms(void) { Mixed(); }
   assert.deepEqual(nodePeriodBadge(mixed), { text: 'ISR·5ms·10ms', tier: 'multi', multi: true });
 });
 
+test('计数助手只有沿每轮调用一次的路径才能推导分频', t => {
+  const counter = name => `void ${name}(void) {}
+void bump_${name}(void) { static unsigned count; if (++count >= 10) { count = 0; ${name}(); } }`;
+  const source = ['Twice', 'Diamond', 'Loop', 'Conditional', 'Once', 'Nested'].map(counter).join('\n') + `
+void left(void) { bump_Diamond(); }
+void right(void) { bump_Diamond(); }
+void once(void) { bump_Once(); }
+int flags;
+void Task1ms(void) {
+  static unsigned slow;
+  if (++slow >= 2) { slow = 0; bump_Nested(); }
+  bump_Twice(); bump_Twice();
+  left(); right();
+  for (int i = 0; i < flags; ++i) bump_Loop();
+  if (flags) bump_Conditional();
+  once();
+}`;
+  const model = loadModel(project(t, { 'timer.c': source }));
+  for (const name of ['Twice', 'Diamond', 'Loop', 'Conditional']) {
+    assert.deepEqual(periodsFor(model, name).map(c => [c.us, c.dividers]), [[1000, undefined]], name);
+  }
+  assert.deepEqual(periodsFor(model, 'Once').map(c => [c.us, c.dividers[0].divider]), [[10000, 10]]);
+  assert.deepEqual(periodsFor(model, 'Nested').map(c => [c.us, c.dividers.map(d => d.divider)]), [[20000, [2, 10]]]);
+});
+
 test('全局 tick 按唯一写者推导主循环周期，与调用者周期取 LCM', async t => {
   const demo = loadModel(fileURLToPath(new URL('../samples/demo', import.meta.url)));
   await buildDataflowIndex(demo);

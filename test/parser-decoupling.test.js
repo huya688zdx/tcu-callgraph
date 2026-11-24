@@ -147,6 +147,51 @@ test('无编译数据库时，Clang 自动从工程头文件目录建立搜索�
   } });
 });
 
+test('Clang AST 按原文件编码还原函数源码和调用列', async (t) => {
+  const utf8 = text => Buffer.from(text, 'utf8');
+  const utf16le = text => Buffer.from(text, 'utf16le');
+  const utf16be = text => utf16le(text).swap16();
+  // 93 FA 96 7B 是 CP932 的「日本」。函数中的 C2 A5 可同时解作 CP932 的「ﾂ･」或 UTF-8 的「¥」。
+  const cases = [
+    { name: 'CP932 汉字及半角浊音', encode: utf8, prefix: Buffer.alloc(0),
+      comment: Buffer.from([0x93, 0xfa, 0x96, 0x7b, 0xb6, 0xde]), text: '日本ｶﾞ', line: 1 },
+    { name: 'CP932 与 UTF-8 重叠片段', encode: utf8,
+      prefix: Buffer.concat([utf8('/*'), Buffer.from([0x93, 0xfa, 0x96, 0x7b]), utf8('*/\r\n')]),
+      comment: Buffer.from([0xc2, 0xa5]), text: 'ﾂ･', line: 2 },
+    { name: 'UTF-8 BOM', encode: utf8, prefix: Buffer.from([0xef, 0xbb, 0xbf]), text: '日本🎵', line: 1 },
+    { name: 'UTF-8 第二行开头的 U+FEFF 计入列号', encode: utf8,
+      prefix: utf8('// header\r\n\uFEFF'), text: '日本🎵', line: 2, columnOffset: 1 },
+    { name: 'UTF-16LE BOM', encode: utf16le, prefix: utf16le('\uFEFF/*上*/\r\n'), text: '日本🎵', line: 2 },
+    { name: 'UTF-16BE BOM', encode: utf16be, prefix: utf16be('\uFEFF/*上*/\r\n'), text: '日本🎵', line: 2 },
+  ];
+  for (const { name, encode, prefix, comment, text, line, columnOffset = 0 } of cases) {
+    await t.test(name, async t => {
+      const dir = temporary(t);
+      const head = 'void run(void) { /*', tail = '*/ step(); }';
+      const bytes = Buffer.concat([prefix, encode(head), comment ?? encode(text), encode(tail)]);
+      fs.writeFileSync(path.join(dir, 'main.c'), bytes);
+      const loc = (token, from = 0) => {
+        const raw = encode(token);
+        const offset = bytes.indexOf(raw, from);
+        assert.ok(offset >= 0, token);
+        return { offset, tokLen: raw.length };
+      };
+      const step = loc('step');
+      const call = { kind: 'CallExpr', range: { begin: step, end: loc(')', step.offset) }, inner: [
+        { kind: 'DeclRefExpr', referencedDecl: { kind: 'FunctionDecl', id: 'step', name: 'step' } },
+      ] };
+      const ast = { kind: 'TranslationUnitDecl', inner: [
+        { kind: 'FunctionDecl', id: 'run', name: 'run', loc: loc('run'), range: { begin: loc('void'), end: loc('}') },
+          inner: [{ kind: 'CompoundStmt', range: { begin: loc('{'), end: loc('}') }, inner: [call] }] },
+      ] };
+      const model = await loadModel(dir, { parserId: 'clang-ast', parserOptions: { execClang: () => ast } });
+      const source = head + text + tail;
+      assert.equal(model.functions[0].sourceText, source);
+      assert.deepEqual([model.edges[0].line, model.edges[0].col], [line, columnOffset + source.indexOf('step') + 1]);
+    });
+  }
+});
+
 test('编译数据库：两种参数格式、相对工作目录、过滤域外与未构建文件、配置指纹隔离', async (t) => {
   const { dir, database } = project(t);
   const build = path.join(dir, 'build');

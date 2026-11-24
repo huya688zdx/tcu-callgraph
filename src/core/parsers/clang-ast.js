@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { sourceDecoder } from '../source-files.js';
+import { lex } from '../lexer.js';
+import { fingerprint } from '../source-fingerprint.js';
 import { fileKey, relativeFile } from './clang-config.js';
 
 export const children = (node) => node?.inner ?? [];
@@ -35,9 +38,16 @@ function sourceLocations(root, unit, files) {
     if (!sources.has(file)) {
       let bytes;
       try { bytes = fs.readFileSync(file); } catch { bytes = Buffer.alloc(0); }
+      const decoder = sourceDecoder(bytes);
       const lines = [0];
-      for (let i = 0; i < bytes.length; i++) if (bytes[i] === 10) lines.push(i + 1);
-      sources.set(file, { bytes, lines });
+      const lf = decoder.encoding === 'utf-16le' ? Buffer.from([10, 0])
+        : decoder.encoding === 'utf-16be' ? Buffer.from([0, 10]) : Buffer.from([10]);
+      for (let i = bytes.indexOf(lf); i !== -1; i = bytes.indexOf(lf, i + 1)) {
+        if (i % lf.length === 0) lines.push(i + lf.length);
+      }
+      // AST 偏移始终指向原文件字节。只跳过文件开头的 BOM，片段沿用整文件判定的编码。
+      const decodeRange = (start, end) => decoder.decode(bytes.subarray(Math.max(start, decoder.bomLength), end));
+      sources.set(file, { bytes, lines, decodeRange });
     }
     return sources.get(file);
   };
@@ -78,11 +88,10 @@ function sourceLocations(root, unit, files) {
     }
     lastLine = line || (abs === lastFile ? lastLine : 1);
     lastFile = abs;
-    // Clang 的列按 UTF-8 字节计数，词法器按 UTF-16 字符计数。
+    // Clang 的位置按原文件字节计数，词法器的列按 UTF-16 码元计数。
     const source = file && Number.isInteger(raw.offset) ? sourceOf(abs) : null;
     const lineStart = source?.lines[lastLine - 1];
-    const prefix = lineStart != null && source.bytes.subarray(lineStart, raw.offset);
-    const col = prefix ? prefix.toString('utf8').replace(/^\uFEFF/, '').length + 1 : raw.col;
+    const col = lineStart != null ? source.decodeRange(lineStart, raw.offset).length + 1 : raw.col;
     return { file, abs, line: lastLine, col, offset: raw.offset, length: raw.tokLen || 0 };
   };
   const record = (node) => {
@@ -93,37 +102,85 @@ function sourceLocations(root, unit, files) {
     for (const child of children(node)) record(child);
   };
   const slice = (a, b) => a?.file && a.abs === b?.abs && Number.isInteger(a.offset) && Number.isInteger(b.offset)
-    ? sourceOf(a.abs).bytes.subarray(a.offset, b.offset + b.length).toString('utf8') : '';
+    ? sourceOf(a.abs).decodeRange(a.offset, b.offset + b.length) : '';
   return {
     record, includes, externalFiles,
     loc: (n) => locations.get(n)?.loc || locations.get(n)?.begin,
     begin: (n) => locations.get(n)?.begin,
     end: (n) => locations.get(n)?.end,
+    slice,
     text: (n) => slice(locations.get(n)?.begin, locations.get(n)?.end),
     token: (loc) => slice(loc, loc),
   };
 }
 
-function fingerprintAST(node) {
+function fingerprintAST(node, context) {
   const hash = createHash('sha256');
-  for (const n of walk(node)) hash.update(JSON.stringify([
-    n.kind, n.name, n.opcode, n.isPostfix, n.value, n.castKind, n.referencedDecl?.name, typeOf(n),
-    children(n).length, n.array_filler?.length,
-  ]));
-  return hash.digest('hex');
+  const uses = new Map();
+  for (const n of walk(node)) {
+    const constant = context.enumById.get(n.referencedDecl?.id);
+    if (constant?.id) uses.set(constant.id, constant.value);
+    hash.update(JSON.stringify([
+      n.kind, n.name, n.opcode, n.isPostfix, n.value, n.castKind, n.referencedDecl?.name, typeOf(n),
+      n.argType?.desugaredQualType || n.argType?.qualType, constant?.value, children(n).length, n.array_filler?.length,
+    ]));
+  }
+  return { semanticFingerprint: hash.digest('hex'), ...(uses.size && { enumUses: Object.fromEntries(uses) }) };
+}
+
+// 第一个名字前，配平的括号可能属于 typeof、属性或内联结构体。未闭合的括号和顶层 * 属于声明符。
+function sharedSpecifiers(prefix) {
+  const stack = [];
+  for (const token of lex(prefix)) {
+    if (!stack.length && token.v === '*') return prefix.slice(0, token.s).trimEnd();
+    if (['(', '{', '['].includes(token.v)) stack.push(token.s);
+    if ([')', '}', ']'].includes(token.v)) stack.pop();
+  }
+  return prefix.slice(0, stack[0] ?? prefix.length).trimEnd();
+}
+
+function declaratorSeparator(tail) {
+  // VarDecl.range 可能在变量名处结束，后面还有含逗号的 __attribute__((...))。
+  let depth = 0;
+  for (const token of lex(tail)) {
+    if (!depth && token.v === ',') return token;
+    if (['(', '{', '['].includes(token.v)) depth++;
+    if ([')', '}', ']'].includes(token.v)) depth--;
+  }
+}
+
+function collectEnum(node, context, insideFunction) {
+  const { loc, enumDeclarations, enumById } = context;
+  const members = children(node).filter(n => n.kind === 'EnumConstantDecl');
+  const file = loc.loc(node)?.file;
+  if (!insideFunction && file && members.length) enumDeclarations.push({ file, hash: fingerprint(loc.text(node)) });
+  let next = 0n;
+  for (const member of members) {
+    const expression = initializer(member);
+    // Clang 会在较宽的枚举值外包一层隐式转换。没有初始化式时由前一值递增。
+    const evaluated = expression && [...walk(expression)].find(n => n.kind === 'ConstantExpr')?.value;
+    const value = expression ? evaluated : next?.toString();
+    next = value != null && /^-?\d+$/.test(value) ? BigInt(value) + 1n : null;
+    if (value == null) continue;
+    const memberFile = loc.loc(member)?.file;
+    enumById.set(member.id, { id: !insideFunction && memberFile ? `enum::${memberFile}::${member.name}` : null,
+      file: memberFile, name: member.name, value });
+  }
 }
 
 export function readTranslationUnit(ast, root, unit, files) {
   if (ast?.kind !== 'TranslationUnitDecl') throw new Error('Clang 未返回 TranslationUnitDecl');
   const loc = sourceLocations(root, unit, files);
   loc.record(ast);
-  const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map() };
+  const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map(),
+    declaratorSources: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
   const recordsById = new Map();
   const aliasRecords = new Map();
   function collect(node, insideFunction) {
     const position = loc.loc(node);
     const { id, kind, name } = node;
     if (id && kind?.endsWith('Decl')) context.declarations.set(id, { node, position });
+    if (kind === 'EnumDecl') collectEnum(node, context, insideFunction);
     if (kind === 'RecordDecl' && node.completeDefinition) {
       recordsById.set(id, node);
       if (name) context.records.set(`${node.tagUsed} ${name}`, node);
@@ -140,7 +197,25 @@ export function readTranslationUnit(ast, root, unit, files) {
       }
       if (kind === 'VarDecl' && (!insideFunction || node.storageClass === 'extern')) context.globals.push(node);
     }
-    for (const child of children(node)) collect(child, insideFunction || kind === 'FunctionDecl');
+    let first, previousEnd, specifiers;
+    for (const child of children(node)) {
+      if (child.kind === 'VarDecl' || child.kind === 'FunctionDecl') {
+        const start = loc.begin(child), end = loc.end(child);
+        if (start?.file && start.abs === first?.abs && start.offset === first.offset && previousEnd?.abs === start.abs) {
+          const tail = loc.slice({ ...previousEnd, offset: previousEnd.offset + previousEnd.length }, end);
+          const separator = declaratorSeparator(tail);
+          if (separator) {
+            specifiers ??= sharedSpecifiers(loc.slice(first, { ...first.nameLoc, length: 0 }));
+            context.declaratorSources.set(child, specifiers + ' ' + tail.slice(separator.e).trimStart());
+          }
+        } else {
+          first = start && { ...start, nameLoc: loc.loc(child) };
+          specifiers = undefined;
+        }
+        previousEnd = end;
+      }
+      collect(child, insideFunction || kind === 'FunctionDecl');
+    }
   }
   collect(ast, false);
   for (const [name, id] of aliasRecords) if (recordsById.has(id)) context.records.set(name, recordsById.get(id));
@@ -155,7 +230,7 @@ export function functionModel({ node, body, context }) {
     id: `${file}::${node.name}`, name: node.name, file, line, endLine: loc.end(node)?.line ?? line,
     isStatic: node.storageClass === 'static',
     params: params.map((p) => loc.text(p) || [typeOf(p), p.name].filter(Boolean).join(' ')),
-    signature: typeOf(node), sourceText: loc.text(node), semanticFingerprint: fingerprintAST(body),
+    signature: typeOf(node), sourceText: loc.text(node), ...fingerprintAST(body, context),
   };
 }
 
@@ -176,7 +251,7 @@ export function variableModel(node, context) {
     id: isStatic ? `var::${file}::${node.name}` : `var::${node.name}`,
     name: node.name, file, line, typeText, isStatic, isExtern: node.storageClass === 'extern' && !node.init,
     isArray: /\[.*\]/.test(typeText), containsUnion: containsUnion(typeText, new Set()),
-    sourceText: context.loc.text(node), semanticFingerprint: fingerprintAST(node),
+    sourceText: context.declaratorSources.get(node) ?? context.loc.text(node), ...fingerprintAST(node, context),
   };
 }
 

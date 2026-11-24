@@ -116,6 +116,10 @@ WorkBuddy / Claude Desktop / Cursor 等支持 Streamable HTTP 的客户端，在
 
 ## AI 组图与标注
 
+日文 TCU 工程已知采用 CP932 时，读取函数或文件行范围请给 `cg_source` 传 `"encoding": "cp932"`。返回的 `sourceEncoding` 是本次实际使用的编码。无 BOM 的字节有时同时符合 CP932 和 UTF-8，此时显式指定可以保留原来的半角假名。文件带 BOM 时使用 BOM 标明的编码。此选项只作用于本次源码读取，MCP 通过 JSON 返回 Unicode 文本。
+
+在图上引用源码中的日文注释、符号和单位时保留原字形及全角、半角。图上标注保存在调用图数据库中。另行编辑工程源码时应沿用原编码和换行，新增文字需能用该编码无损保存。
+
 1. 先用 `cg_page` 确认画布，用 `cg_changes` 读取变更及比较基准。当前模型中的修改函数用 `cg_trace_to_task` 回溯，读取 `upstreamTasks` 和 `upstreamChains`。尚未入图的 Git 快照用 `cg_changes({ snapshotId, id })` 回溯，同样的入口与路径位于结果的 `trace` 内。每个入口对应一条从 TASK / ISR 到目标的最短路径，路径内保留中间函数。
 2. 在比较中，用 `version` 分别回溯函数实际存在的 `before` 和 `after` 版本，再用同版本的 `cg_source` 对照调度定义和各段调用的文件、行号。多个周期可达同一函数时逐个报告。缺少入口、间接调用目标待核实，或 `traceTruncated` 提示结果受限时，说明证据边界。普通无调用方函数只能作为回溯线索。
 3. 用 `cg_compose_view` 的 `changedFunctionIds` 提交修改函数。比较模式按前后版本各自的调用图补齐入口路径，共用节点只显示一次。直接新增或删除的调用、变量读写关系也会补齐另一端。可再用 `vars` 指定其余所需的全局变量。向已有画面追加时传 `mode: "add"`。比较会话内的组图只作用于该比较画布。
