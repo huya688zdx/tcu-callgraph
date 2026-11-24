@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { collectTaskEvidence, applyTaskEvidence } from '../task-periods.js';
-import { staticSchedule } from '../tcu-schedule.js';
+import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
 import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
@@ -342,17 +342,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (!byName.has(fn.name)) byName.set(fn.name, []);
     byName.get(fn.name).push(fn);
   }
-  for (const { names, file, us, source } of scheduleRows) {
-    const targets = new Set();
-    for (const name of names) {
-      const candidates = byName.get(name) || [];
-      const local = candidates.filter(fn => fn.file === file);
-      const visible = local.length ? local : candidates.filter(fn => !fn.isStatic);
-      if (visible.length === 1) targets.add(visible[0]);
-    }
-    if (targets.size !== 1) continue;
-    for (const target of targets) (target.scheduleRows ??= []).push({ us, source });
-  }
+  applyStaticSchedule(scheduleRows, byName);
   const variables = [];
   for (const v of varById.values()) {
     variables.push(v);

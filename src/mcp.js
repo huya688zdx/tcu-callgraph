@@ -62,7 +62,8 @@ async function post(ctx, path, body) {
   const res = await ctx.fetchImpl(`${ctx.baseUrl}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json',
-      ...(ctx.projectId === undefined ? {} : { 'X-Callgraph-Project': String(ctx.projectId) }) },
+      ...(ctx.projectId === undefined ? {} : { 'X-Callgraph-Project': String(ctx.projectId) }),
+      ...(ctx.sessionRevision === undefined ? {} : { 'X-Callgraph-Session': String(ctx.sessionRevision) }) },
     body: JSON.stringify({ ...body, actor: 'ai' }),
   });
   return res.json();
@@ -91,7 +92,7 @@ async function downloadTo(ctx, pathAndQuery, outPath, fallbackExt) {
     return { ok: false, error: text || `导出失败：HTTP ${res.status}`, status: res.status };
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  const target = await ctx.writeOut(n.name, buf);
+  const target = await ctx.writeOut(n.name, buf, ctx.sessionRevision);
   return { ok: true, path: target, bytes: buf.length };
 }
 
@@ -578,7 +579,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
 
   return {
     /** 处理 POST /mcp 的 body（对象或数组）。返回 { status, body }；body 为 null 时只回 202 */
-    async handlePost(rawBody, projectId) {
+    async handlePost(rawBody, projectId, sessionRevision) {
       let parsed;
       try {
         parsed = JSON.parse(rawBody);
@@ -590,7 +591,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
       if (!messages.length) return { status: 400, body: rpcError(null, -32600, '空批量请求' + '') };
 
       const replies = [];
-      const requestCtx = projectId === undefined ? ctx : { ...ctx, projectId };
+      const requestCtx = projectId === undefined ? ctx : { ...ctx, projectId, sessionRevision };
       for (const m of messages) {
         const r = await handleOne(m, requestCtx);
         if (r) replies.push(r);

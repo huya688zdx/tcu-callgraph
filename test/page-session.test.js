@@ -14,7 +14,7 @@ test('显式空画布可通过 GET 与 POST 打开，切换工程后仍能恢复
   assert.equal((await get('/api/page?saved=1')).page, null);
   assert.ok((await get('/api/view')).nodes.length > 0, '旧请求仍自动挑选入口');
   const emptyView = { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260,
-    root: null, roots: [], expansions: [], empty: true, projectId: project.id };
+    root: null, roots: [], expansions: [], empty: true, groupMode: 'file', projectId: project.id };
   assert.deepEqual(await get('/api/view?empty=1'), emptyView);
   assert.deepEqual(await post('/api/view', { empty: true }), emptyView);
   assert.ok((await get('/api/view?empty=1&root=main.c::main')).nodes.length > 0);

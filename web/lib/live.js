@@ -79,7 +79,7 @@ async function flushReload() {
       // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
       const view = await hooks.loadView(page.roots, {
         nav: true, incremental: true, expansions: page.expansions || [],
-        up: page.up ?? 0, down: page.down ?? 0, group: page.group, empty: !!page.empty,
+        up: page.up ?? 0, down: page.down ?? 0, group: page.group, groupMode: page.groupMode, empty: !!page.empty,
         vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
       if (!view) throw new Error(t('live.composeFailed'));
@@ -183,6 +183,7 @@ export function savePage(force = false) {
     up: state.up,
     down: state.down,
     group: state.group,
+    groupMode: state.groupMode,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
     selected: state.selected,
@@ -219,10 +220,12 @@ export async function restorePage(root = null, isCurrent = () => true) {
     pageRevision = stored?.revision ?? 0;
     const saved = root ? null : stored;
     if (saved) {
-      Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
+      const groupMode = saved.groupMode ?? (saved.group === false ? 'flat' : 'file');
+      Object.assign(state, { up: saved.up, down: saved.down, groupMode, group: groupMode !== 'flat' });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
       els.groupMode.checked = state.group;
+      els.layoutGroupSelect.value = state.groupMode;
     }
     let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
     if (!root && !saved) {

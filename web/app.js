@@ -301,13 +301,14 @@ hooks.applyBookmark = async (b) => {
   pendingVarChoices.clear();
   state.up = Number.isInteger(b.up) ? b.up : 1;
   state.down = Number.isInteger(b.down) ? b.down : 1;
-  state.group = !!b.group;
-  state.groupMode = b.groupMode ?? (state.group ? 'file' : 'flat');
+  state.groupMode = b.groupMode ?? (b.group === false ? 'flat' : 'file');
+  state.group = state.groupMode !== 'flat';
   state.vars = new Set(b.vars || []);
   state.hiddenVars.clear();
 
   els.groupMode.checked = state.group;
 
+  els.layoutGroupSelect.value = state.groupMode;
   const roots = (b.roots || []).filter(Boolean);
   await loadView(roots.length ? roots : null, { expansions: b.expansions || [] });
 };

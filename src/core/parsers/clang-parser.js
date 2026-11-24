@@ -3,12 +3,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { scanSources } from '../source-files.js';
-import { clangCacheKey, detectClang, fileKey, findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
+import { decodeSource, scanSources } from '../source-files.js';
+import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
+  findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
+import { lex } from '../lexer.js';
+import { fileMacroScope, preprocess } from '../preproc.js';
+import { applyTaskEvidence, collectTaskEvidence } from '../task-periods.js';
+import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
 
 export { detectClang, findCompileCommands, readCompileCommands };
 const execute = promisify(execFile);
@@ -25,7 +30,7 @@ function resolveDecl(ref, context, byDecl, exported) {
     || (declaration && declaration.node.storageClass !== 'static' ? exported.get(ref.name) : undefined);
 }
 
-function assemble(root, files, units, warnings, failedFiles) {
+function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
   const functions = new Map(), defs = new Map(), externals = new Map();
   const fnDecls = new Map(), varDecls = new Map(), publicFns = new Map();
   const functionRecords = [], recordsById = new Map();
@@ -138,15 +143,18 @@ function assemble(root, files, units, warnings, failedFiles) {
       return [records.find((r) => r.context === context) || records[0]];
     }));
     for (const to of candidates) {
-      const edge = { from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, via };
+      const edge = { from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, col: pos?.col, via };
       edges.set(JSON.stringify([edge.from, to, line, kind, via, pos?.offset]), edge);
     }
   }
 
-  const df = collectDataflow(functionRecords, defs, resolveVariable, callTargets);
+  const macros = addSchedulingEvidence(functions, functionRecords, units, defs, edges, files, sourcePaths);
+  const externalDeps = [...new Set(units.flatMap(unit => [...unit.loc.externalFiles]))]
+    .map(file => dependencyStamp(file) || { file });
+  const df = collectDataflow(units, functionRecords, defs, resolveVariable, callTargets);
   df.failedFiles = failedFiles;
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
-    edges: [...edges.values()], _df: df, includes: [...includes.values()], warnings,
+    edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings,
     fnptrTables: [...tables].map(([id, { slots }]) => ({
       id, name: defs.get(id).name, file: defs.get(id).file,
       map: Object.fromEntries([...slots].map(([slot, to]) => [slot, (functions.get(to) || externals.get(to)).name])),
@@ -156,6 +164,73 @@ function assemble(root, files, units, warnings, failedFiles) {
   return model;
 }
 
+// 以 AST 确认的定义与调用位置为准，从原始源码提取调度器约定。
+function addSchedulingEvidence(functions, records, units, defs, edges, files, sourcePaths) {
+  const headerMacros = new Map(), macros = new Map(), sources = new Map();
+  for (const file of [...files.filter(f => f.isHeader), ...files.filter(f => !f.isHeader)]) {
+    const input = lex(decodeSource(fs.readFileSync(sourcePaths.get(file.rel))), file.rel);
+    const scope = fileMacroScope(headerMacros, new Map(), { trackPositions: true });
+    const { tokens } = preprocess(input, scope, file.rel);
+    sources.set(file.rel, { tokens, scope, lines: Map.groupBy(tokens, t => t.line) });
+    for (const [name, def] of scope.changes) {
+      if (def) macros.set(name, def);
+      if (file.isHeader) {
+        if (def) headerMacros.set(name, def);
+        else headerMacros.delete(name);
+      }
+    }
+  }
+  const byName = Map.groupBy(functions.values(), fn => fn.name);
+  const calls = Map.groupBy(edges.values(), edge => edge.from);
+  const globals = Map.groupBy(units.flatMap(unit => unit.globals.map(node => ({
+    start: unit.loc.begin(node), end: unit.loc.end(node),
+  }))), item => item.start?.file);
+  for (const [file, { tokens, scope }] of sources) {
+    const rows = staticSchedule(tokens, file, scope);
+    applyStaticSchedule(rows.filter(row => (globals.get(file) || []).some(({ start, end }) =>
+      row.line >= start.line && row.line <= end?.line)), byName);
+  }
+  const seen = new Set();
+  for (const { fn, body, node, context } of records) {
+    if (seen.has(fn.id)) continue;
+    seen.add(fn.id);
+    const { lines, scope } = sources.get(fn.file);
+    const first = context.loc.begin(body), last = context.loc.end(body);
+    if (!first?.col || !last?.col) continue;
+    const sites = new Set();
+    for (const part of walk(body)) {
+      for (const position of [context.loc.begin(part), context.loc.end(part)]) {
+        if (position?.file === fn.file) sites.add(position.line + ':' + position.col);
+      }
+    }
+    const inBody = [];
+    for (let line = first.line; line <= last.line; line++) {
+      for (const token of lines.get(line) || []) {
+        if ((line !== first.line || token.col > first.col) && (line !== last.line || token.col < last.col)) inBody.push(token);
+      }
+    }
+    const active = new Set(inBody.filter(t => sites.has(t.line + ':' + t.col)).map(t => t.cond));
+    const params = children(node).filter(n => n.kind === 'ParmVarDecl').map(n => n.name);
+    const evidence = collectTaskEvidence({ ...fn, params }, inBody.filter(t => !t.cond || active.has(t.cond)).map(({ cond, ...token }) => token),
+      scope, calls.get(fn.id));
+    applyTaskEvidence(fn, evidence, byName);
+    for (const counter of [...(fn.counterIncrements || []), ...(fn.callDividers || []).flatMap(site => site.gates)]) {
+      if (counter.local) continue;
+      const local = 'var::' + fn.file + '::' + counter.counter, global = 'var::' + counter.counter;
+      if (defs.has(local)) counter.variable = local;
+      else if (defs.has(global)) counter.variable = global;
+    }
+  }
+  return [...macros.values()];
+}
+
+function readDependencies(file, cwd) {
+  if (!fs.existsSync(file)) return [];
+  const text = fs.readFileSync(file, 'utf8').replace(/\\\r?\n/g, ' ').replace(/^callgraph:/, '');
+  return [...text.matchAll(/(?:\\[ \t#\\]|[^\s])+/g)].map(([word]) => path.resolve(cwd,
+    word.replace(/\\([ \t#\\])/g, '$1').replaceAll('$$', '$')));
+}
+
 async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
   const started = Date.now();
   root = path.resolve(root);
@@ -163,7 +238,7 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
   const warnings = [...(scan?.warnings || [])];
   const database = findCompileCommands(root, compileCommandsPath);
   const bin = clangBin || process.env.CALLGRAPH_CLANG || 'clang';
-  let workRoot = root;
+  let workRoot = root, dependenciesDir;
   const remap = (file) => {
     const rel = relativeFile(root, file);
     return rel === null ? file : path.join(workRoot, rel);
@@ -183,21 +258,30 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     const names = new Map(found.map((f) => [fileKey(f.rel), f.rel]));
     const headers = found.filter((f) => f.isHeader);
     const includeArgs = [...new Set([workRoot, ...headers.map((f) => path.dirname(f.abs))])].flatMap((dir) => ['-I', dir]);
-    const units = database ? readCompileCommands(root, database, { files: found, remap })
+    const units = database ? completeCompileUnits(
+      readCompileCommands(root, database, { files: found, remap, includeTemplates: true }), found, includeArgs)
       : found.filter((f) => !f.isHeader).map((f) => ({ rel: f.rel, file: f.abs, cwd: workRoot, args: includeArgs }));
     const selected = new Set(units.map((unit) => unit.rel));
     if (!units.length) throw new Error('Clang AST 未找到当前工程的编译单元');
     const parsed = [];
+    if (!execClang) dependenciesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-deps-'));
+    const dependencyFile = dependenciesDir && path.join(dependenciesDir, 'headers.d');
     let failedFiles = warnings.length;
     for (const unit of units) {
-      const args = ['-fsyntax-only', '-Xclang', '-ast-dump=json', ...unit.args, '--', unit.file];
+      const dependencyArgs = dependencyFile ? ['-MD', '-MF', dependencyFile, '-MT', 'callgraph'] : [];
+      const args = ['-fsyntax-only', '-Xclang', '-ast-dump=json', ...unit.args, ...dependencyArgs, '--', unit.file];
       try {
         if (sourceFiles && relativeFile(workRoot, unit.cwd) !== null) fs.mkdirSync(unit.cwd, { recursive: true });
+        if (dependencyFile) fs.rmSync(dependencyFile, { force: true });
         const result = execClang ? await execClang(unit.file, args, { cwd: unit.cwd })
           : await execute(bin, args, { cwd: unit.cwd, maxBuffer: 128 * 1024 * 1024, timeout: 120000, windowsHide: true });
         const output = result?.stdout ?? result;
         const ast = Buffer.isBuffer(output) || typeof output === 'string' ? JSON.parse(output.toString()) : output;
         const parsedUnit = readTranslationUnit(ast, workRoot, unit, names);
+        if (dependencyFile) for (const dep of readDependencies(dependencyFile, unit.cwd)) {
+          const rel = relativeFile(workRoot, dep);
+          if (rel === null || !names.has(fileKey(rel))) parsedUnit.loc.externalFiles.add(dep);
+        }
         parsed.push(parsedUnit);
         for (const { target } of parsedUnit.loc.includes.values()) selected.add(target);
       } catch (error) {
@@ -208,8 +292,9 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     }
     if (!parsed.length) throw new Error(warnings.map((w) => `${w.file}：${w.error}`).join('；'));
     const files = found.filter((f) => f.isHeader || selected.has(f.rel)).map(({ abs, ...f }) => f);
-    return { ...assemble(root, files, parsed, warnings, failedFiles), elapsedMs: Date.now() - started };
+    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))), elapsedMs: Date.now() - started };
   } finally {
+    if (dependenciesDir) fs.rmSync(dependenciesDir, { recursive: true, force: true });
     if (workRoot !== root) fs.rmSync(workRoot, { recursive: true, force: true });
   }
 }

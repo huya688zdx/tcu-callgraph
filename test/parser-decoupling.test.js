@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fork } from 'node:child_process';
+import { execFileSync, fork } from 'node:child_process';
+import http from 'node:http';
 import { once } from 'node:events';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildIndex, loadModel, scanSources } from '../src/core/index.js';
 import { buildDataflowIndex } from '../src/core/dataflow.js';
 import { compareProjects } from '../src/core/compare.js';
+import { compareGitProject } from '../src/core/git-compare.js';
 import { cacheKey, openStore } from '../src/core/store.js';
 import { clangParser, detectClang, readCompileCommands } from '../src/core/parsers/clang-parser.js';
 import { diffParserModels, emptyDataflow, normalizeGraphIR, validateGraphIR } from '../src/core/parsers/ir.js';
@@ -168,12 +170,16 @@ test('编译数据库：两种参数格式、相对工作目录、过滤域外�
     '-U', 'IGNORED', '-include', path.join(dir, 'types.h'), '-std=c11']);
   assert.deepEqual(units[1].args, ['-I', path.join(dir, 'inc dir'), '-D', 'MSG=with spaces', '-std=c99']);
   const compiled = [];
-  const result = await loadModel(dir, { parserId: 'clang-ast', parserOptions: { execClang: (file) => {
+  const result = await loadModel(dir, { parserId: 'clang-ast', parserOptions: { execClang: (file, args, { cwd }) => {
     compiled.push(path.basename(file));
+    if (path.basename(file) === 'variant.c') {
+      assert.ok(args.includes('-DSELECTED=2') || args.includes('SELECTED=2'));
+      assert.equal(cwd, path.dirname(file));
+    }
     return path.basename(file) === 'fixture.c' ? fs.readFileSync(astFile) : { kind: 'TranslationUnitDecl' };
   } } });
-  assert.deepEqual(compiled, ['fixture.c', 'another.c']);
-  assert.ok(!result.files.some((f) => f.rel === 'variant.c'));
+  assert.deepEqual(compiled, ['fixture.c', 'another.c', 'variant.c']);
+  assert.ok(result.files.some((f) => f.rel === 'variant.c'));
   const status = { bin: 'test', version: 'test' };
   const oldKey = cacheKey(seen, '', clangParser.cacheKey(dir, {}, status));
   fs.appendFileSync(buildDb, ' ');
@@ -219,6 +225,56 @@ test('工程比较直接复用 Clang 图，编译前后两个独立源码映射'
   assert.equal(result.model._index.byId.get(fn('Read')).change, 'modified');
 });
 
+test('双目录与 Git 比较分析编译数据库未登记的新 C 文件，失败时拒绝发布', async t => {
+  const { dir } = project(t);
+  const before = temporary(t), after = temporary(t);
+  const added = 'void NewEntry(void) {}';
+  fs.writeFileSync(path.join(after, 'added.c'), added);
+  const parserOpts = { parserId: 'clang-ast', parserOptions: { execClang: (file, args, { cwd }) => {
+    if (path.basename(file) === 'fixture.c') return fs.readFileSync(astFile);
+    assert.ok(args.includes('SELECTED=2'));
+    assert.equal(cwd, path.dirname(file));
+    return { kind: 'TranslationUnitDecl', inner: [{
+      kind: 'FunctionDecl', id: 'new', name: 'NewEntry', loc: { line: 1, offset: 5, tokLen: 8 },
+      range: { begin: { offset: 0, line: 1, tokLen: 4 }, end: { offset: added.length - 1, line: 1, tokLen: 1 } },
+      inner: [{ kind: 'CompoundStmt' }],
+    }] };
+  } } };
+  const twoDirs = await compareProjects(dir, before, after, parserOpts);
+  assert.equal(twoDirs.model._index.byId.get('added.c::NewEntry').change, 'added');
+  await assert.rejects(compareProjects(dir, before, after, { ...parserOpts, parserOptions: { execClang: file => {
+    if (path.basename(file) === 'fixture.c') return fs.readFileSync(astFile);
+    throw new Error('缺少编译选项');
+  } } }), /added\.c.*缺少编译选项/);
+
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' });
+  git('init');
+  git('add', 'fixture.c', 'types.h');
+  git('-c', 'user.name=Callgraph Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'baseline');
+  fs.writeFileSync(path.join(dir, 'added.c'), added);
+  const compared = await compareGitProject(dir, { baseRef: 'HEAD', targetRef: 'WORKTREE' }, parserOpts);
+  assert.ok(compared.git.importFacts.directIds.includes('added.c::NewEntry'));
+});
+
+async function startSlowWrite(baseUrl, body) {
+  const request = http.request(baseUrl + '/api/overlay', { method: 'POST', signal: AbortSignal.timeout(10000),
+    headers: { Expect: '100-continue', 'Content-Type': 'application/json' } });
+  const response = once(request, 'response').then(async ([res]) => {
+    res.resume();
+    await once(res, 'end');
+    return res.statusCode;
+  });
+  response.catch(() => {});
+  const continued = once(request, 'continue');
+  request.flushHeaders();
+  await continued;
+  request.write(body.slice(0, 10));
+  return async () => {
+    request.end(body.slice(10));
+    return response;
+  };
+}
+
 async function startServer(dir, db, env = {}) {
   const child = fork(fileURLToPath(new URL('../src/server.js', import.meta.url)), [dir, '0'], {
     env: { ...process.env, CALLGRAPH_DB: db, ...env }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
@@ -254,6 +310,11 @@ test('解析器 API：切换、重启和配置缓存隔离，变量查询不覆�
   const { dir, database } = project(t);
   const preload = path.join(dir, 'mock-clang.mjs');
   const log = path.join(dir, 'clang.log');
+  const headers = temporary(t);
+  const external = path.join(headers, 'external.h');
+  const macroHeader = path.join(headers, 'macro only.h');
+  fs.writeFileSync(macroHeader, '#define RATE 10');
+  fs.writeFileSync(external, 'extern int outside;');
   const db = path.join(dir, 'test.db');
   // 保留服务、worker 和编译器适配器的真实调用入口，仅替换测试二进制的版本/编译输出。
   fs.writeFileSync(preload, `
@@ -270,7 +331,13 @@ function wrapped(...args) { return original(...args); }
 wrapped[promisify.custom] = async (file, args, options) => {
   if (file !== bin) return promisify(original)(file, args, options);
   fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
-  return { stdout: fs.readFileSync(${JSON.stringify(astFile)}, 'utf8') };
+  const ast = JSON.parse(fs.readFileSync(${JSON.stringify(astFile)}, 'utf8'));
+  ast.inner.push({ kind: 'VarDecl', id: 'outside', name: 'outside',
+    loc: { file: ${JSON.stringify(external)}, line: 1, includedFrom: { file: args.at(-1) } } });
+  const dependency = args[args.indexOf('-MF') + 1];
+  const escapedPath = ${JSON.stringify(macroHeader.replaceAll('\\', '/').replaceAll(' ', '\\ '))};
+  fs.writeFileSync(dependency, 'callgraph: ' + escapedPath + '\\n');
+  return { stdout: JSON.stringify(ast) };
 };
 cp.execFile = wrapped;
 syncBuiltinESMExports();
@@ -290,8 +357,11 @@ syncBuiltinESMExports();
     const reader = stream.body.getReader();
     const decoder = new TextDecoder();
     assert.match(decoder.decode((await reader.read()).value), /^retry:/);
+    const oldWrite = await startSlowWrite(srv.baseUrl,
+      JSON.stringify({ nodeId: fn('Enter_A'), data: { note: '旧解析器写入' } }));
     const selected = await srv.post('/api/parsers', { parserId: 'clang-ast', compileCommandsPath: database });
     assert.equal(selected.status, 200, JSON.stringify(selected.body));
+    assert.equal(await oldWrite(), 409);
     assert.match(decoder.decode((await reader.read()).value), /"op":"project.switch"/);
     await reader.cancel();
     assert.equal(selected.body.active, 'clang-ast');
@@ -299,6 +369,17 @@ syncBuiltinESMExports();
     assert.equal(compiled().length, 1);
     const projectInfo = (await srv.request('/api/project')).body;
     assert.equal(projectInfo.parser.id, 'clang-ast');
+    const query = encodeURIComponent(fn('Read'));
+    const view = (await srv.request('/api/view?root=' + query + '&up=0&down=0')).body;
+    const detail = (await srv.request('/api/node?id=' + query)).body;
+    assert.ok(view.nodes.some(n => n.id === fn('Read')));
+    assert.equal(detail.node.id, fn('Read'));
+    for (const node of [...view.nodes, detail.node]) {
+      for (const key of ['sourceText', 'bodyTokens', 'semanticFingerprint']) assert.ok(!Object.hasOwn(node, key));
+    }
+    const response = await fetch(srv.baseUrl + '/api/export/html?root=' + query);
+    assert.equal(response.status, 200);
+    assert.doesNotMatch(await response.text(), /sourceText|semanticFingerprint|bodyTokens|return g_state\.count/);
     const previous = (await srv.request('/api/stats?summary=1')).body;
     const variables = (await srv.request('/api/vars')).body.list;
     assert.ok(variables.some((v) => v.id === 'var::g_state'));
@@ -320,6 +401,22 @@ syncBuiltinESMExports();
     assert.equal((await srv.post('/api/parsers', { parserId: 'builtin' })).body.active, 'builtin');
     assert.equal((await srv.post('/api/parsers', { parserId: 'clang-ast' })).body.active, 'clang-ast');
     assert.equal(compiled().length, 2);
+    fs.appendFileSync(external, '\\nextern int second;');
+    assert.equal((await srv.post('/api/parsers', { parserId: 'clang-ast' })).status, 200);
+    assert.equal(compiled().length, 3, '工程外头文件变化必须使缓存失效');
+    const other = project(t);
+    writeJson(other.database, [{ directory: other.dir, file: 'fixture.c',
+      arguments: ['clang', '-DSECOND_PROJECT', '-c', 'fixture.c'] }]);
+    assert.equal((await srv.post('/api/switch', { path: other.dir })).status, 200);
+    assert.ok(compiled().at(-1).includes('SECOND_PROJECT'), '第二个工程使用自己的数据库');
+    assert.equal((await srv.post('/api/switch', { path: dir })).status, 200);
+    assert.equal(compiled().length, 4, '返回原工程仍命中自己的缓存');
+    fs.unlinkSync(macroHeader);
+    assert.equal((await srv.post('/api/parsers', { parserId: 'clang-ast' })).status, 200);
+    assert.equal(compiled().length, 5, '仅定义宏的外部头文件消失也会让缓存失效');
+    fs.writeFileSync(macroHeader, '#define RATE 11');
+    assert.equal((await srv.post('/api/parsers', { parserId: 'clang-ast' })).status, 200);
+    assert.equal(compiled().length, 6);
   } finally {
     await srv.close();
   }
@@ -327,9 +424,33 @@ syncBuiltinESMExports();
   try {
     assert.equal((await restarted.request('/api/parsers')).body.active, 'clang-ast');
     assert.ok((await restarted.request('/api/vars')).body.list.some((v) => v.id === 'var::g_state'));
-    assert.equal(compiled().length, 2);
+    assert.equal(compiled().length, 6);
   } finally {
     await restarted.close();
+  }
+});
+
+test('慢速写请求跨过同工程比较的进入和退出后返回 409', async t => {
+  const dir = temporary(t), before = temporary(t), after = temporary(t);
+  const file = 'main.c', id = 'main.c::run';
+  fs.writeFileSync(path.join(dir, file), 'int run(void) { return 0; }');
+  fs.copyFileSync(path.join(dir, file), path.join(before, file));
+  fs.writeFileSync(path.join(after, file), 'int run(void) { return 1; }');
+  const srv = await startServer(dir, path.join(dir, 'test.db'));
+  try {
+    const originalId = (await srv.request('/api/project')).body.id;
+    const finish = await startSlowWrite(srv.baseUrl, JSON.stringify({ nodeId: id, data: { note: '过期' } }));
+    const prepared = await srv.post('/api/compare', { beforePath: before, afterPath: after });
+    assert.ok(prepared.body.ok, JSON.stringify(prepared.body));
+    const applied = await srv.post('/api/compare/apply', { previewId: prepared.body.preview.id, selectedIds: [id] });
+    assert.ok(applied.body.ok, JSON.stringify(applied.body));
+    assert.ok((await srv.post('/api/compare/exit', {})).body.ok);
+    assert.equal((await srv.request('/api/project')).body.id, originalId);
+    assert.equal(await finish(), 409);
+    const current = (await srv.request('/api/view?root=' + encodeURIComponent(id))).body;
+    assert.equal(current.nodes.find(n => n.id === id).note, undefined);
+  } finally {
+    await srv.close();
   }
 });
 

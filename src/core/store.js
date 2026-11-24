@@ -21,7 +21,11 @@ import { serialize, deserialize } from 'node:v8';
 import { DatabaseSync } from 'node:sqlite';
 import { normalizeExpansions } from './expansion.js';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
+
+export function resolveGroupMode(mode, grouped) {
+  return ['file', 'period', 'flat'].includes(mode) ? mode : grouped === false ? 'flat' : 'file';
+}
 
 /**
  * v2 新增的表：书签。
@@ -38,6 +42,7 @@ CREATE TABLE IF NOT EXISTS bookmark (
   up         INTEGER NOT NULL DEFAULT 1,
   down       INTEGER NOT NULL DEFAULT 1,
   grouped    INTEGER NOT NULL DEFAULT 1,
+  group_mode TEXT,
   vars       TEXT NOT NULL DEFAULT '[]',
   expansions TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
@@ -233,6 +238,7 @@ const toBookmark = (r) => ({
   up: r.up,
   down: r.down,
   group: !!r.grouped,
+  groupMode: resolveGroupMode(r.group_mode, !!r.grouped),
   vars: parse(r.vars, []),
   expansions: parse(r.expansions, []),
   createdAt: r.created_at,
@@ -431,6 +437,9 @@ function migrate(db) {
     if (cur < 4 && !db.prepare('PRAGMA table_info(bookmark)').all().some((c) => c.name === 'expansions')) {
       db.exec("ALTER TABLE bookmark ADD COLUMN expansions TEXT NOT NULL DEFAULT '[]'");
     }
+    if (cur < 5 && !db.prepare('PRAGMA table_info(bookmark)').all().some(c => c.name === 'group_mode')) {
+      db.exec('ALTER TABLE bookmark ADD COLUMN group_mode TEXT');
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec('COMMIT');
   } catch (err) {
@@ -599,11 +608,11 @@ export function openStore({ dbPath, userData } = {}) {
     bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),
     bmByName: db.prepare('SELECT * FROM bookmark WHERE project_id = ? AND name = ?'),
     bmUpsert: db.prepare(
-      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, vars, expansions, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, group_mode, vars, expansions, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(project_id, name) DO UPDATE SET
          roots = excluded.roots, up = excluded.up, down = excluded.down,
-         grouped = excluded.grouped, vars = excluded.vars, expansions = excluded.expansions,
+         grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars, expansions = excluded.expansions,
          updated_at = excluded.updated_at`
     ),
     bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
@@ -861,7 +870,10 @@ export function openStore({ dbPath, userData } = {}) {
     viewAt(projectId, eventId) {
       let view = null;
       for (const row of q.eventViewsUpTo.iterate(projectId, eventId)) view = row.view;
-      return parse(view, null);
+      const snapshot = parse(view, null);
+      if (!snapshot) return null;
+      const groupMode = resolveGroupMode(snapshot.groupMode, snapshot.group);
+      return { ...snapshot, groupMode, group: groupMode !== 'flat' };
     },
 
     /** 整体替换：恢复到此 / 导入时用。写库和事件分开，调用方决定要不要记事件 */
@@ -919,19 +931,21 @@ export function openStore({ dbPath, userData } = {}) {
      * 保存书签。同名视为覆盖（UNIQUE(project_id,name) + upsert），
      * 用户不用先删再存；返回是否覆盖，前端据此提示。
      */
-    saveBookmark(projectId, { name, roots = [], up = 1, down = 1, group = true, vars = [], expansions = [] }) {
+    saveBookmark(projectId, { name, roots = [], up = 1, down = 1, group = true, groupMode, vars = [], expansions = [] }) {
       const clean = String(name || '').trim();
       if (!clean) throw new Error('书签名称不能为空');
       if (!Array.isArray(roots)) throw new Error('roots 必须是数组');
       const existed = !!q.bmByName.get(projectId, clean);
       const ts = nowMs();
+      groupMode = resolveGroupMode(groupMode, group);
       q.bmUpsert.run(
         projectId,
         clean,
         str(roots),
         Number(up) || 0,
         Number(down) || 0,
-        group ? 1 : 0,
+        groupMode === 'flat' ? 0 : 1,
+        groupMode,
         str(Array.isArray(vars) ? vars : []),
         str(normalizeExpansions(expansions)),
         ts,
@@ -966,7 +980,7 @@ export function openStore({ dbPath, userData } = {}) {
      */
     putCachedModel(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
       // _index 里全是对象引用，存下来只会变成两份互不相干的副本
-      const { _index, _dfPending, ...plain } = model;
+      const { _index, _dfPending, scheduleConfig, ...plain } = model;
       let packed;
       try {
         packed = serialize(plain);

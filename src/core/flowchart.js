@@ -41,8 +41,11 @@ function literalTruth(expression) {
   }
   if (start !== end) return undefined;
   const value = tokens[start]?.v;
-  if (/^(?:false|(?:0+|0x0+|0b0+)[ul]*)$/i.test(value)) return false;
-  if (/^1[ul]*$/i.test(value)) return true;
+  if (value === 'false') return false;
+  if (value === 'true') return true;
+  if (/^(?:0[xX][\da-fA-F]+|0[bB][01]+|0[0-7]*|[1-9]\d*)[uUlL]*$/.test(value)) {
+    return /[1-9a-f]/i.test(value.replace(/^0[xb]/i, ''));
+  }
   return undefined;
 }
 
@@ -142,10 +145,25 @@ function mergeMacroScopes(scope, alternatives) {
   }
 }
 
+function expectsStatement(tokens) {
+  const last = tokens.at(-1)?.v;
+  if (last === 'else' || last === 'do') return true;
+  if (last !== ')') return false;
+  let depth = 1;
+  for (let i = tokens.length - 2; i > 0; i--) {
+    if (tokens[i].v === ')') depth++;
+    if (tokens[i].v === '(' && --depth === 0) {
+      return ['if', 'while', 'for', 'switch'].includes(tokens[i - 1].v);
+    }
+  }
+  return false;
+}
+
 function prepareBody(source, tokens, initial, file, expandMacros) {
   const used = new Set();
   const locations = [];
   let input = 'void flowchart(void) ';
+  const wrapped = new Set();
   const emit = (value, first, last = first, macros) => {
     locations.push({ start: input.length, end: input.length + value.length, first, last, macros });
     input += value;
@@ -198,6 +216,7 @@ function prepareBody(source, tokens, initial, file, expandMacros) {
         pending.push(item);
         continue;
       }
+      const needsBody = expectsStatement(pending);
       emitCode(pending, scope);
       pending = [];
       if (item.t) {
@@ -209,6 +228,11 @@ function prepareBody(source, tokens, initial, file, expandMacros) {
       if (branches[0].unconditional) {
         visit(branches[0].items, scope);
         continue;
+      }
+      if (needsBody) {
+        if (!branches.at(-1).unconditional) throw new Error('条件编译跨越运行期语句体，缺少完整的编译分支');
+        wrapped.add(input.length);
+        input += '{\n';
       }
       const alternatives = branches.map((branch, i) => {
         const { token, name, expr, unconditional } = branch;
@@ -233,6 +257,7 @@ function prepareBody(source, tokens, initial, file, expandMacros) {
         return branchScope;
       });
       input += '#endif\n';
+      if (needsBody) input += '}\n';
       if (!branches.at(-1).unconditional) alternatives.push(scope);
       mergeMacroScopes(scope, alternatives);
     }
@@ -260,7 +285,7 @@ function prepareBody(source, tokens, initial, file, expandMacros) {
     return { line: first.line, endLine: last.line + source.slice(last.s, last.e).split('\n').length - 1,
       first, last, code: source.slice(first.s, last.e), defs };
   }
-  return { input, used, originalOf };
+  return { input, used, originalOf, wrapped };
 }
 
 function buildGraph(body, fn, model, signature, originalOf) {
@@ -334,6 +359,7 @@ function buildGraph(body, fn, model, signature, originalOf) {
     return item.id;
   }
 
+  const showGuards = guards => guards.map(({ condition, branch }) => condition + ' ' + branch).join(' && ');
   const exit = (from, branch, label = branch) => ({ from, ...(branch ? { branch, label } : {}) });
   function connect(incoming, to) {
     for (const edge of incoming) edges.push({ ...edge, to });
@@ -352,10 +378,12 @@ function buildGraph(body, fn, model, signature, originalOf) {
     const id = node(preproc ? 'preproc_decision' : 'decision', text, head, preproc ? head : condition ?? head);
     connect(incoming, id);
     const on = [exit(id, 'ON')], off = [exit(id, 'OFF')];
+    const guarded = branch => preproc && context.dispatch ? { ...context,
+      guards: [...context.guards, { condition: text, branch }] } : context;
     const yes = preproc
-      ? sequence(ast.namedChildren.filter(child => child.id !== condition?.id && child.id !== alternative?.id), on, context)
+      ? sequence(ast.namedChildren.filter(child => child.id !== condition?.id && child.id !== alternative?.id), on, guarded('ON'))
       : visit(field(ast, 'consequence'), on, context);
-    return [...yes, ...visit(alternative, off, context)];
+    return [...yes, ...visit(alternative, off, guarded('OFF'))];
   }
 
   function loop(ast, incoming, context) {
@@ -363,7 +391,8 @@ function buildGraph(body, fn, model, signature, originalOf) {
     const condition = field(ast, 'condition'), body = field(ast, 'body');
     const bodyFirst = type === 'do_statement';
     const breaks = [];
-    if (bodyFirst && literalTruth(condition?.text ?? '') === false) {
+    const truth = condition ? literalTruth(condition.text) : true;
+    if (bodyFirst && truth === false) {
       const next = visit(body, incoming, { ...context, breaks, continues: breaks });
       return [...next, ...breaks];
     }
@@ -378,7 +407,8 @@ function buildGraph(body, fn, model, signature, originalOf) {
     const continues = [];
     const firstEdge = edges.length;
     const entryMarker = Symbol();
-    const bodyExits = visit(body, [bodyFirst ? exit(entryMarker) : exit(id, condition ? 'ON' : undefined)],
+    const bodyEntry = bodyFirst ? [exit(entryMarker)] : truth === false ? [] : [exit(id, condition ? 'ON' : undefined)];
+    const bodyExits = visit(body, bodyEntry,
       { ...context, breaks, continues });
     let repeat = [...bodyExits, ...continues];
     if (update) repeat = visit(update, repeat, context);
@@ -389,7 +419,7 @@ function buildGraph(body, fn, model, signature, originalOf) {
       const entry = marker < 0 ? id : edges.splice(marker, 1)[0].to;
       connect([...incoming, exit(id, 'ON')], entry);
     } else connect(incoming, id);
-    return [...(condition ? [exit(id, 'OFF')] : []), ...breaks];
+    return [...(truth !== true ? [exit(id, 'OFF')] : []), ...breaks];
   }
 
   function visit(ast, incoming, context) {
@@ -417,11 +447,15 @@ function buildGraph(body, fn, model, signature, originalOf) {
       case 'switch_statement': {
         const condition = field(ast, 'condition');
         const id = node('switch', 'switch ' + compact(condition?.text ?? '()'), ast, condition ?? ast);
-        const dispatch = { id, hasDefault: false };
+        const dispatch = { id, defaults: [] };
         const breaks = [];
         connect(incoming, id);
-        const next = visit(field(ast, 'body'), [], { ...context, dispatch, breaks });
-        return [...next, ...breaks, ...(dispatch.hasDefault ? [] : [exit(id, 'CASE', 'default')])];
+        const next = visit(field(ast, 'body'), [], { ...context, dispatch, breaks, guards: [] });
+        if (dispatch.defaults.some(guards => !guards.length)) return [...next, ...breaks];
+        const excluded = dispatch.defaults.map(showGuards);
+        const unmatched = exit(id, 'CASE', excluded.length ? 'default（仅当 ' + excluded.join(' 或 ') + ' 均不成立）' : 'default');
+        if (excluded.length) unmatched.unless = dispatch.defaults;
+        return [...next, ...breaks, unmatched];
       }
       case 'case_statement': {
         const value = field(ast, 'value');
@@ -429,8 +463,11 @@ function buildGraph(body, fn, model, signature, originalOf) {
         const id = node('process', caption + ':', ast, ast.children.find(child => child.type === ':') ?? value ?? ast);
         const dispatch = context.dispatch;
         if (dispatch) {
-          if (!value) dispatch.hasDefault = true;
-          connect([exit(dispatch.id, 'CASE', caption)], id);
+          const { guards } = context;
+          if (!value) dispatch.defaults.push(guards);
+          const edge = exit(dispatch.id, 'CASE', guards.length ? caption + '（' + showGuards(guards) + '）' : caption);
+          if (guards.length) edge.guards = guards;
+          connect([edge], id);
         }
         connect(incoming, id);
         return sequence(ast.namedChildren.filter(child => child.id !== value?.id), [exit(id)], context);
@@ -585,12 +622,30 @@ export async function buildFlowchart(model, fn, { expandMacros = false, version 
   if (!bounds) throw new Error(`无法定位函数定义：${fn.name}`);
   const bodyTokens = tokens.filter(token => token.s >= bounds.open && token.s <= bounds.close);
   const scope = new Map([...headers, ...local.changes]);
-  const { input, used, originalOf } = prepareBody(source, bodyTokens, scope, fn.file, expandMacros);
+  const { input, used, originalOf, wrapped } = prepareBody(source, bodyTokens, scope, fn.file, expandMacros);
   const tree = parser.parse(input);
   let graph;
   try {
     const body = field(tree.rootNode.namedChildren.find(node => node.type === 'function_definition'), 'body');
     if (!body || body.lastChild?.isMissing) throw new Error(`无法解析函数体：${fn.name}`);
+    const hasConditional = bodyTokens.some(t => t.t === 'preproc' && /^#\s*if/.test(t.v));
+    if (hasConditional && body.hasError) throw new Error('条件编译分支跨越了不完整的 C 语句，无法生成流程图');
+    const pending = [body];
+    while (wrapped.size && pending.length) {
+      const ast = pending.pop();
+      if (ast.type === 'compound_statement' && wrapped.delete(ast.startIndex)) {
+        let branch = ast.namedChildren[0];
+        while (branch) {
+          const condition = field(branch, 'condition') ?? field(branch, 'name');
+          const alternative = field(branch, 'alternative');
+          const statements = branch.namedChildren.filter(n => n.id !== condition?.id && n.id !== alternative?.id &&
+            !['comment', 'preproc_def', 'preproc_function_def'].includes(n.type));
+          if (statements.length !== 1) throw new Error('条件编译的每个分支必须提供一条完整的运行期语句');
+          branch = alternative;
+        }
+      }
+      pending.push(...ast.namedChildren);
+    }
     graph = buildGraph(body, fn, model, bounds.signature, originalOf);
   } finally {
     tree.delete();

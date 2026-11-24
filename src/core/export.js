@@ -93,6 +93,10 @@ function inlineJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
+export function publicNode({ sourceText, semanticFingerprint, bodyTokens, ...node }) {
+  return node;
+}
+
 async function layoutForExport(model, { root, ...opts }) {
   const functions = model.functions.some(n => n.kind !== 'var' && !n.headerSymbol && !n.taskPeriods)
     ? withTaskPeriods(model.functions, model).map((n, i) => model.functions[i].taskPeriods ? model.functions[i] : n)
@@ -104,7 +108,7 @@ async function layoutForExport(model, { root, ...opts }) {
     if (!orders.has(e.from)) orders.set(e.from, callNumbers(callSequence(model, e.from), visibleNodes));
     return { ...e, callNumbers: orders.get(e.from).get(e.to) };
   });
-  return { ...await layoutElk(functions, edges, { group: false, ...opts }), root };
+  return { ...await layoutElk(functions.map(publicNode), edges, { group: false, ...opts }), root };
 }
 
 export async function exportSvg(model, outPath, opts = {}) {

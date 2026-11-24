@@ -1,16 +1,21 @@
 import { children, initializer, typeOf, unwrap, walk } from './clang-ast.js';
 import { emptyDataflow } from './ir.js';
 
-export function collectDataflow(records, defs, resolveVariable, callTargets) {
+export function collectDataflow(units, records, defs, resolveVariable, callTargets) {
   const df = emptyDataflow();
   df.defs = [...defs.values()];
   df.byId = defs;
   const bindings = new Map();
-  const getBindings = (context, id) => bindings.get(context)?.get(id) || new Map();
-  function bind(context, id, targets) {
-    if (!id || !targets.length) return false;
+  const globalBindings = new Map();
+  function bindingScope(context, decl) {
+    const id = resolveVariable(decl, context);
+    if (id) return [globalBindings, id];
     if (!bindings.has(context)) bindings.set(context, new Map());
-    const byDecl = bindings.get(context);
+    return [bindings.get(context), decl?.id];
+  }
+  function bind(context, decl, targets) {
+    if (!decl?.id || !targets.length) return false;
+    const [byDecl, id] = bindingScope(context, decl);
     if (!byDecl.has(id)) byDecl.set(id, new Map());
     const values = byDecl.get(id), before = values.size;
     for (const target of targets) {
@@ -50,8 +55,9 @@ export function collectDataflow(records, defs, resolveVariable, callTargets) {
     const [base, left, right] = children(node);
     if (node.kind === 'UnaryOperator' && node.opcode === '&') return refer(base, context);
     if (node.kind === 'DeclRefExpr') {
-      const local = [...getBindings(context, node.referencedDecl?.id).values()];
-      return isArray(node) ? [...local, ...refer(node, context)] : local;
+      const [scope, id] = bindingScope(context, node.referencedDecl);
+      const targets = [...(scope.get(id)?.values() || [])];
+      return isArray(node) ? [...targets, ...refer(node, context)] : targets;
     }
     if (node.kind === 'ConditionalOperator') return [...pointers(left, context), ...pointers(right, context)];
     return isArray(node) ? refer(node, context) : [];
@@ -62,24 +68,24 @@ export function collectDataflow(records, defs, resolveVariable, callTargets) {
       n.kind === 'VarDecl' || n.kind === 'CallExpr' || (n.kind === 'BinaryOperator' && n.opcode === '=')),
   }));
   const params = new Map(records.map((r) => [r, children(r.node).filter((n) => n.kind === 'ParmVarDecl')]));
-  const globalAliases = new Map(records.map(({ context }) => [context, context.globals.filter((n) => typeOf(n).includes('*'))]));
+  const globalAliases = new Map(units.map(context => [context, context.globals.filter(n => n.init && typeOf(n).includes('*'))]));
   let changed;
   do {
     changed = false;
     for (const [context, variables] of globalAliases) for (const variable of variables) {
-      if (bind(context, variable.id, pointers(initializer(variable), context))) changed = true;
+      if (bind(context, variable, pointers(initializer(variable), context))) changed = true;
     }
     for (const { nodes, context } of accesses) for (const n of nodes) {
       const [lhs, rhs] = children(n).map(unwrap);
       if (n.kind === 'VarDecl' && typeOf(n).includes('*')) {
-        if (bind(context, n.id, pointers(initializer(n), context))) changed = true;
+        if (bind(context, n, pointers(initializer(n), context))) changed = true;
       }
       if (n.kind === 'BinaryOperator' && lhs?.kind === 'DeclRefExpr' && typeOf(lhs).includes('*')) {
-        if (bind(context, lhs.referencedDecl?.id, pointers(rhs, context))) changed = true;
+        if (bind(context, lhs.referencedDecl, pointers(rhs, context))) changed = true;
       }
       if (n.kind === 'CallExpr') for (const target of callTargets.get(n) || []) {
         for (const [i, param] of params.get(target).entries()) {
-          if (typeOf(param).includes('*') && bind(target.context, param.id, pointers(n.inner[i + 1], context))) changed = true;
+          if (typeOf(param).includes('*') && bind(target.context, param, pointers(n.inner[i + 1], context))) changed = true;
         }
       }
     }

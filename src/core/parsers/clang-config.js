@@ -24,13 +24,13 @@ export function relativeFile(root, file) {
 export function findCompileCommands(root, explicit) {
   if (explicit) return path.resolve(root, explicit);
   return [path.join(root, 'compile_commands.json'), path.join(root, 'build', 'compile_commands.json')]
-    .find((file) => fs.statSync(file, { throwIfNoEntry: false })?.isFile()) || null;
+    .find((file) => fs.statSync(file, { throwIfNoEntry: false })) || null;
 }
 
 export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
-  return JSON.stringify(['clang-ast', 'v1', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
+  return JSON.stringify(['clang-ast', 'v2', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
 }
 
 /** 只拆分参数，不展开变量、重定向或执行编译数据库里的命令。 */
@@ -98,7 +98,11 @@ function clangArguments(args, directory, remap) {
   return result;
 }
 
-export function readCompileCommands(root, file, { files, remap = (p) => p } = {}) {
+export function readCompileCommands(root, file, { files, remap = (p) => p, includeTemplates = false } = {}) {
+  const stat = fs.statSync(file);
+  if (!stat.isFile() || stat.size > 64 * 1024 * 1024) {
+    throw new Error(`compile_commands.json 必须是 64 MiB 以内的普通文件：${file}`);
+  }
   const database = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
   if (!Array.isArray(database)) throw new Error('compile_commands.json 必须是数组');
   const allowed = files && new Map(files.map((f) => [fileKey(f.rel), f.rel]));
@@ -112,13 +116,53 @@ export function readCompileCommands(root, file, { files, remap = (p) => p } = {}
     const rel = relativeFile(root, abs);
     if (!rel || !SRC_EXT.test(abs)) continue;
     const id = fileKey(rel);
-    if ((allowed && !allowed.has(id)) || units.has(id)) continue;
+    if ((allowed && !allowed.has(id) && !includeTemplates) || units.has(id)) continue;
     const args = Array.isArray(entry.arguments) ? entry.arguments
       : typeof entry.command === 'string' ? splitCommand(entry.command) : [];
     if (!args.length || args.some((arg) => typeof arg !== 'string')) {
       throw new Error(`compile_commands.json 条目缺少有效编译参数：${rel}`);
     }
-    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap) });
+    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap), ...(includeTemplates && { templateOnly: !allowed?.has(id) }) });
   }
   return [...units.values()];
+}
+
+export function completeCompileUnits(entries, files, fallbackArgs) {
+  const units = entries.filter(entry => !entry.templateOnly);
+  const covered = new Set(units.map(entry => fileKey(entry.rel)));
+  const templates = entries.filter(entry => /\.c$/i.test(entry.rel));
+  const depth = (a, b) => {
+    const left = fileKey(a).split('/').slice(0, -1);
+    const right = fileKey(b).split('/').slice(0, -1);
+    let i = 0;
+    while (i < left.length && left[i] === right[i]) i++;
+    return i;
+  };
+  for (const file of files) {
+    if (!/\.c$/i.test(file.rel) || covered.has(fileKey(file.rel))) continue;
+    let best, score = -1;
+    for (const template of templates) {
+      const common = path.posix.dirname(fileKey(file.rel)) === path.posix.dirname(fileKey(template.rel))
+        ? Infinity : depth(file.rel, template.rel);
+      if (common > score) { best = template; score = common; }
+    }
+    units.push({ rel: file.rel, file: file.abs, cwd: path.dirname(file.abs), args: best?.args ?? fallbackArgs });
+  }
+  return units;
+}
+
+export function dependencyStamp(file) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() ? { file, size: stat.size, mtimeMs: stat.mtimeMs } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function externalDependenciesCurrent(model) {
+  return (model.externalDeps || []).every(dep => {
+    const current = dependencyStamp(dep.file);
+    return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs;
+  });
 }

@@ -56,7 +56,7 @@ export const api = {
       ...(empty ? { empty: true } : {}), ...(useSnapshot ? { useSnapshot: true } : {}),
       roots: list, vars: vars || [], hiddenVars: hiddenVars || [], expansions, previous: previous ? {
       projectId: previous.projectId, comparisonId: previous.comparison?.id, width: previous.width, height: previous.height, layoutDirection: previous.layoutDirection, groupMode: previous.groupMode,
-      nodes: previous.nodes.map(({ id, file, x, y, w, h }) => ({ id, file, x, y, w, h })),
+      nodes: previous.nodes.map(({ id, file, group, x, y, w, h }) => ({ id, file, group, x, y, w, h })),
       edges: previous.edges.map(({ from, to, kind, line, change, points, custom, fromSide, toSide }) =>
         ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],

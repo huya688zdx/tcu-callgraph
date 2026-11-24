@@ -131,6 +131,7 @@ function save(name, button) {
       up: state.up,
       down: state.down,
       group: state.group,
+      groupMode: state.groupMode,
       vars: [...state.vars],
     });
     if (!result?.ok) throw new Error(result?.error);

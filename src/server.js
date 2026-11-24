@@ -14,17 +14,18 @@ import { compareGitProject, inspectGitRepo, watchGitProject } from './core/git-c
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
 import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from './core/comparison-status.js';
 import { exportXlsx } from './core/export-xlsx.js';
-import { exportHtml } from './core/export.js';
+import { exportHtml, publicNode } from './core/export.js';
 import { exportSvg } from './core/export-svg.js';
 import { callSequence, callNumbers } from './core/call-sequence.js';
 import { projectTasks, taskPeriods, withTaskPeriods } from './core/task-periods.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import { normalizeExpansions } from './core/expansion.js';
-import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
+import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
-import { findCompileCommands } from './core/parsers/clang-parser.js';
+import { externalDependenciesCurrent, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
+import { scheduleConfig } from './core/tcu-schedule.js';
 import { diffParserModels } from './core/parsers/ir.js';
 import {
   normalizeLabel,
@@ -62,6 +63,7 @@ let PROJECT = null;
 let overlay = { nodes: {}, edges: {}, notes: [], deleted: { nodes: {}, edges: {} }, layout: {} };
 // 工程切换互斥：openTarget 里有 await，不挡的话两个切换请求会交错改写上面这批变量
 let switching = false;
+let sessionRevision = 0;
 let COMPARISON = null;
 let comparisonPreview = null;
 let comparisonBase = null;
@@ -90,8 +92,10 @@ const store = openStore();
 const modelCacheKeys = new WeakMap();
 const analysisPending = new WeakMap();
 const configuredParser = () => store.getSetting('parser.active', 'builtin');
-const parserOptionsFor = (id) => id === 'clang-ast'
-  ? { compileCommandsPath: store.getSetting('parser.compileCommandsPath') } : {};
+const scanRootFor = target => fs.statSync(target, { throwIfNoEntry: false })?.isFile() ? path.dirname(target) : target;
+const compileCommandsKey = scanRoot => 'parser.compileCommandsPath.' + fileKey(path.resolve(scanRoot));
+const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => id === 'clang-ast'
+  ? { compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)) } : {};
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
 
@@ -239,12 +243,13 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
   const warnings = [];
   const scan = isDot ? null : { files: scanSources(scanRoot, warnings), warnings };
-  const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id;
+  const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id + ':2';
   const key = scan && !warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
   const scanMs = performance.now() - t0;
 
   const readAt = performance.now();
   let model = key ? store.getCachedModel(key) : null;
+  if (model && !externalDependenciesCurrent(model)) model = null;
   const fromCache = !!model;
   const cacheReadMs = performance.now() - readAt;
   const parseAt = performance.now();
@@ -286,7 +291,7 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   console.log(`[加载] ${abs}`);
   let loaded, fallback = null;
   try {
-    loaded = await loadTargetModel(abs, isFile, parserId, selection?.parserOptions ?? parserOptionsFor(parserId));
+    loaded = await loadTargetModel(abs, isFile, parserId, selection?.parserOptions ?? parserOptionsFor(parserId, isFile ? path.dirname(abs) : abs));
   } catch (error) {
     if (selection || parserId === 'builtin' || (isFile && /\.(dot|gv)$/i.test(abs))) throw error;
     fallback = `${parserId} 加载失败，已回退到内置快速解析：${error.message}`;
@@ -310,8 +315,9 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
 
   if (selection) store.transaction(() => {
     store.setSetting('parser.active', selection.parserId);
-    if (selection.parserId === 'clang-ast') store.setSetting('parser.compileCommandsPath', selection.parserOptions.compileCommandsPath);
+    if (selection.parserId === 'clang-ast') store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
   });
+  sessionRevision++;
   root = abs;
   ROOT_LABEL = project.name;
   MODEL = model;
@@ -390,12 +396,13 @@ const hasAnnotationValue = (value) => Array.isArray(value) ? value.length > 0 :
 const stringArray = (value) => Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [];
 
 function viewSnapshot(view) {
+  const groupMode = resolveGroupMode(view.groupMode, view.group);
   return {
     roots: stringArray(view.roots),
     expansions: normalizeExpansions(view.expansions),
     up: Math.max(0, Number(view.up) || 0),
     down: Math.max(0, Number(view.down) || 0),
-    group: !!view.group,
+    group: groupMode !== 'flat', groupMode,
     vars: stringArray(view.vars),
     hiddenVars: stringArray(view.hiddenVars),
     empty: !!view.empty,
@@ -406,9 +413,9 @@ function currentViewSnapshot() {
   return pageState && !pageState.reviewing && !COMPARISON ? viewSnapshot(pageState) : undefined;
 }
 
-function emptyCanvasView() {
+function emptyCanvasView(groupMode = 'file') {
   return { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260,
-    root: null, roots: [], expansions: [], empty: true, projectId: PROJECT.id };
+    root: null, roots: [], expansions: [], empty: true, groupMode, projectId: PROJECT.id };
 }
 
 /** 从持久化状态比较，避免仅因 updatedAt 改变产生事件。调用方负责事务和广播。 */
@@ -641,6 +648,7 @@ function composeMcpView(p) {
     up: keepRoots ? prior.up : roots.length ? up : 0,
     down: keepRoots ? prior.down : roots.length ? down : 0,
     group: before?.group ?? true,
+    groupMode: resolveGroupMode(before?.groupMode, before?.group),
     vars: [...new Set([...(prior?.vars || []), ...vars])],
     hiddenVars: (prior?.hiddenVars || []).filter((id) => !vars.includes(id)),
     selected: selected ?? prior?.selected ?? null,
@@ -815,12 +823,22 @@ function guardWrite(req, res) {
     json(res, { ok: false, error: 'unsupported media type' }, 415);
     return false;
   }
-  if (switching || (req.headers['x-callgraph-project'] !== undefined &&
+  if (!currentSession(req) || (req.headers['x-callgraph-project'] !== undefined &&
       Number(req.headers['x-callgraph-project']) !== PROJECT.id)) {
     json(res, { ok: false, error: '工程正在切换或请求所属工程已改变，请刷新后重试' }, 409);
     return false;
   }
   return true;
+}
+
+function currentSession(req, allowSwitch = false) {
+  const expected = req.headers['x-callgraph-session'];
+  return req.sessionRevision === sessionRevision &&
+    (expected === undefined || Number(expected) === sessionRevision) && (!switching || allowSwitch);
+}
+
+function sessionConflict(res) {
+  return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
 }
 
 /**
@@ -865,7 +883,7 @@ function readJson(req, res, limit = 4 * 1024 * 1024) {
         return fail(400, 'body 不是合法 JSON');
       }
       if (!isPlainObject(parsed)) return fail(400, 'body 必须是 JSON 对象');
-      if (req.projectId !== PROJECT.id || req.comparisonId !== COMPARISON?.id || (switching && !req.switchRequest)) {
+      if (!currentSession(req, req.switchRequest)) {
         return fail(409, '工程已切换，请刷新后重试');
       }
       done = true;
@@ -1129,7 +1147,7 @@ async function buildView(
       ...(COMPARISON ? { comparison: comparisonInfo() } : {}) };
     const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
     const emptyLayout = previous ? await layoutElk([], [], { group, groupMode, rootLabel: ROOT_LABEL, previous })
-      : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
+      : emptyCanvasView(groupMode);
     return { ...emptyLayout, root: g.root, roots, groupMode,
       empty: true, projectId, expansions: cleanExpansions, comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
@@ -1201,7 +1219,7 @@ async function buildView(
     ...(COMPARISON ? { comparison: comparisonInfo() } : {}),
     ...recommendations(clean, viewEdges),
   };
-  clean = withTaskPeriods(clean, model, COMPARISON);
+  clean = withTaskPeriods(clean, model, COMPARISON).map(publicNode);
   const visibleNodes = new Set(clean.map((n) => n.id));
   const getCallOrder = callOrderForEdges(model, COMPARISON, visibleNodes);
   for (const e of viewEdges) {
@@ -1243,7 +1261,8 @@ const mcp = createMcpServer({
   // 端口传 0 时由系统分配，listen 之后才知道真实端口，这里必须惰性取
   baseUrl: () => `http://127.0.0.1:${server.address().port}`,
   getAccess: mcpAccess,
-  writeOut: async (name, buf) => {
+  writeOut: async (name, buf, expected) => {
+    if (expected !== sessionRevision || switching) throw new Error('工程已切换，请重新调用');
     fs.mkdirSync(OUT, { recursive: true });
     const file = path.join(OUT, name);
     fs.writeFileSync(file, buf);
@@ -1276,7 +1295,7 @@ export const server = http.createServer(async (req, res) => {
   }
   // 请求体可能稍后才读完，工程身份必须在进入请求时固定。
   req.projectId = PROJECT.id;
-  req.comparisonId = COMPARISON?.id;
+  req.sessionRevision = sessionRevision;
   // 畸形请求目标（如 "//["）会让 new URL 抛异常，必须挡在 try 内，
   // 否则异常冒泡成未捕获异常，整个进程退出
   let u;
@@ -1315,10 +1334,8 @@ export const server = http.createServer(async (req, res) => {
       } catch (err) {
         return json(res, { jsonrpc: '2.0', id: null, error: { code: -32700, message: String(err.message || err) } }, 400);
       }
-      if (req.projectId !== PROJECT.id || switching) {
-        return json(res, { ok: false, error: '工程已切换，请重新调用' }, 409);
-      }
-      const r = await mcp.handlePost(raw, req.projectId);
+      if (!currentSession(req)) return sessionConflict(res);
+      const r = await mcp.handlePost(raw, req.projectId, req.sessionRevision);
       if (r.body === null) {
         res.writeHead(202);
         return res.end();
@@ -1417,9 +1434,7 @@ export const server = http.createServer(async (req, res) => {
         if (u.pathname === '/api/mcp-compose' && ((Array.isArray(payload.vars) && payload.vars.length) ||
             (typeof payload.selected === 'string' && payload.selected.startsWith('var::'))) && MODEL.source !== 'dot') {
           await ensureAnalysis(MODEL);
-          if (req.projectId !== PROJECT.id || switching || COMPARISON) {
-            return json(res, { ok: false, error: '工程已切换，请重新调用' }, 409);
-          }
+          if (!currentSession(req)) return sessionConflict(res);
         }
         if (mcpAccess() !== 'readwrite') return json(res, { ok: false, error: '需要 MCP 读写权限' }, 403);
         return json(res, u.pathname === '/api/mcp-compose' ? composeMcpView(payload) : applyMcpTaskLabels(payload));
@@ -1544,9 +1559,10 @@ export const server = http.createServer(async (req, res) => {
           if (!rootId) return bad(res, '工程里没有函数，无从导出');
           const up = Math.max(0, Number(p.up ?? 0) || 0);
           const down = Math.max(0, Number(p.down ?? 3) || 3);
-          const group = p.group !== false;
+          const groupMode = resolveGroupMode(p.groupMode, p.group);
           // 导出与屏幕统一使用 ELK 排版。
-          const view = await buildView([rootId], up, down, group, null, {}, overlay);
+          const view = await buildView([rootId], up, down, groupMode !== 'flat', null, { groupMode }, overlay);
+          if (!currentSession(req)) return sessionConflict(res);
           if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
           const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
           let name = typeof p.out === 'string' ? p.out.trim() : '';
@@ -1590,7 +1606,8 @@ export const server = http.createServer(async (req, res) => {
           return bad(res, 'compileCommandsPath 必须是 Clang 编译数据库的文件路径');
         }
         const parserOptions = parserOptionsFor(parserId);
-        if (compileCommandsPath !== undefined) parserOptions.compileCommandsPath = compileCommandsPath;
+        if (compileCommandsPath !== undefined) parserOptions.compileCommandsPath = compileCommandsPath &&
+          path.resolve(scanRootFor(root), compileCommandsPath);
         const { stats: st } = await openTarget(root, { selection: { parserId, parserOptions } });
         comparisonPreview = null;
         comparisonBase = null;
@@ -1638,6 +1655,8 @@ export const server = http.createServer(async (req, res) => {
         stats: S,
         parser: parserInfo(),
         projectId: PROJECT.id, tasks: tasks(),
+        scheduleWarnings: COMPARISON ? [COMPARISON.beforeModel, COMPARISON.afterModel].flatMap(m => scheduleConfig(m).warnings)
+          : scheduleConfig(MODEL).warnings,
         root,
         macros: MODEL.macros
           .filter((m) => m.raw && m.raw.trim())
@@ -1760,6 +1779,7 @@ export const server = http.createServer(async (req, res) => {
         const p = await readJson(req, res);
         if (u.pathname.endsWith('/exit')) {
           if (COMPARISON && comparisonBase) {
+            sessionRevision++;
             ({ MODEL, S, overlay, pageState } = comparisonBase);
             COMPARISON = null;
             comparisonBase = null;
@@ -1808,6 +1828,7 @@ export const server = http.createServer(async (req, res) => {
           for (const id of selected) delete nextOverlay.deleted.nodes[id];
           for (const edge of comparison.model.edges) if (chosen.has(edge.from) || chosen.has(edge.to)) delete nextOverlay.deleted.edges[edgeKeyOf(edge)];
           if (!comparisonBase) comparisonBase = { MODEL, S, overlay, pageState };
+          sessionRevision++;
           COMPARISON = { ...comparison, roots, statusOverrides: statuses, id: randomUUID(), previousComparisonId: COMPARISON?.id,
             totalNodes: comparison.model._index.byId.size };
           COMPARISON.summary = statusSummary(COMPARISON);
@@ -1893,7 +1914,7 @@ export const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then(async (p) => {
           const o = await collectOrphans();
-          if (!o) return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
+          if (!o || !currentSession(req)) return sessionConflict(res);
           const total = countOrphans(o);
           if (!total) return json(res, { ok: true, removed: 0 });
           // dry=1 只看会删什么，不动库——批量删除前先让用户能预览
@@ -2274,9 +2295,8 @@ export const server = http.createServer(async (req, res) => {
         : []);
       const up = Number(u.searchParams.get('up') ?? 1);
       const down = Number(u.searchParams.get('down') ?? 1);
-      const rawGroupMode = u.searchParams.get('groupMode');
-      const group = rawGroupMode ? rawGroupMode !== 'flat' : u.searchParams.get('group') !== '0';
-      const groupMode = ['file', 'period', 'flat'].includes(rawGroupMode) ? rawGroupMode : (group ? 'file' : 'flat');
+      const groupMode = resolveGroupMode(u.searchParams.get('groupMode'), u.searchParams.get('group') !== '0');
+      const group = groupMode !== 'flat';
       const prevMode = previous && (previous.groupMode || ((previous.groups.length || previous.layoutSlots?.groups?.length) ? 'file' : 'flat'));
       if (previous && prevMode !== groupMode) previous = null;
       const df = u.searchParams.get('df') || null;
@@ -2291,13 +2311,18 @@ export const server = http.createServer(async (req, res) => {
       if (reviewSnapshot) {
         const histRoots = reviewSnapshot.empty ? [] : reviewSnapshot.roots;
         const histVars = { want: reviewSnapshot.vars || [], skip: reviewSnapshot.hiddenVars || [],
-          expansions: reviewSnapshot.empty ? [] : reviewSnapshot.expansions || [] };
+          expansions: reviewSnapshot.empty ? [] : reviewSnapshot.expansions || [], groupMode: reviewSnapshot.groupMode };
         if (!histRoots?.length && !histVars.expansions.length && !histVars.want.length) {
-          return json(res, withReviewSnapshot(emptyCanvasView()));
+          return json(res, withReviewSnapshot(emptyCanvasView(reviewSnapshot.groupMode)));
         }
         const view = await buildView(histRoots, reviewSnapshot.up, reviewSnapshot.down, reviewSnapshot.group,
           null, histVars, viewOverlay);
         return json(res, withReviewSnapshot(view));
+      }
+      if (emptyRequested && !roots.length && !expansions.length && !varSel.want.length) {
+        return json(res, withReviewSnapshot({
+          ...emptyCanvasView(groupMode), ...(COMPARISON ? { comparison: comparisonInfo() } : {}),
+        }));
       }
       if (!roots.length) {
         if (COMPARISON) return json(res, await buildView(COMPARISON.roots, 0, 0, group, null, varSel, viewOverlay, previous));
@@ -2305,8 +2330,7 @@ export const server = http.createServer(async (req, res) => {
           return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
         }
         if (emptyRequested) {
-          return json(res, withReviewSnapshot(varSel.want.length || previous
-            ? await buildView([], up, down, group, df, varSel, viewOverlay, previous) : emptyCanvasView()));
+          return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
         }
         if (!MODEL.functions.length && !MODEL.headerSymbols?.length) {
           if (varSel.want.length) {
@@ -2350,7 +2374,7 @@ export const server = http.createServer(async (req, res) => {
       });
       const chain = new Set(fn.impactChainIds);
       return json(res, {
-        node: { ...(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn), bodyTokens: undefined },
+        node: publicNode(COMPARISON ? comparisonStatus(fn, COMPARISON.statusOverrides.nodes, id) : fn),
         callSequence: callSequence(COMPARISON?.afterModel || MODEL, id),
         ...(COMPARISON ? { previousCallSequence: callSequence(COMPARISON.beforeModel, id),
           changePoints: COMPARISON.changePoints.filter(point => chain.has(point.id)),

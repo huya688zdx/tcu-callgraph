@@ -434,7 +434,37 @@ function periodGroups(nodes, edges) {
 }
 
 /** 自底向上逐层排布文件或逻辑泳道，再对整图布线。 */
-async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false, period = null }) {
+function reusePeriodPositions(box, previousNodes, previousGroups) {
+  const group = previousGroups.get(box.id);
+  if (!group) return;
+  const fixed = [], fresh = [];
+  for (const node of box.leafNodes) {
+    const old = previousNodes.get(node.id);
+    const pos = box.relPos.get(node.id);
+    if (old?.group === box.id && old.w === node.w && old.h === node.h) {
+      pos.x = old.x - group.x;
+      pos.y = old.y - group.y;
+      fixed.push({ ...pos, w: node.w, h: node.h });
+    } else fresh.push({ node, pos });
+  }
+  if (!fixed.length) return;
+  // 变更节点遇到固定节点时，放入泳道内的新行，避免覆盖手动位置。
+  let below = Math.max(box.h, ...fixed.map(p => p.y + p.h)) + NODE_GAP;
+  for (const { node, pos } of fresh) {
+    if (fixed.some(p => pos.x < p.x + p.w + NODE_GAP && pos.x + node.w + NODE_GAP > p.x &&
+        pos.y < p.y + p.h + NODE_GAP && pos.y + node.h + NODE_GAP > p.y)) {
+      pos.y = below;
+      below += node.h + NODE_GAP;
+    }
+  }
+  for (const node of box.leafNodes) {
+    const { x, y } = box.relPos.get(node.id);
+    box.w = Math.max(box.w, x + node.w + 14);
+    box.h = Math.max(box.h, y + node.h + 14);
+  }
+}
+
+async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false, period = null, previous = null }) {
   const order = modelOrder(sized, edges);
   const root = { id: '', label: '', children: new Map(), leafNodes: [] };
   let boxCount = 0;
@@ -613,9 +643,12 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     box.usedDir = usedDir;
   }
 
+  const previousNodes = new Map(previous?.nodes.map(n => [n.id, n]));
+  const previousGroups = new Map(previous?.groups.map(g => [g.id, g]));
   async function pass1(box, depth) {
     await Promise.all([...box.children.values()].map((child) => pass1(child, depth + 1)));
     await layoutBox(box, depth);
+    if (period && box.fileGroup) reusePeriodPositions(box, previousNodes, previousGroups);
   }
   await pass1(root, 0);
 
@@ -756,7 +789,7 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
   }));
   if (group && groupMode === 'period') {
     const view = await bottomUpCandidate(sized, edges, { rootDir: 'RIGHT', fileDir: 'RIGHT', dirDir: 'DOWN',
-      period: periodGroups(sized, edges) });
+      period: periodGroups(sized, edges), previous: previous?.groupMode === 'period' ? previous : null });
     view.groupMode = 'period';
     return withRoot(view, rootLabel);
   }

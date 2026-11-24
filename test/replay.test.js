@@ -48,9 +48,9 @@ test('时间轴回看并恢复历史画布，同时保留该时刻的标注', as
   const main = 'main.c::main';
   const gear = 'gear.c::Gear_Apply';
   const tick = 'main.c::SysTick_Handler';
-  const cleared = { roots: [], expansions: [], up: 0, down: 0, group: false, vars: [], hiddenVars: [], empty: true };
+  const cleared = { roots: [], expansions: [], up: 0, down: 0, group: false, groupMode: 'flat', vars: [], hiddenVars: [], empty: true };
   const viewA = { ...cleared, roots: [main], empty: false };
-  const viewB = { ...viewA, roots: [gear, tick], group: true,
+  const viewB = { ...viewA, roots: [gear, tick], group: true, groupMode: 'period',
     expansions: [gear, main].map((root) => ({ root, up: 0, down: 0 })) };
   const record = async (view, op = 'view.snapshot', label) => {
     const result = await post('/api/view-event', { op, view, label });

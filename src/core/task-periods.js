@@ -20,8 +20,32 @@ const delays = new Map([
   ['vTaskDelay', 0], ['vTaskDelayUntil', 1], ['xTaskDelayUntil', 1], ['osDelay', 0],
 ]);
 
-const criticalEnter = /^(?:SuspendAllInterrupts|DisableAllInterrupts|EnterCritical|taskENTER_CRITICAL|__disable_irq)$/;
-const criticalExit = /^(?:ResumeAllInterrupts|EnableAllInterrupts|ExitCritical|taskEXIT_CRITICAL|__enable_irq)$/;
+const irqOff = /^(?:DisableAllInterrupts|__disable_irq)$/;
+const irqOn = /^(?:EnableAllInterrupts|__enable_irq)$/;
+const enter = /^(?:SuspendAllInterrupts|EnterCritical|taskENTER_CRITICAL|SchM_Enter_(.+))$/;
+const leave = /^(?:ResumeAllInterrupts|ExitCritical|taskEXIT_CRITICAL|SchM_Exit_(.+))$/;
+const lockFamily = (name, match) => match[1] ?? name.replace(/Suspend|Resume|Enter|Exit|ENTER|EXIT/, '');
+const joinedLock = Symbol('保护方式随分支变化');
+const mergeLocks = (target, ...paths) => {
+  const common = [...paths[0]].map(([key, depth]) => [
+    key, paths.reduce((min, path) => Math.min(min, path.get(key) || 0), depth),
+  ]);
+  const protectedOnEveryPath = paths.every(path => path.size > 0);
+  target.clear();
+  for (const [key, depth] of common) if (depth) target.set(key, depth);
+  if (!target.size && protectedOnEveryPath) target.set(joinedLock, 1);
+};
+
+function gcd(a, b) {
+  while (b) [a, b] = [b, a % b];
+  return a;
+}
+
+function compatible(a, b) {
+  if (a.counter !== b.counter || a.version !== b.version || a.rem == null || b.rem == null) return true;
+  const divisor = gcd(a.divider, b.divider);
+  return a.rem % divisor === b.rem % divisor;
+}
 const counterWrites = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '++', '--']);
 
 function dividerCondition(parts, constant) {
@@ -33,14 +57,14 @@ function dividerCondition(parts, constant) {
   const right = constant(condition.slice(operator + 1));
   if (right == null || !/^[A-Za-z_]\w*$/.test(left[0] === '++' ? left[1] : left[0])) return null;
   if (condition[operator] === '>=') {
-    return left[0] === '++' && left.length === 2 && right > 1 ? { counter: left[1], divider: right, reset: true } : null;
+    return left[0] === '++' && left.length === 2 && right > 1 ? { counter: left[1], divider: right, min: right, reset: true } : null;
   }
   const [counter, op, ...amount] = left;
   const n = constant(amount);
-  if (op === '%' && n > 1 && right < n) return { counter, divider: n };
-  if (op === '&' && lhs[0] === '(' && n > 0 && right <= n &&
+  if (op === '%' && n > 1) return { counter, divider: n, rem: right, impossible: right >= n };
+  if (op === '&' && lhs[0] === '(' && n > 0 &&
       (BigInt(n) & (BigInt(n) + 1n)) === 0n && Number.isSafeInteger(n + 1)) {
-    return { counter, divider: n + 1 };
+    return { counter, divider: n + 1, mask: n, rem: right, impossible: right > n };
   }
   return null;
 }
@@ -54,14 +78,14 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
   const staticLocals = new Set();
   const resets = new Map();
   const callSites = new Set(calls.map(c => `${c.line}:${c.col}`));
-  const guardAccess = tokens.some(t => criticalEnter.test(t.v)) ? new Map() : null;
+  const guardAccess = tokens.some(t => irqOff.test(t.v) || enter.test(t.v)) ? new Map() : null;
   let bypass = false;
   const recordIncrement = counter => increments.set(counter, (increments.get(counter) || 0) + 1);
   const recordWrite = counter => writes.set(counter, (writes.get(counter) || 0) + 1);
   const numberAt = (parts, index) => numericConstant(parts, name => fileMacros?.get(name, tokens[index].line), fn.file);
   const value = i => tokens[i]?.v;
-  const visit = (i, end, depth, guards, locks) => {
-    while (i < end) i = statement(i, end, depth, guards, locks);
+  const visit = (i, end, depth, guards, locks, jumps) => {
+    while (i < end) i = statement(i, end, depth, guards, locks, jumps);
   };
   const recordAccess = (i, end, guards, locks) => {
     for (let k = i; k < end; k++) {
@@ -73,16 +97,35 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
       if (!guardAccess || value(k + 1) === '(') continue;
       if (!guardAccess.has(t.v)) guardAccess.set(t.v, new Map());
       const lines = guardAccess.get(t.v);
-      lines.set(t.line, (lines.get(t.line) ?? true) && locks.count > 0);
+      lines.set(t.line, (lines.get(t.line) ?? true) && locks.size > 0);
     }
   };
-  function statement(i, end, depth, guards, locks) {
+  function statementEnd(i, end) {
     const op = value(i);
     if (op === '{') {
       const close = matchBrace(tokens, i);
-      visit(i + 1, close, depth, guards, { ...locks });
-      // 锁状态可能已在内部语句改变，不把它带出控制范围。
-      if (tokens.slice(i + 1, close).some(t => criticalExit.test(t.v))) locks.count = 0;
+      return close < 0 ? end : close + 1;
+    }
+    if (['if', 'for', 'while', 'switch'].includes(op) && value(i + 1) === '(') {
+      const start = collectArgs(tokens, i + 1)[1];
+      const next = statementEnd(start, end);
+      return op === 'if' && value(next) === 'else' ? statementEnd(next + 1, end) : next;
+    }
+    if (op === 'do') {
+      const next = statementEnd(i + 1, end);
+      if (value(next) !== 'while' || value(next + 1) !== '(') return next;
+      return Math.min(end, collectArgs(tokens, next + 1)[1] + 1);
+    }
+    while (i < end && value(i) !== ';') i++;
+    return Math.min(i + 1, end);
+  }
+
+  function statement(i, end, depth, guards, locks, jumps) {
+    const op = value(i);
+    if (op === '{') {
+      const close = matchBrace(tokens, i);
+      if (close < 0) return end;
+      visit(i + 1, close, depth, guards, locks, jumps);
       return close + 1;
     }
     if (['if', 'for', 'while', 'switch'].includes(op) && value(i + 1) === '(') {
@@ -101,14 +144,46 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
         }
         else gate = null;
       }
-      const next = statement(start, end, depth + 1, gate ? [...guards, gate] : guards, { ...locks });
-      if (tokens.slice(start, next).some(t => criticalExit.test(t.v))) locks.count = 0;
-      if (op !== 'if' || value(next) !== 'else') return next;
-      const after = statement(next + 1, end, depth + 1, guards, { ...locks });
-      if (tokens.slice(next + 1, after).some(t => criticalExit.test(t.v))) locks.count = 0;
+      if (gate) {
+        gate.version = writes.get(gate.counter) || 0;
+        if (guards.some(previous => !compatible(previous, gate))) gate.impossible = true;
+      }
+      const nested = gate ? [...guards, gate] : guards;
+      const yes = new Map(locks), no = new Map(locks);
+      const branchJumps = op === 'if' ? jumps : { break: [], continue: op === 'switch' ? jumps?.continue : [] };
+      if (op === 'while' || op === 'for') discardLoopLocks(start, statementEnd(start, end), yes);
+      const next = statement(start, end, depth + 1, nested, yes, branchJumps);
+      const after = op === 'if' && value(next) === 'else'
+        ? statement(next + 1, end, depth + 1, guards, no, jumps) : next;
+      const truth = op === 'if' && args.length === 1 ? numberAt(args[0].map(t => t.v), i) : null;
+      if (gate?.impossible || truth === 0) mergeLocks(locks, no);
+      else if (truth != null) mergeLocks(locks, yes);
+      else mergeLocks(locks, yes, no, ...(op === 'if' ? [] : branchJumps.break),
+        ...(op === 'while' || op === 'for' ? branchJumps.continue : []));
       return after;
     }
-    if (op === 'do') return statement(i + 1, end, depth + 1, guards, { ...locks });
+    if (op === 'do') {
+      const start = i + 1;
+      // do-while(0) 执行一次，其余循环可能以不同中断状态重入。
+      const tail = statementEnd(start, end);
+      const condition = value(tail) === 'while' && value(tail + 1) === '('
+        ? collectArgs(tokens, tail + 1)[0][0] : null;
+      if (!condition || numberAt(condition.map(t => t.v), i) !== 0) discardLoopLocks(start, tail, locks);
+      const loopJumps = { break: [], continue: [] };
+      const next = statement(start, end, depth + 1, guards, locks, loopJumps);
+      mergeLocks(locks, locks, ...loopJumps.continue);
+      if (value(next) !== 'while' || value(next + 1) !== '(') return next;
+      const [, after] = collectArgs(tokens, next + 1);
+      recordAccess(next + 2, Math.min(after - 1, end), guards, locks);
+      mergeLocks(locks, locks, ...loopJumps.break);
+      return value(after) === ';' ? after + 1 : after;
+    }
+    if (op === 'case' || op === 'default' || value(i + 1) === ':') {
+      let colon = i + 1;
+      while (colon < end && value(colon) !== ':') colon++;
+      locks.clear();
+      return colon + 1;
+    }
     let stop = i;
     while (stop < end && value(stop) !== ';') stop++;
     const parts = tokens.slice(i, stop).map(t => t.v);
@@ -135,18 +210,43 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
     if (parts.some(word => ['return', 'goto'].includes(word))) bypass = true;
     recordAccess(i, stop, guards, locks);
     if (parts[1] === '(') {
-      if (criticalEnter.test(op)) locks.count++;
-      if (criticalExit.test(op)) locks.count = Math.max(0, locks.count - 1);
+      const open = enter.exec(op), close = leave.exec(op);
+      if (!tokens[i].cond && irqOff.test(op)) locks.set('irq', 1);
+      if (irqOn.test(op)) locks.clear();
+      if (open && !tokens[i].cond) {
+        const key = lockFamily(op, open);
+        locks.set(key, (locks.get(key) || 0) + 1);
+      }
+      if (close) {
+        locks.delete(joinedLock);
+        const key = lockFamily(op, close), remaining = (locks.get(key) || 0) - 1;
+        if (remaining > 0) locks.set(key, remaining);
+        else locks.delete(key);
+      }
     }
+    if ((op === 'break' || op === 'continue') && !guards.some(gate => gate.impossible)) {
+      jumps?.[op]?.push(new Map(locks));
+    }
+    if (['break', 'continue', 'goto', 'return'].includes(op)) locks.clear();
     return stop + 1;
   }
-  visit(0, tokens.length, 0, [], { count: 0 });
+  function discardLoopLocks(start, end, locks) {
+    for (let i = start; i < end; i++) {
+      const op = value(i), close = leave.exec(op);
+      if (irqOn.test(op)) locks.clear();
+      if (close) {
+        locks.delete(joinedLock);
+        locks.delete(lockFamily(op, close));
+      }
+    }
+  }
+  visit(0, tokens.length, 0, [], new Map());
   const bindLocal = gate => ({ ...gate, local: locals.has(gate.counter) });
   const counterIncrements = [...increments].filter(([counter, count]) =>
     count === 1 && writes.get(counter) === (resets.has(counter) ? 2 : 1) &&
     (!locals.has(counter) || staticLocals.has(counter)))
     .map(([counter]) => bindLocal({ counter, resetDivider: resets.get(counter) }));
-  const callDividers = dividers.map(({ line, col, gates }) => ({ line, col, gates: gates.map(bindLocal) }));
+  const callDividers = dividers.map(({ line, col, gates }) => ({ line, col, gates: gates.map(({ version, ...gate }) => bindLocal(gate)) }));
   const criticalAccess = guardAccess && [...guardAccess].flatMap(([name, lines]) => {
     const guarded = [...lines].filter(([, protectedLine]) => protectedLine).map(([line]) => line);
     return guarded.length ? [[name, guarded]] : [];
@@ -282,7 +382,7 @@ export function projectTasks(model) {
     const origin = fn.taskRegistration || (fn.taskDeclaration ? `TASK(${name}) 定义`
       : loopDelays.length ? '循环任务' : '入口函数名');
     const nominal = interval?.us ?? (Number.isSafeInteger(value) && value > 0 ? value : null);
-    const priority = Math.max(0, ...rows.map(row => row.priority || 0));
+    const priority = rows.reduce((max, row) => Math.max(max, row.priority || 0), 0);
     const selected = rows.filter(row => (row.priority || 0) === priority);
     const seen = new Set();
     for (const row of selected.length ? selected : [{ us: nominal, source: interval ? origin + ' · ' + interval.evidence : origin }]) {
@@ -301,9 +401,7 @@ export function projectTasks(model) {
 
 function lcm(a, b) {
   if (!a || !b) return a || b;
-  let x = a, y = b;
-  while (y) [x, y] = [y, x % y];
-  return a / x * b;
+  return a / gcd(a, b) * b;
 }
 
 const contextOrder = (a, b) => (a.us ?? Infinity) - (b.us ?? Infinity) || a.task.localeCompare(b.task);
@@ -355,6 +453,7 @@ export function taskPeriods(model) {
       for (const edge of model._index.outAdj.get(id) || []) {
         if (!callKinds.has(edge.kind) || edge.headerReference) continue;
         const gates = gatesByFn.get(id)?.get(`${edge.line}:${edge.col}`) || [];
+        if (gates.some(gate => gate.impossible)) continue;
         let us = source?.us, tick;
         const evidence = [];
         for (const gate of gates) {

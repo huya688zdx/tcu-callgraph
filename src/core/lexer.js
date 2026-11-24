@@ -24,7 +24,7 @@ const isDigit = (c) => c >= '0' && c <= '9';
  * @param {string} file
  * @returns {Array<{t:string,v:string,s:number,e:number,line:number,col:number,cond?:string}>}
  */
-export function lex(src, file = '') {
+export function lex(src, file = '', maxTokens = Infinity) {
   const tokens = [];
   const n = src.length;
   let i = 0;
@@ -33,6 +33,7 @@ export function lex(src, file = '') {
   let atLineStart = true;
 
   while (i < n) {
+    if (tokens.length >= maxTokens) throw new Error('词法标记超过数量上限');
     const c = src[i];
 
     if (c === '\n') {

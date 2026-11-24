@@ -30,6 +30,7 @@ function sourceLocations(root, unit, files) {
   let lastFile = unit.file, lastLine = 1;
   const sources = new Map();
   const includes = new Map();
+  const externalFiles = new Set();
   const sourceOf = (file) => {
     if (!sources.has(file)) {
       let bytes;
@@ -52,6 +53,11 @@ function sourceLocations(root, unit, files) {
     const abs = raw.file ? fileOf(raw.file) : lastFile;
     const rel = relativeFile(root, abs);
     const file = rel ? files.get(fileKey(rel)) : null;
+    if (rel === null && !raw.file?.startsWith('<')) externalFiles.add(abs);
+    if (raw.includedFrom?.file && !raw.includedFrom.file.startsWith('<')) {
+      const parent = fileOf(raw.includedFrom.file);
+      if (relativeFile(root, parent) === null) externalFiles.add(parent);
+    }
     if (file && raw.includedFrom?.file) {
       const parent = relativeFile(root, fileOf(raw.includedFrom.file));
       const from = parent && files.get(fileKey(parent));
@@ -72,7 +78,12 @@ function sourceLocations(root, unit, files) {
     }
     lastLine = line || (abs === lastFile ? lastLine : 1);
     lastFile = abs;
-    return { file, abs, line: lastLine, offset: raw.offset, length: raw.tokLen || 0 };
+    // Clang 的列按 UTF-8 字节计数，词法器按 UTF-16 字符计数。
+    const source = file && Number.isInteger(raw.offset) ? sourceOf(abs) : null;
+    const lineStart = source?.lines[lastLine - 1];
+    const prefix = lineStart != null && source.bytes.subarray(lineStart, raw.offset);
+    const col = prefix ? prefix.toString('utf8').replace(/^\uFEFF/, '').length + 1 : raw.col;
+    return { file, abs, line: lastLine, col, offset: raw.offset, length: raw.tokLen || 0 };
   };
   const record = (node) => {
     const loc = readLocation(node.loc), begin = readLocation(node.range?.begin), end = readLocation(node.range?.end);
@@ -84,7 +95,7 @@ function sourceLocations(root, unit, files) {
   const slice = (a, b) => a?.file && a.abs === b?.abs && Number.isInteger(a.offset) && Number.isInteger(b.offset)
     ? sourceOf(a.abs).bytes.subarray(a.offset, b.offset + b.length).toString('utf8') : '';
   return {
-    record, includes,
+    record, includes, externalFiles,
     loc: (n) => locations.get(n)?.loc || locations.get(n)?.begin,
     begin: (n) => locations.get(n)?.begin,
     end: (n) => locations.get(n)?.end,
