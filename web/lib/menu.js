@@ -11,6 +11,7 @@ import { findCallOrder } from './call-order.js';
 import { showExpansion } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { setStatus } from './change-status.js';
+import { canOpenFlowchart, openFlowchart } from './flowchart.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 // 色块用 getter 在菜单打开时现读 THEME：样式面板改色后菜单立即跟上
@@ -47,6 +48,7 @@ export function showNodeMenu(x, y, n) {
       items: [
         { value: 'expand', label: 'expand.menu' },
         { value: 'df', label: 'menu.dataflow' },
+        ...(canOpenFlowchart(n) ? [{ value: 'flowchart', label: 'flowchart.menu' }] : []),
         ...(!comparing ? [{ value: 'callOrder', label: 'callOrder.find' }] : []),
       ],
     },
@@ -58,6 +60,7 @@ export function showNodeMenu(x, y, n) {
     if (v === 'expand') return showExpansion(n);
     if (v === 'tree:fn') return revealInTree('fn', n.id);
     if (v === 'df') return analyseDataflow(n.id);
+    if (v === 'flowchart') return openFlowchart(n.id);
     if (v === 'callOrder') return findCallOrder(n.id);
     return setNodeChange(n, v);
   });

@@ -8,6 +8,8 @@ const els = {
   search: document.getElementById('search'),
   resetLayout: document.getElementById('resetLayout'),
   groupMode: document.getElementById('groupMode'),
+  layoutGroupSelect: document.getElementById('layoutGroupSelect'),
+  parserSelect: document.getElementById('parserSelect'),
   stats: document.getElementById('stats'),
   results: document.getElementById('results'),
   detail: document.getElementById('detail'),
@@ -48,6 +50,7 @@ const state = {
   down: 1,
   up: 1,
   group: true,
+  groupMode: 'file',
   selectedEdge: null,
   /** 选中的连线标签（存连线 key，与 selectedEdge 并存：标签属于连线） */
   selectedLabel: null,

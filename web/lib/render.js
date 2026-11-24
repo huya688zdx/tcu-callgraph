@@ -5,7 +5,7 @@
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { isDataEdge, edgeDirection } from './edge-flow.js';
-import { periodSubtitle } from './period-text.js';
+import { nodePeriodBadge, periodBadgeBox, periodContainerStyle, PERIOD_COLORS, periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { drawEdgeLabels } from './edge-labels.js';
 import { flowPulseColor, mergeFlowStreams } from './flow-geometry.js';
@@ -634,13 +634,15 @@ function draw({ geometryUnchanged = false } = {}) {
 function drawContainer(ctx, c, dimmed = false) {
   ctx.save();
   if (dimmed) ctx.globalAlpha = 0.32;
+  const style = periodContainerStyle(c.kind);
   roundRect(ctx, c.x, c.y, c.w, c.h, 14);
-  ctx.fillStyle = hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
+  ctx.fillStyle = style?.body || hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04));
   ctx.fill();
-  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08));
+  ctx.strokeStyle = style?.border || hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08));
   ctx.lineWidth = 1.4;
-  // 层级框用实线（函数才是虚线）
+  if (style?.dashed) ctx.setLineDash([7, 5]);
   ctx.stroke();
+  ctx.setLineDash([]);
 
   // 标题做成带底色的胶囊，避免在大容器上完全看不见层级名
   const fs = Math.min(22, Math.max(12, 11 / cam.k));
@@ -652,13 +654,13 @@ function drawContainer(ctx, c, dimmed = false) {
   const bx = c.x + 6;
   const by = c.y + 4;
   roundRect(ctx, bx, by, tw + padX * 2, bh, bh / 2);
-  ctx.fillStyle = hexToRgba(THEME.container.stroke, 0.32);
+  ctx.fillStyle = style?.fill || hexToRgba(THEME.container.stroke, 0.32);
   ctx.fill();
-  ctx.strokeStyle = hexToRgba(THEME.container.stroke, 0.55);
+  ctx.strokeStyle = style?.border || hexToRgba(THEME.container.stroke, 0.55);
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  ctx.fillStyle = '#0C447C';
+  ctx.fillStyle = style?.ink || '#0C447C';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.fillText(label, bx + padX, by + bh / 2 + 0.5);
@@ -1016,6 +1018,27 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     }
   }
 
+  if (!comparing && cam.k >= 0.4) {
+    const badge = nodePeriodBadge(n);
+    if (badge) {
+      const size = Math.max(10.5, 7.5 / cam.k);
+      ctx.font = `600 ${size}px ${FONT}`;
+      const box = periodBadgeBox(n, ctx.measureText(badge.text).width, size, recentlyAdded);
+      if (box) {
+        const { fill, ink } = PERIOD_COLORS[badge.tier];
+        roundRect(ctx, box.x, box.y, box.w, box.h, box.h / 2);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.strokeStyle = ink;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.fillStyle = ink;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(badge.text, box.x + box.w / 2, y, box.w - 10);
+      }
+    }
+  }
   if (recentlyAdded) {
     if (cam.k >= 0.35) {
       const bx = x + w - 28, by = y - 8, bw = 26, bh = 15;

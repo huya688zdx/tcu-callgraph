@@ -12,7 +12,7 @@ import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
  */
 import { roundedPathD } from './routing.js';
 import { displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
-import { periodSubtitle } from '../../web/lib/period-text.js';
+import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function layoutExportEdgeLabels(view) {
   const placed = [];
@@ -137,11 +137,18 @@ export function exportSvg(view, { title = '' } = {}) {
   if (v.containers) {
     // 浅的先画（外层容器垫底），与画布绘制顺序一致
     for (const c of [...v.containers].sort((a, b) => a.depth - b.depth)) {
+      const style = periodContainerStyle(c.kind);
+      const fill = style?.body || `rgba(230,241,251,${(0.16 + Math.min(0.1, c.depth * 0.04)).toFixed(2)})`;
+      const stroke = style?.border || `rgba(107,163,224,${(0.55 + Math.min(0.25, c.depth * 0.08)).toFixed(2)})`;
       out.push(
-        `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="rgba(230,241,251,${(0.16 + Math.min(0.1, c.depth * 0.04)).toFixed(2)})" stroke="rgba(107,163,224,${(0.55 + Math.min(0.25, c.depth * 0.08)).toFixed(2)})" stroke-width="1.4"/>`
+        `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="${fill}" stroke="${stroke}" stroke-width="1.4"${style?.dashed ? ' stroke-dasharray="7 5"' : ''}/>`
       );
+      if (style) {
+        const width = Math.min(c.w - 12, [...String(c.label)].length * 13 + 12);
+        out.push(`<rect x="${c.x + 6}" y="${c.y + 4}" width="${width}" height="19" rx="9.5" fill="${style.fill}" stroke="${stroke}"/>`);
+      }
       out.push(
-        `<text x="${(c.x + 12).toFixed(1)}" y="${(c.y + 18).toFixed(1)}" font-size="13" font-weight="600" fill="#0C447C">${esc(c.label)}</text>`
+        `<text x="${(c.x + 12).toFixed(1)}" y="${(c.y + 18).toFixed(1)}" font-size="13" font-weight="600" fill="${style?.ink || '#0C447C'}">${esc(c.label)}</text>`
       );
     }
   }
@@ -189,6 +196,8 @@ export function exportSvg(view, { title = '' } = {}) {
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || (n.external ? EXTERNAL_LABEL : shortFile(n.file) + ':' + n.line))}</text>`
     );
+    const badge = !v.comparison && !period && nodePeriodBadge(n);
+    if (badge) out.push(periodBadgeSvg(n, badge, esc));
     out.push('</g>');
   }
 

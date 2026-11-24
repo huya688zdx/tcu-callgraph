@@ -89,7 +89,8 @@ export function detectTasks(model, from = null) {
     const task = recognized.get(fn.id);
     const p = task?.us ? { text: 'TASK:' + formatPeriod(task.us).replace(' ', '').replace('µs', 'us'), why: task.source }
       : taskPeriodOf(fn.name);
-    if (p && TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: p });
+    if (task?.kind === 'isr') isrs.push({ id: fn.id, period: p });
+    else if (p && TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: p });
     else if (p && ISR_NAME.test(fn.name)) isrs.push({ id: fn.id, period: p });
     else if (p) tasks.push({ id: fn.id, period: p });
     else if (task || TASK_NAME.test(fn.name)) tasks.push({ id: fn.id, period: null });
@@ -115,7 +116,7 @@ export function detectTasks(model, from = null) {
     const callers = (model._index.inAdj.get(task.id) || []).filter(c => !from || c.from === from);
     // 优先 ISR / main 这类调度者；没有就取第一个调用者
     const scheduler =
-      callers.find((c) => ISR_NAME.test(shortName(c.from)) || shortName(c.from) === 'main') ||
+      callers.find((c) => recognized.get(c.from)?.kind === 'isr' || ISR_NAME.test(shortName(c.from)) || shortName(c.from) === 'main') ||
       callers.find((c) => !TASK_NAME.test(shortName(c.from))) ||
       callers[0];
     if (!scheduler) continue;

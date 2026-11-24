@@ -44,6 +44,14 @@
   .top-actions { margin-left: auto; }
   .tool-group + .tool-group { padding-left: 12px; border-left: 1px solid #DEDDD6; }
   .tool-label { margin-right: 2px; font-size: 11px; color: #888780; }
+  .toolbar-select { max-width: 165px; color: #234361; background-color: #F6F9FC; }
+  .period-detail { margin: 8px 0; padding: 8px; border: 1px solid #D6E3F1; border-radius: 7px; background: #F6F9FC; overflow-wrap: anywhere; }
+  .period-detail ul { padding-inline-start: 16px; margin: 5px 0 0; }
+  .period-detail li + li { margin-top: 5px; }
+  .period-detail small { display: block; color: #5F5E5A; }
+  .period-warning { margin-top: 5px; color: #9A3412; font-weight: 600; }
+  .period-warning.guarded { color: #166534; }
+  .period-multi { color: #6D28D9; }
   header button:disabled { opacity: .4; cursor: default; }
   .tool-menu { position: relative; }
   .tool-menu summary {
@@ -545,6 +553,31 @@
     color: #888780; cursor: pointer; padding: 0 4px;
   }
   .modal-body { padding: 10px 12px; overflow: auto; flex: 1; }
+  #flowchartModal { width: min(1240px, 96vw); height: 90vh; max-height: 90vh; }
+  #flowchartModal .modal-head { gap: 12px; }
+  .flowchart-crumbs { display: flex; min-width: 0; gap: 8px; align-items: center; overflow: auto; white-space: nowrap; }
+  .flowchart-crumbs button { border: 0; background: transparent; color: #475569; }
+  .flowchart-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding: 9px 16px;
+    border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+  .flowchart-toolbar label { display: inline-flex; align-items: center; gap: 5px; }
+  .flowchart-toolbar [hidden], .flowchart-crumbs [hidden] { display: none; }
+  .flowchart-tools { display: flex; align-items: center; gap: 5px; margin-inline-start: auto; }
+  .flowchart-macros { padding: 6px 16px; font-size: 13px; border-bottom: 1px solid #e2e8f0; }
+  .flowchart-macros summary { cursor: pointer; }
+  #flowchartMacroList { max-height: 23vh; overflow: auto; }
+  .flowchart-macros pre { margin: 4px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; color: #5b21b6; }
+  #flowchartViewport { position: relative; flex: 1; min-height: 0; overflow: hidden; touch-action: none;
+    cursor: grab; background: #f8fafc radial-gradient(#d2dce8 1px, transparent 1px) 0 0 / 20px 20px; }
+  #flowchartViewport.panning { cursor: grabbing; }
+  #flowchartViewport svg { display: block; width: 100%; height: 100%; user-select: none; }
+  #flowchartViewport g[data-call] { cursor: pointer; }
+  #flowchartViewport g[data-call]:is(:hover, :focus-visible) rect { stroke-width: 3; stroke: #1d4ed8; }
+  #flowchartStatus { position: absolute; z-index: 1; inset: 12px auto auto 12px; max-width: calc(100% - 24px);
+    background: #fff; color: #334155; border: 1px solid #cbd5e1; padding: 8px 12px; border-radius: 8px; }
+  #flowchartCalls { position: absolute; inset: auto 16px 16px auto; z-index: 1; max-width: calc(100% - 32px);
+    max-height: 55%; overflow: auto; background: #fff; border: 1px solid #cbd5e1; padding: 10px; border-radius: 8px; }
+  #flowchartCalls button { margin: 4px; }
+  .flowchart-detail { margin: 6px 0; }
   #expandForm { display: grid; gap: 14px; }
   #expandFunction { font-weight: 500; overflow-wrap: anywhere; }
   #expandForm label { display: flex; align-items: center; gap: 12px; font-size: 13px; color: #2C2C2A; }
@@ -837,7 +870,13 @@
       <span id="compareSummary" hidden></span>
       <button id="compareExit" hidden data-i18n="compare.exit">退出比较</button>
       <div class="tool-group">
-        <label class="chk"><input type="checkbox" id="groupMode" checked><span data-i18n="btn.group">文件分组</span></label>
+        <input type="checkbox" id="groupMode" checked hidden>
+        <select id="layoutGroupSelect" class="toolbar-select" aria-label="布局分组" data-i18n-aria-label="toolbar.layoutGrouping">
+          <option value="file" data-i18n="btn.group">文件分组</option>
+          <option value="period" data-i18n="toolbar.layoutPeriod">周期泳道</option>
+          <option value="flat" data-i18n="toolbar.layoutFlat">平铺</option>
+        </select>
+        <select id="parserSelect" class="toolbar-select" aria-label="解析引擎" data-i18n-aria-label="toolbar.parser" data-i18n-title="toolbar.parser" hidden></select>
       </div>
       <div class="tool-group">
         <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n-title="toolbar.relayoutHint" data-i18n="btn.reset">重新排版</button>
@@ -937,6 +976,39 @@
   </main>
 
   <div id="overlayMask" class="mask"></div>
+
+  <div id="flowchartModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="flowchartTitle">
+    <div class="modal-head">
+      <h2 id="flowchartTitle" data-i18n="flowchart.title">函数流程图</h2>
+      <nav id="flowchartCrumbs" class="flowchart-crumbs" data-i18n-aria-label="flowchart.navigation" aria-label="函数导航"></nav>
+      <button class="modal-close" type="button" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
+    </div>
+    <div class="flowchart-toolbar">
+      <button id="flowchartBack" type="button" data-i18n="flowchart.back" hidden>← 返回上一函数</button>
+      <label><input id="flowchartExpand" type="checkbox"><span id="flowchartExpandLabel"></span></label>
+      <label id="flowchartVersionLabel" hidden><span data-i18n="flowchart.version">版本</span>
+        <select id="flowchartVersion">
+          <option value="after" data-i18n="flowchart.after">修改后</option>
+          <option value="before" data-i18n="flowchart.before">修改前</option>
+        </select>
+      </label>
+      <div class="flowchart-tools">
+        <button id="flowchartFit" type="button" data-i18n="flowchart.fit">适应窗口</button>
+        <button id="flowchartZoomOut" type="button" data-i18n-aria-label="flowchart.zoomOut" aria-label="缩小">−</button>
+        <button id="flowchartZoomIn" type="button" data-i18n-aria-label="flowchart.zoomIn" aria-label="放大">+</button>
+        <button id="flowchartExport" type="button" data-i18n="flowchart.export">导出 SVG</button>
+      </div>
+    </div>
+    <details id="flowchartMacros" class="flowchart-macros" hidden>
+      <summary data-i18n="flowchart.macros">宏定义对照</summary>
+      <div id="flowchartMacroList"></div>
+    </details>
+    <div id="flowchartViewport">
+      <div id="flowchartStatus" role="status" hidden></div>
+      <div id="flowchartCalls" hidden></div>
+      <div id="flowchartCanvas" style="width: 100%; height: 100%"></div>
+    </div>
+  </div>
 
   <div id="projectModal" class="modal">
     <div class="modal-head">

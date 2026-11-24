@@ -4,6 +4,7 @@ import { edgeCaption, isDataEdge } from './edge-flow.js';
  * 事件在模块加载时一次性绑定
  */
 import { t } from '../i18n.js';
+import { nodePeriodBadge } from './period-text.js';
 import { els, state, cam, FONT, esc, edgeKey, THEME } from './state.js';
 import {
   collidesWith,
@@ -671,6 +672,8 @@ function handlePointerMove(e) {
       const target = n || hoveredEdge;
       els.tooltip.innerHTML += `<br>${t('canvas.status', { status: statusLabel(target.change) })}${target.statusSource === 'manual' ? t('canvas.manualStatus') : ''}`;
     }
+    const badge = n && nodePeriodBadge(n);
+    if (badge) els.tooltip.innerHTML += `<br><b>${esc(badge.text)}</b>${badge.multi ? ' · ' + t('period.multiRate') : ''}`;
     if (n && !trunkEndpoint) els.tooltip.innerHTML += `<br><span style="opacity:.7;font-size:11px">${t('canvas.traceHint')}</span>`;
   } else {
     els.tooltip.style.opacity = '0';

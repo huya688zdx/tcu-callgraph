@@ -1,5 +1,6 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
+import { periodLabels } from './task-periods.js';
 import { textWidth, routeScore, directoryWhitespace, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
 import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from './routing.js';
 const require = createRequire(import.meta.url);
@@ -18,20 +19,33 @@ const flowTarget = (e) => isReverseFlow(e) ? e.from : e.to;
 const callRank = (e) => (e.callNumbers?.length ? parseInt(e.callNumbers[0], 10) : e.orderGroup || e.line) || 0;
 
 function modelOrder(nodes, edges) {
-  const readers = new Set(), callers = new Set(), incoming = new Map();
+  const incoming = new Map(), callers = new Map(), files = new Map(nodes.map(n => [n.id, n.file]));
+  const external = new Map(), levels = new Map();
   for (const e of edges) {
-    if (isReverseFlow(e)) readers.add(e.from);
     if (e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
-    if (e.from !== e.to) callers.add(e.from);
+    if (!callers.has(e.from)) callers.set(e.from, []);
+    callers.get(e.from).push(e.to);
+    if (files.get(e.from) !== files.get(e.to)) {
+      if (!external.has(e.to)) external.set(e.to, []);
+      external.get(e.to).push(e.from);
+    }
     incoming.set(e.to, Math.min(incoming.get(e.to) ?? Infinity, callRank(e)));
+  }
+  const queue = nodes.filter(n => n.taskEntry || !incoming.has(n.id)).map(n => n.id);
+  for (const id of queue) levels.set(id, 0);
+  for (let i = 0; i < queue.length; i++) for (const target of callers.get(queue[i]) || []) {
+    if (levels.has(target)) continue;
+    levels.set(target, levels.get(queue[i]) + 1);
+    queue.push(target);
   }
   const ranked = nodes.map((n) => ({
     id: n.id,
-    role: n.taskEntry ? 0 : n.kind === 'var' ? 2 : readers.has(n.id) && !callers.has(n.id) ? 3 : 1,
+    role: n.kind === 'var' ? 2 : n.taskEntry ? 0 : 1,
+    neighbor: Math.min(...(external.get(n.id) || []).map(id => levels.get(id) ?? Infinity)),
     call: incoming.get(n.id) ?? 0,
     period: (n.taskPeriods || []).reduce((min, { us }) => Number.isInteger(us) && us > 0 ? Math.min(min, us) : min, Infinity),
   }));
-  ranked.sort((a, b) => a.role - b.role || a.call - b.call || a.period - b.period);
+  ranked.sort((a, b) => a.role - b.role || a.call - b.call || a.neighbor - b.neighbor || a.period - b.period);
   return new Map(ranked.map(({ id }, i) => [id, i]));
 }
 
@@ -368,13 +382,64 @@ function preservesSemanticOrder(baseline, candidate, edges) {
   return true;
 }
 
-/** 自底向上逐层紧凑排布：文件框自适应方向/散点网格化 + 跨框邻近微调 + 正交路由。 */
-async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false }) {
+/** 逻辑分组路径供拖动和嵌套校验使用，节点仍保留源码文件路径。 */
+function periodGroups(nodes, edges) {
+  const periods = n => [...new Set((n.taskPeriods || []).map(p => p.us).filter(us => Number.isFinite(us) && us > 0))];
+  const laneOf = n => {
+    const values = periods(n);
+    const irq = /isr|irq|handler|interrupt/i;
+    if (n.isIsr || n.kind === 'isr' || n.taskPeriods?.some(p => p.isIsr || p.kind === 'isr')) return 'isr';
+    if (!values.length && (irq.test(n.name || n.id.split('::').at(-1)) ||
+      n.taskPeriods?.some(p => irq.test(p.task?.split('::').at(-1))))) return 'isr';
+    return values.length > 1 ? 'multi' : values.length ? String(values[0]) : 'init';
+  };
+  const paths = new Map(), boxes = new Map(), peers = new Map();
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  for (const e of edges) {
+    const a = byId.get(e.from), b = byId.get(e.to);
+    if ((a.kind === 'var') === (b.kind === 'var')) continue;
+    const [v, f] = a.kind === 'var' ? [a, b] : [b, a];
+    if (!peers.has(v.id)) peers.set(v.id, new Set());
+    peers.get(v.id).add(f);
+  }
+  const labels = { isr: 'ISR / 中断级', multi: '⚡ 多周期共用', init: '初始化 / 通用', signals: '共享信号区 (Shared Signals)' };
+  const linked = new Set();
+  for (const n of nodes) {
+    let lane = laneOf(n), section = 'functions';
+    if (n.kind === 'var') {
+      const users = [...(peers.get(n.id) || [])], lanes = new Set(users.map(laneOf));
+      const modules = new Set(users.map(f => f.file).filter(Boolean));
+      if (n.file) modules.add(n.file);
+      const shared = lanes.size > 1 || modules.size > 1 || lanes.has('multi') || lane === 'multi';
+      lane = shared ? 'signals' : [...lanes][0] || lane;
+      section = shared ? 'signals' : 'state';
+      if (shared) for (const id of lanes) linked.add(id);
+    }
+    const key = 'period-' + lane, path = key + '/' + section;
+    paths.set(n.id, path);
+    const periodUs = Number(lane) || null;
+    boxes.set(key, { label: labels[lane] || '⏱ ' + periodLabels([{ us: periodUs }])[0] + ' 周期',
+      kind: lane === 'signals' ? 'signal-bus' : 'period-lane', periodUs });
+    boxes.set(path, { label: { functions: '函数', state: '局部状态', signals: '共享变量' }[section] });
+  }
+  const rank = key => ({ 'period-isr': 0, 'period-multi': Number.MAX_VALUE, 'period-init': Infinity }[key] ?? boxes.get(key).periodUs);
+  const lanes = [...boxes.keys()].filter(k => !k.includes('/') && k !== 'period-signals')
+    .sort((a, b) => rank(a) - rank(b));
+  if (boxes.has('period-signals')) {
+    const indices = [...linked].map(k => lanes.indexOf('period-' + k)).filter(i => i >= 0);
+    const position = indices.length ? Math.floor((Math.min(...indices) + Math.max(...indices)) / 2) + 1 : lanes.length;
+    lanes.splice(position, 0, 'period-signals');
+  }
+  return { paths, boxes, lanes };
+}
+
+/** 自底向上逐层排布文件或逻辑泳道，再对整图布线。 */
+async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false, period = null }) {
   const order = modelOrder(sized, edges);
   const root = { id: '', label: '', children: new Map(), leafNodes: [] };
   let boxCount = 0;
   for (const n of sized) {
-    const parts = (n.file || 'unknown').split('/');
+    const parts = (period?.paths.get(n.id) || n.file || 'unknown').split('/');
     let cur = root;
     for (let i = 0; i < parts.length; i++) {
       const key = parts.slice(0, i + 1).join('/');
@@ -386,7 +451,7 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     }
     cur.leafNodes.push(n);
   }
-  if (boxCount < 2) return null;
+  if (!period && boxCount < 2 && sized.length <= 120 && !sized.some(n => n.kind === 'var')) return null;
   // 单子目录只是外层包装，主方向应在第一个有兄弟框的目录生效。
   let mainBox = root;
   while (mainBox.children.size === 1 && !mainBox.leafNodes.length) {
@@ -395,17 +460,20 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     mainBox = child;
   }
   // 多个并列目录可以沿两轴摆放，避免层级链占满整个主轴。
-  if (packMain && (mainBox.children.size < 3 || [...mainBox.children.values()].some((child) => child.fileGroup))) return null;
+  if (packMain && (mainBox.children.size < 3 || (sized.length <= 120 && [...mainBox.children.values()].some(child => child.fileGroup)))) return null;
 
   async function layoutBox(box, depth, dirOverride = null, hints = null) {
     const childItems = [];
     for (const child of box.children.values()) {
       childItems.push({ id: 'box:' + child.id, isBox: true, ref: child, width: child.w, height: child.h, ord: child.minOrd });
     }
+    const hasFunctions = box.leafNodes.some(n => n.kind !== 'var');
+    const states = [];
     for (const n of box.leafNodes) {
+      if (hasFunctions && n.kind === 'var') { states.push(n); continue; }
       childItems.push({ id: n.id, isBox: false, ref: n, width: n.w, height: n.h, ord: order.get(n.id) ?? 0 });
     }
-    box.minOrd = Math.min(...childItems.map((c) => c.ord), 0);
+    box.minOrd = Math.min(...childItems.map((c) => c.ord));
 
     const memberOf = new Map();
     const mapDesc = (b, ownerId) => {
@@ -432,8 +500,23 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
 
     const isRoot = depth === 0;
     const sidePad = isRoot ? ROOT_PAD : 14;
-    const direction = box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : box === mainBox ? rootDir : dirDir;
-    if (childItems.length === 1) {
+    const direction = box.fileGroup ? (fileDir === 'AUTO' ? rootDir : fileDir) : box === mainBox ? rootDir : dirDir;
+    if (period && !box.fileGroup) {
+      const index = child => isRoot ? period.lanes.indexOf(child.ref.id) : Number(child.ref.id.endsWith('/state'));
+      childItems.sort((a, b) => index(a) - index(b));
+      let y = TOP_PADDING;
+      box.relPos = new Map();
+      for (const item of childItems) {
+        box.relPos.set(item.id, { x: sidePad, y });
+        y += item.height + LAYER_GAP;
+      }
+      box.w = Math.max(0, ...childItems.map(it => it.width)) + sidePad * 2;
+      if (!isRoot) box.w = Math.max(box.w, textWidth(period.boxes.get(box.id).label) + sidePad * 2);
+      box.h = y - (childItems.length ? LAYER_GAP : 0) + sidePad;
+      box.usedDir = 'RIGHT';
+      return;
+    }
+    if (childItems.length === 1 && !states.length) {
       const item = childItems[0];
       box.w = item.width + sidePad * 2;
       box.h = item.height + TOP_PADDING + sidePad;
@@ -486,22 +569,38 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
       });
     };
 
-    let best, usedDir;
-    if (dirOverride) {
-      usedDir = dirOverride;
-      best = await runDir(dirOverride);
-    } else if (box.fileGroup && fileDir === 'AUTO' && agg.size > 0) {
-      const [r1, r2] = await Promise.all([runDir('RIGHT'), runDir('DOWN')]);
-      const boxScore = (r) => Math.abs(Math.log(Math.max(1, r.width) / Math.max(1, r.height) / 1.15)) +
-        Math.sqrt(r.width * r.height) / 2000;
-      if (boxScore(r1) <= boxScore(r2)) { best = r1; usedDir = 'RIGHT'; } else { best = r2; usedDir = 'DOWN'; }
-    } else {
-      usedDir = direction;
-      best = await runDir(usedDir);
+    let usedDir = dirOverride || direction;
+    let best = await runDir(usedDir);
+    if (!dirOverride && box.fileGroup && fileDir === 'AUTO' && agg.size) {
+      const extreme = Math.max(best.width / best.height, best.height / best.width) > 2.6;
+      const preserveDirection = edges.some(e => {
+        if (e.from === e.to || e.kind === 'var' || e.kind?.startsWith('df-') || e.kind === 'dataflow') return false;
+        const source = memberOf.has(e.from), target = memberOf.has(e.to);
+        return (source && target) || (!extreme && (source || target));
+      });
+      if (!preserveDirection) {
+        const other = direction === 'RIGHT' ? 'DOWN' : 'RIGHT', alt = await runDir(other);
+        if (Math.abs(Math.log(alt.width / alt.height)) < Math.abs(Math.log(best.width / best.height))) {
+          best = alt;
+          usedDir = other;
+        }
+      }
     }
     box.w = best.width;
     box.h = best.height;
     box.relPos = new Map(best.children.map((c) => [c.id, { x: c.x, y: c.y }]));
+    if (states.length) {
+      let x = sidePad, y = box.h + NODE_GAP, rowH = 0;
+      const width = Math.max(box.w, Math.sqrt(states.reduce((area, n) => area + (n.w + NODE_GAP) * (n.h + NODE_GAP), 0)));
+      for (const n of states) {
+        if (x > sidePad && x + n.w + sidePad > width) { x = sidePad; y += rowH + NODE_GAP; rowH = 0; }
+        box.relPos.set(n.id, { x, y });
+        box.w = Math.max(box.w, x + n.w + sidePad);
+        x += n.w + NODE_GAP;
+        rowH = Math.max(rowH, n.h);
+      }
+      box.h = y + rowH + sidePad;
+    }
     if (pack && agg.size) {
       // 网格没有固定主轴，用调用最多的目录对确定流向。
       const { s, t } = [...agg.values()].reduce((a, b) => a.count >= b.count ? a : b);
@@ -569,35 +668,55 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     }
     return Math.abs(box.w - prevW) > 0.5 || Math.abs(box.h - prevH) > 0.5;
   }
-  if (edges.length) await pass2(root, 0);
+  if (edges.length && sized.length <= 120 && !period) await pass2(root, 0);
 
-  const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h, layoutDirection: packMain ? mainBox.usedDir : rootDir };
+  const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h,
+    layoutDirection: packMain && fileDir === 'AUTO' ? mainBox.usedDir : rootDir };
   const flatten = (box, ox, oy, depth) => {
     for (const child of box.children.values()) {
       const p = box.relPos.get('box:' + child.id);
       const x = ox + p.x, y = oy + p.y;
-      const entry = { id: child.id, label: child.label, x, y, w: child.w, h: child.h, depth };
+      const entry = { id: child.id, label: child.label, x, y, w: child.w, h: child.h, depth, ...period?.boxes.get(child.id) };
       (child.fileGroup ? view.groups : view.containers).push(entry);
       flatten(child, x, y, depth + 1);
     }
     for (const n of box.leafNodes) {
       const p = box.relPos.get(n.id);
-      view.nodes.push({ ...n, x: ox + p.x, y: oy + p.y, group: n.file || 'unknown' });
+      view.nodes.push({ ...n, x: ox + p.x, y: oy + p.y, group: box.id });
     }
   };
   flatten(root, 0, 0, 1);
+  if (period) view.containers.sort((a, b) => a.y - b.y);
 
   // 克隆边送入路由器，避免写入临时属性破坏输出契约。
   const routed = edges.map((e) => ({ ...e }));
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   view.edges = routed;
-  routeEdges(view.nodes, routed);
+  routeEdges(view.nodes, routed, { layoutDirection: view.layoutDirection, searchGaps: true });
   improveEdgeRoutes(view, routed, (e) => byId.get(e.from)?.file !== byId.get(e.to)?.file);
   const bad = routed.filter((e) => e.blocked ||
     pathBlockedByNodes(e.points, view.nodes, new Set([e.from, e.to])) ||
     pathCrossesBody(e.points, byId.get(e.from)) || pathCrossesBody(e.points, byId.get(e.to)));
   if (bad.length) improveEdgeRoutes(view, bad, () => true);
   mergeSharedRoutes(view);
+  if (period || sized.length > 120) {
+    // 跨组边必须穿出所属框，其余兄弟框作为整块障碍物。
+    const boxes = [...view.containers, ...view.groups];
+    for (const edge of routed) {
+      const owners = [byId.get(edge.from).group, byId.get(edge.to).group];
+      const owned = id => owners.some(group => group === id || group.startsWith(id + '/'));
+      const obstacles = boxes.filter(box => {
+        const slash = box.id.lastIndexOf('/');
+        return !owned(box.id) && (slash < 0 || owned(box.id.slice(0, slash)));
+      });
+      if (!obstacles.some(box => pathCrossesBody(edge.points, box))) continue;
+      const trial = { ...edge };
+      const inside = view.nodes.filter(n => owners.includes(n.group));
+      routeEdges([...inside, ...obstacles.map(box => ({ ...box, id: Symbol(box.id) }))], [trial],
+        { layoutDirection: view.layoutDirection, searchGaps: true });
+      if (!trial.blocked) edge.points = trial.points;
+    }
+  }
   view.edges = edges.map((e, i) => ({ ...e, points: routed[i].points }));
 
   let minX = 0, minY = 0, maxX = view.width, maxY = view.height;
@@ -619,7 +738,15 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
   return view;
 }
 
-export async function layoutElk(nodes, edges, { group = true, rootLabel = '', previous = null } = {}) {
+function withRoot(view, rootLabel) {
+  if (rootLabel) {
+    for (const box of [...view.containers, ...view.groups]) box.depth++;
+    view.containers.unshift({ id: '', label: rootLabel, root: true, depth: 1, x: 0, y: 0, w: view.width, h: view.height });
+  }
+  return view;
+}
+
+export async function layoutElk(nodes, edges, { group = true, groupMode = 'file', rootLabel = '', previous = null } = {}) {
   const ids = new Set(nodes.map((n) => n.id));
   edges = edges.filter((e) => ids.has(e.from) && ids.has(e.to));
   const sized = nodes.map((n) => ({ ...n,
@@ -627,6 +754,13 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
       textWidth((n.targetNames || []).join(' / '))) + 28 + (n.kind === 'var' ? 0 : 16))),
     h: n.h || (n.sub ? 58 : 44),
   }));
+  if (group && groupMode === 'period') {
+    const view = await bottomUpCandidate(sized, edges, { rootDir: 'RIGHT', fileDir: 'RIGHT', dirDir: 'DOWN',
+      period: periodGroups(sized, edges) });
+    view.groupMode = 'period';
+    return withRoot(view, rootLabel);
+  }
+  if (previous?.groupMode === 'period' || previous?.containers?.some(box => box.kind === 'period-lane')) previous = null;
   // 删除时保留空位的几何快照。重新加入同一批节点时直接复用，避免再次
   // 运行 INTERACTIVE 排版产生逐轮漂移；拖动过任一剩余节点就不再复用。
   const slots = previous?.layoutSlots;
@@ -681,7 +815,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     };
     const addedEdges = view.edges.filter((e) => !e.points);
     if (addedEdges.length) {
-      routeEdges(view.nodes, addedEdges, { existing: collectSegments(view.edges.filter((e) => e.points)) });
+      routeEdges(view.nodes, addedEdges, { existing: collectSegments(view.edges.filter((e) => e.points)), layoutDirection: direction });
       improveEdgeRoutes(view, addedEdges, () => false);
       mergeSharedRoutes(view, addedEdges);
     }
@@ -724,6 +858,14 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
     return { ...converted(await layoutGraph(graph), sized, edges), layoutDirection: dir };
   };
+  const medium = group && (sized.length > 120 || edges.length > 240) && sized.length <= 400 && edges.length <= 900;
+  if (!previous && medium) {
+    const cfg = { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT' };
+    for (const packMain of [true, false]) {
+      const candidate = await bottomUpCandidate(sized, edges, { ...cfg, packMain });
+      if (candidate && validLayout(candidate)) return withRoot(candidate, rootLabel);
+    }
+  }
   let view = await generate(direction);
   if (!previous) {
     // 全部候选统一在整理干线后校验和评分，避免纵向/分层候选因未合并干线而被过早淘汰。
@@ -756,9 +898,5 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     mergeSharedRoutes(view);
   }
   if (!group) for (const n of view.nodes) delete n.group;
-  if (group && rootLabel) {
-    for (const box of [...view.containers, ...view.groups]) box.depth++;
-    view.containers.unshift({ id: '', label: rootLabel, root: true, depth: 1, x: 0, y: 0, w: view.width, h: view.height });
-  }
-  return view;
+  return withRoot(view, group && rootLabel);
 }

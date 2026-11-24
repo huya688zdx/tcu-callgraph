@@ -7,6 +7,7 @@ import { fork } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex, decodeSource } from './core/index.js';
 import { layoutElk } from './core/layout-elk.js';
+import { buildFlowchart, isFlowchartFunction } from './core/flowchart.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { compareProjects, comparisonDataflow, comparisonGlobals } from './core/compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
@@ -21,6 +22,9 @@ import { createMcpServer } from './mcp.js';
 import { normalizeExpansions } from './core/expansion.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
+import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
+import { findCompileCommands } from './core/parsers/clang-parser.js';
+import { diffParserModels } from './core/parsers/ir.js';
 import {
   normalizeLabel,
   normalizeLabels,
@@ -83,6 +87,11 @@ let pageState = null;
 const store = openStore();
 const modelCacheKeys = new WeakMap();
 const analysisPending = new WeakMap();
+const configuredParser = () => store.getSetting('parser.active', 'builtin');
+const parserOptionsFor = (id) => id === 'clang-ast'
+  ? { compileCommandsPath: store.getSetting('parser.compileCommandsPath') } : {};
+const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
+let parserFallback = null;
 
 // Electron 停止服务时断开 IPC，让服务先终止正在扫描源码的子进程。
 if (process.connected) process.once('disconnect', () => process.exit(0));
@@ -182,7 +191,7 @@ function migrateLegacy(project) {
   }
 }
 
-function scanInProcess(target, scan) {
+function scanInProcess(target, scan, options) {
   return new Promise((resolve, reject) => {
     const child = fork(fileURLToPath(new URL('./core/scan-model.js', import.meta.url)), [], {
       execArgv: [],
@@ -200,7 +209,7 @@ function scanInProcess(target, scan) {
       if (code === 0 && result?.model) resolve(result.model);
       else reject(new Error(result?.error || `源码扫描中断（${signal || code}）`));
     });
-    child.send({ target, scan }, (error) => {
+    child.send({ target, scan, options }, (error) => {
       if (!error) return;
       stop();
       reject(error);
@@ -208,33 +217,20 @@ function scanInProcess(target, scan) {
   });
 }
 
-/**
- * 加载一个工程并切换会话状态。
- * 解析结果是纯派生的，切工程时整份重建；标注 / 布局从库里按 project_id 读。
- */
-async function openTarget(targetPath, { first = false } = {}) {
-  const abs = path.resolve(targetPath);
-  let isFile = false;
-  try {
-    isFile = fs.statSync(abs).isFile();
-  } catch {
-    throw new Error(`路径不存在：${abs}`);
-  }
-  // 打开的根目录名：文件路径都是相对它的，所以要把这一层补进层级里。
-  // 直接选了单个文件时，索引的是它所在目录，根名取目录名（否则会和文件框重名）
-  const label = path.basename(isFile ? path.dirname(abs) : abs) || abs;
-
-  console.log(`[加载] ${abs}`);
+async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const t0 = performance.now();
-
+  const parser = resolveParserForTarget(isFile ? abs : abs + path.sep, parserId);
+  const status = parser.available(parserOptions);
+  if (!status.ok) throw new Error(status.reason || `解析器不可用：${parser.id}`);
   // 解析缓存：源码没动过就直接反序列化模型，省掉整轮词法 + 语法分析。
   // .dot / .gv 走另一套模型（没有文件清单），不参与缓存。
-  const isDot = isFile && /\.(dot|gv)$/i.test(abs);
+  const isDot = parser.id === 'dot';
   const scanRoot = isFile ? path.dirname(abs) : abs;
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
   const warnings = [];
   const scan = isDot ? null : { files: scanSources(scanRoot, warnings), warnings };
-  const key = scan && !warnings.length ? cacheKey(scan.files, focus) : '';
+  const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id;
+  const key = scan && !warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
   const scanMs = performance.now() - t0;
 
   const readAt = performance.now();
@@ -244,25 +240,50 @@ async function openTarget(targetPath, { first = false } = {}) {
   const parseAt = performance.now();
   if (model) {
     model.root = isFile ? path.dirname(abs) : abs;
+    model.parserId = parser.id;
+    model.parserName = parser.name;
     if (focus) model.focusFile = focus;
     rebuildIndex(model);
-  } else if (scan) {
-    model = rebuildIndex(await scanInProcess(abs, scan));
+  } else if (parser.id === 'builtin' || parser.id === 'clang-ast') {
+    model = rebuildIndex(await scanInProcess(abs, scan, { parserId: parser.id, parserOptions }));
   } else {
-    model = loadModel(abs);
+    model = await loadModel(abs, scan, { parserId: parser.id, parserOptions });
   }
   const analyzeMs = performance.now() - parseAt;
 
   // 首屏只需要调用关系；变量清单/数据流由 ensureAnalysis 按需构建。
   const saveAt = performance.now();
   modelCacheKeys.set(model, key);
-  if (key && !fromCache) {
+  if (key && !fromCache && !model.warnings.length && !model._df?.failedFiles) {
     const r = store.putCachedModel(key, model);
     if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
   }
   const cacheWriteMs = performance.now() - saveAt;
   const loadMs = Math.round(performance.now() - t0);
   model.elapsedMs = loadMs;
+  if (scan) console.log(`[耗时] 文件清单 ${Math.round(scanMs)}ms / 缓存读取 ${Math.round(cacheReadMs)}ms / ${fromCache ? '索引重建' : '源码分析'} ${Math.round(analyzeMs)}ms / 缓存写入 ${Math.round(cacheWriteMs)}ms`);
+  return { model, fromCache, loadMs };
+}
+
+/** 加载完成后整体切换会话，工程标注仍以 project_id 为准。 */
+async function openTarget(targetPath, { first = false, selection } = {}) {
+  const abs = path.resolve(targetPath);
+  const entry = fs.statSync(abs, { throwIfNoEntry: false });
+  if (!entry) throw new Error(`路径不存在：${abs}`);
+  const isFile = entry.isFile();
+  const label = path.basename(isFile ? path.dirname(abs) : abs) || abs;
+  const parserId = selection?.parserId ?? configuredParser();
+  console.log(`[加载] ${abs}`);
+  let loaded, fallback = null;
+  try {
+    loaded = await loadTargetModel(abs, isFile, parserId, selection?.parserOptions ?? parserOptionsFor(parserId));
+  } catch (error) {
+    if (selection || parserId === 'builtin' || (isFile && /\.(dot|gv)$/i.test(abs))) throw error;
+    fallback = `${parserId} 加载失败，已回退到内置快速解析：${error.message}`;
+    console.warn(`[解析器] ${fallback}`);
+    loaded = await loadTargetModel(abs, isFile, 'builtin', {});
+  }
+  const { model, fromCache, loadMs } = loaded;
   const st = stats(model);
   const project = store.upsertProject({
     path: abs,
@@ -277,9 +298,14 @@ async function openTarget(targetPath, { first = false } = {}) {
   ov.deleted.nodes = ov.deleted.nodes || {};
   ov.deleted.edges = ov.deleted.edges || {};
 
+  if (selection) store.transaction(() => {
+    store.setSetting('parser.active', selection.parserId);
+    if (selection.parserId === 'clang-ast') store.setSetting('parser.compileCommandsPath', selection.parserOptions.compileCommandsPath);
+  });
   root = abs;
   ROOT_LABEL = project.name;
   MODEL = model;
+  parserFallback = fallback;
   S = st;
   PROJECT = project;
   COMPARISON = null;
@@ -297,7 +323,6 @@ async function openTarget(targetPath, { first = false } = {}) {
       fromCache ? '（解析缓存）' : ''
     }`
   );
-  if (scan) console.log(`[耗时] 文件清单 ${Math.round(scanMs)}ms / 缓存读取 ${Math.round(cacheReadMs)}ms / ${fromCache ? '索引重建' : '源码分析'} ${Math.round(analyzeMs)}ms / 缓存写入 ${Math.round(cacheWriteMs)}ms`);
   console.log(`[存储] ${store.file} · 工程 #${project.id} ${project.isNew ? '(新建)' : ''}`);
   return { project, stats: st };
 }
@@ -1087,9 +1112,10 @@ async function buildView(
   if (!clean.length) {
     if (varSel.preview) return { nodes: [], edges: [], projectId, truncated, ...recommendations([], []),
       ...(COMPARISON ? { comparison: comparisonInfo() } : {}) };
-    const emptyLayout = previous ? await layoutElk([], [], { group, rootLabel: ROOT_LABEL, previous })
+    const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
+    const emptyLayout = previous ? await layoutElk([], [], { group, groupMode, rootLabel: ROOT_LABEL, previous })
       : { nodes: [], edges: [], groups: [], containers: [], width: 480, height: 260 };
-    return { ...emptyLayout, root: g.root, roots,
+    return { ...emptyLayout, root: g.root, roots, groupMode,
       empty: true, projectId, expansions: cleanExpansions, comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
 
@@ -1167,7 +1193,8 @@ async function buildView(
     const numbers = getCallOrder(e);
     if (numbers) e.callNumbers = numbers;
   }
-  const laid = await layoutElk(clean, viewEdges, { group, rootLabel: ROOT_LABEL, previous });
+  const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
+  const laid = await layoutElk(clean, viewEdges, { group, groupMode, rootLabel: ROOT_LABEL, previous });
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -1189,7 +1216,7 @@ async function buildView(
       e.label = labels[0];
     }
   }
-  return { ...laid, root: g.root, roots, expansions: cleanExpansions, truncated, layoutEngine: 'elk', projectId, macroNameMode,
+  return { ...laid, root: g.root, roots, groupMode, expansions: cleanExpansions, truncated, layoutEngine: 'elk', projectId, macroNameMode,
     ...(!roots.length && !cleanExpansions.length ? { empty: true } : {}),
     comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: laid.nodes.length, truncated } : null };
 }
@@ -1240,7 +1267,8 @@ const server = http.createServer(async (req, res) => {
   let u;
   try {
     u = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/apply', '/api/compare/exit'].includes(u.pathname);
+    req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/apply', '/api/compare/exit',
+      '/api/parsers', '/api/parsers/diff'].includes(u.pathname);
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
@@ -1309,6 +1337,42 @@ const server = http.createServer(async (req, res) => {
       const level = mcpAccess();
       const source = MCP_LEVELS.includes(env) ? 'env' : store.getSetting('mcp.access', null) ? 'setting' : 'default';
       return json(res, { level, source });
+    }
+
+    if (u.pathname === '/api/flowchart' && req.method === 'GET') {
+      const { origin, host } = req.headers;
+      if ((origin && (!LOCAL_ORIGIN.test(origin) || new URL(origin).host !== host.toLowerCase())) ||
+          ['cross-site', 'same-site'].includes(req.headers['sec-fetch-site'])) {
+        return json(res, { ok: false, error: 'forbidden origin' }, 403);
+      }
+      const base = MODEL, comparison = COMPARISON, project = PROJECT;
+      const q = u.searchParams;
+      const changed = () => switching || MODEL !== base || COMPARISON !== comparison || PROJECT !== project ||
+        (q.has('projectId') && q.get('projectId') !== String(project.id)) ||
+        (q.has('comparisonId') && q.get('comparisonId') !== (comparison?.id ?? ''));
+      const conflict = () => json(res, { ok: false, error: '工程或比较版本已切换，请重新选择函数' }, 409);
+      if (changed()) return conflict();
+      const id = q.get('id');
+      const version = q.get('version') ?? 'after';
+      const expand = q.get('expandMacros') ?? '0';
+      if (!id?.trim() || !['before', 'after'].includes(version) || !['0', '1'].includes(expand)) {
+        return bad(res, '请传入有效的函数 ID、version 和 expandMacros');
+      }
+      const model = version === 'before' ? comparison?.beforeModel : comparison?.afterModel || base;
+      const fn = model?._index.byId.get(id);
+      if (!fn) return json(res, { ok: false, error: '此版本找不到该函数' }, 404);
+      if (!isFlowchartFunction(fn)) return bad(res, '该节点没有可生成流程图的函数定义');
+      try {
+        const result = await buildFlowchart(model, fn, {
+          version, expandMacros: expand === '1',
+          hasBefore: isFlowchartFunction(comparison?.beforeModel._index.byId.get(id)),
+          hasAfter: isFlowchartFunction((comparison?.afterModel || base)._index.byId.get(id)),
+          sourceRoot: version === 'before' ? comparison?.beforePath : comparison?.afterPath,
+        });
+        return changed() ? conflict() : json(res, result);
+      } catch (err) {
+        return changed() ? conflict() : bad(res, err.message);
+      }
     }
 
     if (u.pathname === '/api/source' && req.method === 'GET') {
@@ -1485,6 +1549,66 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (u.pathname === '/api/parsers' && req.method === 'GET') {
+      const scanRoot = fs.statSync(root, { throwIfNoEntry: false })?.isFile() ? path.dirname(root) : root;
+      const parsers = listParsers().map((parser) => {
+        const options = parserOptionsFor(parser.id);
+        const status = parser.available(options);
+        const database = parser.id === 'clang-ast' && findCompileCommands(scanRoot, options.compileCommandsPath);
+        return { id: parser.id, name: parser.name, available: status.ok, reason: status.reason || null,
+          hasCompileCommands: !!(database && fs.statSync(database, { throwIfNoEntry: false })?.isFile()) };
+      });
+      return json(res, { ok: true, active: MODEL.parserId, configured: configuredParser(), parsers, fallbackReason: parserFallback });
+    }
+
+    if (u.pathname === '/api/parsers' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      switching = true;
+      try {
+        const { parserId, compileCommandsPath } = await readJson(req, res);
+        if (!getParser(parserId) || typeof parserId !== 'string') return bad(res, '未知解析器');
+        const isDot = fs.statSync(root).isFile() && /\.(dot|gv)$/i.test(root);
+        if (isDot !== (parserId === 'dot')) return bad(res, '所选解析器与当前工程文件类型不匹配');
+        if (compileCommandsPath !== undefined && (parserId !== 'clang-ast' ||
+            (compileCommandsPath !== null && (typeof compileCommandsPath !== 'string'
+              || !compileCommandsPath.trim() || compileCommandsPath.includes('\0'))))) {
+          return bad(res, 'compileCommandsPath 必须是 Clang 编译数据库的文件路径');
+        }
+        const parserOptions = parserOptionsFor(parserId);
+        if (compileCommandsPath !== undefined) parserOptions.compileCommandsPath = compileCommandsPath;
+        const { stats: st } = await openTarget(root, { selection: { parserId, parserOptions } });
+        comparisonPreview = null;
+        comparisonBase = null;
+        broadcastChange('project.switch', 'user', { project: ROOT_LABEL, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
+        return json(res, { ok: true, active: MODEL.parserId, configured: configuredParser(), parser: parserInfo(), stats: st,
+          warnings: MODEL.warnings });
+      } catch (error) {
+        if (!res.headersSent) return json(res, { ok: false, error: error.message }, 400);
+      } finally { switching = false; }
+      return;
+    }
+
+    if (u.pathname === '/api/parsers/diff' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      switching = true;
+      try {
+        const { other, parserId = MODEL.parserId } = await readJson(req, res);
+        if (typeof parserId !== 'string' || typeof other !== 'string' || !getParser(parserId) || !getParser(other)
+            || parserId === other || [parserId, other].includes('dot') || MODEL.parserId === 'dot') {
+          return bad(res, '请选择两个不同的源码解析器');
+        }
+        const isFile = fs.statSync(root).isFile();
+        const { model: a } = await loadTargetModel(root, isFile, parserId, parserOptionsFor(parserId));
+        const { model: b } = await loadTargetModel(root, isFile, other, parserOptionsFor(other));
+        await Promise.all([buildDataflowIndex(a), buildDataflowIndex(b)]);
+        return json(res, { ok: true, a: parserId, b: other, ...diffParserModels(a, b),
+          warnings: { a: a.warnings, b: b.warnings }, failedFiles: { a: a._df.failedFiles, b: b._df.failedFiles } });
+      } catch (error) {
+        if (!res.headersSent) return json(res, { ok: false, error: error.message }, 400);
+      } finally { switching = false; }
+      return;
+    }
+
     if (u.pathname === '/api/stats') {
       const tasks = () => COMPARISON ? [
         ...projectTasks(COMPARISON.beforeModel).map(task => ({ ...task, version: 'before' })),
@@ -1492,10 +1616,12 @@ const server = http.createServer(async (req, res) => {
       ] : projectTasks(MODEL);
       if (u.searchParams.get('summary') === '1') {
         const { cycleGroups, selfLoops, ...stats } = S;
-        return json(res, u.searchParams.get('tasks') === '1' ? { stats, projectId: PROJECT.id, tasks: tasks() } : { stats });
+        return json(res, u.searchParams.get('tasks') === '1'
+          ? { stats, parser: parserInfo(), projectId: PROJECT.id, tasks: tasks() } : { stats, parser: parserInfo() });
       }
       return json(res, {
         stats: S,
+        parser: parserInfo(),
         projectId: PROJECT.id, tasks: tasks(),
         root,
         macros: MODEL.macros
@@ -1534,6 +1660,8 @@ const server = http.createServer(async (req, res) => {
         scannedFingerprint: PROJECT.prevFingerprint || PROJECT.fingerprint,
         changed: !!PROJECT.prevFingerprint && PROJECT.prevFingerprint !== fp,
         db: store.file,
+        parser: parserInfo(),
+        parserFallback,
         comparison: comparisonInfo(),
       });
     }
@@ -1652,7 +1780,8 @@ const server = http.createServer(async (req, res) => {
           overlay = nextOverlay;
           comparisonPreview = null;
         } else {
-          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath);
+          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath,
+            { parserId: MODEL.parserId, parserOptions: parserOptionsFor(MODEL.parserId) });
           const candidates = [...comparison.model.functions, ...comparison.model.variables].filter((n) => !n.external)
             .map((n) => ({ id: n.id, name: n.name, file: n.file, line: n.line, kind: n.kind, ...comparisonItem(n) }));
           comparisonPreview = { id: randomUUID(), projectId: PROJECT.id, model: MODEL, comparison, candidateIds: new Set(candidates.map((n) => n.id)) };
@@ -1693,6 +1822,7 @@ const server = http.createServer(async (req, res) => {
         json(res, {
           ok: true,
           project: { id: project.id, name: project.name, path: root },
+          parser: parserInfo(), parserFallback,
           stats: st,
         });
       } catch (err) {
@@ -2096,12 +2226,15 @@ const server = http.createServer(async (req, res) => {
         : []);
       const up = Number(u.searchParams.get('up') ?? 1);
       const down = Number(u.searchParams.get('down') ?? 1);
-      const group = u.searchParams.get('group') !== '0';
-      if (previous && !!(previous.groups.length || previous.layoutSlots?.groups?.length) !== group) previous = null;
+      const rawGroupMode = u.searchParams.get('groupMode');
+      const group = rawGroupMode ? rawGroupMode !== 'flat' : u.searchParams.get('group') !== '0';
+      const groupMode = ['file', 'period', 'flat'].includes(rawGroupMode) ? rawGroupMode : (group ? 'file' : 'flat');
+      const prevMode = previous && (previous.groupMode || ((previous.groups.length || previous.layoutSlots?.groups?.length) ? 'file' : 'flat'));
+      if (previous && prevMode !== groupMode) previous = null;
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions,
-        preview: u.searchParams.get('preview') === '1' };
+        groupMode, preview: u.searchParams.get('preview') === '1' };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
       const reviewSnapshot = at > 0 && useSnapshot ? store.viewAt(PROJECT.id, at) : undefined;

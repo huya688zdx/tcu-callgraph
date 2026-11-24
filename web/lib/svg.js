@@ -6,7 +6,7 @@ import { isDataEdge, svgMarkers } from './edge-flow.js';
 import { t } from '../i18n.js';
 import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
-import { periodSubtitle } from './period-text.js';
+import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from './period-text.js';
 import { labelSvg } from '/core/labels.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
@@ -62,14 +62,15 @@ function buildSVG() {
   if (v.containers) {
     // 浅的先画（外层容器垫底），与画布绘制顺序一致
     for (const c of [...v.containers].sort((a, b) => a.depth - b.depth)) {
+      const style = periodContainerStyle(c.kind);
       out.push(
-        `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="${hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04))}" stroke="${hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08))}" stroke-width="1.4"/>`
+        `<rect x="${c.x.toFixed(1)}" y="${c.y.toFixed(1)}" width="${c.w.toFixed(1)}" height="${c.h.toFixed(1)}" rx="14" fill="${style?.body || hexToRgba(THEME.container.fill, 0.16 + Math.min(0.1, c.depth * 0.04))}" stroke="${style?.border || hexToRgba(THEME.container.stroke, 0.55 + Math.min(0.25, c.depth * 0.08))}" stroke-width="1.4"${style?.dashed ? ' stroke-dasharray="7 5"' : ''}/>`
       );
       const fs = 12, bh = fs * 1.4;
       els.ctx.save(); els.ctx.font = `600 ${fs}px ${FONT}`;
       const tw = els.ctx.measureText(String(c.label)).width; els.ctx.restore();
-      out.push(`<rect x="${c.x + 6}" y="${c.y + 4}" width="${tw + fs}" height="${bh}" rx="${bh / 2}" fill="${hexToRgba(THEME.container.stroke, 0.32)}" stroke="${hexToRgba(THEME.container.stroke, 0.55)}"/>`);
-      out.push(`<text x="${c.x + 6 + fs * 0.5}" y="${c.y + 4 + bh / 2 + 0.5}" dominant-baseline="middle" font-size="${fs}" font-weight="600" fill="#0C447C">${esc(c.label)}</text>`);
+      out.push(`<rect x="${c.x + 6}" y="${c.y + 4}" width="${tw + fs}" height="${bh}" rx="${bh / 2}" fill="${style?.fill || hexToRgba(THEME.container.stroke, 0.32)}" stroke="${style?.border || hexToRgba(THEME.container.stroke, 0.55)}"/>`);
+      out.push(`<text x="${c.x + 6 + fs * 0.5}" y="${c.y + 4 + bh / 2 + 0.5}" dominant-baseline="middle" font-size="${fs}" font-weight="600" fill="${style?.ink || '#0C447C'}">${esc(c.label)}</text>`);
     }
   }
 
@@ -135,6 +136,14 @@ function buildSVG() {
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || sub)}</text>`
     );
+    const badge = !v.comparison && !period && nodePeriodBadge(n);
+    if (badge) out.push(periodBadgeSvg(n, badge, esc, (text, size) => {
+      els.ctx.save();
+      els.ctx.font = `600 ${size}px ${FONT}`;
+      const width = els.ctx.measureText(text).width;
+      els.ctx.restore();
+      return width;
+    }));
     out.push('</g>');
   }
 

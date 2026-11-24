@@ -1,0 +1,287 @@
+{"id": "0x1", "kind": "TranslationUnitDecl", "loc": {}, "range": {"begin":{},"end":{}}, "inner": [
+  {"id": "0x2", "kind": "TypedefDecl", "loc": {"offset":85,"file":"./types.h","line":3,"col":16,"tokLen":2,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":70,"col":1,"tokLen":7,"includedFrom":{"file":"fixture.c"}},"end":{"offset":92,"col":23,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "Fn", "type": {"qualType":"void (*)(int)"}, "inner": [
+    {"id": "0x3", "kind": "PointerType", "type": {"qualType":"void (*)(int)"}, "inner": [
+      {"id": "0x4", "kind": "ParenType", "type": {"qualType":"void (int)"}, "inner": [
+        {"id": "0x5", "kind": "FunctionProtoType", "type": {"qualType":"void (int)"}, "cc": "cdecl", "inner": [
+          {"id": "0x6", "kind": "BuiltinType", "type": {"qualType":"void"}},
+          {"id": "0x7", "kind": "BuiltinType", "type": {"qualType":"int"}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x8", "kind": "RecordDecl", "loc": {"offset":103,"line":4,"col":9,"tokLen":6,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":103,"col":9,"tokLen":6,"includedFrom":{"file":"fixture.c"}},"end":{"offset":130,"col":36,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "tagUsed": "struct", "completeDefinition": true, "inner": [
+    {"id": "0x9", "kind": "FieldDecl", "loc": {"offset":115,"col":21,"tokLen":5,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":112,"col":18,"tokLen":2,"includedFrom":{"file":"fixture.c"}},"end":{"offset":115,"col":21,"tokLen":5,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "enter", "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}},
+    {"id": "0xa", "kind": "FieldDecl", "loc": {"offset":125,"col":31,"tokLen":3,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":122,"col":28,"tokLen":2,"includedFrom":{"file":"fixture.c"}},"end":{"offset":125,"col":31,"tokLen":3,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "run", "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}}
+  ]},
+  {"id": "0xb", "kind": "TypedefDecl", "loc": {"offset":132,"col":38,"tokLen":9,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":95,"col":1,"tokLen":7,"includedFrom":{"file":"fixture.c"}},"end":{"offset":132,"col":38,"tokLen":9,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "StateStep", "type": {"desugaredQualType":"StateStep","qualType":"struct StateStep"}, "inner": [
+    {"id": "0xc", "kind": "ElaboratedType", "type": {"qualType":"struct StateStep"}, "ownedTagDecl": {"id":"0x8","kind":"RecordDecl","name":""}, "inner": [
+      {"id": "0xd", "kind": "RecordType", "type": {"qualType":"StateStep"}, "decl": {"id":"0x8","kind":"RecordDecl","name":""}}
+    ]}
+  ]},
+  {"id": "0xe", "kind": "RecordDecl", "loc": {"offset":151,"line":5,"col":9,"tokLen":6,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":151,"col":9,"tokLen":6,"includedFrom":{"file":"fixture.c"}},"end":{"offset":182,"col":40,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "tagUsed": "struct", "completeDefinition": true, "inner": [
+    {"id": "0xf", "kind": "FieldDecl", "loc": {"offset":164,"col":22,"tokLen":5,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":160,"col":18,"tokLen":3,"includedFrom":{"file":"fixture.c"}},"end":{"offset":164,"col":22,"tokLen":5,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "count", "type": {"qualType":"int"}},
+    {"id": "0x10", "kind": "FieldDecl", "loc": {"offset":175,"col":33,"tokLen":5,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":171,"col":29,"tokLen":3,"includedFrom":{"file":"fixture.c"}},"end":{"offset":175,"col":33,"tokLen":5,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "other", "type": {"qualType":"int"}}
+  ]},
+  {"id": "0x11", "kind": "TypedefDecl", "loc": {"offset":184,"col":42,"tokLen":5,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":143,"col":1,"tokLen":7,"includedFrom":{"file":"fixture.c"}},"end":{"offset":184,"col":42,"tokLen":5,"includedFrom":{"file":"fixture.c"}}}, "isReferenced": true, "name": "State", "type": {"desugaredQualType":"State","qualType":"struct State"}, "inner": [
+    {"id": "0x12", "kind": "ElaboratedType", "type": {"qualType":"struct State"}, "ownedTagDecl": {"id":"0xe","kind":"RecordDecl","name":""}, "inner": [
+      {"id": "0x13", "kind": "RecordType", "type": {"qualType":"State"}, "decl": {"id":"0xe","kind":"RecordDecl","name":""}}
+    ]}
+  ]},
+  {"id": "0x14", "kind": "FunctionDecl", "loc": {"offset":209,"line":6,"col":19,"tokLen":12,"includedFrom":{"file":"fixture.c"}}, "range": {"begin":{"offset":191,"col":1,"tokLen":6,"includedFrom":{"file":"fixture.c"}},"end":{"offset":240,"col":50,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "isUsed": true, "name": "header_value", "mangledName": "header_value", "type": {"qualType":"int (void)"}, "storageClass": "static", "inline": true, "inner": [
+    {"id": "0x15", "kind": "CompoundStmt", "range": {"begin":{"offset":228,"col":38,"tokLen":1,"includedFrom":{"file":"fixture.c"}},"end":{"offset":240,"col":50,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "inner": [
+      {"id": "0x16", "kind": "ReturnStmt", "range": {"begin":{"offset":230,"col":40,"tokLen":6,"includedFrom":{"file":"fixture.c"}},"end":{"offset":237,"col":47,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "inner": [
+        {"id": "0x17", "kind": "IntegerLiteral", "range": {"begin":{"offset":237,"col":47,"tokLen":1,"includedFrom":{"file":"fixture.c"}},"end":{"offset":237,"col":47,"tokLen":1,"includedFrom":{"file":"fixture.c"}}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "2"}
+      ]}
+    ]}
+  ]},
+  {"id": "0x18", "kind": "VarDecl", "loc": {"offset":54,"file":"fixture.c","line":4,"col":7,"tokLen":7}, "range": {"begin":{"offset":48,"col":1,"tokLen":5},"end":{"offset":54,"col":7,"tokLen":7}}, "isUsed": true, "name": "g_state", "mangledName": "g_state", "type": {"qualType":"State","typeAliasDeclId":"0x11"}},
+  {"id": "0x19", "kind": "VarDecl", "loc": {"offset":67,"line":5,"col":5,"tokLen":7}, "range": {"begin":{"offset":63,"col":1,"tokLen":3},"end":{"offset":67,"col":5,"tokLen":7}}, "isUsed": true, "name": "g_index", "mangledName": "g_index", "type": {"qualType":"int"}},
+  {"id": "0x1a", "kind": "FunctionDecl", "loc": {"offset":88,"line":6,"col":13,"tokLen":7}, "range": {"begin":{"offset":76,"col":1,"tokLen":6},"end":{"offset":124,"col":49,"tokLen":1}}, "isUsed": true, "name": "Enter_A", "mangledName": "Enter_A", "type": {"qualType":"void (int)"}, "storageClass": "static", "inner": [
+    {"id": "0x1b", "kind": "ParmVarDecl", "loc": {"offset":100,"col":25,"tokLen":1}, "range": {"begin":{"offset":96,"col":21,"tokLen":3},"end":{"offset":100,"col":25,"tokLen":1}}, "isUsed": true, "name": "x", "type": {"qualType":"int"}},
+    {"id": "0x1c", "kind": "CompoundStmt", "range": {"begin":{"offset":103,"col":28,"tokLen":1},"end":{"offset":124,"col":49,"tokLen":1}}, "inner": [
+      {"id": "0x1d", "kind": "BinaryOperator", "range": {"begin":{"offset":105,"col":30,"tokLen":7},"end":{"offset":121,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "opcode": "=", "inner": [
+        {"id": "0x1e", "kind": "MemberExpr", "range": {"begin":{"offset":105,"col":30,"tokLen":7},"end":{"offset":113,"col":38,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "count", "isArrow": false, "referencedMemberDecl": "0xf", "inner": [
+          {"id": "0x1f", "kind": "DeclRefExpr", "range": {"begin":{"offset":105,"col":30,"tokLen":7},"end":{"offset":105,"col":30,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+        ]},
+        {"id": "0x20", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":121,"col":46,"tokLen":1},"end":{"offset":121,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x21", "kind": "DeclRefExpr", "range": {"begin":{"offset":121,"col":46,"tokLen":1},"end":{"offset":121,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x1b","kind":"ParmVarDecl","name":"x","type":{"qualType":"int"}}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x22", "kind": "FunctionDecl", "loc": {"offset":138,"line":7,"col":13,"tokLen":5}, "range": {"begin":{"offset":126,"col":1,"tokLen":6},"end":{"offset":173,"col":48,"tokLen":1}}, "isUsed": true, "name": "Run_A", "mangledName": "Run_A", "type": {"qualType":"void (int)"}, "storageClass": "static", "inner": [
+    {"id": "0x23", "kind": "ParmVarDecl", "loc": {"offset":148,"col":23,"tokLen":1}, "range": {"begin":{"offset":144,"col":19,"tokLen":3},"end":{"offset":148,"col":23,"tokLen":1}}, "isUsed": true, "name": "x", "type": {"qualType":"int"}},
+    {"id": "0x24", "kind": "CompoundStmt", "range": {"begin":{"offset":151,"col":26,"tokLen":1},"end":{"offset":173,"col":48,"tokLen":1}}, "inner": [
+      {"id": "0x25", "kind": "CompoundAssignOperator", "range": {"begin":{"offset":153,"col":28,"tokLen":7},"end":{"offset":170,"col":45,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "opcode": "+=", "computeLHSType": {"qualType":"int"}, "computeResultType": {"qualType":"int"}, "inner": [
+        {"id": "0x26", "kind": "MemberExpr", "range": {"begin":{"offset":153,"col":28,"tokLen":7},"end":{"offset":161,"col":36,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "count", "isArrow": false, "referencedMemberDecl": "0xf", "inner": [
+          {"id": "0x27", "kind": "DeclRefExpr", "range": {"begin":{"offset":153,"col":28,"tokLen":7},"end":{"offset":153,"col":28,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+        ]},
+        {"id": "0x28", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":170,"col":45,"tokLen":1},"end":{"offset":170,"col":45,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x29", "kind": "DeclRefExpr", "range": {"begin":{"offset":170,"col":45,"tokLen":1},"end":{"offset":170,"col":45,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x23","kind":"ParmVarDecl","name":"x","type":{"qualType":"int"}}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x2a", "kind": "FunctionDecl", "loc": {"offset":187,"line":8,"col":13,"tokLen":7}, "range": {"begin":{"offset":175,"col":1,"tokLen":6},"end":{"offset":223,"col":49,"tokLen":1}}, "isUsed": true, "name": "Enter_B", "mangledName": "Enter_B", "type": {"qualType":"void (int)"}, "storageClass": "static", "inner": [
+    {"id": "0x2b", "kind": "ParmVarDecl", "loc": {"offset":199,"col":25,"tokLen":1}, "range": {"begin":{"offset":195,"col":21,"tokLen":3},"end":{"offset":199,"col":25,"tokLen":1}}, "isUsed": true, "name": "x", "type": {"qualType":"int"}},
+    {"id": "0x2c", "kind": "CompoundStmt", "range": {"begin":{"offset":202,"col":28,"tokLen":1},"end":{"offset":223,"col":49,"tokLen":1}}, "inner": [
+      {"id": "0x2d", "kind": "BinaryOperator", "range": {"begin":{"offset":204,"col":30,"tokLen":7},"end":{"offset":220,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "opcode": "=", "inner": [
+        {"id": "0x2e", "kind": "MemberExpr", "range": {"begin":{"offset":204,"col":30,"tokLen":7},"end":{"offset":212,"col":38,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "other", "isArrow": false, "referencedMemberDecl": "0x10", "inner": [
+          {"id": "0x2f", "kind": "DeclRefExpr", "range": {"begin":{"offset":204,"col":30,"tokLen":7},"end":{"offset":204,"col":30,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+        ]},
+        {"id": "0x30", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":220,"col":46,"tokLen":1},"end":{"offset":220,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x31", "kind": "DeclRefExpr", "range": {"begin":{"offset":220,"col":46,"tokLen":1},"end":{"offset":220,"col":46,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x2b","kind":"ParmVarDecl","name":"x","type":{"qualType":"int"}}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x32", "kind": "FunctionDecl", "loc": {"offset":237,"line":9,"col":13,"tokLen":5}, "range": {"begin":{"offset":225,"col":1,"tokLen":6},"end":{"offset":269,"col":45,"tokLen":1}}, "isUsed": true, "name": "Run_B", "mangledName": "Run_B", "type": {"qualType":"void (int)"}, "storageClass": "static", "inner": [
+    {"id": "0x33", "kind": "ParmVarDecl", "loc": {"offset":247,"col":23,"tokLen":1}, "range": {"begin":{"offset":243,"col":19,"tokLen":3},"end":{"offset":247,"col":23,"tokLen":1}}, "name": "x", "type": {"qualType":"int"}},
+    {"id": "0x34", "kind": "CompoundStmt", "range": {"begin":{"offset":250,"col":26,"tokLen":1},"end":{"offset":269,"col":45,"tokLen":1}}, "inner": [
+      {"id": "0x35", "kind": "UnaryOperator", "range": {"begin":{"offset":252,"col":28,"tokLen":2},"end":{"offset":262,"col":38,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "isPostfix": false, "opcode": "++", "inner": [
+        {"id": "0x36", "kind": "MemberExpr", "range": {"begin":{"offset":254,"col":30,"tokLen":7},"end":{"offset":262,"col":38,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "other", "isArrow": false, "referencedMemberDecl": "0x10", "inner": [
+          {"id": "0x37", "kind": "DeclRefExpr", "range": {"begin":{"offset":254,"col":30,"tokLen":7},"end":{"offset":254,"col":30,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x38", "kind": "FunctionDecl", "loc": {"offset":283,"line":10,"col":13,"tokLen":5}, "range": {"begin":{"offset":271,"col":1,"tokLen":6},"end":{"offset":325,"col":55,"tokLen":1}}, "isUsed": true, "name": "Wrong", "mangledName": "Wrong", "type": {"qualType":"void (double)"}, "storageClass": "static", "inner": [
+    {"id": "0x39", "kind": "ParmVarDecl", "loc": {"offset":296,"col":26,"tokLen":1}, "range": {"begin":{"offset":289,"col":19,"tokLen":6},"end":{"offset":296,"col":26,"tokLen":1}}, "isUsed": true, "name": "x", "type": {"qualType":"double"}},
+    {"id": "0x3a", "kind": "CompoundStmt", "range": {"begin":{"offset":299,"col":29,"tokLen":1},"end":{"offset":325,"col":55,"tokLen":1}}, "inner": [
+      {"id": "0x3b", "kind": "BinaryOperator", "range": {"begin":{"offset":301,"col":31,"tokLen":7},"end":{"offset":322,"col":52,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "opcode": "=", "inner": [
+        {"id": "0x3c", "kind": "MemberExpr", "range": {"begin":{"offset":301,"col":31,"tokLen":7},"end":{"offset":309,"col":39,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "other", "isArrow": false, "referencedMemberDecl": "0x10", "inner": [
+          {"id": "0x3d", "kind": "DeclRefExpr", "range": {"begin":{"offset":301,"col":31,"tokLen":7},"end":{"offset":301,"col":31,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+        ]},
+        {"id": "0x3e", "kind": "CStyleCastExpr", "range": {"begin":{"offset":317,"col":47,"tokLen":1},"end":{"offset":322,"col":52,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "FloatingToIntegral", "inner": [
+          {"id": "0x3f", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":322,"col":52,"tokLen":1},"end":{"offset":322,"col":52,"tokLen":1}}, "type": {"qualType":"double"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "isPartOfExplicitCast": true, "inner": [
+            {"id": "0x40", "kind": "DeclRefExpr", "range": {"begin":{"offset":322,"col":52,"tokLen":1},"end":{"offset":322,"col":52,"tokLen":1}}, "type": {"qualType":"double"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x39","kind":"ParmVarDecl","name":"x","type":{"qualType":"double"}}}
+          ]}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x41", "kind": "VarDecl", "loc": {"offset":334,"line":11,"col":8,"tokLen":13}, "range": {"begin":{"offset":327,"col":1,"tokLen":4},"end":{"offset":359,"col":33,"tokLen":5}}, "name": "wrong_handler", "mangledName": "wrong_handler", "type": {"qualType":"void (*)(double)"}, "init": "c", "inner": [
+    {"id": "0x42", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":359,"col":33,"tokLen":5},"end":{"offset":359,"col":33,"tokLen":5}}, "type": {"qualType":"void (*)(double)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+      {"id": "0x43", "kind": "DeclRefExpr", "range": {"begin":{"offset":359,"col":33,"tokLen":5},"end":{"offset":359,"col":33,"tokLen":5}}, "type": {"qualType":"void (double)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x38","kind":"FunctionDecl","name":"Wrong","type":{"qualType":"void (double)"}}}
+    ]}
+  ]},
+  {"id": "0x44", "kind": "TypedefDecl", "loc": {"offset":381,"line":12,"col":16,"tokLen":7}, "range": {"begin":{"offset":366,"col":1,"tokLen":7},"end":{"offset":394,"col":29,"tokLen":1}}, "isReferenced": true, "name": "Unknown", "type": {"qualType":"void (*)(char)"}, "inner": [
+    {"id": "0x45", "kind": "PointerType", "type": {"qualType":"void (*)(char)"}, "inner": [
+      {"id": "0x46", "kind": "ParenType", "type": {"qualType":"void (char)"}, "inner": [
+        {"id": "0x47", "kind": "FunctionProtoType", "type": {"qualType":"void (char)"}, "cc": "cdecl", "inner": [
+          {"id": "0x6", "kind": "BuiltinType", "type": {"qualType":"void"}},
+          {"id": "0x48", "kind": "BuiltinType", "type": {"qualType":"char"}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x49", "kind": "VarDecl", "loc": {"offset":414,"line":14,"col":17,"tokLen":5}, "range": {"begin":{"offset":398,"col":1,"tokLen":5},"end":{"offset":481,"col":84,"tokLen":1}}, "isUsed": true, "name": "g_tbl", "mangledName": "g_tbl", "type": {"qualType":"const StateStep[2]"}, "init": "c", "inner": [
+    {"id": "0x4a", "kind": "InitListExpr", "range": {"begin":{"offset":424,"col":27,"tokLen":1},"end":{"offset":481,"col":84,"tokLen":1}}, "type": {"qualType":"const StateStep[2]"}, "valueCategory": "prvalue", "inner": [
+      {"id": "0x4b", "kind": "InitListExpr", "range": {"begin":{"offset":426,"col":29,"tokLen":1},"end":{"offset":443,"col":46,"tokLen":1}}, "type": {"qualType":"StateStep","typeAliasDeclId":"0xb"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x4c", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":428,"col":31,"tokLen":7},"end":{"offset":428,"col":31,"tokLen":7}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x4d", "kind": "DeclRefExpr", "range": {"begin":{"offset":428,"col":31,"tokLen":7},"end":{"offset":428,"col":31,"tokLen":7}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x1a","kind":"FunctionDecl","name":"Enter_A","type":{"qualType":"void (int)"}}}
+        ]},
+        {"id": "0x4e", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":437,"col":40,"tokLen":5},"end":{"offset":437,"col":40,"tokLen":5}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x4f", "kind": "DeclRefExpr", "range": {"begin":{"offset":437,"col":40,"tokLen":5},"end":{"offset":437,"col":40,"tokLen":5}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x22","kind":"FunctionDecl","name":"Run_A","type":{"qualType":"void (int)"}}}
+        ]}
+      ]},
+      {"id": "0x50", "kind": "InitListExpr", "range": {"begin":{"offset":446,"col":49,"tokLen":1},"end":{"offset":479,"col":82,"tokLen":1}}, "type": {"qualType":"StateStep","typeAliasDeclId":"0xb"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x51", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":471,"col":74,"tokLen":7},"end":{"offset":471,"col":74,"tokLen":7}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x52", "kind": "DeclRefExpr", "range": {"begin":{"offset":471,"col":74,"tokLen":7},"end":{"offset":471,"col":74,"tokLen":7}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x2a","kind":"FunctionDecl","name":"Enter_B","type":{"qualType":"void (int)"}}}
+        ]},
+        {"id": "0x53", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":455,"col":58,"tokLen":5},"end":{"offset":455,"col":58,"tokLen":5}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x54", "kind": "DeclRefExpr", "range": {"begin":{"offset":455,"col":58,"tokLen":5},"end":{"offset":455,"col":58,"tokLen":5}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x32","kind":"FunctionDecl","name":"Run_B","type":{"qualType":"void (int)"}}}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x55", "kind": "VarDecl", "loc": {"offset":493,"line":15,"col":10,"tokLen":10}, "range": {"begin":{"offset":484,"col":1,"tokLen":2},"end":{"offset":525,"col":42,"tokLen":1}}, "isUsed": true, "name": "g_handlers", "mangledName": "g_handlers", "type": {"qualType":"const Fn[2]"}, "init": "c", "inner": [
+    {"id": "0x56", "kind": "InitListExpr", "range": {"begin":{"offset":508,"col":25,"tokLen":1},"end":{"offset":525,"col":42,"tokLen":1}}, "type": {"qualType":"const Fn[2]"}, "valueCategory": "prvalue", "inner": [
+      {"id": "0x57", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":510,"col":27,"tokLen":7},"end":{"offset":510,"col":27,"tokLen":7}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+        {"id": "0x58", "kind": "DeclRefExpr", "range": {"begin":{"offset":510,"col":27,"tokLen":7},"end":{"offset":510,"col":27,"tokLen":7}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x1a","kind":"FunctionDecl","name":"Enter_A","type":{"qualType":"void (int)"}}}
+      ]},
+      {"id": "0x59", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":519,"col":36,"tokLen":5},"end":{"offset":519,"col":36,"tokLen":5}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+        {"id": "0x5a", "kind": "DeclRefExpr", "range": {"begin":{"offset":519,"col":36,"tokLen":5},"end":{"offset":519,"col":36,"tokLen":5}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x22","kind":"FunctionDecl","name":"Run_A","type":{"qualType":"void (int)"}}}
+      ]}
+    ]}
+  ]},
+  {"id": "0x5b", "kind": "VarDecl", "loc": {"offset":537,"line":16,"col":10,"tokLen":8}, "range": {"begin":{"offset":528,"col":1,"tokLen":2},"end":{"offset":567,"col":40,"tokLen":1}}, "isUsed": true, "name": "g_sparse", "mangledName": "g_sparse", "type": {"qualType":"const Fn[5]"}, "init": "c", "inner": [
+    {"id": "0x5c", "kind": "InitListExpr", "range": {"begin":{"offset":551,"col":24,"tokLen":1},"end":{"offset":567,"col":40,"tokLen":1}}, "type": {"qualType":"const Fn[5]"}, "valueCategory": "prvalue", "array_filler": [
+      {"id": "0x5d", "kind": "ImplicitValueInitExpr", "range": {"begin":{},"end":{}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue"},
+      {"id": "0x5d", "kind": "ImplicitValueInitExpr", "range": {"begin":{},"end":{}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue"},
+      {"id": "0x5d", "kind": "ImplicitValueInitExpr", "range": {"begin":{},"end":{}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue"},
+      {"id": "0x5d", "kind": "ImplicitValueInitExpr", "range": {"begin":{},"end":{}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue"},
+      {"id": "0x5e", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":559,"col":32,"tokLen":7},"end":{"offset":559,"col":32,"tokLen":7}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+        {"id": "0x5f", "kind": "DeclRefExpr", "range": {"begin":{"offset":559,"col":32,"tokLen":7},"end":{"offset":559,"col":32,"tokLen":7}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x2a","kind":"FunctionDecl","name":"Enter_B","type":{"qualType":"void (int)"}}}
+      ]}
+    ]}
+  ]},
+  {"id": "0x60", "kind": "FunctionDecl", "loc": {"offset":583,"line":18,"col":13,"tokLen":13}, "range": {"begin":{"offset":571,"col":1,"tokLen":6},"end":{"offset":613,"col":43,"tokLen":1}}, "isUsed": true, "name": "write_through", "mangledName": "write_through", "type": {"qualType":"void (int *)"}, "storageClass": "static", "inner": [
+    {"id": "0x61", "kind": "ParmVarDecl", "loc": {"offset":602,"col":32,"tokLen":1}, "range": {"begin":{"offset":597,"col":27,"tokLen":3},"end":{"offset":602,"col":32,"tokLen":1}}, "isUsed": true, "name": "p", "type": {"qualType":"int *"}},
+    {"id": "0x62", "kind": "CompoundStmt", "range": {"begin":{"offset":605,"col":35,"tokLen":1},"end":{"offset":613,"col":43,"tokLen":1}}, "inner": [
+      {"id": "0x63", "kind": "UnaryOperator", "range": {"begin":{"offset":607,"col":37,"tokLen":2},"end":{"offset":610,"col":40,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "isPostfix": false, "opcode": "++", "inner": [
+        {"id": "0x64", "kind": "UnaryOperator", "range": {"begin":{"offset":609,"col":39,"tokLen":1},"end":{"offset":610,"col":40,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "isPostfix": false, "opcode": "*", "canOverflow": false, "inner": [
+          {"id": "0x65", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":610,"col":40,"tokLen":1},"end":{"offset":610,"col":40,"tokLen":1}}, "type": {"qualType":"int *"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+            {"id": "0x66", "kind": "DeclRefExpr", "range": {"begin":{"offset":610,"col":40,"tokLen":1},"end":{"offset":610,"col":40,"tokLen":1}}, "type": {"qualType":"int *"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x61","kind":"ParmVarDecl","name":"p","type":{"qualType":"int *"}}}
+          ]}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x67", "kind": "FunctionDecl", "loc": {"offset":637,"line":20,"col":22,"tokLen":8}, "range": {"begin":{"spellingLoc":{"offset":621,"col":6,"tokLen":4},"expansionLoc":{"offset":616,"col":1,"tokLen":4,"isMacroArgExpansion":true}},"end":{"offset":824,"line":27,"col":1,"tokLen":1}}, "name": "Runnable", "mangledName": "Runnable", "type": {"qualType":"void (void)"}, "inner": [
+    {"id": "0x68", "kind": "CompoundStmt", "range": {"begin":{"offset":652,"line":20,"col":37,"tokLen":1},"end":{"offset":824,"line":27,"col":1,"tokLen":1}}, "inner": [
+      {"id": "0x69", "kind": "CallExpr", "range": {"begin":{"spellingLoc":{"offset":671,"line":21,"col":18,"tokLen":7},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":68,"file":"./types.h","line":2,"col":37,"tokLen":1,"includedFrom":{"file":"fixture.c"}},"expansionLoc":{"offset":658,"file":"fixture.c","line":21,"col":5,"tokLen":12}}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x6a", "kind": "ImplicitCastExpr", "range": {"begin":{"spellingLoc":{"offset":671,"col":18,"tokLen":7},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":671,"col":18,"tokLen":7},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}}}, "type": {"qualType":"void (*)(int)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x6b", "kind": "DeclRefExpr", "range": {"begin":{"spellingLoc":{"offset":671,"col":18,"tokLen":7},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":671,"col":18,"tokLen":7},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}}}, "type": {"qualType":"void (int)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x1a","kind":"FunctionDecl","name":"Enter_A","type":{"qualType":"void (int)"}}}
+        ]},
+        {"id": "0x6c", "kind": "CallExpr", "range": {"begin":{"spellingLoc":{"offset":680,"col":27,"tokLen":12},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":693,"col":40,"tokLen":1},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "inner": [
+          {"id": "0x6d", "kind": "ImplicitCastExpr", "range": {"begin":{"spellingLoc":{"offset":680,"col":27,"tokLen":12},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":680,"col":27,"tokLen":12},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}}}, "type": {"qualType":"int (*)(void)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+            {"id": "0x6e", "kind": "DeclRefExpr", "range": {"begin":{"spellingLoc":{"offset":680,"col":27,"tokLen":12},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}},"end":{"spellingLoc":{"offset":680,"col":27,"tokLen":12},"expansionLoc":{"offset":658,"col":5,"tokLen":12,"isMacroArgExpansion":true}}}, "type": {"qualType":"int (void)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x14","kind":"FunctionDecl","name":"header_value","type":{"qualType":"int (void)"}}}
+          ]}
+        ]}
+      ]},
+      {"id": "0x6f", "kind": "CallExpr", "range": {"begin":{"offset":701,"line":22,"col":5,"tokLen":5},"end":{"offset":717,"col":21,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x70", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":701,"col":5,"tokLen":5},"end":{"offset":710,"col":14,"tokLen":5}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x71", "kind": "MemberExpr", "range": {"begin":{"offset":701,"col":5,"tokLen":5},"end":{"offset":710,"col":14,"tokLen":5}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "name": "enter", "isArrow": false, "referencedMemberDecl": "0x9", "inner": [
+            {"id": "0x72", "kind": "ArraySubscriptExpr", "range": {"begin":{"offset":701,"col":5,"tokLen":5},"end":{"offset":708,"col":12,"tokLen":1}}, "type": {"qualType":"const StateStep","typeAliasDeclId":"0xb"}, "valueCategory": "lvalue", "inner": [
+              {"id": "0x73", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":701,"col":5,"tokLen":5},"end":{"offset":701,"col":5,"tokLen":5}}, "type": {"qualType":"const StateStep *"}, "valueCategory": "prvalue", "castKind": "ArrayToPointerDecay", "inner": [
+                {"id": "0x74", "kind": "DeclRefExpr", "range": {"begin":{"offset":701,"col":5,"tokLen":5},"end":{"offset":701,"col":5,"tokLen":5}}, "type": {"qualType":"const StateStep[2]"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x49","kind":"VarDecl","name":"g_tbl","type":{"qualType":"const StateStep[2]"}}}
+              ]},
+              {"id": "0x75", "kind": "IntegerLiteral", "range": {"begin":{"offset":707,"col":11,"tokLen":1},"end":{"offset":707,"col":11,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "1"}
+            ]}
+          ]}
+        ]},
+        {"id": "0x76", "kind": "IntegerLiteral", "range": {"begin":{"offset":716,"col":20,"tokLen":1},"end":{"offset":716,"col":20,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "1"}
+      ]},
+      {"id": "0x77", "kind": "CallExpr", "range": {"begin":{"offset":724,"line":23,"col":5,"tokLen":10},"end":{"offset":739,"col":20,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x78", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":724,"col":5,"tokLen":10},"end":{"offset":736,"col":17,"tokLen":1}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x79", "kind": "ArraySubscriptExpr", "range": {"begin":{"offset":724,"col":5,"tokLen":10},"end":{"offset":736,"col":17,"tokLen":1}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "inner": [
+            {"id": "0x7a", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":724,"col":5,"tokLen":10},"end":{"offset":724,"col":5,"tokLen":10}}, "type": {"qualType":"const Fn *"}, "valueCategory": "prvalue", "castKind": "ArrayToPointerDecay", "inner": [
+              {"id": "0x7b", "kind": "DeclRefExpr", "range": {"begin":{"offset":724,"col":5,"tokLen":10},"end":{"offset":724,"col":5,"tokLen":10}}, "type": {"qualType":"const Fn[2]"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x55","kind":"VarDecl","name":"g_handlers","type":{"qualType":"const Fn[2]"}}}
+            ]},
+            {"id": "0x7c", "kind": "IntegerLiteral", "range": {"begin":{"offset":735,"col":16,"tokLen":1},"end":{"offset":735,"col":16,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "1"}
+          ]}
+        ]},
+        {"id": "0x7d", "kind": "IntegerLiteral", "range": {"begin":{"offset":738,"col":19,"tokLen":1},"end":{"offset":738,"col":19,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "2"}
+      ]},
+      {"id": "0x7e", "kind": "CallExpr", "range": {"begin":{"offset":746,"line":24,"col":5,"tokLen":8},"end":{"offset":759,"col":18,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x7f", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":746,"col":5,"tokLen":8},"end":{"offset":756,"col":15,"tokLen":1}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x80", "kind": "ArraySubscriptExpr", "range": {"begin":{"offset":746,"col":5,"tokLen":8},"end":{"offset":756,"col":15,"tokLen":1}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "inner": [
+            {"id": "0x81", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":746,"col":5,"tokLen":8},"end":{"offset":746,"col":5,"tokLen":8}}, "type": {"qualType":"const Fn *"}, "valueCategory": "prvalue", "castKind": "ArrayToPointerDecay", "inner": [
+              {"id": "0x82", "kind": "DeclRefExpr", "range": {"begin":{"offset":746,"col":5,"tokLen":8},"end":{"offset":746,"col":5,"tokLen":8}}, "type": {"qualType":"const Fn[5]"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x5b","kind":"VarDecl","name":"g_sparse","type":{"qualType":"const Fn[5]"}}}
+            ]},
+            {"id": "0x83", "kind": "IntegerLiteral", "range": {"begin":{"offset":755,"col":14,"tokLen":1},"end":{"offset":755,"col":14,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "3"}
+          ]}
+        ]},
+        {"id": "0x84", "kind": "IntegerLiteral", "range": {"begin":{"offset":758,"col":17,"tokLen":1},"end":{"offset":758,"col":17,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "3"}
+      ]},
+      {"id": "0x85", "kind": "CallExpr", "range": {"begin":{"offset":766,"line":25,"col":5,"tokLen":5},"end":{"offset":786,"col":25,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x86", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":766,"col":5,"tokLen":5},"end":{"offset":781,"col":20,"tokLen":3}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x87", "kind": "MemberExpr", "range": {"begin":{"offset":766,"col":5,"tokLen":5},"end":{"offset":781,"col":20,"tokLen":3}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "name": "run", "isArrow": false, "referencedMemberDecl": "0xa", "inner": [
+            {"id": "0x88", "kind": "ArraySubscriptExpr", "range": {"begin":{"offset":766,"col":5,"tokLen":5},"end":{"offset":779,"col":18,"tokLen":1}}, "type": {"qualType":"const StateStep","typeAliasDeclId":"0xb"}, "valueCategory": "lvalue", "inner": [
+              {"id": "0x89", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":766,"col":5,"tokLen":5},"end":{"offset":766,"col":5,"tokLen":5}}, "type": {"qualType":"const StateStep *"}, "valueCategory": "prvalue", "castKind": "ArrayToPointerDecay", "inner": [
+                {"id": "0x8a", "kind": "DeclRefExpr", "range": {"begin":{"offset":766,"col":5,"tokLen":5},"end":{"offset":766,"col":5,"tokLen":5}}, "type": {"qualType":"const StateStep[2]"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x49","kind":"VarDecl","name":"g_tbl","type":{"qualType":"const StateStep[2]"}}}
+              ]},
+              {"id": "0x8b", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":772,"col":11,"tokLen":7},"end":{"offset":772,"col":11,"tokLen":7}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+                {"id": "0x8c", "kind": "DeclRefExpr", "range": {"begin":{"offset":772,"col":11,"tokLen":7},"end":{"offset":772,"col":11,"tokLen":7}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x19","kind":"VarDecl","name":"g_index","type":{"qualType":"int"}}}
+              ]}
+            ]}
+          ]}
+        ]},
+        {"id": "0x8d", "kind": "IntegerLiteral", "range": {"begin":{"offset":785,"col":24,"tokLen":1},"end":{"offset":785,"col":24,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "4"}
+      ]},
+      {"id": "0x8e", "kind": "CallExpr", "range": {"begin":{"offset":793,"line":26,"col":5,"tokLen":13},"end":{"offset":821,"col":33,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x8f", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":793,"col":5,"tokLen":13},"end":{"offset":793,"col":5,"tokLen":13}}, "type": {"qualType":"void (*)(int *)"}, "valueCategory": "prvalue", "castKind": "FunctionToPointerDecay", "inner": [
+          {"id": "0x90", "kind": "DeclRefExpr", "range": {"begin":{"offset":793,"col":5,"tokLen":13},"end":{"offset":793,"col":5,"tokLen":13}}, "type": {"qualType":"void (int *)"}, "valueCategory": "prvalue", "referencedDecl": {"id":"0x60","kind":"FunctionDecl","name":"write_through","type":{"qualType":"void (int *)"}}}
+        ]},
+        {"id": "0x91", "kind": "UnaryOperator", "range": {"begin":{"offset":807,"col":19,"tokLen":1},"end":{"offset":816,"col":28,"tokLen":5}}, "type": {"qualType":"int *"}, "valueCategory": "prvalue", "isPostfix": false, "opcode": "&", "canOverflow": false, "inner": [
+          {"id": "0x92", "kind": "MemberExpr", "range": {"begin":{"offset":808,"col":20,"tokLen":7},"end":{"offset":816,"col":28,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "count", "isArrow": false, "referencedMemberDecl": "0xf", "inner": [
+            {"id": "0x93", "kind": "DeclRefExpr", "range": {"begin":{"offset":808,"col":20,"tokLen":7},"end":{"offset":808,"col":20,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+          ]}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0x94", "kind": "FunctionDecl", "loc": {"offset":832,"line":29,"col":6,"tokLen":8}, "range": {"begin":{"offset":827,"col":1,"tokLen":4},"end":{"offset":935,"line":33,"col":1,"tokLen":1}}, "name": "Dispatch", "mangledName": "Dispatch", "type": {"qualType":"void (Fn, const StateStep *, Unknown)"}, "inner": [
+    {"id": "0x95", "kind": "ParmVarDecl", "loc": {"offset":844,"line":29,"col":18,"tokLen":2}, "range": {"begin":{"offset":841,"col":15,"tokLen":2},"end":{"offset":844,"col":18,"tokLen":2}}, "isUsed": true, "name": "fp", "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}},
+    {"id": "0x96", "kind": "ParmVarDecl", "loc": {"offset":865,"col":39,"tokLen":3}, "range": {"begin":{"offset":848,"col":22,"tokLen":5},"end":{"offset":865,"col":39,"tokLen":3}}, "isUsed": true, "name": "ops", "type": {"qualType":"const StateStep *"}},
+    {"id": "0x97", "kind": "ParmVarDecl", "loc": {"offset":878,"col":52,"tokLen":7}, "range": {"begin":{"offset":870,"col":44,"tokLen":7},"end":{"offset":878,"col":52,"tokLen":7}}, "isUsed": true, "name": "unknown", "type": {"desugaredQualType":"void (*)(char)","qualType":"Unknown","typeAliasDeclId":"0x44"}},
+    {"id": "0x98", "kind": "CompoundStmt", "range": {"begin":{"offset":887,"col":61,"tokLen":1},"end":{"offset":935,"line":33,"col":1,"tokLen":1}}, "inner": [
+      {"id": "0x99", "kind": "CallExpr", "range": {"begin":{"offset":893,"line":30,"col":5,"tokLen":2},"end":{"offset":897,"col":9,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x9a", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":893,"col":5,"tokLen":2},"end":{"offset":893,"col":5,"tokLen":2}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x9b", "kind": "DeclRefExpr", "range": {"begin":{"offset":893,"col":5,"tokLen":2},"end":{"offset":893,"col":5,"tokLen":2}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x95","kind":"ParmVarDecl","name":"fp","type":{"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}}}
+        ]},
+        {"id": "0x9c", "kind": "IntegerLiteral", "range": {"begin":{"offset":896,"col":8,"tokLen":1},"end":{"offset":896,"col":8,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "1"}
+      ]},
+      {"id": "0x9d", "kind": "CallExpr", "range": {"begin":{"offset":904,"line":31,"col":5,"tokLen":3},"end":{"offset":914,"col":15,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0x9e", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":904,"col":5,"tokLen":3},"end":{"offset":909,"col":10,"tokLen":3}}, "type": {"desugaredQualType":"void (*)(int)","qualType":"Fn","typeAliasDeclId":"0x2"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0x9f", "kind": "MemberExpr", "range": {"begin":{"offset":904,"col":5,"tokLen":3},"end":{"offset":909,"col":10,"tokLen":3}}, "type": {"desugaredQualType":"void (*const)(int)","qualType":"const Fn","typeAliasDeclId":"0x2"}, "valueCategory": "lvalue", "name": "run", "isArrow": true, "referencedMemberDecl": "0xa", "inner": [
+            {"id": "0xa0", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":904,"col":5,"tokLen":3},"end":{"offset":904,"col":5,"tokLen":3}}, "type": {"qualType":"const StateStep *"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+              {"id": "0xa1", "kind": "DeclRefExpr", "range": {"begin":{"offset":904,"col":5,"tokLen":3},"end":{"offset":904,"col":5,"tokLen":3}}, "type": {"qualType":"const StateStep *"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x96","kind":"ParmVarDecl","name":"ops","type":{"qualType":"const StateStep *"}}}
+            ]}
+          ]}
+        ]},
+        {"id": "0xa2", "kind": "IntegerLiteral", "range": {"begin":{"offset":913,"col":14,"tokLen":1},"end":{"offset":913,"col":14,"tokLen":1}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": "2"}
+      ]},
+      {"id": "0xa3", "kind": "CallExpr", "range": {"begin":{"offset":921,"line":32,"col":5,"tokLen":7},"end":{"offset":932,"col":16,"tokLen":1}}, "type": {"qualType":"void"}, "valueCategory": "prvalue", "inner": [
+        {"id": "0xa4", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":921,"col":5,"tokLen":7},"end":{"offset":921,"col":5,"tokLen":7}}, "type": {"desugaredQualType":"void (*)(char)","qualType":"Unknown","typeAliasDeclId":"0x44"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0xa5", "kind": "DeclRefExpr", "range": {"begin":{"offset":921,"col":5,"tokLen":7},"end":{"offset":921,"col":5,"tokLen":7}}, "type": {"desugaredQualType":"void (*)(char)","qualType":"Unknown","typeAliasDeclId":"0x44"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x97","kind":"ParmVarDecl","name":"unknown","type":{"desugaredQualType":"void (*)(char)","qualType":"Unknown","typeAliasDeclId":"0x44"}}}
+        ]},
+        {"id": "0xa6", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":929,"col":13,"tokLen":3},"end":{"offset":929,"col":13,"tokLen":3}}, "type": {"qualType":"char"}, "valueCategory": "prvalue", "castKind": "IntegralCast", "inner": [
+          {"id": "0xa7", "kind": "CharacterLiteral", "range": {"begin":{"offset":929,"col":13,"tokLen":3},"end":{"offset":929,"col":13,"tokLen":3}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "value": 97}
+        ]}
+      ]}
+    ]}
+  ]},
+  {"id": "0xa8", "kind": "FunctionDecl", "loc": {"offset":941,"line":34,"col":5,"tokLen":4}, "range": {"begin":{"offset":937,"col":1,"tokLen":3},"end":{"offset":976,"col":40,"tokLen":1}}, "name": "Read", "mangledName": "Read", "type": {"qualType":"int (void)"}, "inner": [
+    {"id": "0xa9", "kind": "CompoundStmt", "range": {"begin":{"offset":952,"col":16,"tokLen":1},"end":{"offset":976,"col":40,"tokLen":1}}, "inner": [
+      {"id": "0xaa", "kind": "ReturnStmt", "range": {"begin":{"offset":954,"col":18,"tokLen":6},"end":{"offset":969,"col":33,"tokLen":5}}, "inner": [
+        {"id": "0xab", "kind": "ImplicitCastExpr", "range": {"begin":{"offset":961,"col":25,"tokLen":7},"end":{"offset":969,"col":33,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "prvalue", "castKind": "LValueToRValue", "inner": [
+          {"id": "0xac", "kind": "MemberExpr", "range": {"begin":{"offset":961,"col":25,"tokLen":7},"end":{"offset":969,"col":33,"tokLen":5}}, "type": {"qualType":"int"}, "valueCategory": "lvalue", "name": "count", "isArrow": false, "referencedMemberDecl": "0xf", "inner": [
+            {"id": "0xad", "kind": "DeclRefExpr", "range": {"begin":{"offset":961,"col":25,"tokLen":7},"end":{"offset":961,"col":25,"tokLen":7}}, "type": {"qualType":"State","typeAliasDeclId":"0x11"}, "valueCategory": "lvalue", "referencedDecl": {"id":"0x18","kind":"VarDecl","name":"g_state","type":{"qualType":"State","typeAliasDeclId":"0x11"}}}
+          ]}
+        ]}
+      ]}
+    ]}
+  ]}
+]}

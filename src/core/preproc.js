@@ -256,8 +256,9 @@ function substitute(m, args, siteTok) {
 
 /**
  * 递归展开 token 序列中的所有宏调用
+ * onExpand 接收实际展开的定义和本次调用的首尾 token，供调用方映射源码。
  */
-export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
+export function expandSeq(tokens, macros, depth = 0, seen = new Set(), onExpand) {
   if (depth > 12) return tokens.slice();
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
@@ -265,6 +266,7 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
     const m = tk.t === 'id' ? macros.get(tk.v) : undefined;
     if (m && !seen.has(tk.v)) {
       if (m.params === null) {
+        onExpand?.(m, tk, tk);
         const body = m.body.map((b) => ({
           ...b,
           line: tk.line,
@@ -274,17 +276,18 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set()) {
         }));
         const nextSeen = new Set(seen);
         nextSeen.add(tk.v);
-        out.push(...expandSeq(body, macros, depth + 1, nextSeen));
+        out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
         continue;
       }
 
       if (tokens[i + 1] && tokens[i + 1].v === '(') {
         const [args, next] = collectArgs(tokens, i + 1);
         if (args) {
+          onExpand?.(m, tk, tokens[next - 1]);
           const body = substitute(m, args, tk);
           const nextSeen = new Set(seen);
           nextSeen.add(tk.v);
-          out.push(...expandSeq(body, macros, depth + 1, nextSeen));
+          out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
           i = next - 1;
           continue;
         }

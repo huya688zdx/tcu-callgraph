@@ -11,11 +11,13 @@ export function exportName(extension, project) {
   return `${project.name}_${label}_间构成图`.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 150) + '.' + extension;
 }
 
-export async function saveExport(extension, blob) {
+export async function saveExport(extension, blob, label) {
   const id = state.view.projectId;
   const project = await api.project();
   if (project.id !== id || state.view.projectId !== id) throw new Error('工程已切换，请重新导出');
-  const name = exportName(extension, project);
+  const name = label
+    ? `${project.name}_${label}`.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 150) + '.' + extension
+    : exportName(extension, project);
   if (window.callgraph?.saveExport) {
     return window.callgraph.saveExport({ name, bytes: new Uint8Array(await blob.arrayBuffer()), projectPath: project.path });
   }

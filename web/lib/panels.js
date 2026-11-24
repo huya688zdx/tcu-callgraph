@@ -4,7 +4,7 @@
 import { t } from '../i18n.js';
 import { els, state, esc, shortFile, edgeKey } from './state.js';
 import { edgeCaption, isDataEdge } from './edge-flow.js';
-import { periodCaption } from './period-text.js';
+import { formatPeriod, periodCaption } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections, hideMenu } from './ctxmenu.js';
@@ -15,6 +15,7 @@ import { findCallOrder } from './call-order.js';
 import { showExpansion, previewAddition } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
+import { canOpenFlowchart, openFlowchart } from './flowchart.js';
 
 let statsSeq = 0;
 async function loadStats() {
@@ -863,6 +864,33 @@ function showEdgeDetails(edge) {
   return true;
 }
 
+function periodDetail(node) {
+  if (node.kind === 'var') {
+    const cross = node.crossPeriod;
+    if (!cross) return '';
+    const rates = values => values.map(formatPeriod).join(' / ') || 'ISR';
+    return `<div class="period-detail">
+      <div>${t('period.writers', { period: rates(cross.writerUs) })}</div>
+      <div>${t('period.readers', { period: rates(cross.readerUs) })}</div>
+      ${cross.hasIsr ? `<div class="detail-meta">${t('period.isrContext')}</div>` : ''}
+      <div class="period-warning ${cross.protected ? 'guarded' : ''}">${cross.protected ? t('period.guarded') : t('period.hazard')}</div>
+    </div>`;
+  }
+  const periods = node.taskPeriods?.length ? node.taskPeriods : node.previousTaskPeriods;
+  if (!periods?.length) return '';
+  return `<div class="period-detail"><b>${t('period.triggers')}</b>
+    ${node.multiRate ? `<div class="period-multi">${t('period.multiRate')}</div>` : ''}
+    <ul>${periods.map(c => {
+      const rate = [c.kind === 'isr' && 'ISR', formatPeriod(c.us)].filter(Boolean).join(' · ') || t('period.unknown');
+      const evidence = c.dividers?.map(d => t('period.divider', {
+        counter: d.counter, divider: d.divider, location: `${d.file}:${d.line}`,
+      })) || [];
+      return `<li><strong title="${esc(c.task || '')}">${esc(c.task?.split('::').at(-1) || '')}</strong> · ${esc(rate)}
+        ${[c.source, ...evidence].filter(Boolean).map(line => `<small>${esc(line)}</small>`).join('')}</li>`;
+    }).join('')}</ul>
+  </div>`;
+}
+
 async function renderDetail(id) {
   clearDataflow();
   state.hoverRelation = null;
@@ -897,6 +925,7 @@ async function renderDetail(id) {
     els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
       <div class="detail-meta">${esc(target.file || '')}:${target.line || ''}</div>
       ${comparison ? comparisonDetail(target, comparison.changePoints ?? state.view?.comparison?.changePoints) : ''}
+      ${periodDetail(target)}
       ${dataDirections}
       ${statusControl(target)}
       `;
@@ -922,7 +951,9 @@ async function renderDetail(id) {
   els.detail.innerHTML = `
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${canOpenFlowchart(n) ? `<button class="flowchart-detail" type="button" data-node-flowchart>${t('flowchart.menu')}</button>` : ''}
     ${comparison ? comparisonDetail(n, comparison.changePoints ?? state.view?.comparison?.changePoints ?? d.changePoints) : ''}
+    ${periodDetail(target)}
     ${dataDirections}
     ${statusControl(target)}
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
@@ -934,6 +965,7 @@ async function renderDetail(id) {
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
+  els.detail.querySelector('[data-node-flowchart]')?.addEventListener('click', () => openFlowchart(id));
   bindStatusControl(els.detail, target);
 
   const inE = (d.inEdges || []).filter(e => !isDataEdge(e));

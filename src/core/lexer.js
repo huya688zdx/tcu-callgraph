@@ -188,9 +188,9 @@ export function lex(src, file = '') {
   return tokens;
 }
 
-/** 在 tokens 中从 openIdx（必须是 '('）开始配对括号，返回 [参数token数组的数组, 右括号后一位] */
+/** 拆分调用实参或花括号初始化列表，返回 [各项 token 数组, 闭合括号后一位]。 */
 export function collectArgs(tokens, openIdx) {
-  if (!tokens[openIdx] || tokens[openIdx].v !== '(') return [null, openIdx];
+  if (!['(', '{'].includes(tokens[openIdx]?.v)) return [null, openIdx];
   const args = [];
   let cur = [];
   let depth = 0;

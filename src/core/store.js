@@ -204,9 +204,10 @@ export function fingerprintFiles(files = []) {
  * 图就永远停在改动前。工程指纹不带 mtime，是为了避免 git checkout 之类的
  * 时间戳抖动让界面上一直挂个「代码已变更」的星号。
  */
-export function cacheKey(files = [], focus = '') {
+export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v16-header-scope-and-task-periods\0');
+  h.update('analyzed-model-v17-tcu-scheduling-evidence\0');
+  if (parserKey !== 'builtin') h.update(`parser\u0000${parserKey}\n`);
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
