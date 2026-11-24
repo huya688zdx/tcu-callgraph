@@ -6,6 +6,7 @@ import { syncProjectLabel } from './projects.js';
 import { state } from './state.js';
 import { statusOptions } from './change-status.js';
 import { periodCaption } from './period-text.js';
+import { gitRange, openGitCompare, renderGitFacts, syncGitComparison, wireGitCompare } from './git-compare.js';
 
 const normalMode = document.getElementById('projectModeNormal');
 const compareMode = document.getElementById('projectModeCompare');
@@ -28,8 +29,8 @@ let statuses = new Map();
 let changePoints = [];
 let focusedPoint = null;
 const effectiveChange = (n) => statuses.get(n.id) || n.change || 'existing';
-const isDirect = (n) => effectiveChange(n) !== 'existing';
-const isCore = (n) => isDirect(n) || n.macroImpact || n.periodImpact || n.impact;
+const isDirect = (n) => (preview?.git ? n.change : effectiveChange(n)) !== 'existing';
+const isCore = (n) => isDirect(n) || n.macroImpact || n.periodImpact || n.impact || Boolean(preview?.git && n.context);
 const priority = (n) => isDirect(n) ? 0 : n.macroImpact || n.periodImpact ? 1 : n.impact ? 2 : 3;
 let selectionPage = 0;
 let applying = false;
@@ -188,7 +189,7 @@ function renderSelection() {
     { page: selectionPage + 1, pages: Math.max(1, Math.ceil(list.length / pageSize)), n: list.length });
   document.getElementById('comparePickPrev').disabled = selectionPage === 0;
   document.getElementById('comparePickNext').disabled = (selectionPage + 1) * pageSize >= list.length;
-  pickApply.disabled = applying || !selected.size || total > limit;
+  pickApply.disabled = applying || (!preview.refresh && !selected.size) || total > limit;
 }
 
 function cancelSelection() {
@@ -203,6 +204,7 @@ function cancelSelection() {
 document.addEventListener('callgraph:langchange', () => {
   syncComparison(activeComparison);
   if (!preview) return;
+  renderGitFacts(preview.git);
   renderChangePoints();
   renderSelection();
   document.getElementById('comparePickWarningCount').textContent = t('compare.mappingsCount', { n: preview.warnings?.length || 0 });
@@ -265,7 +267,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && preview && picker?.classList.contains('show')) cancelSelection();
 }, true);
 pickApply?.addEventListener('click', async () => {
-  if (applying || !preview || !selected.size) return;
+  if (applying || !preview || (!preview.refresh && !selected.size)) return;
   const retainIds = retainedIds();
   if (new Set([...retainIds, ...selected]).size > maxAllowedCount()) return;
   applying = true;
@@ -274,11 +276,15 @@ pickApply?.addEventListener('click', async () => {
   picker.querySelector('.modal-close').disabled = true;
   pickError.textContent = '';
   try {
-    const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds, statusOverrides: Object.fromEntries(statuses) });
+    const initial = preview.statusOverrides || {};
+    const statusOverrides = Object.fromEntries([...statuses].filter(([id, status]) => initial[id] !== status));
+    const resetStatusIds = preview.candidates.filter(n => initial[n.id] && !statuses.has(n.id)).map(n => n.id);
+    const result = await api.applyComparison({ previewId: preview.id, selectedIds: [...selected], retainIds, statusOverrides, resetStatusIds });
     if (!result?.ok) throw new Error(result?.error || t('common.addFailed'));
+    const version = preview.gitAnalysisVersion;
     preview = null;
     activeComparison = result.comparison;
-    syncComparison(activeComparison);
+    syncComparison(activeComparison, version);
     await hooks.applyComparison(result.roots);
     closeModal();
   } catch (error) { pickError.textContent = error.message || String(error); }
@@ -292,11 +298,12 @@ pickApply?.addEventListener('click', async () => {
 
 function openSelectionModal(data) {
   preview = { ...data, candidates: data.items ?? data.candidates ?? [] };
-  statuses = new Map();
+  statuses = new Map(preview.candidates.filter(n => data.statusOverrides?.[n.id])
+    .map(n => [n.id, data.statusOverrides[n.id]]));
   focusedPoint = null;
   const core = preview.candidates.filter(isCore).sort((a, b) => priority(a) - priority(b));
   const retained = new Set(retainedIds());
-  const fallback = preview.candidates.find((n) => retained.has(n.id)) || preview.candidates[0];
+  const fallback = preview.git ? null : preview.candidates.find((n) => retained.has(n.id)) || preview.candidates[0];
   selected = selectWithinLimit((core.length ? core : fallback ? [fallback] : []).map((n) => n.id));
   pickSearch.value = '';
   pickType.value = 'all';
@@ -306,10 +313,12 @@ function openSelectionModal(data) {
   document.getElementById('comparePickWarnings').textContent = warnings.slice(0, 100).join('\n');
   document.getElementById('comparePickWarningCount').textContent = t('compare.mappingsCount', { n: warnings.length });
   changePoints = buildChangePoints();
+  renderGitFacts(preview.git);
   renderChangePoints();
   resetSelectionPage();
   openModal('compareSelectModal');
 }
+wireGitCompare(openSelectionModal);
 
 async function setProjectMode(comparing) {
   normalMode?.setAttribute('aria-pressed', String(!comparing));
@@ -320,7 +329,7 @@ async function setProjectMode(comparing) {
   if (errorEl) errorEl.textContent = '';
   if (comparing) {
     try {
-      const project = await api.project();
+      const [project] = await Promise.all([api.project(), openGitCompare()]);
       if (projectPath) projectPath.value = project.comparison?.projectPath || project.path;
     } catch (error) {
       if (errorEl) errorEl.textContent = `${t('compare.failed')}：${error.message || error}`;
@@ -330,6 +339,9 @@ async function setProjectMode(comparing) {
 
 normalMode?.addEventListener('click', () => setProjectMode(false));
 compareMode?.addEventListener('click', () => setProjectMode(true));
+document.getElementById('projectBtn')?.addEventListener('click', () => {
+  if (!comparePane?.hidden) setProjectMode(true);
+});
 
 swapBtn?.addEventListener('click', () => {
   if (!beforePath || !afterPath) return;
@@ -395,13 +407,14 @@ exitBtn?.addEventListener('click', async () => {
   }
 });
 
-export function syncComparison(comparison) {
+export function syncComparison(comparison, gitAnalysisVersion) {
   activeComparison = comparison || null;
+  syncGitComparison(activeComparison, gitAnalysisVersion);
   const enabled = Boolean(activeComparison);
   const emptyEl = document.getElementById('compareEmpty');
   if (emptyEl) {
     emptyEl.hidden = !enabled || activeComparison.totalNodes > 0;
-    emptyEl.textContent = t('compare.noChanges');
+    emptyEl.textContent = activeComparison?.git?.noSourceChanges ? t('git.noChanges') : t('compare.noChanges');
   }
   if (enabled) {
     const name = (p) => p?.replace(/\\/g, '/').split('/').pop() || '';
@@ -409,7 +422,8 @@ export function syncComparison(comparison) {
     const button = document.getElementById('projectBtn');
     if (button) {
       button.textContent = activeComparison.projectName || name(activeComparison.projectPath);
-      button.title = `${activeComparison.projectPath}\n${activeComparison.beforePath} → ${activeComparison.afterPath}`;
+      const range = activeComparison.git ? gitRange(activeComparison.git) : [activeComparison.beforePath, activeComparison.afterPath].join(' → ');
+      button.title = [activeComparison.projectPath, range].join('\n');
     }
   }
   if (summaryEl) {
@@ -423,7 +437,9 @@ export function syncComparison(comparison) {
         shown: activeComparison.shownNodes ?? activeComparison.totalNodes ?? 0,
         total: activeComparison.totalNodes ?? 0,
       });
-      summaryEl.title = [activeComparison.projectPath, activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
+      const range = activeComparison.git ? gitRange(activeComparison.git) : null;
+      if (range) summaryEl.textContent = range + ' · ' + summaryEl.textContent;
+      summaryEl.title = [activeComparison.projectPath, range, activeComparison.beforePath, activeComparison.afterPath, ...(activeComparison.warnings || [])].filter(Boolean).join('\n');
       if (activeComparison.warnings?.length) summaryEl.textContent += ' · ' + t('compare.warningCount', { n: activeComparison.warnings.length });
       if (activeComparison.truncated) summaryEl.textContent += ' · ' + t('compare.truncated');
       if (activeComparison.manualStatusCount) summaryEl.textContent += ' · ' + t('compare.manualCount', { n: activeComparison.manualStatusCount });

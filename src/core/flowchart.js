@@ -17,8 +17,11 @@ const isDecision = kind => kind === 'decision' || kind === 'preproc_decision';
 export const isFlowchartFunction = fn => !!fn?.endLine && !fn.external && fn.kind !== 'var' && !fn.headerSymbol;
 
 function sourceReader(model, sourceRoot) {
-  const roots = [model.root, ...(sourceRoot ? [sourceRoot] : [])].map(root => fs.realpathSync(root));
+  let roots;
   return file => {
+    const buffered = model._sourceBuffers?.get(file);
+    if (buffered) return decodeSource(buffered).replace(/\r\n?/g, '\n');
+    roots ??= [model.root, ...(sourceRoot ? [sourceRoot] : [])].map(root => fs.realpathSync(root));
     const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(model.root, file));
     const withinRoots = roots.some(root => {
       const rel = path.relative(root, realFile);

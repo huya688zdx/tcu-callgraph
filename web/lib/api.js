@@ -74,6 +74,7 @@ export const api = {
   removeProject: (id) => post('/api/projects/remove', { id }),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
   switchProject: (body) => post('/api/switch', body),
+  gitStatus: () => get('/api/git/status'),
   compare: (body) => post('/api/compare', body),
   applyComparison: (body) => post('/api/compare/apply', body),
   comparisonStatus: (body) => post('/api/compare/status', body),

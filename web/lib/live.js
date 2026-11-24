@@ -21,6 +21,7 @@ import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { reloadTimeline } from './timeline.js';
 import { syncProjectLabel } from './projects.js';
+import { notifyGitChanged } from './git-compare.js';
 
 // ---------------- SSE 监听 ----------------
 
@@ -133,6 +134,10 @@ if (es) {
       return;
     }
     if (!m) return;
+    if (m.op === 'git.changed') {
+      notifyGitChanged(m);
+      return;
+    }
     if (m.op === 'project.switch') {
       if (m.clientId === clientId) return;
       dirtyCount = 0;

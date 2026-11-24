@@ -10,6 +10,7 @@ import { layoutElk } from './core/layout-elk.js';
 import { buildFlowchart, isFlowchartFunction } from './core/flowchart.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
 import { compareProjects, comparisonDataflow, comparisonGlobals } from './core/compare.js';
+import { compareGitProject, inspectGitRepo, watchGitProject } from './core/git-compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
 import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from './core/comparison-status.js';
 import { exportXlsx } from './core/export-xlsx.js';
@@ -64,6 +65,7 @@ let switching = false;
 let COMPARISON = null;
 let comparisonPreview = null;
 let comparisonBase = null;
+let gitWatch;
 const comparisonMetadata = ({ macroChanges, macroDetails, changePoints, impactIds }) =>
   ({ macroChanges, macroDetails, changePoints, impactIds });
 const comparisonItem = ({ change, reasons, locations, impact, context, macroImpact, macroNames,
@@ -72,7 +74,7 @@ const comparisonItem = ({ change, reasons, locations, impact, context, macroImpa
     periodImpact, periodBefore, periodAfter, periods, impactRole, impactChainIds });
 const comparisonInfo = () => COMPARISON ? {
   id: COMPARISON.id, projectPath: COMPARISON.projectPath, projectName: PROJECT.name,
-  beforePath: COMPARISON.beforePath, afterPath: COMPARISON.afterPath,
+  beforePath: COMPARISON.beforePath, afterPath: COMPARISON.afterPath, git: COMPARISON.git || null,
   summary: COMPARISON.summary, warnings: COMPARISON.warnings, ...comparisonMetadata(COMPARISON),
   totalNodes: COMPARISON.totalNodes,
   mappings: COMPARISON.mappings,
@@ -169,6 +171,14 @@ function broadcastChange(op, actor, extra = {}) {
       sseClients.delete(res);
     }
   }
+}
+
+function startGitWatch(projectPath, projectId) {
+  gitWatch?.abort();
+  gitWatch = new AbortController();
+  return watchGitProject(projectPath, gitWatch.signal, () => {
+    broadcastChange('git.changed', 'system', { projectId, comparisonId: COMPARISON?.id || null });
+  });
 }
 
 // 旧版 out/overlay.json 一次性导入：成功后改名留底，不删原文件。
@@ -324,6 +334,7 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
     }`
   );
   console.log(`[存储] ${store.file} · 工程 #${project.id} ${project.isNew ? '(新建)' : ''}`);
+  await startGitWatch(abs, project.id);
   return { project, stats: st };
 }
 
@@ -543,17 +554,21 @@ async function readMcpSource(q) {
   if (!model.files?.some((entry) => entry.rel === file)) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
-  const realRoot = fs.realpathSync(model.root);
-  const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
-  const roots = comparison ? [realRoot, comparison.beforePath, comparison.afterPath] : [realRoot];
-  const withinRoots = roots.some(root => {
-    const rel = path.relative(root, realFile);
-    return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
-  });
-  if (!withinRoots || !fs.statSync(realFile).isFile()) {
-    throw new Error('源码文件必须位于当前工程或对照目录内');
+  let source = model._sourceBuffers?.get(file);
+  if (!source) {
+    const realRoot = fs.realpathSync(model.root);
+    const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
+    const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
+    const withinRoots = roots.some(root => {
+      const rel = path.relative(root, realFile);
+      return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+    });
+    if (!withinRoots || !fs.statSync(realFile).isFile()) {
+      throw new Error('源码文件必须位于当前工程或对照目录内');
+    }
+    source = fs.readFileSync(realFile);
   }
-  const lines = decodeSource(fs.readFileSync(realFile)).split(/\r\n|\n|\r/);
+  const lines = decodeSource(source).split(/\r\n|\n|\r/);
   if (lines.at(-1) === '') lines.pop();
   if (startLine > lines.length) throw new Error('起始行超出源码文件范围');
   const endLine = Math.min(requestedEndLine, startLine + 249, lines.length);
@@ -1255,7 +1270,7 @@ function readRawBody(req, limit = 4 * 1024 * 1024) {
 }
 
 // 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
-const server = http.createServer(async (req, res) => {
+export const server = http.createServer(async (req, res) => {
   if (!/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(req.headers.host || '')) {
     return json(res, { ok: false, error: 'forbidden host' }, 403);
   }
@@ -1701,6 +1716,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (u.pathname === '/api/git/status' && req.method === 'GET') {
+      return json(res, await inspectGitRepo(COMPARISON?.projectPath || root));
+    }
     if (u.pathname === '/api/compare' && req.method !== 'POST') return json(res, { comparison: comparisonInfo() });
     if (u.pathname === '/api/compare/status' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
@@ -1757,10 +1775,30 @@ const server = http.createServer(async (req, res) => {
             return [...new Set(value)];
           };
           const selected = ids(p.selectedIds, '选择项');
-          if (!selected.length) throw new Error('请至少选择一个函数或变量');
+          if (!selected.length && !preview.refresh) throw new Error('请至少选择一个函数或变量');
           if (selected.some((id) => !preview.candidateIds.has(id))) throw new Error('选择项不在本次比较结果中');
           const comparison = preview.comparison;
           const statuses = { nodes: statusOverrides(p.statusOverrides, preview.candidateIds), edges: new Map() };
+          if (preview.refresh) {
+            const resetIds = new Set(ids(p.resetStatusIds || [], '恢复自动判定项'));
+            for (const [id, status] of COMPARISON.statusOverrides.nodes) {
+              if (comparison.model._index.byId.has(id) && !resetIds.has(id) && !statuses.nodes.has(id)) {
+                statuses.nodes.set(id, status);
+              }
+            }
+            const edgeIds = new Set([...comparison.model.edges, ...(comparison.model.headerEdges || [])]
+              .map(edge => edge.comparisonKey || edgeKeyOf(edge)));
+            for (const slot of Object.values(overlay.layout || {})) {
+              for (const edge of slot.manual || []) {
+                if (comparison.model._index.byId.has(edge.from) && comparison.model._index.byId.has(edge.to)) {
+                  edgeIds.add(edgeKeyOf({ ...edge, line: 0 }));
+                }
+              }
+            }
+            for (const [id, status] of COMPARISON.statusOverrides.edges) {
+              if (edgeIds.has(id)) statuses.edges.set(id, status);
+            }
+          }
           const retained = ids(p.retainIds || [], '保留项').filter((id) => MODEL._index.byId.has(id) && comparison.model._index.byId.has(id));
           const roots = [...new Set([...retained, ...selected])];
           if (roots.length > 600) throw new Error('保留与选择的节点合计超过 600 个，请减少选择');
@@ -1780,15 +1818,25 @@ const server = http.createServer(async (req, res) => {
           overlay = nextOverlay;
           comparisonPreview = null;
         } else {
-          const comparison = await compareProjects(COMPARISON?.projectPath || root, p.beforePath, p.afterPath,
-            { parserId: MODEL.parserId, parserOptions: parserOptionsFor(MODEL.parserId) });
-          const candidates = [...comparison.model.functions, ...comparison.model.variables].filter((n) => !n.external)
+          const projectPath = COMPARISON?.projectPath || root;
+          const git = COMPARISON?.git;
+          const refresh = p.mode === 'git' && p.refresh === true && git?.targetRef === 'WORKTREE' &&
+            p.baseRef === git.baseRef && p.targetRef === git.targetRef && (p.includeUntracked !== false) === git.includeUntracked;
+          const parserOpts = { parserId: MODEL.parserId, parserOptions: parserOptionsFor(MODEL.parserId) };
+          const comparison = p.mode === 'git'
+            ? await compareGitProject(projectPath, { baseRef: p.baseRef, targetRef: p.targetRef, includeUntracked: p.includeUntracked },
+              { ...parserOpts, allowEmptyRefresh: refresh })
+            : await compareProjects(projectPath, p.beforePath, p.afterPath, parserOpts);
+          const candidates = (comparison.git?.noSourceChanges ? [] : [...comparison.model.functions, ...comparison.model.variables])
+            .filter((n) => !n.external)
             .map((n) => ({ id: n.id, name: n.name, file: n.file, line: n.line, kind: n.kind, ...comparisonItem(n) }));
-          comparisonPreview = { id: randomUUID(), projectId: PROJECT.id, model: MODEL, comparison, candidateIds: new Set(candidates.map((n) => n.id)) };
-          return json(res, { ok: true, preview: { id: comparisonPreview.id, projectId: PROJECT.id,
+          comparisonPreview = comparison.model ? { id: randomUUID(), projectId: PROJECT.id, model: MODEL, comparison,
+            refresh, candidateIds: new Set(candidates.map((n) => n.id)) } : null;
+          return json(res, { ok: true, preview: { id: comparisonPreview?.id ?? null, projectId: PROJECT.id, refresh,
             summary: comparison.summary, warnings: comparison.warnings, mappings: comparison.mappings, candidates,
-            ...comparisonMetadata(comparison),
-            validRetainIds: [...comparison.model._index.byId.keys()] } });
+            git: comparison.git || null, ...comparisonMetadata(comparison),
+            statusOverrides: refresh ? Object.fromEntries(COMPARISON.statusOverrides.nodes) : undefined,
+            validRetainIds: comparison.model ? [...comparison.model._index.byId.keys()] : [] } });
         }
         broadcastChange('project.switch', p.actor === 'ai' ? 'ai' : 'user', { project: ROOT_LABEL, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
         return json(res, { ok: true, comparison: comparisonInfo(), roots: COMPARISON?.roots || [] });
@@ -2829,6 +2877,11 @@ const server = http.createServer(async (req, res) => {
 // 只接受本机连接：原本不传 host 会绑到 0.0.0.0，同网段可直接读写用户的布局存档
 server.on('clientError', (err, socket) => {
   if (!socket.destroyed) socket.destroy();
+});
+server.on('close', () => {
+  gitWatch?.abort();
+  clearInterval(sseHeartbeat);
+  store.close();
 });
 
 // 兜底：任何漏网的未捕获异常只记日志，避免 Electron 侧只看到「exited with 1」

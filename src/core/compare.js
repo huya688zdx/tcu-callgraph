@@ -5,7 +5,10 @@ import { buildIndex, rebuildIndex } from './index.js';
 import { comparisonFiles } from './compare-files.js';
 import { buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { getParser } from './parsers/registry.js';
+import { fingerprint } from './parsers/builtin-comparison.js';
 import { nodeTaskPeriods, periodLabels, taskPeriods, withTaskPeriods } from './task-periods.js';
+
+export { fingerprint };
 
 const location = (n) => n ? { file: n.file, line: n.line, endLine: n.endLine } : null;
 const blankCounts = () => ({ existing: 0, modified: 0, added: 0, deleted: 0 });
@@ -129,11 +132,13 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
   if (new Set(identities).size !== 3) {
     throw new Error('总代码、修改前对照、修改后对照必须是三个不同的目录');
   }
-  const { baseFiles, beforeFiles, afterFiles, mappings } = comparisonFiles(projectPath, beforePath, afterPath);
+  const snapshots = options.snapshots;
+  const { baseFiles, beforeFiles, afterFiles, mappings } = snapshots || comparisonFiles(projectPath, beforePath, afterPath);
   const scope = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
-  if (!scope.size) throw new Error('对照目录中没有可解析的 C 文件');
-  if (!baseFiles.size) throw new Error('请先打开包含完整 C 源码的总代码目录');
+  if (!snapshots && !scope.size) throw new Error('对照目录中没有可解析的 C 文件');
+  if (!snapshots && !baseFiles.size) throw new Error('请先打开包含完整 C 源码的总代码目录');
   const withOverrides = (overrides) => {
+    if (snapshots) return overrides;
     const files = new Map(baseFiles);
     for (const rel of scope) {
       if (overrides.has(rel)) files.set(rel, overrides.get(rel));
@@ -145,7 +150,7 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
   const afterModel = await buildIndex(projectPath, withOverrides(afterFiles), null, options);
   for (const m of [beforeModel, afterModel]) {
     if (m.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${m.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
-    if (!m.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${m.root}`);
+    if (!snapshots && !m.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${m.root}`);
     if (m.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
     const df = await buildDataflowIndex(m);
     if (df.failedFiles) throw new Error('部分源码分析失败，无法发布不完整的比较结果');
