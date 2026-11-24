@@ -1,7 +1,8 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { fork } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
@@ -3128,6 +3129,26 @@ server.on('close', () => {
   store.close();
 });
 
+server.once('listening', () => {
+  const actual = server.address().port;
+  console.log(`[服务] http://localhost:${actual}`);
+  if (process.send) process.send({ ready: true, port: actual });
+});
+
+if (PORT === 0) {
+  // 系统分配的端口可能是 Fetch 禁用的 6000。直接绑定高位动态端口，避开探测后再绑定的竞态。
+  for (let attempt = 1; ; attempt++) {
+    server.listen(randomInt(49152, 65536), '127.0.0.1');
+    try {
+      await once(server, 'listening');
+      break;
+    } catch (err) {
+      // Windows 的保留端口也可能返回 EACCES。绑定失败可直接重试，close 会关闭数据库。
+      if (attempt >= 32 || !['EADDRINUSE', 'EACCES'].includes(err.code)) throw err;
+    }
+  }
+}
+
 // 兜底：任何漏网的未捕获异常只记日志，避免 Electron 侧只看到「exited with 1」
 process.on('uncaughtException', (err) => {
   console.error('[未捕获异常]', err && err.stack ? err.stack : err);
@@ -3138,8 +3159,4 @@ server.on('error', (err) => {
   process.exitCode = 1;
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  const actual = server.address().port;
-  console.log(`[服务] http://localhost:${actual}`);
-  if (process.send) process.send({ ready: true, port: actual });
-});
+if (PORT !== 0) server.listen(PORT, '127.0.0.1');
