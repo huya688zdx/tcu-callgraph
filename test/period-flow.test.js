@@ -8,6 +8,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { callSequence, callNumbers } from '../src/core/call-sequence.js';
 import { projectTasks, withTaskPeriods } from '../src/core/task-periods.js';
+import { detectTasks } from '../src/core/detect-tasks.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { edgeCaption, svgMarkers } from '../web/lib/edge-flow.js';
 import { traceVisiblePaths } from '../web/lib/visible-paths.js';
@@ -179,4 +180,93 @@ test('单次扫描保留跨文件任务注册、间隔和后绑定成员调用�
   assert.deepEqual(callSequence(model, 'a_start.c::start').map(group => group.map(call => call.name)),
     [['xTaskCreate'], ['worker'], ['end']]);
   assert.ok(model.functions.every(fn => !fn.bodyTokens), '不因恢复任务证据而长期保留函数 token');
+});
+
+test('延时周期使用调用位置的宏定义及 undef 状态', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-scope-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'worker.c'), `
+#define STEP 10
+#define INTERVAL STEP
+void workerA(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+#undef STEP
+void worker_unknown(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+#define STEP 20
+void workerB(void) { for (;;) vTaskDelay(pdMS_TO_TICKS(INTERVAL)); }
+`);
+  assert.deepEqual(Object.fromEntries(projectTasks(loadModel(root)).map(({ name, us }) => [name, us])), {
+    workerA: 10000, worker_unknown: null, workerB: 20000,
+  });
+});
+
+test('循环内顺序执行的两次相同延时不推断为单次延时周期', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-sequential-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'worker.c'), `
+void worker(void) {
+  while (1) {
+    step1();
+    vTaskDelay(pdMS_TO_TICKS(10));
+    step2();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+`);
+  const tasks = projectTasks(loadModel(root));
+  assert.deepEqual(tasks.map(({ name, us }) => [name, us]), [['worker', null]]);
+});
+
+test('纯 C 周期识别支持 RTOS 注册、循环工作函数、毫秒宏和调度表', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tcu-period-c-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'schedule.h'), '#define STEP_TIME (20U)\n#define STEP_ALIAS STEP_TIME\n');
+  fs.writeFileSync(path.join(root, 'firmware.c'), `
+#include "schedule.h"
+#include "cmsis_os2.h"
+void controller_loop(void) { while (1) { vTaskDelay(pdMS_TO_TICKS(STEP_ALIAS)); } }
+static void controller_entry(void *arg) { controller_loop(); }
+static void read_pressure(void) { while (true) { vTaskDelay(7 / portTICK_PERIOD_MS); } }
+static void service_can(void) { for (;;) vTaskDelayUntil(&last, STEP_TIME / portTICK_PERIOD_MS); }
+void monitor(void) { for (;;) { xTaskDelayUntil(&last, pdMS_TO_TICKS(3)); } }
+void budgeted(void) {
+  while (1) {
+    if (stopped) { vTaskDelay(50); continue; }
+    if (elapsed < STEP_TIME) vTaskDelay((STEP_TIME - elapsed) / portTICK_PERIOD_MS);
+  }
+}
+void wait_cmsis(void) { while (1) osDelay(5); }
+void timeout(void) {}
+void Task_10ms(void) {}
+void main_10ms(void) {}
+void Runnable_5ms(void) {}
+void retry(void) { for (int i = 0; i < 3; i++) vTaskDelay(pdMS_TO_TICKS(2)); }
+void setup_delay(void) { vTaskDelay(pdMS_TO_TICKS(2)); while (1) {} }
+Schedule schedule = { .fast = Runnable_5ms };
+int main(void) {
+  xTaskCreatePinnedToCore(controller_entry, "control", 0, 0, 0, 0, 1);
+  xTaskCreateStatic(&read_pressure, "pressure", 0, 0, 0, 0, 0);
+  xTaskCreateStaticPinnedToCore(service_can, "can", 0, 0, 0, 0, 0, 1);
+  osThreadNew(wait_cmsis, 0, 0);
+  osTimerNew(timeout, osTimerPeriodic, 0, 0);
+  schedule.fast();
+}
+`);
+  fs.writeFileSync(path.join(root, 'legacy.c'), `
+#include "cmsis_os.h"
+void legacy_loop(void) { while (1) osDelay(6); }
+`);
+  const model = loadModel(root);
+  const tasks = projectTasks(model);
+  assert.deepEqual(Object.fromEntries(tasks.map(task => [task.name, task.us])), {
+    controller_loop: 20000, controller_entry: null, read_pressure: 7000, service_can: 20000,
+    monitor: 3000, budgeted: 20000, wait_cmsis: null, timeout: null,
+    Task_10ms: 10000, main_10ms: 10000, Runnable_5ms: 5000, legacy_loop: 6000,
+  });
+  assert.match(tasks.find(task => task.name === 'timeout').source, /osTimerNew/);
+  assert.match(tasks.find(task => task.name === 'read_pressure').source, /xTaskCreateStatic.*vTaskDelay/);
+  assert.match(tasks.find(task => task.name === 'controller_entry').source, /xTaskCreatePinnedToCore/);
+  const wrapper = detectTasks(model, 'firmware.c::controller_entry');
+  assert.ok(wrapper.suggestions.some(s => s.to === 'firmware.c::controller_loop' && s.text === 'TASK:20ms'));
+  const scheduler = detectTasks(model, 'firmware.c::main');
+  assert.ok(scheduler.suggestions.some(s => s.to === 'firmware.c::Runnable_5ms' && s.text === 'TASK:5ms'));
 });

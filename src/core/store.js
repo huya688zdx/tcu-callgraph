@@ -206,7 +206,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v14-single-pass-task-order\0');
+  h.update('analyzed-model-v16-header-scope-and-task-periods\0');
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
@@ -349,16 +349,20 @@ function applyEvent(ov, e) {
       ov.deleted = { nodes: {}, edges: {} };
       return;
     }
-    case 'layout.save': {
+    case 'layout.save':
+    case 'layout.clear': {
+      for (const key of after.clearedLegacyManual || []) {
+        if (ov.layout[key]) ov.layout[key].manual = [];
+      }
+      if (e.op === 'layout.clear') {
+        delete ov.layout[e.target];
+        return;
+      }
       const slot = ov.layout[e.target] || { nodes: {}, edges: {}, manual: [] };
       if (after.nodes) Object.assign(slot.nodes, after.nodes);
       if (after.edges) Object.assign(slot.edges, after.edges);
       if (after.manual) slot.manual = after.manual;
       ov.layout[e.target] = slot;
-      return;
-    }
-    case 'layout.clear': {
-      delete ov.layout[e.target];
       return;
     }
     case 'orphan.purge': {

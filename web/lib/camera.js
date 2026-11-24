@@ -139,12 +139,21 @@ function zoomCam(x, y, delta) {
   camAnim.to = { x: x - a.wx * k, y: y - a.wy * k, k };
 }
 
-/** 把文件框 / 目录容器整体居中并适配到视野 */
-function focusBox(box, pad = 90) {
+function boxInViewport({ x, y, w, h }, margin = 0) {
+  return x * cam.k + cam.x >= margin && (x + w) * cam.k + cam.x <= els.cv.clientWidth - margin &&
+    y * cam.k + cam.y >= margin && (y + h) * cam.k + cam.y <= els.cv.clientHeight - margin;
+}
+
+/** 聚焦时沿用当前比例。容器超出视口时可缩小以容纳整体。 */
+function focusBox(box, pad = 90, { keepZoom = true } = {}) {
   const W = els.cv.clientWidth;
   const H = els.cv.clientHeight;
   if (!W || !H || !box.w || !box.h) return;
-  const k = clampZoom(Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2), 1.6));
+  const { k: currentZoom } = cam;
+  const oversized = box.w * currentZoom > W || box.h * currentZoom > H;
+  const k = !keepZoom && oversized
+    ? Math.min(currentZoom, clampZoom(Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2))))
+    : currentZoom;
   animateCam({
     x: W / 2 - (box.x + box.w / 2) * k,
     y: H / 2 - (box.y + box.h / 2) * k,
@@ -152,46 +161,29 @@ function focusBox(box, pad = 90) {
   });
 }
 
-/** 新节点居中，直接邻居参与计算缩放。仅新增连线时按需移动视角。 */
+/** 新增内容超出视口时平移，沿用当前缩放比例。 */
 function revealAdded(nodes, edges) {
   const W = els.cv.clientWidth, H = els.cv.clientHeight;
   if (!W || !H) return;
-  if (nodes.length) {
-    const bounds = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
-    const include = ({ x, y, w, h }) => {
-      bounds.x0 = Math.min(bounds.x0, x);
-      bounds.y0 = Math.min(bounds.y0, y);
-      bounds.x1 = Math.max(bounds.x1, x + w);
-      bounds.y1 = Math.max(bounds.y1, y + h);
-    };
-    for (const node of nodes) include(node);
-    const added = { ...bounds };
-    const ids = new Set(nodes.map((n) => n.id));
-    const neighbors = new Set();
-    for (const { from, to } of state.view.edges) {
-      if (ids.has(from) && !ids.has(to)) neighbors.add(to);
-      if (ids.has(to) && !ids.has(from)) neighbors.add(from);
-    }
-    for (const node of state.view.nodes) if (neighbors.has(node.id)) include(node);
-    const { x0, y0, x1, y1 } = bounds.x1 - bounds.x0 > W * 2.2 || bounds.y1 - bounds.y0 > H * 2.2 ? added : bounds;
-    const spanW = Math.max(180, x1 - x0), spanH = Math.max(120, y1 - y0);
-    const pad = 72;
-    const k = clampZoom(Math.min(1.15, Math.max(0.6, Math.min((W - pad * 2) / spanW, (H - pad * 2) / spanH))));
-    const addCx = (added.x0 + added.x1) / 2, addCy = (added.y0 + added.y1) / 2;
-    animateCam({ x: W / 2 - addCx * k, y: H / 2 - addCy * k, k }, 340);
-    return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const include = (x, y) => {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+    x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  };
+  // 新节点优先，避免很长的连接线把镜头拉离要查找的节点。
+  for (const { x, y, w, h } of nodes) { include(x, y); include(x + w, y + h); }
+  if (!nodes.length) {
+    for (const edge of edges) for (const [x, y] of edge.points || []) include(x, y);
   }
-  const points = edges.flatMap((e) => e.points || []);
-  if (!points.length) return;
-  const pad = 40;
-  if (points.every(([x, y]) => x * cam.k + cam.x >= pad && x * cam.k + cam.x <= W - pad &&
-      y * cam.k + cam.y >= pad && y * cam.k + cam.y <= H - pad)) return;
-  const x0 = Math.min(...points.map((p) => p[0])), x1 = Math.max(...points.map((p) => p[0]));
-  const y0 = Math.min(...points.map((p) => p[1])), y1 = Math.max(...points.map((p) => p[1]));
-  const k = clampZoom(Math.min(cam.k, (W - pad * 2) / Math.max(1, x1 - x0), (H - pad * 2) / Math.max(1, y1 - y0)));
-  const shift = (lo, hi, origin, size) => lo * k + origin < pad ? pad - lo * k :
-    hi * k + origin > size - pad ? size - pad - hi * k : origin;
-  const target = { x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k };
-  animateCam(target, 300);
+  if (!Number.isFinite(x0) || boxInViewport({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 })) return;
+  const { k } = cam;
+  const shift = (lo, hi, origin, size) => {
+    const span = (hi - lo) * k;
+    if (span >= size) return (size - (lo + hi) * k) / 2;
+    if (lo * k + origin >= 0 && hi * k + origin <= size) return origin;
+    const pad = Math.min(40, (size - span) / 2);
+    return Math.max(pad - lo * k, Math.min(origin, size - pad - hi * k));
+  };
+  animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k }, 300);
 }
-export { contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, focusBox, revealAdded };
+export { contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, boxInViewport, focusBox, revealAdded };

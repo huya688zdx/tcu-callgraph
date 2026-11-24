@@ -24,7 +24,7 @@ import {
   labelText,
   normalizeLabel,
   normalizeLabels,
-  visibleCallOrderMap,
+  callOrderForEdge,
   displayEdgeLabels,
   labelBoxSize,
   placeEdgeLabels,
@@ -257,9 +257,8 @@ export function makeLabel(preset, edge, { num } = {}) {
     });
   }
   if (preset === 'call') {
-    const orders = edge?.from && state.view ? visibleCallOrderMap(state.view, edge.from) : null;
     const order = (Number.isFinite(Number(num)) && Number(num) > 0 ? Math.trunc(Number(num)) : null) ||
-      orders?.get(edge?.to)?.order ||
+      (edge?.from && state.view ? callOrderForEdge(state.view, edge) : null) ||
       (edge?.callNumbers?.length ? parseInt(edge.callNumbers[0], 10) : null) ||
       1;
     return normalizeLabel({
@@ -321,9 +320,9 @@ export function applyLabels(edge, labels) {
 
 /** 落库：labels 为 null / 空组时服务端会删掉这个键（整组清除） */
 export async function persistLabels(edge, projectId = state.view?.projectId) {
-  if (!projectId) throw new Error('工程已切换，请刷新后重试');
+  if (!projectId) throw new Error(t('project.retryAfterSwitch'));
   const result = await api.overlay({ edgeKey: edgeKey(edge), data: { labels: edge.labels || null }, projectId });
-  if (!result?.ok) throw new Error(result?.error === 'review-mode' ? t('timeline.blocked') : result?.error || '保存标签失败');
+  if (!result?.ok) throw new Error(result?.error === 'review-mode' ? t('timeline.blocked') : result?.error || t('label.failed'));
   return edge.labels || null;
 }
 

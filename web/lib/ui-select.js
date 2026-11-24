@@ -13,6 +13,9 @@ function sync(sel) {
   if (!control) return;
   control.label.textContent = sel.options[sel.selectedIndex]?.textContent ?? '';
   control.button.disabled = sel.disabled;
+  const ariaLabel = sel.getAttribute('aria-label');
+  if (ariaLabel) control.button.setAttribute('aria-label', ariaLabel);
+  else control.button.removeAttribute('aria-label');
   if (active === sel && sel.disabled) close();
 }
 
@@ -93,7 +96,6 @@ function upgrade(sel) {
   button.className = 'fsel-btn';
   button.setAttribute('aria-haspopup', 'listbox');
   button.setAttribute('aria-expanded', 'false');
-  if (sel.getAttribute('aria-label')) button.setAttribute('aria-label', sel.getAttribute('aria-label'));
   const label = document.createElement('span');
   button.append(label);
   sel.replaceWith(wrap);
@@ -156,4 +158,4 @@ new MutationObserver((records) => {
     if (sel) sync(sel);
   }
   if (active && !active.isConnected) close();
-}).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true, attributeFilter: ['disabled', 'selected', 'label'] });
+}).observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true, attributeFilter: ['disabled', 'selected', 'label', 'aria-label'] });

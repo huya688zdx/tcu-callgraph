@@ -26,23 +26,20 @@ const restoreBtn = document.getElementById('reviewRestore');
 const exitBtn = document.getElementById('reviewExit');
 
 const PAGE = 50;
-const CHANGE_LABEL = { existing: '既存', added: '追加', deleted: '删除', changed: '变更' };
 
 const OP_KIND = {
-  'node.annotate': 'k-annotate',
-  'edge.annotate': 'k-annotate',
-  'labels.renumber': 'k-annotate',
-  'delete': 'k-delete',
-  'delete.restore': 'k-delete',
-  'delete.clear': 'k-delete',
-  'layout.save': 'k-layout',
-  'layout.clear': 'k-layout',
-  baseline: 'k-anchor',
-  import: 'k-anchor',
-  restore_point: 'k-anchor',
-  'orphan.purge': 'k-delete',
-  'bookmark.save': 'k-anchor',
-  'bookmark.delete': 'k-anchor',
+  'node.annotate': 'Node',
+  'edge.annotate': 'Edge',
+  'labels.renumber': 'Edge',
+  'delete': 'Delete',
+  'delete.restore': 'Delete',
+  'delete.clear': 'Delete',
+  'layout.save': 'Layout',
+  'layout.clear': 'Layout',
+  'orphan.purge': 'Delete',
+  'bookmark.save': 'Bookmark',
+  'bookmark.delete': 'Bookmark',
+  'view.compose': 'Compose',
 };
 
 /** 面板状态：已加载的事件、过滤条件、翻页游标 */
@@ -61,11 +58,27 @@ const dayLabel = (ts) => {
   const d = new Date(ts);
   const today = new Date();
   return d.toDateString() === today.toDateString()
-    ? '今天'
+    ? t('common.today')
     : `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())}`;
 };
 
-const pair = (a, b, sep) => (a && b ? sep : '');
+function formatTarget(target) {
+  const parts = target.split('->');
+  const isEdge = parts.length === 2;
+  const line = isEdge ? parts[1].match(/:(\d+)$/) : null;
+  if (line) parts[1] = parts[1].slice(0, -line[0].length);
+  const names = [];
+  const files = [];
+  for (const part of parts) {
+    const segments = part.split('::');
+    if (segments.length === 1) return { title: target, meta: '' };
+    names.push(segments.pop());
+    if (segments[0] === 'header' || segments[0] === 'var') segments.shift();
+    files.push(segments.join('::'));
+  }
+  const path = files.filter(Boolean).join(' → ');
+  return { title: names.join(' → '), meta: [path, line?.[0]].filter(Boolean).join(' ') };
+}
 
 /** 把一条事件翻译成人话：用户看时间轴时不该看到 op 名 */
 function describe(e) {
@@ -75,48 +88,73 @@ function describe(e) {
     case 'node.annotate':
     case 'edge.annotate': {
       const bits = [];
-      if (b.change) bits.push(CHANGE_LABEL[b.change] || b.change);
-      if (b.note) bits.push(`备注「${b.note}」`);
-      if (b.tag) bits.push(`标签 ${b.tag}`);
-      if (b.color) bits.push('标记颜色');
-      return `${target} → ${bits.join(' · ') || '清空标注'}`;
+      if (b.change) bits.push(t(`compare.version.${b.change === 'changed' ? 'modified' : b.change}`));
+      if (b.note) bits.push(t('timeline.note', { note: b.note }));
+      if (b.tag) bits.push(t('timeline.tag', { tag: b.tag }));
+      if (b.color) bits.push(t('timeline.color'));
+      const labels = Array.isArray(b.labels) ? b.labels.filter(Boolean) : [];
+      if (!labels.length && b.label) labels.push(b.label);
+      if (labels.length) bits.push(t('timeline.labels', { labels: labels.join(' · ') }));
+      else if (b.labelsCount > 0) bits.push(t('timeline.labelCount', { n: b.labelsCount }));
+      if (b.cleared === true) bits.push(t('timeline.cleared'));
+      return bits.join(' · ') || t(e.op === 'edge.annotate' ? 'op.edge.annotate' : 'op.node.annotate');
     }
     case 'labels.renumber':
-      return '结合点编号重排（删除后自动紧凑）';
+      return t('timeline.renumber');
     case 'delete':
-      return `${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${b.edges ? `${b.edges} 条连线` : ''} 被删除`;
-    case 'delete.restore':
-      return `恢复 ${b.nodes ? `${b.nodes} 个函数` : ''}${pair(b.nodes, b.edges, ' / ')}${
-        b.edges ? `${b.edges} 条连线` : ''
-      }`;
+    case 'delete.restore': {
+      const items = [b.nodes && t('common.functionCount', { n: b.nodes }), b.edges && t('common.edgeCount', { n: b.edges })]
+        .filter(Boolean).join(' / ');
+      return items ? t(e.op === 'delete' ? 'timeline.deleted' : 'timeline.recovered', { items }) : t(`op.${e.op}`);
+    }
     case 'delete.clear':
-      return '清空全部删除记录';
+      return t('op.delete.clear');
     case 'layout.save':
-      return `${target || '视图'} 调整布局${b.nodes ? `（${b.nodes} 个节点）` : ''}`;
+      return b.nodes ? t('timeline.layoutNodes', { n: b.nodes }) : t('op.layout.save');
     case 'layout.clear':
-      return `${target || '视图'} 重置布局`;
+      return t('op.layout.clear');
     case 'baseline':
-      return '打开工程（历史起点）';
+      return t('op.baseline');
     case 'import':
-      return '导入旧版 out/overlay.json';
+      return t('timeline.legacy');
     case 'session.import': {
       const im = b.import || {};
-      const base = `导入会话「${target}」· 标注 ${im.annotations || 0} · 布局 ${im.layout || 0} · 书签 ${
-        im.bookmarks || 0
-      }`;
-      return b.codeMismatch ? base + '（代码版本不一致）' : base;
+      const base = t('session.imported', { a: im.annotations || 0, l: im.layout || 0, b: im.bookmarks || 0 });
+      return b.codeMismatch ? base + ' ' + t('session.codeMismatch') : base;
     }
     case 'restore_point':
-      return `恢复到 ${target || '历史时刻'}`;
+      return t('op.restore_point');
     case 'bookmark.save':
-      return `保存书签「${target}」${b.roots ? ` · ${b.roots} 个入口` : ''}`;
+      return [t('op.bookmark.save'), b.roots ? t('common.scopeCount', { n: b.roots }) : ''].filter(Boolean).join(' · ');
     case 'bookmark.delete':
-      return `删除书签「${target}」`;
+      return t('op.bookmark.delete');
+    case 'view.compose': {
+      const reason = b.reason ?? (target.includes('::') ? '' : target);
+      const caption = b.count == null ? t('timeline.compose') : t('timeline.composeCount', { n: b.count });
+      return [caption, reason].filter(Boolean).join(' · ');
+    }
     case 'orphan.purge':
-      return `清理 ${b.total || 0} 条失效标注`;
+      return t('timeline.orphanCount', { n: b.total || 0 });
     default:
       return t(`op.${e.op}`) || e.op;
   }
+}
+
+function collapseEvents(events) {
+  const rows = [];
+  // 接口按事件 ID 倒序返回，合并时保留每组最新的一条。
+  for (const event of events) {
+    const day = dayKey(event.ts);
+    const detail = describe(event);
+    const previous = rows.at(-1);
+    if (previous && previous.day === day && previous.event.op === event.op &&
+        previous.event.target === event.target && previous.detail === detail) {
+      previous.count++;
+    } else {
+      rows.push({ event, day, detail, count: 1 });
+    }
+  }
+  return rows;
 }
 
 function renderAll() {
@@ -128,22 +166,34 @@ function renderAll() {
 
   let html = '';
   let lastDay = '';
-  for (const e of tl.events) {
-    const dk = dayKey(e.ts);
-    if (dk !== lastDay) {
-      lastDay = dk;
+  for (const { event: e, day, detail, count } of collapseEvents(tl.events)) {
+    if (day !== lastDay) {
+      lastDay = day;
       html += `<div class="ev-day">${dayLabel(e.ts)}</div>`;
     }
-    const kind = OP_KIND[e.op] || '';
+    const kind = OP_KIND[e.op] || 'Project';
+    const category = t(`timeline.kind${kind}`);
+    const target = e.target || '';
+    const codeTarget = ['Node', 'Edge', 'Delete', 'Layout', 'Compose'].includes(kind);
+    const displayTarget = kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
+      : kind === 'Compose' && !target.includes('::') ? '' : target;
+    const { title, meta } = codeTarget
+      ? formatTarget(displayTarget)
+      : { title: displayTarget, meta: '' };
     const on = state.at === e.id ? ' on' : '';
-    html += `<div class="ev ${kind}${on}" data-id="${e.id}" data-ts="${e.ts}">
-      <span class="dot"></span>
-      <div style="flex:1;min-width:0">
-        <div class="txt">${esc(describe(e))}</div>
-        <div class="sub">${hhmm(e.ts)}${e.actor === 'system' ? ' · 系统' : ''}${
-          e.actor === 'ai' ? ' <span class="ai-badge">AI</span>' : ''
-        }</div>
+    const sub = [meta, hhmm(e.ts), e.actor === 'system' ? t('common.system') : ''].filter(Boolean).join(' · ');
+    html += `<div class="ev k-${kind.toLowerCase()}${on}" data-id="${esc(e.id)}" data-ts="${esc(e.ts)}">
+      <div class="ev-content">
+        <div class="ev-heading">
+          <span class="ev-kind">${esc(category)}</span>
+          <strong class="ev-title">${esc(title || detail)}</strong>
+          ${count > 1 ? `<span class="ev-repeat">×${count}</span>` : ''}
+          ${e.actor === 'ai' && kind !== 'Compose' ? '<span class="ai-badge">AI</span>' : ''}
+        </div>
+        ${title && title !== detail ? `<div class="ev-detail">${esc(detail)}</div>` : ''}
+        <div class="sub">${esc(sub)}</div>
       </div>
+      <button type="button" class="ev-review">${esc(t('timeline.review'))}</button>
     </div>`;
   }
   if (tl.hasMore) {
@@ -166,7 +216,7 @@ function setCount() {
 
 /** 拉一页。append=true 时接着上一页往后取（游标 = 已加载的最后一条 id） */
 async function load({ append = false } = {}) {
-  if (tl.loading) return;
+  if (append && tl.loading) return;
   tl.loading = true;
   const seq = ++tl.seq;
   const before = append && tl.events.length ? tl.events[tl.events.length - 1].id : 0;
@@ -179,9 +229,11 @@ async function load({ append = false } = {}) {
     tl.total = Number(r.total || 0);
   } catch {
     if (seq !== tl.seq) return;
-    tl.events = [];
-    tl.hasMore = false;
-    tl.total = 0;
+    if (!append) {
+      tl.events = [];
+      tl.hasMore = false;
+      tl.total = 0;
+    }
   } finally {
     if (seq === tl.seq) tl.loading = false;
   }
@@ -272,4 +324,14 @@ document.addEventListener('cg:review-blocked', () => {
 
 wireModals();
 
-export { exitReview, reviewAt, hideBar, load as reloadTimeline };
+export function reloadTimeline() {
+  if (document.getElementById('timelineModal')?.classList.contains('show')) return load();
+}
+
+document.addEventListener('callgraph:langchange', () => {
+  setCount();
+  renderAll();
+  if (state.at) showBar(tl.events.find(event => event.id === state.at)?.ts || Date.now());
+});
+
+export { exitReview, reviewAt, hideBar };

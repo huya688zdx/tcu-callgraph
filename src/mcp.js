@@ -23,6 +23,13 @@
 
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_INFO = { name: 'tcu-callgraph', version: '0.2.0' };
+const AI_INSTRUCTIONS = [
+  'AI 绘图与标注强制规范',
+  '1. 写入前先用 cg_page 对齐当前画布，再用 cg_source 读实际 C 源码。结合 cg_search、cg_node、cg_dataflow 和 cg_detect_tasks 核对函数、调用关系、周期及变量读写。',
+  '2. 使用 cg_compose_view 精选与用户目标直接相关的控制链、周期任务或变量数据流。通常选择 5–40 个核心函数，每次最多提交 80 个函数。',
+  '3. 用 cg_apply_task_labels 写标签。只在有周期或调度证据的调用线上写 TASK，文字带周期，note 记录文件行号和依据。按同一调用方在源码中的实际执行顺序从 コール順1 连续编号，禁止重号。分支或求值顺序不明时说明已知范围。',
+  '4. 节点分类遵守四色语义：existing（既存绿）、modified（変更黄）、added（追加粉）、deleted（削除灰）。',
+].join('\n');
 
 export const ACCESS_LEVELS = ['off', 'readonly', 'readwrite'];
 
@@ -44,7 +51,9 @@ const rpcResult = (id, result) => ({ jsonrpc: '2.0', id, result });
 
 /** 桥接 GET：URLSearchParams 已编码好 */
 async function get(ctx, pathAndQuery) {
-  const res = await ctx.fetchImpl(`${ctx.baseUrl}${pathAndQuery}`);
+  const res = await ctx.fetchImpl(`${ctx.baseUrl}${pathAndQuery}`, ctx.projectId === undefined ? undefined : {
+    headers: { 'X-Callgraph-Project': String(ctx.projectId) },
+  });
   return res.json();
 }
 
@@ -176,6 +185,27 @@ const TOOLS = [
     run: (a, ctx) => get(ctx, '/api/node?id=' + encodeURIComponent(String(a.id || ''))),
   },
   {
+    name: 'cg_source',
+    description: '读取已索引的 C 源码。传函数 id 或项目内的相对文件路径与行范围。最多返回 250 行，函数查询同时返回周期、调用和变量访问。行号从 1 开始。',
+    access: 'read',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', description: '来自 cg_search 的函数 id' },
+        file: { type: 'string', description: '来自 cg_tree 的项目相对路径' },
+        startLine: { type: 'integer', minimum: 1 },
+        endLine: { type: 'integer', minimum: 1 },
+      },
+      oneOf: [{ required: ['id'] }, { required: ['file', 'startLine', 'endLine'] }],
+    },
+    run: (a, ctx) => {
+      const q = new URLSearchParams();
+      for (const key of ['id', 'file', 'startLine', 'endLine']) if (a[key] !== undefined) q.set(key, a[key]);
+      return get(ctx, '/api/source?' + q);
+    },
+  },
+  {
     name: 'cg_vars',
     description: '全工程全局变量 / 常量清单（变量节点的 id 从这里拿）。',
     access: 'read',
@@ -243,10 +273,60 @@ const TOOLS = [
     description:
       '服务端扫源码自动找 TASK / コール順 线索：函数名带周期（Task_10ms 等）的任务、ISR 调度边、' +
       '任务调用链的先后顺序。返回建议清单（含 edgeKey 与证据），不落库——' +
-      '选中哪些由你判断，再用 cg_annotate 的 labels 挂到对应连线上。',
+      '用 cg_source 核实后，将确认的标签交给 cg_apply_task_labels。',
     access: 'read',
     inputSchema: { type: 'object', properties: {} },
     run: (_a, ctx) => get(ctx, '/api/detect-tasks'),
+  },
+  {
+    name: 'cg_compose_view',
+    description: '将精选的入口函数、相关函数和全局变量推送到用户画布，实际调用边随视图显示。先使用 cg_page、cg_node 和 cg_source 核实，通常选择 5–40 个核心函数，总数最多 80。',
+    access: 'write',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['mode'],
+      properties: {
+        mode: { type: 'string', enum: ['replace', 'add'] },
+        roots: { type: 'array', items: { type: 'string' }, maxItems: 80, description: '入口函数 ID，和 functionIds 合计提交 1–80 项' },
+        functionIds: { type: 'array', items: { type: 'string' }, maxItems: 80 },
+        up: { type: 'integer', minimum: 0, maximum: 5, default: 0 },
+        down: { type: 'integer', minimum: 0, maximum: 5, description: '提供精选 functionIds 时默认 0，否则默认 1' },
+        vars: { type: 'array', items: { type: 'string' }, description: 'cg_vars 返回的全局变量 id' },
+        selected: { type: 'string', description: '在结果画布中高亮的节点 ID' },
+        reason: { type: 'string', maxLength: 240, description: '显示在用户画布上的筛选理由' },
+      },
+    },
+    run: (a, ctx) => post(ctx, '/api/mcp-compose', a),
+  },
+  {
+    name: 'cg_apply_task_labels',
+    description: '批量写入 TASK、コール順 和結合点标签。TASK 文字须有周期，note 写出源码依据。调用顺序按同一调用方连续编号，服务端拒绝重号。整批校验后一起落库。',
+    access: 'write',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['items'],
+      properties: {
+        items: {
+          type: 'array', minItems: 1, maxItems: 200,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['edgeKey', 'preset'],
+            properties: {
+              edgeKey: { type: 'string', description: '实际调用边 from->to:line，省略行号时使用画布代表边' },
+              preset: { type: 'string', enum: ['task', 'call', 'conn'] },
+              text: { type: 'string', maxLength: 40 },
+              order: { type: 'integer', minimum: 1, description: 'call 的编号，也可用 コール順N 文字' },
+              note: { type: 'string', maxLength: 80 },
+            },
+          },
+        },
+        merge: { type: 'boolean', default: true, description: '保留该边上未提交的其他标签类型' },
+      },
+    },
+    run: (a, ctx) => post(ctx, '/api/mcp-task-labels', a),
   },
   {
     name: 'cg_annotate',
@@ -254,8 +334,8 @@ const TOOLS = [
       '给函数节点或连线写标注。data 支持的键：note(备注文字)、' +
       'color(底色，只能是固定四色：#CCFFCC=既存绿 / #FFFF99=変更黄 / #FFCCFF=追加粉 / #BFBFBF=削除灰，传 null 清除，别的值会被拒绝)、' +
       'tag(分类标签)、change(既存 existing / 変更 modified / 追加 added / 削除 deleted——底色规则由它驱动，按规则改框色优先用它)、' +
-      'labels(连线标签数组，一条线可挂多条，整组替换——先 cg_view 读现有再合并提交；' +
-      '每条 {preset:"task"|"conn"|"call", text, note(第二行说明小字), border, color, num(结合点编号，不给则自动分配), dx, dy}，传 null 清空全部；' +
+      'labels(连线标签数组，整组替换。优先用 cg_apply_task_labels 保留其他标签；' +
+      '每条 {preset:"task"|"conn"|"call", text, note, num, dx, dy}。TASK 须填写周期与源码依据，コール順 禁止重号。传 null 清空全部；' +
       '旧字段 label=单条仍兼容=整组替换成这一条)。' +
       '标注会实时推送到用户打开的页面上（无需刷新），并记入时间轴。',
     access: 'write',
@@ -286,7 +366,7 @@ const TOOLS = [
       required: ['data'],
     },
     run: (a, ctx) => {
-      if (!a.nodeId && !a.edgeKey) return { ok: false, error: 'nodeId 或 edgeKey 必须给一个' };
+      if (!!a.nodeId === !!a.edgeKey) return { ok: false, error: 'nodeId 与 edgeKey 必须二选一' };
       return post(ctx, '/api/overlay', { nodeId: a.nodeId, edgeKey: a.edgeKey, data: a.data });
     },
   },
@@ -445,11 +525,7 @@ export function createMcpServer({ baseUrl, getAccess, writeOut, fetchImpl = fetc
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
-        instructions:
-          'TCU Callgraph：C 语言调用关系图工具。用户通常开着一个页面实时看图——先用 cg_page 看「用户正在看什么」，' +
-          '再用 cg_search 找函数 id、cg_view 取视图，cg_annotate/cg_delete/cg_save_layout 调整（需要 readwrite），' +
-          'cg_export_* 导出 SVG/Excel/HTML。你的写操作会实时推送到用户打开的页面上。' +
-          '当前权限：' + level + (level !== 'readwrite' ? '。' + accessHint(level) : '。'),
+        instructions: AI_INSTRUCTIONS + '\n当前 MCP 权限：' + level + '。' + accessHint(level),
       });
     }
     if (msg.method === 'ping') return rpcResult(id, {});

@@ -1,10 +1,10 @@
-import { edgeCaption } from './edge-flow.js';
+import { edgeCaption, edgeDirection } from './edge-flow.js';
 /**
  * 右侧「连线标签」面板：只在选中连线时出现。
  *
  * 一条连线可以挂多条标签（任务 / 結合点 / コール順并存）：
  *   - 列表区：每条一行（预设样式演示 + 摘要 + 删除），点击行选中（画布上虚线框）；
- *   - 编辑区：只渲染选中那条（预设切换 / 文字 / 结合点编号 / 说明行 / 边框与文字色）；
+ *   - 编辑区：按当前标签类型展示控件，颜色和边框默认折叠；
  *   - 添加区：按预设添加；结合点在「固定编号」模式下先挑编号（空缺号 + 下一号）；
  *   - 编号模式：固定 / 自动重排，重排模式下删除结合点会自动紧凑成 1..n；
  *   - 自动检测：服务端扫源码给出 TASK 建议；コール順 从函数右键查找。
@@ -17,7 +17,7 @@ import { els, state, esc, edgeKey } from './state.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 import { api } from './api.js';
-import { CONN_PREFIX, LABEL_PRESETS, LABELS_MAX, visibleCallOrderMap } from '/core/labels.js';
+import { CONN_PREFIX, LABEL_PRESETS, LABELS_MAX, numberedCallLabel, visibleCallOrderMap } from '/core/labels.js';
 import {
   edgeLabels,
   visibleEdgeLabels,
@@ -25,25 +25,19 @@ import {
   applyLabels,
   persistLabels,
   makeLabel,
-  switchPreset,
   connChoices,
-  connEntries,
   afterConnDelete,
 } from './edge-labels.js';
 import { hooks } from './hooks.js';
 import { statusControl, bindStatusControl } from './change-status.js';
 
-/** 预设演示：和画布上的实际样式保持一致（黑框 / 红框 / 无框） */
-const PRESET_UI = [
-  { id: 'task', demo: LABEL_PRESETS.task.text, cls: 'task', desc: 'label.preset.task' },
-  { id: 'conn', demo: CONN_PREFIX + '1', cls: 'conn', desc: 'label.preset.conn' },
-  { id: 'call', demo: LABEL_PRESETS.call.text, cls: 'call', desc: 'label.preset.call' },
-];
+const LABEL_NAMES = { call: 'label.callOrder', task: 'label.taskPeriod', conn: 'label.conn', custom: 'label.custom' };
+const TRUNK_ARROWS = { forward: '→', reverse: '←', both: '↔', unknown: '—' };
 
-const selectedId = () => {
+const selectedId = (edge) => {
   const s = state.selectedLabel || '';
   const i = s.lastIndexOf('#');
-  return i > 0 ? s.slice(i + 1) : null;
+  return i > 0 && s.slice(0, i) === edgeKey(edge) ? s.slice(i + 1) : null;
 };
 
 let connMode = null; // 'fixed' | 'renumber'，懒加载
@@ -92,8 +86,10 @@ async function commit(edge, projectId = state.view?.projectId) {
   try {
     await persistLabels(edge, projectId);
     if (state.view?.projectId === projectId) pushHistory();
+    return true;
   } catch (error) {
-    alert(`标签未保存：${error.message}`);
+    alert(t('label.notSaved', { error: error.message }));
+    return false;
   }
 }
 
@@ -103,7 +99,7 @@ async function removeLabel(edge, id) {
   const wasConn = target && target.preset === 'conn';
   applyLabels(edge, edgeLabels(edge).filter((l) => l.id !== id));
   if (state.selectedLabel === `${edgeKey(edge)}#${id}`) {
-    state.selectedLabel = edgeLabels(edge).length ? `${edgeKey(edge)}#${edgeLabels(edge)[0].id}` : null;
+    state.selectedLabel = null;
   }
   draw();
   renderLabelPanel();
@@ -114,21 +110,21 @@ async function removeLabel(edge, id) {
       const changes = await afterConnDelete();
       if (changes.length) {
         const result = await api.renumberConns(changes);
-        if (!result?.ok) throw new Error(result?.error || '结合点重排失败');
+        if (!result?.ok) throw new Error(result?.error || t('label.renumberFailed'));
         if (hooks.reloadKeepCam) await hooks.reloadKeepCam();
       }
     }
   } catch (error) {
-    alert(`标签保存或重排失败：${error.message}`);
+    alert(t('label.reorderSaveFailed', { error: error.message }));
   }
 }
 
 /** 添加或更新一条标签：固定模式下结合点先挑编号（connPick 状态）；コール順 若已有则直接更新序号 */
-let connPick = false; // 展开编号选择
+let connPick = null; // 当前展开新增编号选择的连线
 async function addLabel(edge, preset, num) {
   const current = edgeLabels(edge);
   if (preset === 'call') {
-    const existingCall = current.find((l) => l.preset === 'call');
+    const existingCall = numberedCallLabel(current) || current.find((l) => l.preset === 'call');
     if (existingCall) {
       if (num !== undefined) existingCall.text = `${LABEL_PRESETS.call.text}${num}`;
       state.selectedLabel = `${edgeKey(edge)}#${existingCall.id}`;
@@ -152,18 +148,18 @@ async function addLabel(edge, preset, num) {
   if (!label) return;
   applyLabels(edge, [...current, label]);
   state.selectedLabel = `${edgeKey(edge)}#${label.id}`;
-  connPick = false;
+  connPick = null;
   draw();
   renderLabelPanel();
   try {
     await persistLabels(edge);
     pushHistory();
   } catch (error) {
-    alert(`标签未保存：${error.message}`);
+    alert(t('label.notSaved', { error: error.message }));
   }
 }
 
-/** 一键把当前连线起点函数在画布中的全部可见被调函数标上 コール順1..K（仅图中，首次调用） */
+/** 一键保存当前调用方的可见调用编号，保留已保存的编号。 */
 async function applyCallerVisibleCallOrders(edge) {
   const view = state.view;
   if (!view || !edge?.from) return;
@@ -171,7 +167,9 @@ async function applyCallerVisibleCallOrders(edge) {
   if (!orders.size) return;
   const projectId = view.projectId;
   for (const { order, edge: targetEdge } of orders.values()) {
+    if (state.view !== view) return;
     const list = edgeLabels(targetEdge).slice();
+    if (numberedCallLabel(list)) continue;
     const existing = list.find((l) => l.preset === 'call');
     const text = `${LABEL_PRESETS.call.text}${order}`;
     if (existing) {
@@ -180,55 +178,31 @@ async function applyCallerVisibleCallOrders(edge) {
     } else if (list.length < LABELS_MAX) {
       const created = makeLabel('call', targetEdge, { num: order });
       applyLabels(targetEdge, [...list, created]);
-    }
+    } else continue;
     await persistLabels(targetEdge, projectId);
   }
-  const ownCall = edgeLabels(edge).find((l) => l.preset === 'call');
-  if (ownCall) state.selectedLabel = `${edgeKey(edge)}#${ownCall.id}`;
+  if (state.view !== view) return;
   draw();
   renderLabelPanel();
   pushHistory();
 }
 
 // ---- 自动检测 ----
-let detectResult = null; // {suggestions, inView, offView} | null
+let detectResult = null;
 let applyingDetect = false;
 
-async function runDetect() {
-  const from = state.selectedEdge?.from;
-  const projectId = state.view?.projectId;
-  const r = await api.detectTasks(from).catch(() => null);
-  if (state.selectedEdge?.from !== from || state.view?.projectId !== projectId) return;
-  if (!r || !r.ok) {
-    detectResult = { suggestions: [], inView: [], offView: [], error: true };
-    renderLabelPanel();
-    return;
-  }
-  const byKey = new Map((state.view?.edges || []).map((e) => [edgeKey(e), e]));
+async function runDetect(edge, labelId) {
+  const view = state.view;
+  const result = await api.detectTasks(edge.from).catch(() => null);
+  if (state.view !== view || state.selectedEdge !== edge || selectedId(edge) !== labelId) return;
+  const keys = new Set(view.edges.map(edgeKey));
   const inView = [];
   const offView = [];
-  for (const s of (r.suggestions || []).filter((s) => s.kind === 'task')) {
-    (byKey.has(s.edgeKey) ? inView : offView).push(s);
+  for (const suggestion of result?.suggestions || []) {
+    if (suggestion.kind !== 'task') continue;
+    (keys.has(suggestion.edgeKey) ? inView : offView).push(suggestion);
   }
-  // 同时给出当前函数在画布内的コール順建议（仅限图中可见函数、首次调用 1..K）
-  if (from && state.view) {
-    const orders = visibleCallOrderMap(state.view, from);
-    if (orders.size >= 2) {
-      for (const { order, edge: e } of orders.values()) {
-        inView.push({
-          kind: 'call',
-          preset: 'call',
-          edgeKey: edgeKey(e),
-          from: e.from,
-          to: e.to,
-          line: e.line,
-          text: `${LABEL_PRESETS.call.text}${order}`,
-          evidence: `图中第 ${order} 个被调函数 (${nodeName(e.to)})`,
-        });
-      }
-    }
-  }
-  detectResult = { inView, offView: [] };
+  detectResult = { edge, labelId, inView, offView, error: !result?.ok };
   renderLabelPanel();
 }
 
@@ -249,30 +223,20 @@ async function applyDetect() {
       const target = s && byKey.get(s.edgeKey);
       if (!target) continue;
       const labels = edgeLabels(target);
-      if (s.preset === 'task' && labels.some((l) => l.preset === 'task')) continue;
-      if (s.preset === 'call') {
-        const prevCall = labels.find((l) => l.preset === 'call');
-        if (prevCall) {
-          prevCall.text = s.text;
-          applyLabels(target, labels);
-          await persistLabels(target, projectId);
-          applied++;
-          continue;
-        }
-      }
-      const label = makeLabel(s.preset, target, { num: s.num });
-      if (s.text) label.text = s.text;
-      if (s.note) label.note = s.note;
-      applyLabels(target, [...labels, label]);
+      const currentTask = target === result.edge ? labels.find((l) => l.id === result.labelId && l.preset === 'task') : null;
+      if (!currentTask && (labels.length >= LABELS_MAX || labels.some((l) => l.preset === 'task'))) continue;
+      const label = currentTask || makeLabel('task', target);
+      const updated = { ...label, text: s.text || label.text, note: label.note || s.note };
+      applyLabels(target, currentTask ? labels.map((l) => l === currentTask ? updated : l) : [...labels, updated]);
       try { await persistLabels(target, projectId); }
       catch (error) { applyLabels(target, labels); throw error; }
       applied++;
     }
     if (state.view !== view) return;
-    detectResult = null;
-    if (applied && hooks.reloadKeepCam) await hooks.reloadKeepCam();
-    else renderLabelPanel();
-    if (state.view?.projectId === projectId && applied) pushHistory();
+    if (detectResult === result) detectResult = null;
+    draw();
+    renderLabelPanel();
+    if (applied) pushHistory();
   } catch (error) {
     if (state.view === view) {
       draw();
@@ -287,7 +251,86 @@ async function applyDetect() {
   }
 }
 
-export function renderLabelPanel() {
+let displayedTrunk = null;
+
+function trunkNavigator(trunkHits, activeBranches, allTrunk, edge) {
+  return `<div class="trunk-nav">
+    <div class="trunk-header">
+      <strong>${t('trunk.title', { n: trunkHits.length })}</strong>
+      <button type="button" class="trunk-all${allTrunk ? ' on' : ''}" data-trunk-pick="all" aria-pressed="${allTrunk}">${t('trunk.all', { n: trunkHits.length })}</button>
+    </div>
+    <p class="trunk-hint">${t('trunk.hint')}</p>
+    <div class="trunk-list" role="group" aria-label="${t('trunk.branches')}">
+      ${trunkHits.map((item, idx) => {
+        const active = activeBranches.has(item);
+        const line = item.line > 0 ? `<span class="trunk-line">:${esc(item.line)}</span>` : '';
+        return `<button type="button" class="trunk-branch-row${active ? ' on' : ''}" data-trunk-pick="${idx}"
+          aria-pressed="${active}"${item === edge ? ' data-trunk-anchor' : ''} title="${esc(edgeCaption(item, nodeName))}">
+          <span class="trunk-from">${esc(nodeName(item.from))}</span>
+          <span class="trunk-arrow">${TRUNK_ARROWS[edgeDirection(item)]}</span>
+          <span class="trunk-to">${esc(nodeName(item.to))}</span>${line}
+        </button>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
+
+function bindTrunkNavigator(box, trunkHits, scrollTop, revealAnchor) {
+  const list = box.querySelector('.trunk-list');
+  if (!list) return;
+  list.scrollTop = scrollTop;
+  const anchor = revealAnchor && list.querySelector('[data-trunk-anchor]');
+  if (anchor) {
+    const viewport = list.getBoundingClientRect();
+    const row = anchor.getBoundingClientRect();
+    if (row.top < viewport.top) list.scrollTop += row.top - viewport.top;
+    else if (row.bottom > viewport.bottom) list.scrollTop += row.bottom - viewport.bottom;
+  }
+
+  box.querySelectorAll('[data-trunk-pick]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const pick = button.dataset.trunkPick;
+      const all = pick === 'all';
+      const edge = all ? trunkHits[0] : trunkHits[Number(pick)];
+      if (!edge) return;
+      hooks.selectEdge(edge, { trunkHits, trunkGroup: all ? trunkHits : null });
+      box.querySelector(`[data-trunk-pick="${pick}"]`)?.focus({ preventScroll: true });
+    });
+  });
+}
+
+function labelRow(label, selected, readOnly = false) {
+  const auto = Boolean(label.auto);
+  const detail = auto && !readOnly ? t('label.changeNumber') : label.note;
+  const summary = `<span class="lbl-demo ${label.preset}">${esc(label.text || t(LABEL_NAMES[label.preset] || LABEL_NAMES.custom))}</span>
+    <span class="lbl-state${auto ? ' auto' : ''}">${auto ? t('common.ready') : t('common.saved')}</span>
+    ${detail ? `<span class="lbl-row-txt" title="${esc(detail)}">${esc(detail)}</span>` : ''}`;
+  if (readOnly) return `<div class="lbl-row"><div class="lbl-row-summary">${summary}</div></div>`;
+  return `<div class="lbl-row${selected ? ' on' : ''}" data-id="${esc(label.id)}">
+    <button type="button" class="lbl-row-summary" aria-pressed="${selected}">${summary}</button>
+    ${auto ? '' : `<button type="button" class="lbl-row-del" data-del="${esc(label.id)}" aria-label="${t('label.delete')}" title="${t('label.delete')}">✕</button>`}
+  </div>`;
+}
+
+function taskDetection() {
+  if (!detectResult) return `<button type="button" class="lbl-add lbl-detect" id="lblDetect">${t('label.detectAuto')}</button>`;
+  const { error, inView, offView } = detectResult;
+  const items = inView.map((suggestion, index) => `<label class="dt-item">
+    <input type="checkbox" class="dt-check" data-idx="${index}" checked>
+    <span class="lbl-demo task">${esc(suggestion.text)}</span>
+    <span class="dt-ev">${esc(suggestion.evidence || '')}</span>
+  </label>`).join('');
+  const message = error ? t('label.detectFailed') : items ? t('label.detect.title') : t('label.detect.none');
+  return `<div class="lbl-note">${message}</div>
+    ${items ? `<div class="dt-list">${items}</div>` : ''}
+    ${offView.length ? `<div class="lbl-note">${offView.length} ${t('label.detect.offview')}</div>` : ''}
+    <div class="lbl-actions">
+      ${items ? `<button type="button" id="dtApply">${t('label.detect.apply')}</button>` : `<button type="button" id="lblDetect">${t('label.detectAgain')}</button>`}
+      <button type="button" id="dtCancel">${t('label.hideSuggestions')}</button>
+    </div>`;
+}
+
+export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const sec = els.secLabel;
   const box = els.labelPanel;
   if (!sec || !box) return;
@@ -297,14 +340,13 @@ export function renderLabelPanel() {
     pendingEdge = null;
     pendingProjectId = null;
   } else flushPendingSave();
-  connPick = connPick && connMode === 'fixed';
-
   const edge = state.selectedEdge;
   if (!edge) {
+    displayedTrunk = null;
     sec.style.display = 'none';
     box.innerHTML = '';
     detectResult = null;
-    connPick = false;
+    connPick = null;
     // 选中的是连线时右侧栏只留标签面板（变量区块对连线没意义）；
     // 离开连线选择后恢复
     if (els.secVars) els.secVars.style.display = '';
@@ -314,44 +356,40 @@ export function renderLabelPanel() {
   if (els.secVars) els.secVars.style.display = 'none';
 
   const labels = visibleEdgeLabels(edge, state.view);
-  let sel = selectedId();
+  const sel = selectedId(edge);
   let selLabel = labels.find((l) => l.id === sel) || null;
-  if (!selLabel && labels.length) {
-    selLabel = labels[0];
-    sel = selLabel.id;
-    state.selectedLabel = `${edgeKey(edge)}#${sel}`;
-  }
-  const callerOrders = edge.from && state.view ? visibleCallOrderMap(state.view, edge.from) : new Map();
-  const maxOrder = Math.max(callerOrders.size, 1);
+  if (!selLabel) state.selectedLabel = null;
+  if (connPick !== edge || connMode !== 'fixed' || selLabel) connPick = null;
+  if (detectResult && (detectResult.edge !== edge || detectResult.labelId !== selLabel?.id)) detectResult = null;
 
   const trunkHits = state.trunkHits?.length > 1 && state.trunkHits.includes(edge) ? state.trunkHits : null;
-  const allTrunk = Boolean(state.multiSelection?.trunk && trunkHits);
-  const trunkBar = trunkHits ? `<div class="lbl-segs" style="flex-wrap:wrap;margin-bottom:8px">
-    <button type="button" class="lbl-seg${allTrunk ? ' on' : ''}" data-trunk-pick="all">全部共线 (${trunkHits.length})</button>
-    ${trunkHits.map((item, idx) => `<button type="button" class="lbl-seg${!allTrunk && item === edge ? ' on' : ''}" data-trunk-pick="${idx}" title="${esc(edgeCaption(item, nodeName))}">分支 ${idx + 1}</button>`).join('')}
-  </div>` : '';
-  const head = trunkBar + `<div class="lbl-head">${esc(allTrunk ? `共线干线 · 已在画布高亮 ${trunkHits.length} 条分支` : edgeCaption(edge, nodeName))}</div>${statusControl(edge, true)}`;
+  const activeBranches = new Set(state.multiSelection?.trunk ? state.multiSelection.hits : [edge]);
+  const allTrunk = Boolean(trunkHits && trunkHits.every((item) => activeBranches.has(item)));
+  const focusName = trunkHits && state.trunkFocusNode ? nodeName(state.trunkFocusNode) : null;
+  const caption = focusName && activeBranches.size > 1 ? `${focusName} · ${t('trunk.highlighted', { n: activeBranches.size })}`
+    : allTrunk ? t('trunk.highlightedAll', { n: trunkHits.length })
+    : focusName ? `${focusName} · ${edgeCaption(edge, nodeName)}` : edgeCaption(edge, nodeName);
+  const trunkScrollTop = trunkHits === displayedTrunk ? box.querySelector('.trunk-list')?.scrollTop || 0 : 0;
+  displayedTrunk = trunkHits;
+  const navigator = trunkHits ? trunkNavigator(trunkHits, activeBranches, allTrunk, edge) : '';
+  const head = navigator + `<div class="lbl-head" title="${esc(caption)}">${esc(caption)}</div>${statusControl(edge, true)}`;
 
   if (state.view?.comparison) {
-    const rows = labels.map((l) => `<div class="lbl-row"><span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span><span class="lbl-row-txt">${esc(l.note || '')}</span></div>`).join('');
-    box.innerHTML = head + (rows ? `<div class="lbl-rows">${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
+    const rows = labels.map((label) => labelRow(label, false, true)).join('');
+    box.innerHTML = head + (rows ? `<div class="lbl-rows"><h4>${t('label.existing')}</h4>${rows}</div>` : `<div class="lbl-note">${t('compare.readOnly')}</div>`);
     bindStatusControl(box, edge, true, renderLabelPanel);
+    bindTrunkNavigator(box, trunkHits, trunkScrollTop, scrollToTrunkBranch);
     return;
   }
 
-  // ---- 标签列表：一行一条，点击选中 ----
-  const rows = labels.length
-    ? labels
-        .map(
-          (l) => `
-      <div class="lbl-row${sel === l.id ? ' on' : ''}" data-id="${esc(l.id)}">
-        <span class="lbl-demo ${l.preset}">${esc(l.preset === 'conn' ? l.text : l.text || l.preset)}</span>
-        <span class="lbl-row-txt">${esc(l.note ? l.note : l.auto ? '图中自动顺序（点击可编辑/拖动）' : l.preset === 'conn' ? t('label.num') + ' ' + l.num : '')}</span>
-        ${l.auto ? '' : `<button class="lbl-row-del" data-del="${esc(l.id)}" title="${t('label.delete')}">✕</button>`}
-      </div>`
-        )
-        .join('')
-    : `<div class="lbl-note">${t('label.addHint')}</div>`;
+  const rows = labels.map((label) => labelRow(label, sel === label.id)).join('');
+  const hasAutoCallOrder = labels.some((label) => label.auto && label.preset === 'call');
+  const existing = `<section class="lbl-rows">
+    <h4>${t('label.existing')}</h4>
+    ${rows || `<div class="lbl-note">${t('label.empty')}</div>`}
+    ${hasAutoCallOrder ? `<button type="button" class="lbl-batch" id="lblBatchCallOrder"
+      title="${esc(nodeName(edge.from))}">${t('label.keepAllOrders')}</button>` : ''}
+  </section>`;
 
   // ---- 选中条的编辑区 ----
   let editor = '';
@@ -359,9 +397,7 @@ export function renderLabelPanel() {
     const isConn = selLabel.preset === 'conn';
     const isCall = selLabel.preset === 'call';
     const isTask = selLabel.preset === 'task';
-    const seg = PRESET_UI.map(
-      (p) => `<button class="lbl-seg${selLabel.preset === p.id ? ' on' : ''}" data-preset="${p.id}" title="${esc(t(p.desc))}">${p.id === 'conn' ? '結合点' : p.id === 'call' ? 'コール順' : 'TASK'}</button>`
-    ).join('');
+    const maxOrder = isCall ? visibleCallOrderMap(state.view, edge.from).size : 0;
     const quickCallNums = isCall
       ? `<div class="lbl-picknum">${Array.from({ length: Math.min(12, Math.max(maxOrder, 4)) }, (_, i) => i + 1)
           .map((n) => `<button type="button" class="lbl-num${selLabel.text === `${LABEL_PRESETS.call.text}${n}` ? ' on' : ''}" data-quick-text="${esc(`${LABEL_PRESETS.call.text}${n}`)}">${n}</button>`)
@@ -373,123 +409,73 @@ export function renderLabelPanel() {
           .join('')}</div>`
       : '';
     editor = `
-    <div class="lbl-editor">
-      <div class="lbl-segs">${seg}</div>
+    <section class="lbl-editor">
+      <h4>${t('label.edit')} <span>${t(LABEL_NAMES[selLabel.preset] || LABEL_NAMES.custom)}</span></h4>
       ${
         isConn
-          ? `<div class="field"><label>${t('label.num')}</label><input id="lblNum" type="number" min="1" max="999" value="${selLabel.num}"></div>`
-          : `<div class="field"><label>${t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>${quickCallNums}${quickTaskPeriods}`
+          ? `<div class="field"><label for="lblNum">${t('label.mode')}</label><input id="lblNum" type="number" min="1" max="999" value="${selLabel.num}"></div>`
+          : `<div class="field"><label for="lblText">${isTask ? t('label.periodText') : t('label.text')}</label><input id="lblText" type="text" maxlength="40" value="${esc(selLabel.text || '')}"></div>${quickCallNums}${quickTaskPeriods}`
       }
-      <div class="field">
-        <label>${t('label.note')}</label>
-        <input id="lblNote" type="text" maxlength="80" value="${esc(selLabel.note || '')}" placeholder="${t('label.note')}">
-      </div>
-      <div class="field">
-        <label>${t('label.border')}</label>
-        <div class="lbl-colors">
-          <input type="color" id="lblBorder" value="${esc(selLabel.border || LABEL_PRESETS.task.border)}"${selLabel.border ? '' : ' disabled'}>
-          <label class="chk"><input type="checkbox" id="lblNoBorder"${selLabel.border ? '' : ' checked'}>${t('label.noBorder')}</label>
+      ${isConn ? `<div class="lbl-mode">
+        <div class="lbl-mode-title">${t('label.numberRule')}</div>
+        <div class="lbl-segs" role="group" aria-label="${t('label.connRule')}">
+          <button type="button" class="lbl-seg${connMode === 'fixed' ? ' on' : ''}" data-mode="fixed" aria-pressed="${connMode === 'fixed'}">${t('label.mode.fixed')}</button>
+          <button type="button" class="lbl-seg${connMode === 'renumber' ? ' on' : ''}" data-mode="renumber" aria-pressed="${connMode === 'renumber'}">${t('label.mode.renumber')}</button>
         </div>
-      </div>
+      </div>` : ''}
       <div class="field">
-        <label>${t('label.color')}</label>
-        <div class="lbl-colors">
-          <input type="color" id="lblColor" value="${esc(selLabel.color)}">
-          <span class="lbl-aa" style="color:${esc(selLabel.color)}">Aa</span>
-        </div>
+        <label for="lblNote">${t('label.optionalNote')}</label>
+        <input id="lblNote" type="text" maxlength="80" value="${esc(selLabel.note || '')}">
       </div>
-      ${selLabel.auto ? '' : `<div class="lbl-actions"><button id="lblDelete">${t('label.delete')}</button></div>`}
-    </div>`;
+      ${isTask ? taskDetection() : ''}
+      <details class="lbl-style-more">
+        <summary>${t('label.styleMore')}</summary>
+        <div class="field">
+          <label for="lblBorder">${t('label.border')}</label>
+          <div class="lbl-colors">
+            <input type="color" id="lblBorder" value="${esc(selLabel.border || LABEL_PRESETS.task.border)}"${selLabel.border ? '' : ' disabled'}>
+            <label class="chk"><input type="checkbox" id="lblNoBorder"${selLabel.border ? '' : ' checked'}>${t('label.noBorder')}</label>
+          </div>
+        </div>
+        <div class="field">
+          <label for="lblColor">${t('label.color')}</label>
+          <div class="lbl-colors">
+            <input type="color" id="lblColor" value="${esc(selLabel.color)}">
+            <span class="lbl-aa" style="color:${esc(selLabel.color)}">Aa</span>
+          </div>
+        </div>
+      </details>
+    </section>`;
   }
 
-  // ---- 添加区：结合点在固定模式下先挑编号 ----
-  const autoCallOrder = callerOrders.get(edge.to)?.order;
-  let addArea = `
+  const addArea = `<section class="lbl-add-area">
+    <h4>${t('label.addTitle')}</h4>
     <div class="lbl-adds">
-      <button class="lbl-add" data-add="task">+ TASK</button>
-      <button class="lbl-add" data-add="call">+ コール順${autoCallOrder ? autoCallOrder : ''}</button>
-      <button class="lbl-add${connPick ? ' on' : ''}" data-add="conn">+ 結合点</button>
+      <button type="button" class="lbl-add" data-add="call" data-preset="call">${t('label.addCall')}</button>
+      <button type="button" class="lbl-add" data-add="task" data-preset="task">${t('label.addTask')}</button>
+      <button type="button" class="lbl-add${connPick ? ' on' : ''}" data-add="conn" data-preset="conn" aria-expanded="${Boolean(connPick)}">${t('label.addConn')}</button>
     </div>
-    ${callerOrders.size >= 2 ? `<button type="button" class="lbl-add lbl-detect" id="lblBatchCallOrder" style="margin-top:4px">一键保存 ${esc(nodeName(edge.from))} 的图中コール順 (1..${callerOrders.size})</button>` : ''}`;
-  if (connPick && connMode === 'fixed') {
-    const nums = connChoices(state.view, edge);
-    addArea += `<div class="lbl-picknum">${nums
-      .map((n) => `<button class="lbl-num" data-num="${n}">${n}</button>`)
-      .join('')}</div>`;
-  }
+    ${connPick ? `<div class="lbl-picknum" role="group" aria-label="${t('label.chooseConn')}">
+      ${connChoices(state.view, edge).map((n) => `<button type="button" class="lbl-num" data-num="${n}">${n}</button>`).join('')}
+    </div>` : ''}
+  </section>`;
 
-  // ---- 编号模式 ----
-  const modeArea = `
-    <div class="field lbl-mode">
-      <label>${t('label.mode')}</label>
-      <div class="lbl-segs">
-        <button class="lbl-seg${connMode === 'fixed' ? ' on' : ''}" data-mode="fixed">${t('label.mode.fixed')}</button>
-        <button class="lbl-seg${connMode === 'renumber' ? ' on' : ''}" data-mode="renumber">${t('label.mode.renumber')}</button>
-      </div>
-      <div class="lbl-note">${t('label.mode.hint')}</div>
-    </div>`;
-
-  // ---- 自动检测 ----
-  let detectArea = `<button class="lbl-add lbl-detect" id="lblDetect">${t('label.detect')}</button>`;
-  if (detectResult) {
-    if (!detectResult.inView.length && !detectResult.offView.length) {
-      detectArea += `<div class="lbl-note">${t('label.detect.none')}</div>`;
-    } else {
-      const items = detectResult.inView
-        .map(
-          (s, i) => `
-        <label class="dt-item">
-          <input type="checkbox" class="dt-check" data-idx="${i}" checked>
-          <span class="lbl-demo ${s.preset}">${esc(s.text)}</span>
-          <span class="dt-ev">${esc(s.evidence || '')}</span>
-        </label>`
-        )
-        .join('');
-      detectArea =
-        `<div class="lbl-note">${t('label.detect.title')}</div>` +
-        `<div class="dt-list">${items}</div>` +
-        (detectResult.offView.length
-          ? `<div class="lbl-note">${detectResult.offView.length} ${t('label.detect.offview')}</div>`
-          : '') +
-        `<div class="lbl-actions">
-          <button id="dtApply">${t('label.detect.apply')}</button>
-          <button id="dtCancel">✕</button>
-        </div>`;
-    }
-  }
-
-  box.innerHTML = head + `<div class="lbl-rows">${rows}</div>` + editor + addArea + modeArea + detectArea;
+  box.innerHTML = head + existing + editor + addArea;
   bindStatusControl(box, edge, true, renderLabelPanel);
-  box.querySelectorAll('[data-trunk-pick]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      if (!trunkHits) return;
-      if (btn.dataset.trunkPick === 'all') {
-        state.selectedEdge = trunkHits[0];
-        state.selectedLabel = null;
-        state.multiSelection = { kind: 'edge', anchor: trunkHits[0], view: state.view, edges: new Set(trunkHits.map(edgeKey)), trunk: true, hits: trunkHits };
-      } else {
-        const picked = trunkHits[Number(btn.dataset.trunkPick)] || trunkHits[0];
-        state.selectedEdge = picked;
-        state.selectedLabel = null;
-        state.multiSelection = null;
-      }
-      draw();
-      renderLabelPanel();
-    });
-  });
+  bindTrunkNavigator(box, trunkHits, trunkScrollTop, scrollToTrunkBranch);
 
-  // ---- 事件 ----
-  box.querySelectorAll('.lbl-row').forEach((row) => {
-    row.addEventListener('click', (ev) => {
-      if (ev.target.closest('[data-del]')) return;
-      state.selectedLabel = `${edgeKey(edge)}#${row.dataset.id}`;
-      connPick = false;
-      draw();
-      renderLabelPanel();
-    });
-  });
-  box.querySelectorAll('[data-del]').forEach((btn) => {
-    btn.addEventListener('click', () => removeLabel(edge, btn.dataset.del));
+  box.querySelector('.lbl-rows')?.addEventListener('click', (event) => {
+    const remove = event.target.closest('[data-del]');
+    if (remove) { void removeLabel(edge, remove.dataset.del); return; }
+    const button = event.target.closest('.lbl-row-summary');
+    if (!button) return;
+    const id = button.closest('[data-id]').dataset.id;
+    const index = Array.from(box.querySelectorAll('.lbl-row-summary')).indexOf(button);
+    state.selectedLabel = id === selectedId(edge) ? null : `${edgeKey(edge)}#${id}`;
+    connPick = null;
+    draw();
+    renderLabelPanel();
+    box.querySelectorAll('.lbl-row-summary')[index]?.focus({ preventScroll: true });
   });
 
   if (selLabel) {
@@ -505,6 +491,15 @@ export function renderLabelPanel() {
       return edgeLabels(edge).find((l) => l.id === selLabel.id);
     };
 
+    const saveEdit = async () => {
+      const id = selLabel.id;
+      const row = box.querySelector('.lbl-row.on');
+      if (!await commit(edge) || !row?.isConnected || state.selectedEdge !== edge || selectedId(edge) !== id) return;
+      const saved = edgeLabels(edge).find((label) => label.id === id);
+      if (saved) row.outerHTML = labelRow(saved, true);
+      else renderLabelPanel();
+    };
+
     box.querySelectorAll('[data-quick-text]').forEach((btn) => {
       btn.addEventListener('click', async () => {
         const target = ensureEditableTarget();
@@ -513,20 +508,6 @@ export function renderLabelPanel() {
         draw();
         renderLabelPanel();
         await commit(edge);
-      });
-    });
-
-    box.querySelectorAll('.lbl-segs [data-preset]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const currentTarget = ensureEditableTarget() || selLabel;
-        const next = switchPreset(currentTarget, btn.dataset.preset, edge);
-        if (!next) return;
-        const labels2 = edgeLabels(edge).map((l) => (l.id === currentTarget.id ? next : l));
-        applyLabels(edge, labels2);
-        draw();
-        renderLabelPanel();
-        await persistLabels(edge);
-        pushHistory();
       });
     });
 
@@ -553,7 +534,7 @@ export function renderLabelPanel() {
           draw();
         }
       });
-      textEl.addEventListener('change', () => commit(edge));
+      textEl.addEventListener('change', saveEdit);
     }
 
     const noteEl = box.querySelector('#lblNote');
@@ -565,7 +546,7 @@ export function renderLabelPanel() {
           draw();
         }
       });
-      noteEl.addEventListener('change', () => commit(edge));
+      noteEl.addEventListener('change', saveEdit);
     }
 
     const borderEl = box.querySelector('#lblBorder');
@@ -577,7 +558,7 @@ export function renderLabelPanel() {
           draw();
         }
       });
-      borderEl.addEventListener('change', () => commit(edge));
+      borderEl.addEventListener('change', saveEdit);
     }
     const noBorderEl = box.querySelector('#lblNoBorder');
     if (noBorderEl) {
@@ -590,7 +571,7 @@ export function renderLabelPanel() {
           if (!noBorderEl.checked) borderEl.value = target.border;
         }
         draw();
-        scheduleCommit(edge, 0);
+        void saveEdit();
       });
     }
     const colorEl = box.querySelector('#lblColor');
@@ -604,11 +585,16 @@ export function renderLabelPanel() {
           draw();
         }
       });
-      colorEl.addEventListener('change', () => commit(edge));
+      colorEl.addEventListener('change', saveEdit);
     }
-    box.querySelector('#lblDelete')?.addEventListener('click', () => removeLabel(edge, selLabel.id));
   }
-  box.querySelector('#lblBatchCallOrder')?.addEventListener('click', () => applyCallerVisibleCallOrders(edge));
+  box.querySelector('#lblBatchCallOrder')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try { await applyCallerVisibleCallOrders(edge); }
+    catch (error) { alert(t('label.ordersPartial', { error: error.message })); }
+    finally { button.disabled = false; }
+  });
 
   box.querySelectorAll('[data-add]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -618,8 +604,11 @@ export function renderLabelPanel() {
       }
       // 结合点：固定模式先挑编号；重排模式直接给下一个号
       const mode = await ensureMode();
+      if (state.selectedEdge !== edge) return;
       if (mode === 'fixed') {
-        connPick = !connPick;
+        connPick = connPick ? null : edge;
+        state.selectedLabel = null;
+        draw();
         renderLabelPanel();
       } else {
         await addLabel(edge, 'conn');
@@ -635,11 +624,16 @@ export function renderLabelPanel() {
       const result = await api.setLabelConfig(mode).catch(() => null);
       if (!result?.ok) return;
       connMode = mode;
-      connPick = false;
+      connPick = null;
       renderLabelPanel();
     });
   });
-  box.querySelector('#lblDetect')?.addEventListener('click', () => runDetect());
+  box.querySelector('#lblDetect')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try { await runDetect(edge, selLabel.id); }
+    finally { button.disabled = false; }
+  });
   box.querySelector('#dtApply')?.addEventListener('click', () => applyDetect());
   box.querySelector('#dtCancel')?.addEventListener('click', () => {
     detectResult = null;
@@ -654,16 +648,13 @@ ensureMode().then(() => {
 
 /** 删除键：优先删选中的那条标签，其次才是连线（由 app.js 的快捷键分发调用） */
 export async function deleteSelectedLabel() {
-  const s = state.selectedLabel;
-  if (!s) return false;
-  const i = s.lastIndexOf('#');
-  const key = i > 0 ? s.slice(0, i) : s;
-  const id = i > 0 ? s.slice(i + 1) : null;
-  const edge = (state.view?.edges || []).find((e) => edgeKey(e) === key);
-  if (!edge || !id) {
+  const edge = state.selectedEdge;
+  const id = edge && selectedId(edge);
+  if (!id || !state.view?.edges.includes(edge)) {
     state.selectedLabel = null;
     return false;
   }
+  if (!edgeLabels(edge).some((label) => label.id === id)) return true;
   await removeLabel(edge, id);
   return true;
 }

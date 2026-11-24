@@ -1,6 +1,6 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
-import { textWidth, routeScore, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
+import { textWidth, routeScore, directoryWhitespace, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
 import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
@@ -231,7 +231,7 @@ function seedInteractive(graph, previous, initial) {
   walk(graph);
 }
 
-/** 以走线为主，兼顾相连节点紧凑度、1:1 画布比例与占用面积。 */
+/** 比较走线、相连节点距离、画布比例与目录间留白。 */
 function quality(view) {
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   let distSum = 0, edgeCnt = 0;
@@ -245,7 +245,8 @@ function quality(view) {
   const avgDist = edgeCnt ? distSum / edgeCnt : 0;
   const aspect = Math.max(1, view.width) / Math.max(1, view.height);
   return routeScore(view.edges) +
-    140 * Math.log(aspect) ** 2 + Math.sqrt(view.width * view.height) / 40 + avgDist * 0.22;
+    140 * Math.log(aspect) ** 2 + Math.sqrt(view.width * view.height) / 40 + avgDist * 0.22 +
+    Math.sqrt(directoryWhitespace(view)) * 0.25;
 }
 
 function validLayout(view) {
@@ -368,7 +369,7 @@ function preservesSemanticOrder(baseline, candidate, edges) {
 }
 
 /** 自底向上逐层紧凑排布：文件框自适应方向/散点网格化 + 跨框邻近微调 + 正交路由。 */
-async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
+async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false }) {
   const order = modelOrder(sized, edges);
   const root = { id: '', label: '', children: new Map(), leafNodes: [] };
   let boxCount = 0;
@@ -386,6 +387,15 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
     cur.leafNodes.push(n);
   }
   if (boxCount < 2) return null;
+  // 单子目录只是外层包装，主方向应在第一个有兄弟框的目录生效。
+  let mainBox = root;
+  while (mainBox.children.size === 1 && !mainBox.leafNodes.length) {
+    const child = mainBox.children.values().next().value;
+    if (child.fileGroup) break;
+    mainBox = child;
+  }
+  // 多个并列目录可以沿两轴摆放，避免层级链占满整个主轴。
+  if (packMain && (mainBox.children.size < 3 || [...mainBox.children.values()].some((child) => child.fileGroup))) return null;
 
   async function layoutBox(box, depth, dirOverride = null, hints = null) {
     const childItems = [];
@@ -422,26 +432,28 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
 
     const isRoot = depth === 0;
     const sidePad = isRoot ? ROOT_PAD : 14;
+    const direction = box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : box === mainBox ? rootDir : dirDir;
     if (childItems.length === 1) {
       const item = childItems[0];
       box.w = item.width + sidePad * 2;
       box.h = item.height + TOP_PADDING + sidePad;
       box.relPos = new Map([[item.id, { x: sidePad, y: TOP_PADDING }]]);
-      box.usedDir = dirOverride || (box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : isRoot ? rootDir : dirDir);
+      box.usedDir = dirOverride || direction;
       return;
     }
     const pad = isRoot ? `[top=${TOP_PADDING},left=${ROOT_PAD},bottom=${ROOT_PAD},right=${ROOT_PAD}]` : `[top=${TOP_PADDING},left=14,bottom=14,right=14]`;
     const gap = box.fileGroup ? 16 : 30;
     const layerGap = box.fileGroup ? 28 : 44;
+    const pack = packMain && box === mainBox;
 
     const runDir = async (dir) => {
-      if (agg.size === 0 && childItems.length > 1) {
+      if (agg.size === 0 || pack) {
         return elk.layout({
           id: 'g:' + box.id,
           layoutOptions: {
             'elk.algorithm': 'rectpacking',
             'elk.padding': pad,
-            'elk.spacing.nodeNode': String(gap),
+            'elk.spacing.nodeNode': String(box.fileGroup ? gap : LAYER_GAP),
             'elk.aspectRatio': '1.15',
           },
           children: childItems.map((it) => ({ id: it.id, width: it.width, height: it.height })),
@@ -484,12 +496,21 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
         Math.sqrt(r.width * r.height) / 2000;
       if (boxScore(r1) <= boxScore(r2)) { best = r1; usedDir = 'RIGHT'; } else { best = r2; usedDir = 'DOWN'; }
     } else {
-      usedDir = box.fileGroup ? (fileDir === 'AUTO' ? 'DOWN' : fileDir) : isRoot ? rootDir : dirDir;
+      usedDir = direction;
       best = await runDir(usedDir);
     }
     box.w = best.width;
     box.h = best.height;
     box.relPos = new Map(best.children.map((c) => [c.id, { x: c.x, y: c.y }]));
+    if (pack && agg.size) {
+      // 网格没有固定主轴，用调用最多的目录对确定流向。
+      const { s, t } = [...agg.values()].reduce((a, b) => a.count >= b.count ? a : b);
+      const children = new Map(best.children.map((c) => [c.id, c]));
+      const a = children.get(s), b = children.get(t);
+      const dx = Math.abs(a.x + a.width / 2 - b.x - b.width / 2);
+      const dy = Math.abs(a.y + a.height / 2 - b.y - b.height / 2);
+      usedDir = dx >= dy ? 'RIGHT' : 'DOWN';
+    }
     box.usedDir = usedDir;
   }
 
@@ -550,7 +571,7 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir }) {
   }
   if (edges.length) await pass2(root, 0);
 
-  const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h, layoutDirection: rootDir };
+  const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h, layoutDirection: packMain ? mainBox.usedDir : rootDir };
   const flatten = (box, ox, oy, depth) => {
     for (const child of box.children.values()) {
       const p = box.relPos.get('box:' + child.id);
@@ -640,6 +661,13 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     return old && old.file === n.file && old.w === n.w && old.h === n.h;
   })) {
     const files = new Set(sized.map((n) => n.file || 'unknown'));
+    const directories = new Set();
+    for (const file of files) {
+      for (let slash = file.lastIndexOf('/'); slash >= 0; slash = file.lastIndexOf('/', slash - 1)) {
+        directories.add(file.slice(0, slash));
+        if (!slash) break;
+      }
+    }
     const view = { width: previous.width, height: previous.height, layoutDirection: direction,
       nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
         ...(group ? { group: n.file || 'unknown' } : {}) })),
@@ -649,8 +677,7 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
           custom: old?.custom ?? e.custom, fromSide: old?.fromSide ?? e.fromSide, toSide: old?.toSide ?? e.toSide };
       }),
       groups: group ? (previous.groups || []).filter((g) => files.has(g.id)).map((g) => ({ ...g })) : [],
-      containers: group ? (previous.containers || []).filter((c) => c.root ||
-        [...files].some((file) => file.startsWith(c.id + '/'))).map((c) => ({ ...c })) : [],
+      containers: group ? (previous.containers || []).filter((c) => c.root || directories.has(c.id)).map((c) => ({ ...c })) : [],
     };
     const addedEdges = view.edges.filter((e) => !e.points);
     if (addedEdges.length) {
@@ -712,9 +739,11 @@ export async function layoutElk(nodes, edges, { group = true, rootLabel = '', pr
     const downTask = generate('DOWN').then(finalizeCandidate);
     const buConfigs = edges.length
       ? [
+          { rootDir: 'RIGHT', dirDir: 'RIGHT', fileDir: 'AUTO' },
           { rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' },
           { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO' },
           { rootDir: 'DOWN', dirDir: 'DOWN', fileDir: 'AUTO' },
+          { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO', packMain: true },
         ]
       : [{ rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' }];
     const buTasks = group && sized.length <= 120 && edges.length <= 240

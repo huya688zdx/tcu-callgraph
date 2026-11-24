@@ -2,7 +2,10 @@
  * 弹层原语：遮罩 + 居中面板
  * 工程选择和时间轴都用它，避免各自写一份遮罩逻辑
  */
+import { t } from '../i18n.js';
+
 const mask = document.getElementById('overlayMask');
+let wired = false;
 
 export function openModal(id) {
   if (!mask) return;
@@ -22,7 +25,8 @@ export function isModalOpen() {
 }
 
 export function wireModals() {
-  if (!mask) return;
+  if (!mask || wired) return;
+  wired = true;
   // 点遮罩空白处关闭：面板内部的点击要 stopPropagation 由调用方处理
   mask.addEventListener('click', () => {
     if (!document.querySelector('.confirm-modal.show')) closeModal();
@@ -59,7 +63,7 @@ export function esc(s) {
  * dangerous 操作把确认键标红，且默认焦点在取消上，回车不会误确认；
  * Escape 在捕获阶段拦下，只关本弹窗，不把底下打开的弹窗（如选择工程）一起带走。
  */
-export function confirmDialog({ title, message, okText = '确定', cancelText = '取消', danger = false }) {
+export function confirmDialog({ title, message, okText = t('common.confirm'), cancelText = t('common.cancel'), danger = false }) {
   return new Promise((resolve) => {
     const box = document.createElement('div');
     box.className = 'modal confirm-modal show';

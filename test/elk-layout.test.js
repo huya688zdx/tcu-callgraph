@@ -206,6 +206,18 @@ test('增量布局拒绝其他工程的画面坐标', async (t) => {
   assert.equal(response.status, 409);
 });
 
+test('增量布局拒绝损坏的空位快照', async (t) => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const url = srv.baseUrl + '/api/view?root=main.c::main';
+  const previous = await (await fetch(url)).json();
+  previous.layoutSlots = { nodes: [null], edges: [], groups: [], containers: [], width: 800, height: 600 };
+  const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ previous }) });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /增量布局数据无效/);
+});
+
 test('变量关系可单独移出并恢复，不影响同一函数的其他变量引用', async (t) => {
   const srv = await launchServer({ target: 'samples/shared-state' });
   t.after(() => srv.close());
@@ -279,6 +291,37 @@ test('多文件分层视图紧凑且接近 1:1，缩短相连函数距离并保�
   assert.ok(distSum / distCnt < 400, `demo/main avgDist=${Math.round(distSum / distCnt)}`);
   assert.deepEqual(demoView.edges.map(({ points, ...e }) => e), demoGraph.edges);
   assertMidpointPorts(demoView);
+});
+
+test('固件的十个单测文件汇入 park_init 时使用多行多列布局并减少目录间留白', async () => {
+  const tests = Array.from({ length: 10 }, (_, i) => `test_${i + 1}`);
+  const appFiles = ['ti_shadow', 'main', 'pa7_hook', 'pa7_shadow', 'park', 'park_law'];
+  const nodes = [
+    ...tests.map((id) => ({ id, file: `firmware/tests/unit/${id}.c` })),
+    ...appFiles.map((name) => ({ id: name === 'park' ? 'park_init' : name, file: `firmware/app/${name}.c` })),
+    { id: 'park_mon', file: 'firmware/safety/park_mon.c' },
+  ];
+  const edges = [
+    ...[...tests, ...appFiles.slice(0, 4)].map((from) => ({ from, to: 'park_init', kind: 'direct' })),
+    ...['park_law', 'park_mon'].map((to) => ({ from: 'park_init', to, kind: 'direct' })),
+  ];
+  const view = await layoutElk(nodes, edges);
+  const unitFiles = view.groups.filter((box) => box.id.startsWith('firmware/tests/unit/'));
+  const unit = view.containers.find((box) => box.id === 'firmware/tests/unit');
+  assert.equal(unitFiles.length, 10);
+  assert.ok(new Set(unitFiles.map((box) => box.x)).size > 1);
+  assert.ok(new Set(unitFiles.map((box) => box.y)).size > 1);
+  assert.ok(unit.h < 650, `tests/unit 高度为 ${unit.h}`);
+  const aspect = view.width / view.height;
+  assert.ok(aspect >= 0.75 && aspect <= 1.33, `画布宽高比为 ${aspect.toFixed(2)}`);
+  const siblings = view.containers.filter((box) => box.depth === 2);
+  const siblingBoundsArea = (Math.max(...siblings.map((b) => b.x + b.w)) - Math.min(...siblings.map((b) => b.x))) *
+    (Math.max(...siblings.map((b) => b.y + b.h)) - Math.min(...siblings.map((b) => b.y)));
+  const occupied = siblings.reduce((area, box) => area + box.w * box.h, 0);
+  assert.ok(occupied / siblingBoundsArea > 0.6, '增加并排文件后，同层目录也应减少空白');
+  assert.deepEqual(view.edges.map(({ points, ...edge }) => edge), edges);
+  assert.ok(view.edges.every((e) => view.nodes.every((n) => !pathCrossesBody(e.points, n))));
+  assertMidpointPorts(view);
 });
 
 test('存在目录层时，跨文件显式 callNumbers 调用同文件多个目标仍保持调用序单调', async () => {

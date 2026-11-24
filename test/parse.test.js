@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
 import { parseDot } from '../src/core/dot.js';
-import { buildIndex, loadModel, stats } from '../src/core/index.js';
+import { buildIndex, loadModel, stats, subgraph } from '../src/core/index.js';
 import { detectTasks } from '../src/core/detect-tasks.js';
 
 const SAMPLE = path.join(import.meta.dirname, '..', 'samples', 'tcu');
@@ -150,6 +150,75 @@ test('恒假分支不修改宏，跨文件 static 不解析为调用目标', (t)
   const edges = loadModel(dir).edges.filter((e) => e.from === 'c.c::entry');
   assert.ok(edges.some((e) => e.to === 'a.c::real_target'));
   assert.ok(edges.some((e) => e.to === 'ext::helper'));
+});
+
+test('同名平台实现按调用方选择硬件、主机或测试版本', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-platform-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const files = {
+    'app/main.c': 'void main(void) { plat_mb_poll_init(); printf("init"); }',
+    'platform/sh7254r/plat_sh7254r.c': 'void plat_mb_poll_init(void) { init_rx(); init_tx(); }',
+    'platform/host/plat_host.c': 'void plat_mb_poll_init(void) {}',
+    'platform/host/entry.c': 'void host_main(void) { plat_mb_poll_init(); }',
+    'tests/unit/stub_plat.c': 'void plat_mb_poll_init(void) {}',
+    'tests/unit/test_main.c': 'void test_main(void) { plat_mb_poll_init(); }',
+  };
+  for (const [rel, source] of Object.entries(files)) {
+    const file = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, source);
+  }
+  const model = loadModel(dir);
+  const targets = (id) => model._index.outAdj.get(id).map(({ to }) => to);
+  assert.deepEqual(targets('app/main.c::main'), ['platform/sh7254r/plat_sh7254r.c::plat_mb_poll_init', 'ext::printf']);
+  assert.deepEqual(targets('platform/host/entry.c::host_main'), ['platform/host/plat_host.c::plat_mb_poll_init']);
+  assert.deepEqual(targets('tests/unit/test_main.c::test_main'), ['tests/unit/stub_plat.c::plat_mb_poll_init']);
+  assert.ok(!model._index.byId.has('ext::plat_mb_poll_init'));
+});
+
+test('子图将头文件 static inline 解析为工程内节点，外部调用按需展示', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-externals-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'cal_inplace.h'), 'static inline int cal_u8(void) { return 0; }');
+  fs.writeFileSync(path.join(dir, 'main.c'), '#include "cal_inplace.h"\nvoid main(void) { printf("init"); cal_u8(); }');
+  const model = loadModel(dir);
+  const root = 'main.c::main', inline = 'cal_inplace.h::cal_u8', external = 'ext::printf';
+  assert.equal(model._index.byId.get(inline).isStatic, true);
+
+  const hidden = subgraph(model, root, { maxNodes: 2 });
+  assert.deepEqual(hidden.nodes.map(({ id }) => id), [root, inline]);
+  assert.deepEqual(hidden.edges.map(({ to }) => to), [inline]);
+  assert.equal(hidden.truncated, false);
+  const visible = subgraph(model, root, { includeExternals: true });
+  assert.deepEqual(visible.edges.map(({ to }) => to), [external, inline]);
+  assert.ok(visible.nodes.some(({ id }) => id === external));
+  const externalRoot = subgraph(model, external, { up: 1 });
+  assert.deepEqual(externalRoot.nodes.map(({ id }) => id), [external, root]);
+  assert.deepEqual(externalRoot.edges.map(({ from, to }) => [from, to]), [[root, external]]);
+});
+
+test('头文件静态函数只对直接或间接包含该头文件的调用方可见', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-header-scope-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'include', 'driver'), { recursive: true });
+  const files = {
+    'include/driver/private.h': 'static inline int helper(void) { return 1; }\nstatic inline int scoped(void) { return 2; }',
+    'include/public.h': '#include "driver/private.h"\n',
+    'uses.c': '#include "private.h"\nint uses(void) { return helper(); }',
+    'transitive.c': '#include "include/public.h"\nint transitive(void) { return helper(); }',
+    'inactive.c': '#if 0\n#include "private.h"\n#endif\nint inactive(void) { return helper(); }',
+    'noinc.c': 'extern int helper(void);\nint noinc(void) { return helper(); }',
+    'linked.c': 'int scoped(void) { return 3; }',
+    'app.c': '#include "private.h"\nint app(void) { return scoped(); }',
+  };
+  for (const [file, source] of Object.entries(files)) fs.writeFileSync(path.join(dir, file), source);
+  const model = loadModel(dir);
+  const target = (name) => model._index.outAdj.get(`${name}.c::${name}`)[0].to;
+  assert.equal(target('uses'), 'include/driver/private.h::helper');
+  assert.equal(target('transitive'), 'include/driver/private.h::helper');
+  assert.equal(target('inactive'), 'ext::helper');
+  assert.equal(target('noinc'), 'ext::helper');
+  assert.equal(target('app'), 'include/driver/private.h::scoped');
 });
 
 test('DOT 端口不产生节点，引号内冒号保留', () => {

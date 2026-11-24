@@ -441,7 +441,7 @@ function draw({ geometryUnchanged = false } = {}) {
     ctx.fillStyle = '#B4B2A9';
     ctx.font = `13px ${FONT}`;
     ctx.textAlign = 'center';
-    ctx.fillText('未在该路径下找到 C 函数', W / 2, H / 2);
+    ctx.fillText(t('canvas.noFunctions'), W / 2, H / 2);
     return;
   }
   collectingEffects = true;
@@ -459,9 +459,13 @@ function draw({ geometryUnchanged = false } = {}) {
   const tracedColors = new Map((trace?.edgeIndices || []).map(index => [v.edges[index], state.pairFlow.colors.get(index)]));
   const tracedEdges = new Set(tracedColors.keys());
   const flowingEdges = new Set((trace?.flowEdgeIndices || []).map(index => v.edges[index]));
-  const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.edges
+  const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.trunk ? state.multiSelection.hits
+    : state.multiSelection?.edges
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
   const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
+  const trunkHits = state.trunkHits;
+  const trunkNodes = trunkHits?.length > 1 && trunkHits.includes(focusedEdge)
+    ? new Set(trunkHits.flatMap((e) => [e.from, e.to])) : null;
   const selectedNodes = state.multiSelection?.nodes || null;
   const relations = !focusedEdges.size && !selectedNodes?.size && state.selected
     ? classifySelectionRelations(v, state.selected) : null;
@@ -548,7 +552,9 @@ function draw({ geometryUnchanged = false } = {}) {
   }
 
   const nb = neighborSet();
-  for (const n of v.nodes) if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null);
+  for (const n of v.nodes) {
+    if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null, trunkNodes?.has(n.id));
+  }
   for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
     const node = v.nodes.find(n => n.id === id);
     if (!node || !boxVisible(node, area)) continue;
@@ -825,7 +831,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
 /**
  * @param {Set<string>|null} nb 选中节点的邻接集合（draw 时统一算好传进来；为空表示没有选中）
  */
-function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
+function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trunkEndpoint = false) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
   const allNodes = !!state.multiSelection?.nodes;
@@ -837,11 +843,34 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
   const role = !selected && nodeRoles?.get(n.id);
   const isHoverPeer = state.hoverRelation?.peerId === n.id;
   const invK = Math.max(1, 1 / cam.k);
+  const comparing = Boolean(state.view?.comparison);
+  const taskEntry = n.isTaskEntry || n.taskEntry;
+  const period = periodSubtitle(n, comparing);
+  const periodImpact = comparing && (n.periodImpact || period.includes('→'));
+  const macroImpact = comparing && (n.macroImpact || n.impactRole === 'macro_lsb_impact');
+  const changed = comparing && n.change && n.change !== 'existing';
+  const impacted = comparing && (macroImpact || periodImpact || n.impact ||
+    n.impactRole === 'dataflow_impact' || n.impactRole === 'caller_impact');
+  const accent = macroImpact ? '#69419A' : periodImpact || taskEntry ? '#185FA5' :
+    changed ? '#8A490E' : impacted ? '#69419A' : null;
+  const tags = [taskEntry && 'TASK', macroImpact && t('canvas.lsb'), periodImpact && t('compare.point.period'),
+    impacted && !changed && !macroImpact && !periodImpact && t('compare.role.affected')].filter(Boolean);
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
+  const alpha = dimmed ? (trunkEndpoint ? 0.65 : 0.22) : 1;
 
   ctx.save();
-  ctx.globalAlpha = dimmed ? 0.22 : 1;
+  if (trunkEndpoint) {
+    const focused = state.trunkFocusNode === n.id;
+    const gap = 4 / cam.k;
+    roundRect(ctx, x - gap, y - gap, w + gap * 2, h + gap * 2, 8 + gap);
+    ctx.strokeStyle = focused ? '#0369A1' : edgeRelated ? '#197FAF' : '#358EAD';
+    ctx.lineWidth = (focused ? 3 : edgeRelated ? 2 : 1.5) / cam.k;
+    if (!edgeRelated) ctx.setLineDash([4 / cam.k, 3 / cam.k]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.globalAlpha = alpha;
 
   if (selected && !allNodes) {
     const ringGap = Math.min(8, 3 * invK);
@@ -864,6 +893,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
     : dropTarget ? 2.6
     : selected || edgeRelated ? Math.min(6, 2.6 * invK)
     : role ? Math.min(5.5, (isHoverPeer ? 3.2 : 2.2) * invK)
+    : accent ? Math.min(10, 2.3 * invK)
     : hover ? 1.6 : 1;
   ctx.strokeStyle = recentlyAdded
     ? RECENT_COLOR
@@ -875,13 +905,17 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
     ? THEME.node.hover
     : role
     ? (role === 'in' ? CALLER_COLOR : role === 'both' ? BIDIR_COLOR : role === 'out' ? CALLEE_COLOR : THEME.node.selected)
+    : accent
+    ? accent
     : n.external
     ? THEME.node.externalBorder
     : isVar
     ? THEME.node.varBorder
     : THEME.node.border;
   // 函数框/变量框各自的虚实线型，样式面板可调；选中时的流动虚线只在虚线开启时有效
-  ctx.setLineDash((isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
+  const impactDash = impacted && !changed && !selected && !edgeRelated;
+  ctx.setLineDash(impactDash ? [7 * invK, 4 * invK] :
+    !accent && (isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
   const animated = collectingEffects && selected && !state.dragNode && ((allNodes && n.id === state.selected) ||
     state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
   const dash = ctx.getLineDash();
@@ -893,7 +927,31 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
       [5 / cam.k, 4 / cam.k], 1.5 / cam.k, 10);
   }
   ctx.setLineDash([]);
-  ctx.globalAlpha = dimmed ? 0.22 : 1;
+  ctx.globalAlpha = alpha;
+
+  if (accent) {
+    const thickness = Math.min(10, 3.4 * invK);
+    ctx.fillStyle = accent;
+    roundRect(ctx, x + 4, y + 6, thickness, h - 12, thickness / 2);
+    ctx.fill();
+  }
+  if (tags.length && cam.k >= 0.4) {
+    const tag = tags.join(' · ');
+    const fontSize = Math.max(10, 8 / cam.k);
+    const bwMax = w - (recentlyAdded ? 40 : 16);
+    ctx.font = `600 ${fontSize}px ${FONT}`;
+    const bw = Math.min(bwMax, ctx.measureText(tag).width + 12);
+    if (bw > 12) {
+      const bh = fontSize + 4;
+      roundRect(ctx, x + 8, y - bh / 2, bw, bh, 5);
+      ctx.fillStyle = accent;
+      ctx.fill();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tag, x + 8 + bw / 2, y, bw - 10);
+    }
+  }
 
   if (n.note) {
     // 旧数据里还留着备注的节点：只保留一个小圆点做提示（备注面板已下线）
@@ -925,12 +983,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null) {
       saved = { name, font, width: maxW, label };
       nodeNames.set(n, saved);
     }
-    const period = periodSubtitle(n);
-    const showSubtitle = cam.k >= 0.62 || (period && cam.k >= 0.4);
+    const showSubtitle = cam.k >= 0.62 || (period && cam.k >= 0.4 && h * cam.k >= 18);
     ctx.fillText(saved.label, cx, y + (showSubtitle ? h / 2 - 8 : h / 2));
 
     if (showSubtitle) {
-      ctx.font = period ? `600 11px ${FONT}` : `10.5px ${FONT}`;
+      ctx.font = period ? `600 ${Math.max(11, 7 / cam.k)}px ${FONT}` : `10.5px ${FONT}`;
       ctx.fillStyle = period ? '#124B71' : '#888780';
       const sub = n.external
         ? t('node.external')

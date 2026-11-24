@@ -1,3 +1,4 @@
+import { t } from '../i18n.js';
 /**
  * AI 改动实时同步
  *
@@ -34,6 +35,9 @@ try {
 let flushTimer = null;
 let dirtyCount = 0;
 let failures = 0; // 连续刷新失败次数：服务重启期间有限重试，超过就放弃并提示
+let pendingCompose = null;
+let applyingCompose = false;
+let pageRevision = 0;
 
 /** 用户是否正在拖节点 / 拖连线 / 平移——此刻刷新会打断操作，稍后再试 */
 function isInteracting() {
@@ -48,40 +52,78 @@ function scheduleReload() {
 
 async function flushReload() {
   flushTimer = null;
-  if (!dirtyCount) return;
+  if (!dirtyCount || applyingCompose) return;
+  if (state.view?.comparison) return;
   if (state.at > 0) {
     // 回看历史：画面是过去的重放，不能就地刷新，改完的量记在提示里
     const n = dirtyCount;
     dirtyCount = 0;
-    toast(`AI 改了 ${n} 处（正在回看历史，回到最新后可见）`);
+    toast(pendingCompose ? t('live.reviewCompose') :
+      t('live.reviewEdits', { n }));
     reloadTimeline();
     return;
   }
-  if (isInteracting()) {
+  if (isInteracting() || (pendingCompose && restoring)) {
     flushTimer = setTimeout(flushReload, 500); // 忙等拖拽结束，dirtyCount 保留
     return;
   }
   const n = dirtyCount;
   dirtyCount = 0;
+  const compose = pendingCompose;
+  pendingCompose = null;
   try {
-    await hooks.reloadKeepCam();
+    if (compose && compose.page.projectId === state.view?.projectId) {
+      const { page, reason } = compose;
+      applyingCompose = true;
+      // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
+      const view = await hooks.loadView(page.roots, {
+        nav: true, incremental: true, expansions: page.expansions || [],
+        up: page.up ?? 0, down: page.down ?? 0, vars: page.vars || [], hiddenVars: page.hiddenVars || [],
+      });
+      if (!view) throw new Error(t('live.composeFailed'));
+      pageRevision = page.revision;
+      state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
+      renderVars();
+      renderLabelPanel();
+      draw();
+      renderDetail(state.selected).catch(() => {});
+      toast([t('live.composed'), reason].filter(Boolean).join(' · '));
+    } else {
+      await hooks.reloadKeepCam();
+      toast(n > 1 ? t('live.edits', { n }) : t('live.updated'));
+    }
     failures = 0;
     loadStats();
     reloadTimeline(); // 时间轴面板开着时同步新事件
-    toast(n > 1 ? `AI 更新了视图（${n} 处改动）` : 'AI 更新了视图');
   } catch {
     // 刷新失败（服务重启中等）：稍后重试，连续失败则放弃并提示手动刷新
     failures++;
     if (failures <= 3) {
-      dirtyCount = n;
-      flushTimer = setTimeout(flushReload, 2000);
+      dirtyCount += n;
+      pendingCompose ??= compose;
+      if (!flushTimer) flushTimer = setTimeout(flushReload, 2000);
     } else {
-      toast('AI 的改动刷新失败，请手动刷新页面');
+      toast(t('live.refreshFailed'));
     }
+  } finally {
+    applyingCompose = false;
+    if (dirtyCount && !flushTimer) flushTimer = setTimeout(flushReload, 400);
   }
 }
 
 if (es) {
+  es.addEventListener('open', async () => {
+    // SSE 无事件重放，重连时检查断线期间是否有新版画布。
+    if (restoring || !state.view?.projectId) return;
+    try {
+      const { page } = await api.savedPage();
+      if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
+          page.revision > (pendingCompose?.page.revision ?? 0)) {
+        pendingCompose = { page };
+        scheduleReload();
+      }
+    } catch { /* 页面上报仍可重试 */ }
+  });
   es.addEventListener('change', (ev) => {
     let m = null;
     try {
@@ -93,11 +135,13 @@ if (es) {
     if (m.op === 'project.switch') {
       if (m.clientId === clientId) return;
       dirtyCount = 0;
-      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast('工程切换后刷新失败，请手动刷新页面'));
-      toast(`已切换工程：${m.project || ''}`);
+      pendingCompose = null;
+      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast(t('live.projectRefreshFailed')));
+      toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }
     if (m.actor !== 'ai') return;
+    if (m.op === 'view.compose' && m.page) pendingCompose = m;
     scheduleReload();
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror
@@ -112,9 +156,11 @@ let pendingSave = Promise.resolve();
 
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */
 export function savePage(force = false) {
-  if (restoring || !state.view?.projectId || !state.roots.length || (!force && isInteracting())) return pendingSave;
+  if (restoring || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId || !state.roots.length ||
+      (!force && isInteracting())) return pendingSave.catch(() => {});
   const page = {
     projectId: state.view.projectId,
+    revision: state.at && pendingCompose?.page.projectId === state.view.projectId ? pendingCompose.page.revision : pageRevision,
     roots: state.roots,
     expansions: state.expansions,
     up: state.up,
@@ -132,23 +178,29 @@ export function savePage(force = false) {
   pendingSave = pendingSave.catch(() => {}).then(async () => {
     if (sig === lastSig) return;
     const result = await api.reportPage(page);
-    if (!result?.ok) throw new Error(result?.error || '保存当前视图失败');
+    if (!result?.ok) throw new Error(result?.error || t('live.saveFailed'));
     lastSig = sig;
   });
   return pendingSave;
 }
-setInterval(() => savePage().catch(() => {}), 800);
+setInterval(() => {
+  if (!state.view?.comparison && !state.at && (pendingCompose || dirtyCount) && !flushTimer) {
+    flushTimer = setTimeout(flushReload, 400);
+    if (!dirtyCount) dirtyCount = 1;
+  }
+  savePage().catch(() => {});
+}, 800);
 
 /** 显式链接优先；没有入口参数时恢复当前工程上次关闭前的选择。 */
 export async function restorePage(root = null, isCurrent = () => true) {
   restoring = true;
   try {
     if (!isCurrent()) return;
-    let saved = null;
-    if (!root) {
-      try { saved = (await api.savedPage()).page; } catch { /* 首次打开或服务暂不可用，走默认入口。 */ }
-    }
+    let stored = null;
+    try { stored = (await api.savedPage()).page; } catch { /* 首次打开或服务暂不可用，走默认入口。 */ }
     if (!isCurrent()) return; // 旧设置等待期间已有新操作，不再回填旧选择。
+    pageRevision = stored?.revision ?? 0;
+    const saved = root ? null : stored;
     if (saved) {
       Object.assign(state, { up: saved.up, down: saved.down, group: saved.group });
       state.vars = new Set(saved.vars || []);

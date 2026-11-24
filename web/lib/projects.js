@@ -14,6 +14,31 @@ const btn = document.getElementById('projectBtn');
 const listEl = document.getElementById('projectList');
 const pathInput = document.getElementById('projectPath');
 const openBtn = document.getElementById('projectOpen');
+const projectError = document.getElementById('projectError') || (listEl && document.createElement('div'));
+if (projectError && !projectError.id) {
+  projectError.id = 'projectError';
+  projectError.setAttribute('role', 'status');
+  projectError.style.margin = '0 12px 8px';
+  projectError.hidden = true;
+  listEl.after(projectError);
+}
+let switching = false;
+const lockedControls = new Set();
+
+function lockProjectControls() {
+  document.querySelectorAll('#projectNormalPane button, #projectNormalPane input, #projectModeCompare').forEach((control) => {
+    if (control.disabled) return;
+    control.disabled = true;
+    lockedControls.add(control);
+  });
+}
+
+function projectMessage(message, error = false) {
+  if (!projectError) return;
+  projectError.className = error ? 'df-error' : 'detail-meta';
+  projectError.textContent = message;
+  projectError.hidden = !message;
+}
 
 const fmtTime = (ts) => {
   if (!ts) return '';
@@ -22,7 +47,7 @@ const fmtTime = (ts) => {
   const sameDay = d.toDateString() === now.toDateString();
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
-  if (sameDay) return `今天 ${hh}:${mm}`;
+  if (sameDay) return `${t('common.today')} ${hh}:${mm}`;
   return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
 };
 
@@ -53,34 +78,40 @@ export async function syncProjectLabel() {
 }
 
 async function switchTo(body) {
-  if (listEl) listEl.innerHTML = `<div class="empty">${t('project.switching')}</div>`;
-  let r;
+  if (switching) return;
+  switching = true;
+  listEl?.setAttribute('aria-busy', 'true');
+  lockProjectControls();
+  projectMessage(t('project.switching'));
   try {
-    r = await api.switchProject(body);
-  } catch (err) {
-    r = { ok: false, error: String(err.message || err) };
+    const result = await api.switchProject(body);
+    if (!result?.ok) throw new Error(result?.error || t('common.unknown'));
+    await hooks.reloadAll();
+    await syncProjectLabel();
+    projectMessage('');
+    if (document.getElementById('projectModal')?.classList.contains('show')) closeModal();
+  } catch (error) {
+    projectMessage(`${t('project.failed')}：${error.message || error}`, true);
+  } finally {
+    switching = false;
+    listEl?.removeAttribute('aria-busy');
+    for (const control of lockedControls) control.disabled = false;
+    lockedControls.clear();
   }
-  if (!r || !r.ok) {
-    if (listEl) {
-      listEl.innerHTML = `<div class="empty">${t('project.failed')}：${esc(r?.error || '未知错误')}</div>`;
-    }
-    return;
-  }
-  closeModal();
-  await hooks.reloadAll();
-  await syncProjectLabel();
 }
 
 async function render() {
   if (!listEl) return;
-  listEl.innerHTML = `<div class="empty">${t('project.empty')}</div>`;
   let rows = [];
   try {
     rows = await api.projects();
   } catch {
     return;
   }
-  if (!rows.length) return;
+  if (!rows.length) {
+    listEl.innerHTML = `<div class="empty">${t('project.empty')}</div>`;
+    return;
+  }
   listEl.innerHTML = rows
     .map(
       (p) => `
@@ -93,9 +124,9 @@ async function render() {
       </div>
       <div class="proj-tools"><div class="tm">${fmtTime(p.openedAt)}</div>
         <div class="proj-actions">
-          <button class="icon-btn" data-action="rename" title="重命名" aria-label="重命名">${ICONS.rename}</button>
-          <button class="icon-btn" data-action="folder" title="打开工程所在文件夹" aria-label="所在文件夹">${ICONS.folder}</button>
-          <button class="icon-btn danger" data-action="remove" title="从最近列表移除，保留源码与存档；重新打开原路径即可恢复" aria-label="移出列表">${ICONS.remove}</button>
+          <button class="icon-btn" data-action="rename" title="${t('project.rename')}" aria-label="${t('project.rename')}">${ICONS.rename}</button>
+          <button class="icon-btn" data-action="folder" title="${t('project.openFolder')}" aria-label="${t('project.folder')}">${ICONS.folder}</button>
+          <button class="icon-btn danger" data-action="remove" title="${t('project.removeHint')}" aria-label="${t('project.remove')}">${ICONS.remove}</button>
         </div>
       </div>
     </div>`
@@ -104,6 +135,7 @@ async function render() {
   listEl.querySelectorAll('.proj').forEach((row) => {
     const project = rows.find((p) => p.id === Number(row.dataset.id));
     row.addEventListener('click', async (event) => {
+      if (switching) return;
       const button = event.target.closest('button');
       if (!button) {
         if (!event.target.closest('input') && !row.querySelector('.proj-rename')) switchTo({ id: project.id });
@@ -112,24 +144,25 @@ async function render() {
       try {
         if (button.dataset.action === 'rename') return rename(row, project);
         if (button.dataset.action === 'folder') {
-          if (!window.callgraph?.openProjectFolder) return hint('请在桌面版中打开工程所在文件夹');
+          if (!window.callgraph?.openProjectFolder) return hint(t('project.desktopFolder'));
           await window.callgraph.openProjectFolder(project.id);
         } else if (button.dataset.action === 'remove') {
           const ok = await confirmDialog({
-            title: '移出最近列表',
-            message: `确定将工程“${project.name}”移出最近列表吗？\n${project.path}\n源码和存档都会保留，重新打开原路径即可恢复。`,
+            title: t('project.removeRecent'),
+            message: [t('project.removeConfirm', { name: project.name }), project.path, t('project.removeKeep')].join('\n'),
             danger: true,
           });
-          if (!ok) return;
+          if (!ok || switching) return;
           button.disabled = true;
           const result = await api.removeProject(project.id);
           if (!result.ok) throw new Error(result.error);
           await render();
-          hint('已移出最近列表，源码和存档保留；打开原路径即可恢复');
+          hint(t('project.removedRecent'));
         }
       } catch (error) { hint(error.message); button.disabled = false; }
     });
   });
+  if (switching) lockProjectControls();
 }
 
 /** 在列表内编辑，避免 Electron 不支持浏览器 prompt，也避免误触工程切换。 */
@@ -138,7 +171,7 @@ function rename(row, project) {
   const name = row.querySelector('.nm');
   const original = name.innerHTML;
   row.classList.add('renaming'); // 编辑期间收起右侧操作图标，少一层干扰
-  name.innerHTML = `<div class="proj-rename"><input aria-label="工程名称" maxlength="80" value="${esc(project.name)}"><button class="icon-btn ok" data-save title="保存" aria-label="保存">${ICONS.save}</button><button class="icon-btn" data-cancel title="取消" aria-label="取消">${ICONS.cancel}</button></div>`;
+  name.innerHTML = `<div class="proj-rename"><input aria-label="${t('project.name')}" maxlength="80" value="${esc(project.name)}"><button class="icon-btn ok" data-save title="${t('common.save')}" aria-label="${t('common.save')}">${ICONS.save}</button><button class="icon-btn" data-cancel title="${t('common.cancel')}" aria-label="${t('common.cancel')}">${ICONS.cancel}</button></div>`;
   const input = name.querySelector('input'), save = name.querySelector('[data-save]');
   const cancel = () => {
     if (save.disabled) return;
@@ -206,6 +239,7 @@ async function renderOrphans() {
     </div>`;
 
   document.getElementById('orphanClean')?.addEventListener('click', async (e) => {
+    if (switching) return;
     const btn = e.currentTarget;
     btn.disabled = true;
     btn.textContent = t('project.switching');
@@ -219,6 +253,7 @@ async function renderOrphans() {
       btn.textContent = t('orphan.failed');
     }
   });
+  if (switching) lockProjectControls();
 }
 
 function open() {
@@ -266,10 +301,10 @@ fileInput?.addEventListener('change', async () => {
   try {
     payload = JSON.parse(await file.text());
   } catch {
-    hint(`${t('session.importFailed')}：文件不是合法 JSON`);
+    hint(`${t('session.importFailed')}: ${t('session.invalidJson')}`);
     return;
   }
-  const ok = await confirmDialog({ title: '导入会话', message: '导入会覆盖同名的本地标注、布局和书签。确定继续吗？' });
+  const ok = await confirmDialog({ title: t('session.import'), message: t('session.overwrite') });
   if (!ok) return;
   const r = await api.importSession(payload).catch((error) => ({ ok: false, error: error.message }));
   if (!r || !r.ok) {

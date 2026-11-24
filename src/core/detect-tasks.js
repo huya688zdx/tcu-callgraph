@@ -108,17 +108,17 @@ export function detectTasks(model, from = null) {
   };
 
   // ---- 2. 「调度入口 → 任务」的边挂 TASK（仅限能明确识别出周期的任务，不猜测未知周期） ----
-  for (const task of tasks.slice(0, MAX_TASKS)) {
+  for (const task of tasks) {
+    if (seenEdges.size >= MAX_TASKS) break;
     const period = task.period || taskPeriodOf(shortName(task.id));
     if (!period) continue;
-    const callers = model._index.inAdj.get(task.id) || [];
+    const callers = (model._index.inAdj.get(task.id) || []).filter(c => !from || c.from === from);
     // 优先 ISR / main 这类调度者；没有就取第一个调用者
     const scheduler =
       callers.find((c) => ISR_NAME.test(shortName(c.from)) || shortName(c.from) === 'main') ||
       callers.find((c) => !TASK_NAME.test(shortName(c.from))) ||
       callers[0];
     if (!scheduler) continue;
-    if (from && scheduler.from !== from) continue;
     const key = edgeKeyOf(scheduler);
     if (seenEdges.has(key)) continue;
     seenEdges.add(key);

@@ -9,7 +9,7 @@ import { hooks } from './lib/hooks.js';
 import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
 import { draw, resize, pulseAdded } from './lib/render.js';
 import { history, pushHistory, undo, redo } from './lib/history.js';
-import { loadStats, loadTree, resetVars, renderVars, renderDetail, syncTreeSelection } from './lib/panels.js';
+import { loadStats, loadTree, resetVars, renderVars, renderDetail, renderTree, runSearch, syncTreeSelection } from './lib/panels.js';
 import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
@@ -41,7 +41,7 @@ const navStack = [];
 const NAV_MAX = 30;
 
 async function loadView(rootId, opts = {}) {
-  const { nav = true, incremental = false } = opts;
+  const { nav = true, incremental = false, fitOnLoad = !incremental } = opts;
   const previous = incremental && !state.at && state.view ? state.view : null;
   if (state.pairFlow) clearPairFlow();
   stopCamAnim();
@@ -71,7 +71,7 @@ async function loadView(rootId, opts = {}) {
   });
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
-    console.warn(data?.error || '读取视图失败，保留当前画面');
+    console.warn(data?.error || t('app.viewFailed'));
     return;
   }
   if (prior) {
@@ -82,16 +82,22 @@ async function loadView(rootId, opts = {}) {
   state.vars = new Set(vars); state.hiddenVars = new Set(hiddenVars);
   // 请求期间旧画布仍可交互；安装新视图时清除可能重新创建的旧双点查询。
   if (state.pairFlow) clearPairFlow({ paint: false });
+  const priorView = state.view;
+  stopCamAnim();
   state.view = data;
   state.expansions = data.expansions || [];
   syncComparison(data.comparison);
-  state.root = data.root;
-  state.roots = roots.length ? roots : data.roots || (data.root ? [data.root] : []);
+  state.roots = data.roots ?? (data.root ? [data.root] : roots);
+  state.root = data.root || state.roots[0] || null;
   state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = null;
   state.selectedLabel = null;
-  const rootNode = data.nodes.find((n) => n.id === data.root);
+  state.multiSelection = null;
+  state.trunkHits = null;
+  state.prevTrunkHits = null;
+  state.trunkFocusNode = null;
+  const rootNode = data.nodes.find((n) => n.id === state.root);
   els.rootName.textContent = rootNode
     ? `· ${rootNode.name}${state.roots.length > 1 ? ` +${state.roots.length - 1}` : ''}`
     : '';
@@ -99,38 +105,35 @@ async function loadView(rootId, opts = {}) {
   els.rootName.title = els.rootName.textContent;
   syncTreeSelection(state.roots);
   renderVars();
-  const oldNodes = new Map((previous?.nodes || []).map((n) => [n.id, n]));
-  const oldEdges = new Set((previous?.edges || []).map(edgeKey));
-  const addedNodes = previous ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
-  const addedEdges = previous ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  const common = data.nodes.filter((n) => oldNodes.has(n.id));
-  if (!previous) {
+  const keepCam = !fitOnLoad && Boolean(priorView?.nodes.length);
+  const oldNodes = new Map((keepCam ? priorView.nodes : []).map((n) => [n.id, n]));
+  const oldEdges = new Set((keepCam ? priorView.edges : []).map(edgeKey));
+  const addedNodes = keepCam ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
+  const addedEdges = keepCam ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
+  if (!keepCam) {
     fit({ paint: false });
-    constrainCam();
   } else {
     // 先按共同节点的位移锚定当前镜头起点，避免重排瞬间旧节点在屏幕上跳变，再平滑移向新增节点。
+    const common = data.nodes.filter((n) => oldNodes.has(n.id));
     if (common.length) {
       for (const axis of ['x', 'y']) {
         const shifts = common.map((n) => oldNodes.get(n.id)[axis] - n[axis]).sort((a, b) => a - b);
         cam[axis] += shifts[Math.floor(shifts.length / 2)] * cam.k;
       }
-    } else if (!previous.nodes.length) {
-      fit({ paint: false });
     }
-    constrainCam();
     if (addedNodes.length || addedEdges.length) {
       revealAdded(addedNodes, addedEdges);
       if (addedNodes.length === 1 && addedNodes[0].kind !== 'var') state.selected = addedNodes[0].id;
     }
   }
   pulseAdded(addedNodes, addedEdges);
-  renderDetail(state.selected).catch((error) => console.warn('读取节点详情失败：', error));
+  renderDetail(state.selected).catch((error) => console.warn(t('common.detailError'), error));
   renderLabelPanel();
   history.stack = [];
   history.idx = -1;
   pushHistory();
   // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
-  await savePage(true).catch((error) => console.warn('保存视图范围失败：', error));
+  await savePage(true).catch((error) => console.warn(t('app.scopeSaveFailed'), error));
   return seq === viewSeq ? data : undefined;
 }
 
@@ -147,7 +150,7 @@ hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } 
     if (state.view?.projectId !== projectId) return;
     if (hidden.length) {
       const result = await api.del({ nodes: hidden, restore: true, projectId });
-      if (!result?.ok) throw new Error(result?.error || '重新加入失败');
+      if (!result?.ok) throw new Error(result?.error || t('app.readdFailed'));
     }
   }
   const selected = state.selected;
@@ -155,8 +158,11 @@ hooks.addFunction = async (root, { includeShown = false, restoreHidden = true } 
   const expansions = [...state.expansions, ...ids.filter((id) => !expanded.has(id))
     .map((id) => ({ root: id, up: 0, down: 0 }))];
   const view = await loadView(state.roots, { incremental: true, expansions });
-  if (view && !state.selected && selected && view.nodes.some((n) => n.id === selected)) {
+  if (view && view === state.view && !state.selected && !state.selectedEdge && !state.pairFlow &&
+      selected && view.nodes.some((n) => n.id === selected)) {
     state.selected = selected;
+    state.selectedEdge = null;
+    state.selectedLabel = null;
     await renderDetail(selected);
     draw();
   }
@@ -186,7 +192,7 @@ hooks.applyComparison = async (roots) => {
   state.hiddenVars.clear();
   navStack.length = 0;
   await loadView(roots, { nav: false, incremental: true, exact: true, expansions: [] });
-  if (!state.view?.comparison) throw new Error('比较结果已准备，画布加载失败，请重试');
+  if (!state.view?.comparison) throw new Error(t('app.compareViewFailed'));
   // 比较视图固定零层展开（原层数已存进 comparisonPage）：只把 exact 用在首次请求的话，
   // 之后每次 reloadKeepCam 都会按原层数展开全部保留+选中的根，把未选中的调用者/被调用者拉回图里
   state.up = 0; state.down = 0;
@@ -230,6 +236,7 @@ hooks.applyBookmark = async (b) => {
 hooks.reloadAll = async () => {
   comparisonPage = null;
   const seq = ++viewSeq;
+  if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = null;
   state.hoverRelation = null;
   state.selected = null;
@@ -264,7 +271,7 @@ hooks.toggleVar = (id, on) => {
 
 async function postDelete(body) {
   const result = await api.del(body);
-  if (!result?.ok) throw new Error(result?.error || '移出画布失败');
+  if (!result?.ok) throw new Error(result?.error || t('common.removeFailed'));
 }
 
 /** 回退到上一个视图（入口 + 视角一起还原） */
@@ -292,13 +299,13 @@ async function deleteSelection() {
   const v = state.view;
   if (!v || v.comparison) return;
   // 选中标签时 Delete 只删标签，不删整条连线
-  if (state.selectedLabel && (await deleteSelectedLabel())) return;
+  if (!state.selected && state.selectedEdge && state.selectedLabel && (await deleteSelectedLabel())) return;
   let body = null;
 
-  if (state.selectedEdge) {
-    body = { edges: [edgeKey(state.selectedEdge)] };
-  } else if (state.selected) {
+  if (state.selected) {
     body = { nodes: [state.selected] };
+  } else if (state.selectedEdge) {
+    body = { edges: [edgeKey(state.selectedEdge)] };
   } else if (state.moveTarget?.kind === 'file' && state.moveTarget.view === v) {
     // 文件框只隐藏当前框内节点，沿用单节点删除的存档与撤销。
     body = { nodes: v.nodes.filter(n => n.group === state.moveTarget.item.id).map(n => n.id) };
@@ -387,10 +394,19 @@ window.addEventListener('keydown', (e) => {
 els.groupMode.addEventListener('change', () => {
   state.group = els.groupMode.checked;
   state.selectedEdge = null;
+  state.selectedLabel = null;
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
 });
 els.resetLayout.addEventListener('click', () => {
   loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
+});
+
+// interact.js 先完成命中检测和点选，普通单击选中节点后退出双点路径。
+els.cv.addEventListener('pointerdown', (event) => {
+  if (event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || !state.selected) return;
+  state.selectedEdge = null;
+  state.selectedLabel = null;
+  if (state.pairFlow) clearPairFlow();
 });
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
@@ -427,7 +443,7 @@ for (const [id, extension, build] of [
     try {
       await saveExport(extension, await build());
     } catch (error) {
-      alert('导出失败：' + error.message);
+      alert(t('app.exportFailed', { error: error.message }));
     } finally {
       button.disabled = false;
     }
@@ -441,6 +457,16 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 // ---------------- 启动 ----------------
 
 applyI18n();
+document.addEventListener('callgraph:langchange', () => {
+  renderTree(true);
+  syncTreeSelection();
+  runSearch().catch(() => {});
+  loadStats().catch(() => {});
+  renderVars();
+  if (document.getElementById('secDataflow').hidden) renderDetail(state.selected).catch(() => {});
+  renderLabelPanel();
+  draw();
+});
 window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
@@ -461,9 +487,9 @@ resize();
   }
   await Promise.all([loadStats(), loadTree()]);
   await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
-  if (!state.view) throw new Error('未能加载视图');
+  if (!state.view) throw new Error(t('app.noView'));
 })().catch((error) => {
-  if (confirm(`启动失败：${error.message}\n是否刷新页面重试？`)) location.reload();
+  if (confirm(t('app.retryStart', { error: error.message }))) location.reload();
 });
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）

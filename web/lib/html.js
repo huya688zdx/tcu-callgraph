@@ -1,13 +1,14 @@
 /** 独立 HTML 导出：携带当前几何、详情数据与 GUI 原有模块，离线复用同一套绘制和交互。 */
 import { state, cam, els, esc, THEME } from './state.js';
 import { api } from './api.js';
+import { getLang, t } from '../i18n.js';
 
 export async function buildStandaloneHtml() {
   const view = structuredClone(state.view);
   const snapshot = { view, cam: { ...cam }, width: els.cv.clientWidth, height: els.cv.clientHeight,
     selected: state.selected, ctxBox: state.ctxBox && { ...state.ctxBox },
     vars: [...state.vars], hiddenVars: [...state.hiddenVars],
-    theme: structuredClone(THEME) };
+    theme: structuredClone(THEME), language: getLang() };
   const right = document.getElementById('right').cloneNode(true);
   right.removeAttribute('data-mode');
   right.querySelectorAll('.fsel').forEach(wrap => wrap.replaceWith(wrap.querySelector('select')));
@@ -46,18 +47,18 @@ export async function buildStandaloneHtml() {
   const title = view.nodes.find((n) => n.id === view.root)?.name || view.root || 'callgraph';
   const json = JSON.stringify({ snapshot, sources }).replace(/</g, '\\u003c');
   return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="${snapshot.language}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)} · TCU 调用关系图</title>
+<title>${esc(title)} · ${esc(t('offline.title'))}</title>
 <style>${css}
 #app { grid-template-columns: minmax(0, 1fr) 310px; grid-template-areas: "top top" "main right"; }
 .offline-bar { display:flex; align-items:center; flex-wrap:wrap; gap:12px; padding:10px 14px; }
 .offline-bar .hint { white-space:normal; }
 </style></head><body>
 <div id="app">
-<header class="offline-bar"><b>TCU 调用关系图</b><span>${esc(title)}</span><button id="offlineFit">适应</button>
-<button id="offlinePng">导出 PNG</button><button id="offlineSvg">导出 SVG</button>
-<span class="hint">离线快照 · 滚轮上下移动 · Shift+滚轮左右移动 · Ctrl+滚轮缩放 · 双击节点 / 层级标题 / 连线后调整 · 空白处 / Esc 退出移动 · Ctrl+Z 撤销 · 变量勾选表示导出时的入图状态</span></header>
+<header class="offline-bar"><b>${esc(t('app.title'))}</b><span>${esc(title)}</span><button id="offlineFit">${esc(t('help.fit'))}</button>
+<button id="offlinePng">${esc(t('offline.png'))}</button><button id="offlineSvg">${esc(t('btn.svg'))}</button>
+<span class="hint">${esc(t('offline.hint'))}</span></header>
 <main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu" class="ctx-menu"></div></main>
 ${right.outerHTML}
 </div><div hidden><input id="search"><ul id="results"></ul></div>
