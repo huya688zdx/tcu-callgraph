@@ -614,13 +614,20 @@ function buildGraph(body, fn, model, signature, originalOf) {
     edges: edges.filter(edge => seen.has(edge.from)).map((edge, i) => ({ id: 'e' + i, ...edge })) };
 }
 
+const DISPLAY_LINE_WIDTH = 46;
+
+function displayLineLength(chars) {
+  if (chars.length <= DISPLAY_LINE_WIDTH) return chars.length;
+  const space = chars.lastIndexOf(' ', DISPLAY_LINE_WIDTH);
+  return space > 16 ? space : DISPLAY_LINE_WIDTH;
+}
+
 function displayLines(text) {
   const lines = [];
   for (const original of text.split('\n')) {
     let remaining = Array.from(original);
-    while (remaining.length > 46 && lines.length < 3) {
-      const space = remaining.slice(0, 47).lastIndexOf(' ');
-      const split = space > 16 ? space : 46;
+    while (remaining.length > DISPLAY_LINE_WIDTH && lines.length < 3) {
+      const split = displayLineLength(remaining);
       lines.push(remaining.slice(0, split).join(''));
       remaining = remaining.slice(split);
       if (remaining[0] === ' ') remaining.shift();
@@ -637,10 +644,17 @@ function displayLines(text) {
 async function layout({ nodes, edges }) {
   const children = nodes.map(node => {
     node.lines = displayLines(node.text);
-    const textWidth = Math.max(...node.lines.map(line => Array.from(line).reduce((w, char) => w + (/[^\x00-\x7f]/.test(char) ? 14 : 8), 0)));
+    const lines = node.diffLines?.map(line => line.map(({ text }) => text).join('')) ?? node.lines;
+    const textWidth = lines.reduce((width, line) => {
+      const lineWidth = Array.from(line).reduce((w, char) => w + (/[^\x00-\x7f]/.test(char) ? 14 : 8), 0);
+      return Math.max(width, lineWidth);
+    }, 0);
     const diamond = isDecision(node.kind) || node.kind === 'switch';
-    const width = diamond ? Math.max(164, Math.ceil((textWidth + 34) * 1.45)) : Math.max(104, textWidth + 46);
-    const height = diamond ? Math.max(90, node.lines.length * 40 + 42) : Math.max(42, node.lines.length * 18 + 22);
+    const height = diamond ? Math.max(90, lines.length * 40 + 42) : Math.max(42, lines.length * 18 + 22);
+    // 菱形靠近顶点处更窄，按最外侧一行的截面留出文字空间。
+    const diamondScale = diamond && node.diffLines
+      ? Math.max(1.45, height / (height - (lines.length - 1) * 18 - 16)) : 1.45;
+    const width = diamond ? Math.max(164, Math.ceil((textWidth + 34) * diamondScale)) : Math.max(104, textWidth + 46);
     const port = (side, x, y) => ({ id: node.id + ':' + side, x, y, width: 0, height: 0,
       layoutOptions: { 'elk.port.side': side } });
     return {
@@ -709,7 +723,7 @@ function nodeSignature(node) {
 
 const MAX_DIFF_CELLS = 250000;
 
-function alignBlocks(a, b, score) {
+function alignSequence(a, b, score) {
   const m = a.length, n = b.length;
   const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
   for (let i = m - 1; i >= 0; i--) {
@@ -730,16 +744,17 @@ function alignBlocks(a, b, score) {
   return pairs;
 }
 
-function markModifiedBlocks(a, b, statuses) {
+function markModifiedBlocks(a, b, changes) {
   if (!a.length || !b.length) return;
   if (a.length * b.length > MAX_DIFF_CELLS) {
-    const counts = new Map();
-    for (const { node } of b) counts.set(node.kind, (counts.get(node.kind) || 0) + 1);
+    const byKind = new Map();
+    for (const { node } of b.toReversed()) {
+      if (!byKind.has(node.kind)) byKind.set(node.kind, []);
+      byKind.get(node.kind).push(node);
+    }
     for (const { node, index } of a) {
-      const count = counts.get(node.kind);
-      if (!count) continue;
-      counts.set(node.kind, count - 1);
-      statuses[index] = 'modified';
+      const counterpartNode = byKind.get(node.kind)?.pop();
+      if (counterpartNode) changes[index] = { change: 'modified', counterpartNode };
     }
     return;
   }
@@ -747,23 +762,23 @@ function markModifiedBlocks(a, b, statuses) {
   // 同类节点优先匹配相近的源码，避免把新分支中的语句错配给后面的修改。
   const comparable = ({ node }) => ({ kind: node.kind, tokens: new Set(lex(node.code || node.text || '')
     .filter(token => token.t !== 'punct').map(token => token.v)) });
-  const pairs = alignBlocks(a.map(comparable), b.map(comparable), (x, y) => {
+  const pairs = alignSequence(a.map(comparable), b.map(comparable), (x, y) => {
     if (x.kind !== y.kind) return 0;
     let shared = 0;
     for (const token of x.tokens) if (y.tokens.has(token)) shared++;
     return 1 + Math.round(40 * shared / (x.tokens.size + y.tokens.size || 1));
   });
-  for (const [i] of pairs) statuses[a[i].index] = 'modified';
+  for (const [i, j] of pairs) changes[a[i].index] = { change: 'modified', counterpartNode: b[j].node };
 }
 
 /** 先对齐未变节点，再按类型和源码相似度比较锚点之间的节点。 */
-export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') {
+function matchFlowchartNodes(primaryNodes, otherNodes, version) {
   const unmatched = version === 'before' ? 'deleted' : 'added';
-  const statuses = primaryNodes.map(({ kind }) => isTerminal(kind) ? 'existing' : unmatched);
+  const changes = primaryNodes.map(({ kind }) => ({ change: isTerminal(kind) ? 'existing' : unmatched }));
   const blocks = nodes => nodes.flatMap((node, index) => isTerminal(node.kind) ? []
     : [{ node, index, signature: nodeSignature(node) }]);
   const a = blocks(primaryNodes), b = blocks(otherNodes);
-  if (!a.length || !b.length) return statuses;
+  if (!a.length || !b.length) return changes;
   if (a.length * b.length > MAX_DIFF_CELLS) {
     // 超大函数先按签名计数，保留变化块的空间给后续类型匹配。
     const bySignature = new Map();
@@ -776,22 +791,91 @@ export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') 
       const match = bySignature.get(block.signature)?.pop();
       if (!match) return true;
       remaining.delete(match);
-      statuses[block.index] = 'existing';
+      changes[block.index].change = 'existing';
       return false;
     });
-    markModifiedBlocks(changed, [...remaining], statuses);
-    return statuses;
+    markModifiedBlocks(changed, [...remaining], changes);
+    return changes;
   }
-  const anchors = alignBlocks(a, b, (x, y) => Number(x.signature === y.signature));
+  const anchors = alignSequence(a, b, (x, y) => Number(x.signature === y.signature));
   anchors.push([a.length, b.length]);
   let prevA = 0, prevB = 0;
   for (const [endA, endB] of anchors) {
-    markModifiedBlocks(a.slice(prevA, endA), b.slice(prevB, endB), statuses);
-    if (endA < a.length) statuses[a[endA].index] = 'existing';
+    markModifiedBlocks(a.slice(prevA, endA), b.slice(prevB, endB), changes);
+    if (endA < a.length) changes[a[endA].index].change = 'existing';
     prevA = endA + 1;
     prevB = endB + 1;
   }
-  return statuses;
+  return changes;
+}
+
+export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') {
+  return matchFlowchartNodes(primaryNodes, otherNodes, version).map(({ change }) => change);
+}
+
+function displayTokens(text) {
+  // 把行首的 # 单独保留，让词法分析器逐个读取预处理指令里的标记。
+  const preproc = text.startsWith('#');
+  const code = preproc ? text.slice(1) : text;
+  const tokens = preproc ? ['#'] : [];
+  let offset = 0;
+  for (const { s, e } of lex(code)) {
+    if (s > offset) tokens.push(code.slice(offset, s));
+    tokens.push(code.slice(s, e));
+    offset = e;
+  }
+  if (offset < code.length) tokens.push(code.slice(offset));
+  return tokens;
+}
+
+function appendSegment(segments, text, op) {
+  if (!text) return;
+  const last = segments.at(-1);
+  if (last?.op === op) last.text += text;
+  else segments.push({ text, op });
+}
+
+function wrapDiffLines(segments) {
+  const chars = segments.flatMap(({ text, op }) => Array.from(text, char => ({ char, op })));
+  const lines = [];
+  for (let start = 0; start < chars.length;) {
+    const preview = chars.slice(start, start + DISPLAY_LINE_WIDTH + 1).map(({ char }) => char);
+    const newline = preview.indexOf('\n');
+    const length = newline < 0 ? displayLineLength(preview) : newline;
+    const line = [];
+    for (const { char, op } of chars.slice(start, start + length)) appendSegment(line, char, op);
+    lines.push(line);
+    start += length + (newline < 0 ? 0 : 1);
+  }
+  return lines;
+}
+
+function diffDisplayLines(beforeText, afterText) {
+  if (beforeText === afterText) return [];
+  const before = displayTokens(beforeText), after = displayTokens(afterText);
+  let start = 0, beforeEnd = before.length, afterEnd = after.length;
+  while (start < beforeEnd && start < afterEnd && before[start] === after[start]) start++;
+  while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd--;
+    afterEnd--;
+  }
+  const removed = before.slice(start, beforeEnd), added = after.slice(start, afterEnd);
+  // 长表达式先保留共同首尾，限制中间部分的 LCS 计算量。
+  const pairs = removed.length && added.length && removed.length * added.length <= MAX_DIFF_CELLS
+    ? alignSequence(removed, added, (a, b) => Number(a === b)) : [];
+  pairs.push([removed.length, added.length]);
+  const segments = [];
+  appendSegment(segments, before.slice(0, start).join(''), 'same');
+  let i = 0, j = 0;
+  for (const [endA, endB] of pairs) {
+    appendSegment(segments, removed.slice(i, endA).join(''), 'del');
+    appendSegment(segments, added.slice(j, endB).join(''), 'add');
+    appendSegment(segments, removed[endA], 'same');
+    i = endA + 1;
+    j = endB + 1;
+  }
+  appendSegment(segments, before.slice(beforeEnd).join(''), 'same');
+  return wrapDiffLines(segments);
 }
 
 function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
@@ -903,7 +987,7 @@ function addCallInputs(hash, index, fn) {
 export function flowchartCacheHash(model, fn, { version = 'after', expandMacros = false, fnChange = 'existing',
   otherModel = null, otherFn = null, otherSourceText, sourceRoot, otherSourceRoot } = {}) {
   const h = createHash('sha1');
-  h.update(`fc-v5\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0`);
+  h.update(`fc-v6\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0`);
   // 目录对照的两侧可映射到同一份工程文件，在本次调用内共用文件状态。
   const fileStats = otherModel ? new Map() : undefined;
   function fileInputs(graphModel, graphFn, graphRoot) {
@@ -934,23 +1018,29 @@ export async function buildFlowchart(model, fn, { expandMacros = false, version 
   otherSourceText, otherSourceRoot } = {}) {
   const parser = await getParser();
   const { graph, macrosUsed, headers } = extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot);
-  let statuses;
-  if (fnChange === 'added' || fnChange === 'deleted') {
-    statuses = graph.nodes.map(() => fnChange);
-  } else {
+  const defaultChange = fnChange === 'added' || fnChange === 'deleted' ? fnChange : 'existing';
+  let changes;
+  if (defaultChange === 'existing') {
     try {
       const counterpart = otherModel && isFlowchartFunction(otherFn)
         ? extractFlowchartGraph(parser, otherModel, otherFn, expandMacros, otherSourceRoot)
         : typeof otherSourceText === 'string'
           ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) : null;
-      if (counterpart) statuses = diffFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
+      if (counterpart) changes = matchFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
     } catch { /* 对照版本无法解析时，仅保留函数级状态。 */ }
   }
   const nodeChangeById = new Map();
   graph.nodes = graph.nodes.map((node, idx) => {
-    const change = statuses?.[idx] ?? 'existing';
+    const { change = defaultChange, counterpartNode } = changes?.[idx] ?? {};
     nodeChangeById.set(node.id, change);
-    return { ...node, change };
+    const item = { ...node, change };
+    if (change === 'modified' && counterpartNode) {
+      // 两侧的 text 是生成 lines 的显示标签，在折行前比较可保留完整的 C 标记。
+      const [before, after] = version === 'before' ? [node, counterpartNode] : [counterpartNode, node];
+      const diffLines = diffDisplayLines(before.text, after.text);
+      if (diffLines.length) item.diffLines = diffLines;
+    }
+    return item;
   });
   graph.edges = graph.edges.map((edge) => {
     const fc = nodeChangeById.get(edge.from);

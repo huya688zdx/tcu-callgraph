@@ -116,7 +116,73 @@ void run(int x) {
       assert.equal(byText.get('x = 1;'), 'modified');
       assert.equal(byText.get('obsolete(x);'), 'deleted');
     }
+    for (const node of graph.nodes.filter(node => node.change !== 'modified')) {
+      assert.equal(Object.hasOwn(node, 'diffLines'), false, node.text);
+    }
   }
+});
+
+test('修改的判断节点在两个版本中都按修改前后顺序标记追加和替换', async t => {
+  const source = (first, second) => `
+void run(int a, int b, int old_flag, int new_flag) {
+  if (${first}) a++;
+  if (${second}) b++;
+}
+`;
+  const before = source('a > 0', 'a > 0 && old_flag');
+  const after = source('a > 0 && b == 1', 'a > 0 && new_flag');
+  for (const [version, current, otherSourceText] of [['after', after, before], ['before', before, after]]) {
+    const model = flowchartProject(t, { 'app.c': current });
+    const fn = model._index.byId.get('app.c::run');
+    const graph = await buildFlowchart(model, fn, { version, fnChange: 'modified', otherSourceText });
+    const [extension, replacement] = graph.nodes.filter(node => node.kind === 'decision');
+    assert.equal(extension.change, 'modified');
+    assert.deepEqual(extension.diffLines, [[
+      { text: 'if (a > 0', op: 'same' },
+      { text: ' && b == 1', op: 'add' },
+      { text: ')', op: 'same' },
+    ]]);
+    assert.equal(replacement.change, 'modified');
+    assert.deepEqual(replacement.diffLines, [[
+      { text: 'if (a > 0 && ', op: 'same' },
+      { text: 'old_flag', op: 'del' },
+      { text: 'new_flag', op: 'add' },
+      { text: ')', op: 'same' },
+    ]]);
+  }
+});
+
+test('修改的长条件折行后保留标记，并按新尺寸布置节点和连线', async t => {
+  const oldFlag = 'old_' + 'condition_'.repeat(5) + 'flag';
+  const newFlag = oldFlag.replace('old_', 'new_');
+  const condition = flag => `if (a > 0 && ${flag})`;
+  const source = flag => `void run(int a, int ${flag}) { ${condition(flag)} a++; }`;
+  const model = flowchartProject(t, { 'app.c': source(newFlag) });
+  const fn = model._index.byId.get('app.c::run');
+  const baseline = await buildFlowchart(model, fn);
+  const graph = await buildFlowchart(model, fn, { fnChange: 'modified', otherSourceText: source(oldFlag) });
+  const node = graph.nodes.find(node => node.kind === 'decision');
+  assert.equal(node.change, 'modified');
+  assert.ok(node.diffLines.length > node.lines.length);
+  assert.ok(node.h > baseline.nodes.find(node => node.kind === 'decision').h);
+  for (const line of node.diffLines) assert.ok(line.map(({ text }) => text).join('').length <= 46);
+  const segments = node.diffLines.flat();
+  const textWithout = excluded => segments.filter(({ op }) => op !== excluded).map(({ text }) => text).join('');
+  assert.equal(textWithout('add'), condition(oldFlag));
+  assert.equal(textWithout('del'), condition(newFlag));
+  const outgoing = branch => graph.edges.find(edge => edge.from === node.id && edge.branch === branch);
+  assert.deepEqual(outgoing('ON').points[0], [node.x + node.w / 2, node.y + node.h]);
+  assert.deepEqual(outgoing('OFF').points[0], [node.x + node.w, node.y + node.h / 2]);
+});
+
+test('宏定义变化时，显示文字相同的修改节点没有行内标记', async t => {
+  const source = value => `#define VALUE ${value}\nint run(void) { return VALUE; }\n`;
+  const model = flowchartProject(t, { 'app.c': source(2) });
+  const fn = model._index.byId.get('app.c::run');
+  const graph = await buildFlowchart(model, fn, { fnChange: 'modified', otherSourceText: source(1) });
+  const node = graph.nodes.find(node => node.text === 'return VALUE;');
+  assert.equal(node.change, 'modified');
+  assert.equal(Object.hasOwn(node, 'diffLines'), false);
 });
 
 test('已缓存的头文件宏等长改写后会更新缓存键和宏展开', async t => {
