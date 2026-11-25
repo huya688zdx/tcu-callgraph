@@ -6,12 +6,19 @@ import { state } from './state.js';
 // 页面标识用于识别延迟到达的自身切换广播，不依赖请求是否已经结束。
 export const clientId = crypto.randomUUID();
 
-const get = (url) => fetch(url).then((r) => r.json());
+const get = (url) => fetch(url).then(parseJson);
 let layoutWrites = Promise.resolve();
 let chatWrites = Promise.resolve();
 
+async function parseJson(response) {
+  if (response.ok) return response.json();
+  const body = await response.json().catch(() => null);
+  return { ...body, ok: false, error: body?.error || `HTTP ${response.status}`, status: response.status };
+}
+
 async function parseView(response) {
-  const view = await response.json();
+  const view = await parseJson(response);
+  if (!response.ok) return view;
   const revision = response.headers.get('X-Callgraph-Session');
   return revision === null ? view : { ...view, sessionRevision: Number(revision) };
 }
@@ -106,6 +113,7 @@ export const api = {
   /** 书签：保存的视图（入口集合 + 深度 + 模式） */
   bookmarks: () => get('/api/bookmarks'),
   saveBookmark: (body) => guardWrite('bookmarks') || post('/api/bookmarks', body),
+  renameBookmark: (id, name) => guardWrite('bookmarks') || post('/api/bookmarks/rename', { id, name }),
   deleteBookmark: (id) => guardWrite('bookmarks') || post('/api/bookmarks/delete', { id }),
   /** 导入 .cgx 会话（导出走浏览器直接下载，不需要接口封装） */
   importSession: (body) => guardWrite('session') || post('/api/session/import', body),

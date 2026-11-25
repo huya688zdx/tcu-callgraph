@@ -644,6 +644,7 @@ export function openStore({ dbPath, userData } = {}) {
          grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars, expansions = excluded.expansions,
          updated_at = excluded.updated_at`
     ),
+    bmRename: db.prepare('UPDATE bookmark SET name = ?, updated_at = ? WHERE project_id = ? AND id = ? RETURNING *'),
     bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
   };
 
@@ -981,6 +982,20 @@ export function openStore({ dbPath, userData } = {}) {
         ts
       );
       return { bookmark: toBookmark(q.bmByName.get(projectId, clean)), overwritten: existed };
+    },
+
+    renameBookmark(projectId, id, newName) {
+      // 与输入框的长度限制一致，截断时保留完整字符。
+      const clean = String(newName ?? '').trim().slice(0, 80).replace(/[\uD800-\uDBFF]$/, '').trimEnd();
+      if (!clean) throw new Error('书签名称不能为空');
+      try {
+        const row = q.bmRename.get(clean, nowMs(), projectId, Number(id));
+        return row ? toBookmark(row) : null;
+      } catch (err) {
+        // SQLITE_CONSTRAINT_UNIQUE：同一工程内已存在此名称。
+        if (err.errcode === 2067) throw new Error('已存在同名书签，请换一个名称');
+        throw err;
+      }
     },
 
     deleteBookmark(projectId, id) {
