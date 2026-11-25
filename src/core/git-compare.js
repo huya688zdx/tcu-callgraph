@@ -1,7 +1,7 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -337,16 +337,37 @@ async function diffNameStatus(repo, refArgs) {
   return parsed;
 }
 
-async function diskSource(repo, relative) {
+async function diskSource(repo, relative, configBytes) {
   const expected = path.join(repo.root, relative);
   try {
     const actual = await realpath(expected);
     const info = await lstat(expected);
     if (path.relative(expected, actual) || !info.isFile()) return null;
     if (info.size > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
-    const buffer = await readFile(actual);
-    if (buffer.length > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
-    return buffer;
+    if (configBytes === undefined) {
+      const buffer = await readFile(actual);
+      if (buffer.length > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
+      return buffer;
+    }
+    const file = await open(actual, 'r');
+    try {
+      const current = await file.stat();
+      if (!current.isFile()) return null;
+      addScheduleBytes(configBytes, current.size);
+      const buffer = Buffer.allocUnsafe(current.size);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) return Buffer.from(buffer.subarray(0, offset));
+        offset += bytesRead;
+      }
+      // fstat 后增长的文件最多再读一字节，避免重新越过预算。
+      const { bytesRead } = await file.read(Buffer.allocUnsafe(1), 0, 1, offset);
+      if (bytesRead) throw new Error('读取时调度配置已更改，请重试：' + relative);
+      return buffer;
+    } finally {
+      await file.close();
+    }
   } catch (error) {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
     throw error;
@@ -391,6 +412,8 @@ async function worktreeSnapshot(repo, baseSha, before, includeUntracked) {
   const dirty = new Set();
   let diffEntries = [];
   const toRead = new Set();
+  const dirRealCache = new Map();
+  let configBytes = 0;
 
   if (!baseSha) {
     const [tracked, untracked] = await Promise.all([
@@ -426,40 +449,48 @@ async function worktreeSnapshot(repo, baseSha, before, includeUntracked) {
       dirty.add(file);
     }
     // 稀疏检出等场景下未落盘文件不在工作区，仅保留真实存在的常规文件；超 8 MB 直接报错不误判删除。
-    const dirRealCache = new Map();
     for (const [file, object] of before) {
       if (dirty.has(file)) continue;
-      if (verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true })) files.set(file, object);
+      const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+      if (!info) continue;
+      if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, info.size);
+      files.set(file, object);
     }
   }
 
   const readList = [...toRead].sort();
-  const buffers = await mapLimit(readList, ioConcurrency, file => diskSource(repo, file));
+  const scheduleFiles = readList.filter(isScheduleFile);
+  let preflightBytes = configBytes;
+  for (const file of scheduleFiles) {
+    const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+    if (info) preflightBytes = addScheduleBytes(preflightBytes, info.size);
+  }
+
   const diffSet = new Set(diffEntries.flatMap(e => [e.file, e.oldFile]).filter(Boolean));
-  for (let i = 0; i < readList.length; i++) {
-    const file = readList[i];
-    const data = buffers[i];
+  const record = (file, data) => {
     if (data === null) files.delete(file);
     else if (!diffSet.has(file) && before.has(file) && gitBlobOid(data) === before.get(file)) {
       // assume-unchanged / skip-worktree 文件经核对内容与基准 blob 完全一致，避免误报修改。
       files.set(file, before.get(file));
     } else files.set(file, data);
+  };
+  // 依次按已保留的实际字节分配配置缓冲区，避免多个并发读取越过预算。
+  for (const file of scheduleFiles) {
+    const data = await diskSource(repo, file, configBytes);
+    if (data) configBytes = addScheduleBytes(configBytes, data.length);
+    record(file, data);
   }
+  await mapLimit(readList.filter(file => !isScheduleFile(file)), ioConcurrency, async file =>
+    record(file, await diskSource(repo, file)));
 
-  // 检查调度配置总大小限制，同时基于未改文件的 OID 与改动文件的字节计算工作区指纹。
-  let configBytes = 0;
+  // 基于未改文件的 OID 与改动文件的字节计算工作区指纹。
   const hash = createHash('sha256');
   const sortedNames = [...files.keys()].sort();
   for (const file of sortedNames) {
     const entry = files.get(file);
     if (Buffer.isBuffer(entry)) {
-      if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, entry.length);
       hash.update(JSON.stringify([file, 'buf', entry.length])).update(entry);
     } else {
-      if (isScheduleFile(file)) {
-        const info = await stat(path.join(repo.root, file)).catch(() => null);
-        if (info?.isFile()) configBytes = addScheduleBytes(configBytes, info.size);
-      }
       hash.update(JSON.stringify([file, 'oid', entry]));
     }
   }

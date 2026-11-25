@@ -125,24 +125,28 @@ export function openManualNodeDialog({ file, kind = 'fn' } = {}) {
 }
 
 export async function removeManualNodePermanently(node) {
-  if (!node?.id || state.at || state.view?.comparison) return false;
-  const label = node.name || node.id;
+  const view = state.view;
+  const { projectId, sessionRevision } = view || {};
+  const id = node?.id;
+  if (!id || projectId == null || state.at || view.comparison) return false;
+  const stillActive = () => state.view === view && !state.at;
+  const label = node.name || id;
   const ok = await confirmDialog({
     title: t('manual.deleteTitle'),
     message: t('manual.deleteConfirm', { name: label }),
     okText: t('manual.deleteBtn'),
     danger: true,
   });
-  if (!ok) return false;
-  const res = await api.deleteManualNode({ id: node.id });
-  if (!res?.ok) return false;
-  state.roots = state.roots.filter((id) => id !== node.id);
-  state.expansions = state.expansions.filter((s) => s.root !== node.id);
-  state.vars.delete(node.id);
-  state.hiddenVars.delete(node.id);
-  if (state.selected === node.id) state.selected = null;
+  if (!ok || !stillActive()) return false;
+  const res = await api.deleteManualNode({ id, projectId, sessionRevision });
+  if (!res?.ok || !stillActive()) return false;
+  state.roots = state.roots.filter((root) => root !== id);
+  state.expansions = state.expansions.filter((scope) => scope.root !== id);
+  state.vars.delete(id);
+  state.hiddenVars.delete(id);
+  if (state.selected === id) state.selected = null;
   resetVars();
   await Promise.all([loadTree(), loadStats()]);
-  await hooks.reloadKeepCam?.();
+  if (stillActive()) await hooks.reloadKeepCam?.();
   return true;
 }

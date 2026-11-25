@@ -310,3 +310,87 @@ test('无头浏览器：撤销与重做手工连线增量存档并保留视图�
   await checkWrites('h.undo(); h.redo(); h.undo();', [original]);
   assert.deepEqual(await snapshot(), [outside, original]);
 });
+
+test('无头浏览器：手工节点删除绑定原工程和会话，切换后丢弃迟到的确认与响应', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const { baseUrl, request } = await fixture(t);
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-manual-delete-other-'));
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(other, file), 'void a(void) {}');
+  const first = await request('/api/project');
+  const id = fn('Planned');
+  const addNode = () => request('/api/manual-nodes', { kind: 'fn', name: 'Planned', file });
+  const switchTo = (body) => request('/api/switch', body);
+  const marker = () => request('/api/page', { roots: [id], up: 0, down: 0 });
+  await addNode();
+  await marker();
+  await switchTo({ path: other });
+  const second = await request('/api/project');
+  await addNode();
+  await marker();
+  await switchTo({ id: first.id });
+
+  const chrome = await launchCdp({ url: `${baseUrl}/` });
+  t.after(() => chrome.close());
+  const { evaluate, waitFor } = chrome;
+  const waitProject = (project) => waitFor(`(async () => {
+    const { state } = await import('/lib/state.js');
+    return state.view?.projectId === ${project} && state.roots.includes(${JSON.stringify(id)});
+  })()`);
+  const openDeletion = async () => {
+    await evaluate(`(async () => {
+      const { removeManualNodePermanently } = await import('/lib/manual-node.js');
+      window.pendingDeletion = removeManualNodePermanently({ id: ${JSON.stringify(id)} });
+    })()`);
+    await waitFor('document.querySelector(".confirm-modal [data-ok]") !== null');
+  };
+  const confirm = () => evaluate('document.querySelector(".confirm-modal [data-ok]").click()');
+
+  await waitProject(first.id);
+  await evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    window.originalDelete = api.deleteManualNode;
+    window.deleteCalls = [];
+    api.deleteManualNode = async body => {
+      window.deleteCalls.push(body);
+      return window.originalDelete(body);
+    };
+  })()`);
+  await openDeletion();
+  await switchTo({ id: second.id });
+  await waitProject(second.id);
+  await confirm();
+  assert.equal(await evaluate('window.pendingDeletion'), false);
+  assert.deepEqual(await evaluate('window.deleteCalls'), []);
+  assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === id));
+
+  await switchTo({ id: first.id });
+  await waitProject(first.id);
+  const oldRevision = await evaluate(`import('/lib/state.js').then(({ state }) => state.view.sessionRevision)`);
+  assert.ok(Number.isSafeInteger(oldRevision));
+  await evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    api.deleteManualNode = async body => {
+      window.deleteCalls.push(body);
+      window.deleteResponse = await window.originalDelete(body);
+      await new Promise(resolve => { window.releaseDeletion = resolve; });
+      return window.deleteResponse;
+    };
+  })()`);
+  await openDeletion();
+  await confirm();
+  await waitFor('window.deleteResponse?.ok === true && typeof window.releaseDeletion === "function"');
+  assert.deepEqual(await evaluate('window.deleteCalls'), [{ id, projectId: first.id, sessionRevision: oldRevision }]);
+
+  await switchTo({ id: second.id });
+  await waitProject(second.id);
+  await evaluate('window.releaseDeletion()');
+  assert.equal(await evaluate('window.pendingDeletion'), false);
+  await waitProject(second.id);
+  assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === id));
+  const stale = await fetch(`${baseUrl}/api/manual-nodes/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Callgraph-Project': String(second.id),
+      'X-Callgraph-Session': String(oldRevision) }, body: JSON.stringify({ id }),
+  });
+  assert.equal(stale.status, 409);
+});

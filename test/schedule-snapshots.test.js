@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import promises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { compareProjects } from '../src/core/compare.js';
@@ -114,6 +116,68 @@ test('历史和 INDEX 两侧的调度配置均在 Git 读取任何 blob 前执�
     assert.ok(gitCommands.some(argv => argv.includes('--batch-check')));
     assert.ok(!gitCommands.some(argv => argv.includes('--batch')), '拒绝之前不得请求 blob 内容');
   }
+});
+
+test('WORKTREE 配置超限时不读取内容，并限制预检后增长的文件', async t => {
+  const { root, put } = tree(t);
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { windowsHide: true });
+  git('init', '--quiet');
+  put('app.c', source);
+  git('add', 'app.c');
+  git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline');
+
+  const MiB = 1024 * 1024;
+  const names = Array.from({ length: 10 }, (_, index) => `task-${index}.arxml`);
+  for (const name of names) {
+    put(name, '');
+    fs.truncateSync(path.join(root, name), 5 * MiB);
+  }
+  const readFile = promises.readFile;
+  const open = promises.open;
+  const opened = [];
+  let readBytes = 0;
+  let growBeforeStat = false;
+  let growAfterStat = false;
+  promises.readFile = async (file, ...options) => {
+    if (typeof file === 'string' && file.endsWith('.arxml')) assert.fail('调度配置不得无界读入');
+    return readFile(file, ...options);
+  };
+  promises.open = async (name, ...options) => {
+    if (!name.endsWith('.arxml')) return open(name, ...options);
+    opened.push(path.basename(name));
+    if (growBeforeStat && name.endsWith('task-5.arxml')) fs.truncateSync(name, 8 * MiB);
+    const file = await open(name, ...options);
+    const read = file.read.bind(file);
+    file.read = async (...args) => {
+      if (growAfterStat && name.endsWith('task-5.arxml')) fs.truncateSync(name, 8 * MiB);
+      const result = await read(...args);
+      readBytes += result.bytesRead;
+      return result;
+    };
+    return file;
+  };
+  syncBuiltinESMExports();
+  t.after(() => {
+    promises.readFile = readFile;
+    promises.open = open;
+    syncBuiltinESMExports();
+  });
+
+  await assert.rejects(compareGitProject(root), /调度配置累计超过 32 MiB/);
+  assert.deepEqual(opened, [], '50 MiB 的预检必须在打开任何配置文件前失败');
+
+  for (const name of names.slice(6)) fs.unlinkSync(path.join(root, name));
+  growBeforeStat = true;
+  await assert.rejects(compareGitProject(root), /调度配置累计超过 32 MiB/);
+  assert.deepEqual(opened, names.slice(0, 6));
+  assert.equal(readBytes, 25 * MiB, '打开后已超过剩余额度的文件不得读取内容');
+
+  fs.truncateSync(path.join(root, names[5]), 5 * MiB);
+  growBeforeStat = false;
+  growAfterStat = true;
+  readBytes = 0;
+  await assert.rejects(compareGitProject(root), /读取时调度配置已更改/);
+  assert.equal(readBytes, 30 * MiB + 1, '打开后再次增长只能多读一个探测字节');
 });
 
 test('同尺寸调度配置改写后重开工程，命中 C 解析缓存并重新读取配置', t => {

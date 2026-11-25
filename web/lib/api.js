@@ -9,14 +9,21 @@ export const clientId = crypto.randomUUID();
 const get = (url) => fetch(url).then((r) => r.json());
 let layoutWrites = Promise.resolve();
 
-const post = (url, body) =>
+async function parseView(response) {
+  const view = await response.json();
+  const revision = response.headers.get('X-Callgraph-Session');
+  return revision === null ? view : { ...view, sessionRevision: Number(revision) };
+}
+
+const post = (url, body, parse = (response) => response.json()) =>
   fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId,
       ...((body.projectId ?? state.view?.projectId) == null ? {} :
-        { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }) },
+        { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }),
+      ...(body.sessionRevision == null ? {} : { 'X-Callgraph-Session': String(body.sessionRevision) }) },
     body: JSON.stringify(body),
-  }).then((r) => r.json());
+  }).then(parse);
 
 /**
  * 回看模式下拦掉写操作。
@@ -50,7 +57,7 @@ export const api = {
     if (at > 0) q.set('at', String(at));
     const hasComma = [...(list.length > 1 ? list : []), ...(vars || []), ...(hiddenVars || [])]
       .some((id) => id.includes(','));
-    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return get('/api/view?' + q);
+    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return fetch('/api/view?' + q).then(parseView);
     for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
     return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId,
@@ -62,7 +69,7 @@ export const api = {
         ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
       layoutSlots: previous.layoutSlots,
-    } : null });
+    } : null }, parseView);
   },
   stats: () => get('/api/stats?summary=1'),
   parsers: () => fetch('/api/parsers').then(response => response.ok ? response.json() : null).catch(() => null),

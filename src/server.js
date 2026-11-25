@@ -3154,6 +3154,7 @@ export const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/view') {
+      res.setHeader('X-Callgraph-Session', String(req.sessionRevision));
       const at = Number(u.searchParams.get('at') || 0);
       let emptyRequested = u.searchParams.get('empty') === '1';
       let useSnapshot = u.searchParams.get('useSnapshot') === '1';
