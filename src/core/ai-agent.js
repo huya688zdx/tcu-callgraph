@@ -1,12 +1,13 @@
 /**
  * 内置直连 OpenAI 兼容模型代理：
  * - 零新依赖，直接调用本地或远程 /v1/chat/completions（兼容 Ollama / vLLM / LM Studio / llama.cpp / 旧版中转）。
- * - 面向本地中小模型（如 Qwen 27B）精简到 5 个扁平参数工具，避免几十个复杂 schema 导致模型空转思考。
+ * - 为本地中小模型（如 Qwen 27B）提供简洁的工具参数。
  * - 自动兼容旧版 OpenAI 接口：支持标准 tool_calls、旧版 function_call，以及不传 tools / role:"tool" 的纯对话工具调用回退。
  */
 
 const VALID_TOOL_MODES = new Set(['auto', 'tools', 'prompt']);
-const MAX_AGENT_STEPS = 8;
+const VALID_REASONING_EFFORTS = new Set(['default', 'off', 'low', 'medium', 'high']);
+const MAX_AGENT_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 180_000;
 
 export const DEFAULT_AI_CONFIG = {
@@ -14,6 +15,7 @@ export const DEFAULT_AI_CONFIG = {
   model: '',
   apiKey: '',
   toolMode: 'auto',
+  reasoningEffort: 'default',
   temperature: 0.2,
   maxTokens: 2048,
 };
@@ -61,11 +63,12 @@ export function normalizeAiConfig(raw = {}, existing = DEFAULT_AI_CONFIG) {
     ? String(raw.apiKey || '').trim().slice(0, 500)
     : urlChanged ? '' : prev.apiKey;
   const toolMode = VALID_TOOL_MODES.has(raw.toolMode) ? raw.toolMode : prev.toolMode;
+  const reasoningEffort = VALID_REASONING_EFFORTS.has(raw.reasoningEffort) ? raw.reasoningEffort : prev.reasoningEffort;
   const temperature = raw.temperature === undefined ? prev.temperature
     : Math.max(0, Math.min(2, Number(raw.temperature) || 0));
   const maxTokens = raw.maxTokens === undefined ? prev.maxTokens
     : Math.max(0, Math.min(32768, Math.trunc(Number(raw.maxTokens) || 0)));
-  return { baseUrl: nextNorm, model, apiKey, toolMode, temperature, maxTokens };
+  return { baseUrl: nextNorm, model, apiKey, toolMode, reasoningEffort, temperature, maxTokens };
 }
 
 export function publicAiConfig(config) {
@@ -75,6 +78,7 @@ export function publicAiConfig(config) {
     model: c.model,
     hasApiKey: Boolean(c.apiKey),
     toolMode: c.toolMode,
+    reasoningEffort: c.reasoningEffort,
     temperature: c.temperature,
     maxTokens: c.maxTokens,
   };
@@ -115,7 +119,7 @@ function clipToolOutput(output, maxChars = 12000) {
   });
 }
 
-/** 仅 5 个扁平工具，所有参数简单直白，适合本地 27B 及以下模型一次调对。 */
+/** 直连模型可用的画布工具。 */
 export const AGENT_TOOLS = [
   {
     name: 'get_git_changes',
@@ -162,6 +166,8 @@ export const AGENT_TOOLS = [
         vars: { type: 'array', items: { type: 'string' }, description: '要加入的全局变量名或 var::ID 列表' },
         fromGit: { type: 'boolean', description: '为 true 时使用当前 Git 改动快照并自动按变更着色' },
         mode: { type: 'string', enum: ['add', 'replace'], description: 'add 追加到画布，replace 替换画布' },
+        splitByGroup: { type: 'boolean', description: '当 Git 改动包含多个互不关联的独立模块时，自动拆分为多个视图书签（默认 true）' },
+        bookmarkName: { type: 'string', description: '可选：同时将本次画布保存为该名称的书签' },
         includeTasks: { type: 'boolean', description: '是否自动补齐上游 TASK/ISR 调用链，默认 true' },
         up: { type: 'integer', description: '向上展开调用者层数 (0-3)，默认 0' },
         down: { type: 'integer', description: '向下展开被调者层数 (0-3)，默认 0' },
@@ -171,10 +177,11 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'apply_labels',
-    description: '给画布上的调用连线批量添加 TASK 周期、コール順 调用顺序或結合点标签。from/to 支持短函数名，可选 line 指定调用行号。',
+    description: '给画布上的调用连线批量添加 TASK:xms 周期标签、コール順 调用顺序或結合点标签。注意：コール順（call）标签不要填 note 注释。from/to 支持短函数名，可选 line 指定调用行号。',
     parameters: {
       type: 'object',
       properties: {
+        autoDetect: { type: 'boolean', description: '为 true 时直接将当前画布自动识别的 TASK（含函数头注释周期）和 コール順 标签写入画布' },
         items: {
           type: 'array',
           description: '标签列表',
@@ -184,16 +191,39 @@ export const AGENT_TOOLS = [
               from: { type: 'string', description: '调用方函数名或完整 ID' },
               to: { type: 'string', description: '被调方函数名或完整 ID' },
               line: { type: 'integer', description: '可选：具体调用行号' },
-              preset: { type: 'string', enum: ['task', 'call', 'conn'], description: 'task=周期，call=调用顺序，conn=结合点' },
+              preset: { type: 'string', enum: ['task', 'call', 'conn'], description: 'task=周期(TASK:xms)，call=调用顺序(コール順N，不带注释)，conn=结合点' },
               text: { type: 'string', description: '标签文字，如 "TASK:10ms"' },
               order: { type: 'integer', description: 'preset=call 时的顺序编号，从 1 开始' },
-              note: { type: 'string', description: '来源依据，如 "main.c:539"' },
+              note: { type: 'string', description: '仅 task/conn 可选填简短依据，call(コール順) 不要填写' },
             },
             required: ['from', 'to', 'preset'],
           },
         },
       },
-      required: ['items'],
+    },
+  },
+  {
+    name: 'ask_user',
+    description: '在修改画布前遇到明确歧义时向用户提问（如：Git 改动含多个独立模块问是否按书签拆分、重名函数或分析范围不清）。提供 2-4 个简洁选项；若指令已明确或用户刚回答过，直接动手不要多余提问。',
+    parameters: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: '简明中文问题' },
+        options: {
+          type: 'array',
+          description: '2-4 个简洁选项',
+          items: {
+            type: 'object',
+            properties: {
+              label: { type: 'string', description: '按钮标题（简短）' },
+              description: { type: 'string', description: '可选简短补充' },
+            },
+            required: ['label'],
+          },
+        },
+        allowCustom: { type: 'boolean', description: '是否允许用户自由回复，默认 true' },
+      },
+      required: ['question'],
     },
   },
 ];
@@ -232,13 +262,15 @@ function buildSystemPrompt(context, promptToolMode) {
   }
 
   const base = [
-    '你是 TCU C 调用图画布助手。目标是尽快调用工具把用户需要的函数和变量加入画布，再给出简明中文说明。',
+    '你是 TCU C 调用图画布助手。目标是尽快调用工具把用户需要的函数和变量加入可编辑画布，再给出简明中文说明。',
     '核心原则：',
     '1. 不要长篇空想，立刻动手调工具。',
-    '2. 用户提到 Git 改动/未提交修改时，直接调 add_to_canvas({ fromGit: true })（需要筛选时先调 get_git_changes 看列表，再传 functions 与 fromGit: true）。',
+    '2. 用户要求将 Git 改动加入画布时，调用 add_to_canvas({ fromGit: true })，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块可调用 add_to_canvas({ fromGit: true, splitByGroup: true }) 自动拆分为独立书签；如确实需要用户决定，先用 ask_user 询问拆分书签还是合并到单个画布。用户要求合并时传 splitByGroup: false。',
     '3. 用户按功能/关键词找函数或变量时，先调 find_symbols，再调 add_to_canvas 加入画布（支持短函数名，默认自动补齐上游 TASK 链）。',
-    '4. 绝不编造不存在的函数名；如果返回 ambiguous 重名提示，按候选的完整「文件::函数名」重试一次。',
-    '5. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
+    '4. 补齐 TASK 周期或调用顺序时，先调用 find_symbols({}) 查看 canvasEdges 和 suggestedLabels（含从函数头注释提取的周期），再调用 apply_labels 传入 items 或 { autoDetect: true } 写入画布。手动标周期用 preset:"task"（如 text:"TASK:10ms"），标调用顺序用 preset:"call"（コール順N），且 call 标签禁止填写 note。',
+    '5. 源码若为日文 CP932，调 read_function 可传 encoding:"cp932"，严禁将乱码写入标签注释或回复。',
+    '6. 只使用已确认存在的函数名。遇到重名时，根据上下文选择完整「文件::函数名」；如果目标仍不明确，在修改画布前用 ask_user 提供候选项。仅在重大画布修改前确有歧义时提问，用户意图明确或已回答时直接执行。',
+    '7. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -335,6 +367,20 @@ export function parsePromptToolCalls(text, allowedNames = TOOL_NAME_SET, { tagOn
 export function isToolUnsupportedError(status, bodyText) {
   if (![400, 404, 422, 500, 501].includes(status)) return false;
   return /tool|function|role|schema|choice|unsupported|unrecognized|not\s+supported|not\s+allowed|invalid_request/i.test(String(bodyText || ''));
+}
+
+export function isReasoningUnsupportedError(status, bodyText) {
+  if (![400, 422].includes(status)) return false;
+  const text = String(bodyText || '');
+  if (/reasoning|thinking|chat_template_kwargs/i.test(text)) return true;
+  if (/tool|function|role/i.test(text)) return false;
+  return /extra_forbidden|unrecognized|unknown\s+(?:field|param|parameter|property)|additional\s+properties|not\s+permitted/i.test(text);
+}
+
+function buildReasoningPayload(effort) {
+  if (effort === 'off') return { enable_thinking: false, chat_template_kwargs: { enable_thinking: false } };
+  if (['low', 'medium', 'high'].includes(effort)) return { reasoning_effort: effort };
+  return {};
 }
 
 /** 把已包含 tool_calls / role:tool / role:function 的会话无损转为纯 system/user/assistant，避免回退时重跑写工具。 */
@@ -452,12 +498,15 @@ function summarizeToolResult(name, result) {
     return `发现 ${result.changedFiles?.length || 0} 个文件、${result.changedFunctions?.length || 0} 个变更函数`;
   }
   if (name === 'find_symbols') {
-    if (result.matches) return `找到 ${result.matches.length} 项匹配`;
-    return `画布 ${result.canvasRoots?.length || 0} 个入口，工程 ${result.tasks?.length || 0} 个任务`;
+    const summary = result.matches
+      ? `找到 ${result.matches.length} 项匹配`
+      : `画布 ${result.canvasRoots?.length || 0} 个入口，工程 ${result.tasks?.length || 0} 个任务`;
+    return Array.isArray(result.suggestedLabels) ? `${summary}，${result.suggestedLabels.length} 条建议标签` : summary;
   }
   if (name === 'read_function') return `已读 ${result.name || result.id} (${result.file}:${result.startLine}-${result.endLine})`;
   if (name === 'add_to_canvas') {
     const parts = [`已加入画布（${result.addedCount ?? result.roots?.length ?? 0} 项）`];
+    if (result.bookmarks?.length) parts.push(`已创建 ${result.bookmarks.length} 个书签`);
     if (result.ambiguous?.length) parts.push(`${result.ambiguous.length} 个重名待确认`);
     if (result.notFound?.length) parts.push(`${result.notFound.length} 个未找到`);
     return parts.join('，');
@@ -476,6 +525,7 @@ export async function runAiAgent({
   onEvent = () => {},
   fetchImpl = fetch,
   signal = null,
+  maxSteps = MAX_AGENT_STEPS,
 }) {
   const { chatUrl } = normalizeBaseUrl(config?.baseUrl);
   if (!chatUrl) throw new Error('尚未配置模型 API 地址，请先在「直连 API」中填写');
@@ -497,16 +547,23 @@ export async function runAiAgent({
   const allThoughts = [];
   const toolLog = [];
   let switchedToPrompt = false;
+  let reasoningDegraded = false;
+  const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
+  const requestDefaults = {
+    model: config.model,
+    temperature: config.temperature ?? 0.2,
+    ...(config.maxTokens > 0 ? { max_tokens: config.maxTokens } : {}),
+    stream: false,
+  };
 
-  for (let step = 0; step < MAX_AGENT_STEPS; step++) {
+  let step = 0;
+  for (; step < maxSteps; step++) {
     if (signal?.aborted) throw new Error('已取消');
     onEvent({ type: 'status', text: step === 0 ? '正在思考并选择工具…' : `正在整合结果（第 ${step + 1} 步）…` });
     const reqBody = {
-      model: config.model,
+      ...requestDefaults,
       messages,
-      temperature: config.temperature ?? 0.2,
-      ...(config.maxTokens > 0 ? { max_tokens: config.maxTokens } : {}),
-      stream: false,
+      ...(reasoningDegraded ? {} : reasoningPayload),
       ...(activeMode === 'tools' ? { tools: openAiToolsPayload(), tool_choice: 'auto' } : {}),
     };
 
@@ -517,6 +574,12 @@ export async function runAiAgent({
     }, fetchImpl, DEFAULT_TIMEOUT_MS, signal);
 
     if (!res.ok) {
+      if (!reasoningDegraded && Object.keys(reasoningPayload).length > 0 && isReasoningUnsupportedError(res.status, res.text)) {
+        reasoningDegraded = true;
+        onEvent({ type: 'fallback', text: '接口不支持思考等级参数，已自动按默认模式继续' });
+        step--;
+        continue;
+      }
       if (config.toolMode === 'auto' && activeMode === 'tools' && !switchedToPrompt && isToolUnsupportedError(res.status, res.text)) {
         switchedToPrompt = true;
         activeMode = 'prompt';
@@ -535,8 +598,11 @@ export async function runAiAgent({
     const msg = choice?.message;
     if (!msg) throw new Error('模型返回格式异常：缺少 choices[0].message');
 
-    const { thinking, text } = extractThinkingAndText(msg.content ?? '', msg.reasoning_content ?? '');
-    if (thinking) allThoughts.push(thinking);
+    const { thinking, text } = extractThinkingAndText(msg.content ?? '', msg.reasoning_content ?? msg.reasoning ?? msg.thinking ?? '');
+    if (thinking) {
+      allThoughts.push(thinking);
+      onEvent({ type: 'thinking', step: step + 1, text: thinking });
+    }
 
     // 解析三种形态的工具调用：标准 tool_calls / 旧版 function_call / 纯文本 <tool_call>
     let calls = [];
@@ -583,13 +649,32 @@ export async function runAiAgent({
     }
 
     if (!calls.length) {
-      const answer = text || (toolLog.length ? '已完成画布操作。' : '模型未返回有效回复。');
-      const result = { ok: true, answer, thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
+      if (!text) {
+        step++;
+        break;
+      }
+      const result = { ok: true, answer: text, thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
       onEvent({ type: 'done', ...result });
       return result;
     }
 
     if (signal?.aborted) throw new Error('已取消');
+
+    const ask = calls.find(call => call.name === 'ask_user');
+    if (ask) {
+      const question = String(ask.arguments?.question || text || '请确认你的需求').trim() || '请确认你的需求';
+      const rawOptions = ask.arguments?.options;
+      const options = Array.isArray(rawOptions)
+        ? rawOptions.map(option => ({
+          label: String(option?.label ?? '').trim(),
+          description: String(option?.description ?? '').trim(),
+        })).filter(option => option.label).slice(0, 6)
+        : [];
+      const allowCustom = ask.arguments?.allowCustom !== false;
+      const thinking = allThoughts.join('\n\n');
+      onEvent({ type: 'question', question, options, allowCustom, thinking });
+      return { ok: true, awaitingUser: true, question, options, allowCustom, answer: question, thinking, toolLog, modeUsed: activeMode };
+    }
 
     // 把模型本轮输出加入历史（确保 tool_calls 数量与后续 role:tool 回复一一对应）
     if (callStyle === 'tool_calls' && activeMode === 'tools') {
@@ -633,10 +718,39 @@ export async function runAiAgent({
     }
   }
 
-  const fallbackAnswer = toolLog.length
-    ? `已执行 ${toolLog.length} 步操作（${toolLog.map(t => t.summary).join('；')}），达到单轮最大步数上限。`
-    : '已达到最大调用步数，未能完成任务，请尝试更明确的函数名或关键词。';
-  const result = { ok: true, answer: fallbackAnswer, thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
+  let answer = '';
+  if (toolLog.length > 0 && !signal?.aborted) {
+    let summaryMessage;
+    try {
+      const res = await fetchJson(chatUrl, {
+        method: 'POST',
+        headers: authHeaders(config.apiKey),
+        body: JSON.stringify({
+          ...requestDefaults,
+          ...(reasoningDegraded ? {} : reasoningPayload),
+          messages: [...messages, { role: 'user', content: '请用 2-4 句简明中文总结以上已完成的操作结果，不要再调用工具。' }],
+        }),
+      }, fetchImpl, 15_000, signal);
+      if (res.ok) summaryMessage = res.json?.choices?.[0]?.message;
+    } catch {
+      // 总结请求失败时使用已记录的工具结果。
+    }
+    if (summaryMessage) {
+      const { thinking, text } = extractThinkingAndText(
+        summaryMessage.content ?? '',
+        summaryMessage.reasoning_content ?? summaryMessage.reasoning ?? summaryMessage.thinking ?? '',
+      );
+      if (thinking) {
+        allThoughts.push(thinking);
+        onEvent({ type: 'thinking', step: step + 1, text: thinking });
+      }
+      answer = text;
+    }
+  }
+  answer ||= toolLog.length
+    ? `已完成 ${toolLog.length} 步操作：${toolLog.map(t => t.summary).join('；')}。如需继续，请发下一条指令。`
+    : '未能直接完成该请求，请补充更明确的函数名或关键词。';
+  const result = { ok: true, answer, thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
   onEvent({ type: 'done', ...result });
   return result;
 }

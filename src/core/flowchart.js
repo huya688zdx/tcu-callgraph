@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import ELK from 'elkjs/lib/elk.bundled.js';
 import { declaratorName, getParser } from './cparse.js';
 import { collectArgs, lex } from './lexer.js';
@@ -602,8 +603,55 @@ async function layout({ nodes, edges }) {
   };
 }
 
-export async function buildFlowchart(model, fn, { expandMacros = false, version = 'after', hasBefore = false,
-  hasAfter = true, sourceRoot } = {}) {
+function nodeSignature(node) {
+  return `${node.kind}\u0000${compact(node.code || node.text || '')}`;
+}
+
+/** 用 LCS 对比修改前后两版流程图语句节点，给每个节点和连线标出 existing / modified / added / deleted。 */
+export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') {
+  const a = primaryNodes.map(nodeSignature);
+  const b = otherNodes.map(nodeSignature);
+  const m = a.length, n = b.length;
+  // 限制 DP 规模避免超大函数卡顿
+  if (m * n > 250000) {
+    const counts = new Map();
+    for (const sig of b) counts.set(sig, (counts.get(sig) || 0) + 1);
+    return primaryNodes.map((node, i) => {
+      const c = counts.get(a[i]) || 0;
+      if (c > 0) { counts.set(a[i], c - 1); return 'existing'; }
+      return version === 'before' ? 'deleted' : 'added';
+    });
+  }
+  const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const anchors = [];
+  let i = 0, j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) { anchors.push([i, j]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else j++;
+  }
+  anchors.push([m, n]);
+  const statuses = new Array(m).fill('existing');
+  let prevA = 0, prevB = 0;
+  for (const [endA, endB] of anchors) {
+    const gapA = endA - prevA;
+    const gapB = endB - prevB;
+    const paired = Math.min(gapA, gapB);
+    for (let k = 0; k < gapA; k++) {
+      statuses[prevA + k] = k < paired ? 'modified' : (version === 'before' ? 'deleted' : 'added');
+    }
+    prevA = endA + 1;
+    prevB = endB + 1;
+  }
+  return statuses;
+}
+
+async function extractFlowchartGraph(model, fn, { expandMacros = false, sourceRoot } = {}) {
   if (!isFlowchartFunction(fn) || !model.files.some(file => file.rel === fn.file)) {
     throw new Error('无法找到函数源码');
   }
@@ -651,6 +699,70 @@ export async function buildFlowchart(model, fn, { expandMacros = false, version 
     tree.delete();
   }
   const macrosUsed = [...used].map(({ name, params, raw, file, line }) => ({ name, params, raw, file, line }));
-  return { ok: true, fn: { id: fn.id, name: fn.name, file: fn.file, line: fn.line, endLine: fn.endLine, hasBefore, hasAfter },
-    version, expandMacros, macrosUsed, ...await layout(graph) };
+  return { graph, macrosUsed, source };
+}
+
+export function flowchartCacheHash(model, fn, { version = 'after', expandMacros = false, fnChange = 'existing',
+  otherModel = null, otherFn = null, sourceRoot, otherSourceRoot } = {}) {
+  const h = createHash('sha1');
+  h.update(`fc-v3\0${fn.id}\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0${fn.line}:${fn.endLine}\0`);
+  try {
+    const read = sourceReader(model, sourceRoot);
+    h.update(read(fn.file));
+  } catch { /* fallback */ }
+  // 头文件宏改动会影响宏信息与展开结果，把当前模型的宏定义指纹纳入缓存键。
+  if (Array.isArray(model?.macros) && model.macros.length) {
+    h.update('\0macros:');
+    for (const m of model.macros) {
+      h.update(`${m.file}:${m.name}:${m.raw || ''}\0`);
+    }
+  }
+  if (otherModel && otherFn && isFlowchartFunction(otherFn)) {
+    h.update(`\0other:${otherFn.line}:${otherFn.endLine}\0`);
+    try {
+      const readOther = sourceReader(otherModel, otherSourceRoot);
+      h.update(readOther(otherFn.file));
+    } catch { /* fallback */ }
+  }
+  return h.digest('hex');
+}
+
+export async function buildFlowchart(model, fn, { expandMacros = false, version = 'after', hasBefore = false,
+  hasAfter = true, sourceRoot, fnChange = 'existing', otherModel = null, otherFn = null, otherSourceRoot } = {}) {
+  const { graph, macrosUsed } = await extractFlowchartGraph(model, fn, { expandMacros, sourceRoot });
+  // 按调用关系图一致的语义给每个流程图节点与连线标出变更颜色状态
+  let statuses = null;
+  if (fnChange === 'added' || fnChange === 'deleted') {
+    statuses = graph.nodes.map(() => fnChange);
+  } else if (otherModel && otherFn && isFlowchartFunction(otherFn)) {
+    try {
+      const counterpart = await extractFlowchartGraph(otherModel, otherFn, { expandMacros, sourceRoot: otherSourceRoot });
+      statuses = diffFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
+    } catch { /* 对照版本无法解析时退回整体状态 */ }
+  }
+  if (!statuses) {
+    statuses = graph.nodes.map(() => (fnChange === 'modified' ? 'modified' : 'existing'));
+  }
+  const nodeChangeById = new Map();
+  graph.nodes = graph.nodes.map((node, idx) => {
+    const change = statuses[idx] || 'existing';
+    nodeChangeById.set(node.id, change);
+    return { ...node, change };
+  });
+  graph.edges = graph.edges.map((edge) => {
+    const fc = nodeChangeById.get(edge.from);
+    const tc = nodeChangeById.get(edge.to);
+    const change = fc === 'added' || tc === 'added' ? 'added'
+      : fc === 'deleted' || tc === 'deleted' ? 'deleted'
+      : 'existing';
+    return { ...edge, change };
+  });
+  return {
+    ok: true,
+    fn: { id: fn.id, name: fn.name, file: fn.file, line: fn.line, endLine: fn.endLine, change: fnChange, hasBefore, hasAfter },
+    version,
+    expandMacros,
+    macrosUsed,
+    ...await layout(graph),
+  };
 }

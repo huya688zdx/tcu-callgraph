@@ -188,19 +188,30 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
     if (model.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${model.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
     if (!snapshots && !model.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${model.root}`);
     if (model.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
+    if (model.parserId === 'builtin' || !model.parserId) model._keepAnalysisSources = true;
     const df = await buildDataflowIndex(model);
     if (df.failedFiles) throw new Error('部分源码分析失败，无法发布不完整的比较结果');
     return model;
   };
   const beforeModel = await buildSide(beforeFiles);
-  const afterModel = await buildSide(afterFiles, sameSources && beforeModel);
   const parser = getParser(beforeModel.parserId);
   const fingerprint = parser.fingerprint || ((value) => value.trim());
-  const { macroChanges, macroDetails, macrosIn, changedExpansion } = parser.compareMacros?.(beforeModel, afterModel)
-    ?? { macroChanges: [], macroDetails: [], macrosIn: () => new Set(), changedExpansion: () => new Set() };
-  const definitionsOf = parser.compareDefinitions || definitionsFromGraph;
-  const beforeDefs = await definitionsOf(beforeModel, macrosIn, fingerprint);
-  const afterDefs = sameSources ? beforeDefs : await definitionsOf(afterModel, macrosIn, fingerprint);
+  const definitionsOf = parser.id === 'builtin' ? parser.compareDefinitions
+    : (model, macrosIn) => (parser.compareDefinitions || definitionsFromGraph)(model, macrosIn, fingerprint);
+  let afterModel, beforeDefs, afterDefs, macroChanges, macroDetails, macrosIn, changedExpansion;
+  try {
+    afterModel = await buildSide(afterFiles, sameSources && beforeModel);
+    ({ macroChanges, macroDetails, macrosIn, changedExpansion } = parser.compareMacros?.(beforeModel, afterModel)
+      ?? { macroChanges: [], macroDetails: [], macrosIn: () => new Set(), changedExpansion: () => new Set() });
+    beforeDefs = await definitionsOf(beforeModel, macrosIn);
+    afterDefs = sameSources ? beforeDefs : await definitionsOf(afterModel, macrosIn, beforeDefs);
+  } finally {
+    for (const model of [beforeModel, afterModel]) {
+      if (!model) continue;
+      delete model._analysisSources;
+      delete model._keepAnalysisSources;
+    }
+  }
   const beforePeriods = taskPeriods(beforeModel), afterPeriods = taskPeriods(afterModel);
   const points = new Map();
   const addPoint = (point) => points.set(point.id, { point, seeds: new Set() });

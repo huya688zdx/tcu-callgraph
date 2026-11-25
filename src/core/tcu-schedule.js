@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { decodeSource } from './source-files.js';
 import { collectArgs, lex } from './lexer.js';
 import { matchBrace } from './extract.js';
 
@@ -236,7 +237,7 @@ export function readScheduleFiles(files) {
       const stat = fs.lstatSync(abs);
       if (!stat.isFile()) throw new Error('调度配置必须是普通文件');
       bytes = addScheduleBytes(bytes, stat.size);
-      const text = fs.readFileSync(abs, 'utf8').replace(/^\uFEFF/, '');
+      const text = decodeSource(fs.readFileSync(abs)).replace(/^\uFEFF/, '');
       if (ext === '.oil') {
         for (const row of oilSchedule(text, file)) rows.push(row);
       } else if (ext === '.arxml') {

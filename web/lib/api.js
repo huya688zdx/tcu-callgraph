@@ -144,9 +144,11 @@ export const api = {
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
-  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试与对话 */
+  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试、按工程隔离的对话管理与对话 */
   aiConfig: () => get('/api/ai/config'),
   saveAiConfig: (body) => post('/api/ai/config', body),
+  aiChats: () => get('/api/ai/chats'),
+  saveAiChats: (body) => post('/api/ai/chats', body),
   aiModels: (body) => post('/api/ai/models', body),
   aiTest: (body) => post('/api/ai/test', body),
   aiChat: (body, signal) =>

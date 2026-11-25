@@ -822,13 +822,15 @@ function impactRoleBadge(node) {
   const [style, label] = impactRoles[node.change] || (node.macroImpact && impactRoles.macro_lsb_impact) ||
     (node.periodImpact && impactRoles.period_impact) || automaticRole || (node.context && impactRoles.callee_context) ||
     (node.impact ? ['impact', 'compare.role.affected'] : ['context', 'status.existing']);
-  return `<div class="detail-meta"><b>${t('compare.role.title')}</b> <span class="compare-badge ${style}">${t(label)}</span></div>`;
+  return `<span class="compare-badge ${style}" title="${esc(t('compare.role.title'))}">${t(label)}</span>`;
 }
 
-function rootChangePoints(node, points) {
-  if (!node.impactChainIds?.length || !points?.length) return '';
-  const ids = new Set(node.impactChainIds);
-  const rootPoints = points.filter((point) => ids.has(point.id));
+function compactDetailText(value) {
+  const chars = Array.from(value.replace(/\s+/g, ' ').trim());
+  return chars.length > 48 ? chars.slice(0, 47).join('') + '…' : chars.join('');
+}
+
+function rootChangePoints(node, rootPoints) {
   if (!rootPoints.length) return '';
   const value = (v) => (Array.isArray(v) ? v.join(' / ') : String(v ?? '')) || '—';
   return `<div class="detail-meta"><b>${t('compare.relatedPoints')}</b></div><div class="compare-points">${rootPoints.map((point) => {
@@ -837,11 +839,15 @@ function rootChangePoints(node, points) {
       ? state.view?.nodes.find((n) => n.headerSymbol && n.name === point.name && n.file === point.file)?.id : null;
     const affected = point.affectedIds?.find((id) => id !== node.id && inCanvas(id)) || node.id;
     const target = source || affected;
-    const diff = point.beforeValue != null || point.afterValue != null
-      ? `${value(point.beforeValue)} → ${value(point.afterValue)}` : '';
-    const description = point.kind === 'function' ? point.summary || diff : diff || point.summary;
+    const before = value(point.beforeValue);
+    const after = value(point.afterValue);
+    const hasDiff = point.beforeValue != null || point.afterValue != null;
+    const diff = hasDiff ? `${compactDetailText(before)} → ${compactDetailText(after)}` : '';
+    const summary = compactDetailText(String(point.summary ?? ''));
+    const description = point.kind === 'function' ? summary || diff : diff || summary;
     const action = source ? t('compare.point.locate') : t('compare.point.locateAffected');
-    return `<button type="button" class="compare-point" data-locate-node="${esc(target)}" title="${esc([action, point.file, point.summary].filter(Boolean).join('\n'))}"><b>${esc(point.name || point.id)}</b>${description ? ` <span>${esc(description)}</span>` : ''}</button>`;
+    const title = [action, point.file, point.summary, hasDiff ? `${before} → ${after}` : ''].filter(Boolean).join('\n');
+    return `<button type="button" class="compare-point" data-locate-node="${esc(target)}" title="${esc(title)}"><b>${esc(point.name || point.id)}</b>${description ? ` <span>${esc(description)}</span>` : ''}</button>`;
   }).join('')}</div>`;
 }
 
@@ -851,22 +857,33 @@ function comparisonDetail(node, points) {
     const rows = (Array.isArray(values) ? values : values ? [values] : []).map((v) =>
       `${v.file || ''}${v.line ? `:${v.line}` : ''}`
     ).filter(Boolean);
-    return rows.length ? rows.join(' · ') : '—';
+    return rows.join(' · ');
   };
-  const describe = (value) => {
-    const values = Array.isArray(value) ? value : value == null ? [] : [value];
-    return values.map((v) => {
-      if (typeof v === 'string' || typeof v === 'number') return String(v);
-      return v.reason || v.text || v.name || JSON.stringify(v);
-    }).map(esc).join(' · ') || '—';
-  };
+  const before = location('before');
+  const after = location('after');
+  const locations = before === after ? (before ? [before] : []) : [
+    `${t('compare.locationBefore')}: ${before || '—'}`,
+    `${t('compare.locationAfter')}: ${after || '—'}`,
+  ];
+  const ids = new Set(node.impactChainIds);
+  const rootPoints = (points || []).filter((point) => ids.has(point.id));
+  const reasons = (Array.isArray(node.reasons) ? node.reasons : [node.reasons]).filter(Boolean);
+  const reasonText = reasons.map((reason) =>
+    typeof reason === 'object' ? reason.reason || reason.text || reason.name || JSON.stringify(reason) : reason
+  ).map(esc).join(' · ');
+  const count = rootPoints.length + reasons.length + locations.length;
   const period = periodCaption(node);
-  return `${impactRoleBadge(node)}
-    ${period.includes('→') ? `<div class="detail-meta"><b>${t('compare.role.period')}</b> <span class="compare-badge period">${esc(period)}</span></div>` : ''}
-    ${rootChangePoints(node, points)}
-    <div class="detail-meta">${t('compare.locationBefore')}: ${esc(location('before'))}</div>
-    <div class="detail-meta">${t('compare.locationAfter')}: ${esc(location('after'))}</div>
-    ${node.reasons?.length ? `<div class="detail-meta">${t('compare.reasons')}: ${describe(node.reasons)}</div>` : ''}`;
+  return `<div class="detail-meta">${impactRoleBadge(node)}
+    ${period.includes('→') ? `<span class="compare-badge period" title="${esc(t('compare.role.period'))}">${esc(period)}</span>` : ''}
+    </div>
+    ${count ? `<details class="period-detail">
+      <summary><span class="period-summary-label">${t('compare.reasons')}</span><span class="period-summary-rate">(${count})</span></summary>
+      <div class="period-detail-body">
+        ${rootChangePoints(node, rootPoints)}
+        ${reasonText ? `<div class="detail-meta">${reasonText}</div>` : ''}
+        ${locations.map((line) => `<div class="detail-meta">${esc(line)}</div>`).join('')}
+      </div>
+    </details>` : ''}`;
 }
 
 function showEdgeDetails(edge) {
@@ -919,15 +936,15 @@ function periodDetail(node) {
   return `<details class="period-detail">
     <summary title="${esc(`${t('period.triggers')}：${fullSummary}`)}"><span class="period-summary-label">${t('period.summary')}</span>${firstName ? `<span class="period-summary-task">${esc(firstName)}</span>` : ''}<span class="period-summary-rate">${esc(rateBadge)}</span></summary>
     <div class="period-detail-body">
-      <div class="period-detail-title">${t('period.triggers')}</div>
       ${node.multiRate ? `<div class="period-multi">${t('period.multiRate')}</div>` : ''}
       <ul>${periods.map(c => {
-        const rate = [c.kind === 'isr' && 'ISR', formatPeriod(c.us)].filter(Boolean).join(' · ') || t('period.unknown');
         const evidence = c.dividers?.map(d => t('period.divider', {
           counter: d.counter, divider: d.divider, location: `${d.file}:${d.line}`,
         })) || [];
-        return `<li><strong title="${esc(c.task || '')}">${esc(c.task?.split('::').at(-1) || '')}</strong> · ${esc(rate)}
-          ${[c.source, ...evidence].filter(Boolean).map(line => `<small>${esc(line)}</small>`).join('')}</li>`;
+        const source = c.source || evidence[0] || '';
+        const sourceTitle = [c.source, ...evidence].filter(Boolean).join('\n');
+        return `<li><strong title="${esc(c.task || '')}">${esc(c.task?.split('::').at(-1) || '')}</strong> · ${esc(compactRateText(c))}
+          ${source ? `<small title="${esc(sourceTitle)}">${esc(compactDetailText(source))}</small>` : ''}</li>`;
       }).join('')}</ul>
     </div>
   </details>`;
@@ -954,13 +971,18 @@ async function renderDetail(id) {
     }
     return e.from === id ? 'out' : 'in';
   };
-  const dataDirections = dataEdges.length ? `<div class="detail-directions"><b>${t('node.rwDirections')}</b>
-    ${dataEdges.map(e => {
-      const peerId = e.from === id ? e.to : e.from;
-      const dir = dataDir(e);
-      const inView = inViewIds.has(peerId);
-      return `<div class="df-dir-item call-relation${inView ? ' in-view' : ''}" data-peer-id="${esc(peerId)}" data-edge-key="${esc(edgeKey(e))}"${dir ? ` data-rel-dir="${dir}"` : ''}${inView ? ` title="${esc(t('common.locateClick'))}"` : ''}><span>${esc(edgeCaption(e, nodeId => names.get(nodeId) || nodeId))}</span>${addFunctionButton(peerId)}</div>`;
-    }).join('')}</div>` : '';
+  const dataRows = dataEdges.map(e => {
+    const peerId = e.from === id ? e.to : e.from;
+    const dir = dataDir(e);
+    const inView = inViewIds.has(peerId);
+    const fullCaption = edgeCaption(e, nodeId => names.get(nodeId) || nodeId);
+    const caption = edgeCaption(e, nodeId => compactDetailText((names.get(nodeId) || nodeId).split('::').at(-1)));
+    return `<div class="df-dir-item call-relation${inView ? ' in-view' : ''}" data-peer-id="${esc(peerId)}" data-edge-key="${esc(edgeKey(e))}"${dir ? ` data-rel-dir="${dir}"` : ''}${inView ? ` title="${esc(t('common.locateClick'))}"` : ''}><span title="${esc(fullCaption)}">${esc(caption)}</span>${addFunctionButton(peerId)}</div>`;
+  }).join('');
+  const dataDirections = dataEdges.length > 4 ? `<details class="period-detail" open>
+    <summary><span class="period-summary-label">${t('node.rwDirections')}</span><span class="period-summary-rate">(${dataEdges.length})</span></summary>
+    <div class="period-detail-body detail-directions">${dataRows}</div>
+  </details>` : dataRows ? `<div class="detail-directions"><b>${t('node.rwDirections')}</b>${dataRows}</div>` : '';
   if (target?.kind === 'var') {
     if (els.secDetail) els.secDetail.style.display = '';
     if (els.secEdges) els.secEdges.style.display = 'none';
@@ -1004,7 +1026,6 @@ async function renderDetail(id) {
         <option value="target" ${target.nameModeOverride === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
       </select></label>` : ''}
     ${periodDetail(target)}
-    <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
   els.detail.querySelector('[data-node-flowchart]')?.addEventListener('click', () => openFlowchart(id));

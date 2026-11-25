@@ -287,15 +287,27 @@ async function showFolderDialog() {
 
 async function pickFolder() {
   const dir = await showFolderDialog();
-  if (dir) startTarget(dir);
+  if (!dir) return;
+  // 服务已就绪时交由前端走 /api/switch（带清晰加载提示、无需杀进程重启）；仅在冷启动/失联时重启服务。
+  if (win && child && !stopping && serverOrigin) {
+    currentTarget = dir;
+    win.webContents.executeJavaScript(
+      `window.dispatchEvent(new CustomEvent('cg:switch-project-path', { detail: ${JSON.stringify(dir)} }))`
+    ).catch(() => startTarget(dir));
+    return;
+  }
+  startTarget(dir);
 }
 
-// 工程面板的「打开」按钮在输入框为空时也走这里：同一个选择框、同一个默认路径
+// 工程面板的「打开」按钮在输入框为空时也走这里：返回目录路径给前端直接切工程，不再绕过前端加载提示重启服务
 ipcMain.handle('cg:pick-folder', async (event) => {
   if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
       new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的工程来源');
   const dir = await showFolderDialog();
-  if (dir) startTarget(dir);
+  if (dir) {
+    currentTarget = dir;
+    if (!child || stopping) startTarget(dir);
+  }
   return dir;
 });
 

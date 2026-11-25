@@ -896,10 +896,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const changed = comparing && n.change && n.change !== 'existing';
   const impacted = comparing && (macroImpact || periodImpact || n.impact ||
     n.impactRole === 'dataflow_impact' || n.impactRole === 'caller_impact');
-  const accent = macroImpact ? '#69419A' : periodImpact || taskEntry ? '#185FA5' :
-    changed ? '#8A490E' : impacted ? '#69419A' : null;
-  const tags = [taskEntry && 'TASK', macroImpact && t('canvas.lsb'), periodImpact && t('compare.point.period'),
-    impacted && !changed && !macroImpact && !periodImpact && t('compare.role.affected')].filter(Boolean);
+  const accent = changed ? '#8A490E' : null;
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
   const alpha = dimmed ? (trunkEndpoint ? 0.65 : 0.22) : 1;
@@ -982,23 +979,6 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ctx.fillStyle = accent;
     roundRect(ctx, x + 4, y + 6, thickness, h - 12, thickness / 2);
     ctx.fill();
-  }
-  if (tags.length && cam.k >= 0.4) {
-    const tag = tags.join(' · ');
-    const fontSize = Math.max(10, 8 / cam.k);
-    const bwMax = w - (recentlyAdded ? 40 : 16);
-    ctx.font = `600 ${fontSize}px ${FONT}`;
-    const bw = Math.min(bwMax, ctx.measureText(tag).width + 12);
-    if (bw > 12) {
-      const bh = fontSize + 4;
-      roundRect(ctx, x + 8, y - bh / 2, bw, bh, 5);
-      ctx.fillStyle = accent;
-      ctx.fill();
-      ctx.fillStyle = '#FFFFFF';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(tag, x + 8 + bw / 2, y, bw - 10);
-    }
   }
 
   if (n.note) {

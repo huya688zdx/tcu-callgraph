@@ -423,10 +423,10 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
           <button type="button" class="lbl-seg${connMode === 'renumber' ? ' on' : ''}" data-mode="renumber" aria-pressed="${connMode === 'renumber'}">${t('label.mode.renumber')}</button>
         </div>
       </div>` : ''}
-      <div class="field">
+      ${isCall ? '' : `<div class="field">
         <label for="lblNote">${t('label.optionalNote')}</label>
         <input id="lblNote" type="text" maxlength="80" value="${esc(selLabel.note || '')}">
-      </div>
+      </div>`}
       ${isTask ? taskDetection() : ''}
       <details class="lbl-style-more">
         <summary>${t('label.styleMore')}</summary>
