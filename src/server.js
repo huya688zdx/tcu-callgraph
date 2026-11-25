@@ -3256,14 +3256,7 @@ export const server = http.createServer(async (req, res) => {
           if (varSel.want.length) {
             return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
           }
-          return json(res, withReviewSnapshot({
-            nodes: [],
-            edges: [],
-            width: 480,
-            height: 260,
-            root: null,
-            empty: true,
-          }));
+          return json(res, withReviewSnapshot(emptyCanvasView(groupMode)));
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile

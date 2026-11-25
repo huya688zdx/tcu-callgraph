@@ -126,7 +126,8 @@ export const api = {
   layout(body) {
     const blocked = guardWrite('layout');
     if (blocked) return blocked;
-    const patch = { ...body, projectId: body.projectId ?? state.view?.projectId };
+    const patch = { ...body, projectId: body.projectId ?? state.view?.projectId,
+      sessionRevision: body.sessionRevision ?? state.view?.sessionRevision };
     // 连续撤销与重做的手工关系增量必须按触发顺序落库。
     const write = layoutWrites.then(() => post('/api/layout', patch));
     layoutWrites = write.catch(() => {});

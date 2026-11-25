@@ -947,16 +947,24 @@ els.cv.addEventListener('pointerup', (e) => {
     if (hover) {
       const oldFrom = edge.from;
       const oldTo = edge.to;
+      const from = which === 'from' ? hover.id : oldFrom;
+      const to = which === 'to' ? hover.id : oldTo;
+      const changedPair = oldFrom !== from || oldTo !== to;
+      if (edge.manual && changedPair && state.view.edges.some((other) =>
+        other.from === from && other.to === to && (other.manual || other.line === 0))) {
+        draw();
+        return;
+      }
       if (which === 'from') {
-        edge.from = hover.id;
+        edge.from = from;
         edge.fromSide = nearestSide(hover, pos);
       } else {
-        edge.to = hover.id;
+        edge.to = to;
         edge.toSide = nearestSide(hover, pos);
       }
       edge.custom = false; // 重连后恢复自动布线
       rerouteScope([edge]);
-      saveLayout(edge.manual ? {
+      saveLayout(edge.manual && changedPair ? {
         removeManual: [{ from: oldFrom, to: oldTo }],
         addManual: [{ from: edge.from, to: edge.to }],
       } : {});

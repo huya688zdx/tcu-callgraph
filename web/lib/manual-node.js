@@ -10,9 +10,8 @@ import { openModal, closeModal, confirmDialog } from './modal.js';
 import { loadStats, loadTree, resetVars, renderVars } from './panels.js';
 
 let wired = false;
-let currentFile = '';
+let dialog = null;
 let currentKind = 'fn';
-let submitting = false;
 
 function refs() {
   return {
@@ -62,7 +61,14 @@ function wireDialog() {
   ui.name?.addEventListener('input', () => setError(''));
   ui.form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
-    if (submitting || !currentFile) return;
+    const attempt = dialog;
+    if (!attempt || attempt.submitting || !ui.modal.classList.contains('show')) return;
+    const { file, view, projectId, sessionRevision } = attempt;
+    const stillActive = () => dialog === attempt && state.view === view && !state.at;
+    if (!stillActive()) {
+      closeModal();
+      return;
+    }
     const name = ui.name.value.trim();
     if (!name) {
       setError(t('manual.nameRequired'));
@@ -74,17 +80,18 @@ function wireDialog() {
       ui.name.focus();
       return;
     }
-    submitting = true;
+    attempt.submitting = true;
     ui.submit.disabled = true;
     setError('');
     try {
       const res = await api.addManualNode({
-        file: currentFile,
+        file, projectId, sessionRevision,
         kind: currentKind,
         name,
         typeText: currentKind === 'var' ? ui.typeText.value.trim() : '',
         change: ui.change.value || 'existing',
       });
+      if (!stillActive() || !ui.modal.classList.contains('show')) return;
       if (!res?.ok || !res.node) {
         setError(res?.error || t('manual.addFailed'));
         return;
@@ -93,28 +100,35 @@ function wireDialog() {
       const created = res.node;
       resetVars();
       await Promise.all([loadTree(), loadStats()]);
+      if (!stillActive()) return;
       if (created.kind === 'var') {
         await hooks.addFunction?.([], { restoreHidden: false, varIds: [created.id] });
       } else {
         await hooks.addFunction?.(created.id, { restoreHidden: false });
       }
-      renderVars();
+      if (dialog === attempt && state.view?.projectId === projectId &&
+          state.view.sessionRevision === sessionRevision && !state.at) renderVars();
     } catch (err) {
-      setError(String(err?.message || err || t('manual.addFailed')));
+      if (stillActive() && ui.modal.classList.contains('show')) setError(String(err?.message || err || t('manual.addFailed')));
     } finally {
-      submitting = false;
-      ui.submit.disabled = false;
+      if (dialog === attempt) {
+        attempt.submitting = false;
+        ui.submit.disabled = false;
+      }
     }
   });
 }
 
 export function openManualNodeDialog({ file, kind = 'fn' } = {}) {
-  if (!file || state.at || state.view?.comparison) return;
+  const view = state.view;
+  const { projectId, sessionRevision } = view || {};
+  if (!file || projectId == null || state.at || view.comparison) return;
   wireDialog();
   const ui = refs();
   if (!ui.modal) return;
-  currentFile = String(file);
-  if (ui.file) ui.file.textContent = currentFile;
+  dialog = { file: String(file), view, projectId, sessionRevision, submitting: false };
+  ui.submit.disabled = false;
+  if (ui.file) ui.file.textContent = dialog.file;
   if (ui.name) ui.name.value = '';
   if (ui.typeText) ui.typeText.value = '';
   if (ui.change) ui.change.value = 'existing';

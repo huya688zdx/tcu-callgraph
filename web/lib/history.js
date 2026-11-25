@@ -203,12 +203,12 @@ async function addManualEdge(from, to) {
   state.view.edges.push(e);
   rerouteScope([e]); // 由共享路由器布线
   pulseAdded([], [e]);
+  pushHistory();
   await api.layout({
     root: layoutRootKey(),
     addManual: [{ from, to }],
     mode: state.group ? 'group' : 'flat',
   });
-  pushHistory();
 }
 export {
   history,
