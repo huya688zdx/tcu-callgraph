@@ -29,6 +29,10 @@ const deleteChatBtn = document.getElementById('aiDeleteChat');
 const setupBanner = document.getElementById('aiSetupBanner');
 const goConfigBtn = document.getElementById('aiGoConfig');
 const messagesEl = document.getElementById('aiMessages');
+const selectionBar = document.getElementById('aiSelectionBar');
+const selectionText = document.getElementById('aiSelectionText');
+const selectionQuestions = document.getElementById('aiSelectionQuestions');
+const clearSelectionBtn = document.getElementById('aiClearSelection');
 const inputEl = document.getElementById('aiPromptInput');
 const sendBtn = document.getElementById('aiSendChat');
 const stopBtn = document.getElementById('aiStopChat');
@@ -42,13 +46,14 @@ const chatStatusEl = document.getElementById('aiChatStatus');
 // API 配置区 DOM
 const baseUrlEl = document.getElementById('aiBaseUrl');
 const modelEl = document.getElementById('aiModel');
-const modelListEl = document.getElementById('aiModelList');
+const modelSelectEl = document.getElementById('aiModelSelect');
 const fetchModelsBtn = document.getElementById('aiFetchModels');
 const apiKeyEl = document.getElementById('aiApiKey');
 const clearKeyBtn = document.getElementById('aiClearKey');
 const toolModeEl = document.getElementById('aiToolMode');
 const reasoningEffortEl = document.getElementById('aiReasoningEffort');
 const contextWindowEl = document.getElementById('aiContextWindow');
+const maxTokensEl = document.getElementById('aiMaxTokens');
 const testConnBtn = document.getElementById('aiTestConn');
 const saveApiBtn = document.getElementById('aiSaveApi');
 const apiStatusEl = document.getElementById('aiApiStatus');
@@ -75,6 +80,8 @@ const GENERIC_THREAD_TITLES = new Set([NEW_THREAD_TITLE, GIT_THREAD_TITLE, LABEL
 const GIT_QUICK_PROMPT = '先调用 get_git_changes 查看当前 Git 未提交改动。如果改动涉及多个独立模块或多个车型目录（如不同路径前缀），先用 ask_user 询问我保留哪些车型或是否按书签拆分；如果范围唯一明确，直接调用 add_to_canvas({ fromGit: true }) 加入画布并简述影响。';
 const LABELS_QUICK_PROMPT = '立即补全当前画布上缺失的 TASK 周期（含函数上方注释中的周期）和 コール順 标签：先调 find_symbols({}) 查看画布连线与自动识别的候选标签，再直接调用 apply_labels 把标签写入画布（コール順 不带注释），不要只口头列出。';
 const BOOKMARK_COMMAND = '/bookmark';
+const DEFAULT_CONTEXT_WINDOW = 32768;
+const DEFAULT_MAX_TOKENS = 8192;
 
 const LABELS_FOLLOWUP = { label: '🏷 补全当前图 TASK/顺序标签', prompt: LABELS_QUICK_PROMPT };
 const FOLLOWUPS = new Map([
@@ -104,13 +111,15 @@ const TITLE_SOURCES = [
   { name: 'remove_from_canvas', prefix: '画布', symbols: ['removed', 'functions'], paths: ['excludePaths'] },
 ];
 
-let currentTab = 'chat';
+let apiConfigLoad = null;
+let showApiOnOpen = false;
 let mcpLevel = 'readonly';
 let envLocked = false;
 const REASONING_LABELS = new Map([['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
 let llmConfig = {
   baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
-  toolMode: 'auto', reasoningEffort: 'default', contextWindow: 32768,
+  toolMode: 'auto', reasoningEffort: 'default', contextWindow: DEFAULT_CONTEXT_WINDOW,
+  maxTokens: DEFAULT_MAX_TOKENS,
 };
 let clearApiKeyPending = false;
 let chatGeneration = 0;
@@ -122,6 +131,10 @@ let activeChatId = '';
 let renamingThread = null;
 let activeAbort = null;
 let compacting = false;
+let stickToBottom = true;
+let displayedContextTokens = 0;
+let canvasSelection = null;
+const dismissedSelectionKeys = new Set();
 
 function toolTitleSubject(tool, { prefix, symbols, paths = [] }) {
   const digest = typeof tool.digest === 'string' ? tool.digest : '';
@@ -182,12 +195,17 @@ function newThreadObject(title = NEW_THREAD_TITLE) {
   };
 }
 
+function setActiveChat(id) {
+  if (id !== activeChatId) stickToBottom = true;
+  activeChatId = id;
+}
+
 function activeThread() {
   let th = chatThreads.find((item) => item.id === activeChatId);
   if (!th) {
     th = newThreadObject();
     chatThreads.unshift(th);
-    activeChatId = th.id;
+    setActiveChat(th.id);
   }
   return th;
 }
@@ -263,12 +281,17 @@ function tokenCount(value) {
   return value >= 1000 ? `${Number((value / 1000).toFixed(1))}k` : String(value);
 }
 
+function renderContextBadge() {
+  const limit = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  const used = displayedContextTokens;
+  contextBadge.textContent = `上下文 ${tokenCount(used)} / ${tokenCount(limit)} (${Math.round(used / limit * 100)}%)`;
+}
+
 function renderTelemetry(thread, liveMetrics) {
   const metrics = liveMetrics || thread.metrics || thread.messages.findLast((m) => m.metrics)?.metrics;
-  const used = liveMetrics?.totalTokens ?? liveMetrics?.contextTokens ?? liveMetrics?.promptTokens ??
+  displayedContextTokens = liveMetrics?.totalTokens ?? liveMetrics?.contextTokens ?? liveMetrics?.promptTokens ??
     liveMetrics?.contextEstTokens ?? estimateContext(thread.messages);
-  const limit = liveMetrics?.contextWindow || llmConfig.contextWindow || 32768;
-  contextBadge.textContent = `上下文 ${tokenCount(used)} / ${tokenCount(limit)} (${Math.round(used / limit * 100)}%)`;
+  renderContextBadge();
   const speed = metrics?.tokensPerSecond ?? metrics?.tokPerSec;
   const tokens = metrics?.outputTokens ?? metrics?.completionTokens;
   speedBadge.textContent = [Number.isFinite(speed) ? `${speed.toFixed(1)} tok/s` : '',
@@ -284,6 +307,15 @@ function updateChatControls() {
   sendBtn.disabled = Boolean(activeAbort || compacting);
   compactBtn.disabled = sendBtn.disabled || !activeThread().messages.length;
   stopBtn.hidden = !activeAbort;
+  for (const chip of selectionQuestions.children) chip.disabled = sendBtn.disabled;
+}
+
+function isNearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+}
+
+function followChatScroll() {
+  if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function formatAssistantText(text) {
@@ -292,21 +324,31 @@ function formatAssistantText(text) {
     if (part.startsWith('`')) return `<code>${esc(part.slice(1, -1))}</code>`;
     return `<strong>${esc(part.slice(2, -2))}</strong>`;
   }).join('');
-  const lines = String(text || '').split(/\r?\n/);
-  let list = '';
+  const lines = String(text || '').replace(/\r\n?/g, '\n')
+    .replace(/^\s*\n+/, '').replace(/\n+\s*$/, '').replace(/\n{3,}/g, '\n\n').split('\n');
+  let block = '';
   let html = '';
   for (const line of lines) {
-    const item = line.match(/^\s*([-*+]|\d+\.)\s+(.+)$/);
-    const tag = item ? (/^\d/.test(item[1]) ? 'ol' : 'ul') : '';
-    if (list !== tag) {
-      if (list) html += `</${list}>`;
+    const item = line.match(/^\s*([-*+]|\d+\.)\s+(\S.*)$/);
+    const tag = item ? (/^\d/.test(item[1]) ? 'ol' : 'ul') : line.trim() ? 'p' : '';
+    if (block !== tag) {
+      if (block) html += `</${block}>`;
       if (tag) html += `<${tag}>`;
-      list = tag;
+      block = tag;
+    } else if (tag === 'p') {
+      html += '<br>';
     }
-    html += item ? `<li>${inline(item[2])}</li>` : `${inline(line)}\n`;
+    if (item) html += `<li>${inline(item[2])}</li>`;
+    else if (tag) html += inline(line);
   }
-  if (list) html += `</${list}>`;
-  return html.trimEnd();
+  if (block) html += `</${block}>`;
+  return html;
+}
+
+function followThinkingScroll(details, pre) {
+  if (details.open && details.dataset.streaming === 'true' && pre.dataset.stickToBottom !== 'false') {
+    pre.scrollTop = pre.scrollHeight;
+  }
 }
 
 function showThinking(box, before, thinking, seconds, streaming = false) {
@@ -318,12 +360,11 @@ function showThinking(box, before, thinking, seconds, streaming = false) {
     details.open = streaming;
     details.innerHTML = '<summary></summary><pre></pre>';
     box.insertBefore(details, box.querySelector('.ai-steps') || before);
-    details.addEventListener('toggle', () => {
-      if (details.open && details.dataset.streaming === 'true') {
-        const pre = details.querySelector('pre');
-        pre.scrollTop = pre.scrollHeight;
-      }
-    });
+    const pre = details.querySelector('pre');
+    pre.addEventListener('scroll', () => {
+      if (pre.clientHeight) pre.dataset.stickToBottom = String(isNearBottom(pre));
+    }, { passive: true });
+    details.addEventListener('toggle', () => followThinkingScroll(details, pre));
   }
   details.dataset.streaming = String(streaming);
   const timer = Number.isFinite(seconds) ? ` · ${seconds.toFixed(1)}s` : '';
@@ -332,7 +373,7 @@ function showThinking(box, before, thinking, seconds, streaming = false) {
     : `Thinking${timer} · 点击收起/展开`;
   const pre = details.querySelector('pre');
   pre.textContent = thinking;
-  if (streaming) pre.scrollTop = pre.scrollHeight;
+  followThinkingScroll(details, pre);
 }
 
 function renderQuestion(text, message, thread) {
@@ -421,6 +462,82 @@ function renderFollowups(box, message, thread) {
   box.appendChild(chips);
 }
 
+function selectionKey(selection) {
+  if (selection?.kind === 'node' && selection.id) return `node:${selection.id}`;
+  if (selection?.kind === 'edge' && selection.edgeKey) return `edge:${selection.edgeKey}`;
+  if (selection?.kind === 'file' && typeof selection.path === 'string') return `file:${selection.path}`;
+  return '';
+}
+
+function describeSelection(selection) {
+  if (selection.kind === 'node') {
+    const { id, name, file, line } = selection;
+    const variable = selection.nodeKind === 'var';
+    const location = file ? ` (${file}${line ? `:${line}` : ''})` : '';
+    return {
+      caption: `${variable ? '变量' : '函数'}：${name || id}${location}`,
+      questions: variable ? [
+        ['解释变量', `请解释变量「${id}」的用途。`],
+        ['查读写关系', `请查找读写变量「${id}」的函数。`],
+      ] : [
+        ['解释函数', `请解释函数「${id}」的职责和主要逻辑。`],
+        ['查上游调用链', `请追踪函数「${id}」的上游调用链。`],
+      ],
+    };
+  }
+  if (selection.kind === 'edge') {
+    const { from, to, fromName, toName, labels = [], line } = selection;
+    const tag = labels.find(label => label.preset === 'task')?.text || labels[0]?.text;
+    const endpoints = `${fromName || from?.split('::').pop()} → ${toName || to?.split('::').pop()}`;
+    const edgeRef = `「${from} → ${to}」${line ? `（第 ${line} 行）` : ''}`;
+    return {
+      caption: `连线：${endpoints}${tag ? ` [${tag}]` : ''}`,
+      questions: [
+        ['分析此连线', `请分析连线${edgeRef}的关系和调用场景。`],
+        ['核对标签周期', `请核对连线${edgeRef}的 TASK 标签和实际任务周期。`],
+      ],
+    };
+  }
+  const directory = selection.containerKind === 'dir';
+  const kind = directory ? '目录' : '文件';
+  const path = selection.path || '.';
+  return {
+    caption: `${kind}：${selection.path || selection.label || path}`,
+    questions: [
+      [directory ? '梳理目录函数' : '梳理文件函数', `请梳理${kind}「${path}」中的主要函数及其关系。`],
+      ['查改动影响', `请分析${kind}「${path}」中的 Git 改动及其影响范围。`],
+    ],
+  };
+}
+
+function setCanvasSelection(selection, explicit = false) {
+  const key = selectionKey(selection);
+  if (explicit) dismissedSelectionKeys.delete(key);
+  const next = key && !dismissedSelectionKeys.has(key) ? selection : null;
+  if (canvasSelection === next) return;
+  canvasSelection = next;
+  selectionBar.hidden = !next;
+  selectionQuestions.replaceChildren();
+  if (next) {
+    const { caption, questions } = describeSelection(next);
+    selectionText.textContent = selectionText.title = `📎 ${caption}`;
+    for (const [label, prompt] of questions) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'ai-followup-chip';
+      chip.textContent = label;
+      chip.disabled = sendBtn.disabled;
+      chip.addEventListener('click', () => sendPrompt(prompt));
+      selectionQuestions.appendChild(chip);
+    }
+  }
+  followChatScroll();
+}
+
+function currentUiContext() {
+  return canvasSelection ?? undefined;
+}
+
 function renderThreadMessages() {
   if (!messagesEl) return;
   const th = activeThread();
@@ -431,6 +548,7 @@ function renderThreadMessages() {
     messagesEl.innerHTML = '<div class="empty">直接告诉我你想找什么函数、分析 Git 改动，或点上方快捷按钮，我会自动查找并加入当前画布。</div>';
     return;
   }
+  const scrollTop = messagesEl.scrollTop;
   messagesEl.innerHTML = '';
   for (const m of th.messages) {
     if (m.role === 'user') {
@@ -459,7 +577,8 @@ function renderThreadMessages() {
       messagesEl.appendChild(box);
     }
   }
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (!stickToBottom) messagesEl.scrollTop = scrollTop;
+  followChatScroll();
 }
 
 async function loadProjectChats({ force = false } = {}) {
@@ -488,7 +607,7 @@ async function loadProjectChats({ force = false } = {}) {
       const latest = thread.messages.at(-1);
       if (previous?.completed && latest?.role === 'assistant' && latest.text === previous.text) latest.completed = true;
     }
-    activeChatId = res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id;
+    setActiveChat(res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id);
     renderChatBar();
     renderThreadMessages();
   } catch {
@@ -496,7 +615,7 @@ async function loadProjectChats({ force = false } = {}) {
     if (!chatThreads.length) {
       const th = newThreadObject();
       chatThreads = [th];
-      activeChatId = th.id;
+      setActiveChat(th.id);
     }
     renderChatBar();
     renderThreadMessages();
@@ -520,9 +639,10 @@ function ensurePanelStyle() {
 }
 
 function setTab(name) {
-  currentTab = name;
+  showApiOnOpen = false;
   for (const tab of tabs) tab.classList.toggle('on', tab.dataset.aiTab === name);
   for (const [key, pane] of Object.entries(panes)) if (pane) pane.hidden = key !== name;
+  if (name === 'chat') followChatScroll();
 }
 
 function setApiStatus(text, isError = false) {
@@ -531,10 +651,16 @@ function setApiStatus(text, isError = false) {
   apiStatusEl.classList.toggle('err', isError);
 }
 
+function syncModelPicker() {
+  modelSelectEl.value = modelEl.value.trim();
+  if (modelSelectEl.selectedIndex < 0) modelSelectEl.value = '';
+}
+
 function syncApiForm() {
   if (!baseUrlEl) return;
   baseUrlEl.value = llmConfig.baseUrl || '';
   modelEl.value = llmConfig.model || '';
+  syncModelPicker();
   apiKeyEl.value = '';
   apiKeyEl.placeholder = llmConfig.hasApiKey ? '已保存（留空保持不变）' : '可选；本地模型留空即可';
   clearApiKeyPending = false;
@@ -542,8 +668,9 @@ function syncApiForm() {
   if (toolModeEl) toolModeEl.value = llmConfig.toolMode || 'auto';
   const reasoningLabel = REASONING_LABELS.get(llmConfig.reasoningEffort);
   if (reasoningEffortEl) reasoningEffortEl.value = reasoningLabel ? llmConfig.reasoningEffort : 'default';
-  contextWindowEl.value = llmConfig.contextWindow ?? '';
-  if (chatThreads.length && !activeAbort) renderTelemetry(activeThread());
+  contextWindowEl.value = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+  maxTokensEl.value = llmConfig.maxTokens ?? DEFAULT_MAX_TOKENS;
+  renderContextBadge();
   const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
   if (setupBanner) setupBanner.hidden = configured;
   if (modelBadge) {
@@ -559,11 +686,16 @@ function readApiDraft() {
     model: modelEl.value.trim(),
     toolMode: toolModeEl.value,
     reasoningEffort: reasoningEffortEl?.value || 'default',
-    contextWindow: contextWindowEl.value ? contextWindowEl.valueAsNumber : 32768,
+    contextWindow: contextWindowEl.value ? contextWindowEl.valueAsNumber : DEFAULT_CONTEXT_WINDOW,
+    maxTokens: maxTokensEl.value ? maxTokensEl.valueAsNumber : DEFAULT_MAX_TOKENS,
   };
   if (clearApiKeyPending) draft.apiKey = '';
   else if (apiKeyEl.value.trim()) draft.apiKey = apiKeyEl.value.trim();
   return draft;
+}
+
+function invalidTokenCount(input, value) {
+  return input.validity.badInput || !Number.isInteger(value) || value < Number(input.min) || value > Number(input.max);
 }
 
 function renderMcp() {
@@ -621,7 +753,6 @@ function appendUserMessage(text) {
   div.className = 'ai-msg user';
   div.textContent = text;
   messagesEl.appendChild(div);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
 function createAssistantBox() {
@@ -630,7 +761,7 @@ function createAssistantBox() {
   box.className = 'ai-msg assistant';
   box.innerHTML = '<div class="ai-steps"></div><div class="ai-msg-text">正在连接模型…</div>';
   messagesEl.appendChild(box);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  followChatScroll();
   return {
     box,
     steps: box.querySelector('.ai-steps'),
@@ -744,7 +875,7 @@ async function saveViewBookmark(name) {
   }
 }
 
-async function sendPrompt(rawText) {
+async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const text = String(rawText ?? inputEl.value).trim();
   if (!text) return;
   if (text === '/clear' || text === '/compact') {
@@ -763,7 +894,9 @@ async function sendPrompt(rawText) {
     setApiStatus('请先填写本地模型 API 地址和模型名称', true);
     return;
   }
-  if (!(await ensureChatProject()) || activeAbort || compacting) return;
+  const submittedProjectId = state.view?.projectId ?? chatProjectId;
+  if (!(await ensureChatProject()) || activeAbort || compacting ||
+      (submittedProjectId !== null && submittedProjectId !== chatProjectId)) return;
   const thread = activeThread();
   const threadId = thread.id;
   const myProjectId = chatProjectId;
@@ -788,6 +921,7 @@ async function sendPrompt(rawText) {
   persistChats(myProjectId);
 
   inputEl.value = '';
+  stickToBottom = true;
   appendUserMessage(text);
   const ui = createAssistantBox();
   const controller = new AbortController();
@@ -922,11 +1056,11 @@ async function sendPrompt(rawText) {
       terminalReceived = true;
       finishInterrupted(ev.error || '执行失败');
     }
-    if (isVisible()) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (isVisible()) followChatScroll();
   };
   try {
     const res = await api.aiChat({
-      prompt: text, history: historySnapshot, at: state.at || 0, threadId,
+      prompt: text, history: historySnapshot, at: state.at || 0, threadId, uiContext,
     }, controller.signal);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -956,42 +1090,74 @@ async function sendPrompt(rawText) {
       activeAbort = null;
       updateChatControls();
     }
-    if (isVisible()) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (isVisible()) followChatScroll();
   }
 }
 
-async function openDrawer() {
-  if (!drawer) return;
-  if (drawer.classList.contains('show')) {
-    drawer.classList.remove('show');
-    return;
-  }
+function showDrawer(showSetup = false) {
+  if (drawer.classList.contains('show')) return apiConfigLoad;
   drawer.classList.add('show');
-  try {
-    const [mcpCfg, aiCfg] = await Promise.all([
-      api.mcpConfig().catch(() => null),
-      api.aiConfig().catch(() => null),
-      loadProjectChats({ force: true }),
-    ]);
-    if (mcpCfg) {
-      mcpLevel = mcpCfg.level;
-      envLocked = mcpCfg.source === 'env';
-    }
-    if (aiCfg?.config) llmConfig = aiCfg.config;
-  } catch { /* 按默认渲染 */ }
-  syncApiForm();
-  renderMcp();
-  if (!llmConfig.baseUrl || !llmConfig.model) setTab('api');
-  else setTab(currentTab);
+  showApiOnOpen = showSetup;
+  followChatScroll();
+  void loadProjectChats({ force: true });
+  if (!apiConfigLoad) {
+    const previousConfig = llmConfig;
+    apiConfigLoad = api.aiConfig().catch(() => null).then((result) => {
+      if (llmConfig === previousConfig) {
+        if (result?.config) llmConfig = result.config;
+        syncApiForm();
+      }
+      if (showApiOnOpen && (!llmConfig.baseUrl || !llmConfig.model)) setTab('api');
+    }).finally(() => { apiConfigLoad = null; });
+    void api.mcpConfig().catch(() => null).then((config) => {
+      if (config) {
+        mcpLevel = config.level;
+        envLocked = config.source === 'env';
+      }
+      renderMcp();
+    });
+  }
+  return apiConfigLoad;
 }
+
+document.addEventListener('cg:selection-changed', (event) => setCanvasSelection(event.detail));
+document.addEventListener('cg:ask-ai', async (event) => {
+  const { prompt, ...selection } = event.detail || {};
+  setCanvasSelection(selection, true);
+  const uiContext = currentUiContext();
+  const projectId = state.view?.projectId;
+  const configLoad = showDrawer();
+  setTab('chat');
+  inputEl.focus({ preventScroll: true });
+  if (typeof prompt !== 'string' || !prompt.trim()) return;
+  await configLoad;
+  if (!drawer.classList.contains('show') || state.view?.projectId !== projectId) return;
+  if (activeAbort || compacting || !llmConfig.baseUrl || !llmConfig.model) {
+    prefillPrompt(prompt);
+  } else {
+    await sendPrompt(prompt, uiContext);
+  }
+});
+clearSelectionBtn.addEventListener('click', () => {
+  const key = selectionKey(canvasSelection);
+  if (!key) return;
+  dismissedSelectionKeys.add(key);
+  setCanvasSelection(null);
+  inputEl.focus({ preventScroll: true });
+});
+messagesEl.addEventListener('scroll', () => {
+  if (messagesEl.clientHeight) stickToBottom = isNearBottom(messagesEl);
+}, { passive: true });
 
 // 切换工程时自动隔离并切换到目标工程的独立对话列表
 document.addEventListener('cg:project-changed', () => {
   finishThreadRename(false);
+  dismissedSelectionKeys.clear();
+  setCanvasSelection(null);
   chatGeneration++;
   chatProjectId = null;
   chatThreads = [];
-  activeChatId = '';
+  setActiveChat('');
   renameChatBtn.disabled = true;
   if (activeAbort) {
     activeAbort.abort();
@@ -1002,7 +1168,7 @@ document.addEventListener('cg:project-changed', () => {
 
 if (chatSelectEl) chatSelectEl.addEventListener('change', () => {
   if (activeAbort) activeAbort.abort();
-  activeChatId = chatSelectEl.value;
+  setActiveChat(chatSelectEl.value);
   renderChatBar();
   renderThreadMessages();
   persistChats();
@@ -1011,7 +1177,7 @@ if (newChatBtn) newChatBtn.addEventListener('click', () => {
   if (activeAbort) activeAbort.abort();
   const th = newThreadObject();
   chatThreads.unshift(th);
-  activeChatId = th.id;
+  setActiveChat(th.id);
   renderChatBar();
   renderThreadMessages();
   persistChats();
@@ -1040,13 +1206,16 @@ if (deleteChatBtn) deleteChatBtn.addEventListener('click', () => {
   if (activeAbort) activeAbort.abort();
   chatThreads = chatThreads.filter((x) => x.id !== activeChatId);
   if (!chatThreads.length) chatThreads.push(newThreadObject());
-  activeChatId = chatThreads[0].id;
+  setActiveChat(chatThreads[0].id);
   renderChatBar();
   renderThreadMessages();
   persistChats();
 });
 
-if (btn) btn.addEventListener('click', openDrawer);
+if (btn) btn.addEventListener('click', () => {
+  if (drawer.classList.contains('show')) drawer.classList.remove('show');
+  else void showDrawer(true);
+});
 if (closeBtn) closeBtn.addEventListener('click', () => drawer?.classList.remove('show'));
 // 隔离抽屉内按键事件，防止 F / Delete / Esc 误触画布快捷键
 if (drawer) drawer.addEventListener('keydown', (e) => {
@@ -1093,6 +1262,10 @@ if (inputEl) inputEl.addEventListener('keydown', (e) => {
 });
 
 // API 配置事件
+modelEl.addEventListener('input', syncModelPicker);
+modelSelectEl.addEventListener('change', () => {
+  if (modelSelectEl.value) modelEl.value = modelSelectEl.value;
+});
 if (apiKeyEl) apiKeyEl.addEventListener('input', () => {
   if (apiKeyEl.value) clearApiKeyPending = false;
 });
@@ -1108,9 +1281,14 @@ if (fetchModelsBtn) fetchModelsBtn.addEventListener('click', async () => {
   try {
     const r = await api.aiModels(readApiDraft());
     if (!r?.ok) throw new Error(r?.error || '拉取失败');
-    modelListEl.innerHTML = (r.models || []).map(id => `<option value="${esc(id)}"></option>`).join('');
-    if (!modelEl.value.trim() && r.models?.length) modelEl.value = r.models[0];
-    setApiStatus(r.models?.length ? `已获取 ${r.models.length} 个模型，可在下拉中选择` : '接口返回空列表，可手动输入模型名');
+    const models = r.models || [];
+    const placeholder = new Option('选择已获取的模型', '');
+    placeholder.disabled = true;
+    modelSelectEl.replaceChildren(placeholder, ...models.map(id => new Option(id, id)));
+    modelSelectEl.hidden = !models.length;
+    if (!modelEl.value.trim() && models.length) modelEl.value = models[0];
+    syncModelPicker();
+    setApiStatus(models.length ? `已获取 ${models.length} 个模型，可在下拉中选择` : '接口返回空列表，可手动输入模型名');
   } catch (err) {
     setApiStatus(err.message || String(err), true);
   } finally {
@@ -1131,16 +1309,40 @@ if (testConnBtn) testConnBtn.addEventListener('click', async () => {
   }
 });
 if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
-  if (!contextWindowEl.reportValidity()) return;
+  const draft = readApiDraft();
+  if (invalidTokenCount(contextWindowEl, draft.contextWindow)) {
+    setApiStatus('上下文窗口须为 4096 到 1048576 之间的整数', true);
+    contextWindowEl.focus();
+    return;
+  }
+  if (invalidTokenCount(maxTokensEl, draft.maxTokens)) {
+    setApiStatus('单次最大输出须为 0 到 65536 之间的整数', true);
+    maxTokensEl.focus();
+    return;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  saveApiBtn.disabled = true;
   setApiStatus('正在保存…');
   try {
-    const r = await api.saveAiConfig(readApiDraft());
-    if (!r?.ok) throw new Error(r?.error || '保存失败');
+    const response = await fetch('/api/ai/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId },
+      body: JSON.stringify(draft),
+      signal: controller.signal,
+    });
+    const r = await response.json().catch(() => null);
+    if (!response.ok || !r?.ok || !r.config) {
+      throw new Error(r?.error || (response.ok ? '保存失败' : `HTTP ${response.status}`));
+    }
     llmConfig = r.config;
     syncApiForm();
     setApiStatus('✓ 配置已保存，可直接切到「对话助手」使用');
   } catch (err) {
-    setApiStatus(err.message || String(err), true);
+    setApiStatus(controller.signal.aborted ? '保存配置超时，请重试' : err.message || String(err), true);
+  } finally {
+    clearTimeout(timeout);
+    saveApiBtn.disabled = false;
   }
 });
 

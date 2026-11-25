@@ -897,10 +897,12 @@
   .ai-msg.user::before { content: ">"; margin-right: 7px; color: #61768A; font-family: monospace; }
   .ai-msg.assistant { background: transparent; padding: 2px 2px 10px; border-bottom: 1px solid rgba(0,0,0,0.06); color: #2C2C2A; }
   .ai-msg.error, .ai-chat-status.err { color: #A32D2D; }
-  .ai-msg-text { white-space: pre-wrap; }
+  .ai-msg-text { white-space: normal; word-break: break-word; }
   .ai-msg-text:empty, .ai-steps:empty { display: none; }
   .ai-msg-text code { background: #F1F2F4; padding: 1px 4px; border-radius: 3px; font-size: .92em; }
-  .ai-msg-text ul, .ai-msg-text ol { margin: 4px 0; padding-left: 22px; }
+  .ai-msg-text p { margin: 0 0 6px; }
+  .ai-msg-text p:last-child { margin-bottom: 0; }
+  .ai-msg-text ul, .ai-msg-text ol { margin: 4px 0 6px 18px; padding: 0; }
   .ai-steps { display: grid; gap: 4px; margin-bottom: 8px; }
   .ai-step { color: #5F5E5A; font-size: 11.5px; }
   .ai-step-head, .ai-step-result { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -925,6 +927,14 @@
   .ai-q-opt:disabled { background: #fff; cursor: default; opacity: .65; }
   .ai-q-opt.chosen { background: #DFEEFA; border-color: #7CAED8; color: #124B71; opacity: 1; }
   .ai-q-hint { margin: 6px 0 0; font-size: 11.5px; color: #5F5E5A; }
+  .ai-selection-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; padding: 5px 10px; border-top: 1px solid rgba(0, 0, 0, 0.08); }
+  .ai-selection-bar[hidden] { display: none; }
+  .ai-selection-pill { display: flex; align-items: center; gap: 4px; min-width: 0; max-width: 100%; padding: 0 3px 0 7px; border: 1px solid #C7DDF3; border-radius: 13px; background: #E6F1FB; color: #124B71; }
+  #aiSelectionText { min-width: 0; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #aiClearSelection { flex: none; height: 22px; padding: 0 5px; border: 0; border-radius: 50%; background: transparent; color: inherit; font-size: 14px; }
+  #aiClearSelection:hover { background: #C7DDF3; }
+  .ai-selection-questions { display: flex; flex-wrap: wrap; gap: 4px; }
+  .ai-selection-questions .ai-followup-chip { min-height: 22px; padding-block: 1px; }
   .ai-composer { border-top: 1px solid rgba(0, 0, 0, 0.08); padding: 8px 10px; display: grid; gap: 6px; background: #FAF9F6; }
   .ai-telemetry { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: #595953; font-size: 11px; font-variant-numeric: tabular-nums; }
   #aiSpeedBadge:empty, .ai-chat-status:empty { display: none; }
@@ -937,6 +947,7 @@
   .ai-form { display: grid; gap: 10px; font-size: 12.5px; }
   .ai-form label { display: grid; gap: 4px; font-size: 12px; color: #5F5E5A; }
   .ai-form input, .ai-form select { width: 100%; height: 31px; padding: 0 9px; border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 7px; font-size: 12.5px; background: #fff; }
+  .ai-model-field { display: grid; gap: 4px; min-width: 0; }
   .ai-form-row { display: flex; gap: 6px; align-items: center; }
   .ai-form-row input { flex: 1; min-width: 0; }
   .ai-status { font-size: 12px; min-height: 18px; color: #235326; }
@@ -1457,6 +1468,13 @@
       <div class="ai-scroll" id="aiMessages">
         <div class="empty">直接告诉我你想找什么函数、分析 Git 改动，或点上方快捷按钮，我会自动查找并加入当前画布。</div>
       </div>
+      <div class="ai-selection-bar" id="aiSelectionBar" role="group" aria-label="画布选区" hidden>
+        <div class="ai-selection-pill">
+          <span id="aiSelectionText"></span>
+          <button type="button" id="aiClearSelection" aria-label="移除画布选区" title="移除画布选区">&times;</button>
+        </div>
+        <div class="ai-selection-questions" id="aiSelectionQuestions"></div>
+      </div>
       <div class="ai-composer">
         <div class="ai-telemetry">
           <span id="aiContextBadge" title="当前对话估算上下文占用">上下文 0 / 32k</span>
@@ -1482,13 +1500,14 @@
           <label>API 地址（支持 OpenAI 兼容及旧版接口）
             <input id="aiBaseUrl" type="url" placeholder="http://127.0.0.1:11434/v1">
           </label>
-          <label>模型名称
+          <div class="ai-model-field">
+            <label for="aiModel">模型名称</label>
             <div class="ai-form-row">
-              <input id="aiModel" type="text" list="aiModelList" placeholder="例如 qwen3.8:27b 或本地模型 ID">
+              <input id="aiModel" type="text" placeholder="例如 qwen3.8:27b 或本地模型 ID">
               <button type="button" id="aiFetchModels">拉取模型</button>
             </div>
-            <datalist id="aiModelList"></datalist>
-          </label>
+            <select id="aiModelSelect" aria-label="已获取的模型" hidden></select>
+          </div>
           <label>API Key（本地服务通常可留空）
             <div class="ai-form-row">
               <input id="aiApiKey" type="password" autocomplete="off" placeholder="可选；本地模型留空即可">
@@ -1512,7 +1531,10 @@
             </select>
           </label>
           <label>上下文窗口（tokens）
-            <input id="aiContextWindow" type="number" min="4096" max="1048576" step="1024" placeholder="32768">
+            <input id="aiContextWindow" type="number" min="4096" max="1048576" step="1" placeholder="32768">
+          </label>
+          <label>单次最大输出（max_tokens，0 表示不限制）
+            <input id="aiMaxTokens" type="number" min="0" max="65536" step="1" placeholder="8192">
           </label>
           <div class="ai-form-row">
             <button type="button" id="aiTestConn">测试连接</button>
