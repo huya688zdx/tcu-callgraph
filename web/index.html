@@ -542,13 +542,13 @@
   /* ---- 弹层（工程选择 / 时间轴） ---- */
   .mask {
     position: absolute; inset: 0; background: rgba(20, 20, 18, 0.28);
-    display: none; z-index: 40;
+    display: none; z-index: 48;
   }
   .mask.show { display: block; }
   .modal {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     width: 560px; max-height: 74vh; display: none; flex-direction: column;
-    background: #fff; border-radius: 14px; z-index: 41;
+    background: #fff; border-radius: 14px; z-index: 49;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); overflow: hidden;
   }
   .modal.show { display: flex; }
@@ -618,7 +618,8 @@
     border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none;
   }
   /* 应用内确认弹窗（confirmDialog）：直挂 body，层级要盖过普通弹窗和右侧 AI 抽屉 */
-  .confirm-modal { width: 420px; z-index: 55; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22); }
+  .confirm-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(20, 20, 18, 0.28); }
+  .confirm-modal { width: min(420px, calc(100vw - 24px)); box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22); }
   .confirm-modal .modal-body { padding: 14px 16px 4px; font-size: 13px; line-height: 1.7; color: #2C2C2A; white-space: pre-line; }
   .confirm-modal .modal-foot { justify-content: flex-end; padding: 10px 16px 14px; }
   button.danger { background: #D9303E; border-color: #D9303E; color: #fff; }
@@ -961,6 +962,15 @@
   }
   .ai-followups { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
   #aiDrawer .ai-followup-chip { height: auto; min-height: 26px; padding: 3px 10px; white-space: normal; text-align: left; }
+  #aiDrawer .ai-followup-chip[data-ai-dynamic="true"] {
+    background: #F4F8FD; border-color: #C9DEF4; color: #164775;
+  }
+  #aiDrawer .ai-followup-chip[data-ai-dynamic="true"]::before {
+    content: "✦ "; color: #185FA5; font-size: 10.5px;
+  }
+  #aiDrawer .ai-followup-chip[data-ai-dynamic="true"]:hover {
+    background: #E6F1FB; border-color: #8FC0EB; color: #0C447C;
+  }
 
   .ai-banner {
     margin: 10px 14px 0; padding: 8px 10px 8px 12px; border-radius: 10px;
@@ -1192,6 +1202,12 @@
   #aiDrawer #aiSendChat {
     height: 28px; padding: 0 14px; font-size: 12px; font-weight: 500; border-radius: 8px;
   }
+  #aiDrawer #aiSendChat.steering {
+    background: #D97706; border-color: #D97706; color: #FFFFFF;
+  }
+  #aiDrawer #aiSendChat.steering:hover:not(:disabled) {
+    background: #B45309; border-color: #B45309;
+  }
   #aiDrawer #aiSendChat:disabled { opacity: .5; cursor: default; }
 
   #aiPaneApi .ai-scroll, #aiPaneMcp .ai-scroll { padding: 14px; }
@@ -1200,7 +1216,7 @@
   @media (max-width: 420px) {
     .ai-form-grid-2 { grid-template-columns: 1fr; }
   }
-  .ai-form label { display: grid; gap: 5px; font-size: 12px; font-weight: 500; color: #4E4D49; min-width: 0; }
+  .ai-form label { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; font-size: 12px; font-weight: 500; color: #4E4D49; min-width: 0; }
   .ai-form input, .ai-form select {
     width: 100%; height: 33px; padding: 0 10px; border: 1px solid #DCD9CF; border-radius: 8px;
     font-size: 12.5px; color: #242422; background: #FFFFFF; outline: none;
@@ -1208,6 +1224,11 @@
   }
   .ai-form input:focus, .ai-form select:focus {
     border-color: #185FA5; box-shadow: 0 0 0 3px rgba(24, 95, 165, 0.11);
+  }
+  .ai-form label > .fsel > .fsel-btn { width: 100%; height: 33px; justify-content: space-between; text-align: left; }
+  .ai-form label > .fsel > .fsel-btn > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  body:has(#aiPaneApi .ai-form label > .fsel.open) > .fsel-pop button {
+    min-height: 32px; height: auto; padding-block: 6px; white-space: normal; overflow-wrap: anywhere;
   }
   #aiModelSelect { background: #F5F9FD; border-color: #B8D4EE; color: #0C447C; }
   #aiModelSelect[hidden] { display: none; }
@@ -1416,7 +1437,7 @@
     <div id="ctxMenu" class="ctx-menu"></div>
 
     <div id="reviewBar" class="review-bar">
-      <span id="reviewText"></span>
+      <span id="reviewText" aria-live="polite"></span>
       <button id="reviewRestore" class="primary" data-i18n="timeline.restore">恢复到此</button>
       <button id="reviewExit" data-i18n="timeline.exit">回到最新</button>
     </div>
@@ -1826,24 +1847,22 @@
               <button type="button" id="aiClearKey" hidden>清除</button>
             </div>
           </label>
-          <div class="ai-form-grid-2">
-            <label>工具调用兼容模式
-              <select id="aiToolMode">
-                <option value="auto">自动兼容（推荐：先试标准 Tools，旧接口自动退回纯对话）</option>
-                <option value="prompt">旧版纯对话兼容（不发 tools / role:tool，最稳）</option>
-                <option value="tools">标准 OpenAI Tools</option>
-              </select>
-            </label>
-            <label>思考等级（不支持自动降级）
-              <select id="aiReasoningEffort">
-                <option value="default">跟随服务端默认</option>
-                <option value="off">关闭思考（最快）</option>
-                <option value="low">低（简短思考）</option>
-                <option value="medium">中（均衡）</option>
-                <option value="high">高（深度思考）</option>
-              </select>
-            </label>
-          </div>
+          <label>工具调用兼容模式
+            <select id="aiToolMode">
+              <option value="auto">自动兼容（推荐：先试标准 Tools，旧接口自动退回纯对话）</option>
+              <option value="prompt">旧版纯对话兼容（不发 tools / role:tool，最稳）</option>
+              <option value="tools">标准 OpenAI Tools</option>
+            </select>
+          </label>
+          <label>思考等级（不支持自动降级）
+            <select id="aiReasoningEffort">
+              <option value="default">跟随服务端默认</option>
+              <option value="off">关闭思考（最快）</option>
+              <option value="low">低（简短思考）</option>
+              <option value="medium">中（均衡）</option>
+              <option value="high">高（深度思考）</option>
+            </select>
+          </label>
           <div class="ai-form-grid-2">
             <label>上下文窗口（tokens）
               <input id="aiContextWindow" type="number" min="4096" max="1048576" step="1" placeholder="32768">

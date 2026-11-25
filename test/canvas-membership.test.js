@@ -152,11 +152,10 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
     const hold = new Promise(resolve => { window.releaseOlderView = resolve; });
     window.fetch = async (url, options) => {
       const response = await fetchOriginal(url, options);
-      if (url.startsWith('/api/view?') && options && JSON.parse(options.body).hiddenVars.includes(${JSON.stringify(special)})) {
+      if (url.startsWith('/api/view?') && options?.body && JSON.parse(options.body).hiddenVars.includes(${JSON.stringify(special)})) {
         window.olderViewReady = true;
         await hold;
-        const read = response.json.bind(response);
-        response.json = async () => { const data = await read(); window.olderViewRead = true; return data; };
+        window.olderViewAborted = options.signal.aborted;
       }
       return response;
     };
@@ -167,7 +166,7 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
   await select(check(special));
   await waitFor(`${count(4)} && __cg.view !== initialView`);
   await evaluate('releaseOlderView()');
-  await waitFor('window.olderViewRead');
+  await waitFor('window.olderViewAborted');
   assert.equal(await evaluate(`${count(4)} && ${detailA}`), true, '较旧的取消勾选响应不能覆盖最新视图');
   const painted = await evaluate(`(() => {
     const ctx = document.getElementById('cv').getContext('2d');
@@ -397,7 +396,7 @@ test('无头浏览器：手工节点增删绑定原工程和会话，切换后�
   await openDeletion();
   await switchTo({ id: second.id });
   await waitProject(second.id);
-  await confirm();
+  assert.equal(await evaluate('document.querySelector(".confirm-modal") === null'), true);
   assert.equal(await evaluate('window.pendingDeletion'), false);
   assert.deepEqual(await evaluate('window.deleteCalls'), []);
   assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === id));

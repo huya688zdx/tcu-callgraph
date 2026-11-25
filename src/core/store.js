@@ -16,8 +16,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { gzipSync, gunzipSync } from 'node:zlib';
-import { serialize, deserialize } from 'node:v8';
+import { packModel, unpackModel } from './model-cache.js';
+import { analysisJob } from './analysis-jobs.js';
 import { DatabaseSync } from 'node:sqlite';
 import { normalizeExpansions } from './expansion.js';
 
@@ -648,6 +648,15 @@ export function openStore({ dbPath, userData } = {}) {
     bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
   };
 
+  function writePackedModel(key, packed, keep) {
+    const { data, ...result } = packed;
+    if (data) {
+      q.cachePut.run(key, nowMs(), null, data);
+      q.cachePrune.run(keep);
+    }
+    return result;
+  }
+
   let seqInMs = 0;
   let lastTs = 0;
 
@@ -1011,7 +1020,7 @@ export function openStore({ dbPath, userData } = {}) {
       const r = q.cacheGet.get(key);
       if (!r || !r.model) return null;
       try {
-        return deserialize(gunzipSync(r.model));
+        return unpackModel(r.model);
       } catch {
         q.cacheDel.run(key);
         return null;
@@ -1023,32 +1032,22 @@ export function openStore({ dbPath, userData } = {}) {
      * 避免大工程仅因展开后的 token 较大就永远无法命中缓存。
      */
     putCachedModel(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
-      // _index 里全是对象引用；手工节点属于单工程持久化数据，绝不能写入共享源码解析缓存。
-      const { _index, _dfPending, scheduleConfig, ...rawPlain } = model;
-      const plain = {
-        ...rawPlain,
-        ...(Array.isArray(rawPlain.files) ? { files: rawPlain.files.filter((f) => !f.manual) } : {}),
-        ...(Array.isArray(rawPlain.functions) ? { functions: rawPlain.functions.filter((f) => !f.manual) } : {}),
-        ...(Array.isArray(rawPlain.variables) ? { variables: rawPlain.variables.filter((v) => !v.manual) } : {}),
-        ...(rawPlain._df ? {
-          _df: {
-            ...rawPlain._df,
-            defs: (rawPlain._df.defs || []).filter((d) => !d.manual),
-            byId: new Map([...(rawPlain._df.byId || [])].filter(([, d]) => !d?.manual)),
-          },
-        } : {}),
-      };
-      let packed;
-      try {
-        packed = serialize(plain);
-      } catch {
-        return { cached: false, reason: 'serialize' };
-      }
-      const gz = gzipSync(packed, { level: 1 });
-      if (gz.length > maxBytes) return { cached: false, reason: 'too-large', bytes: gz.length };
-      q.cachePut.run(key, nowMs(), null, gz);
-      q.cachePrune.run(keep);
-      return { cached: true, rawBytes: packed.length, gzBytes: gz.length };
+      return writePackedModel(key, packModel(model, maxBytes), keep);
+    },
+
+    async getCachedModelAsync(key) {
+      const bytes = q.cacheGet.get(key)?.model;
+      if (!bytes) return null;
+      try { return await analysisJob('cache', () => ({ bytes })); }
+      catch { return null; }
+    },
+
+    async putCachedModelAsync(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
+      const packed = await analysisJob('cache', () => {
+        const { _index, _dfPending, scheduleConfig, ...data } = model;
+        return { model: data, maxBytes };
+      });
+      return writePackedModel(key, packed, keep);
     },
 
     pruneCache(keep = 12) {

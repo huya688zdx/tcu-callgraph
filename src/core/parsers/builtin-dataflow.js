@@ -9,47 +9,55 @@ import { fileMacroScope, preprocess } from '../preproc.js';
 
 // 联合体成员共享存储。保守识别含联合体的聚合类型；对无法解析的类型，工程中
 // 存在联合体时不按字段排除，以免把真实依赖误报为不存在。
-function unionTypeResolver(parsedFiles) {
+function unionTypeResolver() {
   const types = new Map();
   let hasUnion = false;
-  const register = (name, node) => {
+  const register = (name, type) => {
     if (!types.has(name)) types.set(name, []);
-    types.get(name).push(node);
+    types.get(name).push(type);
   };
-  const walk = (node) => {
+  // 布尔值表示已确定是否含联合体，类型名和成员数组延迟解析，null 表示未知。
+  const describe = (node) => {
+    if (!node) return null;
+    if (node.type === 'union_specifier') return true;
+    if (node.type === 'type_identifier') return node.text;
+    if (node.type !== 'struct_specifier') return false;
+    const body = node.childForFieldName('body');
+    if (!body) return `struct ${node.childForFieldName('name')?.text}`;
+    return body.namedChildren.filter((field) => field.type === 'field_declaration')
+      .map((field) => describe(field.childForFieldName('type')));
+  };
+  const collect = (node) => {
     if (node.type === 'union_specifier') hasUnion = true;
-    if (node.type === 'struct_specifier' || node.type === 'union_specifier') {
+    if (node.type === 'struct_specifier') {
       const name = node.childForFieldName('name')?.text;
-      if (name && node.childForFieldName('body')) register(`${node.type === 'struct_specifier' ? 'struct' : 'union'} ${name}`, node);
+      if (name && node.childForFieldName('body')) register(`struct ${name}`, describe(node));
     }
     if (node.type === 'type_definition') {
       const alias = node.childForFieldName('declarator')?.text;
-      if (alias) register(alias, node.childForFieldName('type'));
+      if (alias) register(alias, describe(node.childForFieldName('type')));
     }
-    for (const child of node.namedChildren) walk(child);
+    for (const child of node.namedChildren) collect(child);
   };
-  for (const { root } of parsedFiles) walk(root);
-  const contains = (node, seen) => {
-    if (!node) return hasUnion;
-    if (node.type === 'union_specifier') return true;
-    if (node.type === 'type_identifier') return resolve(node.text, seen);
-    if (node.type !== 'struct_specifier') return false;
-    const body = node.childForFieldName('body');
-    if (!body) return resolve(`struct ${node.childForFieldName('name')?.text}`, seen);
-    return body.namedChildren.some((field) => field.type === 'field_declaration' && contains(field.childForFieldName('type'), seen));
+  const contains = (type, seen) => {
+    if (type === null) return hasUnion;
+    if (typeof type === 'string') return resolve(type, seen);
+    if (Array.isArray(type)) return type.some((member) => contains(member, seen));
+    return type;
   };
   const resolve = (name, seen = new Set()) => {
     if (name.startsWith('union ')) return true;
     if (seen.has(name)) return false;
     const next = new Set(seen); next.add(name);
-    return types.has(name) ? types.get(name).some((node) => contains(node, next)) : hasUnion;
+    return types.has(name) ? types.get(name).some((type) => contains(type, next)) : hasUnion;
   };
-  return (typeText) => {
+  const containsUnion = (typeText) => {
     const name = typeText.replace(/\b(const|volatile)\b/g, '').trim();
     if (/^union\b/.test(name)) return true;
     const match = name.match(/^struct\s+([A-Za-z_]\w*)|^([A-Za-z_]\w*)$/);
     return match ? resolve(match[1] ? `struct ${match[1]}` : match[2]) : hasUnion;
   };
+  return { collect, containsUnion };
 }
 
 /** 比较与数据流复用同一份逐文件宏展开口径和原始行号。 */
@@ -95,8 +103,10 @@ export async function buildBuiltinDataflow(model) {
   try {
     const defs = [];
     const keepOriginal = Boolean(model._keepAnalysisSources);
-    let { sources, failedFiles } = analysisSources(model, { keepOriginal });
-    if (keepOriginal) model._analysisSources = { sources: [...sources], failedFiles };
+    const { sources, failedFiles: readFailures } = analysisSources(model, { keepOriginal });
+    let failedFiles = readFailures;
+    if (keepOriginal) model._analysisSources = { sources, failedFiles };
+    const releaseExpanded = !keepOriginal && sources !== model._analysisSources?.sources;
     const defsByName = new Map();
     const fnAccess = new Map(); // fnId -> { writes: Map, reads: Map }
     const readers = new Map(); // varId -> Set<fnId>
@@ -112,6 +122,7 @@ export async function buildBuiltinDataflow(model) {
       fnsByFile.get(fn.file).push(fn);
     }
 
+    const { collect: collectTypes, containsUnion } = unionTypeResolver();
     for (const f of sources) {
       let rec;
       try {
@@ -120,26 +131,33 @@ export async function buildBuiltinDataflow(model) {
         failedFiles += 1;
         console.warn(`[数据流] 解析失败，已跳过 ${f.rel}：`, err.message);
         continue; // 单个文件解析失败不影响整体
+      } finally {
+        if (releaseExpanded) f.expanded = '';
       }
-      parsedFiles.push({ file: f.rel, root: rec.root, tree: rec.tree });
+      const keepTree = fnsByFile.has(f.rel);
+      if (keepTree) parsedFiles.push({ file: f.rel, root: rec.root, tree: rec.tree });
 
-      for (const g of collectGlobals(rec.root)) {
-        const id = g.isStatic ? `var::${f.rel}::${g.name}` : `var::${g.name}`;
-        const def = { ...g, id, file: f.rel };
-        const prev = defsByName.get(g.name) || [];
-        const same = prev.find((d) => d.id === id);
-        if (same) {
-          // extern 只是声明，真实定义优先
-          if (same.isExtern && !g.isExtern) Object.assign(same, def);
-          continue;
+      try {
+        collectTypes(rec.root);
+        for (const g of collectGlobals(rec.root)) {
+          const id = g.isStatic ? `var::${f.rel}::${g.name}` : `var::${g.name}`;
+          const def = { ...g, id, file: f.rel };
+          const prev = defsByName.get(g.name) || [];
+          const same = prev.find((d) => d.id === id);
+          if (same) {
+            // extern 只是声明，真实定义优先
+            if (same.isExtern && !g.isExtern) Object.assign(same, def);
+            continue;
+          }
+          defs.push(def);
+          defsByName.set(g.name, [...prev, def]);
         }
-        defs.push(def);
-        defsByName.set(g.name, [...prev, def]);
+      } finally {
+        if (!keepTree) rec.tree.delete();
       }
     }
-    if (!keepOriginal && sources !== model._analysisSources?.sources) sources.length = 0;
+    if (releaseExpanded) sources.length = 0;
 
-    const containsUnion = unionTypeResolver(parsedFiles);
     for (const def of defs) def.containsUnion = containsUnion(def.typeText);
 
     // 先收齐声明与函数，再沿明确的实参将目标绑定到指针形参。

@@ -11,11 +11,13 @@
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { state, cam } from './state.js';
+import { state, cam, edgeKey } from './state.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
 import { constrainCam } from './camera.js';
 import { draw } from './render.js';
+import { acceptRestoredRevision, savePage } from './live.js';
+import { renderLabelPanel } from './label-panel.js';
 
 const btn = document.getElementById('timelineBtn');
 const listEl = document.getElementById('timelineList');
@@ -227,6 +229,7 @@ function setCount() {
 
 /** 拉一页。append=true 时接着上一页往后取（游标 = 已加载的最后一条 id） */
 async function load({ append = false } = {}) {
+  if (reviewSessionChanged) return;
   if (append && tl.loading) return;
   tl.loading = true;
   const seq = ++tl.seq;
@@ -257,9 +260,19 @@ let reviewTime = 0;
 let reviewSeq = 0;
 let changingReview = false;
 let restoringSnapshot = false;
+let latestUpdated = false;
+let reviewSessionChanged = false;
+
+export const reviewTransition = () => changingReview || restoringSnapshot;
+export function markReviewUpdated(sessionChanged = false) {
+  if (latestUpdated && (!sessionChanged || reviewSessionChanged)) return;
+  latestUpdated = true;
+  reviewSessionChanged ||= sessionChanged;
+  showBar();
+}
 
 function syncReviewControls() {
-  restoreBtn.disabled = changingReview || restoringSnapshot;
+  restoreBtn.disabled = changingReview || restoringSnapshot || reviewSessionChanged;
   exitBtn.disabled = changingReview || restoringSnapshot;
   document.dispatchEvent(new Event('cg:review-mode'));
 }
@@ -269,7 +282,8 @@ function showBar() {
   const time = `${dayLabel(reviewTime)} ${hhmm(reviewTime)}`;
   const key = changingReview ? 'timeline.reviewLoading'
     : state.view?.reviewSnapshot ? 'timeline.reviewSnapshot' : 'timeline.reviewOverlay';
-  barText.textContent = t(key, { time, n: state.view?.nodes.length || 0 });
+  barText.textContent = [t(key, { time, n: state.view?.nodes.length || 0 }),
+    latestUpdated && t('live.reviewLatestUpdated')].filter(Boolean).join(' · ');
   bar.classList.add('show');
   syncReviewControls();
 }
@@ -279,13 +293,15 @@ function hideBar() {
   preReview = null;
   reviewTime = 0;
   changingReview = false;
+  latestUpdated = false;
+  reviewSessionChanged = false;
   bar?.classList.remove('show');
   syncReviewControls();
 }
 
 /** 进入回看：把 state.at 指到某个事件，重新拉一次视图 */
 async function reviewAt(eventId, ts) {
-  if (changingReview || restoringSnapshot || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (reviewTransition() || reviewSessionChanged || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
   if (!state.at) {
     preReview = { roots: [...state.roots], expansions: structuredClone(state.expansions),
       up: state.up, down: state.down, group: state.group, groupMode: state.groupMode, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
@@ -306,6 +322,7 @@ async function reviewAt(eventId, ts) {
     changingReview = false;
     showBar();
     renderAll();
+    void savePage(true).catch(() => {});
   } catch (error) {
     if (seq !== reviewSeq) return;
     state.at = previousId;
@@ -324,15 +341,35 @@ async function exitReview() {
   const seq = ++reviewSeq;
   changingReview = true;
   syncReviewControls();
-  state.at = 0;
   try {
-    const view = await hooks.loadView(saved.roots, { ...saved, nav: false });
+    const latest = await api.savedPage();
+    if (seq !== reviewSeq) return;
+    if (latest.ok === false) throw new Error(latest.error);
+    const page = latest.page;
+    const sameProject = latest.project?.id === state.view?.projectId;
+    if (!sameProject || latest.comparisonId) {
+      closeModal();
+      await hooks.reloadAll({ preserveAiChat: sameProject });
+      return;
+    }
+    const target = page || saved;
+    state.at = 0;
+    const view = await hooks.loadView(target.roots, { ...target, nav: false });
     if (seq !== reviewSeq) return;
     if (!view) throw new Error(t('app.viewFailed'));
-    Object.assign(cam, saved.cam);
+    acceptRestoredRevision(page?.revision);
+    if (target.cam) Object.assign(cam, target.cam);
+    if (page) {
+      state.selected = view.nodes.some(node => node.id === page.selected) ? page.selected : null;
+      state.selectedEdge = view.edges.find(edge => edgeKey(edge) === page.selectedEdge) || null;
+      state.ctxBox = page.ctxBox;
+      renderLabelPanel();
+      void hooks.renderDetail(state.selected).catch(() => {});
+    }
     constrainCam();
     draw();
     hideBar();
+    void savePage(true).catch(() => {});
   } catch (error) {
     if (seq !== reviewSeq) return;
     state.at = eventId;
@@ -343,7 +380,7 @@ async function exitReview() {
 }
 
 restoreBtn?.addEventListener('click', async () => {
-  if (!state.at || changingReview || restoringSnapshot) return;
+  if (!state.at || reviewTransition() || reviewSessionChanged) return;
   const seq = reviewSeq;
   restoringSnapshot = true;
   syncReviewControls();

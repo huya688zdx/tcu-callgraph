@@ -38,6 +38,7 @@ wireFlowchart();
  * @param {string|string[]|null} rootId 单个函数 id、多个函数 id（文件树多选）、或 null（默认入口）
  */
 let viewSeq = 0;
+let viewRequest;
 let reloadEpoch = 0;
 const pendingVarChoices = new Map();
 const varRestores = new Map();
@@ -93,6 +94,9 @@ async function loadView(rootId, opts = {}) {
   // 请求成功后才记录跳转；聚焦查找失败时保留原画布和范围。
   const prior = opts.prior ?? (nav && state.view && !state.at ? { ...currentViewSnapshot(), cam: { ...cam } } : null);
   const seq = ++viewSeq;
+  viewRequest?.abort();
+  const request = new AbortController();
+  viewRequest = request;
   clearDataflow(); // 换视图时关闭旧的查询结果
   const roots = (Array.isArray(rootId) ? rootId : rootId ? [rootId] : []).filter(Boolean);
   const expansions = opts.expansions ?? (incremental || !nav ? state.expansions : []);
@@ -119,12 +123,14 @@ async function loadView(rootId, opts = {}) {
       if (seq !== viewSeq) return;
     }
     data = await api.view({ roots, expansions, up, down, groupMode, vars: [...vars], hiddenVars: [...hiddenVars],
-      at: state.at, previous, empty, useSnapshot: opts.useSnapshot ?? state.at > 0 });
+      at: state.at, previous, empty, useSnapshot: opts.useSnapshot ?? state.at > 0, signal: request.signal });
   } catch (error) {
     if (seq !== viewSeq) return;
     pendingVarChoices.clear();
     renderVars();
     throw error;
+  } finally {
+    if (viewRequest === request) viewRequest = null;
   }
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   pendingVarChoices.clear();
@@ -321,6 +327,7 @@ hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
   pendingVarChoices.clear();
   comparisonPage = null;
   const seq = ++viewSeq;
+  viewRequest?.abort();
   if (state.pairFlow) clearPairFlow({ paint: false });
   state.view = null;
   syncFlowchart();

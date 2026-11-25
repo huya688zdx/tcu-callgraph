@@ -6,12 +6,11 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { execFile, fork } from 'node:child_process';
 import { isDeepStrictEqual, promisify } from 'node:util';
-import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
+import { loadModel, stats, subgraph, search, dataflowOf, rebuildIndex } from './core/index.js';
 import { decodeSource, sourceDecoder } from './core/source-files.js';
-import { layoutElk } from './core/layout-elk.js';
-import { buildFlowchart, flowchartCacheHash, isFlowchartFunction } from './core/flowchart.js';
-import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
-import { compareProjects, comparisonDataflow, comparisonGlobals } from './core/compare.js';
+import { isFlowchartFunction } from './core/flowchart.js';
+import { dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
+import { comparisonDataflow, comparisonGlobals } from './core/compare.js';
 import { compareGitProject, inspectGitRepo, quickGitDirtySummary, watchGitProject } from './core/git-compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
 import { CHANGE_STATES, statusOverrides, comparisonStatus, statusSummary } from './core/comparison-status.js';
@@ -22,7 +21,7 @@ import { callSequence, callNumbers } from './core/call-sequence.js';
 import { needsCounterAnalysis, projectTasks, taskPeriods, withTaskPeriods } from './core/task-periods.js';
 import { traceToTasks } from './core/task-trace.js';
 import { readChangeQuery, changesPage } from './core/mcp-changes.js';
-import { detectTasks, readFunctionHeaderComment } from './core/detect-tasks.js';
+import { analysisJob, analysisModel } from './core/analysis-jobs.js';
 import { createMcpServer } from './mcp.js';
 import {
   DEFAULT_AI_CONFIG,
@@ -31,15 +30,16 @@ import {
   normalizeAiConfig,
   publicAiConfig,
   runAiAgent,
+  sanitizeSuggestions,
   testConnection as testAiConnection,
 } from './core/ai-agent.js';
 import { normalizeExpansions } from './core/expansion.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
-import { externalDependenciesCurrent, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
+import { fileKey, findCompileCommands } from './core/parsers/clang-config.js';
 import { scheduleConfig } from './core/tcu-schedule.js';
-import { diffParserModels } from './core/parsers/ir.js';
+import { applyDataflow, diffParserModels } from './core/parsers/ir.js';
 import {
   LABEL_PRESETS,
   normalizeLabel,
@@ -80,6 +80,7 @@ let switching = false;
 let sessionRevision = 0;
 let COMPARISON = null;
 let comparisonPreview = null;
+let comparisonRequest = 0;
 let comparisonBase = null;
 const readSnapshots = new WeakMap();
 let latestSnapshotRequest = 0;
@@ -102,6 +103,15 @@ const comparisonInfo = () => COMPARISON ? {
 // 页面当前视图状态（入口 / 深度 / 选中）：前端上报，AI 通过 cg_page 工具读取，
 // 用来对齐「用户正在看什么」，AI 组图时也会同步更新这里。
 let pageState = null;
+const reviewingPage = page => !!page?.reviewing || Number(page?.at) > 0;
+const savedViewKey = () => 'ui.last-view.' + PROJECT.id;
+function latestPage() {
+  return COMPARISON ? COMPARISON.composedPage || { roots: COMPARISON.roots, up: 0, down: 0 }
+    : store.getSetting(savedViewKey());
+}
+const reviewWriteResult = () => reviewingPage(pageState)
+  ? { updatedWhileReviewing: true, reviewNote: '已写入最新画布，退出回看即可查看' }
+  : {};
 
 // 单库多工程：所有状态按 project_id 隔离，见 docs/superpowers/specs/2026-10-22-persistence-design.md
 const store = openStore();
@@ -114,6 +124,19 @@ const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => id === 'clang-ast
   ? { compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)) } : {};
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
+async function compareProjects(...args) {
+  const comparison = await analysisJob('compare', () => args);
+  for (const model of [comparison.model, comparison.beforeModel, comparison.afterModel]) rebuildIndex(model);
+  return comparison;
+}
+
+function analyzeTasks(model, opts = {}) {
+  return analysisJob('task', state => {
+    const previous = state.index?.deref();
+    state.index = new WeakRef(model._index);
+    return { ...opts, model: previous === model._index ? undefined : analysisModel(model) };
+  });
+}
 
 // Electron 停止服务时断开 IPC，让服务先终止正在扫描源码的子进程。
 if (process.connected) process.once('disconnect', () => process.exit(0));
@@ -123,16 +146,23 @@ async function ensureAnalysis(model) {
   if (model._df) return;
   if (analysisPending.has(model)) return analysisPending.get(model);
   const pending = (async () => {
-    await buildDataflowIndex(model);
+    const df = await analysisJob('dataflow', () => analysisModel({
+      ...model, variables: model.variables.filter(variable => !variable.manual),
+    }));
+    const parser = getParser(model.parserId);
+    if (!parser || parser.id === 'builtin' || parser.buildDataflow) {
+      // 线程返回后投影到当前模型，保留期间用户新增的手工节点和关系。
+      // 数据流线程的输入只包含源码符号，期间删掉的规划变量也不会被重新加回。
+      applyDataflow(model, df);
+      rebuildIndex(model);
+    }
+    model._df = df;
     if (model === MODEL) S = stats(model);
     const key = modelCacheKeys.get(model);
     if (key && !model._df?.failedFiles) {
-      try {
-        const r = store.putCachedModel(key, model);
+      void store.putCachedModelAsync(key, model).then(r => {
         if (!r.cached) console.log(`[缓存] 未缓存变量分析：${r.reason}`);
-      } catch (err) {
-        console.warn('[缓存] 变量分析缓存写入失败：', err.message);
-      }
+      }).catch(err => console.warn('[缓存] 变量分析缓存写入失败：', err.message));
     }
   })();
   analysisPending.set(model, pending);
@@ -167,12 +197,21 @@ function mcpAccess() {
 // 写操作落库后广播给所有打开的页面（web/lib/live.js 监听），
 // 让 AI 通过 MCP 改的标注 / 删除 / 布局即时反映到界面上，不用手动刷新。
 const sseClients = new Set();
+function writeSse(res, payload) {
+  // 慢客户端断线后自动重连，并核对服务端的最新画布版本。
+  if (res.destroyed || res.writableLength > 1024 * 1024) {
+    sseClients.delete(res);
+    res.destroy();
+    return;
+  }
+  res.write(payload);
+}
 
 // 心跳：SSE 连接长时间无数据时可能被中间层掐掉，定时发注释行保活，也顺便探活死连接
 const sseHeartbeat = setInterval(() => {
   for (const res of sseClients) {
     try {
-      res.write(': ping\n\n');
+      writeSse(res, ': ping\n\n');
     } catch {
       sseClients.delete(res);
     }
@@ -183,25 +222,22 @@ sseHeartbeat.unref?.();
 /** 广播一条 change 事件；单个连接写失败只摘掉它，不影响其他页面 */
 function broadcastChange(op, actor, extra = {}) {
   if (!sseClients.size) return;
-  const payload = `event: change\ndata: ${JSON.stringify({ op, actor, ts: Date.now(), ...extra })}\n\n`;
+  const payload = `event: change\ndata: ${JSON.stringify({ op, actor, ts: Date.now(), projectId: PROJECT?.id, ...extra })}\n\n`;
   for (const res of sseClients) {
     try {
-      res.write(payload);
+      writeSse(res, payload);
     } catch {
       sseClients.delete(res);
     }
   }
 }
 
-let gitWatchReady = Promise.resolve();
 function startGitWatch(projectPath, projectId) {
   gitWatch?.abort();
   gitWatch = new AbortController();
-  const ready = watchGitProject(projectPath, gitWatch.signal, () => {
+  return watchGitProject(projectPath, gitWatch.signal, () => {
     broadcastChange('git.changed', 'system', { projectId, comparisonId: COMPARISON?.id || null });
   }).catch((err) => console.warn('[Git 监听]', err.message));
-  gitWatchReady = ready;
-  return ready;
 }
 
 // 旧版 out/overlay.json 一次性导入：成功后改名留底，不删原文件。
@@ -235,9 +271,14 @@ function scanInProcess(target, scan, options) {
     let result;
     const stop = () => child.kill();
     process.once('exit', stop);
+    const timer = setTimeout(() => {
+      stop();
+      reject(new Error('源码扫描超时'));
+    }, 300_000);
     child.once('message', (message) => { result = message; });
     child.once('error', reject);
     child.once('close', (code, signal) => {
+      clearTimeout(timer);
       process.off('exit', stop);
       if (code === 0 && result?.model) resolve(result.model);
       else reject(new Error(result?.error || `源码扫描中断（${signal || code}）`));
@@ -260,15 +301,13 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const isDot = parser.id === 'dot';
   const scanRoot = isFile ? path.dirname(abs) : abs;
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
-  const warnings = [];
-  const scan = isDot ? null : { files: scanSources(scanRoot, warnings), warnings };
+  const scan = isDot ? null : await analysisJob('scan', () => scanRoot);
   const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id + ':2';
-  const key = scan && !warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
+  const key = scan && !scan.warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
   const scanMs = performance.now() - t0;
 
   const readAt = performance.now();
-  let model = key ? store.getCachedModel(key) : null;
-  if (model && !externalDependenciesCurrent(model)) model = null;
+  let model = key ? await store.getCachedModelAsync(key) : null;
   const fromCache = !!model;
   const cacheReadMs = performance.now() - readAt;
   const parseAt = performance.now();
@@ -289,8 +328,12 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const saveAt = performance.now();
   modelCacheKeys.set(model, key);
   if (key && !fromCache && !model.warnings.length && !model._df?.failedFiles) {
-    const r = store.putCachedModel(key, model);
-    if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
+    try {
+      const r = await store.putCachedModelAsync(key, model);
+      if (!r.cached) console.log(`[缓存] 未缓存：${r.reason}`);
+    } catch (error) {
+      console.warn('[缓存] 解析缓存写入失败：', error.message);
+    }
   }
   const cacheWriteMs = performance.now() - saveAt;
   const loadMs = Math.round(performance.now() - t0);
@@ -480,32 +523,44 @@ async function readGitHeadFileText(projectRoot, relFile) {
 
 async function getOrBuildFlowchart(projectId, model, fn, opts = {}) {
   const { version = 'after', expandMacros = false, fnChange = 'existing', otherModel = null, otherFn = null,
-    otherSourceText = null, sourceRoot, otherSourceRoot } = opts;
+    persist = true, signal, ...flowOptions } = opts;
   const entryKey = `${fn.id}|${version}|${expandMacros ? 1 : 0}`;
-  const hash = flowchartCacheHash(model, fn, { version, expandMacros, fnChange, otherModel, otherFn, otherSourceText, sourceRoot, otherSourceRoot });
   const cache = loadProjectFlowchartCache(projectId);
-  const hit = cache.get(entryKey);
-  if (hit && hit.hash === hash && hit.data?.ok) {
-    return { ...hit.data, fn: { ...hit.data.fn, hasBefore: !!opts.hasBefore, hasAfter: !!opts.hasAfter }, cached: true };
-  }
-  const built = await buildFlowchart(model, fn, opts);
-  cache.set(entryKey, { hash, savedAt: Date.now(), data: built });
-  saveProjectFlowchartCache(projectId, cache);
-  return built;
+  let hit;
+  const { hash, data } = await analysisJob('flowchart', state => {
+    const previous = state.indexes || [];
+    const models = [model, otherFn ? otherModel : null].map((item, i) => {
+      if (!item) return null;
+      if (previous[i]?.deref() === item._index) return undefined;
+      const { root, parserId, files, includes, functions, externals, edges, headerSymbols, _sourceFiles, _sourceBuffers } = item;
+      return analysisModel({ root, parserId, files, includes, functions, externals, edges, headerSymbols, _sourceFiles, _sourceBuffers });
+    });
+    state.indexes = [model, otherFn ? otherModel : null].map(item => item && new WeakRef(item._index));
+    hit = cache.get(entryKey);
+    return { models, id: fn.id, opts: { version, expandMacros, fnChange, ...flowOptions }, cachedHash: hit?.hash };
+  }, { signal });
+  if (!data) return { ...hit.data, fn: { ...hit.data.fn, hasBefore: !!opts.hasBefore, hasAfter: !!opts.hasAfter }, cached: true };
+  cache.set(entryKey, { hash, savedAt: Date.now(), data });
+  if (persist) saveProjectFlowchartCache(projectId, cache);
+  return data;
 }
 
-function prewarmChangedFlowcharts(projectId, model, fnEntries, beforeModel = null, beforeSourceRoot = null) {
+function prewarmChangedFlowcharts(projectId, model, fnEntries, beforeModel = null, beforeSourceRoot = null, sourceRoot) {
   if (!projectId || !model || !Array.isArray(fnEntries) || !fnEntries.length) return;
-  if (beforeModel) gitBeforeSnapshotByProject.set(projectId, { beforeModel, beforePath: beforeSourceRoot || null });
+  if (beforeModel && !COMPARISON && PROJECT?.id === projectId) {
+    gitBeforeSnapshotByProject.clear();
+    gitBeforeSnapshotByProject.set(projectId, { beforeModel, beforePath: beforeSourceRoot || null });
+  }
   const list = fnEntries.slice(0, 25);
   setImmediate(async () => {
+    let dirty = false;
     for (const item of list) {
-      if (switching || PROJECT?.id !== projectId || MODEL !== model) return;
+      if (switching || PROJECT?.id !== projectId || (COMPARISON?.afterModel || MODEL) !== model) break;
       const fn = model._index?.byId?.get(item.id);
       if (!isFlowchartFunction(fn)) continue;
       const otherFn = beforeModel?._index?.byId?.get(item.id) || null;
       try {
-        await getOrBuildFlowchart(projectId, model, fn, {
+        const result = await getOrBuildFlowchart(projectId, model, fn, {
           version: 'after',
           expandMacros: false,
           hasBefore: isFlowchartFunction(otherFn),
@@ -514,12 +569,16 @@ function prewarmChangedFlowcharts(projectId, model, fnEntries, beforeModel = nul
           otherModel: otherFn ? beforeModel : null,
           otherFn,
           otherSourceRoot: beforeSourceRoot || undefined,
+          sourceRoot,
+          persist: false,
         });
+        dirty ||= !result.cached;
       } catch {
         /* 单个函数预生成失败不影响主流程 */
       }
       await new Promise((resolve) => setImmediate(resolve));
     }
+    if (dirty) saveProjectFlowchartCache(projectId, loadProjectFlowchartCache(projectId));
   });
 }
 
@@ -618,9 +677,12 @@ function reconcileManualVariables(model, projectId, list, savedPage) {
 }
 
 /** 加载完成后整体切换会话，工程标注仍以 project_id 为准。 */
-async function openTarget(targetPath, { first = false, selection, preservePage = false } = {}) {
+async function openTarget(targetPath, { first = false, selection, refreshCurrent } = {}) {
   const abs = path.resolve(targetPath);
-  const entry = fs.statSync(abs, { throwIfNoEntry: false });
+  const entry = await fs.promises.stat(abs).catch(error => {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  });
   if (!entry) throw new Error(`路径不存在：${abs}`);
   const isFile = entry.isFile();
   const label = path.basename(isFile ? path.dirname(abs) : abs) || abs;
@@ -636,6 +698,14 @@ async function openTarget(targetPath, { first = false, selection, preservePage =
     loaded = await loadTargetModel(abs, isFile, 'builtin', {});
   }
   const { model, fromCache, loadMs } = loaded;
+  // 同工程刷新期间照常接受写入。先在局部构建模型，发布前再检查会话并读最新存档。
+  if (refreshCurrent) {
+    refreshCurrent();
+    if (model.source !== 'dot' && loadManualNodes(PROJECT.id).some(item => item.kind === 'var')) {
+      await ensureAnalysis(model);
+      refreshCurrent();
+    }
+  }
   const project = store.upsertProject({
     path: abs,
     name: label,
@@ -644,12 +714,11 @@ async function openTarget(targetPath, { first = false, selection, preservePage =
   if (first) migrateLegacy(project);
 
   const list = loadManualNodes(project.id);
-  if (model.source !== 'dot' && list.some((item) => item.kind === 'var')) await ensureAnalysis(model);
+  if (!refreshCurrent && model.source !== 'dot' && list.some((item) => item.kind === 'var')) await ensureAnalysis(model);
   const pageKey = 'ui.last-view.' + project.id;
   const reconciled = store.transaction(() => {
     const savedPage = store.getSetting(pageKey);
-    const previousPage = preservePage && pageState ? { ...savedPage, ...pageState } : savedPage;
-    const result = reconcileManualVariables(model, project.id, list, previousPage);
+    const result = reconcileManualVariables(model, project.id, list, savedPage);
     if (result.overlay) {
       if (result.page) store.setSetting(pageKey, result.page);
       store.appendEvent(project.id, {
@@ -671,16 +740,18 @@ async function openTarget(targetPath, { first = false, selection, preservePage =
     store.setSetting('parser.active', selection.parserId);
     if (selection.parserId === 'clang-ast') store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
   });
-  sessionRevision++;
+  if (!refreshCurrent) sessionRevision++;
   root = abs;
   ROOT_LABEL = project.name;
   MODEL = model;
   parserFallback = fallback;
   S = st;
+  if (PROJECT?.id !== project.id) gitBeforeSnapshotByProject.clear();
   PROJECT = project;
   COMPARISON = null;
   overlay = ov;
-  pageState = preservePage && pageState ? reconciled.page : null;
+  if (!refreshCurrent) pageState = null;
+  else if (!reviewingPage(pageState)) pageState = reconciled.page;
 
   // 已有数据但还没钉过起点时，补一条 baseline：
   // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
@@ -695,12 +766,30 @@ async function openTarget(targetPath, { first = false, selection, preservePage =
   );
   console.log(`[存储] ${store.file} · 工程 #${project.id} ${project.isNew ? '(新建)' : ''}`);
   // Git 监听异步安装，不阻塞切换工程接口返回；同时后台预热已有变更标记的函数流程图
+  if (refreshCurrent) return { project, stats: st };
   void startGitWatch(abs, project.id);
   const prewarmEntries = Object.entries(ov.nodes || {})
     .filter(([, data]) => data && ['modified', 'added'].includes(data.change))
     .map(([id, data]) => ({ id, change: data.change }));
   if (prewarmEntries.length) prewarmChangedFlowcharts(project.id, model, prewarmEntries);
   return { project, stats: st };
+}
+
+let liveRefresh;
+function refreshLiveProject() {
+  const revision = sessionRevision;
+  if (liveRefresh?.revision === revision) return liveRefresh.pending;
+  const refresh = { revision };
+  liveRefresh = refresh;
+  refresh.pending = openTarget(root, { refreshCurrent() {
+    if (switching || sessionRevision !== revision) throw new Error('工程或比较会话已切换，请重试');
+  } }).then(result => {
+    comparisonPreview = null;
+    return result;
+  }).finally(() => {
+    if (liveRefresh === refresh) liveRefresh = null;
+  });
+  return refresh.pending;
 }
 
 /** 重新从库里载入 overlay 到内存镜像（清理孤儿标注后用） */
@@ -768,7 +857,8 @@ function viewSnapshot(view) {
 }
 
 function currentViewSnapshot() {
-  return pageState && !pageState.reviewing && !COMPARISON ? viewSnapshot(pageState) : undefined;
+  const page = !COMPARISON && (pageState && !reviewingPage(pageState) ? pageState : latestPage());
+  return page ? viewSnapshot(page) : undefined;
 }
 
 function emptyCanvasView(groupMode = 'file') {
@@ -961,9 +1051,10 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
     requestId = ++latestSnapshotRequest;
     const model = MODEL;
     if (model.parserId === 'dot') throw new Error('Git 源码变更查询需要打开 C 工程');
-    const comparison = await compareGitProject(scanRootFor(COMPARISON?.projectPath || root), {
+    const projectPath = COMPARISON?.projectPath || model.root;
+    const comparison = await compareGitProject(projectPath, {
       baseRef: q.get('baseRef') ?? undefined, targetRef: q.get('targetRef') ?? undefined,
-    }, { parserId: model.parserId, parserOptions: parserOptionsFor(model.parserId),
+    }, { parserId: model.parserId, parserOptions: parserOptionsFor(model.parserId, projectPath), runComparison: compareProjects,
       allowEmptyRefresh: !!query.id, deferUnchangedAnalysis: true });
     if (!sessionCurrent() || MODEL !== model || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
     if (requestId !== latestSnapshotRequest) throw new Error('较新的 Git 查询已开始，请使用最新查询的快照');
@@ -1018,19 +1109,19 @@ async function readMcpSource(q) {
   if (!model.files?.some((entry) => entry.rel === file)) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
-  let source = model._sourceBuffers?.get(file);
+  let source = await model._sourceBuffers?.getAsync(file);
   if (!source) {
-    const realRoot = fs.realpathSync(model.root);
-    const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
+    const realRoot = await fs.promises.realpath(model.root);
+    const realFile = await fs.promises.realpath(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
     const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
     const withinRoots = roots.some(root => {
       const rel = path.relative(root, realFile);
       return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
     });
-    if (!withinRoots || !fs.statSync(realFile).isFile()) {
+    if (!withinRoots || !(await fs.promises.stat(realFile)).isFile()) {
       throw new Error('源码文件必须位于当前工程或对照目录内');
     }
-    source = fs.readFileSync(realFile);
+    source = await fs.promises.readFile(realFile);
   }
   const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
   let decoded;
@@ -1131,6 +1222,38 @@ function fallbackCallerPaths(model, id, isNode, includePaths, excludePaths) {
     }
   }
   return [...roots].map(root => [root.id, ...root.path.map(step => step.id)]);
+}
+
+function collectNewlyReferencedVarsAndSources(gitModel, liveModel, fnIds, hidden, pathFilter) {
+  const functions = new Set(fnIds);
+  const refs = new Map();
+  const sources = new Set();
+  const visible = id => !hidden[id] && liveModel._index.byId.has(id) &&
+    !pathFilter?.excludePaths?.some(prefix => fileMatchesPathPrefix(fileOfNodeId(liveModel, id), prefix));
+  const outgoing = gitModel?._index?.outAdj;
+  const edges = outgoing ? fnIds.flatMap(id => outgoing.get(id) || []) : gitModel?.edges || [];
+  for (const edge of edges) {
+    if (edge.kind !== 'var' || edge.change !== 'added' || !functions.has(edge.from) || hidden[edge.from] || !visible(edge.to)) continue;
+    if (!refs.has(edge.to)) {
+      const { id, name, file, line } = liveModel._index.byId.get(edge.to);
+      refs.set(id, { id, name, file, line, via: edge.via, usedBy: [], writers: [] });
+    }
+    const ref = refs.get(edge.to);
+    if (ref.via !== edge.via) ref.via = '读写';
+    if (!ref.usedBy.includes(edge.from)) ref.usedBy.push(edge.from);
+  }
+  for (const ref of refs.values()) {
+    const writers = liveModel._df?.writers?.get(ref.id) ?? (gitModel._index?.inAdj?.get(ref.id) ?? gitModel.edges)
+      .filter(e => e.to === ref.id && e.kind === 'var' && e.change !== 'deleted' && ['写', '读写'].includes(e.via)).map(e => e.from);
+    for (const id of writers) {
+      if (!visible(id) || functions.has(id) || ref.writers.includes(id)) continue;
+      if (!sources.has(id) && sources.size >= 18) continue;
+      sources.add(id);
+      ref.writers.push(id);
+      if (ref.writers.length === 6) break;
+    }
+  }
+  return { varIds: [...refs.keys()], sourceWriterIds: [...sources], newlyReferencedVars: [...refs.values()] };
 }
 
 function changedFunctionScope(model, comparison, changes, isNode, pathFilter = null, { fallbackCallers = false } = {}) {
@@ -1249,9 +1372,8 @@ function composeMcpView(p, { chatClientId } = {}) {
     if (roots.length + functions.length > 80) throw new Error('入口路径与变更关系涉及超过 80 个函数，请分批选链，显式传 changedFunctionIds: [] 与所选 functionIds');
     vars = [...new Set([...vars, ...scope.variableIds])];
   }
-  const key = 'ui.last-view.' + PROJECT.id;
-  const saved = COMPARISON ? COMPARISON.composedPage || { roots: COMPARISON.roots, up: 0, down: 0 } : store.getSetting(key);
-  const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
+  const key = savedViewKey();
+  const before = latestPage();
   let prior = mode === 'add' ? before : null;
   if (prior && switchingComparison) {
     prior = {
@@ -1317,9 +1439,10 @@ function composeMcpView(p, { chatClientId } = {}) {
     });
     store.setSetting(key, page);
   });
-  pageState = page;
+  const review = reviewWriteResult();
+  if (!review.updatedWhileReviewing) pageState = page;
   broadcastChange('view.compose', 'ai', { page, reason });
-  return { ok: true, page, ...scope.details, eventId: page.revision };
+  return { ok: true, page, ...scope.details, ...review, eventId: page.revision };
 }
 
 function applyMcpTaskLabels({ items, merge = true }) {
@@ -1452,9 +1575,23 @@ const bookmarkEventPayload = (b) => ({
   up: b.up,
   down: b.down,
   group: !!b.group,
+  ...(b.groupMode === 'period' && { groupMode: b.groupMode }),
   vars: b.vars || [],
   expansions: b.expansions || [],
 });
+
+function saveBookmarkWithEvent(data, actor = 'user') {
+  return store.transaction(() => {
+    const prev = store.findBookmark(PROJECT.id, data.name);
+    const result = store.saveBookmark(PROJECT.id, data);
+    store.appendEvent(PROJECT.id, {
+      op: 'bookmark.save', actor, target: result.bookmark.name,
+      before: prev ? bookmarkEventPayload(prev) : null,
+      after: bookmarkEventPayload(result.bookmark),
+    });
+    return result;
+  });
+}
 
 /** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
 const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
@@ -1500,6 +1637,14 @@ function currentSession(req, allowSwitch = false) {
 
 function sessionConflict(res) {
   return json(res, { ok: false, error: '工程已切换，请刷新后重试' }, 409);
+}
+
+function responseSignal(res) {
+  const controller = new AbortController();
+  const closed = () => { if (!res.writableEnded) controller.abort(); };
+  if (res.destroyed) closed();
+  else res.once('close', closed);
+  return controller.signal;
 }
 
 /**
@@ -1668,13 +1813,18 @@ async function buildView(
   previous = null
 ) {
   const projectId = PROJECT.id;
+  const revision = sessionRevision;
   const model = MODEL;
+  const assertCurrent = () => {
+    if (revision !== sessionRevision) throw new Error('工程已切换，请刷新后重试');
+  };
+  const layoutElk = (...args) => analysisJob('layout', () => args, { signal: varSel.signal });
   const requestedRoots = Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [];
   const mustAnalyzeForView = Boolean(varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')));
   const needCounter = Boolean((requestedRoots.length || varSel.expansions?.length) && needsCounterAnalysis(model));
   if (!COMPARISON && (mustAnalyzeForView || (needCounter && (varSel.groupMode === 'period' || (model.files?.length || 0) <= 40)))) {
     await ensureAnalysis(model);
-    if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
+    assertCurrent();
   } else if (!COMPARISON && needCounter && !model._df) {
     // 大工程首帧恢复普通视图时异步预热全工程数据流分析，避免冷启动卡顿数秒。
     void ensureAnalysis(model).catch(() => {});
@@ -1691,7 +1841,7 @@ async function buildView(
     .filter((s) => model._index.byId.has(s.root) && model._index.byId.get(s.root).kind !== 'var'));
   const scopes = [...roots.map((root) => ({ root, up, down })), ...cleanExpansions];
   for (const scope of scopes) {
-    const part = subgraph(MODEL, scope.root, { up: scope.up, down: scope.down,
+    const part = subgraph(model, scope.root, { up: scope.up, down: scope.down,
       maxNodes: perRoot, includeVariables: !!COMPARISON });
     truncated ||= part.truncated;
     for (const n of part.nodes) if (!nodeMap.has(n.id)) nodeMap.set(n.id, n);
@@ -1714,7 +1864,7 @@ async function buildView(
   // 局部范围补当前已显示节点之间的关系，不带入邻接函数。
   const allowedIds = new Set(nodeMap.keys());
   for (const scope of cleanExpansions) {
-    const part = subgraph(MODEL, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
+    const part = subgraph(model, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
     for (const e of part.edges) {
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
       if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
@@ -1755,7 +1905,7 @@ async function buildView(
   // 右侧面板里勾选的全局变量：补节点 + 视图内函数对它的引用边
   if (wantVars.size) {
     const ids = new Set(clean.map((n) => n.id));
-    const df = MODEL._df;
+    const df = model._df;
     for (const id of wantVars) {
       if (ids.has(id) || skipVars.has(id) || viewOverlay.deleted.nodes[id]) continue;
       const indexed = model._index.byId.get(id);
@@ -1793,7 +1943,7 @@ async function buildView(
       }
       if (seen.has(k)) return;
       seen.add(k);
-      const def = (df && df.byId.get(varId)) || MODEL._index.byId.get(varId);
+      const def = (df && df.byId.get(varId)) || model._index.byId.get(varId);
       const edge = {
         from: fnId,
         to: varId,
@@ -1811,7 +1961,7 @@ async function buildView(
         for (const fnId of df.readers.get(id) || []) pushVarEdge(fnId, id, '读');
       }
     } else {
-      for (const e of MODEL.edges) {
+      for (const e of model.edges) {
         if (e.kind !== 'var' || !wantVars.has(e.to)) continue;
         pushVarEdge(e.from, e.to, e.via || '变量');
       }
@@ -1824,18 +1974,19 @@ async function buildView(
     const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
     const emptyLayout = previous ? await layoutElk([], [], { group, groupMode, rootLabel: ROOT_LABEL, previous })
       : emptyCanvasView(groupMode);
+    assertCurrent();
     return { ...emptyLayout, root: g.root, roots, groupMode,
       empty: true, projectId, expansions: cleanExpansions, comparison: COMPARISON ? { ...comparisonInfo(), shownNodes: 0, truncated } : null };
   }
 
   // 数据流（按需展开）：把相关的函数也拉进视图，否则只有连线看不到两端
   if (dfNode) {
-    const flows = dataflowOf(MODEL, dfNode);
+    const flows = dataflowOf(model, dfNode);
     const ids = new Set(clean.map((n) => n.id));
     for (const f of flows) {
       for (const id of [f.from, f.to]) {
         if (ids.has(id) || viewOverlay.deleted.nodes[id]) continue;
-        const fn = MODEL._index.byId.get(id);
+        const fn = model._index.byId.get(id);
         if (!fn) continue;
         const { bodyTokens, ...rest } = fn;
         clean.push(rest);
@@ -1879,7 +2030,7 @@ async function buildView(
   }
   if (COMPARISON) {
     const ids = new Set(clean.map((n) => n.id));
-    viewEdges = [...MODEL.edges, ...(MODEL.headerEdges || []).map((e) => ({ ...e, change: 'existing' })),
+    viewEdges = [...model.edges, ...(model.headerEdges || []).map((e) => ({ ...e, change: 'existing' })),
       ...viewEdges.filter((e) => e.manual)].filter((e) => ids.has(e.from) && ids.has(e.to));
   }
   viewEdges = viewEdges.filter((e) => !viewOverlay.deleted.edges[edgeKeyOf(e)])
@@ -1906,6 +2057,7 @@ async function buildView(
   }
   const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
   const laid = await layoutElk(clean, viewEdges, { group, groupMode, rootLabel: ROOT_LABEL, previous });
+  assertCurrent();
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -2079,7 +2231,7 @@ export const server = http.createServer(async (req, res) => {
       try {
         const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
         const cfg = normalizeAiConfig(p, saved);
-        return json(res, await listAiModels(cfg));
+        return json(res, await listAiModels(cfg, { signal: responseSignal(res) }));
       } catch (err) {
         return bad(res, err.message);
       }
@@ -2092,7 +2244,7 @@ export const server = http.createServer(async (req, res) => {
       try {
         const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
         const cfg = normalizeAiConfig(p, saved);
-        return json(res, await testAiConnection(cfg));
+        return json(res, await testAiConnection(cfg, { signal: responseSignal(res) }));
       } catch (err) {
         return bad(res, err.message);
       }
@@ -2117,6 +2269,7 @@ export const server = http.createServer(async (req, res) => {
             .map((m) => ({
               role: m.role,
               text: String(m.text || '').slice(0, 8000),
+              ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
               ...(Array.isArray(m.tools) && m.tools.length ? {
                 tools: m.tools.slice(0, 20).map((tl) => ({
@@ -2182,6 +2335,7 @@ export const server = http.createServer(async (req, res) => {
         const compacted = await compactConversation({
           config: saved,
           messages: Array.isArray(p?.messages) ? p.messages : [],
+          signal: responseSignal(res),
         });
         return json(res, compacted);
       } catch (err) {
@@ -2211,7 +2365,13 @@ export const server = http.createServer(async (req, res) => {
       req.on('close', cancel);
       res.on('close', cancel);
       const sendEvent = (ev) => {
-        if (!res.writableEnded) res.write(JSON.stringify(ev) + '\n');
+        if (res.writableEnded || res.destroyed) return;
+        if (res.writableLength > 1024 * 1024) {
+          cancel();
+          res.destroy();
+          return;
+        }
+        res.write(JSON.stringify(ev) + '\n');
       };
 
       const chatProjectId = PROJECT.id;
@@ -2225,7 +2385,7 @@ export const server = http.createServer(async (req, res) => {
         }
       };
 
-      const resolveSymbols = (model, rawList, kind) => {
+      const resolveSymbols = (model, rawList, kind, matchPath) => {
         const resolved = [];
         const seen = new Set();
         const ambiguous = [];
@@ -2248,8 +2408,9 @@ export const server = http.createServer(async (req, res) => {
               if (!seen.has(prefixed.id)) { seen.add(prefixed.id); resolved.push(prefixed.id); }
               continue;
             }
-            const byName = (model.variables || []).filter(v => !overlay.deleted.nodes[v.id] &&
+            let byName = (model.variables || []).filter(v => !overlay.deleted.nodes[v.id] &&
               (v.name === clean || v.name.toLowerCase() === clean.toLowerCase()));
+            if (byName.length > 1 && matchPath) byName = byName.filter(matchPath);
             if (byName.length === 1) {
               if (!seen.has(byName[0].id)) { seen.add(byName[0].id); resolved.push(byName[0].id); }
             } else if (byName.length > 1) {
@@ -2261,6 +2422,7 @@ export const server = http.createServer(async (req, res) => {
               const lower = clean.toLowerCase();
               matches = (model.functions || []).filter(n => !n.external && !overlay.deleted.nodes[n.id] && n.name.toLowerCase() === lower);
             }
+            if (matches.length > 1 && matchPath) matches = matches.filter(matchPath);
             if (matches.length === 1) {
               if (!seen.has(matches[0].id)) { seen.add(matches[0].id); resolved.push(matches[0].id); }
             } else if (matches.length > 1) {
@@ -2271,7 +2433,7 @@ export const server = http.createServer(async (req, res) => {
         return { resolved, ambiguous, notFound };
       };
 
-      const collectCanvasLabelContext = (model, page) => {
+      const collectCanvasLabelContext = async (model, page) => {
         const roots = (page?.roots || []).map((id) => remapLegacyExt(id, model)).filter((id) => model._index.byId.has(id));
         const expansions = normalizeExpansions((page?.expansions || [])
           .map((s) => ({ ...s, root: remapLegacyExt(s.root, model) }))
@@ -2306,7 +2468,8 @@ export const server = http.createServer(async (req, res) => {
           return { canvasNodeCount: 0, canvasEdges: [], suggestedLabels: [], commentTasks: [] };
         }
         const detected = model.parserId === 'dot' ? { suggestions: [], tasks: [] }
-          : detectTasks(model, null, { onlyIds: nodeIds });
+          : await analyzeTasks(model, { onlyIds: nodeIds });
+        assertActive();
         const canvasEdges = [...edgeMap.values()].slice(0, 60).map((e) => {
           const key = annotationEdgeKey(overlay.edges, e, model);
           const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
@@ -2547,7 +2710,6 @@ export const server = http.createServer(async (req, res) => {
         return branches.length > 1 ? branches : [];
       };
 
-      const isReviewing = () => (Number(p.at) > 0) || Boolean(pageState?.reviewing || Number(pageState?.at) > 0);
       const executeAiTool = async (name, args) => {
         assertActive();
         if (name === 'get_git_changes') {
@@ -2576,6 +2738,10 @@ export const server = http.createServer(async (req, res) => {
             id: c.id, name: c.name, file: c.file, line: c.line, change: c.change,
           }));
           const groupModel = snap?.comparison?.afterModel || snap?.comparison?.model || MODEL;
+          if (snap.comparison.model) await ensureAnalysis(groupModel);
+          assertActive();
+          const { newlyReferencedVars } = collectNewlyReferencedVarsAndSources(snap.comparison.model, groupModel,
+            changedFunctions.map(f => f.id), overlay.deleted.nodes);
           const groups = changedFunctions.length > 1
             ? splitChangedGroups(groupModel, changedFunctions.map(f => f.id), changedVars.map(v => v.id))
             : [];
@@ -2590,6 +2756,7 @@ export const server = http.createServer(async (req, res) => {
             changedFiles,
             changedFunctions,
             changedVars,
+            newlyReferencedVars: newlyReferencedVars.slice(0, 20),
             ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ...(groups.length > 1 ? {
               isolatedGroupCount: groups.length,
@@ -2597,7 +2764,8 @@ export const server = http.createServer(async (req, res) => {
                 index: g.index,
                 name: g.name,
                 functions: g.fnIds.slice(0, 12),
-                vars: g.varIds.map((id) => id.replace(/^var::/, '')),
+                vars: [...new Set([...g.varIds, ...newlyReferencedVars.filter(v => v.usedBy.some(id => g.fnIds.includes(id))).map(v => v.id)])]
+                  .map((id) => id.replace(/^var::/, '')),
                 tasks: g.taskIds.slice(0, 8),
               })),
             } : {}),
@@ -2636,7 +2804,6 @@ export const server = http.createServer(async (req, res) => {
           };
         }
         if (name === 'remove_from_canvas') {
-          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再修改画布' };
           if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能局部移除节点' };
           const excludePaths = normalizePathPrefixes(args.excludePaths);
           const rawFns = Array.isArray(args.functions) ? args.functions : [];
@@ -2656,9 +2823,8 @@ export const server = http.createServer(async (req, res) => {
           const shouldRemove = (id) => removeIdSet.has(id) ||
             (excludePaths.length > 0 && excludePaths.some((pref) => fileMatchesPathPrefix(fileOfNodeId(MODEL, id), pref)));
 
-          const key = 'ui.last-view.' + PROJECT.id;
-          const saved = store.getSetting(key);
-          const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
+          const key = savedViewKey();
+          const before = latestPage();
           if (!before || (!(before.roots?.length) && !(before.expansions?.length))) {
             return { ok: false, error: '当前画布为空，没有可移除的节点' };
           }
@@ -2702,6 +2868,7 @@ export const server = http.createServer(async (req, res) => {
             up: 0,
             down: 0,
             vars: nextVars,
+            empty: !nextRoots.length && !nextExpansions.length,
             selected: before.selected && !shouldRemove(before.selected) ? before.selected : null,
             selectedEdge: null,
             at: 0,
@@ -2718,14 +2885,16 @@ export const server = http.createServer(async (req, res) => {
             });
             store.setSetting(key, nextPage);
           });
-          pageState = nextPage;
-          broadcastChange('view.compose', 'ai', { page: nextPage, reason }, req.headers['x-callgraph-client']);
+          const review = reviewWriteResult();
+          if (!review.updatedWhileReviewing) pageState = nextPage;
+          broadcastChange('view.compose', 'ai', { page: nextPage, reason });
           return {
             ok: true,
             removedCount: removedIds.length,
             removed: removedIds.slice(0, 30),
             remainingCount: keptIds.length,
             roots: nextRoots.slice(0, 20),
+            ...review,
           };
         }
         if (name === 'find_symbols') {
@@ -2737,11 +2906,12 @@ export const server = http.createServer(async (req, res) => {
             const tasks = activeModel.parserId === 'dot' ? [] : projectTasks(activeModel).slice(0, 20).map(t => ({
               id: t.id, name: t.name, kind: t.kind, periodUs: t.us,
             }));
-            const labelCtx = collectCanvasLabelContext(activeModel, pageState);
+            const page = latestPage();
+            const labelCtx = await collectCanvasLabelContext(activeModel, page);
             return {
               ok: true,
               project: PROJECT.name,
-              canvasRoots: (pageState?.roots || []).slice(0, 20),
+              canvasRoots: (page?.roots || []).slice(0, 20),
               tasks,
               ...labelCtx,
             };
@@ -2782,7 +2952,8 @@ export const server = http.createServer(async (req, res) => {
           const src = await readMcpSource(q);
           assertActive();
           const fnNode = MODEL._index.byId.get(resolved[0]);
-          const headerInfo = fnNode ? readFunctionHeaderComment(MODEL, fnNode) : { comment: '', period: null };
+          const headerInfo = fnNode ? await analyzeTasks(MODEL, { headerId: fnNode.id }) : { comment: '', period: null };
+          assertActive();
           const lines = String(src.source || '').split('\n');
           const kept = [];
           let chars = 0;
@@ -2811,7 +2982,6 @@ export const server = http.createServer(async (req, res) => {
           };
         }
         if (name === 'add_to_canvas') {
-          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再修改画布' };
           const includeTasks = args.includeTasks !== false;
           const includePaths = normalizePathPrefixes(args.includePaths);
           const excludePaths = normalizePathPrefixes(args.excludePaths);
@@ -2826,12 +2996,19 @@ export const server = http.createServer(async (req, res) => {
           const detectedNodeChanges = new Map();
           const detectedAddedEdges = [];
 
-          if (args.fromGit) {
-            const needFreshWorktree = !COMPARISON || COMPARISON.git?.targetRef !== 'WORKTREE';
+          const custom = Array.isArray(args.groups);
+          if (custom && (args.groups.length < 2 || args.groups.some(g => !g || typeof g.name !== 'string' || !g.name.trim() ||
+              !Array.isArray(g.functions) || !g.functions.length || (g.vars !== undefined && !Array.isArray(g.vars))))) {
+            return { ok: false, error: '请给至少两个分组分别指定书签名和函数列表' };
+          }
+          if (args.fromGit || args.snapshotId || (custom && COMPARISON)) {
+            const needFreshWorktree = args.snapshotId || !COMPARISON || (args.fromGit && COMPARISON.git?.targetRef !== 'WORKTREE');
             if (needFreshWorktree) {
               let snap = null;
               if (typeof args.snapshotId === 'string' && args.snapshotId.trim()) {
-                try { snap = getMcpChangeSnapshot(args.snapshotId.trim()); } catch { snap = null; }
+                try { snap = getMcpChangeSnapshot(args.snapshotId.trim()); } catch (err) {
+                  if (!args.fromGit) throw err;
+                }
               }
               if (!snap) {
                 const q = new URLSearchParams({ limit: '80', baseRef: 'HEAD', targetRef: 'WORKTREE' });
@@ -2846,6 +3023,7 @@ export const server = http.createServer(async (req, res) => {
               if (COMPARISON) snapshotId = snap.id;
               targetModel = snap.comparison.model;
             }
+            gitComparison ??= COMPARISON;
             const hidden = (snapshotId ? comparisonBase?.overlay ?? overlay : overlay).deleted.nodes;
             const directFns = (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && n.change !== 'existing');
             const impactFns = directFns.length ? directFns : (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && (n.impact || n.macroImpact || n.periodImpact));
@@ -2860,28 +3038,20 @@ export const server = http.createServer(async (req, res) => {
             // 普通画布要从同一份工作区源码解析调用边；符号 ID 未变时，调用和数据流也可能已更新。
             if (!COMPARISON && gitComparison) {
               assertActive();
-              switching = true;
-              try {
-                await openTarget(root, { preservePage: true });
-                comparisonPreview = null;
-                if (PROJECT?.id === chatProjectId) expectedSession = sessionRevision;
-              } finally {
-                switching = false;
-              }
+              await refreshLiveProject();
               assertActive();
-              if ((defaultVarIds.length || (Array.isArray(args.vars) && args.vars.length)) && !MODEL._df && MODEL.source !== 'dot') {
-                await ensureAnalysis(MODEL);
-                assertActive();
-              }
               targetModel = MODEL;
               defaultFnIds = defaultFnIds.filter((id) => MODEL._index?.byId?.has(id));
-              defaultVarIds = defaultVarIds.filter((id) => MODEL._index?.byId?.has(id) || MODEL._df?.byId?.has(id));
             }
-          } else if (Array.isArray(args.vars) && args.vars.length && !COMPARISON && MODEL.source !== 'dot') {
-            await ensureAnalysis(MODEL);
-            assertActive();
-            targetModel = MODEL;
           }
+          const groupModel = gitComparison?.afterModel || COMPARISON?.afterModel || MODEL;
+          if (defaultVarIds.length || args.vars?.length || args.groups?.some(g => g.vars?.length) ||
+              gitComparison?.model?.edges.some(e => e.kind === 'var' && e.change === 'added')) {
+            if (!COMPARISON && MODEL.source !== 'dot') await ensureAnalysis(MODEL);
+            if (groupModel !== MODEL) await ensureAnalysis(groupModel);
+            assertActive();
+          }
+          defaultVarIds = defaultVarIds.filter(id => targetModel._index.byId.has(id));
 
           assertActive();
           const hasExplicitFns = Array.isArray(args.functions) && args.functions.length > 0;
@@ -2891,30 +3061,31 @@ export const server = http.createServer(async (req, res) => {
             if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(file, p))) return false;
             return true;
           });
-          const fnRes = hasExplicitFns ? resolveSymbols(targetModel, args.functions, 'fn') : { resolved: filterByPath(defaultFnIds), ambiguous: [], notFound: [] };
-          // 多车型同名函数消歧：若提供了 includePaths / excludePaths，自动过滤重名候选。
-          if (hasExplicitFns && fnRes.ambiguous.length && (includePaths.length || excludePaths.length)) {
-            const stillAmbig = [];
-            for (const item of fnRes.ambiguous) {
-              const filtered = item.candidates.filter((id) => {
-                const f = fileOfNodeId(targetModel, id);
-                if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(f, p))) return false;
-                if (includePaths.length && !includePaths.some((p) => fileMatchesPathPrefix(f, p))) return false;
-                return true;
-              });
-              if (filtered.length === 1) {
-                if (!fnRes.resolved.includes(filtered[0])) fnRes.resolved.push(filtered[0]);
-              } else {
-                stillAmbig.push(filtered.length ? { ...item, candidates: filtered } : item);
-              }
+          const resolveGroupSymbols = (items, kind) => {
+            const res = resolveSymbols(targetModel, items, kind, node =>
+              !excludePaths.some(prefix => fileMatchesPathPrefix(node.file, prefix)) &&
+              (!includePaths.length || includePaths.some(prefix => fileMatchesPathPrefix(node.file, prefix))));
+            res.resolved = filterByPath(res.resolved);
+            return res;
+          };
+          const explicitGroups = [];
+          for (const g of args.groups || []) {
+            const fns = resolveGroupSymbols(g.functions, 'fn'), vars = resolveGroupSymbols(g.vars, 'var');
+            if (!fns.resolved.length || fns.ambiguous.length || vars.ambiguous.length || fns.notFound.length || vars.notFound.length) {
+              return { ok: false, error: '分组符号无法确定：' + g.name, ambiguous: [...fns.ambiguous, ...vars.ambiguous],
+                notFound: [...fns.notFound, ...vars.notFound] };
             }
-            fnRes.ambiguous = stillAmbig;
+            const name = g.name.trim().slice(0, 60);
+            if (explicitGroups.some(group => group.name === name)) return { ok: false, error: '分组书签名称重复：' + name };
+            explicitGroups.push({ name, fnIds: fns.resolved, varIds: vars.resolved, taskNames: [] });
           }
-          const varRes = hasExplicitVars ? resolveSymbols(targetModel, args.vars, 'var') : { resolved: defaultVarIds, ambiguous: [], notFound: [] };
-          let actualFnIds = fnRes.resolved.slice(0, 80);
-          const varIds = varRes.resolved.slice(0, 40);
+          const fnRes = hasExplicitFns ? resolveGroupSymbols(args.functions, 'fn') : { resolved: filterByPath(defaultFnIds), ambiguous: [], notFound: [] };
+          const varRes = hasExplicitVars ? resolveGroupSymbols(args.vars, 'var') : { resolved: filterByPath(defaultVarIds), ambiguous: [], notFound: [] };
+          let actualFnIds = custom ? [...new Set(explicitGroups.flatMap(g => g.fnIds))] : fnRes.resolved.slice(0, 80);
+          const varIds = custom ? [...new Set(explicitGroups.flatMap(g => g.varIds))] : varRes.resolved.slice(0, 40);
           // 支持仅追加全局变量到已有画布
-          const pureVars = !actualFnIds.length && varIds.length > 0 && !args.fromGit && (pageState?.roots?.length > 0);
+          const currentPage = latestPage();
+          const pureVars = !actualFnIds.length && varIds.length > 0 && !args.fromGit && (currentPage?.roots?.length > 0);
           if (!actualFnIds.length && !pureVars) {
             return {
               ok: false,
@@ -2925,10 +3096,9 @@ export const server = http.createServer(async (req, res) => {
               notFound: [...fnRes.notFound, ...varRes.notFound],
             };
           }
-          const mode = args.mode === 'replace' || args.mode === 'add'
+          const mode = custom ? 'replace' : args.mode === 'replace' || args.mode === 'add'
             ? args.mode
-            : (args.fromGit ? 'replace' : 'add');
-          const groupModel = gitComparison?.afterModel || MODEL;
+            : (args.fromGit || (typeof args.bookmarkName === 'string' && args.bookmarkName.trim()) ? 'replace' : 'add');
           // 安全拦截：检测到共通/修改函数的上游横跨多个车型或目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
           if (!COMPARISON && includeTasks && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
             const branches = summarizeVehicleBranches(groupModel, actualFnIds);
@@ -2941,25 +3111,45 @@ export const server = http.createServer(async (req, res) => {
               };
             }
           }
-          const splitGroups = (!COMPARISON && !pureVars && args.fromGit && args.splitByGroup !== false && !hasExplicitFns && actualFnIds.length > 1)
+          const splitGroups = custom ? explicitGroups : (!COMPARISON && !pureVars && args.fromGit && args.splitByGroup !== false && !hasExplicitFns && actualFnIds.length > 1)
             ? splitChangedGroups(groupModel, actualFnIds, varIds)
             : [];
-          const activeGroup = splitGroups.length > 1 ? splitGroups[0] : null;
-          const activeFnsForCanvas = activeGroup ? activeGroup.fnIds : actualFnIds;
-          const activeVarsForCanvas = activeGroup ? activeGroup.varIds : varIds;
+          const grouped = splitGroups.length > 1;
+          const scopes = grouped ? splitGroups : [{ name: '', fnIds: actualFnIds, varIds }];
+          const pathFilter = { includePaths, excludePaths };
+          const hidden = (snapshotId ? comparisonBase?.overlay ?? overlay : overlay).deleted.nodes;
+          const isNode = id => targetModel._index.byId.has(id) && !hidden[id] && !targetModel._index.byId.get(id).external;
+          const assignedFns = new Set(actualFnIds);
+          for (const g of scopes) {
+            const refs = collectNewlyReferencedVarsAndSources(gitComparison?.model, COMPARISON ? groupModel : MODEL, g.fnIds, hidden, pathFilter);
+            g.varIds = [...new Set([...g.varIds, ...refs.varIds])];
+            g.sourceWriterIds = refs.sourceWriterIds.filter(id => !assignedFns.has(id));
+            if (!grouped) continue;
+            const withinGroup = id => !assignedFns.has(id) || g.fnIds.includes(id);
+            const trace = includeTasks ? changedFunctionScope(groupModel, null, g.fnIds, isNode, pathFilter, { fallbackCallers: true }) : null;
+            const roots = [...(trace?.taskRoots || [])].filter(withinGroup);
+            g.roots = roots.length ? roots : g.fnIds;
+            g.functions = [...new Set([...(trace?.functionIds || g.fnIds), ...g.sourceWriterIds])]
+              .filter(id => withinGroup(id) && !g.roots.includes(id));
+            if (g.roots.length + g.functions.length > 80) return { ok: false, error: '分组超过 80 个函数：' + g.name };
+          }
+          const active = scopes[0];
+          const activeGroup = grouped ? active : null;
+          const activeFnsForCanvas = active.fnIds;
+          const activeVarsForCanvas = active.varIds;
           const composePayload = pureVars
-            ? { mode: 'add', roots: pageState.roots.slice(0, 1), changedFunctionIds: [], vars: varIds, up: 0, down: 0, reason: reason || 'AI 加入全局变量到画布' }
+            ? { mode: 'add', roots: currentPage.roots.slice(0, 1), changedFunctionIds: [], vars: varIds, up: 0, down: 0, reason: reason || 'AI 加入全局变量到画布' }
             : {
               mode,
               ...(snapshotId ? { snapshotId } : {}),
               ...(includePaths.length ? { includePaths } : {}),
               ...(excludePaths.length ? { excludePaths } : {}),
-              ...(includeTasks
-                ? { changedFunctionIds: activeFnsForCanvas, functionIds: [], fallbackCallers: true }
-                : { roots: activeFnsForCanvas, changedFunctionIds: [] }),
+              ...(grouped ? { roots: active.roots, functionIds: active.functions, changedFunctionIds: [] }
+                : includeTasks ? { changedFunctionIds: activeFnsForCanvas, functionIds: active.sourceWriterIds, fallbackCallers: true }
+                : { roots: activeFnsForCanvas, functionIds: active.sourceWriterIds, changedFunctionIds: [] }),
               vars: activeVarsForCanvas,
-              up,
-              down,
+              up: custom ? 0 : up,
+              down: custom ? 0 : down,
               reason: reason || (activeGroup ? `AI 按独立模块拆图（当前：${activeGroup.name}）` : args.fromGit ? 'AI 加入 Git 改动链路' : 'AI 加入函数到画布'),
             };
           let composed;
@@ -2974,6 +3164,7 @@ export const server = http.createServer(async (req, res) => {
                 mode,
                 ...(snapshotId ? { snapshotId } : {}),
                 roots: actualFnIds,
+                functionIds: active.sourceWriterIds,
                 changedFunctionIds: [],
                 vars: activeVarsForCanvas,
                 up: Math.min(up, 1),
@@ -2991,41 +3182,26 @@ export const server = http.createServer(async (req, res) => {
             ...(composed.page.roots || []),
             ...(composed.page.expansions || []).map((s) => s.root),
           ]);
-          const bmPathFilter = (includePaths.length || excludePaths.length) ? { includePaths, excludePaths } : null;
-          if (!COMPARISON && splitGroups.length > 1) {
+          if (grouped) {
             const groupMode = composed.page.groupMode || 'file';
-            const isNode = (id) => typeof id === 'string' && !id.startsWith('ext::') &&
-              !MODEL._index.byId.get(id)?.external && !overlay.deleted.nodes[id] && MODEL._index.byId.has(id);
-            for (const g of splitGroups) {
-              try {
-                let bmRoots = g.fnIds;
-                let bmExpansions = g.fnIds.slice(1).map((r) => ({ root: r, up: 0, down: 0 }));
-                let bmVars = g.varIds;
-                if (includeTasks) {
-                  const sc = changedFunctionScope(MODEL, null, g.fnIds, isNode, bmPathFilter, { fallbackCallers: true });
-                  const rList = sc.taskRoots.size ? [...sc.taskRoots] : g.fnIds;
-                  const fList = [...sc.functionIds].filter((fid) => !rList.includes(fid));
-                  bmRoots = rList;
-                  bmExpansions = normalizeExpansions([
-                    ...rList.slice(1).map((r) => ({ root: r, up: 0, down: 0 })),
-                    ...fList.map((r) => ({ root: r, up: 0, down: 0 })),
-                  ]);
-                  bmVars = [...new Set([...g.varIds, ...sc.variableIds])];
-                }
-                const bmName = includePaths.length && !g.name.toLowerCase().includes(includePaths[0])
+            store.transaction(() => {
+              for (const g of splitGroups) {
+                const bmRoots = g.roots, bmVars = g.varIds;
+                const bmExpansions = normalizeExpansions([...bmRoots.slice(1), ...g.functions].map(root => ({ root, up: 0, down: 0 })));
+                const bmName = !custom && includePaths.length && !g.name.toLowerCase().includes(includePaths[0])
                   ? `${includePaths.join('+')} · ${g.name}`.slice(0, 60)
                   : g.name;
                 for (const id of [...bmRoots, ...bmExpansions.map((s) => s.root)]) allGroupCanvasIds.add(id);
-                const savedBm = store.saveBookmark(PROJECT.id, {
+                const savedBm = saveBookmarkWithEvent({
                   name: bmName,
                   roots: bmRoots,
-                  up,
-                  down,
+                  up: composed.page.up,
+                  down: composed.page.down,
                   group: composed.page.group ?? true,
                   groupMode,
                   vars: bmVars,
                   expansions: bmExpansions,
-                });
+                }, 'ai');
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -3033,12 +3209,12 @@ export const server = http.createServer(async (req, res) => {
                   vars: bmVars.map((id) => id.replace(/^var::/, '')),
                   tasks: g.taskNames,
                 });
-              } catch { /* 单个分组书签失败不影响其他分组 */ }
-            }
+              }
+            });
           } else if (!COMPARISON && typeof args.bookmarkName === 'string' && args.bookmarkName.trim()) {
             const bmName = args.bookmarkName.trim().slice(0, 60);
             try {
-              const savedBm = store.saveBookmark(PROJECT.id, {
+              const savedBm = saveBookmarkWithEvent({
                 name: bmName,
                 roots: composed.page.roots || [],
                 up: composed.page.up ?? 0,
@@ -3047,13 +3223,14 @@ export const server = http.createServer(async (req, res) => {
                 groupMode: composed.page.groupMode || 'file',
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
-              });
+              }, 'ai');
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
+          if (createdBookmarks.length) broadcastChange('bookmark.save', 'ai', { projectId: PROJECT.id });
           // 组图成功后再仅对本次选入画布/书签的变更节点与新增连线写入变更分类（避免未选节点或报错时误写标注）。
           if (!COMPARISON && args.fromGit && (detectedNodeChanges.size || detectedAddedEdges.length)) {
-            const scopedNodeIds = new Set([...allGroupCanvasIds, ...actualFnIds, ...varIds, ...(composed.page.vars || [])]);
+            const scopedNodeIds = new Set([...allGroupCanvasIds, ...actualFnIds, ...scopes.flatMap(g => g.varIds), ...(composed.page.vars || [])]);
             store.transaction(() => {
               overlay.nodes = overlay.nodes || {};
               overlay.edges = overlay.edges || {};
@@ -3079,7 +3256,9 @@ export const server = http.createServer(async (req, res) => {
           let autoTaskLabels = 0;
           if (!COMPARISON && includeTasks) {
             try {
-              const detected = detectTasks(MODEL, null, allGroupCanvasIds.size ? { onlyIds: allGroupCanvasIds } : {});
+              const labelModel = MODEL;
+              const detected = await analyzeTasks(labelModel, { onlyIds: allGroupCanvasIds });
+              assertActive();
               const taskItems = [];
               const seenEdge = new Set();
               for (const s of detected.suggestions || []) {
@@ -3090,14 +3269,14 @@ export const server = http.createServer(async (req, res) => {
                 seenEdge.add(s.edgeKey);
                 taskItems.push({ edgeKey: s.edgeKey, preset: 'task', text: s.text });
               }
-              if (taskItems.length) {
+              if (taskItems.length && MODEL === labelModel) {
                 const applied = applyMcpTaskLabels({ items: taskItems, merge: true });
                 autoTaskLabels = applied.edgeKeys?.length || 0;
               }
             } catch { /* 自动 TASK 线段标签不影响主组图结果 */ }
           }
           // 后台为有变更的函数预生成并保存流程图（带修改前后颜色对比）
-          if (!COMPARISON && gitComparison) {
+          if (sessionCurrent() && !COMPARISON && gitComparison) {
             const changedEntries = actualFnIds
               .filter((id) => ['modified', 'added'].includes(detectedNodeChanges.get(id)))
               .map((id) => ({ id, change: detectedNodeChanges.get(id) }));
@@ -3108,7 +3287,7 @@ export const server = http.createServer(async (req, res) => {
           return {
             ok: true,
             editable: !COMPARISON,
-            addedCount: actualFnIds.length + varIds.length,
+            addedCount: new Set([...actualFnIds, ...scopes.flatMap(g => [...g.varIds, ...g.sourceWriterIds])]).size,
             autoTaskLabels,
             ...(createdBookmarks.length ? { bookmarks: createdBookmarks, activeBookmark: createdBookmarks[0].name } : {}),
             roots: composed.page.roots.slice(0, 30),
@@ -3117,15 +3296,17 @@ export const server = http.createServer(async (req, res) => {
             ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
             notFound: [...fnRes.notFound, ...varRes.notFound],
             untracedIds: composed.untracedIds || [],
+            ...(composed.updatedWhileReviewing ? { updatedWhileReviewing: true, reviewNote: composed.reviewNote } : {}),
             ...(fallbackNote ? { note: fallbackNote } : {}),
           };
         }
         if (name === 'apply_labels') {
-          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再写入标签' };
           if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能写入标签' };
           let rawItems = Array.isArray(args.items) ? args.items : [];
           if (!rawItems.length && args.autoDetect) {
-            const labelCtx = collectCanvasLabelContext(MODEL, pageState);
+            const model = MODEL;
+            const labelCtx = await collectCanvasLabelContext(model, latestPage());
+            if (MODEL !== model) return { ok: false, error: '源码已刷新，请重新检测标签' };
             rawItems = labelCtx.suggestedLabels;
             if (!rawItems.length) {
               return { ok: true, applied: 0, edgeKeys: [], note: '当前画布上没有缺失的 TASK 或 コール順 候选标签' };
@@ -3160,7 +3341,7 @@ export const server = http.createServer(async (req, res) => {
           }
           assertActive();
           const applied = applyMcpTaskLabels({ items, merge: true });
-          return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [] };
+          return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [], ...reviewWriteResult() };
         }
         return { ok: false, error: `未知工具：${name}` };
       };
@@ -3225,7 +3406,7 @@ export const server = http.createServer(async (req, res) => {
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
           varCount: MODEL.variables?.length || 0,
-          canvasRoots: (pageState?.roots || []).slice(0, 12),
+          canvasRoots: (latestPage()?.roots || []).slice(0, 12),
           isGitRepo: Boolean(gitInfo?.isRepo),
           gitDirtyFiles: gitInfo?.isRepo ? gitInfo.dirtyFiles : [],
           tasks,
@@ -3258,7 +3439,7 @@ export const server = http.createServer(async (req, res) => {
       }
       const base = MODEL, comparison = COMPARISON, project = PROJECT;
       const q = u.searchParams;
-      const changed = () => switching || MODEL !== base || COMPARISON !== comparison || PROJECT !== project ||
+      const changed = () => !currentSession(req) || COMPARISON !== comparison || PROJECT.id !== project.id ||
         (q.has('projectId') && q.get('projectId') !== String(project.id)) ||
         (q.has('comparisonId') && q.get('comparisonId') !== (comparison?.id ?? ''));
       const conflict = () => json(res, { ok: false, error: '工程或比较版本已切换，请重新选择函数' }, 409);
@@ -3299,6 +3480,7 @@ export const server = http.createServer(async (req, res) => {
           otherFn: isFlowchartFunction(otherFn) ? otherFn : null,
           otherSourceText,
           otherSourceRoot: version === 'before' ? afterRoot : beforeRoot,
+          signal: responseSignal(res),
         });
         return changed() ? conflict() : json(res, result);
       } catch (err) {
@@ -3359,7 +3541,6 @@ export const server = http.createServer(async (req, res) => {
       if (origin && !LOCAL_ORIGIN.test(origin)) {
         return json(res, { ok: false, error: 'forbidden origin' }, 403);
       }
-      await gitWatchReady;
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-store',
@@ -3367,7 +3548,7 @@ export const server = http.createServer(async (req, res) => {
       });
       res.write('retry: 2000\n\n'); // 断开后浏览器自动重连的间隔
       sseClients.add(res);
-      req.on('close', () => sseClients.delete(res));
+      res.on('close', () => sseClients.delete(res));
       return;
     }
 
@@ -3382,7 +3563,8 @@ export const server = http.createServer(async (req, res) => {
             if (p.comparisonId !== undefined && p.comparisonId !== (COMPARISON?.id ?? null)) return sessionConflict(res);
             const key = 'ui.last-view.' + PROJECT.id;
             const revision = COMPARISON ? COMPARISON.composedPage?.revision ?? 0 : store.getSetting(key)?.revision ?? 0;
-            if ((!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
+            const reviewing = Number(p.at) > 0;
+            if (!reviewing && (!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
             }
             const str = (v) => (typeof v === 'string' ? v : null);
@@ -3392,8 +3574,7 @@ export const server = http.createServer(async (req, res) => {
               ...(COMPARISON ? { comparisonId: COMPARISON.id } : {}),
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
-              // 回看历史时 AI 不该往当前状态写（前端也会拦），带上让模型知情
-              reviewing: Number(p.at) > 0,
+              reviewing,
               at: Math.max(0, Number(p.at) || 0),
               ts: Date.now(),
               revision,
@@ -3412,6 +3593,7 @@ export const server = http.createServer(async (req, res) => {
       return json(res, {
         page: u.searchParams.has('saved') ? COMPARISON ? COMPARISON.composedPage || null : store.getSetting('ui.last-view.' + PROJECT.id) : pageState,
         project: PROJECT ? { id: PROJECT.id, name: PROJECT.name, path: root } : null,
+        comparisonId: COMPARISON?.id ?? null,
         hint: pageState
           ? undefined
           : '还没有页面连上来过：打开应用页面后，这里会返回用户当前正在看的视图',
@@ -3471,7 +3653,7 @@ export const server = http.createServer(async (req, res) => {
           const down = Math.max(0, Number(p.down ?? 3) || 3);
           const groupMode = resolveGroupMode(p.groupMode, p.group);
           // 导出与屏幕统一使用 ELK 排版。
-          const view = await buildView([rootId], up, down, groupMode !== 'flat', null, { groupMode }, overlay);
+          const view = await buildView([rootId], up, down, groupMode !== 'flat', null, { groupMode, signal: responseSignal(res) }, overlay);
           if (!currentSession(req)) return sessionConflict(res);
           if (!view.nodes || !view.nodes.length) return bad(res, '视图为空：入口函数不存在或全被删除');
           const svg = exportSvg(view, { title: PROJECT.name + ' / ' + rootId });
@@ -3532,22 +3714,23 @@ export const server = http.createServer(async (req, res) => {
 
     if (u.pathname === '/api/parsers/diff' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
-      switching = true;
       try {
         const { other, parserId = MODEL.parserId } = await readJson(req, res);
         if (typeof parserId !== 'string' || typeof other !== 'string' || !getParser(parserId) || !getParser(other)
             || parserId === other || [parserId, other].includes('dot') || MODEL.parserId === 'dot') {
           return bad(res, '请选择两个不同的源码解析器');
         }
-        const isFile = fs.statSync(root).isFile();
-        const { model: a } = await loadTargetModel(root, isFile, parserId, parserOptionsFor(parserId));
-        const { model: b } = await loadTargetModel(root, isFile, other, parserOptionsFor(other));
-        await Promise.all([buildDataflowIndex(a), buildDataflowIndex(b)]);
+        const targetPath = root;
+        const isFile = (await fs.promises.stat(targetPath)).isFile();
+        const { model: a } = await loadTargetModel(targetPath, isFile, parserId, parserOptionsFor(parserId, scanRootFor(targetPath)));
+        const { model: b } = await loadTargetModel(targetPath, isFile, other, parserOptionsFor(other, scanRootFor(targetPath)));
+        await Promise.all([ensureAnalysis(a), ensureAnalysis(b)]);
+        if (!currentSession(req)) return sessionConflict(res);
         return json(res, { ok: true, a: parserId, b: other, ...diffParserModels(a, b),
           warnings: { a: a.warnings, b: b.warnings }, failedFiles: { a: a._df.failedFiles, b: b._df.failedFiles } });
       } catch (error) {
         if (!res.headersSent) return json(res, { ok: false, error: error.message }, 400);
-      } finally { switching = false; }
+      }
       return;
     }
 
@@ -3685,7 +3868,8 @@ export const server = http.createServer(async (req, res) => {
     }
     if (['/api/compare', '/api/compare/apply', '/api/compare/exit'].includes(u.pathname) && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
-      switching = true;
+      const activate = u.pathname !== '/api/compare';
+      if (activate) switching = true;
       try {
         const p = await readJson(req, res);
         if (u.pathname.endsWith('/exit')) {
@@ -3764,9 +3948,12 @@ export const server = http.createServer(async (req, res) => {
               change: comparisonStatus(COMPARISON.model._index.byId.get(n.id), COMPARISON.statusOverrides.nodes, n.id).change,
             }));
           if (changedFlowTargets.length) {
-            prewarmChangedFlowcharts(PROJECT.id, COMPARISON.afterModel, changedFlowTargets, COMPARISON.beforeModel, COMPARISON.beforePath);
+            prewarmChangedFlowcharts(PROJECT.id, COMPARISON.afterModel, changedFlowTargets,
+              COMPARISON.beforeModel, COMPARISON.beforePath, COMPARISON.afterPath);
           }
         } else {
+          const requestId = ++comparisonRequest;
+          const model = MODEL;
           const projectPath = COMPARISON?.projectPath || root;
           const git = COMPARISON?.git;
           const refresh = p.mode === 'git' && p.refresh === true && git?.targetRef === 'WORKTREE' &&
@@ -3774,8 +3961,9 @@ export const server = http.createServer(async (req, res) => {
           const parserOpts = { parserId: MODEL.parserId, parserOptions: parserOptionsFor(MODEL.parserId) };
           const comparison = p.mode === 'git'
             ? await compareGitProject(projectPath, { baseRef: p.baseRef, targetRef: p.targetRef, includeUntracked: p.includeUntracked },
-              { ...parserOpts, allowEmptyRefresh: refresh })
+              { ...parserOpts, allowEmptyRefresh: refresh, runComparison: compareProjects })
             : await compareProjects(projectPath, p.beforePath, p.afterPath, parserOpts);
+          if (!currentSession(req) || MODEL !== model || requestId !== comparisonRequest) return sessionConflict(res);
           const candidates = (comparison.git?.noSourceChanges ? [] : [...comparison.model.functions, ...comparison.model.variables])
             .filter((n) => !n.external)
             .map((n) => ({ id: n.id, name: n.name, file: n.file, line: n.line, kind: n.kind, ...comparisonItem(n) }));
@@ -3791,7 +3979,7 @@ export const server = http.createServer(async (req, res) => {
         return json(res, { ok: true, comparison: comparisonInfo(), roots: COMPARISON?.roots || [] });
       } catch (err) {
         if (!res.headersSent) return json(res, { ok: false, error: String(err.message || err) }, 400);
-      } finally { switching = false; }
+      } finally { if (activate) switching = false; }
       return;
     }
 
@@ -3877,20 +4065,7 @@ export const server = http.createServer(async (req, res) => {
             try {
               // 状态 + 事件同一个事务：崩溃时要么都进库、要么都不进，
               // 不会出现「书签改了但时间轴没记」这种回放对不上的状态
-              const r = store.transaction(() => {
-                const name = String(p.name || '').trim();
-                const prev = store.findBookmark(PROJECT.id, name);
-                const r = store.saveBookmark(PROJECT.id, p);
-                store.appendEvent(PROJECT.id, {
-                  op: 'bookmark.save',
-                  target: r.bookmark.name,
-                  // 整份视图参数都记下来：少存深度 / vars 的话，
-                  // 以后想按事件重建书签就是有损的
-                  before: prev ? bookmarkEventPayload(prev) : null,
-                  after: bookmarkEventPayload(r.bookmark),
-                });
-                return r;
-              });
+              const r = saveBookmarkWithEvent(p);
               json(res, { ok: true, ...r });
             } catch (err) {
               bad(res, String(err.message || err));
@@ -4313,7 +4488,7 @@ export const server = http.createServer(async (req, res) => {
       const df = u.searchParams.get('df') || null;
       const split = (k) => (u.searchParams.get(k) ? u.searchParams.get(k).split(',').filter(Boolean) : []);
       const varSel = { want: bodyVars || split('vars'), skip: bodyHiddenVars || split('novars'), expansions,
-        groupMode, preview: u.searchParams.get('preview') === '1' };
+        groupMode, preview: u.searchParams.get('preview') === '1', signal: responseSignal(res) };
       // 时间轴回看：at=<eventId> 时用重放出来的历史状态，而不是当前状态
       if (COMPARISON && at > 0) return bad(res, '比较视图不支持回看普通工程历史');
       const reviewSnapshot = at > 0 && useSnapshot ? store.viewAt(PROJECT.id, at) : undefined;
@@ -4322,7 +4497,7 @@ export const server = http.createServer(async (req, res) => {
       if (reviewSnapshot) {
         const histRoots = reviewSnapshot.empty ? [] : reviewSnapshot.roots;
         const histVars = { want: reviewSnapshot.vars || [], skip: reviewSnapshot.hiddenVars || [],
-          expansions: reviewSnapshot.empty ? [] : reviewSnapshot.expansions || [], groupMode: reviewSnapshot.groupMode };
+          expansions: reviewSnapshot.empty ? [] : reviewSnapshot.expansions || [], groupMode: reviewSnapshot.groupMode, signal: varSel.signal };
         if (!histRoots?.length && !histVars.expansions.length && !histVars.want.length) {
           return json(res, withReviewSnapshot(emptyCanvasView(reviewSnapshot.groupMode)));
         }
@@ -4421,10 +4596,10 @@ export const server = http.createServer(async (req, res) => {
       const model = MODEL, comparison = COMPARISON, projectId = PROJECT.id;
       if (body.projectId !== projectId || body.comparisonId !== comparison?.id) return json(res, { error: '工程或比较会话已切换，请重新选择' }, 409);
       if (!comparison) await ensureAnalysis(model);
-      if (MODEL !== model || COMPARISON !== comparison) return json(res, { error: '工程已切换，请重新选择' }, 409);
+      if (!currentSession(req)) return sessionConflict(res);
       if (![body.a, body.b].every(id => model._index.byId.has(id))) return bad(res, '所选函数或变量不存在');
       const result = await (comparison ? comparisonPairDataflow(comparison, body.a, body.b) : pairDataflow(model, body.a, body.b));
-      if (MODEL !== model || COMPARISON !== comparison) return json(res, { error: '工程已切换，请重新选择' }, 409);
+      if (!currentSession(req)) return sessionConflict(res);
       return json(res, { ...result, projectId, comparisonId: comparison?.id });
     }
 
@@ -4434,14 +4609,12 @@ export const server = http.createServer(async (req, res) => {
       const dir = u.searchParams.get('dir') || 'out';
       if (!fnId) return json(res, { error: 'missing fn' }, 400);
       if (!MODEL._index) return json(res, { error: '该视图不支持数据流分析' }, 400);
-      if (!COMPARISON) {
-        const model = MODEL;
-        await ensureAnalysis(model);
-        if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
-      }
       const comparison = COMPARISON, model = MODEL;
+      if (!comparison) await ensureAnalysis(model);
+      if (!currentSession(req)) return sessionConflict(res);
       return (comparison ? comparisonDataflow(comparison, fnId, dir) : dataflowFor(model, fnId, dir))
         .then((r) => {
+          if (!currentSession(req)) return sessionConflict(res);
           if (!comparison && r.fn) r.fn.taskPeriods = taskPeriods(model).get(r.fn.id) || [];
           return json(res, r);
         })
@@ -4455,9 +4628,9 @@ export const server = http.createServer(async (req, res) => {
       if (COMPARISON) return json(res, { list: comparisonGlobals(COMPARISON) });
       const model = MODEL;
       await ensureAnalysis(model);
-      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
-      return listGlobals(MODEL)
-        .then((list) => json(res, { list }))
+      if (!currentSession(req)) return sessionConflict(res);
+      return listGlobals(model)
+        .then((list) => currentSession(req) ? json(res, { list }) : sessionConflict(res))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
     }
 
@@ -4471,9 +4644,9 @@ export const server = http.createServer(async (req, res) => {
       }
       const model = MODEL;
       await ensureAnalysis(model);
-      if (model !== MODEL) return json(res, { error: '工程已切换，请重试' }, 409);
-      return sharedVariables(MODEL)
-        .then((list) => json(res, { list }))
+      if (!currentSession(req)) return sessionConflict(res);
+      return sharedVariables(model)
+        .then((list) => currentSession(req) ? json(res, { list }) : sessionConflict(res))
         .catch((err) => json(res, { ok: false, error: String(err.message || err) }, 500));
     }
 
@@ -4840,7 +5013,9 @@ export const server = http.createServer(async (req, res) => {
     // 自动检测 TASK / コール順：扫当前工程模型出建议清单（不落库），
     // 界面面板勾选应用 / AI 经 cg_detect_tasks 读取后自己 cg_annotate
     if (u.pathname === '/api/detect-tasks') {
-      return json(res, detectTasks(MODEL, u.searchParams.get('from')));
+      const model = MODEL;
+      const result = await analyzeTasks(model, { from: u.searchParams.get('from') });
+      return MODEL === model && currentSession(req) ? json(res, result) : sessionConflict(res);
     }
 
     // 结合点编号模式：fixed=固定（删除不前移，新增从空缺号+下一号里挑）
@@ -5066,6 +5241,7 @@ export const server = http.createServer(async (req, res) => {
     res.writeHead(404);
     res.end('not found');
   } catch (err) {
+    if (res.destroyed) return;
     console.error(err);
     json(res, { error: String(err) }, 500);
   }

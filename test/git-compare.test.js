@@ -5,6 +5,7 @@ import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { buildFlowchart } from '../src/core/flowchart.js';
 import { compareGitProject, inspectGitRepo } from '../src/core/git-compare.js';
 import { decodeSource } from '../src/core/index.js';
 
@@ -81,6 +82,8 @@ test('工作区读取最新内容，区分暂存区、未跟踪源码、注释�
   assert.match(index.changePoints.find(p => p.id === active).afterValue, /return 2/);
   const trackedOnly = await compareGitProject(root, { includeUntracked: false });
   assert.equal(byId(trackedOnly, fresh), undefined);
+  put(file, 'int shift(void) { return 99; }\n');
+  assert.match(decodeSource(live.model._sourceBuffers.get(file)), /return 3;/);
   await assert.rejects(compareGitProject(root, { baseRef: '--help' }), /引用无效/);
   await assert.rejects(compareGitProject(root, { targetRef: 'missing-tag' }), /无效或不存在/);
 });
@@ -88,12 +91,16 @@ test('工作区读取最新内容，区分暂存区、未跟踪源码、注释�
 test('子目录工程只收录自己的 C/H，头文件变更推导宏与数据流影响', async t => {
   const { root, put, commit } = repository(t);
   const dir = 'packages/計測';
-  put(dir + '/lsb.h', '#define SCALE 10\n');
-  put(dir + '/control.c', '#include "lsb.h"\nint signal;\nvoid update(void) { signal = SCALE; }\n');
-  put(dir + '/observe.c', 'extern int signal;\nint observe(void) { return signal; }\n');
+  const header = scale => `#define SCALE ${scale}
+typedef union { int a, b; } Shared;
+typedef struct { Shared value; } Signal;
+`;
+  put(dir + '/lsb.h', header(10));
+  put(dir + '/control.c', '#include "lsb.h"\nSignal signal;\nvoid update(void) { signal.value.a = SCALE; }\n');
+  put(dir + '/observe.c', '#include "lsb.h"\nextern Signal signal;\nint observe(void) { return signal.value.b; }\n');
   put('packages/計測-extra/other.c', 'int other(void) { return 1; }\n');
   commit('base');
-  put(dir + '/lsb.h', '#define SCALE 20\n');
+  put(dir + '/lsb.h', header(20));
   put('packages/計測-extra/other.c', 'int other(void) { return 9; }\n');
   const project = path.join(root, dir);
 
@@ -104,6 +111,7 @@ test('子目录工程只收录自己的 C/H，头文件变更推导宏与数据�
   assert.deepEqual(comp.git.changedFiles, [{ file: 'lsb.h', status: 'modified', oldFile: null }]);
   assert.equal(byId(comp, 'control.c::update').impactRole, 'macro_lsb_impact');
   assert.ok(comp.git.importFacts.implicitImpactIds.includes('control.c::update'));
+  assert.equal(comp.afterModel._df.byId.get('var::signal').containsUnion, true);
   assert.ok(comp.git.importFacts.chainImpactIds.includes('observe.c::observe'));
   assert.deepEqual(comp.git.importFacts.directIds, []);
   assert.equal(comp.model.functions.some(fn => fn.name === 'other'), false);
@@ -146,7 +154,11 @@ test('历史比较以两个提交为准，识别删除和重命名，无关工�
 
 test('大仓库未改动文件复盘与按需快照隔离：后续磁盘编辑不污染历史 _sourceBuffers', async t => {
   const { root, put, commit } = repository(t);
+  const file = 'src/mod/f2.c';
+  const diskPath = path.join(root, file);
+  const time = new Date('2020-01-01T00:00:00Z');
   for (let i = 0; i < 40; i++) put(`src/mod/f${i}.c`, `int fn_${i}(void) { return ${i}; }\n`);
+  fs.utimesSync(diskPath, time, time);
   commit('base');
   put('src/mod/f0.c', 'int fn_0(void) { return 100; }\n');
   put('src/mod/f1.c', 'int fn_1(void) { return 101; }\n');
@@ -158,11 +170,22 @@ test('大仓库未改动文件复盘与按需快照隔离：后续磁盘编辑�
   assert.equal(byId(comp, 'src/mod/f1.c::fn_1').change, 'modified');
   assert.equal(byId(comp, 'src/mod/f2.c::fn_2').change, 'existing');
 
-  // 比较完成后再修改磁盘上未改动的 f2.c，快照 _sourceBuffers 仍应返回提交时的内容。
-  put('src/mod/f2.c', 'int fn_2(void) { return 9999; }\n');
-  assert.match(decodeSource(comp.beforeModel._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
-  assert.match(decodeSource(comp.afterModel._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
-  assert.match(decodeSource(comp.model._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
+  const buffers = comp.model._sourceBuffers;
+  const original = buffers.get(file);
+  const reread = buffers.get(file);
+  assert.notEqual(reread, original);
+  assert.deepEqual(reread, original);
+
+  // 等长改写并恢复修改时间后，三份快照仍按原 OID 读取。
+  put(file, 'int fn_2(void) { return 9; }\n');
+  fs.utimesSync(diskPath, time, time);
+  assert.deepEqual(comp.beforeModel._sourceBuffers.get(file), original);
+  assert.deepEqual(comp.afterModel._sourceBuffers.get(file), original);
+  const recovered = buffers.get(file);
+  assert.deepEqual(recovered, original);
+  assert.equal(buffers.get(file), recovered);
+  const graph = await buildFlowchart(comp.model, byId(comp, file + '::fn_2'));
+  assert.ok(graph.nodes.some(node => node.lines.some(line => /return 2/.test(line))));
 });
 
 test('边界回归：diff.relative=true、暂存重命名重建旧路径、ident 转换均不污染比较结果', async t => {

@@ -188,23 +188,38 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
     if (model.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${model.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
     if (!snapshots && !model.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${model.root}`);
     if (model.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
+    return model;
+  };
+  const analyzeDataflow = async (model) => {
     if (model.parserId === 'builtin' || !model.parserId) model._keepAnalysisSources = true;
     const df = await buildDataflowIndex(model);
     if (df.failedFiles) throw new Error('部分源码分析失败，无法发布不完整的比较结果');
-    return model;
   };
   const beforeModel = await buildSide(beforeFiles);
   const parser = getParser(beforeModel.parserId);
   const fingerprint = parser.fingerprint || ((value) => value.trim());
   const definitionsOf = parser.id === 'builtin' ? parser.compareDefinitions
     : (model, macrosIn) => (parser.compareDefinitions || definitionsFromGraph)(model, macrosIn, fingerprint);
+  // 内置宏比较只读索引中的宏，可在逐侧分析数据流前完成。
+  const analyzeBeforeMacros = sameSources || parser.id !== 'builtin';
   let afterModel, beforeDefs, afterDefs, macroChanges, macroDetails, macrosIn, changedExpansion;
   try {
+    if (analyzeBeforeMacros) await analyzeDataflow(beforeModel);
     afterModel = await buildSide(afterFiles, sameSources && beforeModel);
+    if (analyzeBeforeMacros && !sameSources) await analyzeDataflow(afterModel);
     ({ macroChanges, macroDetails, macrosIn, changedExpansion } = parser.compareMacros?.(beforeModel, afterModel)
       ?? { macroChanges: [], macroDetails: [], macrosIn: () => new Set(), changedExpansion: () => new Set() });
-    beforeDefs = await definitionsOf(beforeModel, macrosIn);
-    afterDefs = sameSources ? beforeDefs : await definitionsOf(afterModel, macrosIn, beforeDefs);
+    if (!analyzeBeforeMacros) await analyzeDataflow(beforeModel);
+    beforeDefs = await definitionsOf(beforeModel, macrosIn, null, { retainByFile: !sameSources });
+    delete beforeModel._analysisSources;
+    if (sameSources) {
+      afterDefs = beforeDefs;
+    } else {
+      if (!analyzeBeforeMacros) await analyzeDataflow(afterModel);
+      afterDefs = await definitionsOf(afterModel, macrosIn, beforeDefs, { retainByFile: false });
+    }
+    delete afterModel._analysisSources;
+    if (parser.id === 'builtin') delete beforeDefs._byFile;
   } finally {
     for (const model of [beforeModel, afterModel]) {
       if (!model) continue;

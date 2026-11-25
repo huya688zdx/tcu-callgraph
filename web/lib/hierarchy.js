@@ -27,16 +27,65 @@ export function beginHierarchyMove(view, selection) {
     const from = ids.has(edge.from), to = ids.has(edge.to);
     (from && to ? internal : from || to ? crossing : stationary).push(edge);
   }
-  return { ...selection, view, boxes, moving, ancestors, nodes, ids, internal, crossing, stationary,
-    rects: [...moving, ...ancestors].map(({ box }) => ({ item: box, x: box.x, y: box.y, w: box.w, h: box.h })),
-    positions: nodes.map((n) => ({ item: n, x: n.x, y: n.y })),
-    paths: [...internal, ...crossing].map((edge) => ({ edge, points: edge.points.map((p) => [...p]) })),
+  const watched = [...moving, ...ancestors];
+  const initialOverlap = new Map();
+  for (const a of watched) {
+    for (const b of boxes) {
+      if (a.box === b.box || inside(a, b) || inside(b, a)) continue;
+      const area = gapOverlapArea(a.box, b.box);
+      if (area > 0) initialOverlap.set(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`, area);
+    }
+  }
+  const parentId = (id) => id.split('/').slice(0, -1).join('/');
+  const peers = boxes.filter((b) => b.box !== selection.box && !b.box.root &&
+    !inside(selection, b) && !inside(b, selection) && parentId(b.box.id) === parentId(selection.box.id));
+  const ancestorChildren = ancestors.map((ancestor) => ({
+    ancestor,
+    children: boxes.filter((c) => inside(ancestor, c)).map((c) => c.box),
+  }));
+  const rects = watched.map(({ box }) => ({ item: box, x: box.x, y: box.y, w: box.w, h: box.h }));
+  const positions = nodes.map((n) => ({ item: n, x: n.x, y: n.y }));
+  const restoreList = [...rects, ...positions];
+  const origin = rects.find((r) => r.item === selection.box);
+  let minMoveX = Infinity, minMoveY = Infinity;
+  for (const { box } of moving) {
+    if (box.x < minMoveX) minMoveX = box.x;
+    if (box.y < minMoveY) minMoveY = box.y;
+  }
+  if (!Number.isFinite(minMoveX)) minMoveX = 0;
+  if (!Number.isFinite(minMoveY)) minMoveY = 0;
+  // 留出祖先容器左侧/顶部内边距，避免拖拽贴近画布左上边界时整块被拦停。
+  const topPadNeeded = ancestors.reduce((sum, a) => sum + (a.box.root ? 24 : 32), 0);
+  const leftPadNeeded = ancestors.reduce((sum, a) => sum + (a.box.root ? 24 : 10), 0);
+  minMoveX = Math.max(0, minMoveX - leftPadNeeded);
+  minMoveY = Math.max(0, minMoveY - topPadNeeded);
+  const paths = [...internal, ...crossing].map((edge) => ({
+    edge,
+    internal: ids.has(edge.from) && ids.has(edge.to),
+    fromMoves: ids.has(edge.from),
+    points: edge.points.map((p) => [...p]),
+  }));
+  return {
+    ...selection, view, boxes, moving, ancestors, watched, peers, ancestorChildren, initialOverlap,
+    nodes, ids, internal, crossing, stationary,
+    origin, minMoveX, minMoveY,
+    rects, positions, restoreList, paths,
     width: view.width, height: view.height, dx: 0, dy: 0, guides: [],
   };
 }
 
 function restoreRects(drag) {
-  for (const { item, ...rect } of [...drag.rects, ...(drag.positions || [])]) Object.assign(item, rect);
+  const list = drag.restoreList || [...drag.rects, ...(drag.positions || [])];
+  for (let i = 0; i < list.length; i++) {
+    const r = list[i];
+    const item = r.item;
+    item.x = r.x;
+    item.y = r.y;
+    if (r.w !== undefined) {
+      item.w = r.w;
+      item.h = r.h;
+    }
+  }
 }
 
 export function cancelHierarchyMove(drag) {
@@ -46,12 +95,40 @@ export function cancelHierarchyMove(drag) {
   drag.view.height = drag.height;
 }
 
+/** 拖拽大型层级框时的 O(1)/边 轻量正交预览：避免每帧全量 A* 重布线导致掉帧卡顿，松手再做全量精布线。 */
+export function updateCrossingEdgePreview(drag) {
+  const dx = drag.dx, dy = drag.dy;
+  for (const entry of drag.paths) {
+    if (entry.internal) continue;
+    const src = entry.points;
+    if (src.length < 2) continue;
+    const pts = src.map((p) => [p[0], p[1]]);
+    if (entry.fromMoves) {
+      pts[0][0] += dx;
+      pts[0][1] += dy;
+      if (pts.length >= 3) {
+        if (Math.abs(src[0][0] - src[1][0]) < 0.5) pts[1][0] += dx;
+        else if (Math.abs(src[0][1] - src[1][1]) < 0.5) pts[1][1] += dy;
+      }
+    } else {
+      const last = pts.length - 1;
+      pts[last][0] += dx;
+      pts[last][1] += dy;
+      if (pts.length >= 3) {
+        if (Math.abs(src[last][0] - src[last - 1][0]) < 0.5) pts[last - 1][0] += dx;
+        else if (Math.abs(src[last][1] - src[last - 1][1]) < 0.5) pts[last - 1][1] += dy;
+      }
+    }
+    entry.edge.points = pts;
+  }
+}
+
 export function moveHierarchy(drag, dx, dy, tolerance = 0) {
-  const origin = drag.rects.find((r) => r.item === drag.box);
-  const parentId = (id) => id.split('/').slice(0, -1).join('/');
-  const peers = drag.boxes.filter((b) => b.box !== drag.box && !b.box.root &&
-    !inside(drag, b) && !inside(b, drag) && parentId(b.box.id) === parentId(drag.box.id));
-  const snapped = { x: dx, y: dy }, guides = [];
+  const origin = drag.origin || drag.rects.find((r) => r.item === drag.box);
+  const peers = drag.peers || [];
+  const clampedDx = Math.max(-drag.minMoveX, dx);
+  const clampedDy = Math.max(-drag.minMoveY, dy);
+  const snapped = { x: clampedDx, y: clampedDy }, guides = [];
   for (const [axis, size] of [['x', 'w'], ['y', 'h']]) {
     let best = tolerance, match = null;
     for (const peer of peers) for (const ratio of [0, 0.5, 1]) {
@@ -61,39 +138,89 @@ export function moveHierarchy(drag, dx, dy, tolerance = 0) {
     }
     if (match) { snapped[axis] += match.offset; guides.push(match); }
   }
+  snapped.x = Math.max(-drag.minMoveX, snapped.x);
+  snapped.y = Math.max(-drag.minMoveY, snapped.y);
 
+  const watched = drag.watched || [...drag.moving, ...drag.ancestors];
+  const initialOverlap = drag.initialOverlap;
   const apply = (tx, ty) => {
     restoreRects(drag);
     for (const { box } of drag.moving) { box.x += tx; box.y += ty; }
     for (const n of drag.nodes) { n.x += tx; n.y += ty; }
-    for (const ancestor of drag.ancestors) {
-      const b = ancestor.box, children = drag.boxes.filter((c) => inside(ancestor, c)).map((c) => c.box);
+    for (const { ancestor, children } of drag.ancestorChildren) {
+      const b = ancestor.box;
       const pad = b.root ? 24 : 10;
-      const right = Math.max(b.x + b.w, ...children.map((c) => c.x + c.w + pad));
-      const bottom = Math.max(b.y + b.h, ...children.map((c) => c.y + c.h + pad));
-      b.x = Math.min(b.x, ...children.map((c) => c.x - pad));
-      b.y = Math.min(b.y, ...children.map((c) => c.y - 32));
+      const topPad = b.root ? 24 : 32;
+      let right = b.x + b.w, bottom = b.y + b.h, minX = b.x, minY = b.y;
+      for (const c of children) {
+        if (c.x + c.w + pad > right) right = c.x + c.w + pad;
+        if (c.y + c.h + pad > bottom) bottom = c.y + c.h + pad;
+        if (c.x - pad < minX) minX = c.x - pad;
+        if (c.y - topPad < minY) minY = c.y - topPad;
+      }
+      b.x = minX;
+      b.y = minY;
       b.w = right - b.x;
       b.h = bottom - b.y;
     }
-    return [...drag.moving, ...drag.ancestors].every((a) => a.box.x >= 0 && a.box.y >= 0 &&
-      drag.boxes.every((b) => a.box === b.box || inside(a, b) || inside(b, a) || !overlap(a.box, b.box)));
+    for (const a of watched) {
+      if (a.box.x < 0 || a.box.y < 0) return false;
+      for (const b of drag.boxes) {
+        if (a.box === b.box || inside(a, b) || inside(b, a)) continue;
+        if (!overlap(a.box, b.box)) continue;
+        if (!initialOverlap) return false;
+        const area = gapOverlapArea(a.box, b.box);
+        const initial = initialOverlap.get(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`) || 0;
+        if (!(initial > 0 && area <= initial + 0.01)) return false;
+      }
+    }
+    return true;
   };
-  let accepted = [drag.dx, drag.dy];
-  // 碰撞时沿可行的单轴滑动，不推走其他层级。
-  for (const [tx, ty] of [[snapped.x, snapped.y], [dx, dy], [snapped.x, drag.dy], [drag.dx, snapped.y], [drag.dx, drag.dy]]) {
+
+  let accepted = null;
+  for (const [tx, ty] of [[snapped.x, snapped.y], [clampedDx, clampedDy], [snapped.x, drag.dy], [drag.dx, snapped.y]]) {
     if (apply(tx, ty)) { accepted = [tx, ty]; break; }
+  }
+  // 鼠标跨过障碍时沿目标方向二分贴边滑动，不再卡死在旧坐标不跟手。
+  if (!accepted) {
+    let bestX = drag.dx, bestY = drag.dy;
+    const slideAxis = (targetX, targetY) => {
+      let lo = 0, hi = 1, hit = null;
+      for (let step = 0; step < 6; step++) {
+        const mid = (lo + hi) * 0.5;
+        const mx = bestX + (targetX - bestX) * mid;
+        const my = bestY + (targetY - bestY) * mid;
+        if (apply(mx, my)) { lo = mid; hit = [mx, my]; }
+        else hi = mid;
+      }
+      if (hit) [bestX, bestY] = hit;
+    };
+    slideAxis(clampedDx, clampedDy);
+    if (bestX === drag.dx && bestY === drag.dy) {
+      slideAxis(clampedDx, bestY);
+      slideAxis(bestX, clampedDy);
+    }
+    apply(bestX, bestY);
+    accepted = [bestX, bestY];
   }
   const changed = accepted[0] !== drag.dx || accepted[1] !== drag.dy;
   [drag.dx, drag.dy] = accepted;
   drag.guides = guides.filter((g) => (g.axis === 'x' ? drag.dx : drag.dy) === snapped[g.axis]);
   if (changed) {
-    for (const { edge, points } of drag.paths) {
-      const internal = drag.ids.has(edge.from) && drag.ids.has(edge.to);
-      edge.points = points.map(([x, y]) => internal ? [x + drag.dx, y + drag.dy] : [x, y]);
+    for (const entry of drag.paths) {
+      if (entry.internal) {
+        entry.edge.points = entry.points.map(([x, y]) => [x + drag.dx, y + drag.dy]);
+      } else if (drag.crossing.length <= 6) {
+        entry.edge.points = entry.points.map(([x, y]) => [x, y]);
+      }
     }
-    drag.view.width = Math.max(drag.width, ...drag.boxes.map(({ box }) => box.x + box.w));
-    drag.view.height = Math.max(drag.height, ...drag.boxes.map(({ box }) => box.y + box.h));
+    let maxW = drag.width, maxH = drag.height;
+    for (const { box } of drag.boxes) {
+      if (box.x + box.w > maxW) maxW = box.x + box.w;
+      if (box.y + box.h > maxH) maxH = box.y + box.h;
+    }
+    drag.view.width = maxW;
+    drag.view.height = maxH;
   }
   return changed;
 }

@@ -33,7 +33,7 @@ import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './ed
 import { edgeAiDetail, renderLabelPanel } from './label-panel.js';
 import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
-import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove, beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from './hierarchy.js';
+import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove, updateCrossingEdgePreview, beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from './hierarchy.js';
 import { openManualNodeDialog, removeManualNodePermanently } from './manual-node.js';
 import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 import { hooks } from './hooks.js';
@@ -680,18 +680,22 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   // 只允许拖动已双击选中的层级；单击只切换右侧范围。
+  const startBoxDrag = (target) => {
+    pushHistory();
+    state.dragBox = beginHierarchyMove(state.view, target);
+    if (state.dragBox.crossing.length && state.dragBox.crossing.length <= 6) {
+      state.dragBox.stationarySegments = collectSegments(state.dragBox.stationary);
+    }
+    state.dragStart = { x: e.clientX, y: e.clientY };
+    els.cv.style.cursor = 'grabbing';
+    els.cv.setPointerCapture(e.pointerId);
+  };
   const title = hitTitle(e);
   if (title) {
     clearTrunk();
     state.multiSelection = null;
-    if (editable && moveReady(title.kind, title.box)) {
-      pushHistory();
-      state.dragBox = beginHierarchyMove(state.view, title);
-      if (state.dragBox.crossing.length) state.dragBox.stationarySegments = collectSegments(state.dragBox.stationary);
-      state.dragStart = { x: e.clientX, y: e.clientY };
-      els.cv.style.cursor = 'grabbing';
-      els.cv.setPointerCapture(e.pointerId);
-    } else state.moveTarget = null;
+    if (editable && moveReady(title.kind, title.box)) startBoxDrag(title);
+    else state.moveTarget = null;
     state.flash = null;
     els.tooltip.style.opacity = '0';
     selectBox(title);
@@ -713,6 +717,19 @@ els.cv.addEventListener('pointerdown', (e) => {
   }
 
   if (pickEdgeAt(e, selectEdge)) return;
+  // 双击解锁文件框/目录容器后，拖拽框内空白区域也能直接移动，不必瞄准左上角标题胶囊。
+  if (editable && state.moveTarget?.view === state.view && (state.moveTarget.kind === 'file' || state.moveTarget.kind === 'dir')) {
+    const p = worldPos(e);
+    const b = state.moveTarget.item;
+    if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+      clearTrunk();
+      state.multiSelection = null;
+      startBoxDrag({ kind: state.moveTarget.kind, box: b });
+      state.flash = null;
+      els.tooltip.style.opacity = '0';
+      return;
+    }
+  }
   if (e.shiftKey && editable && state.view?.nodes.length) {
     const { x, y } = worldPos(e);
     state.marquee = { x0: x, y0: y, x1: x, y1: y, view: state.view };
@@ -757,14 +774,19 @@ function handlePointerMove(e) {
     if (state.dragMoved) {
       const changed = moveHierarchy(drag, dragDelta(dx), dragDelta(dy), e.shiftKey ? 0 : 8 / cam.k);
       if (changed && drag.crossing.length) {
-        const moving = collectSegments(drag.internal);
-        const fixed = drag.stationarySegments;
-        routeEdges(state.view.nodes, drag.crossing, {
-          existing: { h: [...fixed.h, ...moving.h], v: [...fixed.v, ...moving.v], edges: [...fixed.edges, ...moving.edges] },
-          preservePaths: true,
-        });
+        if (drag.crossing.length <= 6 && drag.stationarySegments) {
+          const moving = collectSegments(drag.internal);
+          const fixed = drag.stationarySegments;
+          routeEdges(state.view.nodes, drag.crossing, {
+            existing: { h: [...fixed.h, ...moving.h], v: [...fixed.v, ...moving.v], edges: [...fixed.edges, ...moving.edges] },
+            preservePaths: true,
+          });
+        } else {
+          updateCrossingEdgePreview(drag);
+        }
       }
-      draw({ geometryUnchanged: !changed });
+      // 拖拽过程复用标签缓存，避免每帧重算全图标签碰撞造成卡顿；松手后完整重绘。
+      draw({ geometryUnchanged: true });
     }
     return;
   }
@@ -858,9 +880,17 @@ function handlePointerMove(e) {
   const title = next || rh ? null : hitTitle(e);
   const hits = !n && !title && !rh ? hitEdges(e) : [];
   const hoveredEdge = hits[0];
+  const unlockedBody = !n && !rh && !title && !hoveredEdge &&
+    state.moveTarget?.view === state.view && (state.moveTarget.kind === 'file' || state.moveTarget.kind === 'dir') && (() => {
+      const p = worldPos(e);
+      const b = state.moveTarget.item;
+      return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+    })();
   let cursor = rh ? (RESIZE_CURSORS[rh.edge] || 'nwse-resize')
     : title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
-    : n ? (moveReady('node', n) ? 'move' : 'pointer') : hoveredEdge ? 'pointer' : '';
+    : n ? (moveReady('node', n) ? 'move' : 'pointer')
+    : hoveredEdge ? 'pointer'
+    : unlockedBody ? 'grab' : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
   if (state.selectedEdge) {
