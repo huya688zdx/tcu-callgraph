@@ -324,6 +324,25 @@ test('无头浏览器：撤销与重做手工连线增量存档并保留视图�
     await pending;
   `, [original]);
   assert.deepEqual(await snapshot(), [outside, original], '新增尚未返回时也可以撤销');
+
+  await checkWrites(`
+    const cv = document.getElementById('cv');
+    const edge = { ...state.view.edges.find(edge => edge.manual) };
+    const hover = state.view.nodes.find(node => node.id === changed.to);
+    state.dragEnd = { edge, which: 'to', hover, pos: { x: hover.x, y: hover.y + hover.h / 2 } };
+    cv.dispatchEvent(new PointerEvent('pointerup'));
+
+    state.linkFrom = { ...state.view.nodes.find(node => node.id === original.from) };
+    state.linkMode = 'click';
+    const { cam } = await import('/lib/state.js');
+    const rect = cv.parentElement.getBoundingClientRect();
+    cv.dispatchEvent(new PointerEvent('pointerdown', {
+      button: 0, clientX: rect.left + cam.x + (hover.x + hover.w / 2) * cam.k,
+      clientY: rect.top + cam.y + (hover.y + hover.h / 2) * cam.k,
+    }));
+    if (writes.length) throw new Error('测试发现旧画布的手势发出了存档请求');
+  `, [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
   await checkWrites('h.redo(); reconnect(changed.to);', [original, changed]);
   assert.deepEqual(await snapshot(), [outside, original, changed], '重连到已有关系不能吞掉原来的连线');
 });

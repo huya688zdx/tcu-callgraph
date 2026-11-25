@@ -530,7 +530,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     const target = hitTest(e);
     resetDragState();
     els.tooltip.style.opacity = '0';
-    if (target && target.id !== from.id && !state.at && !state.view?.comparison) {
+    if (target && target.id !== from.id && !state.at && !state.view?.comparison && state.view?.nodes.includes(from)) {
       addManualEdge(from.id, target.id);
     }
     draw();
@@ -944,7 +944,8 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (dragEnd) {
     const { edge, which, hover, pos } = dragEnd;
-    if (hover) {
+    if (hover && !state.at && !state.view?.comparison &&
+        state.view?.edges.includes(edge) && state.view.nodes.includes(hover)) {
       const oldFrom = edge.from;
       const oldTo = edge.to;
       const from = which === 'from' ? hover.id : oldFrom;
