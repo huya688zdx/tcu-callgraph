@@ -761,3 +761,119 @@ test('e2e：多车型(z145/z144)共通代码分支检测、按路径过滤入图
   assert.equal(compactRes.compacted, true);
   assert.ok(compactRes.messages.length < 6, '压缩后消息条数应减少');
 });
+
+test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者自动入图、对话中并发保存配置不卡顿、画布选中 uiContext 联动', async t => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-nested-'));
+  t.after(() => fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 3 }));
+  const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], { windowsHide: true });
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.invalid');
+
+  fs.mkdirSync(path.join(repoDir, 'src', 'common'), { recursive: true });
+  fs.mkdirSync(path.join(repoDir, 'src', 'z145'), { recursive: true });
+  fs.mkdirSync(path.join(repoDir, 'src', 'z144'), { recursive: true });
+  const sharedBase = 'void common_step(void) { volatile int x = 1; (void)x; }\n';
+  fs.writeFileSync(path.join(repoDir, 'src', 'common', 'step.c'), sharedBase);
+  // 故意不命名成 Task_*，验证无正式 TASK 时也能把上级调用者加入画布并识别多车型目录分叉
+  fs.writeFileSync(path.join(repoDir, 'src', 'z145', 'flow.c'), 'void common_step(void);\nvoid z145_entry(void) { common_step(); }\n');
+  fs.writeFileSync(path.join(repoDir, 'src', 'z144', 'flow.c'), 'void common_step(void);\nvoid z144_entry(void) { common_step(); }\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'init');
+  fs.writeFileSync(path.join(repoDir, 'src', 'common', 'step.c'), sharedBase.replace('x = 1', 'x = 7'));
+
+  let turn = 0;
+  let capturedSystem = '';
+  let capturedToolGate = null;
+  let releaseStream = null;
+  const streamStarted = new Promise((resolve) => { releaseStream = resolve; });
+  let finishStream = null;
+  const streamCanFinish = new Promise((resolve) => { finishStream = resolve; });
+
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', async () => {
+      const body = JSON.parse(raw || '{}');
+      capturedSystem = body.messages?.[0]?.content || '';
+      const lastTool = [...(body.messages || [])].reverse().find((m) => m.role === 'tool');
+      if (lastTool) {
+        const parsed = JSON.parse(lastTool.content);
+        if (parsed.needsVehicleChoice) capturedToolGate = parsed;
+      }
+      turn++;
+      if (turn === 1) {
+        // 先故意不带筛选调用 add_to_canvas，验证服务端强制拦截并提示询问用户
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'g1', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ fromGit: true }) } }] } }],
+        }));
+      }
+      if (turn === 2) {
+        // 第二步按 z145 过滤加入画布，同时模拟流式等待期间并发保存 /api/ai/config
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'g2', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ fromGit: true, includePaths: ['src/z145'] }) } }] } }],
+        }));
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '已保留 z145 上级调用链。' } }] })}\n\n`);
+      releaseStream();
+      await streamCanFinish;
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+  });
+  await new Promise((resolve) => mockLlm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => mockLlm.close(resolve)));
+
+  const srv = await launchServer({ target: repoDir });
+  t.after(srv.close);
+  const get = (route) => fetch(srv.baseUrl + route).then((r) => r.json());
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-nested', toolMode: 'tools', maxTokens: 8192 });
+
+  const chatPromise = fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: '把改动加到画布并结合我选中的连线分析',
+      uiContext: {
+        kind: 'edge',
+        edgeKey: 'src/z145/flow.c::z145_entry->src/common/step.c::common_step:2',
+        from: 'src/z145/flow.c::z145_entry',
+        to: 'src/common/step.c::common_step',
+        fromName: 'z145_entry',
+        toName: 'common_step',
+        labels: [{ preset: 'task', text: 'TASK:10ms' }],
+      },
+    }),
+  });
+
+  // 等流式回复进行到一半时并发修改并保存上下文长度，验证绝不互相卡死
+  await streamStarted;
+  const savedWhileChatting = await post('/api/ai/config', { contextWindow: 128000, maxTokens: 16384 });
+  assert.equal(savedWhileChatting.ok, true, '对话流式输出期间保存上下文长度必须立即成功，不可卡死');
+  assert.equal(savedWhileChatting.config.contextWindow, 128000);
+  assert.equal(savedWhileChatting.config.maxTokens, 16384);
+  finishStream();
+
+  const chatRes = await chatPromise;
+  assert.equal(chatRes.status, 200);
+  const events = (await chatRes.text()).trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(events.some((e) => e.type === 'done'), '对话流在并发保存配置后仍应正常结束');
+  assert.equal(capturedToolGate?.needsVehicleChoice, true, '嵌套目录 src/z145 与 src/z144 未指定筛选时必须拦截并要求询问');
+  assert.ok(capturedToolGate?.pathBranches?.some((b) => b.prefix === 'src/z145'));
+  assert.ok(capturedToolGate?.pathBranches?.some((b) => b.prefix === 'src/z144'));
+  assert.match(capturedSystem, /z145_entry.*common_step|TASK:10ms/, '画布选中的连线与标签上下文应注入系统提示');
+
+  const page = (await get('/api/page')).page;
+  const shown = [...(page.roots || []), ...(page.expansions || []).map((s) => s.root)];
+  assert.ok(shown.includes('src/z145/flow.c::z145_entry'), '非 TASK 命名的上级调用者 z145_entry 也应自动加入画布');
+  assert.ok(shown.includes('src/common/step.c::common_step'), '被修改的共通函数应保留在画布');
+  assert.ok(!shown.some((id) => id.includes('src/z144/')), '被排除的 src/z144 不应加入画布');
+});

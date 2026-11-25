@@ -9,6 +9,9 @@ const VALID_TOOL_MODES = new Set(['auto', 'tools', 'prompt']);
 const VALID_REASONING_EFFORTS = new Set(['default', 'off', 'low', 'medium', 'high']);
 const MAX_AGENT_STEPS = 24;
 const DEFAULT_TIMEOUT_MS = 180_000;
+const SSE_TRAILER_TIMEOUT_MS = 1_000;
+const MAX_SSE_FRAME_CHARS = 4 * 1024 * 1024;
+const SSE_FRAME_SEPARATOR = /(?:\r\n|\r(?!\n)|\n){2}/;
 
 export const DEFAULT_AI_CONFIG = {
   baseUrl: 'http://127.0.0.1:11434/v1',
@@ -17,7 +20,7 @@ export const DEFAULT_AI_CONFIG = {
   toolMode: 'auto',
   reasoningEffort: 'default',
   temperature: 0.2,
-  maxTokens: 2048,
+  maxTokens: 8192,
   contextWindow: 32768,
 };
 
@@ -72,7 +75,7 @@ export function normalizeAiConfig(raw = {}, existing = DEFAULT_AI_CONFIG) {
   const temperature = raw.temperature === undefined ? prev.temperature
     : Math.max(0, Math.min(2, Number(raw.temperature) || 0));
   const maxTokens = raw.maxTokens === undefined ? prev.maxTokens
-    : Math.max(0, Math.min(32768, Math.trunc(Number(raw.maxTokens) || 0)));
+    : Math.max(0, Math.min(65536, Math.trunc(Number(raw.maxTokens) || 0)));
   const requestedWindow = Number(raw.contextWindow);
   const contextWindow = validContextWindow(requestedWindow) ? requestedWindow : prev.contextWindow;
   return { baseUrl: nextNorm, model, apiKey, toolMode, reasoningEffort, temperature, maxTokens, contextWindow };
@@ -102,8 +105,15 @@ function scrubSecret(text, apiKey) {
 function clipToolOutput(output, maxChars = 12000) {
   let text = JSON.stringify(output);
   if (text.length <= maxChars) return text;
+  // 裁剪工具结果时保留车型选择所需的目录前缀。
+  const vehicleChoice = {
+    ...(output?.needsVehicleChoice === true ? { needsVehicleChoice: true } : {}),
+    ...(Array.isArray(output?.pathBranches) ? {
+      pathBranches: output.pathBranches.map(branch => ({ prefix: typeof branch === 'string' ? branch : branch?.prefix })),
+    } : {}),
+  };
   if (output && typeof output === 'object' && !Array.isArray(output)) {
-    const clone = { ...output, truncated: true };
+    const clone = { ...output, ...vehicleChoice, truncated: true };
     if (typeof clone.source === 'string' && clone.source.length > 2000) {
       const budget = Math.max(800, maxChars - (text.length - clone.source.length) - 120);
       clone.source = clone.source.slice(0, budget) + '\n/* ...truncated */';
@@ -111,6 +121,7 @@ function clipToolOutput(output, maxChars = 12000) {
       if (text.length <= maxChars) return text;
     }
     for (const key of Object.keys(clone)) {
+      if (key === 'pathBranches') continue;
       if (Array.isArray(clone[key]) && clone[key].length > 12) {
         clone[key] = clone[key].slice(0, 12);
       } else if (typeof clone[key] === 'string' && clone[key].length > 1000) {
@@ -120,11 +131,13 @@ function clipToolOutput(output, maxChars = 12000) {
     text = JSON.stringify(clone);
     if (text.length <= maxChars) return text;
   }
-  return JSON.stringify({
+  const preview = {
     ok: output?.ok !== false,
     truncated: true,
-    preview: text.slice(0, Math.max(200, maxChars - 120)),
-  });
+    ...vehicleChoice,
+  };
+  const budget = Math.max(200, maxChars - JSON.stringify(preview).length - 120);
+  return JSON.stringify({ ...preview, preview: text.slice(0, budget) });
 }
 
 /** 直连模型可用的画布工具。 */
@@ -176,6 +189,7 @@ export const AGENT_TOOLS = [
         snapshotId: { type: 'string', description: '可选：复用 get_git_changes 返回的 snapshotId，避免重复扫描 Git' },
         includePaths: { type: 'array', items: { type: 'string' }, description: '可选：仅保留路径匹配这些目录前缀（如 ["z145"]）的上游车型分支（共通改动函数仍会保留）' },
         excludePaths: { type: 'array', items: { type: 'string' }, description: '可选：排除路径匹配这些目录前缀（如 ["z144"]）的上游车型分支' },
+        includeAllBranches: { type: 'boolean', description: '当检测到多个车型/目录分支且用户明确要求全部保留时设为 true' },
         mode: { type: 'string', enum: ['add', 'replace'], description: 'add 追加到画布，replace 替换画布' },
         splitByGroup: { type: 'boolean', description: '当 Git 改动包含多个互不关联的独立模块时，自动拆分为多个视图书签（默认 true）' },
         bookmarkName: { type: 'string', description: '可选：同时将本次画布保存为该名称的书签' },
@@ -215,14 +229,14 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'ask_user',
-    description: '在修改画布前遇到明确歧义时向用户提问（如：Git 改动含多个独立模块问是否按书签拆分、重名函数或分析范围不清）。提供 2-4 个简洁选项；若指令已明确或用户刚回答过，直接动手不要多余提问。',
+    description: '在修改画布前遇到明确歧义时向用户提问。确认车型时为每个目录前缀提供选项并加上「全部保留」，其他情况提供 2-4 个简洁选项。指令明确或用户已回答时直接执行。',
     parameters: {
       type: 'object',
       properties: {
         question: { type: 'string', description: '简明中文问题' },
         options: {
           type: 'array',
-          description: '2-4 个简洁选项',
+          description: '简洁选项。确认车型时每个目录前缀一项，另加「全部保留」',
           items: {
             type: 'object',
             properties: {
@@ -313,19 +327,47 @@ function buildSystemPrompt(context, promptToolMode) {
   if (context.tasks?.length) {
     ctxLines.push(`已识别任务入口：${context.tasks.slice(0, 10).join(', ')}`);
   }
+  if (context.uiContext) {
+    const ui = context.uiContext;
+    const selectedNode = ui.selectedNode ?? (ui.kind === 'node' ? ui : null);
+    const selectedEdge = ui.selectedEdge ?? (ui.kind === 'edge' ? ui : null);
+    const selectedFile = ui.selectedFile ?? (ui.kind === 'file' ? ui : null);
+    const selections = [];
+    const location = (file, line) => {
+      if (!line) return file;
+      return file ? `${file}:${line}` : `第 ${line} 行`;
+    };
+    if (selectedNode) {
+      const id = typeof selectedNode === 'string' ? selectedNode : selectedNode.id ?? selectedNode.name;
+      const source = location(selectedNode.file ?? selectedNode.path, selectedNode.line ?? selectedNode.startLine);
+      selections.push(`节点 ${[id, source].filter(Boolean).join('，')}`);
+    }
+    if (selectedEdge) {
+      const { from, to, id, edgeKey, file, line, labels, label } = selectedEdge;
+      const endpoints = typeof selectedEdge === 'string' ? selectedEdge : from && to ? `${from} → ${to}` : '';
+      const texts = (Array.isArray(labels) ? labels : [labels ?? label])
+        .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
+      const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
+      selections.push(`连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`);
+    }
+    const file = typeof selectedFile === 'string' ? selectedFile : selectedFile?.path ?? selectedFile?.file;
+    if (file) selections.push(`文件 ${file}`);
+    ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
+  }
 
   const base = [
     '你是 TCU C 调用图画布助手。目标是尽快调用工具把用户需要的函数和变量加入可编辑画布，再给出简明中文说明。',
     '核心原则：',
     '1. 不要长篇空想，立刻动手调工具。',
-    '2. 用户要求将 Git 改动加入画布时，调用 add_to_canvas({ fromGit: true })，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块可调用 add_to_canvas({ fromGit: true, splitByGroup: true }) 自动拆分为独立书签；如确实需要用户决定，先用 ask_user 询问拆分书签还是合并到单个画布。用户要求合并时传 splitByGroup: false。',
+    '2. 用户要求将 Git 改动加入画布时，先调用 get_git_changes 检查目录分支，再按第 8、9 条确定范围。调用 add_to_canvas 时传 fromGit: true 和已取得的 snapshotId，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块默认拆分为独立书签，若需要用户决定则用 ask_user 确认拆分或合并。用户要求合并时传 splitByGroup: false。',
     '3. 用户按功能/关键词找函数或变量时，先调 find_symbols，再调 add_to_canvas 加入画布（支持短函数名，默认自动补齐上游 TASK 链）。',
     '4. 补齐 TASK 周期或调用顺序时，先调用 find_symbols({}) 查看 canvasEdges 和 suggestedLabels（含从函数头注释提取的周期），再调用 apply_labels 传入 items 或 { autoDetect: true } 写入画布。手动标周期用 preset:"task"（如 text:"TASK:10ms"），标调用顺序用 preset:"call"（コール順N），且 call 标签禁止填写 note。',
     '5. 源码若为日文 CP932，调 read_function 可传 encoding:"cp932"，严禁将乱码写入标签注释或回复。',
     '6. 只使用已确认存在的函数名。遇到重名时，根据上下文选择完整「文件::函数名」；如果目标仍不明确，在修改画布前用 ask_user 提供候选项。仅在重大画布修改前确有歧义时提问，用户意图明确或已回答时直接执行。',
     '7. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
-    '8. Git 改动需要确认车型时，先用 get_git_changes，必要时用 trace_upstream 读取上游链。发现多个目录前缀（如 z145/ 和 z144/）且用户尚未选择时，只调用一次 ask_user，为每个车型提供可点击的目录选项并加上「全部保留」。',
-    '9. 用户确认车型、路径或说「继续」时，立即根据历史决定与工具摘要调用 add_to_canvas，复用已有 snapshotId，按确认内容传 includePaths/excludePaths；选择「全部保留」时不加路径过滤。用户要求从现有画布移除车型时，立即调用 remove_from_canvas 并传 excludePaths。执行工具后才确认结果，不要重复询问或只口头确认。',
+    '8. 准备写入画布且需要确认上游车型时，先用 trace_upstream 读取上游链。get_git_changes、trace_upstream 或 add_to_canvas 返回至少两个 pathBranches 分支或 needsVehicleChoice: true，且用户尚未明确范围时，下一步必须单独调用 ask_user。用每个分支的 prefix 作为一个选项，再加一个「全部保留」选项。等用户选择后再调用 add_to_canvas。',
+    '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
+    '10. 用户提到当前选中的函数、连线或文件时，使用当前画布选中对象中的完整 ID、端点及文件路径定位。回答解释类问题时只读分析。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -476,28 +518,88 @@ function convertMessagesToPromptMode(messages, context) {
   return out;
 }
 
-async function fetchJson(url, options, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null, readStream = null) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`请求模型接口超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`)), timeoutMs);
-  const onParentAbort = () => controller.abort(signal.reason || new Error('已取消'));
-  if (signal) {
-    if (signal.aborted) { clearTimeout(timer); throw new Error('已取消'); }
-    signal.addEventListener('abort', onParentAbort, { once: true });
-  }
+async function withResponseReader(body, signal, read) {
+  signal.throwIfAborted();
+  const reader = body.getReader();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    void reader.cancel(signal.reason).catch(() => {});
+    reader.releaseLock();
+  };
+  signal.addEventListener('abort', release, { once: true });
   try {
-    const res = await fetchImpl(url, { ...options, signal: controller.signal });
+    const value = await read(reader);
+    signal.throwIfAborted();
+    return value;
+  } finally {
+    signal.removeEventListener('abort', release);
+    release();
+  }
+}
+
+async function readResponseText(res, signal) {
+  if (!res.body?.getReader) return res.text();
+  return withResponseReader(res.body, signal, async (reader) => {
+    const decoder = new TextDecoder();
+    let text = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) return text + decoder.decode();
+      text += decoder.decode(value, { stream: true });
+    }
+  });
+}
+
+async function fetchJson(url, options, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null, readStream = null) {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const requestSignal = controller.signal;
+  const onParentAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onParentAbort, { once: true });
+
+  let timer;
+  const resetTimeout = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(new Error(`请求模型接口超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`)), timeoutMs);
+  };
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(requestSignal.reason);
+    requestSignal.addEventListener('abort', onAbort, { once: true });
+  });
+  const request = async () => {
+    const res = await fetchImpl(url, { ...options, signal: requestSignal });
+    if (requestSignal.aborted) {
+      void res.body?.cancel?.(requestSignal.reason).catch(() => {});
+      requestSignal.throwIfAborted();
+    }
     if (readStream && res.ok && /text\/event-stream/i.test(res.headers?.get('content-type') || '')) {
-      const json = await readStream(res.body, controller.signal);
+      resetTimeout();
+      const json = await readStream(res.body, requestSignal, resetTimeout);
       return { ok: true, status: res.status, json };
     }
-    const text = await res.text();
+    const text = await readResponseText(res, requestSignal);
+    requestSignal.throwIfAborted();
     let json = null;
     try { json = JSON.parse(text); } catch { /* 非 JSON 错误体 */ }
     return { ok: res.ok, status: res.status, text, json };
+  };
+  resetTimeout();
+  try {
+    // 自定义 fetch 或响应体即使未响应 AbortSignal，请求也能按时结束。
+    return await Promise.race([aborted, request()]);
   } finally {
     clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', onParentAbort);
+    signal?.removeEventListener('abort', onParentAbort);
+    requestSignal.removeEventListener('abort', onAbort);
   }
+}
+
+function normalizeLineBreaks(text) {
+  return text.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n');
 }
 
 // 暂存可能属于标签的尾部，直到下一段确认其用途。
@@ -544,12 +646,31 @@ function mergeFunctionDelta(target, delta) {
   }
 }
 
-async function readChatStream(body, signal, onDelta, onChunk) {
+async function readChatStream(body, signal, onDelta, onChunk, onProgress) {
   const decoder = new TextDecoder();
   const calls = new Map();
   const legacyCall = {};
   const msg = { content: '', reasoning_content: '' };
-  const readContent = createContentReader(onDelta);
+  const pendingWhitespace = [];
+  let emittedText = false;
+  const readContent = createContentReader((channel, delta) => {
+    signal.throwIfAborted();
+    if (channel !== 'text') {
+      onDelta(channel, delta);
+      return;
+    }
+    // 推迟发送尾部空白，跨数据块合并换行并丢弃正文的首尾空白。
+    const visible = delta.trimEnd();
+    if (!visible) {
+      if (emittedText) pendingWhitespace.push(delta);
+      return;
+    }
+    const text = emittedText ? pendingWhitespace.join('') + visible : visible.trimStart();
+    pendingWhitespace.length = 0;
+    if (visible.length < delta.length) pendingWhitespace.push(delta.slice(visible.length));
+    emittedText = true;
+    onDelta('text', normalizeLineBreaks(text));
+  });
   let finishReason;
   let usage;
   let seenChoice = false;
@@ -557,20 +678,23 @@ async function readChatStream(body, signal, onDelta, onChunk) {
   let buffer = '';
 
   const consume = (frame) => {
-    const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:'))
+    signal.throwIfAborted();
+    if (frame.length > MAX_SSE_FRAME_CHARS) throw new Error('模型的单个 SSE 数据帧过大');
+    const data = frame.split(/\r\n|[\r\n]/).filter(line => line.startsWith('data:'))
       .map(line => line.slice(5).replace(/^ /, '')).join('\n').trim();
     if (!data) return;
     if (data === '[DONE]') {
       done = true;
       return;
     }
-    const chunk = JSON.parse(data);
+    let chunk;
+    try { chunk = JSON.parse(data); } catch { throw new Error('模型返回了无效的 SSE JSON'); }
     if (chunk?.error) throw new Error(chunk.error.message || '模型返回流式错误');
     usage = chunk?.usage ?? usage;
-    const choice = chunk?.choices?.find((item, index) => (item.index ?? index) === 0);
+    const choice = chunk?.choices?.find((item, index) => item && (item.index ?? index) === 0);
     if (!choice) return;
     seenChoice = true;
-    finishReason = choice.finish_reason ?? finishReason;
+    finishReason = choice.finish_reason || finishReason;
     const delta = choice.delta ?? {};
     const thoughts = [];
     const content = flattenContent(delta.content, thoughts);
@@ -583,6 +707,7 @@ async function readChatStream(body, signal, onDelta, onChunk) {
     }
     msg.content += content;
     readContent(content);
+    signal.throwIfAborted();
     for (const [index, part] of (delta.tool_calls || []).entries()) {
       const key = part.index ?? index;
       const call = calls.get(key) ?? { function: {} };
@@ -592,7 +717,9 @@ async function readChatStream(body, signal, onDelta, onChunk) {
       calls.set(key, call);
     }
     mergeFunctionDelta(legacyCall, delta.function_call);
-    if (content || thoughts.length || delta.function_call || delta.tool_calls?.length) {
+    const hasDelta = content || thoughts.length || delta.function_call || delta.tool_calls?.length;
+    if (hasDelta || choice.finish_reason) onProgress();
+    if (hasDelta) {
       const toolDeltas = delta.tool_calls?.map(call => call.function) ?? [delta.function_call];
       const toolText = toolDeltas.map(fn => (fn?.name ?? '') + (fn?.arguments ?? '')).join('');
       onChunk(content + thoughts.join('') + toolText);
@@ -600,27 +727,34 @@ async function readChatStream(body, signal, onDelta, onChunk) {
   };
 
   if (!body) throw new Error('模型未返回流式响应体');
-  const reader = body.getReader();
-  const cancel = () => { void reader.cancel().catch(() => {}); };
-  signal.addEventListener('abort', cancel, { once: true });
+  let trailerTimer;
   try {
-    while (!done) {
-      signal.throwIfAborted();
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      let boundary;
-      while (!done && (boundary = /\r?\n\r?\n/.exec(buffer))) {
-        consume(buffer.slice(0, boundary.index));
-        buffer = buffer.slice(boundary.index + boundary[0].length);
+    await withResponseReader(body, signal, async (reader) => {
+      let trailerDeadline;
+      while (!done) {
+        signal.throwIfAborted();
+        // finish_reason 后只短暂等候用量统计和 [DONE]，兼容不主动关闭连接的接口。
+        if (finishReason && !trailerDeadline) {
+          trailerDeadline = new Promise(resolve => {
+            trailerTimer = setTimeout(() => resolve({ done: true }), SSE_TRAILER_TIMEOUT_MS);
+          });
+        }
+        const pending = reader.read();
+        const chunk = await (trailerDeadline ? Promise.race([pending, trailerDeadline]) : pending);
+        signal.throwIfAborted();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let boundary;
+        while (!done && (boundary = SSE_FRAME_SEPARATOR.exec(buffer))) {
+          consume(buffer.slice(0, boundary.index));
+          buffer = buffer.slice(boundary.index + boundary[0].length);
+        }
+        if (!done && buffer.length > MAX_SSE_FRAME_CHARS) throw new Error('模型的单个 SSE 数据帧过大');
       }
-    }
+    });
   } finally {
-    signal.removeEventListener('abort', cancel);
-    cancel();
-    reader.releaseLock();
+    clearTimeout(trailerTimer);
   }
-  signal.throwIfAborted();
   if (!done && (buffer += decoder.decode()).trim()) consume(buffer);
   if (!seenChoice || (!done && !finishReason)) throw new Error('模型输出流提前中断');
   readContent('', true);
@@ -756,8 +890,8 @@ function summarizeToolResult(name, result) {
 }
 
 const DIGEST_FIELDS = [
-  'snapshotId', 'includePaths', 'excludePaths', 'functions', 'vars', 'fromGit', 'splitByGroup',
-  'id', 'file', 'pathBranches', 'isolatedGroups', 'changedFunctions', 'changedFiles', 'changedVars',
+  'snapshotId', 'includePaths', 'excludePaths', 'includeAllBranches', 'functions', 'vars', 'fromGit', 'splitByGroup',
+  'id', 'file', 'pathBranches', 'needsVehicleChoice', 'isolatedGroups', 'changedFunctions', 'changedFiles', 'changedVars',
   'roots', 'matches', 'upstreamChains', 'applied', 'removed', 'bookmarks', 'edgeKeys', 'error',
 ];
 
@@ -817,6 +951,7 @@ function historyContent(message, maxLength = Infinity) {
 }
 
 export async function compactConversation({ config, messages, fetchImpl = fetch, signal = null }) {
+  signal?.throwIfAborted();
   const beforeTokens = estimateMessagesTokens(messages);
   if (messages.length <= 4) {
     return { ok: true, compacted: false, messages, beforeTokens, afterTokens: beforeTokens, summary: '' };
@@ -857,6 +992,7 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
       }, fetchImpl, 8_000, signal);
       if (res.ok) modelSummary = extractThinkingAndText(res.json?.choices?.[0]?.message?.content).text;
     } catch {
+      signal?.throwIfAborted();
       // 模型不可用时，根据原记录生成结构化摘要。
     }
   }
@@ -878,17 +1014,19 @@ export async function runAiAgent({
   signal = null,
   maxSteps = MAX_AGENT_STEPS,
 }) {
+  signal?.throwIfAborted();
   const { chatUrl } = normalizeBaseUrl(config?.baseUrl);
   if (!chatUrl) throw new Error('尚未配置模型 API 地址，请先在「直连 API」中填写');
   if (!config?.model) throw new Error('尚未配置模型名称，请先在「直连 API」中填写或拉取模型');
   const userText = String(prompt || '').trim();
   if (!userText) throw new Error('请输入要执行的任务');
 
-  let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
+  // 同一轮对话固定使用启动时的配置，保存的新配置在下次请求生效。
   config = {
     ...config,
     contextWindow: validContextWindow(config.contextWindow) ? config.contextWindow : DEFAULT_AI_CONFIG.contextWindow,
   };
+  let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
   const cleanHistory = (Array.isArray(history) ? history : [])
     .filter(m => m && ['user', 'assistant'].includes(m.role))
     .map(m => ({ role: m.role, content: historyContent(m, 4000) }))
@@ -899,10 +1037,11 @@ export async function runAiAgent({
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
   const removal = /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
   const pendingVehicle = /车型|目录|全部保留|\bz\d+\b/u.test(lastReply) &&
-    /[？?]|待确认选项|请(?:选择|确认)/u.test(lastReply);
-  const selectedOption = /待确认选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
+    /[？?]|待确认选项|已提供选项|请(?:选择|确认)/u.test(lastReply);
+  const selectedOption = !/^(?:继续|确认)[。！!]*$/u.test(userText) &&
+    /待确认选项|已提供选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
   const requiredTool = removal ? 'remove_from_canvas'
-    : pendingVehicle && (selectedOption || /继续|全部保留|^确认$|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
+    : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
 
   let messages = [
     { role: 'system', content: buildSystemPrompt(context, activeMode === 'prompt') },
@@ -917,20 +1056,22 @@ export async function runAiAgent({
   let emptyThinkRetries = 0;
   let actionRetries = 0;
   const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
+  const maxTokens = config.maxTokens ?? DEFAULT_AI_CONFIG.maxTokens;
   const requestDefaults = {
     model: config.model,
-    temperature: config.temperature ?? 0.2,
-    ...(config.maxTokens > 0 ? { max_tokens: config.maxTokens } : {}),
+    temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
+    ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
   };
   const finish = (answer) => {
-    const result = { ok: true, answer, thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
+    signal?.throwIfAborted();
+    const result = { ok: true, answer: normalizeLineBreaks(answer).trim(), thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
     onEvent({ type: 'done', ...result });
     return result;
   };
 
   let step = 0;
   for (; step < maxSteps; step++) {
-    if (signal?.aborted) throw new Error('已取消');
+    signal?.throwIfAborted();
     onEvent({ type: 'status', text: step === 0 ? '正在思考并选择工具…' : `正在整合结果（第 ${step + 1} 步）…` });
     const reqBody = {
       ...requestDefaults,
@@ -946,12 +1087,14 @@ export async function runAiAgent({
       method: 'POST',
       headers: authHeaders(config.apiKey),
       body: JSON.stringify(reqBody),
-    }, fetchImpl, DEFAULT_TIMEOUT_MS, signal, (body, requestSignal) => readChatStream(body, requestSignal,
+    }, fetchImpl, DEFAULT_TIMEOUT_MS, signal, (body, requestSignal, resetTimeout) => readChatStream(body, requestSignal,
       (channel, delta) => {
         if (channel !== 'tool') onEvent({ type: channel + '_delta', step: step + 1, delta });
       },
       metrics.chunk,
+      resetTimeout,
     ));
+    signal?.throwIfAborted();
 
     if (!res.ok) {
       if ([400, 422].includes(res.status)) {
@@ -1053,8 +1196,7 @@ export async function runAiAgent({
     if (finishReason === 'length' || finishReason === 'content_filter') calls = [];
     if (!calls.length) {
       if (finishReason === 'length') {
-        const notice = '模型输出达到单次最大长度（max_tokens）被截断，可发送「继续」或调大 max_tokens。';
-        return finish([text, notice].filter(Boolean).join('\n\n'));
+        return finish(text || '模型输出达到单次长度上限，可发送「继续」或调大 max_tokens。');
       }
       if (finishReason === 'content_filter') return finish(text || '模型输出被上游内容过滤器拦截。');
       if (!text && thinking && emptyThinkRetries < 1 && step + 1 < maxSteps) {
@@ -1067,7 +1209,7 @@ export async function runAiAgent({
       }
     }
 
-    if (signal?.aborted) throw new Error('已取消');
+    signal?.throwIfAborted();
 
     const ask = calls.find(call => call.name === 'ask_user');
     if (requiredTool && (!calls.length || ask) && !toolLog.some(tool => tool.name === requiredTool && tool.ok)) {
@@ -1090,14 +1232,15 @@ export async function runAiAgent({
     }
 
     if (ask) {
-      const question = String(ask.arguments?.question || text || '请确认你的需求').trim() || '请确认你的需求';
+      const question = normalizeLineBreaks(String(ask.arguments?.question || text)).trim() || '请确认你的需求';
       const rawOptions = ask.arguments?.options;
-      const options = Array.isArray(rawOptions)
+      const parsedOptions = Array.isArray(rawOptions)
         ? rawOptions.map(option => ({
           label: String(option?.label ?? '').trim(),
           description: String(option?.description ?? '').trim(),
-        })).filter(option => option.label).slice(0, 6)
+        })).filter(option => option.label)
         : [];
+      const options = parsedOptions.some(option => option.label === '全部保留') ? parsedOptions : parsedOptions.slice(0, 6);
       const allowCustom = ask.arguments?.allowCustom !== false;
       const thinking = allThoughts.join('\n\n');
       onEvent({ type: 'question', question, options, allowCustom, thinking });
@@ -1115,8 +1258,9 @@ export async function runAiAgent({
 
     const promptResults = [];
     for (const call of calls) {
-      if (signal?.aborted) throw new Error('已取消');
+      signal?.throwIfAborted();
       onEvent({ type: 'tool_start', name: call.name, arguments: call.arguments });
+      signal?.throwIfAborted();
       let output;
       try {
         if (!TOOL_NAME_SET.has(call.name)) output = { ok: false, error: `未知工具：${call.name}` };
@@ -1124,6 +1268,7 @@ export async function runAiAgent({
       } catch (err) {
         output = { ok: false, error: String(err?.message || err) };
       }
+      signal?.throwIfAborted();
       const summary = summarizeToolResult(call.name, output);
       const digest = summarizeToolDigest(call.name, call.arguments, output);
       toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, summary, digest });
@@ -1147,11 +1292,12 @@ export async function runAiAgent({
     }
   }
 
+  signal?.throwIfAborted();
   if (requiredTool && !toolLog.some(tool => tool.name === requiredTool && tool.ok)) {
     return finish(toolLog.findLast(tool => tool.name === requiredTool)?.summary ?? '已达到工具调用步数上限，所确认的操作未执行。');
   }
   let answer = '';
-  if (toolLog.length > 0 && !signal?.aborted) {
+  if (toolLog.length > 0) {
     let summaryMessage;
     try {
       const request = {
@@ -1171,6 +1317,7 @@ export async function runAiAgent({
         metrics.finish(res.json);
       }
     } catch {
+      signal?.throwIfAborted();
       // 总结请求失败时使用已记录的工具结果。
     }
     if (summaryMessage) {
