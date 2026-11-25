@@ -162,6 +162,7 @@ if (es) {
 /** 视图状态的指纹：变化才上报，避免空转打接口 */
 let lastSig = '';
 let restoring = true;
+let restoreId = 0;
 let pendingSave = Promise.resolve();
 
 export function acceptRestoredRevision(revision) {
@@ -215,13 +216,17 @@ setInterval(() => {
 }, 800);
 
 /** 显式链接优先；没有入口参数时恢复当前工程上次关闭前的选择。 */
-export async function restorePage(root = null, isCurrent = () => true) {
+export async function restorePage({ root = null, isCurrent = () => true } = {}) {
+  const id = ++restoreId;
   restoring = true;
+  let started = false;
+  let view;
+  const superseded = () => id !== restoreId || !isCurrent(started);
   try {
-    if (!isCurrent()) return;
+    if (superseded()) return { status: 'superseded' };
     let stored = null;
     try { stored = (await api.savedPage()).page; } catch { /* 首次打开或服务暂不可用，走默认入口。 */ }
-    if (!isCurrent()) return; // 旧设置等待期间已有新操作，不再回填旧选择。
+    if (superseded()) return { status: 'superseded' };
     pageRevision = stored?.revision ?? 0;
     const saved = root ? null : stored;
     if (saved) {
@@ -235,30 +240,42 @@ export async function restorePage(root = null, isCurrent = () => true) {
     let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
     if (!root && !saved) {
       const project = await api.project().catch(() => null);
-      if (!isCurrent()) return;
+      if (superseded()) return { status: 'superseded' };
       empty = !project?.focusFile && !project?.comparison;
     }
-    const view = await hooks.loadView(empty ? [] : root || saved?.roots || null,
-      { nav: false, empty, expansions: empty ? [] : saved?.expansions || [] });
+    started = true;
+    view = await hooks.loadView(empty ? [] : root || saved?.roots || null,
+      { nav: false, empty, expansions: empty ? [] : saved?.expansions || [], restore: true });
+    if (superseded()) return { status: 'superseded' };
+    if (!view || view.error || !Array.isArray(view.nodes)) {
+      return { status: 'error', error: view?.error || t('app.noView') };
+    }
     // 比较进行中刷新页面：saved page 为空、通常也没有 root 参数，服务端按 COMPARISON.roots 零层出图，
     // 但启动时从 uiPrefs 恢复的非零层数还留在 state 里，之后的重载（勾变量/换分组）会把未选节点拉回图。
     // 这里把生效层数归零并同步控件；只动本次会话，不回写 uiPrefs 里的普通偏好。
     if (state.view?.comparison && !saved?.comparisonId) {
       state.up = 0; state.down = 0;
     }
-    if (saved && view && state.view === view) {
+    if (saved && state.view === view) {
       state.selected = state.view.nodes.some((n) => n.id === saved.selected) ? saved.selected : null;
       state.selectedEdge = state.view.edges.find((e) => edgeKey(e) === saved.selectedEdge) || null;
       state.ctxBox = saved.ctxBox;
       if (saved.cam) Object.assign(cam, saved.cam);
       constrainCam();
       renderVars();
-      await renderDetail(state.selected);
+      void renderDetail(state.selected).catch((error) => console.warn(t('common.detailError'), error));
       renderLabelPanel();
       draw();
     }
-  } finally { restoring = false; }
+  } catch (error) {
+    if (superseded()) return { status: 'superseded' };
+    return { status: 'error', error: error?.message || t('app.noView') };
+  } finally {
+    if (id === restoreId) restoring = false;
+  }
   await savePage(true).catch(() => {});
+  if (superseded()) return { status: 'superseded' };
+  return { status: view.nodes.length ? 'ok' : 'empty' };
 }
 
 // ---------------- 轻量提示条 ----------------
