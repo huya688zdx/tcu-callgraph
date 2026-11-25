@@ -119,6 +119,8 @@ let mcpLevel = 'readonly';
 let envLocked = false;
 const REASONING_LABELS = new Map([['default', '默认'], ['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
 const QUICK_CONFIG_ACTION = '__ai_open_config__';
+const DEFAULT_PROMPT_PLACEHOLDER = inputEl?.placeholder || '例如：把 Git 未提交改动的函数加入画布；或：找出油压控制相关函数和共享变量加到图里…';
+const STEERING_PROMPT_PLACEHOLDER = '生成中可随时输入并按 Enter 中途引导或纠正…';
 let llmConfig = {
   baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
   toolMode: 'auto', reasoningEffort: 'default', contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -137,6 +139,7 @@ let chatThreads = []; // [{ id, title, customTitle?, updatedAt, messages }]
 let activeChatId = '';
 let renamingThread = null;
 let activeAbort = null;
+let pendingSteer = null;
 let compacting = false;
 let stickToBottom = true;
 let displayedContext = { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
@@ -412,10 +415,15 @@ function setChatStatus(text = '', error = false) {
 }
 
 function updateChatControls() {
-  sendBtn.disabled = Boolean(activeAbort || compacting);
-  compactBtn.disabled = sendBtn.disabled || !activeThread().messages.length;
-  stopBtn.hidden = !activeAbort;
-  for (const chip of selectionQuestions.children) chip.disabled = sendBtn.disabled;
+  const streaming = Boolean(activeAbort);
+  sendBtn.disabled = Boolean(compacting);
+  sendBtn.textContent = streaming ? '引导' : '发送';
+  sendBtn.title = streaming ? '立即中止当前步骤并带上新引导继续' : '';
+  sendBtn.classList.toggle('steering', streaming);
+  if (inputEl) inputEl.placeholder = streaming ? STEERING_PROMPT_PLACEHOLDER : DEFAULT_PROMPT_PLACEHOLDER;
+  compactBtn.disabled = Boolean(streaming || compacting) || !activeThread().messages.length;
+  stopBtn.hidden = !streaming;
+  for (const chip of selectionQuestions.children) chip.disabled = Boolean(compacting);
 }
 
 function isNearBottom(el) {
@@ -535,28 +543,53 @@ function prefillPrompt(draft) {
   inputEl.setSelectionRange(draft.length, draft.length);
 }
 
+function sanitizeSuggestions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const label = String(item.label ?? '').trim().slice(0, 40);
+    const prompt = typeof item.prompt === 'string' ? item.prompt.trim().slice(0, 400) : '';
+    const draft = typeof item.draft === 'string' && item.draft.trim() ? item.draft.trimStart().slice(0, 200) : '';
+    if (!label || (!prompt && !draft) || seen.has(label)) continue;
+    seen.add(label);
+    out.push(draft ? { label, draft } : { label, prompt });
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
 function renderFollowups(box, message, thread) {
-  if (!message.completed || thread.messages.at(-1) !== message) return;
+  if (thread.messages.at(-1) !== message || message.error) return;
   const tools = message.tools || [];
   if (tools.some(tool => tool.name === 'ask_user')) return;
-  const successfulTools = tools.filter(tool => tool.ok !== false);
-  const addedToCanvas = successfulTools.some(tool => tool.name === 'add_to_canvas');
-  const action = successfulTools.findLast(tool => FOLLOWUPS.has(tool.name) &&
-    (tool.name !== 'get_git_changes' || !addedToCanvas));
-  const options = FOLLOWUPS.get(action?.name);
-  if (!options) return;
+  const dynamicOptions = sanitizeSuggestions(message.suggestions);
+  let options = dynamicOptions;
+  const isDynamic = dynamicOptions.length > 0;
+  if (!isDynamic) {
+    if (!message.completed) return;
+    const successfulTools = tools.filter(tool => tool.ok !== false);
+    const addedToCanvas = successfulTools.some(tool => tool.name === 'add_to_canvas');
+    const action = successfulTools.findLast(tool => FOLLOWUPS.has(tool.name) &&
+      (tool.name !== 'get_git_changes' || !addedToCanvas));
+    options = FOLLOWUPS.get(action?.name) || [];
+  }
+  if (!options.length) return;
 
   const chips = document.createElement('div');
   chips.className = 'ai-followups';
   chips.setAttribute('role', 'group');
-  chips.setAttribute('aria-label', '后续操作');
+  chips.setAttribute('aria-label', isDynamic ? 'AI 推荐的后续操作' : '后续操作');
   for (const option of options) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'ai-followup-chip';
+    if (isDynamic) button.dataset.aiDynamic = 'true';
     button.textContent = option.label;
+    button.title = option.prompt || option.draft || option.label;
     button.addEventListener('click', () => {
-      if (activeAbort || compacting || activeChatId !== thread.id || thread.messages.at(-1) !== message) return;
+      if (compacting || activeChatId !== thread.id || thread.messages.at(-1) !== message) return;
       if (chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
       if (option.draft) {
         prefillPrompt(option.draft);
@@ -634,7 +667,7 @@ function setCanvasSelection(selection, explicit = false) {
       chip.type = 'button';
       chip.className = 'ai-followup-chip';
       chip.textContent = label;
-      chip.disabled = sendBtn.disabled;
+      chip.disabled = Boolean(compacting);
       chip.addEventListener('click', () => sendPrompt(prompt));
       selectionQuestions.appendChild(chip);
     }
@@ -704,6 +737,7 @@ async function loadProjectChats({ force = false } = {}) {
   }
   const gen = ++chatGeneration;
   const mutation = chatMutation;
+  pendingSteer = null;
   if (activeAbort) {
     activeAbort.abort();
     activeAbort = null;
@@ -716,11 +750,21 @@ async function loadProjectChats({ force = false } = {}) {
     chatProjectId = projectId;
     chatProjectName = res.projectName || '';
     chatThreads = Array.isArray(res.threads) && res.threads.length ? res.threads : [newThreadObject()];
-    // 重开抽屉时保留本次会话中已收到 done 的建议。
+    // 重开抽屉时保留本次会话中已收到 done 的建议与动态提示。
     for (const thread of chatThreads) {
       const previous = previousThreads.find(item => item.id === thread.id && item.updatedAt === thread.updatedAt)?.messages.at(-1);
       const latest = thread.messages.at(-1);
-      if (previous?.completed && latest?.role === 'assistant' && latest.text === previous.text) latest.completed = true;
+      if (latest?.role === 'assistant') {
+        const cleanSaved = sanitizeSuggestions(latest.suggestions);
+        if (cleanSaved.length) latest.suggestions = cleanSaved;
+        else delete latest.suggestions;
+        if (previous && latest.text === previous.text) {
+          if (previous.completed) latest.completed = true;
+          if (!latest.suggestions?.length && previous.suggestions?.length) {
+            latest.suggestions = sanitizeSuggestions(previous.suggestions);
+          }
+        }
+      }
     }
     setActiveChat(res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id);
     renderChatBar();
@@ -1097,18 +1141,44 @@ async function saveViewBookmark(name) {
 async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const text = String(rawText ?? inputEl.value).trim();
   if (!text) return;
-  if (text === '/new' || text === '/clear' || text === '/compact') {
+  if (text === '/new' || text === '/clear') {
+    pendingSteer = null;
     inputEl.value = '';
-    if (text === '/compact') await compactChat();
-    else if (await ensureChatProject()) {
+    if (await ensureChatProject()) {
       startNewThread();
       setChatStatus('已新建空白对话，原对话保留在历史列表中');
     }
     return;
   }
-  if (activeAbort || compacting) return;
+  if (text === '/compact') {
+    if (activeAbort || compacting) {
+      setChatStatus('请等待当前生成结束后再压缩上下文');
+      return;
+    }
+    inputEl.value = '';
+    await compactChat();
+    return;
+  }
+  if (compacting) return;
   if (text === BOOKMARK_COMMAND || text.startsWith(BOOKMARK_COMMAND + ' ')) {
+    if (activeAbort) {
+      setChatStatus('请等待当前生成结束后再保存书签');
+      return;
+    }
     await saveViewBookmark(text.slice(BOOKMARK_COMMAND.length).trim());
+    return;
+  }
+  if (activeAbort) {
+    pendingSteer = {
+      text,
+      uiContext,
+      threadId: activeChatId,
+      projectId: chatProjectId,
+      gen: chatGeneration,
+    };
+    inputEl.value = '';
+    setChatStatus('正在中断当前步骤并应用新引导…');
+    activeAbort.abort();
     return;
   }
   if (!llmConfig.baseUrl || !llmConfig.model) {
@@ -1194,14 +1264,23 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     if (isVisible()) renderTelemetry(thread, metrics);
     return turnMessages.at(-1);
   };
+  const isSteerQueuedForThisTurn = () => Boolean(
+    pendingSteer && pendingSteer.threadId === threadId &&
+    pendingSteer.projectId === myProjectId && pendingSteer.gen === myGen
+  );
   const finishInterrupted = (message, stopped = false) => {
     stopThinking();
     for (const { row, name } of pendingSteps) {
       finishStep(row, { name, ok: false, summary: '执行中断' });
     }
+    const steeringNow = stopped && isSteerQueuedForThisTurn();
     if (collectedTools.length || streamedText) {
       ui.text.innerHTML = formatAssistantText(streamedText);
       commitAssistantMsg({ text: streamedText });
+    } else if (steeringNow) {
+      // 中途引导且本轮尚未产生工具结果或正文时，直接移除空占位，避免插入多余报错气泡。
+      ui.box.remove();
+      return;
     } else {
       ui.box.classList.toggle('error', !stopped);
       ui.text.textContent = message;
@@ -1209,7 +1288,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     if (isVisible()) {
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
-      if (collectedTools.length || streamedText) setChatStatus(message, !stopped);
+      if (!steeringNow && (collectedTools.length || streamedText)) setChatStatus(message, !stopped);
     }
   };
   const handleLine = (line) => {
@@ -1266,6 +1345,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       } else {
         entry.text = ev.answer || streamedText || '已完成。';
         entry.completed = true;
+        const suggestions = sanitizeSuggestions(ev.suggestions);
+        if (suggestions.length) entry.suggestions = suggestions;
       }
       ui.text.innerHTML = formatAssistantText(entry.text);
       const saved = commitAssistantMsg(entry);
@@ -1308,11 +1389,15 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
     }
   } finally {
+    let steer = null;
     if (activeAbort === controller) {
       activeAbort = null;
+      if (isSteerQueuedForThisTurn() && isVisible()) steer = pendingSteer;
+      pendingSteer = null;
       updateChatControls();
     }
     if (isVisible()) followChatScroll();
+    if (steer) void sendPrompt(steer.text, steer.uiContext);
   }
 }
 
@@ -1382,6 +1467,7 @@ document.addEventListener('cg:project-changed', () => {
   chatThreads = [];
   setActiveChat('');
   renameChatBtn.disabled = true;
+  pendingSteer = null;
   if (activeAbort) {
     activeAbort.abort();
     activeAbort = null;
@@ -1390,6 +1476,7 @@ document.addEventListener('cg:project-changed', () => {
 });
 
 if (chatSelectEl) chatSelectEl.addEventListener('change', () => {
+  pendingSteer = null;
   if (activeAbort) activeAbort.abort();
   setActiveChat(chatSelectEl.value);
   renderChatBar();
@@ -1397,6 +1484,7 @@ if (chatSelectEl) chatSelectEl.addEventListener('change', () => {
   persistChats();
 });
 function startNewThread() {
+  pendingSteer = null;
   if (activeAbort) activeAbort.abort();
   const th = newThreadObject();
   chatThreads.unshift(th);
@@ -1440,6 +1528,7 @@ if (deleteChatBtn) deleteChatBtn.addEventListener('click', async () => {
     });
     if (!ok || activeChatId !== targetId) return;
   }
+  pendingSteer = null;
   if (activeAbort) activeAbort.abort();
   chatThreads = chatThreads.filter((x) => x.id !== targetId);
   if (!chatThreads.length) chatThreads.push(newThreadObject());
@@ -1477,7 +1566,10 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
 }
 
 if (sendBtn) sendBtn.addEventListener('click', () => sendPrompt());
-if (stopBtn) stopBtn.addEventListener('click', () => activeAbort?.abort());
+if (stopBtn) stopBtn.addEventListener('click', () => {
+  pendingSteer = null;
+  activeAbort?.abort();
+});
 compactBtn.addEventListener('click', compactChat);
 if (quickModelEl) quickModelEl.addEventListener('change', () => {
   const val = quickModelEl.value;
