@@ -2,7 +2,7 @@
  * 侧栏面板：统计 / 文件树 / 搜索结果 / 节点详情
  */
 import { t } from '../i18n.js';
-import { els, state, esc, shortFile, edgeKey } from './state.js';
+import { els, state, esc, shortFile, edgeKey, nodeById } from './state.js';
 import { edgeCaption, isDataEdge } from './edge-flow.js';
 import { formatPeriod, nodePeriodBadge, periodCaption } from './period-text.js';
 import { api } from './api.js';
@@ -17,6 +17,31 @@ import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
 import { canOpenFlowchart, openFlowchart } from './flowchart.js';
 import { openManualNodeDialog, removeManualNodePermanently } from './manual-node.js';
+
+export function nodeAiDetail(node) {
+  return {
+    kind: 'node',
+    id: node.id,
+    name: node.displayName || node.name,
+    nodeKind: node.kind || 'fn',
+    file: node.file || '',
+    line: node.line || 0,
+    change: node.change || 'existing',
+    taskPeriods: (node.taskPeriods || []).slice(0, 4).map(({ task, us, kind }) => ({ task, us, kind })),
+  };
+}
+
+export function fileAiDetail(path, containerKind, label) {
+  return { kind: 'file', path, containerKind, label };
+}
+
+export function publishAiSelection(detail) {
+  document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail }));
+}
+
+export function askAi(detail) {
+  document.dispatchEvent(new CustomEvent('cg:ask-ai', { detail }));
+}
 
 let statsSeq = 0;
 async function loadStats() {
@@ -560,6 +585,7 @@ function openTreeMenu(ev, kind, payload) {
     else if (!window.__EXPORT && payload.fnIds?.length) items.push({ value: 'alone', label: t('common.openAlone') });
     if (items.length) sections.push({ items });
   }
+  if (!window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: '✨ 问 AI' }] });
   if (!sections.length) return;
   showMenuSections(
     ev.clientX,
@@ -567,6 +593,9 @@ function openTreeMenu(ev, kind, payload) {
     payload.label,
     sections,
     async (v) => {
+      if (v === 'askAi') return askAi(kind === 'fn'
+        ? nodeAiDetail(nodeById(payload.id) || payload.node)
+        : fileAiDetail(payload.id, kind, payload.label));
       if (v === 'addFn') return openManualNodeDialog({ file: payload.id, kind: 'fn' });
       if (v === 'addVar') return openManualNodeDialog({ file: payload.id, kind: 'var' });
       if (v === 'deleteManual') return removeManualNodePermanently({ id: payload.id, name: payload.label });
@@ -574,7 +603,10 @@ function openTreeMenu(ev, kind, payload) {
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
       if (kind === 'fn') return handleFunctionViewAction(v, payload.id);
-      if (await locateBox(kind, payload.id, v === 'alone' ? payload.fnIds : [])) renderVars();
+      if (await locateBox(kind, payload.id, v === 'alone' ? payload.fnIds : [])) {
+        renderVars();
+        publishAiSelection(fileAiDetail(payload.id, kind, payload.label));
+      }
     }
   );
 }
@@ -630,9 +662,13 @@ function buildTreeNode(node, depth, expanded = new Map()) {
       fr.appendChild(lab);
       fr.insertAdjacentHTML('beforeend', addFunctionButton(f.id));
       fr.classList.toggle('shown', shown.has(f.id));
-      fr.addEventListener('click', () => searchPick(f.id, fr.querySelector('[data-add-function]')));
+      const treeFn = { ...f, file: node.path };
+      fr.addEventListener('click', () => {
+        if (!inCanvas(f.id)) publishAiSelection(nodeAiDetail(treeFn));
+        searchPick(f.id, fr.querySelector('[data-add-function]'));
+      });
       fr.addEventListener('contextmenu', (ev) =>
-        openTreeMenu(ev, 'fn', { id: f.id, label: f.name, manual: !!f.manual })
+        openTreeMenu(ev, 'fn', { id: f.id, label: f.name, manual: !!f.manual, node: treeFn })
       );
       kids.appendChild(fr);
     }
@@ -644,8 +680,9 @@ function buildTreeNode(node, depth, expanded = new Map()) {
   wrap.appendChild(kids);
 
   // 文件 / 目录行右键：定位到该文件或该目录
+  const kind = node.type === 'file' ? 'file' : 'dir';
   row.addEventListener('contextmenu', (ev) =>
-    openTreeMenu(ev, node.type === 'file' ? 'file' : 'dir', {
+    openTreeMenu(ev, kind, {
       id: node.path,
       label: node.name,
       fnIds: collectFnIds(node),
@@ -653,7 +690,9 @@ function buildTreeNode(node, depth, expanded = new Map()) {
   );
 
   row.addEventListener('click', (ev) => {
-    if (ev.target.tagName === 'INPUT' || !hasKids) return;
+    if (ev.target.tagName === 'INPUT') return;
+    publishAiSelection(fileAiDetail(node.path, kind, node.name));
+    if (!hasKids) return;
     const open = kids.style.display !== 'none';
     if (!open) populateFunctions();
     kids.style.display = open ? 'none' : 'block';
@@ -950,15 +989,19 @@ function periodDetail(node) {
   </details>`;
 }
 
-async function renderDetail(id) {
+async function renderDetail(id, boxDetail = null) {
   clearDataflow();
   state.hoverRelation = null;
   const my = ++detailSeq;
-  const target = id && state.view ? state.view.nodes.find((n) => n.id === id) : null;
+  const target = id ? nodeById(id) : null;
+  if (target || !state.selectedEdge) publishAiSelection(target ? nodeAiDetail(target) : boxDetail);
   const isFn = !!target && target.kind !== 'var';
   const comparison = state.compareInfo?.active ? state.compareInfo : state.view?.comparison;
   syncDetailSections(isFn);
   if (!target && comparison && showEdgeDetails(state.selectedEdge)) return;
+  const askAiButton = target && !window.__EXPORT
+    ? `<button class="flowchart-detail" type="button" data-node-ask-ai="${esc(target.id)}">✨ 问 AI</button>`
+    : '';
   const inViewIds = new Set((state.view?.nodes || []).map((n) => n.id));
   const dataEdges = target ? state.view.edges.filter(e => isDataEdge(e) && (e.from === id || e.to === id)) : [];
   const names = dataEdges.length ? new Map(state.view.nodes.map(n => [n.id, n.displayName || n.name])) : null;
@@ -988,6 +1031,7 @@ async function renderDetail(id) {
     if (els.secEdges) els.secEdges.style.display = 'none';
     els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
       <div class="detail-meta">${esc(target.file || '')}${target.manual ? ` · ${t('node.manualVar')}${target.typeText ? ' · ' + esc(target.typeText) : ''}` : `:${target.line || ''}`}</div>
+      ${askAiButton}
       ${comparison ? comparisonDetail(target, comparison.changePoints ?? state.view?.comparison?.changePoints) : ''}
       ${dataDirections}
       ${statusControl(target)}
@@ -1016,6 +1060,7 @@ async function renderDetail(id) {
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}${n.manual ? ' · ' + t('node.manualFn') : `:${n.line}`}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
     ${canOpenFlowchart(n) ? `<button class="flowchart-detail" type="button" data-node-flowchart>${t('flowchart.menu')}</button>` : ''}
+    ${askAiButton}
     ${comparison ? comparisonDetail(n, comparison.changePoints ?? state.view?.comparison?.changePoints ?? d.changePoints) : ''}
     ${dataDirections}
     ${statusControl(target)}
@@ -1071,6 +1116,12 @@ for (const panel of [els.edges, els.detail]) {
   if (!panel) continue;
   panel.addEventListener('click', (event) => {
     if (!state.selected) return;
+    const ask = event.target.closest('[data-node-ask-ai]');
+    if (ask?.dataset.nodeAskAi === state.selected) {
+      const node = nodeById(state.selected);
+      if (node) askAi(nodeAiDetail(node));
+      return;
+    }
     if (event.target.closest('button, select, input, a')) return;
     const row = event.target.closest('[data-peer-id].in-view');
     if (row) peekNode(row.dataset.peerId);
