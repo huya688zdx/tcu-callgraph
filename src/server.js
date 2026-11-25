@@ -4,10 +4,10 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { fork } from 'node:child_process';
-import { isDeepStrictEqual } from 'node:util';
+import { execFile, fork } from 'node:child_process';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
-import { sourceDecoder } from './core/source-files.js';
+import { decodeSource, sourceDecoder } from './core/source-files.js';
 import { layoutElk } from './core/layout-elk.js';
 import { buildFlowchart, flowchartCacheHash, isFlowchartFunction } from './core/flowchart.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
@@ -26,6 +26,7 @@ import { detectTasks, readFunctionHeaderComment } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
 import {
   DEFAULT_AI_CONFIG,
+  compactConversation,
   listModels as listAiModels,
   normalizeAiConfig,
   publicAiConfig,
@@ -455,11 +456,33 @@ function saveProjectFlowchartCache(projectId, mem) {
   }
 }
 
+const execFileAsync = promisify(execFile);
+
+/** 仅读取单个文件在 Git HEAD 下的源码，用于普通模式下对已修改函数做逐块流程图差分（避免全库重解析）。 */
+async function readGitHeadFileText(projectRoot, relFile) {
+  if (!projectRoot || !relFile || relFile.includes('..')) return null;
+  const rel = String(relFile).replace(/\\/g, '/').replace(/^\/+/, '');
+  try {
+    const { stdout: prefixOut } = await execFileAsync(
+      'git', ['-c', 'core.quotePath=false', '-C', projectRoot, 'rev-parse', '--show-prefix'],
+      { encoding: 'utf8', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, timeout: 5000, windowsHide: true }
+    );
+    const prefix = prefixOut.replace(/\r?\n$/, '');
+    const { stdout: buf } = await execFileAsync(
+      'git', ['-c', 'core.quotePath=false', '-C', projectRoot, 'show', `HEAD:${prefix}${rel}`],
+      { encoding: 'buffer', env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, maxBuffer: 8 * 1024 * 1024, timeout: 8000, windowsHide: true }
+    );
+    return decodeSource(buf);
+  } catch {
+    return null;
+  }
+}
+
 async function getOrBuildFlowchart(projectId, model, fn, opts = {}) {
   const { version = 'after', expandMacros = false, fnChange = 'existing', otherModel = null, otherFn = null,
-    sourceRoot, otherSourceRoot } = opts;
+    otherSourceText = null, sourceRoot, otherSourceRoot } = opts;
   const entryKey = `${fn.id}|${version}|${expandMacros ? 1 : 0}`;
-  const hash = flowchartCacheHash(model, fn, { version, expandMacros, fnChange, otherModel, otherFn, sourceRoot, otherSourceRoot });
+  const hash = flowchartCacheHash(model, fn, { version, expandMacros, fnChange, otherModel, otherFn, otherSourceText, sourceRoot, otherSourceRoot });
   const cache = loadProjectFlowchartCache(projectId);
   const hit = cache.get(entryKey);
   if (hit && hit.hash === hash && hit.data?.ok) {
@@ -1033,9 +1056,49 @@ async function readMcpSource(q) {
   };
 }
 
-function changedFunctionScope(model, comparison, changes, isNode) {
+function normalizePathPrefixes(raw) {
+  const arr = Array.isArray(raw) ? raw : typeof raw === 'string' && raw.trim() ? [raw] : [];
+  return [...new Set(arr.map((s) => String(s || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase()).filter(Boolean))];
+}
+
+function fileMatchesPathPrefix(filePath, prefix) {
+  const norm = String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+  if (!norm || !prefix) return false;
+  return norm === prefix || norm.startsWith(prefix + '/') || norm.includes('/' + prefix + '/');
+}
+
+function fileOfNodeId(model, id) {
+  const node = model?._index?.byId?.get(id);
+  if (node?.file) return node.file;
+  const raw = String(id || '');
+  const parts = raw.split('::');
+  if (parts[0] === 'var') return parts.length >= 3 ? parts[1] : '';
+  return parts.length >= 2 ? parts[0] : '';
+}
+
+function chainMatchesPathFilters(model, chain, targetSet, includePaths, excludePaths) {
+  const files = (chain.path || []).map((fnId) => ({ fnId, file: fileOfNodeId(model, fnId) }));
+  if (excludePaths.length) {
+    // 任一上游节点（或非目标本身节点）命中排除路径，整条支路排除
+    if (files.some(({ fnId, file }) => !targetSet.has(fnId) && excludePaths.some((p) => fileMatchesPathPrefix(file, p)))) {
+      return false;
+    }
+  }
+  if (includePaths.length) {
+    // 只要整条上游链路中存在命中 includePaths 的节点，即保留（共通改动函数自动保留）
+    if (!files.some(({ file }) => includePaths.some((p) => fileMatchesPathPrefix(file, p)))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function changedFunctionScope(model, comparison, changes, isNode, pathFilter = null) {
   const taskRoots = new Set(), functionIds = new Set(changes), variableIds = new Set();
   const untracedIds = [], untracedVersions = [], omittedRelationTargets = new Set();
+  const includePaths = normalizePathPrefixes(pathFilter?.includePaths);
+  const excludePaths = normalizePathPrefixes(pathFilter?.excludePaths);
+  const targetSet = new Set(changes);
   const sides = comparison
     ? [['after', comparison.afterModel], ['before', comparison.beforeModel]]
     : [['current', model]];
@@ -1048,6 +1111,10 @@ function changedFunctionScope(model, comparison, changes, isNode) {
       if (trace.traceTruncated) throw new Error('入口过多，请按版本分页选链，分批传 functionIds 和 changedFunctionIds: []');
       if (!trace.totalTasks) untracedVersions.push({ id, version });
       for (const chain of trace.upstreamChains) {
+        if ((includePaths.length || excludePaths.length) &&
+            !chainMatchesPathFilters(side, chain, targetSet, includePaths, excludePaths)) {
+          continue;
+        }
         reached = true;
         taskRoots.add(chain.taskId);
         for (const fn of chain.path) {
@@ -1064,6 +1131,7 @@ function changedFunctionScope(model, comparison, changes, isNode) {
       for (const edge of adjacency.get(id) || []) {
         if (edge.change !== 'added' && edge.change !== 'deleted') continue;
         const other = edge.from === id ? edge.to : edge.from;
+        if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(fileOfNodeId(model, other), p))) continue;
         if (!isNode(other) || overlay.deleted.edges[edgeKeyOf(edge)]) omittedRelationTargets.add(other);
         else if (model._index.byId.get(other).kind === 'var') variableIds.add(other);
         else functionIds.add(other);
@@ -1122,7 +1190,10 @@ function composeMcpView(p, { chatClientId } = {}) {
   if (invalid.size) throw Object.assign(new Error(`以下 ID 无效、类型不符、为外部节点或已隐藏：${[...invalid].join('、')}`),
     { invalidIds: [...invalid] });
 
-  const scope = changedFunctionScope(model, comparison, changes, isNode);
+  const pathFilter = (p.includePaths?.length || p.excludePaths?.length)
+    ? { includePaths: p.includePaths, excludePaths: p.excludePaths }
+    : null;
+  const scope = changedFunctionScope(model, comparison, changes, isNode, pathFilter);
   if (changes.length) {
     roots = [...new Set([...scope.taskRoots, ...roots])];
     const rootSet = new Set(roots);
@@ -1545,10 +1616,14 @@ async function buildView(
   const projectId = PROJECT.id;
   const model = MODEL;
   const requestedRoots = Array.isArray(rootIds) ? rootIds : rootIds ? [rootIds] : [];
-  if (!COMPARISON && (varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')) ||
-      ((requestedRoots.length || varSel.expansions?.length) && needsCounterAnalysis(model)))) {
+  const mustAnalyzeForView = Boolean(varSel.want?.length || dfNode || requestedRoots.some((id) => id?.startsWith('var::')));
+  const needCounter = Boolean((requestedRoots.length || varSel.expansions?.length) && needsCounterAnalysis(model));
+  if (!COMPARISON && (mustAnalyzeForView || (needCounter && (varSel.groupMode === 'period' || (model.files?.length || 0) <= 40)))) {
     await ensureAnalysis(model);
     if (model !== MODEL) throw new Error('工程已切换，请刷新后重试');
+  } else if (!COMPARISON && needCounter && !model._df) {
+    // 大工程首帧恢复普通视图时异步预热全工程数据流分析，避免冷启动卡顿数秒。
+    void ensureAnalysis(model).catch(() => {});
   }
   // 多个入口各自取子图，并将旧占位入口迁移为工程内定义。
   const roots = requestedRoots.map((id) => remapLegacyExt(id, model)).filter(Boolean);
@@ -1981,6 +2056,7 @@ export const server = http.createServer(async (req, res) => {
           if (!id || seen.has(id)) continue;
           seen.add(id);
           const title = String(item.title || '新对话').trim().slice(0, 80) || '新对话';
+          const customTitle = Boolean(item.customTitle);
           const updatedAt = Number(item.updatedAt) || Date.now();
           const messages = (Array.isArray(item.messages) ? item.messages : []).slice(-80)
             .filter((m) => m && ['user', 'assistant'].includes(m.role))
@@ -1993,6 +2069,7 @@ export const server = http.createServer(async (req, res) => {
                   name: String(tl?.name || '').slice(0, 64),
                   ok: tl?.ok !== false,
                   summary: String(tl?.summary || '').slice(0, 240),
+                  ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
                 })),
               } : {}),
               ...(Array.isArray(m.questionOptions) && m.questionOptions.length ? {
@@ -2003,9 +2080,22 @@ export const server = http.createServer(async (req, res) => {
                 ...(Number.isInteger(m.questionSelected) && m.questionSelected >= 0 ? { questionSelected: m.questionSelected } : {}),
                 ...(m.allowCustom === false ? { allowCustom: false } : {}),
               } : {}),
+              ...(m.metrics && typeof m.metrics === 'object' ? {
+                metrics: {
+                  promptTokens: Number(m.metrics.promptTokens) || 0,
+                  completionTokens: Number(m.metrics.completionTokens) || 0,
+                  totalTokens: Number(m.metrics.totalTokens) || 0,
+                  contextEstTokens: Number(m.metrics.contextEstTokens) || 0,
+                  contextWindow: Number(m.metrics.contextWindow) || 32768,
+                  tokPerSec: Number(m.metrics.tokPerSec) || 0,
+                  elapsedMs: Number(m.metrics.elapsedMs) || 0,
+                  estimated: Boolean(m.metrics.estimated),
+                },
+              } : {}),
+              ...(m.isSummary ? { isSummary: true } : {}),
               ...(m.error ? { error: true } : {}),
             }));
-          threads.push({ id, title, updatedAt, messages });
+          threads.push({ id, title, ...(customTitle ? { customTitle: true } : {}), updatedAt, messages });
         }
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
@@ -2024,6 +2114,25 @@ export const server = http.createServer(async (req, res) => {
       }
       const saved = sanitizeChats(store.getSetting(chatKey, { activeId: '', threads: [] }));
       return json(res, { ok: true, projectId: PROJECT.id, projectName: PROJECT.name, ...saved });
+    }
+
+    if (u.pathname === '/api/ai/compact' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res, 4 * 1024 * 1024); } catch { return; }
+      if (p?.projectId != null && Number(p.projectId) !== PROJECT.id) {
+        return json(res, { ok: false, error: '工程已切换，请刷新对话列表' }, 409);
+      }
+      try {
+        const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+        const compacted = await compactConversation({
+          config: saved,
+          messages: Array.isArray(p?.messages) ? p.messages : [],
+        });
+        return json(res, compacted);
+      } catch (err) {
+        return bad(res, String(err?.message || err));
+      }
     }
 
     if (u.pathname === '/api/ai/chat' && req.method === 'POST') {
@@ -2272,21 +2381,108 @@ export const server = http.createServer(async (req, res) => {
           if (!placed && groupList[0]) groupList[0].varIds.add(vid);
         }
         groupList.sort((a, b) => b.fnIds.length - a.fnIds.length || a.fnIds[0].localeCompare(b.fnIds[0]));
+        const usedNames = new Set();
         return groupList.map((g, idx) => {
           const taskIds = [...g.taskIds];
           const taskNames = taskIds.map((id) => id.split('::').pop());
-          const leadFn = g.fnIds[0].split('::').pop();
-          const labelCore = taskNames[0] && taskNames[0] !== leadFn ? `${taskNames[0]} → ${leadFn}` : leadFn;
-          const extra = g.fnIds.length > 1 ? ` 等${g.fnIds.length}个` : '';
+          const leadId = g.fnIds[0];
+          const leadFn = leadId.split('::').pop();
+          const leadFile = fileOfNodeId(model, leadId);
+          const dirParts = leadFile.split('/').filter(Boolean);
+          const scopeTag = dirParts.length > 1 ? dirParts[0] : (dirParts[0] ? dirParts[0].replace(/\.[^.]+$/, '') : '');
+          const periodMatch = taskNames.map((n) => /(\d+\s*(?:ms|us|s))/i.exec(n)?.[1]).find(Boolean);
+          const headParts = [scopeTag, leadFn].filter(Boolean);
+          let baseName = headParts.join(' · ');
+          if (periodMatch && !baseName.toLowerCase().includes(periodMatch.toLowerCase())) {
+            baseName += ` (${periodMatch})`;
+          } else if (g.fnIds.length > 1) {
+            baseName += ` (+${g.fnIds.length - 1})`;
+          }
+          baseName = (baseName || `改动模块 ${idx + 1}`).slice(0, 56);
+          let finalName = baseName;
+          let seq = 2;
+          while (usedNames.has(finalName)) finalName = `${baseName.slice(0, 50)} #${seq++}`;
+          usedNames.add(finalName);
           return {
             index: idx + 1,
-            name: `Git改动${idx + 1}: ${labelCore}${extra}`.slice(0, 60),
+            name: finalName,
             fnIds: g.fnIds,
             varIds: [...g.varIds],
             taskIds,
             taskNames,
           };
         });
+      };
+
+      // 检测改动/目标函数的上游调用链是否横跨多个车型/目录前缀（如 z145/ 与 z144/），便于 AI 提前询问筛选。
+      const summarizeVehicleBranches = (model, fnIds) => {
+        const targetSet = new Set(fnIds);
+        const targetDirs = new Set(fnIds.map((id) => {
+          const segs = fileOfNodeId(model, id).split('/').filter(Boolean);
+          return segs.length > 1 ? segs[0] : '';
+        }).filter(Boolean));
+        const byPrefix = new Map();
+        const recordNode = (prefix, fnId, isTask) => {
+          if (!prefix) return;
+          if (!byPrefix.has(prefix)) byPrefix.set(prefix, { prefix, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          const entry = byPrefix.get(prefix);
+          if (isTask) entry.taskIds.add(fnId);
+          else entry.sampleFunctions.add(fnId);
+        };
+        const branchPrefixOf = (file) => {
+          const segs = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
+          if (segs.length <= 1) return '';
+          return segs[0];
+        };
+        for (const id of targetSet) {
+          if (!model._index?.byId?.has(id)) continue;
+          let sawChains = false;
+          try {
+            const trace = traceToTasks(model, id, { limit: 60 });
+            for (const chain of trace.upstreamChains || []) {
+              sawChains = true;
+              const chainPrefixes = new Set();
+              for (const nodeId of chain.path || []) {
+                if (targetSet.has(nodeId)) continue;
+                const pref = branchPrefixOf(fileOfNodeId(model, nodeId));
+                if (!pref || targetDirs.has(pref)) continue;
+                chainPrefixes.add(pref);
+                recordNode(pref, nodeId, nodeId === chain.taskId);
+              }
+              for (const pref of chainPrefixes) {
+                if (byPrefix.has(pref)) byPrefix.get(pref).chainCount++;
+              }
+            }
+          } catch { /* ignore */ }
+          if (!sawChains) {
+            // 若上游未定义正式 TASK，则向上回溯 4 层直接调用者识别目录分支
+            const queue = [{ node: id, depth: 0 }];
+            const visited = new Set([id]);
+            for (let qi = 0; qi < queue.length; qi++) {
+              const { node, depth } = queue[qi];
+              if (depth >= 4) continue;
+              for (const e of model._index.inAdj.get(node) || []) {
+                if (e.kind === 'var' || visited.has(e.from)) continue;
+                visited.add(e.from);
+                const pref = branchPrefixOf(fileOfNodeId(model, e.from));
+                if (pref && !targetDirs.has(pref)) {
+                  recordNode(pref, e.from, false);
+                  byPrefix.get(pref).chainCount++;
+                }
+                queue.push({ node: e.from, depth: depth + 1 });
+              }
+            }
+          }
+        }
+        const branches = [...byPrefix.values()]
+          .map((b) => ({
+            prefix: b.prefix,
+            taskIds: [...b.taskIds].slice(0, 12),
+            sampleFunctions: [...b.sampleFunctions].slice(0, 8),
+            chainCount: b.chainCount,
+          }))
+          .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
+        return branches.length > 1 ? branches : [];
       };
 
       const isReviewing = () => (Number(p.at) > 0) || Boolean(pageState?.reviewing || Number(pageState?.at) > 0);
@@ -2321,6 +2517,9 @@ export const server = http.createServer(async (req, res) => {
           const groups = changedFunctions.length > 1
             ? splitChangedGroups(groupModel, changedFunctions.map(f => f.id), changedVars.map(v => v.id))
             : [];
+          const pathBranches = changedFunctions.length
+            ? summarizeVehicleBranches(groupModel, changedFunctions.map((f) => f.id))
+            : [];
           return {
             ok: true,
             source: result.source,
@@ -2329,17 +2528,142 @@ export const server = http.createServer(async (req, res) => {
             changedFiles,
             changedFunctions,
             changedVars,
+            ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ...(groups.length > 1 ? {
               isolatedGroupCount: groups.length,
               isolatedGroups: groups.map((g) => ({
                 index: g.index,
                 name: g.name,
-                functions: g.fnIds.map((id) => id.split('::').pop()),
+                functions: g.fnIds.slice(0, 12),
                 vars: g.varIds.map((id) => id.replace(/^var::/, '')),
-                tasks: g.taskNames,
+                tasks: g.taskIds.slice(0, 8),
               })),
             } : {}),
             total: result.total ?? allNodes.length,
+          };
+        }
+        if (name === 'trace_upstream') {
+          const rawFns = Array.isArray(args.functions) ? args.functions : (args.name ? [args.name] : []);
+          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, rawFns, 'fn');
+          if (!resolved.length) {
+            return {
+              ok: false,
+              error: ambiguous.length ? '函数名在多个路径下重名，请指定完整「文件::函数名」或先按目录过滤' : '未找到指定函数',
+              ambiguous,
+              notFound,
+            };
+          }
+          const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
+          const traces = resolved.slice(0, 15).map((id) => {
+            const tr = traceToTasks(MODEL, id, { limit });
+            return {
+              id,
+              upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
+              chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
+              totalTasks: tr.totalTasks || 0,
+            };
+          });
+          const pathBranches = summarizeVehicleBranches(MODEL, resolved);
+          return {
+            ok: true,
+            functions: resolved,
+            traces,
+            ...(pathBranches.length > 1 ? { pathBranches } : {}),
+            ambiguous,
+            notFound,
+          };
+        }
+        if (name === 'remove_from_canvas') {
+          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再修改画布' };
+          if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能局部移除节点' };
+          const excludePaths = normalizePathPrefixes(args.excludePaths);
+          const rawFns = Array.isArray(args.functions) ? args.functions : [];
+          if (!excludePaths.length && !rawFns.length) {
+            return { ok: false, error: '请提供要移除的 functions 或 excludePaths（例如 ["z144"]）' };
+          }
+          const removeIdSet = new Set();
+          for (const raw of rawFns) {
+            const clean = String(raw || '').trim().replace(/\(\s*\)$/, '');
+            if (!clean) continue;
+            if (MODEL._index.byId.has(clean)) {
+              removeIdSet.add(clean);
+            } else {
+              for (const fn of MODEL._index.byName.get(clean) || []) removeIdSet.add(fn.id);
+            }
+          }
+          const shouldRemove = (id) => removeIdSet.has(id) ||
+            (excludePaths.length > 0 && excludePaths.some((pref) => fileMatchesPathPrefix(fileOfNodeId(MODEL, id), pref)));
+
+          const key = 'ui.last-view.' + PROJECT.id;
+          const saved = store.getSetting(key);
+          const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
+          if (!before || (!(before.roots?.length) && !(before.expansions?.length))) {
+            return { ok: false, error: '当前画布为空，没有可移除的节点' };
+          }
+          // 展开当前画布实际可见节点，确保通过 up/down 带进来的被排除车型节点也能彻底去掉。
+          const visibleFnIds = new Set();
+          const baseRoots = (before.roots || []).map((id) => remapLegacyExt(id, MODEL)).filter((id) => MODEL._index.byId.has(id));
+          const baseExps = normalizeExpansions((before.expansions || [])
+            .map((s) => ({ ...s, root: remapLegacyExt(s.root, MODEL) }))
+            .filter((s) => MODEL._index.byId.has(s.root)));
+          const scopes = [
+            ...baseRoots.map((r) => ({ root: r, up: Number(before.up) || 0, down: Number(before.down) || 0 })),
+            ...baseExps,
+          ];
+          const perRoot = Math.max(120, Math.floor(600 / Math.max(1, baseRoots.length)));
+          for (const scope of scopes) {
+            const part = subgraph(MODEL, scope.root, { up: scope.up, down: scope.down, maxNodes: perRoot, includeVariables: false });
+            for (const n of part.nodes) {
+              if (!overlay.deleted.nodes[n.id] && n.kind !== 'var') visibleFnIds.add(n.id);
+            }
+          }
+          const removedIds = [...visibleFnIds].filter(shouldRemove);
+          if (!removedIds.length) {
+            return { ok: true, removedCount: 0, removed: [], remainingCount: visibleFnIds.size, note: '当前画布上没有匹配该条件的函数' };
+          }
+          const keptIds = [...visibleFnIds].filter((id) => !shouldRemove(id));
+          const keptRoots = baseRoots.filter((id) => !shouldRemove(id));
+          const nextRoots = keptRoots.length ? keptRoots : keptIds.slice(0, 1);
+          const nextRootSet = new Set(nextRoots);
+          const nextExpansions = normalizeExpansions(
+            keptIds.filter((id) => !nextRootSet.has(id)).map((r) => ({ root: r, up: 0, down: 0 }))
+          );
+          const nextVars = (before.vars || []).filter((vid) => !shouldRemove(vid));
+          const reason = typeof args.reason === 'string' && args.reason.trim()
+            ? args.reason.trim().slice(0, 240)
+            : (excludePaths.length ? `AI 移除路径 ${excludePaths.join(', ')}` : 'AI 移除指定函数');
+          const nextPage = {
+            ...before,
+            projectId: PROJECT.id,
+            roots: nextRoots,
+            expansions: nextExpansions,
+            up: 0,
+            down: 0,
+            vars: nextVars,
+            selected: before.selected && !shouldRemove(before.selected) ? before.selected : null,
+            selectedEdge: null,
+            at: 0,
+            reviewing: false,
+            ts: Date.now(),
+          };
+          store.transaction(() => {
+            nextPage.revision = store.appendEvent(PROJECT.id, {
+              op: 'view.compose',
+              actor: 'ai',
+              target: nextRoots[0] || removedIds[0],
+              before,
+              after: { ...nextPage, count: keptIds.length, rootCount: nextRoots.length, reason, view: viewSnapshot(nextPage) },
+            });
+            store.setSetting(key, nextPage);
+          });
+          pageState = nextPage;
+          broadcastChange('view.compose', 'ai', { page: nextPage, reason }, req.headers['x-callgraph-client']);
+          return {
+            ok: true,
+            removedCount: removedIds.length,
+            removed: removedIds.slice(0, 30),
+            remainingCount: keptIds.length,
+            roots: nextRoots.slice(0, 20),
           };
         }
         if (name === 'find_symbols') {
@@ -2427,6 +2751,8 @@ export const server = http.createServer(async (req, res) => {
         if (name === 'add_to_canvas') {
           if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再修改画布' };
           const includeTasks = args.includeTasks !== false;
+          const includePaths = normalizePathPrefixes(args.includePaths);
+          const excludePaths = normalizePathPrefixes(args.excludePaths);
           const up = Math.max(0, Math.min(3, Math.trunc(Number(args.up) || 0)));
           const down = Math.max(0, Math.min(3, Math.trunc(Number(args.down) || 0)));
           const reason = typeof args.reason === 'string' ? args.reason.slice(0, 240) : '';
@@ -2441,15 +2767,21 @@ export const server = http.createServer(async (req, res) => {
           if (args.fromGit) {
             const needFreshWorktree = !COMPARISON || COMPARISON.git?.targetRef !== 'WORKTREE';
             if (needFreshWorktree) {
-              const q = new URLSearchParams({ limit: '80', baseRef: 'HEAD', targetRef: 'WORKTREE' });
-              const gitRes = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit: Boolean(COMPARISON), sessionCurrent });
-              assertActive();
-              const snap = getMcpChangeSnapshot(gitRes.snapshotId);
+              let snap = null;
+              if (typeof args.snapshotId === 'string' && args.snapshotId.trim()) {
+                try { snap = getMcpChangeSnapshot(args.snapshotId.trim()); } catch { snap = null; }
+              }
+              if (!snap) {
+                const q = new URLSearchParams({ limit: '80', baseRef: 'HEAD', targetRef: 'WORKTREE' });
+                const gitRes = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit: Boolean(COMPARISON), sessionCurrent });
+                assertActive();
+                snap = getMcpChangeSnapshot(gitRes.snapshotId);
+              }
               if (!snap.comparison.model) {
                 return { ok: false, error: '当前 Git 工作区没有未提交的 C/H 代码改动' };
               }
               gitComparison = snap.comparison;
-              if (COMPARISON) snapshotId = gitRes.snapshotId;
+              if (COMPARISON) snapshotId = snap.id;
               targetModel = snap.comparison.model;
             }
             const hidden = (snapshotId ? comparisonBase?.overlay ?? overlay : overlay).deleted.nodes;
@@ -2492,7 +2824,30 @@ export const server = http.createServer(async (req, res) => {
           assertActive();
           const hasExplicitFns = Array.isArray(args.functions) && args.functions.length > 0;
           const hasExplicitVars = Array.isArray(args.vars) && args.vars.length > 0;
-          const fnRes = hasExplicitFns ? resolveSymbols(targetModel, args.functions, 'fn') : { resolved: defaultFnIds, ambiguous: [], notFound: [] };
+          const filterByPath = (ids) => ids.filter((id) => {
+            const file = fileOfNodeId(targetModel, id);
+            if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(file, p))) return false;
+            return true;
+          });
+          const fnRes = hasExplicitFns ? resolveSymbols(targetModel, args.functions, 'fn') : { resolved: filterByPath(defaultFnIds), ambiguous: [], notFound: [] };
+          // 多车型同名函数消歧：若提供了 includePaths / excludePaths，自动过滤重名候选。
+          if (hasExplicitFns && fnRes.ambiguous.length && (includePaths.length || excludePaths.length)) {
+            const stillAmbig = [];
+            for (const item of fnRes.ambiguous) {
+              const filtered = item.candidates.filter((id) => {
+                const f = fileOfNodeId(targetModel, id);
+                if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(f, p))) return false;
+                if (includePaths.length && !includePaths.some((p) => fileMatchesPathPrefix(f, p))) return false;
+                return true;
+              });
+              if (filtered.length === 1) {
+                if (!fnRes.resolved.includes(filtered[0])) fnRes.resolved.push(filtered[0]);
+              } else {
+                stillAmbig.push(filtered.length ? { ...item, candidates: filtered } : item);
+              }
+            }
+            fnRes.ambiguous = stillAmbig;
+          }
           const varRes = hasExplicitVars ? resolveSymbols(targetModel, args.vars, 'var') : { resolved: defaultVarIds, ambiguous: [], notFound: [] };
           let actualFnIds = fnRes.resolved.slice(0, 80);
           const varIds = varRes.resolved.slice(0, 40);
@@ -2501,7 +2856,7 @@ export const server = http.createServer(async (req, res) => {
           if (!actualFnIds.length && !pureVars) {
             return {
               ok: false,
-              error: fnRes.ambiguous.length ? '函数名重名，请改用完整「文件::函数名」'
+              error: fnRes.ambiguous.length ? '函数名重名，请改用完整「文件::函数名」或传入 includePaths 指定车型目录'
                 : varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
                 : '未匹配到可加入画布的函数',
               ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
@@ -2523,6 +2878,8 @@ export const server = http.createServer(async (req, res) => {
             : {
               mode,
               ...(snapshotId ? { snapshotId } : {}),
+              ...(includePaths.length ? { includePaths } : {}),
+              ...(excludePaths.length ? { excludePaths } : {}),
               ...(includeTasks
                 ? { changedFunctionIds: activeFnsForCanvas, functionIds: [] }
                 : { roots: activeFnsForCanvas, changedFunctionIds: [] }),
@@ -2560,6 +2917,7 @@ export const server = http.createServer(async (req, res) => {
             ...(composed.page.roots || []),
             ...(composed.page.expansions || []).map((s) => s.root),
           ]);
+          const bmPathFilter = (includePaths.length || excludePaths.length) ? { includePaths, excludePaths } : null;
           if (!COMPARISON && splitGroups.length > 1) {
             const groupMode = composed.page.groupMode || 'file';
             const isNode = (id) => typeof id === 'string' && !id.startsWith('ext::') &&
@@ -2570,7 +2928,7 @@ export const server = http.createServer(async (req, res) => {
                 let bmExpansions = g.fnIds.slice(1).map((r) => ({ root: r, up: 0, down: 0 }));
                 let bmVars = g.varIds;
                 if (includeTasks) {
-                  const sc = changedFunctionScope(MODEL, null, g.fnIds, isNode);
+                  const sc = changedFunctionScope(MODEL, null, g.fnIds, isNode, bmPathFilter);
                   const rList = sc.taskRoots.size ? [...sc.taskRoots] : g.fnIds;
                   const fList = [...sc.functionIds].filter((fid) => !rList.includes(fid));
                   bmRoots = rList;
@@ -2580,9 +2938,12 @@ export const server = http.createServer(async (req, res) => {
                   ]);
                   bmVars = [...new Set([...g.varIds, ...sc.variableIds])];
                 }
+                const bmName = includePaths.length && !g.name.toLowerCase().includes(includePaths[0])
+                  ? `${includePaths.join('+')} · ${g.name}`.slice(0, 60)
+                  : g.name;
                 for (const id of [...bmRoots, ...bmExpansions.map((s) => s.root)]) allGroupCanvasIds.add(id);
                 const savedBm = store.saveBookmark(PROJECT.id, {
-                  name: g.name,
+                  name: bmName,
                   roots: bmRoots,
                   up,
                   down,
@@ -2593,7 +2954,7 @@ export const server = http.createServer(async (req, res) => {
                 });
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
-                  name: g.name,
+                  name: bmName,
                   functions: g.fnIds.map((id) => id.split('::').pop()),
                   vars: bmVars.map((id) => id.replace(/^var::/, '')),
                   tasks: g.taskNames,
@@ -2795,6 +3156,11 @@ export const server = http.createServer(async (req, res) => {
       const fnChange = comparison
         ? (comparisonStatus(comparison.model?._index?.byId?.get(id) || fn, comparison.statusOverrides.nodes, id)?.change || 'existing')
         : (overlay.nodes?.[id]?.change || 'existing');
+      let otherSourceText = null;
+      if (!comparison && version === 'after' && fnChange === 'modified' && !isFlowchartFunction(otherFn) && model.root) {
+        otherSourceText = await readGitHeadFileText(model.root, fn.file);
+        if (changed()) return conflict();
+      }
       try {
         const result = await getOrBuildFlowchart(project.id, model, fn, {
           version, expandMacros: expand === '1',
@@ -2804,6 +3170,7 @@ export const server = http.createServer(async (req, res) => {
           fnChange,
           otherModel: isFlowchartFunction(otherFn) ? otherModel : null,
           otherFn: isFlowchartFunction(otherFn) ? otherFn : null,
+          otherSourceText,
           otherSourceRoot: version === 'before' ? afterRoot : beforeRoot,
         });
         return changed() ? conflict() : json(res, result);
@@ -3407,6 +3774,36 @@ export const server = http.createServer(async (req, res) => {
           });
         return;
       }
+    }
+
+    if (u.pathname === '/api/bookmarks/rename' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const id = Number(p.id);
+          if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          try {
+            const result = store.transaction(() => {
+              const prev = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
+              const bookmark = store.renameBookmark(PROJECT.id, id, p.name);
+              if (!bookmark) throw new Error('找不到该书签');
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.save',
+                target: bookmark.name,
+                before: prev ? bookmarkEventPayload(prev) : null,
+                after: bookmarkEventPayload(bookmark),
+              });
+              return bookmark;
+            });
+            json(res, { ok: true, bookmark: result });
+          } catch (err) {
+            bad(res, String(err.message || err));
+          }
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
     }
 
     if (u.pathname === '/api/bookmarks/delete' && req.method === 'POST') {
