@@ -30,7 +30,7 @@ export function findCompileCommands(root, explicit) {
 export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
-  return JSON.stringify(['clang-ast', 'v3', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
+  return JSON.stringify(['clang-ast', 'v5', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
 }
 
 /** 只拆分参数，不展开变量、重定向或执行编译数据库里的命令。 */

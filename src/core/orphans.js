@@ -40,6 +40,13 @@ export function validEdgeKeys(model) {
 export function collectOrphans(model, targets) {
   const nodes = validNodeIds(model);
   const edges = validEdgeKeys(model);
+  for (const s of targets.layouts || []) {
+    for (const m of s.manual || []) {
+      if (m && nodes.has(m.from) && nodes.has(m.to)) {
+        edges.add(`${m.from}->${m.to}:0`);
+      }
+    }
+  }
   const out = { annotations: [], deleted: [], layoutSlots: [], layoutNodes: [] };
   const isBad = (kind, id) => (kind === 'node' ? !nodes.has(id) : !edges.has(id));
 

@@ -4,7 +4,7 @@
 import { t } from '../i18n.js';
 import { els, state, esc, shortFile, edgeKey } from './state.js';
 import { edgeCaption, isDataEdge } from './edge-flow.js';
-import { formatPeriod, periodCaption } from './period-text.js';
+import { formatPeriod, nodePeriodBadge, periodCaption } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
 import { showMenuSections, hideMenu } from './ctxmenu.js';
@@ -16,6 +16,7 @@ import { showExpansion, previewAddition } from './expand.js';
 import { setNodeName } from './node-name.js';
 import { statusControl, bindStatusControl, statusLabel } from './change-status.js';
 import { canOpenFlowchart, openFlowchart } from './flowchart.js';
+import { openManualNodeDialog, removeManualNodePermanently } from './manual-node.js';
 
 let statsSeq = 0;
 async function loadStats() {
@@ -525,28 +526,50 @@ function collectFnIds(node) {
   return out;
 }
 
-/** 文件树右键：区分图中定位和以新入口查看。 */
+/** 文件树右键：区分图中定位、以新入口查看，以及文件节点上手工添加函数/变量。 */
 function openTreeMenu(ev, kind, payload) {
   ev.preventDefault();
   ev.stopPropagation();
+  const editable = !window.__EXPORT && !state.at && !state.view?.comparison;
+  const sections = [];
   const items = [];
   if (kind === 'fn') {
-    items.push({ value: 'expand', label: 'expand.menu' });
-    items.push({ value: 'dataflow', label: 'menu.dataflow' });
-    if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
+    if (!payload.manual) {
+      items.push({ value: 'expand', label: 'expand.menu' });
+      items.push({ value: 'dataflow', label: 'menu.dataflow' });
+      if (!state.view?.comparison) items.push({ value: 'callOrder', label: 'callOrder.find' });
+    }
     items.push(...functionViewActions(payload.id).filter(({ value }) => !window.__EXPORT || value === 'locate'));
+    if (items.length) sections.push({ items });
+    if (payload.manual && editable) {
+      sections.push({ id: 'manualDel', items: [{ value: 'deleteManual', label: 'manual.deleteFn' }] });
+    }
   } else {
+    if (kind === 'file' && editable) {
+      sections.push({
+        id: 'manualAdd',
+        label: 'manual.menuSection',
+        items: [
+          { value: 'addFn', label: 'manual.addFn' },
+          { value: 'addVar', label: 'manual.addVar' },
+        ],
+      });
+    }
     const boxes = kind === 'file' ? state.view?.groups : state.view?.containers;
     if (boxes?.some((box) => box.id === payload.id)) items.push({ value: 'locate', label: t('common.locateCanvas') });
     else if (!window.__EXPORT && payload.fnIds?.length) items.push({ value: 'alone', label: t('common.openAlone') });
+    if (items.length) sections.push({ items });
   }
-  if (!items.length) return;
+  if (!sections.length) return;
   showMenuSections(
     ev.clientX,
     ev.clientY,
     payload.label,
-    [{ items }],
+    sections,
     async (v) => {
+      if (v === 'addFn') return openManualNodeDialog({ file: payload.id, kind: 'fn' });
+      if (v === 'addVar') return openManualNodeDialog({ file: payload.id, kind: 'var' });
+      if (v === 'deleteManual') return removeManualNodePermanently({ id: payload.id, name: payload.label });
       if (v === 'expand') return showExpansion({ id: payload.id, name: payload.label });
       if (v === 'dataflow') return analyseDataflow(payload.id);
       if (v === 'callOrder') return findCallOrder(payload.id);
@@ -603,13 +626,13 @@ function buildTreeNode(node, depth, expanded = new Map()) {
       const lab = document.createElement('span');
       lab.className = 'nm';
       lab.textContent = f.name;
-      lab.title = `${node.path}:${f.line}`;
+      lab.title = f.manual ? `${node.path} · ${t('node.manualFn')}` : `${node.path}:${f.line}`;
       fr.appendChild(lab);
       fr.insertAdjacentHTML('beforeend', addFunctionButton(f.id));
       fr.classList.toggle('shown', shown.has(f.id));
       fr.addEventListener('click', () => searchPick(f.id, fr.querySelector('[data-add-function]')));
       fr.addEventListener('contextmenu', (ev) =>
-        openTreeMenu(ev, 'fn', { id: f.id, label: f.name })
+        openTreeMenu(ev, 'fn', { id: f.id, label: f.name, manual: !!f.manual })
       );
       kids.appendChild(fr);
     }
@@ -864,31 +887,50 @@ function showEdgeDetails(edge) {
   return true;
 }
 
+function compactRateText(c) {
+  const rate = formatPeriod(c.us).replace(' ', '');
+  return [c.kind === 'isr' && 'ISR', rate].filter(Boolean).join('·') || t('period.unknown');
+}
+
 function periodDetail(node) {
   if (node.kind === 'var') {
     const cross = node.crossPeriod;
     if (!cross) return '';
     const rates = values => values.map(formatPeriod).join(' / ') || 'ISR';
-    return `<div class="period-detail">
-      <div>${t('period.writers', { period: rates(cross.writerUs) })}</div>
-      <div>${t('period.readers', { period: rates(cross.readerUs) })}</div>
-      ${cross.hasIsr ? `<div class="detail-meta">${t('period.isrContext')}</div>` : ''}
-      <div class="period-warning ${cross.protected ? 'guarded' : ''}">${cross.protected ? t('period.guarded') : t('period.hazard')}</div>
-    </div>`;
+    const badge = nodePeriodBadge(node);
+    return `<details class="period-detail">
+      <summary title="${esc(t('period.triggers'))}"><span class="period-summary-label">${t('period.summary')}</span><span class="period-summary-val">${esc(badge?.text || rates(cross.writerUs))}</span></summary>
+      <div class="period-detail-body">
+        <div>${t('period.writers', { period: rates(cross.writerUs) })}</div>
+        <div>${t('period.readers', { period: rates(cross.readerUs) })}</div>
+        ${cross.hasIsr ? `<div class="detail-meta">${t('period.isrContext')}</div>` : ''}
+        <div class="period-warning ${cross.protected ? 'guarded' : ''}">${cross.protected ? t('period.guarded') : t('period.hazard')}</div>
+      </div>
+    </details>`;
   }
   const periods = node.taskPeriods?.length ? node.taskPeriods : node.previousTaskPeriods;
   if (!periods?.length) return '';
-  return `<div class="period-detail"><b>${t('period.triggers')}</b>
-    ${node.multiRate ? `<div class="period-multi">${t('period.multiRate')}</div>` : ''}
-    <ul>${periods.map(c => {
-      const rate = [c.kind === 'isr' && 'ISR', formatPeriod(c.us)].filter(Boolean).join(' · ') || t('period.unknown');
-      const evidence = c.dividers?.map(d => t('period.divider', {
-        counter: d.counter, divider: d.divider, location: `${d.file}:${d.line}`,
-      })) || [];
-      return `<li><strong title="${esc(c.task || '')}">${esc(c.task?.split('::').at(-1) || '')}</strong> · ${esc(rate)}
-        ${[c.source, ...evidence].filter(Boolean).map(line => `<small>${esc(line)}</small>`).join('')}</li>`;
-    }).join('')}</ul>
-  </div>`;
+  const first = periods[0];
+  const firstName = first.task?.split('::').at(-1) || '';
+  const firstRate = compactRateText(first);
+  const extra = periods.length > 1 ? ` +${periods.length - 1}` : '';
+  const fullSummary = `${firstName ? `${firstName} (${firstRate})` : firstRate}${extra}`;
+  const rateBadge = firstName ? `(${firstRate})${extra}` : `${firstRate}${extra}`;
+  return `<details class="period-detail">
+    <summary title="${esc(`${t('period.triggers')}：${fullSummary}`)}"><span class="period-summary-label">${t('period.summary')}</span>${firstName ? `<span class="period-summary-task">${esc(firstName)}</span>` : ''}<span class="period-summary-rate">${esc(rateBadge)}</span></summary>
+    <div class="period-detail-body">
+      <div class="period-detail-title">${t('period.triggers')}</div>
+      ${node.multiRate ? `<div class="period-multi">${t('period.multiRate')}</div>` : ''}
+      <ul>${periods.map(c => {
+        const rate = [c.kind === 'isr' && 'ISR', formatPeriod(c.us)].filter(Boolean).join(' · ') || t('period.unknown');
+        const evidence = c.dividers?.map(d => t('period.divider', {
+          counter: d.counter, divider: d.divider, location: `${d.file}:${d.line}`,
+        })) || [];
+        return `<li><strong title="${esc(c.task || '')}">${esc(c.task?.split('::').at(-1) || '')}</strong> · ${esc(rate)}
+          ${[c.source, ...evidence].filter(Boolean).map(line => `<small>${esc(line)}</small>`).join('')}</li>`;
+      }).join('')}</ul>
+    </div>
+  </details>`;
 }
 
 async function renderDetail(id) {
@@ -923,11 +965,11 @@ async function renderDetail(id) {
     if (els.secDetail) els.secDetail.style.display = '';
     if (els.secEdges) els.secEdges.style.display = 'none';
     els.detail.innerHTML = `<div class="detail-title">${esc(target.name)}</div>
-      <div class="detail-meta">${esc(target.file || '')}:${target.line || ''}</div>
+      <div class="detail-meta">${esc(target.file || '')}${target.manual ? ` · ${t('node.manualVar')}${target.typeText ? ' · ' + esc(target.typeText) : ''}` : `:${target.line || ''}`}</div>
       ${comparison ? comparisonDetail(target, comparison.changePoints ?? state.view?.comparison?.changePoints) : ''}
-      ${periodDetail(target)}
       ${dataDirections}
       ${statusControl(target)}
+      ${periodDetail(target)}
       `;
     bindStatusControl(els.detail, target);
     els.edges.innerHTML = '';
@@ -950,10 +992,9 @@ async function renderDetail(id) {
 
   els.detail.innerHTML = `
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
-    <div class="detail-meta">${esc(n.file)}:${n.line}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    <div class="detail-meta">${esc(n.file)}${n.manual ? ' · ' + t('node.manualFn') : `:${n.line}`}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
     ${canOpenFlowchart(n) ? `<button class="flowchart-detail" type="button" data-node-flowchart>${t('flowchart.menu')}</button>` : ''}
     ${comparison ? comparisonDetail(n, comparison.changePoints ?? state.view?.comparison?.changePoints ?? d.changePoints) : ''}
-    ${periodDetail(target)}
     ${dataDirections}
     ${statusControl(target)}
     ${n.headerSymbol ? `<div class="detail-meta">#define ${esc(n.name)}${Array.isArray(n.macroParams) ? '(' + esc(n.macroParams.join(', ')) + ')' : ''} ${esc(n.raw)}</div>
@@ -962,6 +1003,7 @@ async function renderDetail(id) {
         <option value="alias" ${target.nameModeOverride === 'alias' ? 'selected' : ''}>${t('name.alias')}: ${esc(n.name)}</option>
         <option value="target" ${target.nameModeOverride === 'target' ? 'selected' : ''}>${t('name.target')}: ${esc(n.targetNames.join(' / '))}</option>
       </select></label>` : ''}
+    ${periodDetail(target)}
     <div class="detail-hint">${t(state.view?.comparison ? 'compare.readOnly' : 'detail.hint')}</div>
   `;
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));

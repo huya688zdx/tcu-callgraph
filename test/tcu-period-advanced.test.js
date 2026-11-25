@@ -9,7 +9,7 @@ import { buildDataflowIndex } from '../src/core/dataflow.js';
 import { projectTasks, taskPeriods, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
-import { nodePeriodBadge } from '../web/lib/period-text.js';
+import { canvasPeriodBadge, nodePeriodBadge } from '../web/lib/period-text.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 
 function project(t, files) {
@@ -73,6 +73,31 @@ void App_Task10ms(void) { Mixed(); }
   assert.equal(mixed.multiRate, true);
   assert.equal(mixed.isIsr, true);
   assert.deepEqual(nodePeriodBadge(mixed), { text: 'ISR·5ms·10ms', tier: 'multi', multi: true });
+});
+
+test('计数助手只有沿每轮调用一次的路径才能推导分频', t => {
+  const counter = name => `void ${name}(void) {}
+void bump_${name}(void) { static unsigned count; if (++count >= 10) { count = 0; ${name}(); } }`;
+  const source = ['Twice', 'Diamond', 'Loop', 'Conditional', 'Once', 'Nested'].map(counter).join('\n') + `
+void left(void) { bump_Diamond(); }
+void right(void) { bump_Diamond(); }
+void once(void) { bump_Once(); }
+int flags;
+void Task1ms(void) {
+  static unsigned slow;
+  if (++slow >= 2) { slow = 0; bump_Nested(); }
+  bump_Twice(); bump_Twice();
+  left(); right();
+  for (int i = 0; i < flags; ++i) bump_Loop();
+  if (flags) bump_Conditional();
+  once();
+}`;
+  const model = loadModel(project(t, { 'timer.c': source }));
+  for (const name of ['Twice', 'Diamond', 'Loop', 'Conditional']) {
+    assert.deepEqual(periodsFor(model, name).map(c => [c.us, c.dividers]), [[1000, undefined]], name);
+  }
+  assert.deepEqual(periodsFor(model, 'Once').map(c => [c.us, c.dividers[0].divider]), [[10000, 10]]);
+  assert.deepEqual(periodsFor(model, 'Nested').map(c => [c.us, c.dividers.map(d => d.divider)]), [[20000, [2, 10]]]);
 });
 
 test('全局 tick 按唯一写者推导主循环周期，与调用者周期取 LCM', async t => {
@@ -291,14 +316,17 @@ ISR(ExternalVector) { interruptValue = 1; }
   assert.deepEqual(varNode('exposed').taskPeriods.map(c => c.us), [2000, 10000]);
   assert.deepEqual(nodePeriodBadge(varNode('exposed')), { text: '⚡2↔10ms', tier: 'cross-hazard' });
   assert.deepEqual(nodePeriodBadge(varNode('guarded')), { text: '🔒2↔10ms', tier: 'cross-safe' });
+  assert.deepEqual(canvasPeriodBadge(varNode('exposed')), { text: '⚡2↔10ms', tier: 'cross-hazard' });
+  assert.equal(canvasPeriodBadge(view.nodes.find(node => node.name === 'App_Task2ms')), null);
   assert.equal(nodePeriodBadge({ taskPeriods: [{ us: null }] }), null);
   const svg = exportSvg(view);
   assert.match(svg, />shared\.c:2<\/text>/);
-  assert.match(svg, /data-period-badge="fast"/);
+  assert.doesNotMatch(svg, /data-period-badge="(?:fast|mid|slow|isr|multi)"/);
   assert.match(svg, /data-period-badge="cross-hazard"/);
   assert.match(svg, /data-period-badge="cross-safe"/);
   assert.doesNotMatch(svg, /周期待确认/);
   const cliSvg = buildSVGFromLayout(view);
   assert.match(cliSvg, />shared\.c:2<\/text>/);
+  assert.doesNotMatch(cliSvg, /data-period-badge="(?:fast|mid|slow|isr|multi)"/);
   assert.match(cliSvg, /data-period-badge="cross-safe"/);
 });

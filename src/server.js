@@ -6,7 +6,8 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { fork } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
-import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex, decodeSource } from './core/index.js';
+import { loadModel, stats, subgraph, search, dataflowOf, scanSources, rebuildIndex } from './core/index.js';
+import { sourceDecoder } from './core/source-files.js';
 import { layoutElk } from './core/layout-elk.js';
 import { buildFlowchart, isFlowchartFunction } from './core/flowchart.js';
 import { dataflowFor, sharedVariables, listGlobals, buildDataflowIndex } from './core/dataflow.js';
@@ -23,6 +24,14 @@ import { traceToTasks } from './core/task-trace.js';
 import { readChangeQuery, changesPage } from './core/mcp-changes.js';
 import { detectTasks } from './core/detect-tasks.js';
 import { createMcpServer } from './mcp.js';
+import {
+  DEFAULT_AI_CONFIG,
+  listModels as listAiModels,
+  normalizeAiConfig,
+  publicAiConfig,
+  runAiAgent,
+  testConnection as testAiConnection,
+} from './core/ai-agent.js';
 import { normalizeExpansions } from './core/expansion.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
@@ -286,6 +295,212 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   return { model, fromCache, loadMs };
 }
 
+const manualNodesKey = (projectId) => `manual.nodes.${projectId}`;
+
+function sanitizeManualFile(raw) {
+  const s = String(raw || '').replace(/\\/g, '/').trim().replace(/^\/+/, '');
+  if (!s || s.length > 512 || /[\x00-\x1f]/.test(s)) return '';
+  if (s.split('/').some((seg) => !seg || seg === '.' || seg === '..')) return '';
+  return s;
+}
+
+function sanitizeManualName(raw) {
+  const s = String(raw || '').trim();
+  if (!s || s.length > 160 || s.includes('::') || /[\x00-\x1f]/.test(s)) return '';
+  return s;
+}
+
+function loadManualNodes(projectId) {
+  const raw = store.getSetting(manualNodesKey(projectId), []);
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const kind = item.kind === 'var' ? 'var' : item.kind === 'fn' ? 'fn' : null;
+    const file = sanitizeManualFile(item.file);
+    const name = sanitizeManualName(item.name);
+    if (!kind || !file || !name) continue;
+    const id = kind === 'var' ? `var::${file}::${name}` : `${file}::${name}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      kind,
+      file,
+      name,
+      typeText: kind === 'var' ? String(item.typeText || '').trim().slice(0, 120) : '',
+    });
+  }
+  return out;
+}
+
+function saveManualNodes(projectId, list) {
+  store.setSetting(manualNodesKey(projectId), list);
+}
+
+function toManualModelNode(item) {
+  if (item.kind === 'var') {
+    return {
+      id: item.id,
+      kind: 'var',
+      name: item.name,
+      file: item.file,
+      line: 0,
+      typeText: item.typeText || '',
+      isStatic: true,
+      isConst: false,
+      manual: true,
+      params: [],
+    };
+  }
+  return {
+    id: item.id,
+    kind: 'fn',
+    name: item.name,
+    file: item.file,
+    line: 0,
+    isStatic: false,
+    manual: true,
+    params: [],
+    calls: [],
+    varAccess: [],
+  };
+}
+
+function injectManualNodeIntoModel(model, item) {
+  if (!model || model._index?.byId?.has(item.id) || model._df?.byId?.has(item.id)) return null;
+  const node = toManualModelNode(item);
+  if (!model.files.some((f) => f.rel === item.file)) {
+    model.files.push({ rel: item.file, isHeader: /\.h$/i.test(item.file), bytes: 0, manual: true });
+  }
+  if (item.kind === 'var') {
+    model.variables = model.variables || [];
+    model.variables.push(node);
+    if (model._df) {
+      model._df.defs.push(node);
+      model._df.byId.set(node.id, node);
+    }
+  } else {
+    model.functions = model.functions || [];
+    model.functions.push(node);
+  }
+  return node;
+}
+
+function applyManualNodes(model, projectId, list = loadManualNodes(projectId)) {
+  if (!model) return;
+  model.functions = (model.functions || []).filter((n) => !n.manual);
+  model.variables = (model.variables || []).filter((v) => !v.manual);
+  model.files = (model.files || []).filter((f) => !f.manual);
+  if (model._df) {
+    model._df.defs = (model._df.defs || []).filter((d) => !d.manual);
+    for (const [k, d] of [...(model._df.byId || [])]) {
+      if (d?.manual) model._df.byId.delete(k);
+    }
+  }
+  rebuildIndex(model);
+  let injected = false;
+  for (const item of list) {
+    if (injectManualNodeIntoModel(model, item)) injected = true;
+  }
+  if (injected) rebuildIndex(model);
+}
+
+function manualNodesMap(list) {
+  return Object.fromEntries((list || []).map((item) => [item.id, item]));
+}
+
+function variableConflicts(model, { id, file, name }) {
+  const get = (key) => model._df?.byId?.get(key) ?? model._index?.byId?.get(key);
+  return [get(id), get(`var::${name}`), ...(model.variables || []).filter((v) =>
+    v.name === name && (v.file === file || !v.isStatic))].filter(Boolean);
+}
+
+/** 将已由同文件源码实现的规划变量及其存档绑定迁移到真实符号。 */
+function reconcileManualVariables(model, projectId, list, savedPage) {
+  const bindings = new Map();
+  for (const item of list) {
+    if (item.kind !== 'var') continue;
+    const implementation = variableConflicts(model, item).find((v) =>
+      !v.manual && !v.isExtern && v.file === item.file);
+    if (implementation) bindings.set(item.id, implementation.id);
+  }
+  if (!bindings.size) return { list, page: savedPage };
+
+  const nodeId = (id) => bindings.get(id) ?? id;
+  const nodeIds = (ids) => [...new Set(ids.map(nodeId))];
+  const edgeId = (id) => {
+    const match = /^(.+?)->(.+?)(:-?\d+)?$/.exec(id);
+    return match ? `${nodeId(match[1])}->${nodeId(match[2])}${match[3] || ''}` : id;
+  };
+  const remapKeys = (entries, idFor) => {
+    const result = new Map();
+    for (const [key, data] of Object.entries(entries || {})) {
+      const id = idFor(key);
+      if (id === key) continue;
+      result.set(id, data);
+    }
+    for (const [key, data] of Object.entries(entries || {})) {
+      if (idFor(key) !== key) continue;
+      const old = result.get(key);
+      result.set(key, isPlainObject(old) && isPlainObject(data) ? { ...old, ...data } : data);
+    }
+    return Object.fromEntries(result);
+  };
+  const remapPage = (page) => page && {
+    ...page,
+    roots: nodeIds(page.roots || []),
+    vars: nodeIds(page.vars || []),
+    ...(page.hiddenVars && { hiddenVars: nodeIds(page.hiddenVars) }),
+    ...(page.expansions && { expansions: normalizeExpansions(page.expansions.map((scope) =>
+      ({ ...scope, root: nodeId(scope.root) }))) }),
+    ...(page.selected && { selected: nodeId(page.selected) }),
+    ...(page.selectedEdge && { selectedEdge: edgeId(page.selectedEdge) }),
+  };
+
+  const live = store.loadOverlay(projectId);
+  const layout = new Map();
+  const slots = Object.entries(live.layout).map(([key, slot]) => {
+    const mode = key.lastIndexOf('::');
+    const roots = nodeIds(key.slice(0, mode).split('+')).join('+');
+    return { key, id: roots + key.slice(mode), slot };
+  });
+  for (const { id, slot } of [...slots.filter((entry) => entry.id !== entry.key),
+    ...slots.filter((entry) => entry.id === entry.key)]) {
+    const prior = layout.get(id);
+    const edges = new Map();
+    for (const edge of [...(prior?.manual || []), ...(slot.manual || [])]) {
+      const from = nodeId(edge.from), to = nodeId(edge.to);
+      if (from !== to) edges.set(edgeKeyOf({ from, to, line: 0 }), { from, to });
+    }
+    layout.set(id, {
+      nodes: { ...prior?.nodes, ...remapKeys(slot.nodes, nodeId) },
+      edges: { ...prior?.edges, ...remapKeys(slot.edges, edgeId) },
+      manual: [...edges.values()],
+    });
+  }
+  const next = {
+    ...live,
+    nodes: remapKeys(live.nodes, nodeId),
+    edges: remapKeys(live.edges, edgeId),
+    deleted: {
+      nodes: remapKeys(live.deleted.nodes, nodeId),
+      edges: remapKeys(live.deleted.edges, edgeId),
+    },
+    layout: Object.fromEntries(layout),
+  };
+  const remaining = list.filter((item) => !bindings.has(item.id));
+  const page = remapPage(savedPage);
+  store.replaceOverlay(projectId, next);
+  saveManualNodes(projectId, remaining);
+  for (const bookmark of store.listBookmarks(projectId)) {
+    const updated = remapPage(bookmark);
+    if (JSON.stringify(updated) !== JSON.stringify(bookmark)) store.saveBookmark(projectId, updated);
+  }
+  return { list: remaining, page, overlay: { ...next, manualNodes: manualNodesMap(remaining) } };
+}
+
 /** 加载完成后整体切换会话，工程标注仍以 project_id 为准。 */
 async function openTarget(targetPath, { first = false, selection } = {}) {
   const abs = path.resolve(targetPath);
@@ -305,14 +520,29 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
     loaded = await loadTargetModel(abs, isFile, 'builtin', {});
   }
   const { model, fromCache, loadMs } = loaded;
-  const st = stats(model);
   const project = store.upsertProject({
     path: abs,
     name: label,
     fingerprint: fingerprintFiles(model.files),
   });
-
   if (first) migrateLegacy(project);
+
+  const list = loadManualNodes(project.id);
+  if (model.source !== 'dot' && list.some((item) => item.kind === 'var')) await ensureAnalysis(model);
+  const pageKey = 'ui.last-view.' + project.id;
+  const reconciled = store.transaction(() => {
+    const result = reconcileManualVariables(model, project.id, list, store.getSetting(pageKey));
+    if (result.overlay) {
+      if (result.page) store.setSetting(pageKey, result.page);
+      store.appendEvent(project.id, {
+        op: 'manual.variable.bind', actor: 'system',
+        after: { ...result.overlay, ...(result.page && { view: viewSnapshot(result.page) }) },
+      });
+    }
+    return result;
+  });
+  applyManualNodes(model, project.id, reconciled.list);
+  const st = stats(model);
 
   const ov = store.loadOverlay(project.id);
   ov.deleted = ov.deleted || { nodes: {}, edges: {} };
@@ -337,7 +567,7 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   // 已有数据但还没钉过起点时，补一条 baseline：
   // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
   if (!store.hasAnchor(project.id)) {
-    store.appendEvent(project.id, { op: 'baseline', target: 'open', after: ov, actor: 'system' });
+    store.appendEvent(project.id, { op: 'baseline', target: 'open', after: { ...ov, manualNodes: manualNodesMap(reconciled.list) }, actor: 'system' });
   }
 
   console.log(
@@ -349,8 +579,6 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   await startGitWatch(abs, project.id);
   return { project, stats: st };
 }
-
-await openTarget(target, { first: true });
 
 /** 重新从库里载入 overlay 到内存镜像（清理孤儿标注后用） */
 function reloadOverlay() {
@@ -499,7 +727,20 @@ function mcpEdgeIndex() {
     }
   }
   const exact = key => source.exact.get(key) || manual.get(key);
-  return { exact, resolve: key => exact(key) || source.pairs.get(key) || manual.get(`${key}:0`) };
+  const notDeleted = (e) => e && !overlay.deleted.edges[canvasEdgeKey(e)] && !overlay.deleted.edges[edgeKeyOf(e)];
+  const resolvePair = (pair) => {
+    const candidate = source.pairs.get(pair);
+    if (notDeleted(candidate)) return candidate;
+    // 默认候选被删时，从源码边里找同端点未删的边
+    const [from, to] = pair.split('->');
+    const live = [...(MODEL.edges || []), ...(MODEL.headerEdges || [])]
+      .find((e) => e.from === from && e.to === to && notDeleted(e));
+    if (live) return live;
+    const man = manual.get(`${pair}:0`);
+    if (notDeleted(man)) return man;
+    return candidate || man;
+  };
+  return { exact, resolve: key => exact(key) || resolvePair(key) };
 }
 
 // 普通图上同一函数和变量之间只有一条读写线。沿用前端的键以兼容已保存的标注。
@@ -576,15 +817,15 @@ function checkAiCallOrders(index, updates) {
 function getMcpChangeSnapshot(snapshotId) {
   if (COMPARISON && snapshotId === COMPARISON.id) return { id: COMPARISON.id, comparison: COMPARISON };
   const snapshot = readSnapshots.get(MODEL);
-  if (!COMPARISON && snapshot && snapshot.id === snapshotId && snapshot.revision === sessionRevision) return snapshot;
+  if (snapshot && snapshot.id === snapshotId && snapshot.revision === sessionRevision) return snapshot;
   throw new Error('查询快照已失效，请重新调用 cg_changes');
 }
 
-async function readMcpChanges(q, req) {
+async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = false } = {}) {
   const query = readChangeQuery(q);
   const hasRefs = q.has('baseRef') || q.has('targetRef');
   let snapshot, requestId;
-  if (q.has('snapshotId') || COMPARISON) {
+  if (!forceGit && (q.has('snapshotId') || COMPARISON)) {
     snapshot = getMcpChangeSnapshot(q.get('snapshotId') ?? COMPARISON.id);
     const git = snapshot.comparison.git;
     if (hasRefs && (!git || ['baseRef', 'targetRef'].some(k => q.has(k) && q.get(k) !== git[k]))) {
@@ -594,11 +835,11 @@ async function readMcpChanges(q, req) {
     requestId = ++latestSnapshotRequest;
     const model = MODEL;
     if (model.parserId === 'dot') throw new Error('Git 源码变更查询需要打开 C 工程');
-    const comparison = await compareGitProject(scanRootFor(root), {
+    const comparison = await compareGitProject(scanRootFor(COMPARISON?.projectPath || root), {
       baseRef: q.get('baseRef') ?? undefined, targetRef: q.get('targetRef') ?? undefined,
     }, { parserId: model.parserId, parserOptions: parserOptionsFor(model.parserId),
       allowEmptyRefresh: !!query.id, deferUnchangedAnalysis: true });
-    if (!currentSession(req) || MODEL !== model || mcpAccess() === 'off') throw new Error('工程或访问权限已改变');
+    if (!currentSession(req) || MODEL !== model || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
     if (requestId !== latestSnapshotRequest) throw new Error('较新的 Git 查询已开始，请使用最新查询的快照');
     snapshot = { id: randomUUID(), comparison, revision: sessionRevision };
   }
@@ -607,15 +848,15 @@ async function readMcpChanges(q, req) {
     snapshot.pending ??= snapshot.comparison.analyze();
     try {
       const analyzed = await snapshot.pending;
-      if (!currentSession(req) || mcpAccess() === 'off') throw new Error('工程或访问权限已改变');
+      if (!currentSession(req) || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
       getMcpChangeSnapshot(snapshot.id);
       snapshot.comparison = analyzed;
     } finally { delete snapshot.pending; }
   }
   const result = changesPage(snapshot.comparison, query);
   if (requestId !== undefined) readSnapshots.set(MODEL, snapshot);
-  return { ok: true, source: COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
-    comparisonId: COMPARISON?.id ?? null, ...result };
+  return { ok: true, source: !forceGit && COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
+    comparisonId: !forceGit ? (COMPARISON?.id ?? null) : null, ...result };
 }
 
 // 比较的合并图含两个版本的边；在一个确定版本内回溯，防止拼出从未存在的路径。
@@ -665,7 +906,11 @@ async function readMcpSource(q) {
     }
     source = fs.readFileSync(realFile);
   }
-  const lines = decodeSource(source).split(/\r\n|\n|\r/);
+  const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
+  let decoded;
+  try { decoded = decoder.decode(source.subarray(decoder.bomLength)); }
+  catch { throw new Error(`${file} 含无效的 ${decoder.encoding} 字节，请核对原文件编码`); }
+  const lines = decoded.split(/\r\n|\n|\r/);
   if (lines.at(-1) === '') lines.pop();
   if (startLine > lines.length) throw new Error('起始行超出源码文件范围');
   const endLine = Math.min(requestedEndLine, startLine + 249, lines.length);
@@ -675,7 +920,7 @@ async function readMcpSource(q) {
   }
   return {
     ok: true, id: fn?.id ?? null, name: fn?.name ?? null, file, startLine, endLine,
-    requestedEndLine, truncated: endLine < requestedEndLine,
+    requestedEndLine, truncated: endLine < requestedEndLine, sourceEncoding: decoder.encoding,
     source: lines.slice(startLine - 1, endLine).join('\n'),
     taskPeriods: fn ? taskPeriods(model).get(id) || [] : [],
     traceVersion, ...(fn ? traceToTasks(model, id) : {}),
@@ -730,11 +975,13 @@ function composeMcpView(p) {
   // 所有检查在切换画布前完成，失败时不改变工程、预览或时间轴。
   const comparison = p.snapshotId === undefined ? COMPARISON : getMcpChangeSnapshot(p.snapshotId).comparison;
   const entering = comparison && !COMPARISON;
+  const switchingComparison = comparison && comparison !== COMPARISON;
   if (entering && p.mode !== 'replace') throw new Error('首次按 Git 快照组图请使用 replace 打开比较');
-  if (entering && !comparison.model) throw new Error('该 Git 快照没有源码变更');
+  if (switchingComparison && !comparison.model) throw new Error('该 Git 快照没有源码变更');
   const model = comparison?.model || MODEL;
+  const sourceOverlay = switchingComparison ? comparisonBase?.overlay ?? overlay : overlay;
   const isNode = (id) => typeof id === 'string' && !id.startsWith('ext::') &&
-    !model._index.byId.get(id)?.external && !overlay.deleted.nodes[id] && model._index.byId.has(id);
+    !model._index.byId.get(id)?.external && !sourceOverlay.deleted.nodes[id] && model._index.byId.has(id);
   const isFn = (id) => {
     const node = model._index.byId.get(id);
     return isNode(id) && node.kind !== 'var' && !node.headerSymbol;
@@ -783,7 +1030,17 @@ function composeMcpView(p) {
   const key = 'ui.last-view.' + PROJECT.id;
   const saved = COMPARISON ? COMPARISON.composedPage || { roots: COMPARISON.roots, up: 0, down: 0 } : store.getSetting(key);
   const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
-  const prior = mode === 'add' ? before : null;
+  let prior = mode === 'add' ? before : null;
+  if (prior && switchingComparison) {
+    prior = {
+      ...before,
+      roots: (before.roots || []).filter(isNode),
+      expansions: (before.expansions || []).filter(({ root }) => isNode(root)),
+      vars: (before.vars || []).filter(isNode),
+      hiddenVars: (before.hiddenVars || []).filter(isNode),
+      selected: isNode(before.selected) ? before.selected : null,
+    };
+  }
   const keepRoots = Boolean(prior?.roots?.length);
   const allRoots = keepRoots ? prior.roots : [...new Set(roots)];
   if (!allRoots.length) allRoots.push(functions[0]);
@@ -809,11 +1066,11 @@ function composeMcpView(p) {
   if (comparison) {
     const visible = [...new Set([...allRoots, ...expansions.map(scope => scope.root), ...page.vars])];
     if (visible.length > 600) throw new Error('比较画布最多支持 600 个显式选择的节点');
-    if (entering) {
+    if (switchingComparison) {
       const nextStats = stats(model);
-      const nextOverlay = structuredClone(overlay);
+      const nextOverlay = structuredClone(sourceOverlay);
       const next = { ...comparison, id: p.snapshotId, statusOverrides: { nodes: new Map(), edges: new Map() }, totalNodes: model._index.byId.size };
-      comparisonBase = { MODEL, S, overlay, pageState };
+      comparisonBase ??= { MODEL, S, overlay, pageState };
       COMPARISON = next;
       MODEL = model;
       S = nextStats;
@@ -826,7 +1083,7 @@ function composeMcpView(p) {
     COMPARISON.roots = visible;
     COMPARISON.composedPage = page;
     pageState = page;
-    broadcastChange(entering ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
+    broadcastChange(switchingComparison ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
     return { ok: true, page, ...scope.details, eventId: null };
   }
   store.transaction(() => {
@@ -927,7 +1184,7 @@ function buildFileTree(model) {
     }
   }
   for (const fn of symbols) {
-    fileNodes.get(fn.file)?.functions.push({ id: fn.id, name: fn.name, line: fn.line });
+    fileNodes.get(fn.file)?.functions.push({ id: fn.id, name: fn.name, line: fn.line, ...(fn.manual ? { manual: true } : {}) });
   }
   const toObj = (n) => ({
     name: n.name,
@@ -1238,7 +1495,18 @@ async function buildView(
   const wantVars = new Set(varSel.want || []);
   const skipVars = new Set(varSel.skip || []);
 
-  let alive = g.nodes.filter((n) => !viewOverlay.deleted.nodes[n.id]);
+  let alive = g.nodes.filter((n) => !viewOverlay.deleted.nodes[n.id] &&
+    !(viewOverlay !== overlay && n.manual && !viewOverlay.manualNodes?.[n.id]));
+  // 时间轴回看：补回当时存在但后来被永久删除的手工函数
+  if (viewOverlay !== overlay && viewOverlay.manualNodes) {
+    const presentIds = new Set(alive.map((n) => n.id));
+    const wantedIds = new Set([...roots, ...(varSel.expansions || []).map((s) => s.root)]);
+    for (const [id, entry] of Object.entries(viewOverlay.manualNodes)) {
+      if (entry.kind !== 'fn' || !wantedIds.has(id) || presentIds.has(id) || viewOverlay.deleted.nodes[id]) continue;
+      alive.push(toManualModelNode(entry));
+      presentIds.add(id);
+    }
+  }
   // 右侧面板里被取消勾选的全局变量：连节点带边一起去掉
   if (skipVars.size) alive = alive.filter((n) => !(n.kind === 'var' && skipVars.has(n.id)));
   const aliveIds = new Set(alive.map((n) => n.id));
@@ -1257,7 +1525,11 @@ async function buildView(
     for (const id of wantVars) {
       if (ids.has(id) || skipVars.has(id) || viewOverlay.deleted.nodes[id]) continue;
       const indexed = model._index.byId.get(id);
-      const def = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
+      const histManual = viewOverlay !== overlay ? viewOverlay.manualNodes?.[id] : null;
+      const rawDef = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
+      const def = (viewOverlay !== overlay && rawDef?.manual && !histManual)
+        ? null
+        : rawDef || (histManual?.kind === 'var' ? toManualModelNode(histManual) : null);
       if (!def) continue;
       clean.push({
         ...(COMPARISON ? def : {}),
@@ -1269,6 +1541,7 @@ async function buildView(
         typeText: def.typeText,
         isStatic: !!def.isStatic,
         isConst: !!def.isConst,
+        ...(def.manual ? { manual: true } : {}),
         params: [],
       });
       ids.add(id);
@@ -1365,6 +1638,8 @@ async function buildView(
     if (seenManual.has(mk)) continue;
     seenManual.add(mk);
     if (!byId.has(m.from) || !byId.has(m.to) || viewOverlay.deleted.edges[edgeKeyOf({ ...m, line: 0 })]) continue;
+    // 已有同向行号 0 边（如合并后的变量读写边）时不重复注入手工边，避免边键冲突。
+    if (viewEdges.some((e) => e.from === m.from && e.to === m.to && e.line === 0)) continue;
     viewEdges.push({ from: m.from, to: m.to, callee: byId.get(m.to).name,
       kind: 'manual', line: 0, via: '手动', manual: true });
   }
@@ -1457,6 +1732,8 @@ function readRawBody(req, limit = 4 * 1024 * 1024) {
   });
 }
 
+await openTarget(target, { first: true });
+
 // 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
 export const server = http.createServer(async (req, res) => {
   if (!/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(req.headers.host || '')) {
@@ -1541,6 +1818,410 @@ export const server = http.createServer(async (req, res) => {
       const level = mcpAccess();
       const source = MCP_LEVELS.includes(env) ? 'env' : store.getSetting('mcp.access', null) ? 'setting' : 'default';
       return json(res, { level, source });
+    }
+
+    // ---- 内置直连 OpenAI 兼容模型（本地 27B / 旧版接口均可） ----
+    if (u.pathname === '/api/ai/config') {
+      const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+      if (req.method === 'POST') {
+        if (!guardWrite(req, res)) return;
+        let p;
+        try { p = await readJson(req, res); } catch { return; }
+        try {
+          const next = normalizeAiConfig(p, saved);
+          store.setSetting('ai.llm.config', next);
+          return json(res, { ok: true, config: publicAiConfig(next) });
+        } catch (err) {
+          return bad(res, err.message);
+        }
+      }
+      return json(res, { ok: true, config: publicAiConfig(saved) });
+    }
+
+    if (u.pathname === '/api/ai/models' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      try {
+        const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+        const cfg = normalizeAiConfig(p, saved);
+        return json(res, await listAiModels(cfg));
+      } catch (err) {
+        return bad(res, err.message);
+      }
+    }
+
+    if (u.pathname === '/api/ai/test' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      try {
+        const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+        const cfg = normalizeAiConfig(p, saved);
+        return json(res, await testAiConnection(cfg));
+      } catch (err) {
+        return bad(res, err.message);
+      }
+    }
+
+    if (u.pathname === '/api/ai/chat' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+      let cfg;
+      try { cfg = normalizeAiConfig(p.config || {}, saved); } catch (err) { return bad(res, err.message); }
+      const prompt = String(p.prompt || '').trim();
+      if (!prompt) return bad(res, '请输入要执行的任务');
+
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      });
+      const abort = new AbortController();
+      const cancel = () => { if (!res.writableEnded) abort.abort(new Error('用户已取消')); };
+      req.on('close', cancel);
+      res.on('close', cancel);
+      const sendEvent = (ev) => {
+        if (!res.writableEnded) res.write(JSON.stringify(ev) + '\n');
+      };
+
+      const chatProject = PROJECT;
+      let expectedSession = sessionRevision;
+      const assertActive = () => {
+        if (abort.signal.aborted) throw new Error('已取消');
+        if (switching || PROJECT !== chatProject || sessionRevision !== expectedSession) {
+          throw new Error('工程或比较会话已切换，请重试');
+        }
+      };
+
+      const resolveSymbols = (model, rawList, kind) => {
+        const resolved = [];
+        const seen = new Set();
+        const ambiguous = [];
+        const notFound = [];
+        const items = Array.isArray(rawList) ? rawList : typeof rawList === 'string' && rawList.trim() ? [rawList] : [];
+        for (const raw of items) {
+          const text = String(raw || '').trim();
+          if (!text) continue;
+          const clean = kind === 'fn' ? text.replace(/\(\s*\)$/, '').trim() : text;
+          const exact = model._index.byId.get(clean);
+          const validExact = exact && !exact.external && !overlay.deleted.nodes[exact.id] &&
+            (kind === 'var' ? exact.kind === 'var' : exact.kind !== 'var' && !exact.headerSymbol);
+          if (validExact) {
+            if (!seen.has(exact.id)) { seen.add(exact.id); resolved.push(exact.id); }
+            continue;
+          }
+          if (kind === 'var') {
+            const prefixed = model._index.byId.get('var::' + clean);
+            if (prefixed && prefixed.kind === 'var' && !overlay.deleted.nodes[prefixed.id]) {
+              if (!seen.has(prefixed.id)) { seen.add(prefixed.id); resolved.push(prefixed.id); }
+              continue;
+            }
+            const byName = (model.variables || []).filter(v => !overlay.deleted.nodes[v.id] &&
+              (v.name === clean || v.name.toLowerCase() === clean.toLowerCase()));
+            if (byName.length === 1) {
+              if (!seen.has(byName[0].id)) { seen.add(byName[0].id); resolved.push(byName[0].id); }
+            } else if (byName.length > 1) {
+              ambiguous.push({ query: text, candidates: byName.slice(0, 8).map(v => v.id) });
+            } else notFound.push(text);
+          } else {
+            let matches = (model._index.byName.get(clean) || []).filter(n => !n.external && !overlay.deleted.nodes[n.id]);
+            if (!matches.length) {
+              const lower = clean.toLowerCase();
+              matches = (model.functions || []).filter(n => !n.external && !overlay.deleted.nodes[n.id] && n.name.toLowerCase() === lower);
+            }
+            if (matches.length === 1) {
+              if (!seen.has(matches[0].id)) { seen.add(matches[0].id); resolved.push(matches[0].id); }
+            } else if (matches.length > 1) {
+              ambiguous.push({ query: text, candidates: matches.slice(0, 8).map(n => n.id) });
+            } else notFound.push(text);
+          }
+        }
+        return { resolved, ambiguous, notFound };
+      };
+
+      const isReviewing = () => (Number(p.at) > 0) || Boolean(pageState?.reviewing || Number(pageState?.at) > 0);
+      const executeAiTool = async (name, args) => {
+        assertActive();
+        if (name === 'get_git_changes') {
+          const q = new URLSearchParams({ limit: '80' });
+          if (args.baseRef) q.set('baseRef', String(args.baseRef));
+          if (args.targetRef) q.set('targetRef', String(args.targetRef));
+          const wantsWorktree = !args.baseRef && !args.targetRef;
+          const forceGit = Boolean(COMPARISON && (
+            (wantsWorktree && COMPARISON.git?.targetRef !== 'WORKTREE') ||
+            (args.baseRef && COMPARISON.git?.baseRef !== String(args.baseRef)) ||
+            (args.targetRef && COMPARISON.git?.targetRef !== String(args.targetRef))
+          ));
+          if (forceGit && wantsWorktree) {
+            q.set('baseRef', 'HEAD');
+            q.set('targetRef', 'WORKTREE');
+          }
+          const result = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit });
+          assertActive();
+          const snap = getMcpChangeSnapshot(result.snapshotId);
+          const allNodes = result.nodes || [];
+          const changedFiles = (snap?.comparison?.git?.changedFiles || []).slice(0, 40);
+          return {
+            ok: true,
+            source: result.source,
+            snapshotId: result.snapshotId,
+            noChanges: !allNodes.length && !(result.edges?.length) && !changedFiles.length,
+            changedFiles,
+            changedFunctions: allNodes.filter(c => c.kind !== 'var').slice(0, 40).map(c => ({
+              id: c.id, name: c.name, file: c.file, line: c.line, change: c.change,
+            })),
+            changedVars: allNodes.filter(c => c.kind === 'var').slice(0, 30).map(c => ({
+              id: c.id, name: c.name, file: c.file, line: c.line, change: c.change,
+            })),
+            total: result.total ?? allNodes.length,
+          };
+        }
+        if (name === 'find_symbols') {
+          const query = String(args.query || '').trim();
+          const kind = ['fn', 'var', 'all'].includes(args.kind) ? args.kind : 'all';
+          const limit = Math.max(1, Math.min(50, Number(args.limit) || 20));
+          const activeModel = MODEL;
+          if (!query) {
+            const tasks = activeModel.parserId === 'dot' ? [] : projectTasks(activeModel).slice(0, 20).map(t => ({
+              id: t.id, name: t.name, kind: t.kind, periodUs: t.us,
+            }));
+            return {
+              ok: true,
+              project: PROJECT.name,
+              canvasRoots: (pageState?.roots || []).slice(0, 20),
+              tasks,
+            };
+          }
+          const matches = [];
+          if (kind !== 'var') {
+            for (const fn of search(activeModel, query)) {
+              if (overlay.deleted.nodes[fn.id]) continue;
+              matches.push({ id: fn.id, name: fn.name, kind: 'fn', file: fn.file, line: fn.line, fanIn: fn.fanIn, fanOut: fn.fanOut });
+              if (matches.length >= limit) break;
+            }
+          }
+          if (kind !== 'fn' && matches.length < limit) {
+            if (!COMPARISON && activeModel.source !== 'dot') {
+              await ensureAnalysis(activeModel);
+              assertActive();
+            }
+            const vars = COMPARISON ? comparisonGlobals(COMPARISON) : await listGlobals(activeModel);
+            assertActive();
+            const lower = query.toLowerCase();
+            for (const v of vars) {
+              if (overlay.deleted.nodes[v.id]) continue;
+              if (!v.name.toLowerCase().includes(lower) && !v.id.toLowerCase().includes(lower)) continue;
+              matches.push({ id: v.id, name: v.name, kind: 'var', file: v.file, line: v.line, writers: v.writers?.length || 0, readers: v.readers?.length || 0 });
+              if (matches.length >= limit) break;
+            }
+          }
+          return { ok: true, query, matches, total: matches.length };
+        }
+        if (name === 'read_function') {
+          const target = String(args.name || args.id || '').trim();
+          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, [target], 'fn');
+          if (!resolved.length) {
+            return { ok: false, error: ambiguous.length ? '函数名重名，请改用候选中的完整「文件::函数名」' : `未找到函数：${target}`, ambiguous, notFound };
+          }
+          const q = new URLSearchParams({ id: resolved[0] });
+          if (['auto', 'cp932', 'utf-8'].includes(args.encoding)) q.set('encoding', args.encoding);
+          const src = await readMcpSource(q);
+          assertActive();
+          const lines = String(src.source || '').split('\n');
+          const kept = [];
+          let chars = 0;
+          let clipped = false;
+          for (const line of lines) {
+            if (kept.length >= 120 || chars + line.length + 1 > 8000) { clipped = true; break; }
+            kept.push(line);
+            chars += line.length + 1;
+          }
+          return {
+            ok: true,
+            id: src.id,
+            name: src.name,
+            file: src.file,
+            startLine: src.startLine,
+            endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
+            truncated: Boolean(src.truncated || clipped),
+            sourceEncoding: src.sourceEncoding,
+            source: clipped ? kept.join('\n') + '\n/* ... */' : kept.join('\n'),
+            taskPeriods: src.taskPeriods,
+            upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
+            calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
+            varAccess: (src.varAccess || []).slice(0, 25),
+          };
+        }
+        if (name === 'add_to_canvas') {
+          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再修改画布' };
+          const includeTasks = args.includeTasks !== false;
+          const up = Math.max(0, Math.min(3, Math.trunc(Number(args.up) || 0)));
+          const down = Math.max(0, Math.min(3, Math.trunc(Number(args.down) || 0)));
+          const reason = typeof args.reason === 'string' ? args.reason.slice(0, 240) : '';
+          let snapshotId;
+          let targetModel = MODEL;
+          let defaultFnIds = [];
+          let defaultVarIds = [];
+
+          if (args.fromGit) {
+            const needFreshWorktree = !COMPARISON || COMPARISON.git?.targetRef !== 'WORKTREE';
+            if (needFreshWorktree) {
+              const q = new URLSearchParams({ limit: '80', baseRef: 'HEAD', targetRef: 'WORKTREE' });
+              const gitRes = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit: Boolean(COMPARISON) });
+              assertActive();
+              const snap = getMcpChangeSnapshot(gitRes.snapshotId);
+              if (!snap.comparison.model) {
+                return { ok: false, error: '当前 Git 工作区没有未提交的 C/H 代码改动' };
+              }
+              snapshotId = gitRes.snapshotId;
+              targetModel = snap.comparison.model;
+            }
+            const hidden = (snapshotId ? comparisonBase?.overlay ?? overlay : overlay).deleted.nodes;
+            const directFns = (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && n.change !== 'existing');
+            const impactFns = directFns.length ? directFns : (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && (n.impact || n.macroImpact || n.periodImpact));
+            defaultFnIds = impactFns.slice(0, 40).map(n => n.id);
+            defaultVarIds = (targetModel.variables || []).filter(v => !hidden[v.id] && v.change !== 'existing').slice(0, 20).map(v => v.id);
+          } else if (Array.isArray(args.vars) && args.vars.length && !COMPARISON && MODEL.source !== 'dot') {
+            await ensureAnalysis(MODEL);
+            assertActive();
+            targetModel = MODEL;
+          }
+
+          assertActive();
+          const hasExplicitFns = Array.isArray(args.functions) && args.functions.length > 0;
+          const hasExplicitVars = Array.isArray(args.vars) && args.vars.length > 0;
+          const fnRes = hasExplicitFns ? resolveSymbols(targetModel, args.functions, 'fn') : { resolved: defaultFnIds, ambiguous: [], notFound: [] };
+          const varRes = hasExplicitVars ? resolveSymbols(targetModel, args.vars, 'var') : { resolved: defaultVarIds, ambiguous: [], notFound: [] };
+          let actualFnIds = fnRes.resolved.slice(0, 80);
+          const varIds = varRes.resolved.slice(0, 40);
+          // 支持仅追加全局变量到已有画布
+          const pureVars = !actualFnIds.length && varIds.length > 0 && !snapshotId && (pageState?.roots?.length > 0);
+          if (!actualFnIds.length && !pureVars) {
+            return {
+              ok: false,
+              error: fnRes.ambiguous.length ? '函数名重名，请改用完整「文件::函数名」'
+                : varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
+                : '未匹配到可加入画布的函数',
+              ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
+              notFound: [...fnRes.notFound, ...varRes.notFound],
+            };
+          }
+          const mode = args.mode === 'replace' || args.mode === 'add'
+            ? args.mode
+            : (snapshotId ? 'replace' : 'add');
+          const composePayload = pureVars
+            ? { mode: 'add', roots: pageState.roots.slice(0, 1), changedFunctionIds: [], vars: varIds, up: 0, down: 0, reason: reason || 'AI 加入全局变量到画布' }
+            : {
+              mode,
+              ...(snapshotId ? { snapshotId } : {}),
+              ...(includeTasks
+                ? { changedFunctionIds: actualFnIds, functionIds: [] }
+                : { roots: actualFnIds, changedFunctionIds: [] }),
+              vars: varIds,
+              up,
+              down,
+              reason: reason || (args.fromGit ? 'AI 加入 Git 改动链路' : 'AI 加入函数到画布'),
+            };
+          let composed;
+          let fallbackNote = '';
+          try {
+            composed = composeMcpView(composePayload);
+          } catch (err) {
+            if (includeTasks && !pureVars && /80|入口过多/.test(err.message)) {
+              actualFnIds = actualFnIds.slice(0, 40);
+              composed = composeMcpView({
+                mode,
+                ...(snapshotId ? { snapshotId } : {}),
+                roots: actualFnIds,
+                changedFunctionIds: [],
+                vars: varIds,
+                up: Math.min(up, 1),
+                down: Math.min(down, 1),
+                reason: reason || 'AI 加入函数到画布',
+              });
+              fallbackNote = '上游入口链超过 80 个函数，已直接加入前 40 个目标函数本体';
+            } else throw err;
+          }
+          // 若本次操作由助手自身切入 Git 比较，同步会话版本使同一轮后续读工具不被误判为外部切换。
+          if (snapshotId && PROJECT === chatProject) expectedSession = sessionRevision;
+          return {
+            ok: true,
+            addedCount: actualFnIds.length + varIds.length,
+            roots: composed.page.roots.slice(0, 30),
+            vars: composed.page.vars.slice(0, 20),
+            resolved: actualFnIds,
+            ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
+            notFound: [...fnRes.notFound, ...varRes.notFound],
+            untracedIds: composed.untracedIds || [],
+            ...(fallbackNote ? { note: fallbackNote } : {}),
+          };
+        }
+        if (name === 'apply_labels') {
+          if (isReviewing()) return { ok: false, error: '当前处于时间轴回看模式（只读），请先点「回到最新」再写入标签' };
+          if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能写入标签' };
+          const rawItems = Array.isArray(args.items) ? args.items : [];
+          if (!rawItems.length) return { ok: false, error: 'items 不能为空' };
+          const items = [];
+          for (const item of rawItems) {
+            const from = resolveSymbols(MODEL, [item.from], 'fn');
+            const to = resolveSymbols(MODEL, [item.to], 'fn');
+            if (!from.resolved.length || !to.resolved.length) {
+              return {
+                ok: false,
+                error: `无法解析连线端点：${item.from} -> ${item.to}`,
+                ambiguous: [...from.ambiguous, ...to.ambiguous],
+                notFound: [...from.notFound, ...to.notFound],
+              };
+            }
+            const lineSuffix = Number.isInteger(Number(item.line)) && Number(item.line) > 0 ? `:${Number(item.line)}` : '';
+            items.push({
+              edgeKey: `${from.resolved[0]}->${to.resolved[0]}${lineSuffix}`,
+              preset: item.preset,
+              ...(item.text !== undefined ? { text: String(item.text) } : {}),
+              ...(item.order !== undefined ? { order: Number(item.order) } : {}),
+              ...(item.note !== undefined ? { note: String(item.note) } : {}),
+            });
+          }
+          assertActive();
+          const applied = applyMcpTaskLabels({ items, merge: true });
+          return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [] };
+        }
+        return { ok: false, error: `未知工具：${name}` };
+      };
+
+      try {
+        const gitInfo = MODEL.parserId === 'dot' ? null : await inspectGitRepo(COMPARISON?.projectPath || root).catch(() => null);
+        assertActive();
+        const tasks = MODEL.parserId === 'dot' ? [] : projectTasks(MODEL).slice(0, 10).map(t => t.name);
+        const context = {
+          projectName: PROJECT.name,
+          fnCount: MODEL.functions?.length || 0,
+          varCount: MODEL.variables?.length || 0,
+          canvasRoots: (pageState?.roots || []).slice(0, 12),
+          isGitRepo: Boolean(gitInfo?.isRepo),
+          gitDirtyFiles: gitInfo?.isRepo ? gitInfo.workingTree.files.map(f => f.file) : [],
+          tasks,
+        };
+        await runAiAgent({
+          config: cfg,
+          prompt,
+          history: p.history || [],
+          context,
+          executeTool: executeAiTool,
+          onEvent: sendEvent,
+          signal: abort.signal,
+        });
+      } catch (err) {
+        sendEvent({ type: 'error', error: String(err?.message || err) });
+      } finally {
+        req.off('close', cancel);
+        res.off('close', cancel);
+        if (!res.writableEnded) res.end();
+      }
+      return;
     }
 
     if (u.pathname === '/api/flowchart' && req.method === 'GET') {
@@ -2204,6 +2885,7 @@ export const server = http.createServer(async (req, res) => {
           edges: S.edges,
         },
         overlay: store.loadOverlay(PROJECT.id),
+        manualNodes: loadManualNodes(PROJECT.id),
         bookmarks: store.listBookmarks(PROJECT.id),
         events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
         eventsTotal,
@@ -2227,11 +2909,16 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/session/import' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res, 32 * 1024 * 1024)
-        .then((p) => {
+        .then(async (p) => {
           if (!p || p.format !== 'tcu-callgraph-session') return bad(res, '不是 .cgx 会话文件');
           if (Number(p.version) > 1) return bad(res, `会话文件版本 ${p.version} 高于当前支持的 1`);
           if (p.overlay !== undefined && !isPlainObject(p.overlay)) return bad(res, 'overlay 必须是对象');
           if (p.bookmarks !== undefined && !Array.isArray(p.bookmarks)) return bad(res, 'bookmarks 必须是数组');
+
+          if (MODEL.source !== 'dot' && Array.isArray(p.manualNodes) && p.manualNodes.some((item) => item?.kind === 'var')) {
+            await ensureAnalysis(MODEL);
+            if (!currentSession(req)) return sessionConflict(res);
+          }
 
           const ov = p.overlay || {};
           const nodes = isPlainObject(ov.nodes) ? ov.nodes : {};
@@ -2300,6 +2987,33 @@ export const server = http.createServer(async (req, res) => {
               }
             }
 
+            let importedManual = 0;
+            if (Array.isArray(p.manualNodes)) {
+              const mergedMap = new Map(loadManualNodes(PROJECT.id).map((item) => [item.id, item]));
+              for (const rawItem of p.manualNodes) {
+                if (!isPlainObject(rawItem)) continue;
+                const kind = rawItem.kind === 'var' ? 'var' : rawItem.kind === 'fn' ? 'fn' : null;
+                const file = sanitizeManualFile(rawItem.file);
+                const name = sanitizeManualName(rawItem.name);
+                if (!kind || !file || !name) continue;
+                const id = kind === 'var' ? `var::${file}::${name}` : `${file}::${name}`;
+                mergedMap.set(id, {
+                  id,
+                  kind,
+                  file,
+                  name,
+                  typeText: kind === 'var' ? String(rawItem.typeText || '').trim().slice(0, 120) : '',
+                });
+                importedManual++;
+              }
+              saveManualNodes(PROJECT.id, [...mergedMap.values()]);
+            }
+
+            const pageKey = 'ui.last-view.' + PROJECT.id;
+            const beforePage = store.getSetting(pageKey);
+            const reconciled = reconcileManualVariables(MODEL, PROJECT.id, loadManualNodes(PROJECT.id), beforePage);
+            if (reconciled.overlay && reconciled.page) store.setSetting(pageKey, reconciled.page);
+
             // 代码版本对不上时标注可能挂不到节点上，返回给前端提示
             const fp = fingerprintFiles(MODEL.files);
             const sameCode = !p.project?.fingerprint || p.project.fingerprint === fp;
@@ -2311,13 +3025,18 @@ export const server = http.createServer(async (req, res) => {
               target: p.project?.name || 'session',
               after: {
                 ...store.loadOverlay(PROJECT.id),
-                summary: { annotations, layout, bookmarks, sameCode },
+                manualNodes: manualNodesMap(reconciled.list),
+                ...(reconciled.overlay && reconciled.page && { view: viewSnapshot(reconciled.page) }),
+                summary: { annotations, layout, bookmarks, manualNodes: importedManual, sameCode },
               },
             });
 
-            return { annotations, layout, bookmarks, delNodes, delEdges, sameCode };
+            return { annotations, layout, bookmarks, manualNodes: importedManual, delNodes, delEdges, sameCode, reconciled };
           });
 
+          applyManualNodes(MODEL, PROJECT.id, result.reconciled.list);
+          if (result.reconciled.overlay && result.reconciled.page) pageState = result.reconciled.page;
+          S = stats(MODEL);
           reloadOverlay();
           broadcastChange('session.import', 'user');
           json(res, {
@@ -2363,18 +3082,30 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/restore' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((p) => {
+        .then(async (p) => {
           const at = Number(p.eventId);
           if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
           const latest = store.latestEventId(PROJECT.id);
           if (at > latest) return bad(res, 'eventId 超出范围');
-          const restored = store.overlayAt(PROJECT.id, at);
-          const restoredView = store.viewAt(PROJECT.id, at);
+          let restored = store.overlayAt(PROJECT.id, at);
+          let restoredView = store.viewAt(PROJECT.id, at);
           let restoredPage;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
+          let restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
+          if (MODEL.source !== 'dot' && restoredManualList.some((item) => item.kind === 'var')) {
+            await ensureAnalysis(MODEL);
+            if (!currentSession(req)) return sessionConflict(res);
+          }
           const eventId = store.transaction(() => {
             store.replaceOverlay(PROJECT.id, restored);
+            saveManualNodes(PROJECT.id, restoredManualList);
+            const reconciled = reconcileManualVariables(MODEL, PROJECT.id, restoredManualList, restoredView);
+            if (reconciled.overlay) {
+              restored = reconciled.overlay;
+              restoredManualList = reconciled.list;
+              restoredView = reconciled.page;
+            }
             const eventId = store.appendEvent(PROJECT.id, {
               op: 'restore_point',
               target: `event#${at}`,
@@ -2389,6 +3120,8 @@ export const server = http.createServer(async (req, res) => {
             return eventId;
           });
           // 同步内存镜像，后续请求直接读到恢复后的状态
+          applyManualNodes(MODEL, PROJECT.id, restoredManualList);
+          S = stats(MODEL);
           if (restoredPage) pageState = restoredPage;
           overlay.nodes = restored.nodes;
           overlay.edges = restored.edges;
@@ -2421,6 +3154,7 @@ export const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/view') {
+      res.setHeader('X-Callgraph-Session', String(req.sessionRevision));
       const at = Number(u.searchParams.get('at') || 0);
       let emptyRequested = u.searchParams.get('empty') === '1';
       let useSnapshot = u.searchParams.get('useSnapshot') === '1';
@@ -2522,14 +3256,7 @@ export const server = http.createServer(async (req, res) => {
           if (varSel.want.length) {
             return json(res, withReviewSnapshot(await buildView([], up, down, group, df, varSel, viewOverlay, previous)));
           }
-          return json(res, withReviewSnapshot({
-            nodes: [],
-            edges: [],
-            width: 480,
-            height: 260,
-            root: null,
-            empty: true,
-          }));
+          return json(res, withReviewSnapshot(emptyCanvasView(groupMode)));
         }
         // 默认：入度为 0 的入口函数（如 main / ISR）；单文件模式优先该文件
         const pool = MODEL.focusFile
@@ -2715,6 +3442,122 @@ export const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (u.pathname === '/api/manual-nodes' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      if (COMPARISON) return json(res, { ok: false, error: '比较视图仅供查看' }, 409);
+      let body;
+      try { body = await readJson(req, res); } catch { return; }
+      if (!isPlainObject(body)) return bad(res, '请求体必须是对象');
+      const kind = body.kind === 'var' ? 'var' : body.kind === 'fn' ? 'fn' : null;
+      if (!kind) return bad(res, 'kind 必须是 fn 或 var');
+      const file = sanitizeManualFile(body.file);
+      if (!file) return bad(res, '文件路径无效');
+      if (!MODEL.files.some((f) => f.rel === file && !f.manual)) {
+        return bad(res, '请选择工程内已有的源码文件');
+      }
+      const name = sanitizeManualName(body.name);
+      if (!name) return bad(res, '名称不能为空且不能包含 ::');
+      const typeText = kind === 'var' ? String(body.typeText || '').trim().slice(0, 120) : '';
+      const change = body.change == null ? 'existing' : String(body.change);
+      if (!['existing', 'modified', 'added', 'deleted'].includes(change)) return bad(res, 'change 不合法');
+      const id = kind === 'var' ? `var::${file}::${name}` : `${file}::${name}`;
+      if (kind === 'var' && !MODEL._df && MODEL.source !== 'dot') {
+        const model = MODEL;
+        await ensureAnalysis(model);
+        if (!currentSession(req) || MODEL !== model) return sessionConflict(res);
+      }
+      const globalVarConflict = kind === 'var' && variableConflicts(MODEL, { id, file, name }).length;
+      if (MODEL._index?.byId?.has(id) || MODEL._df?.byId?.has(id) || globalVarConflict) {
+        return json(res, { ok: false, error: `该文件中已存在同名${kind === 'var' ? '变量' : '函数'}：${name}` }, 409);
+      }
+      const list = loadManualNodes(PROJECT.id);
+      if (list.some((item) => item.id === id)) {
+        return json(res, { ok: false, error: `该文件中已存在同名${kind === 'var' ? '变量' : '函数'}：${name}` }, 409);
+      }
+      const entry = { id, kind, file, name, typeText };
+      const node = injectManualNodeIntoModel(MODEL, entry);
+      if (!node) return json(res, { ok: false, error: '无法添加该手工节点' }, 409);
+      rebuildIndex(MODEL);
+      store.transaction(() => {
+        saveManualNodes(PROJECT.id, [...list, entry]);
+        // 清理可能残留的旧同名节点标注，确保新建手工节点状态干净
+        store.deleteAnnotation(PROJECT.id, 'node', id);
+        if (overlay.nodes) delete overlay.nodes[id];
+        if (change !== 'existing') {
+          const merged = writeAnnotation('node', id, { change }, 'user');
+          if (merged) {
+            overlay.nodes = overlay.nodes || {};
+            overlay.nodes[id] = merged;
+          }
+        }
+        store.appendEvent(PROJECT.id, {
+          op: 'manual.node.add',
+          target: id,
+          after: { ...entry, change },
+          actor: 'user',
+        });
+      });
+      S = stats(MODEL);
+      broadcastChange('manual.node.add', 'user', { target: id });
+      return json(res, { ok: true, node: { ...publicNode(node), change } });
+    }
+
+    if (u.pathname === '/api/manual-nodes/delete' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      if (COMPARISON) return json(res, { ok: false, error: '比较视图仅供查看' }, 409);
+      let body;
+      try { body = await readJson(req, res); } catch { return; }
+      const id = typeof body?.id === 'string' ? body.id.trim() : '';
+      if (!id) return bad(res, '缺少节点 id');
+      const list = loadManualNodes(PROJECT.id);
+      const existing = list.find((item) => item.id === id);
+      if (!existing) return json(res, { ok: false, error: '找不到该手工节点' }, 404);
+      const nextList = list.filter((item) => item.id !== id);
+      // 仅移除 manual: true 的手工节点，绝不误删后来在源码中实现的同名真实函数/变量。
+      MODEL.functions = (MODEL.functions || []).filter((n) => !(n.id === id && n.manual));
+      MODEL.variables = (MODEL.variables || []).filter((n) => !(n.id === id && n.manual));
+      if (MODEL._df) {
+        MODEL._df.defs = MODEL._df.defs.filter((d) => !(d.id === id && d.manual));
+        if (MODEL._df.byId.get(id)?.manual) MODEL._df.byId.delete(id);
+      }
+      if (MODEL.files.some((f) => f.rel === existing.file && f.manual) &&
+          !MODEL.functions.some((f) => f.file === existing.file) &&
+          !MODEL.variables.some((v) => v.file === existing.file)) {
+        MODEL.files = MODEL.files.filter((f) => !(f.rel === existing.file && f.manual));
+      }
+      rebuildIndex(MODEL);
+      const keptSourceSymbol = Boolean(MODEL._index?.byId?.has(id) || MODEL._df?.byId?.has(id));
+      store.transaction(() => {
+        saveManualNodes(PROJECT.id, nextList);
+        if (!keptSourceSymbol) {
+          for (const [k, slot] of Object.entries(overlay.layout || {})) {
+            if (!slot?.manual?.length) continue;
+            const filtered = slot.manual.filter((m) => m.from !== id && m.to !== id);
+            if (filtered.length !== slot.manual.length) {
+              const sep = k.lastIndexOf('::');
+              const rootKey = sep >= 0 ? k.slice(0, sep) : k;
+              const mode = sep >= 0 && k.slice(sep + 2) === 'flat' ? 'flat' : 'group';
+              overlay.layout[k] = store.saveLayout(PROJECT.id, rootKey, mode, { manual: filtered });
+            }
+          }
+          store.deleteAnnotation(PROJECT.id, 'node', id);
+          if (overlay.nodes) delete overlay.nodes[id];
+          store.setDeleted(PROJECT.id, 'node', id, false);
+          delete overlay.deleted.nodes[id];
+        }
+        store.appendEvent(PROJECT.id, {
+          op: 'manual.node.delete',
+          target: id,
+          before: existing,
+          after: { keptSourceSymbol },
+          actor: 'user',
+        });
+      });
+      S = stats(MODEL);
+      broadcastChange('manual.node.delete', 'user', { target: id });
+      return json(res, { ok: true, id, keptSourceSymbol });
+    }
+
     if (u.pathname === '/api/layout' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
@@ -2722,17 +3565,35 @@ export const server = http.createServer(async (req, res) => {
           if (patch.nodes !== undefined && !isPlainObject(patch.nodes)) return bad(res, 'nodes 必须是对象');
           if (patch.edges !== undefined && !isPlainObject(patch.edges)) return bad(res, 'edges 必须是对象');
           if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
+          if (patch.addManual !== undefined && !Array.isArray(patch.addManual)) return bad(res, 'addManual 必须是数组');
+          if (patch.removeManual !== undefined && !Array.isArray(patch.removeManual)) return bad(res, 'removeManual 必须是数组');
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = remapLayoutRoot(String(patch.root || ''), MODEL);
           const key = layoutKey(rootId, mode);
-          const migrated = patch.clear || patch.manual !== undefined
+          const hasManualOp = patch.manual !== undefined || patch.addManual !== undefined || patch.removeManual !== undefined;
+          const migrated = patch.clear || hasManualOp
             ? legacyManualKeys(overlay.layout || {}, rootId, mode, MODEL) : [];
           const slot = store.transaction(() => {
             const before = store.getLayout(PROJECT.id, rootId, mode);
+            let nextManual = patch.manual;
+            if (nextManual === undefined && (patch.addManual !== undefined || patch.removeManual !== undefined)) {
+              const merged = [];
+              const seen = new Set();
+              const removed = new Set((patch.removeManual || []).map((m) => `${m?.from}\u0000${m?.to}`));
+              const legacy = migrated.flatMap((key) => overlay.layout[key].manual);
+              for (const m of [...legacy, ...(before.manual || []), ...(patch.addManual || [])]) {
+                if (!m || typeof m.from !== 'string' || typeof m.to !== 'string') continue;
+                const mk = `${m.from}\u0000${m.to}`;
+                if (removed.has(mk) || seen.has(mk)) continue;
+                seen.add(mk);
+                merged.push({ from: m.from, to: m.to });
+              }
+              nextManual = merged;
+            }
             const slot = store.saveLayout(PROJECT.id, rootId, mode, {
               nodes: patch.nodes,
               edges: patch.edges,
-              manual: patch.manual,
+              manual: nextManual,
               clear: !!patch.clear,
             });
             // 手工线是整组替换，清空旧别名的连线以免之后又被回退读取。
@@ -2746,9 +3607,9 @@ export const server = http.createServer(async (req, res) => {
               before: {
                 nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
                 edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
-                manual: patch.manual ? before.manual : undefined,
+                manual: nextManual ? before.manual : undefined,
               },
-              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: patch.manual,
+              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: nextManual,
                 clearedLegacyManual: migrated.length ? migrated : undefined, view: currentViewSnapshot() },
               actor: patch.actor === 'ai' ? 'ai' : 'user',
             });

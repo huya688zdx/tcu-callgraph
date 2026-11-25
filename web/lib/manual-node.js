@@ -1,0 +1,166 @@
+/**
+ * 手工节点弹窗：右键文件框或文件树中的文件，向该文件添加源码中不存在的函数或变量，
+ * 立即放入当前画布并持久化，随后可直接手动连线。
+ */
+import { t } from '../i18n.js';
+import { state } from './state.js';
+import { api } from './api.js';
+import { hooks } from './hooks.js';
+import { openModal, closeModal, confirmDialog } from './modal.js';
+import { loadStats, loadTree, resetVars, renderVars } from './panels.js';
+
+let wired = false;
+let dialog = null;
+let currentKind = 'fn';
+
+function refs() {
+  return {
+    modal: document.getElementById('manualNodeModal'),
+    file: document.getElementById('manualNodeFile'),
+    kindFn: document.getElementById('manualKindFn'),
+    kindVar: document.getElementById('manualKindVar'),
+    name: document.getElementById('manualNodeName'),
+    typeRow: document.getElementById('manualNodeTypeRow'),
+    typeText: document.getElementById('manualNodeType'),
+    change: document.getElementById('manualNodeChange'),
+    error: document.getElementById('manualNodeError'),
+    submit: document.getElementById('manualNodeSubmit'),
+    cancel: document.getElementById('manualNodeCancel'),
+    form: document.getElementById('manualNodeForm'),
+  };
+}
+
+function setKind(kind) {
+  currentKind = kind === 'var' ? 'var' : 'fn';
+  const ui = refs();
+  ui.kindFn?.setAttribute('aria-pressed', String(currentKind === 'fn'));
+  ui.kindVar?.setAttribute('aria-pressed', String(currentKind === 'var'));
+  if (ui.typeRow) ui.typeRow.hidden = currentKind !== 'var';
+  if (ui.name) {
+    ui.name.placeholder = currentKind === 'var'
+      ? t('manual.varPlaceholder')
+      : t('manual.fnPlaceholder');
+  }
+}
+
+function setError(msg) {
+  const { error } = refs();
+  if (!error) return;
+  error.textContent = msg || '';
+  error.hidden = !msg;
+}
+
+function wireDialog() {
+  if (wired) return;
+  const ui = refs();
+  if (!ui.modal || !ui.form) return;
+  wired = true;
+  ui.kindFn?.addEventListener('click', () => { setKind('fn'); ui.name?.focus(); });
+  ui.kindVar?.addEventListener('click', () => { setKind('var'); ui.name?.focus(); });
+  ui.cancel?.addEventListener('click', () => closeModal());
+  ui.name?.addEventListener('input', () => setError(''));
+  ui.form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const attempt = dialog;
+    if (!attempt || attempt.submitting || !ui.modal.classList.contains('show')) return;
+    const { file, view, projectId, sessionRevision } = attempt;
+    const stillActive = () => dialog === attempt && state.view === view && !state.at;
+    if (!stillActive()) {
+      closeModal();
+      return;
+    }
+    const name = ui.name.value.trim();
+    if (!name) {
+      setError(t('manual.nameRequired'));
+      ui.name.focus();
+      return;
+    }
+    if (name.includes('::')) {
+      setError(t('manual.invalidName'));
+      ui.name.focus();
+      return;
+    }
+    attempt.submitting = true;
+    ui.submit.disabled = true;
+    setError('');
+    try {
+      const res = await api.addManualNode({
+        file, projectId, sessionRevision,
+        kind: currentKind,
+        name,
+        typeText: currentKind === 'var' ? ui.typeText.value.trim() : '',
+        change: ui.change.value || 'existing',
+      });
+      if (!stillActive() || !ui.modal.classList.contains('show')) return;
+      if (!res?.ok || !res.node) {
+        setError(res?.error || t('manual.addFailed'));
+        return;
+      }
+      closeModal();
+      const created = res.node;
+      resetVars();
+      await Promise.all([loadTree(), loadStats()]);
+      if (!stillActive()) return;
+      if (created.kind === 'var') {
+        await hooks.addFunction?.([], { restoreHidden: false, varIds: [created.id] });
+      } else {
+        await hooks.addFunction?.(created.id, { restoreHidden: false });
+      }
+      if (dialog === attempt && state.view?.projectId === projectId &&
+          state.view.sessionRevision === sessionRevision && !state.at) renderVars();
+    } catch (err) {
+      if (stillActive() && ui.modal.classList.contains('show')) setError(String(err?.message || err || t('manual.addFailed')));
+    } finally {
+      if (dialog === attempt) {
+        attempt.submitting = false;
+        ui.submit.disabled = false;
+      }
+    }
+  });
+}
+
+export function openManualNodeDialog({ file, kind = 'fn' } = {}) {
+  const view = state.view;
+  const { projectId, sessionRevision } = view || {};
+  if (!file || projectId == null || state.at || view.comparison) return;
+  wireDialog();
+  const ui = refs();
+  if (!ui.modal) return;
+  dialog = { file: String(file), view, projectId, sessionRevision, submitting: false };
+  ui.submit.disabled = false;
+  if (ui.file) ui.file.textContent = dialog.file;
+  if (ui.name) ui.name.value = '';
+  if (ui.typeText) ui.typeText.value = '';
+  if (ui.change) ui.change.value = 'existing';
+  setError('');
+  setKind(kind);
+  openModal('manualNodeModal');
+  requestAnimationFrame(() => ui.name?.focus());
+}
+
+export async function removeManualNodePermanently(node) {
+  const view = state.view;
+  const { projectId, sessionRevision } = view || {};
+  const id = node?.id;
+  if (!id || projectId == null || state.at || view.comparison) return false;
+  const stillActive = () => state.view === view && !state.at;
+  const label = node.name || id;
+  const ok = await confirmDialog({
+    title: t('manual.deleteTitle'),
+    message: t('manual.deleteConfirm', { name: label }),
+    okText: t('manual.deleteBtn'),
+    danger: true,
+  });
+  if (!ok || !stillActive()) return false;
+  const res = await api.deleteManualNode({ id, projectId, sessionRevision });
+  if (!res?.ok || !stillActive()) return false;
+  state.roots = state.roots.filter((root) => root !== id);
+  state.expansions = state.expansions.filter((scope) => scope.root !== id);
+  state.vars.delete(id);
+  state.hiddenVars.delete(id);
+  if (state.selected === id) state.selected = null;
+  resetVars();
+  await Promise.all([loadTree(), loadStats()]);
+  if (stillActive()) await hooks.reloadKeepCam?.();
+  return true;
+}

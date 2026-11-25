@@ -103,9 +103,9 @@ function renderChangePoints() {
   if (!pickFocus || !pickPoints) return;
   pickFocus.hidden = !changePoints.length;
   pickPoints.innerHTML = changePoints.map((point, index) => {
-    const type = point.kind === 'macro_lsb' ? t('compare.point.macro') : point.kind === 'period' ? t('compare.point.period') :
+    const type = point.kind === 'macro_lsb' ? t('compare.point.macro') : point.kind === 'enum' ? t('compare.point.enum') : point.kind === 'period' ? t('compare.point.period') :
       point.change === 'added' ? t('compare.version.added') : point.change === 'deleted' ? t('bookmark.delete') : t('compare.version.modified');
-    const showValues = point.kind === 'macro_lsb' || point.kind === 'period';
+    const showValues = ['macro_lsb', 'enum', 'period'].includes(point.kind);
     const hasValues = showValues && (point.beforeValue != null || point.afterValue != null);
     const value = (v) => {
       const text = Array.isArray(v) ? v.join(' / ') : String(v ?? '');

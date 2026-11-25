@@ -11,6 +11,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { decodeSource } from './source-files.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -48,7 +49,7 @@ export function getParser() {
 
 /** 语法树归本次分析所有，由调用方在读取完成后释放。 */
 export async function parseFile(abs, rel, src) {
-  const text = src ?? fs.readFileSync(abs, 'utf8');
+  const text = src ?? decodeSource(fs.readFileSync(abs));
   const parser = await getParser();
   const tree = parser.parse(text);
   return { tree, root: tree.rootNode, src: text, rel };

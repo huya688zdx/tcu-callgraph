@@ -80,6 +80,7 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
   const shadowed = new Set();
   const resets = new Map();
   const callSites = new Set(calls.map(c => `${c.line}:${c.col}`));
+  const onceSites = new Set();
   const guardAccess = tokens.some(t => irqOff.test(t.v) || enter.test(t.v)) ? new Map() : null;
   let bypass = false;
   let blockDepth = 0;
@@ -215,6 +216,13 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
       // 初始化表达式也可能给已有计数器赋值。
       recordWrites(i + lhs.length + 1, stop);
     } else recordWrites(i, stop);
+    if (depth === guards.length && !bypass && !tokens[i].cond) {
+      // 整条调用语句仅受已识别的分频门控。循环、其他条件、短路和跳转可改变执行次数。
+      const start = op === 'return' ? i + 1 : i;
+      if (tokens[start]?.t === 'id' && value(start + 1) === '(' && collectArgs(tokens, start + 1)[1] === stop) {
+        onceSites.add(`${tokens[start].line}:${tokens[start].col}`);
+      }
+    }
     if (!depth && !bypass && !tokens[i].cond) {
       if (parts.length === 2 && parts[0] === '++' && id.test(parts[1])) recordIncrement(parts[1], [tokens[i + 1].line]);
       if (parts.length === 2 && parts[1] === '++' && id.test(parts[0])) recordIncrement(parts[0], [tokens[i].line]);
@@ -254,6 +262,12 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
     }
   }
   visit(0, tokens.length, 0, [], new Map());
+  // 向后跳转可以重复执行位于 goto 前的调用点。
+  if (onceSites.size && !tokens.some(t => t.v === 'goto')) {
+    for (const call of calls) if (call.kind === 'direct' && onceSites.has(`${call.line}:${call.col}`)) {
+      call.onceWhenGatesMatch = true;
+    }
+  }
   const bindLocal = gate => ({ ...gate, local: locals.has(gate.counter) });
   const counterIncrements = [...increments].filter(([counter, count]) =>
     count === 1 && !shadowed.has(counter) && writes.get(counter) === (resets.has(counter) ? 2 : 1) &&
@@ -465,20 +479,25 @@ export function taskPeriods(model) {
   }
   const { tickUs } = scheduleConfig(model);
   const ticks = new Map();
+  const incomingCalls = new Map();
+  for (const edge of model.edges) if (callKinds.has(edge.kind) && !edge.headerReference) {
+    incomingCalls.set(edge.to, (incomingCalls.get(edge.to) || 0) + 1);
+  }
   for (const [variable, owners] of tickOwners) {
     if (owners.length !== 1) continue;
     const entries = (byEntry.get(owners[0]) || []).filter(task => task.us);
+    if (incomingCalls.has(owners[0])) continue;
     if (entries.length === 1) ticks.set(variable, entries[0]);
     else if (!entries.length && tickUs) ticks.set(variable, { id: owners[0], us: tickUs,
       kind: byEntry.get(owners[0])?.[0]?.kind || 'task', source: 'tcu-schedule.json · tickUs' });
   }
 
   function propagate(id, source) {
-    const queue = [{ id, source }];
+    const queue = [{ id, source, once: !!source && !incomingCalls.has(id) && byEntry.get(id)?.length === 1 }];
     const seen = new Set();
     for (let i = 0; i < queue.length; i++) {
-      const { id, source } = queue[i];
-      const key = JSON.stringify([id, source?.us, source?.kind, !!source?.dividers]);
+      const { id, source, once } = queue[i];
+      const key = JSON.stringify([id, source?.us, source?.kind, !!source?.dividers, once]);
       if (seen.has(key)) continue;
       seen.add(key);
       if (source) {
@@ -496,7 +515,7 @@ export function taskPeriods(model) {
           const own = ownIncrements.get(fn.id)?.some(inc => inc.counter === gate.counter && inc.local === gate.local &&
             (!inc.resetDivider || gate.reset));
           const owner = !own && !gate.local && ticks.get(gate.variable);
-          const basis = own ? source?.us : owner?.us;
+          const basis = own && once ? source?.us : owner?.us;
           if (!(basis > 0)) continue;
           const next = lcm(us, basis * gate.divider);
           if (!Number.isSafeInteger(next)) continue;
@@ -504,8 +523,10 @@ export function taskPeriods(model) {
           tick ||= owner;
           evidence.push({ counter: gate.counter, divider: gate.divider, file: fn.file, line: edge.line, col: edge.col });
         }
+        const nextOnce = once && edge.onceWhenGatesMatch === true && evidence.length === gates.length &&
+          incomingCalls.get(edge.to) === 1 && !byEntry.has(edge.to);
         if (!evidence.length) {
-          if (source) queue.push({ id: edge.to, source });
+          if (source) queue.push({ id: edge.to, source, once: nextOnce });
           continue;
         }
         // 已有独立入口提供同一周期时，避免把主循环的 tick 再当成一个任务。
@@ -513,7 +534,7 @@ export function taskPeriods(model) {
         const base = source ?? { task: tick.id, kind: tick.kind, source: tick.source };
         const prior = base.dividers || [];
         if (prior.some(item => item.file === fn.file && item.line === edge.line && item.col === edge.col)) continue;
-        queue.push({ id: edge.to, source: { ...base, us, dividers: [...prior, ...evidence] } });
+        queue.push({ id: edge.to, once: nextOnce, source: { ...base, us, dividers: [...prior, ...evidence] } });
       }
     }
   }

@@ -26,6 +26,7 @@ const SERVER_INFO = { name: 'tcu-callgraph', version: '0.2.0' };
 const AI_INSTRUCTIONS = [
   'AI 绘图与标注强制规范',
   '1. 写入前先用 cg_page 对齐当前画布，再用 cg_source 读实际 C 源码。结合 cg_search、cg_node、cg_dataflow 和 cg_detect_tasks 核对函数、调用关系、周期及变量读写。',
+  '已知源码是 Windows CP932 时，调用 cg_source 传 encoding: "cp932"，按 sourceEncoding 核对。引述注释、字符串、标识符和写图上标签时保留原文及全角、半角。源码修改须保留原编码和换行，新增文字应能用 CP932 无损表示。',
   '2. 变更分析先用 cg_changes 取快照，以相同 snapshotId 和函数 id 查看 trace。已入图的版本也可用 cg_trace_to_task。核对每个 TASK / ISR 的路径、命名推断和间接调用，按分页提示续查，有缺口须说明。用 cg_compose_view 传 snapshotId、changedFunctionIds，在同一比较中显示各入口、中间调用和直接增删关系。每次最多 80 个函数。',
   '3. 用 cg_apply_task_labels 写标签。只在有周期或调度证据的调用线上写 TASK，文字带周期，note 记录文件行号和依据。按同一调用方在源码中的实际执行顺序从 コール順1 连续编号，禁止重号。分支或求值顺序不明时说明已知范围。',
   '4. 节点按定义源码分类。未改的 TASK、调用方、被调用方和仅受影响者均为 existing（既存绿），自身定义修改为 modified（変更黄），新增为 added（追加粉），删除为 deleted（削除灰）。',
@@ -223,7 +224,7 @@ const TOOLS = [
   },
   {
     name: 'cg_source',
-    description: '按函数 id 或相对路径和行范围读取 C 源码，最多 250 行。按函数读还返回周期、调用、变量访问和上游 TASK / ISR 路径。',
+    description: '按函数 id 或相对路径和行范围读取 C 源码，最多 250 行。已知日文工程为 CP932 时传 encoding: "cp932"。返回实际使用的 sourceEncoding；按函数读还返回周期、调用、变量访问和上游 TASK / ISR 路径。',
     access: 'read',
     inputSchema: {
       type: 'object',
@@ -233,13 +234,14 @@ const TOOLS = [
         file: { type: 'string', description: '来自 cg_tree 的项目相对路径' },
         startLine: { type: 'integer', minimum: 1 },
         endLine: { type: 'integer', minimum: 1 },
+        encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], default: 'auto', description: '本次源码读取的编码。文件 BOM 优先' },
         version: traceVersion,
       },
       oneOf: [{ required: ['id'] }, { required: ['file', 'startLine', 'endLine'] }],
     },
     run: (a, ctx) => {
       const q = new URLSearchParams();
-      for (const key of ['id', 'file', 'startLine', 'endLine', 'version']) if (a[key] !== undefined) q.set(key, a[key]);
+      for (const key of ['id', 'file', 'startLine', 'endLine', 'version', 'encoding']) if (a[key] !== undefined) q.set(key, a[key]);
       return get(ctx, '/api/source?' + q);
     },
   },

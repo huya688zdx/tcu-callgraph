@@ -10,8 +10,10 @@ import { analyseDataflow } from './df.js';
 import { findCallOrder } from './call-order.js';
 import { showExpansion } from './expand.js';
 import { setNodeName } from './node-name.js';
+import { hooks } from './hooks.js';
 import { setStatus } from './change-status.js';
 import { canOpenFlowchart, openFlowchart } from './flowchart.js';
+import { removeManualNodePermanently } from './manual-node.js';
 // ---------------- 右键菜单：标记变更分类 / 连线状态 ----------------
 
 // 色块用 getter 在菜单打开时现读 THEME：样式面板改色后菜单立即跟上
@@ -29,9 +31,10 @@ const EDGE_ITEMS = [
   { value: 'deleted', label: 'edgeState.deleted', get color() { return THEME.edge.call; } },
 ];
 
-/** 函数节点的右键菜单：数据流分析 + 变更分类 */
+/** 函数节点的右键菜单：数据流分析 + 手动连线 + 变更分类 */
 export function showNodeMenu(x, y, n) {
   const comparing = Boolean(state.view?.comparison);
+  const editable = !comparing && !state.at;
   const sections = [
     ...(n.headerSymbol ? [{ id: 'name', label: 'name.title', items: [
       { value: 'name:default', label: 'name.default', active: !n.nameModeOverride },
@@ -43,7 +46,14 @@ export function showNodeMenu(x, y, n) {
       label: 'menu.locate',
       items: [{ value: 'tree:fn', label: 'locate.treeFn' }],
     },
-    {
+    ...(editable ? [{
+      id: 'manualConnect',
+      items: [
+        { value: 'connect', label: 'manual.connectNode' },
+        ...(n.manual ? [{ value: 'deleteManual', label: 'manual.deleteFn' }] : []),
+      ],
+    }] : []),
+    ...(!n.manual ? [{
       id: 'df',
       items: [
         { value: 'expand', label: 'expand.menu' },
@@ -51,12 +61,14 @@ export function showNodeMenu(x, y, n) {
         ...(canOpenFlowchart(n) ? [{ value: 'flowchart', label: 'flowchart.menu' }] : []),
         ...(!comparing ? [{ value: 'callOrder', label: 'callOrder.find' }] : []),
       ],
-    },
+    }] : []),
     { id: 'change', label: 'status.title', items: (comparing ? COMPARISON_ITEMS : CHANGE_ITEMS).map((it) => ({ ...it,
       active: it.value === (comparing && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing') })) },
   ];
   showMenuSections(x, y, n.name, sections, (v) => {
     if (v.startsWith('name:')) return setNodeName(n, v.slice(5));
+    if (v === 'connect') return hooks.startManualLink?.(n);
+    if (v === 'deleteManual') return removeManualNodePermanently(n);
     if (v === 'expand') return showExpansion(n);
     if (v === 'tree:fn') return revealInTree('fn', n.id);
     if (v === 'df') return analyseDataflow(n.id);

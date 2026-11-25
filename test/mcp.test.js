@@ -226,6 +226,46 @@ test('e2e：cg_source 返回函数定义和分析信息，按行读源码时拒�
   assert.equal((await callTool(base, 'cg_source', { id: 'ext::missing' })).ok, false);
 });
 
+test('e2e：CP932 日文源码原样引用到标注，显式编码区分可兼作 UTF-8 的半角假名字节', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-cp932-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = '制御.c', id = file + '::shift';
+  const raw = Buffer.concat([Buffer.from('void shift(void) { /* '),
+    Buffer.from('93fa967bb6c5fbfc955c', 'hex'), Buffer.from(' */ }\r\n')]);
+  fs.writeFileSync(path.join(root, file), raw);
+  const ambiguous = Buffer.concat([Buffer.from('/* '), Buffer.from('c2a2', 'hex'), Buffer.from(' */\r\n')]);
+  fs.writeFileSync(path.join(root, 'notes.h'), ambiguous);
+  const { baseUrl: base, close } = await launchServer({ target: root });
+  t.after(close);
+  for (const args of [{ id }, { id, encoding: 'cp932' }]) {
+    const source = await callTool(base, 'cg_source', args);
+    assert.equal(source.sourceEncoding, 'cp932');
+    assert.equal(source.source, 'void shift(void) { /* 日本ｶﾅ髙表 */ }');
+  }
+  const range = { file: 'notes.h', startLine: 1, endLine: 1 };
+  const automatic = await callTool(base, 'cg_source', range);
+  assert.equal(automatic.sourceEncoding, 'utf-8');
+  assert.equal(automatic.source, '/* ¢ */');
+  const specified = await callTool(base, 'cg_source', { ...range, encoding: 'cp932' });
+  assert.equal(specified.sourceEncoding, 'cp932');
+  assert.equal(specified.source, '/* ﾂ｢ */');
+  assert.equal((await callTool(base, 'cg_source', { ...range, encoding: 'gbk' })).ok, false);
+  const unicode = '/* 日本ｶﾅ */';
+  fs.writeFileSync(path.join(root, 'notes.h'), Buffer.from('\uFEFF' + unicode + '\r\n', 'utf16le'));
+  const withBom = await callTool(base, 'cg_source', { ...range, encoding: 'cp932' });
+  assert.equal(withBom.sourceEncoding, 'utf-16le');
+  assert.equal(withBom.source, unicode);
+  fs.writeFileSync(path.join(root, 'notes.h'), Buffer.from([0x82, 0x20]));
+  const malformed = await callTool(base, 'cg_source', { ...range, encoding: 'cp932' });
+  assert.equal(malformed.ok, false);
+  assert.match(malformed.error, /无效的 cp932 字节/);
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const note = '日本ｶﾅ髙表';
+  assert.ok((await callTool(base, 'cg_annotate', { nodeId: id, data: { note } })).ok);
+  assert.equal((await callTool(base, 'cg_node', { id })).overlay.note, note);
+  assert.deepEqual(fs.readFileSync(path.join(root, file)), raw);
+});
+
 test('e2e：比较模式的 cg_source 读取映射后的修改和新增源码', async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-compare-'));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));

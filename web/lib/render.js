@@ -5,7 +5,7 @@
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
 import { isDataEdge, edgeDirection } from './edge-flow.js';
-import { nodePeriodBadge, periodBadgeBox, periodContainerStyle, PERIOD_COLORS, periodSubtitle } from './period-text.js';
+import { canvasPeriodBadge, periodBadgeBox, periodContainerStyle, PERIOD_COLORS, periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { midAnchor } from '/core/labels.js';
 import { drawEdgeLabels } from './edge-labels.js';
@@ -531,11 +531,11 @@ function draw({ geometryUnchanged = false } = {}) {
     const a = state.linkFrom;
     ctx.save();
     ctx.beginPath();
-    ctx.moveTo(a.x + a.w / 2, a.y + a.h);
+    ctx.moveTo(a.x + a.w / 2, a.y + a.h / 2);
     ctx.lineTo(state.linkPos.x, state.linkPos.y);
     ctx.strokeStyle = THEME.edge.manual;
-    ctx.lineWidth = 1.8;
-    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 2 / cam.k;
+    ctx.setLineDash([6 / cam.k, 4 / cam.k]);
     ctx.stroke();
     ctx.restore();
   }
@@ -590,11 +590,44 @@ function draw({ geometryUnchanged = false } = {}) {
     ctx.restore();
   }
 
-  // 文件和目录本体为实线，双击解锁后使用动态外圈；节点按自身线型处理。
-  if (state.moveTarget && !state.dragBox && !['edge', 'node'].includes(state.moveTarget.kind)) {
+  // 文件和目录本体为实线，双击解锁后使用动态外圈并画出 8 个拖拽缩放手柄；节点按自身线型处理。
+  const resizableBox = state.resizeBox?.box ||
+    (state.moveTarget && !state.dragBox && !['edge', 'node'].includes(state.moveTarget.kind) ? state.moveTarget.item : null);
+  if (state.moveTarget && !state.dragBox && !state.resizeBox && !['edge', 'node'].includes(state.moveTarget.kind)) {
     const b = state.moveTarget.item, gap = 4 / cam.k;
     recordBoxEffect({ x: b.x - gap, y: b.y - gap, w: b.w + gap * 2, h: b.h + gap * 2 },
       [5 / cam.k, 4 / cam.k], 1.5 / cam.k, state.moveTarget.kind === 'dir' ? 14 : 12);
+  }
+  if (state.resizeBox) {
+    const b = state.resizeBox.box;
+    ctx.save();
+    ctx.strokeStyle = THEME.node.selected;
+    ctx.lineWidth = 2 / cam.k;
+    roundRect(ctx, b.x - 1, b.y - 1, b.w + 2, b.h + 2, state.resizeBox.kind === 'dir' ? 14 : 12);
+    ctx.stroke();
+    ctx.restore();
+  }
+  if (resizableBox && !state.view?.comparison && !state.at) {
+    const hs = 7 / cam.k;
+    const pts = [
+      [resizableBox.x, resizableBox.y],
+      [resizableBox.x + resizableBox.w / 2, resizableBox.y],
+      [resizableBox.x + resizableBox.w, resizableBox.y],
+      [resizableBox.x + resizableBox.w, resizableBox.y + resizableBox.h / 2],
+      [resizableBox.x + resizableBox.w, resizableBox.y + resizableBox.h],
+      [resizableBox.x + resizableBox.w / 2, resizableBox.y + resizableBox.h],
+      [resizableBox.x, resizableBox.y + resizableBox.h],
+      [resizableBox.x, resizableBox.y + resizableBox.h / 2],
+    ];
+    ctx.save();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = THEME.node.selected;
+    ctx.lineWidth = 1.5 / cam.k;
+    for (const [hx, hy] of pts) {
+      ctx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
+      ctx.strokeRect(hx - hs / 2, hy - hs / 2, hs, hs);
+    }
+    ctx.restore();
   }
 
   if (state.dragBox && state.dragMoved) {
@@ -848,7 +881,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const allNodes = !!state.multiSelection?.nodes;
   const selected = allNodes ? state.multiSelection.nodes.has(n.id) : state.selected === n.id;
   const hover = state.hover === n.id;
-  const dropTarget = state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id;
+  const dropTarget = (state.dragEnd && state.dragEnd.hover && state.dragEnd.hover.id === n.id) ||
+    (state.linkFrom && state.linkFrom.id !== n.id && state.hover === n.id);
   const edgeRelated = focusedNodes?.has(n.id);
   const recentlyAdded = state.recent?.nodes.has(n.id);
   const role = !selected && nodeRoles?.get(n.id);
@@ -1005,6 +1039,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
       ctx.fillStyle = period ? '#124B71' : '#888780';
       const sub = n.external
         ? t('node.external')
+        : n.manual
+        ? (isVar ? n.typeText || t('node.manualVar') : t('node.manualFn'))
         : isVar
         ? n.typeText || t('node.variable')
         : `${shortFile(n.file)}:${n.line}`;
@@ -1013,7 +1049,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   }
 
   if (!comparing && cam.k >= 0.4) {
-    const badge = nodePeriodBadge(n);
+    const badge = canvasPeriodBadge(n);
     if (badge) {
       const size = Math.max(10.5, 7.5 / cam.k);
       ctx.font = `600 ${size}px ${FONT}`;

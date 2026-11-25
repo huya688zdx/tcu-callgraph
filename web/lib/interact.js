@@ -33,9 +33,72 @@ import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './ed
 import { renderLabelPanel } from './label-panel.js';
 import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
-import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove } from './hierarchy.js';
+import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove, beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from './hierarchy.js';
+import { openManualNodeDialog, removeManualNodePermanently } from './manual-node.js';
 import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 import { hooks } from './hooks.js';
+
+const RESIZE_CURSORS = {
+  n: 'ns-resize',
+  s: 'ns-resize',
+  e: 'ew-resize',
+  w: 'ew-resize',
+  nw: 'nwse-resize',
+  se: 'nwse-resize',
+  ne: 'nesw-resize',
+  sw: 'nesw-resize',
+};
+
+/** 命中已解锁文件框 / 目录容器的 8 个缩放手柄或 4 条边。 */
+function hitResizeHandle(e) {
+  const mt = state.moveTarget;
+  if (!state.view || state.view.comparison || state.at) return null;
+  if (!mt || mt.view !== state.view || (mt.kind !== 'file' && mt.kind !== 'dir')) return null;
+  const b = mt.item;
+  const p = worldPos(e);
+  const r = 8 / cam.k;
+  const corners = [
+    ['nw', b.x, b.y],
+    ['ne', b.x + b.w, b.y],
+    ['se', b.x + b.w, b.y + b.h],
+    ['sw', b.x, b.y + b.h],
+    ['n', b.x + b.w / 2, b.y],
+    ['e', b.x + b.w, b.y + b.h / 2],
+    ['s', b.x + b.w / 2, b.y + b.h],
+    ['w', b.x, b.y + b.h / 2],
+  ];
+  let best = null;
+  let bestDist = Infinity;
+  for (const [edge, hx, hy] of corners) {
+    if (Math.abs(p.x - hx) <= r && Math.abs(p.y - hy) <= r) {
+      const dist = Math.hypot(p.x - hx, p.y - hy);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = { kind: mt.kind, box: b, edge };
+      }
+    }
+  }
+  if (best) return best;
+  const edgeTol = 5 / cam.k;
+  const withinX = p.x >= b.x - edgeTol && p.x <= b.x + b.w + edgeTol;
+  const withinY = p.y >= b.y - edgeTol && p.y <= b.y + b.h + edgeTol;
+  if (withinX && Math.abs(p.y - (b.y + b.h)) <= edgeTol) return { kind: mt.kind, box: b, edge: 's' };
+  if (withinX && Math.abs(p.y - b.y) <= edgeTol) return { kind: mt.kind, box: b, edge: 'n' };
+  if (withinY && Math.abs(p.x - (b.x + b.w)) <= edgeTol) return { kind: mt.kind, box: b, edge: 'e' };
+  if (withinY && Math.abs(p.x - b.x) <= edgeTol) return { kind: mt.kind, box: b, edge: 'w' };
+  return null;
+}
+
+hooks.startManualLink = (n) => {
+  if (!n || state.at || state.view?.comparison) return;
+  resetDragState();
+  state.moveTarget = null;
+  state.linkFrom = n;
+  state.linkMode = 'click';
+  state.linkPos = { x: n.x + n.w / 2, y: n.y + n.h / 2 };
+  els.cv.classList.add('linking');
+  draw({ geometryUnchanged: true });
+};
 function worldPos(e) {
   const rect = els.cv.parentElement.getBoundingClientRect();
   return {
@@ -284,6 +347,7 @@ function resetDragState() {
   pendingMove = null;
   state.dragNode = null;
   state.dragBox = null;
+  state.resizeBox = null;
   state.dragEnd = null;
   state.dragSeg = null;
   state.dragLabel = null;
@@ -291,6 +355,7 @@ function resetDragState() {
   state.marquee = null;
   state.linkFrom = null;
   state.linkPos = null;
+  state.linkMode = null;
   state.panning = false;
   state.dragMoved = false;
   dragCache = null;
@@ -301,8 +366,9 @@ function resetDragState() {
 /** pointercancel / lostpointercapture：直接丢弃这次手势，不提交任何变更 */
 function cancelDrag() {
   const active =
-    state.dragBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom || state.marquee;
+    state.dragBox || state.resizeBox || state.dragNode || state.dragEnd || state.dragSeg || state.dragLabel || state.panning || state.linkFrom || state.marquee;
   if (state.dragBox) cancelHierarchyMove(state.dragBox);
+  if (state.resizeBox) cancelBoxResize(state.resizeBox);
   if (state.dragSeg) {
     state.dragSeg.edge.points = state.dragSeg.original;
     state.dragSeg.edge.custom = state.dragSeg.custom;
@@ -342,18 +408,41 @@ function hitBox(e) {
 els.cv.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!state.view) return;
+  if (state.linkFrom) {
+    resetDragState();
+    els.tooltip.style.opacity = '0';
+    draw({ geometryUnchanged: true });
+    return;
+  }
   if (state.moveTarget) { state.moveTarget = null; draw(); }
   if (state.multiSelection) { state.multiSelection = null; draw(); }
+  const comparing = Boolean(state.view?.comparison);
+  const editable = !comparing && !state.at;
 
   const n = hitTest(e);
   if (n) {
     clearTrunk();
     selectNode(n.id);
     if (n.kind === 'var') {
-      // 变量节点外观与函数一致，也允许标记变更分类（没有数据流/定位项）
-      showMenu(e.clientX, e.clientY, n.name || n.id, state.view?.comparison ? COMPARISON_ITEMS : CHANGE_ITEMS, state.view?.comparison && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing', (v) =>
-        setNodeChange(n, v)
-      );
+      const items = (comparing ? COMPARISON_ITEMS : CHANGE_ITEMS).map((it) => ({
+        ...it,
+        active: it.value === (comparing && n.statusSource !== 'manual' ? 'auto' : n.change || 'existing'),
+      }));
+      const sections = [
+        ...(editable ? [{
+          id: 'manualConnect',
+          items: [
+            { value: 'connect', label: 'manual.connectNode' },
+            ...(n.manual ? [{ value: 'deleteManual', label: 'manual.deleteVar' }] : []),
+          ],
+        }] : []),
+        { id: 'change', label: 'status.title', items },
+      ];
+      showMenuSections(e.clientX, e.clientY, n.name || n.id, sections, (v) => {
+        if (v === 'connect') return hooks.startManualLink?.(n);
+        if (v === 'deleteManual') return removeManualNodePermanently(n);
+        return setNodeChange(n, v);
+      });
       return;
     }
     showNodeMenu(e.clientX, e.clientY, n);
@@ -367,30 +456,68 @@ els.cv.addEventListener('contextmenu', (e) => {
     );
   }, true)) return;
 
-  // 文件框 / 目录容器：定位到当前文件或当前目录
+  // 文件框 / 目录容器：添加手工函数或变量、调整大小、收缩空白、定位到文件树
   const box = hitBox(e);
   if (box) {
     state.ctxBox = { kind: box.kind, id: box.box.id };
     renderVars();
     const title = String(box.box.label || box.box.id || '');
-    showMenuSections(
-      e.clientX,
-      e.clientY,
-      title,
-      [
+    const sections = [];
+    const isRealFileBox = box.kind === 'file' && state.groupMode !== 'period' &&
+      !String(box.box.id || '').startsWith('period-');
+    if (isRealFileBox && editable) {
+      sections.push({
+        id: 'manualAdd',
+        label: 'manual.menuSection',
+        items: [
+          { value: 'addFn', label: 'manual.addFn' },
+          { value: 'addVar', label: 'manual.addVar' },
+        ],
+      });
+    }
+    if (editable) {
+      sections.push({
+        id: 'boxSize',
+        label: 'box.sizeMenu',
+        items: [
+          { value: 'unlockBox', label: 'box.resize' },
+          { value: 'fitBox', label: 'box.fitContent' },
+        ],
+      });
+    }
+    sections.push({
+      id: 'locate',
+      label: 'menu.locate',
+      items: [
         {
-          id: 'locate',
-          label: 'menu.locate',
-          items: [
-            {
-              value: 'locate',
-              label: box.kind === 'file' ? 'locate.treeFile' : 'locate.treeDir',
-            },
-          ],
+          value: 'locate',
+          label: box.kind === 'file' ? 'locate.treeFile' : 'locate.treeDir',
         },
       ],
-      () => revealInTree(box.kind, box.box.id)
-    );
+    });
+    showMenuSections(e.clientX, e.clientY, title, sections, (v) => {
+      if (v === 'addFn') return openManualNodeDialog({ file: box.box.id, kind: 'fn' });
+      if (v === 'addVar') return openManualNodeDialog({ file: box.box.id, kind: 'var' });
+      if (v === 'unlockBox') {
+        state.selected = null;
+        state.selectedEdge = null;
+        state.selectedLabel = null;
+        state.ctxBox = { kind: box.kind, id: box.box.id };
+        state.moveTarget = { kind: box.kind, item: box.box, view: state.view };
+        renderDetail(null);
+        renderVars();
+        renderLabelPanel();
+        draw();
+        return;
+      }
+      if (v === 'fitBox') {
+        pushHistory();
+        if (shrinkBoxToFit(state.view, box)) pushHistory();
+        draw();
+        return;
+      }
+      revealInTree(box.kind, box.box.id);
+    });
     return;
   }
   hideMenu();
@@ -398,6 +525,17 @@ els.cv.addEventListener('contextmenu', (e) => {
 
 els.cv.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  if (state.linkFrom && state.linkMode === 'click') {
+    const from = state.linkFrom;
+    const target = hitTest(e);
+    resetDragState();
+    els.tooltip.style.opacity = '0';
+    if (target && target.id !== from.id && !state.at && !state.view?.comparison && state.view?.nodes.includes(from)) {
+      addManualEdge(from.id, target.id);
+    }
+    draw();
+    return;
+  }
   if (state.multiSelection && !state.multiSelection.trunk && (!e.shiftKey || state.multiSelection.kind !== 'nodes')) {
     state.multiSelection = null;
     draw();
@@ -472,6 +610,20 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   if (n && !e.shiftKey && pickTrunkEndpoint(n.id)) return;
 
+  const rh = hitResizeHandle(e);
+  if (rh && editable) {
+    clearTrunk();
+    state.multiSelection = null;
+    pushHistory();
+    state.resizeBox = beginBoxResize(state.view, { kind: rh.kind, box: rh.box }, rh.edge);
+    state.dragStart = { x: e.clientX, y: e.clientY };
+    els.cv.style.cursor = RESIZE_CURSORS[rh.edge] || 'nwse-resize';
+    els.tooltip.style.opacity = '0';
+    els.cv.setPointerCapture(e.pointerId);
+    draw();
+    return;
+  }
+
   // 只允许拖动已双击选中的层级；单击只切换右侧范围。
   const title = hitTitle(e);
   if (title) {
@@ -538,6 +690,17 @@ function handlePointerMove(e) {
     state.marquee.x1 = x;
     state.marquee.y1 = y;
     draw({ geometryUnchanged: true });
+    return;
+  }
+  if (state.resizeBox) {
+    const drag = state.resizeBox;
+    if (drag.view !== state.view) { cancelDrag(); return; }
+    const dx = e.clientX - state.dragStart.x, dy = e.clientY - state.dragStart.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) state.dragMoved = true;
+    if (state.dragMoved) {
+      const changed = resizeBox(drag, dragDelta(dx), dragDelta(dy));
+      draw({ geometryUnchanged: !changed });
+    }
     return;
   }
   if (state.dragBox) {
@@ -614,6 +777,15 @@ function handlePointerMove(e) {
 
   if (state.linkFrom) {
     state.linkPos = worldPos(e);
+    const over = hitTest(e);
+    state.hover = over && over.id !== state.linkFrom.id ? over.id : null;
+    const rect = els.cv.getBoundingClientRect();
+    els.tooltip.style.opacity = '1';
+    els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
+    els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
+    els.tooltip.innerHTML = over && over.id !== state.linkFrom.id
+      ? `<b>${esc(state.linkFrom.name)} → ${esc(over.name)}</b><br>${t(state.linkMode === 'click' ? 'manual.linkClickComplete' : 'manual.linkReleaseComplete')}`
+      : `<b>${esc(state.linkFrom.name)} → …</b><br>${t('manual.linkHint')}`;
     draw({ geometryUnchanged: true });
     return;
   }
@@ -636,10 +808,12 @@ function handlePointerMove(e) {
     els.cv.classList.toggle('over-node', !!next);
     draw({ geometryUnchanged: true });
   }
-  const title = next ? null : hitTitle(e);
-  const hits = !n && !title ? hitEdges(e) : [];
+  const rh = hitResizeHandle(e);
+  const title = next || rh ? null : hitTitle(e);
+  const hits = !n && !title && !rh ? hitEdges(e) : [];
   const hoveredEdge = hits[0];
-  let cursor = title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
+  let cursor = rh ? (RESIZE_CURSORS[rh.edge] || 'nwse-resize')
+    : title ? (moveReady(title.kind, title.box) ? 'grab' : 'pointer')
     : n ? (moveReady('node', n) ? 'move' : 'pointer') : hoveredEdge ? 'pointer' : '';
 
   // 光标反馈：选中边的端点 / 线段手柄
@@ -655,7 +829,7 @@ function handlePointerMove(e) {
   // 标签可以拖：悬停时给个抓手光标，比默认箭头好认
   if (hitLabel(worldPos(e))) els.cv.style.cursor = 'move';
 
-  if (n || title || hoveredEdge) {
+  if (n || rh || title || hoveredEdge) {
     const rect = els.cv.getBoundingClientRect();
     const trunkEndpoint = n && activeTrunk()?.some((edge) => edge.from === n.id || edge.to === n.id);
     const nodeAction = trunkEndpoint ? t('trunk.switch')
@@ -664,7 +838,8 @@ function handlePointerMove(e) {
     els.tooltip.style.left = e.clientX - rect.left + 14 + 'px';
     els.tooltip.style.top = e.clientY - rect.top + 14 + 'px';
     els.tooltip.innerHTML = n
-      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}:${n.line}</span><br>${nodeAction}${state.view?.comparison ? '' : `<br><span style="opacity:.5;font-size:11px">${t('canvas.connectHint')}</span>`}`
+      ? `<b>${esc(n.name)}</b><br><span style="opacity:.7">${esc(n.file)}${n.manual ? ` · ${t(n.kind === 'var' ? 'node.manualVar' : 'node.manualFn')}` : `:${n.line}`}</span><br>${nodeAction}${state.view?.comparison ? '' : `<br><span style="opacity:.5;font-size:11px">${t('canvas.connectHint')}</span>`}`
+      : rh ? `<b>${esc(rh.box.label || rh.box.id)}</b><br>${t('box.resizeHint')}`
       : title ? `<b>${esc(title.box.label || title.box.id)}</b><br>${moveReady(title.kind, title.box) ? t('canvas.groupDragActive') : t('canvas.groupDragInactive')}`
       : hits.length > 1 ? `<b>${t('trunk.title', { n: hits.length })}</b><br>${t('trunk.hitHint')}`
       : `<b>${esc(edgeCaption(hoveredEdge, id => id.split('::').pop()))}</b><br>${state.view?.comparison ? t('canvas.edgeComparison') : moveReady('edge', hoveredEdge) ? t('canvas.edgeActive') : t('canvas.edgeInactive')}`;
@@ -689,7 +864,7 @@ function flushPointerMove() {
 }
 
 els.cv.addEventListener('pointermove', (e) => {
-  if (!(state.panning || state.marquee || state.dragBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
+  if (!(state.panning || state.marquee || state.dragBox || state.resizeBox || state.dragNode || state.dragSeg || state.dragEnd || state.dragLabel || state.linkFrom)) {
     handlePointerMove(e);
     return;
   }
@@ -714,15 +889,25 @@ els.cv.addEventListener('pointerup', (e) => {
   const dragSeg = state.dragSeg;
   const dragNode = state.dragNode;
   const dragBox = state.dragBox;
+  const resize = state.resizeBox;
   const dragLabel = state.dragLabel;
   const dragStart = state.dragStart;
   const originalNodeRoutes = dragCache;
   const moved = state.dragMoved;
   const linkFrom = state.linkFrom;
+  const linkMode = state.linkMode;
   const marquee = state.marquee;
   const panning = state.panning;
   const panMoved = state.panMoved;
+  if (linkFrom && linkMode === 'click') return;
   resetDragState();
+
+  if (resize) {
+    if (resize.changed) pushHistory();
+    else if (moved) cancelBoxResize(resize);
+    draw();
+    return;
+  }
 
   if (marquee) {
     if (marquee.view !== state.view || state.at) return;
@@ -759,17 +944,31 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (dragEnd) {
     const { edge, which, hover, pos } = dragEnd;
-    if (hover) {
+    if (hover && !state.at && !state.view?.comparison &&
+        state.view?.edges.includes(edge) && state.view.nodes.includes(hover)) {
+      const oldFrom = edge.from;
+      const oldTo = edge.to;
+      const from = which === 'from' ? hover.id : oldFrom;
+      const to = which === 'to' ? hover.id : oldTo;
+      const changedPair = oldFrom !== from || oldTo !== to;
+      if (edge.manual && changedPair && state.view.edges.some((other) =>
+        other.from === from && other.to === to && (other.manual || other.line === 0))) {
+        draw();
+        return;
+      }
       if (which === 'from') {
-        edge.from = hover.id;
+        edge.from = from;
         edge.fromSide = nearestSide(hover, pos);
       } else {
-        edge.to = hover.id;
+        edge.to = to;
         edge.toSide = nearestSide(hover, pos);
       }
       edge.custom = false; // 重连后恢复自动布线
       rerouteScope([edge]);
-      saveLayout();
+      saveLayout(edge.manual && changedPair ? {
+        removeManual: [{ from: oldFrom, to: oldTo }],
+        addManual: [{ from: edge.from, to: edge.to }],
+      } : {});
       pushHistory();
       renderLabelPanel();
     }
@@ -847,6 +1046,7 @@ const labelSelectionType = (l) => JSON.stringify([
 ]);
 
 document.addEventListener('keydown', (e) => {
+  if (e.target?.closest?.('#aiDrawer')) return;
   if (e.key === 'Escape' && (state.marquee || state.multiSelection?.kind === 'nodes') && !document.querySelector('.modal.show')) {
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -892,10 +1092,11 @@ document.addEventListener('keydown', (e) => {
     }
     return;
   }
-  if (e.key === 'Escape' && (state.dragBox || state.dragNode || state.moveTarget) && !document.querySelector('.modal.show')) {
+  if (e.key === 'Escape' && (state.dragBox || state.resizeBox || state.dragNode || state.linkFrom || state.moveTarget) && !document.querySelector('.modal.show')) {
     e.preventDefault();
     e.stopImmediatePropagation();
     state.moveTarget = null;
+    els.tooltip.style.opacity = '0';
     cancelDrag();
     draw();
   } else if (e.key === 'Escape' && state.pairFlow && !document.querySelector('.modal.show')) {
@@ -933,11 +1134,23 @@ els.cv.addEventListener('dblclick', (e) => {
     return;
   }
   hideMenu();
-  pickEdgeAt(e, (edge, selection) => {
+  if (pickEdgeAt(e, (edge, selection) => {
     selectEdge(edge, selection);
     if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };
     draw();
-  }, true);
+  }, true)) return;
+  const box = !state.view?.comparison ? hitBox(e) : null;
+  if (box) {
+    state.selected = null;
+    state.selectedEdge = null;
+    state.selectedLabel = null;
+    state.ctxBox = { kind: box.kind, id: box.box.id };
+    state.moveTarget = { kind: box.kind, item: box.box, view: state.view };
+    renderDetail(null);
+    renderVars();
+    renderLabelPanel();
+    draw();
+  }
 });
 
 els.cv.addEventListener(

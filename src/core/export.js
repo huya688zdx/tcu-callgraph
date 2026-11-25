@@ -13,7 +13,7 @@ import { needsCounterAnalysis, withTaskPeriods } from './task-periods.js';
 import { buildDataflowIndex } from './dataflow.js';
 import { exportNodeFill, layoutExportEdgeLabels } from './export-svg.js';
 import { deletedEdgeMarkSvg, LABEL_PRESETS, labelSvg } from './labels.js';
-import { nodePeriodBadge, periodBadgeSvg, periodSubtitle } from '../../web/lib/period-text.js';
+import { canvasPeriodBadge, nodePeriodBadge, periodBadgeSvg, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function buildSVGFromLayout(laid) {
   const pad = 24;
@@ -66,7 +66,7 @@ export function buildSVGFromLayout(laid) {
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || (n.external ? '外部符号' : `${n.file}:${n.line}`))}</text>`
     );
-    const badge = !laid.comparison && !period && nodePeriodBadge(n);
+    const badge = !laid.comparison && !period && canvasPeriodBadge(n);
     if (badge) out.push(periodBadgeSvg(n, badge, esc));
     out.push('</g>');
   }
@@ -143,7 +143,7 @@ export async function exportHtml(model, outPath, opts = {}) {
       name: n.displayName || n.name,
       file: n.file,
       line: n.line,
-      period: periodSubtitle(n),
+      period: periodSubtitle(n) || nodePeriodBadge(n)?.text || '',
       change: n.change,
       detectedChange: n.detectedChange,
       statusSource: n.statusSource,

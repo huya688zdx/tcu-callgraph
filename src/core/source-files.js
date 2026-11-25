@@ -1,35 +1,37 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isUtf8 } from 'node:buffer';
 
 export const SRC_EXT = /\.(c|cc|cpp)$/i;
 export const HDR_EXT = /\.(h|hh|hpp)$/i;
 
 /**
- * 源码解码：先按 UTF-8 严格解码，失败则回退 CP932(Shift-JIS)。
- * 汽车电子不少 TCU 工程出自日文环境，源码是 CP932 编码，
- * 直接按 UTF-8 读会把注释和字符串里的日文变成乱码。
- * 同时兼容 UTF-8 BOM / UTF-16 BOM。
+ * 先识别文件 BOM。无 BOM 时，已知 CP932 的工程可显式指定，否则优先选择合法 UTF-8。
+ * 同一文件的各个字节切片共用此解码器，防止将局部的半角假名重新猜成 UTF-8。
  */
-export function decodeSource(buf) {
+export function sourceDecoder(buf, preferred = 'auto', { fatal = false } = {}) {
+  if (!['auto', 'cp932', 'utf-8'].includes(preferred)) throw new Error('源码编码须为 auto、cp932 或 utf-8');
+  let encoding = preferred, bomLength = 0;
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
-    return new TextDecoder('utf-8').decode(buf.subarray(3));
+    encoding = 'utf-8';
+    bomLength = 3;
+  } else if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    encoding = 'utf-16le';
+    bomLength = 2;
+  } else if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    encoding = 'utf-16be';
+    bomLength = 2;
+  } else if (preferred === 'auto') {
+    encoding = isUtf8(buf) ? 'utf-8' : 'cp932';
   }
-  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
-    return new TextDecoder('utf-16le').decode(buf.subarray(2));
-  }
-  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
-    return new TextDecoder('utf-16be').decode(buf.subarray(2));
-  }
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
-  } catch {
-    // 不是合法 UTF-8，继续尝试 CP932
-  }
-  try {
-    return new TextDecoder('shift_jis').decode(buf);
-  } catch {
-    return buf.toString('latin1');
-  }
+  // 调用方只在文件开头跳过 BOM，Clang 的字节范围始终基于原文件。
+  const decoder = new TextDecoder(encoding === 'cp932' ? 'shift_jis' : encoding, { fatal, ignoreBOM: true });
+  return { encoding, bomLength, decode: bytes => decoder.decode(bytes) };
+}
+
+export function decodeSource(buf) {
+  const decoder = sourceDecoder(buf);
+  return decoder.decode(buf.subarray(decoder.bomLength));
 }
 
 export function listSourceFiles(root) {

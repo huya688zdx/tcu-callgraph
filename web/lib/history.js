@@ -37,6 +37,7 @@ function snapshotView() {
       color: n.color,
       note: n.note,
       external: n.external,
+      manual: n.manual,
       // 语义字段必须一起快照：否则 undo 后变量节点会变回函数（kind 丢失）、
       // 变更分类颜色全部回落成「既存」
       kind: n.kind,
@@ -89,6 +90,7 @@ function applySnapshot(str) {
   // 所以撤销时必须把标签差异也写回服务端，否则画布回退了、库里还是新值，
   // 刷新一下又变回来——看起来像撤销没生效。
   const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.labels || null)]));
+  const previousManual = collectManual();
   const beforeNames = new Map(v.nodes.filter((n) => n.headerSymbol).map((n) => [n.id, n.nameModeOverride || null]));
   v.nodes = s.nodes;
   for (const n of v.nodes) if (n.headerSymbol) {
@@ -113,7 +115,11 @@ function applySnapshot(str) {
     const patch = { nodeId: n.id, projectId: v.projectId, data: { nameMode: n.nameModeOverride || null } };
     labelWrites = labelWrites.then(() => api.overlay(patch)).catch((err) => console.warn('[撤销] 名称写回失败：', err));
   }
-  saveLayout();
+  const currentManual = new Set(collectManual().map((e) => edgeKey({ ...e, line: 0 })));
+  const visible = new Set(s.nodes.map((n) => n.id));
+  const removeManual = previousManual.filter((e) => visible.has(e.from) && visible.has(e.to) &&
+    !currentManual.has(edgeKey({ ...e, line: 0 })));
+  saveLayout({ removeManual });
 }
 
 /** 把快照恢复后与恢复前的标签差异逐边写回；失败只打日志，不打断撤销流程 */
@@ -160,12 +166,13 @@ function redo() {
   return true;
 }
 
-async function saveLayout() {
+async function saveLayout(patch = {}) {
   if (state.view?.comparison) return;
   await api.layout({
     root: layoutRootKey(),
-    manual: collectManual(),
+    addManual: collectManual(),
     mode: state.group ? 'group' : 'flat',
+    ...patch,
   });
 }
 
@@ -177,7 +184,13 @@ async function addManualEdge(from, to) {
   if (state.view?.comparison) return;
   const a = nodeById(from);
   const b = nodeById(to);
-  if (!a || !b) return;
+  if (!a || !b || from === to) return;
+  // 若两端之间已有行号 0 的手工边或变量读写边，直接选中已有边，避免键冲突。
+  const existing = state.view.edges.find((ed) => ed.from === from && ed.to === to && (ed.manual || ed.line === 0));
+  if (existing) {
+    hooks.selectEdge?.(existing);
+    return;
+  }
   const e = {
     from,
     to,
@@ -190,12 +203,12 @@ async function addManualEdge(from, to) {
   state.view.edges.push(e);
   rerouteScope([e]); // 由共享路由器布线
   pulseAdded([], [e]);
+  pushHistory();
   await api.layout({
     root: layoutRootKey(),
-    manual: collectManual(),
+    addManual: [{ from, to }],
     mode: state.group ? 'group' : 'flat',
   });
-  pushHistory();
 }
 export {
   history,

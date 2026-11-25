@@ -64,6 +64,11 @@ export function nodePeriodBadge(node) {
     rates[0] <= 2000 ? 'fast' : rates[0] <= 20000 ? 'mid' : 'slow' };
 }
 
+/** 画布与导出 SVG 仅在跨周期共享变量节点上绘制角标；普通函数周期走通用连线标签。 */
+export function canvasPeriodBadge(node) {
+  return node?.crossPeriod ? nodePeriodBadge(node) : null;
+}
+
 export const PERIOD_COLORS = {
   isr: { fill: '#FEE2E2', ink: '#B91C1C' },
   fast: { fill: '#FEF3C7', ink: '#B45309' },

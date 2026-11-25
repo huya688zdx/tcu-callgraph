@@ -1,7 +1,7 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -16,26 +16,133 @@ const indexRef = 'INDEX';
 const regularBlob = /^100(?:644|755)$/;
 const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const maxSourceBytes = 8 * 1024 * 1024;
+const defaultGitTimeoutMs = 120_000;
+const ioConcurrency = 16;
 
-async function git(directory, args, { binary = false, input } = {}) {
-  const command = run('git', ['-c', 'core.quotePath=false', '-C', directory, ...args], {
+// 只让 Git 扫描关心的 C/H 源码与调度配置，避免在大仓库里遍历海量非源码文件或构建产物。
+const sourcePathspecs = [
+  ':(icase)*.c',
+  ':(icase)*.h',
+  ':(icase)*.oil',
+  ':(icase)*.arxml',
+  ':(literal)tcu-schedule.json',
+];
+
+async function git(directory, args, { binary = false, input, timeout = defaultGitTimeoutMs } = {}) {
+  const command = run('git', ['-c', 'core.quotePath=false', '-c', 'diff.relative=false', '-C', directory, ...args], {
     encoding: binary ? 'buffer' : 'utf8',
     env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
     maxBuffer: 72 * 1024 * 1024,
-    timeout: 30_000,
+    timeout,
     windowsHide: true,
   });
   if (input) {
     command.child.stdin.on('error', () => {}); // 错误由子进程退出结果报告
     command.child.stdin.end(input);
   }
-  return (await command).stdout;
+  try {
+    return (await command).stdout;
+  } catch (error) {
+    if (error?.killed && error?.signal) {
+      const sub = args[0] || 'command';
+      const timeoutError = new Error(`Git 命令超时（git ${sub}，超过 ${Math.round(timeout / 1000)} 秒），请检查仓库规模或文件锁状态`);
+      timeoutError.gitTimeout = true;
+      throw timeoutError;
+    }
+    throw error;
+  }
+}
+
+/** 受限并发执行：任一任务失败后停止派发新任务，并等待所有已启动任务完全结束再抛错，防止清理目录后仍有残留写入。 */
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  let firstError = null;
+  const worker = async () => {
+    while (!firstError && next < items.length) {
+      const i = next++;
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (err) {
+        if (!firstError) firstError = err;
+        return;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (firstError) throw firstError;
+  return results;
 }
 
 const singleLine = value => value.replace(/\r?\n$/, '');
 const records = value => value.split('\0').slice(0, -1);
 const emptySummary = () => Object.fromEntries(['functions', 'variables'].map(key =>
   [key, { existing: 0, modified: 0, added: 0, deleted: 0 }]));
+
+/**
+ * 按需读取未落临时盘的快照内容：
+ * - 文件未被后续磁盘编辑改动（size + mtimeMs 匹配快照记录且非符号链接）时直接读盘（0.1ms，不阻塞流程图）；
+ * - 若后续被编辑、删除或替换，则回退到 git cat-file blob 读取精确历史快照。
+ */
+class SnapshotBuffers {
+  constructor(repoRoot, entries) {
+    this._repoRoot = repoRoot;
+    this._entries = entries;
+  }
+  get size() { return this._entries.size; }
+  has(key) { return this._entries.has(key); }
+  keys() { return this._entries.keys(); }
+  get(key) {
+    const entry = this._entries.get(key);
+    if (!entry) return undefined;
+    if (entry.buffer) return entry.buffer;
+    if (entry.diskPath && entry.size !== undefined && entry.mtimeMs !== undefined) {
+      try {
+        const info = fs.lstatSync(entry.diskPath);
+        if (info.isFile() && !info.isSymbolicLink() && info.size === entry.size && info.mtimeMs === entry.mtimeMs &&
+            info.size <= maxSourceBytes) {
+          const buf = fs.readFileSync(entry.diskPath);
+          if (buf.length === entry.size) {
+            entry.buffer = buf;
+            return buf;
+          }
+        }
+      } catch {
+        // 文件被删或无法访问时回退到 Git 对象库
+      }
+    }
+    if (entry.oid) {
+      const buf = execFileSync('git', ['-c', 'core.quotePath=false', '-C', this._repoRoot, 'cat-file', 'blob', entry.oid], {
+        encoding: 'buffer',
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+        maxBuffer: maxSourceBytes + 4096,
+        timeout: 30_000,
+        windowsHide: true,
+      });
+      entry.buffer = buf;
+      return buf;
+    }
+    if (entry.diskPath) {
+      const buf = fs.readFileSync(entry.diskPath);
+      entry.buffer = buf;
+      return buf;
+    }
+    return undefined;
+  }
+  [Symbol.iterator]() {
+    const self = this;
+    return (function* () {
+      for (const key of self._entries.keys()) yield [key, self.get(key)];
+    })();
+  }
+  entries() { return this[Symbol.iterator](); }
+  values() {
+    const self = this;
+    return (function* () {
+      for (const key of self._entries.keys()) yield self.get(key);
+    })();
+  }
+}
 
 async function locateRepo(projectPath) {
   let root;
@@ -110,7 +217,7 @@ export async function inspectGitRepo(projectPath) {
       git(repoRoot, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']),
       git(repoRoot, ['for-each-ref', '--sort=-creatordate', '--count=30', '--format=%(refname:short)', 'refs/tags']),
       head.hasCommits ? git(repoRoot, ['log', '-30', '-z', '--format=%H%x00%h%x00%s%x00%aI', head.sha, '--']) : '',
-      git(repoRoot, ['status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=all', '--', ...scopeOf(repo)]),
+      git(repo.root, ['status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=all', '--', ...sourcePathspecs]),
     ]);
     const branches = branchOutput.split(/\r?\n/).filter(Boolean);
     if (branches.includes(head.ref)) {
@@ -127,8 +234,8 @@ export async function inspectGitRepo(projectPath) {
       ok: true, isRepo: true, repoRoot, projectPrefix, head, branches,
       tags: tagOutput.split(/\r?\n/).filter(Boolean), recentCommits, workingTree: workingStatus(repo, porcelain),
     };
-  } catch {
-    return { ok: true, isRepo: false, reason: 'statusUnavailable' };
+  } catch (error) {
+    return { ok: true, isRepo: false, reason: error?.gitTimeout ? 'statusTimeout' : 'statusUnavailable' };
   }
 }
 
@@ -158,6 +265,7 @@ async function resolveCommit(repo, ref) {
 async function commitFiles(repo, sha) {
   const files = new Map();
   if (!sha) return files;
+  // ls-tree 不支持 :(icase) 魔法路径，仅读树对象元数据本身很快，在内存中按 projectSource 过滤。
   const output = await git(repo.repoRoot, ['ls-tree', '-rz', '--full-tree', sha, '--', ...scopeOf(repo)]);
   for (const record of records(output)) {
     const tab = record.indexOf('\t');
@@ -170,7 +278,7 @@ async function commitFiles(repo, sha) {
 
 async function indexFiles(repo, worktree = false) {
   const files = new Map();
-  const output = await git(repo.repoRoot, ['ls-files', '--stage', '-z', '--', ...scopeOf(repo)]);
+  const output = await git(repo.root, ['ls-files', '--stage', '--full-name', '-z', '--', ...sourcePathspecs]);
   for (const record of records(output)) {
     const tab = record.indexOf('\t');
     const [mode, object, stage] = record.slice(0, tab).split(' ');
@@ -180,95 +288,309 @@ async function indexFiles(repo, worktree = false) {
     files.set(file, object);
   }
   if (!worktree) {
-    const intentOnly = await git(repo.repoRoot, [
-      'diff', '--name-only', '-z', '--diff-filter=A', '--ita-invisible-in-index', '--no-ext-diff', '--', ...scopeOf(repo),
+    const intentOnly = await git(repo.root, [
+      'diff', '--name-only', '-z', '--diff-filter=A', '--ita-invisible-in-index', '--no-ext-diff', '--', ...sourcePathspecs,
     ]);
     for (const relative of records(intentOnly)) files.delete(projectSource(repo, relative));
   }
   return files;
 }
 
-async function diskSource(repo, relative) {
+async function untrackedFiles(repo) {
+  const output = await git(repo.root, ['ls-files', '--others', '--exclude-standard', '--full-name', '-z', '--', ...sourcePathspecs]);
+  return records(output).map(file => projectSource(repo, file)).filter(Boolean);
+}
+
+/** 找出带 --assume-unchanged（首字母小写）或 --skip-worktree（大写 S）标记的跟踪源码，避免绕过 git diff 脏检查。 */
+async function assumeUnchangedFiles(repo) {
+  const output = await git(repo.root, ['ls-files', '-v', '--full-name', '-z', '--', ...sourcePathspecs]);
+  const flagged = [];
+  for (const record of records(output)) {
+    if (record.length < 3) continue;
+    const tag = record[0];
+    if ((tag >= 'a' && tag <= 'z') || tag === 'S') {
+      const file = projectSource(repo, record.slice(2));
+      if (file) flagged.push(file);
+    }
+  }
+  return flagged;
+}
+
+function gitBlobOid(buffer) {
+  return createHash('sha1').update(`blob ${buffer.length}\0`).update(buffer).digest('hex');
+}
+
+async function diffNameStatus(repo, refArgs) {
+  const diff = await git(repo.root, [
+    'diff', '--name-status', '-z', '--find-renames', '--no-ext-diff', '--no-textconv',
+    ...refArgs, '--', ...sourcePathspecs,
+  ]);
+  const entries = records(diff);
+  const parsed = [];
+  for (let i = 0; i < entries.length;) {
+    const code = entries[i++];
+    const oldFile = projectSource(repo, entries[i++]);
+    const renamed = code.startsWith('R');
+    const file = renamed || code.startsWith('C') ? projectSource(repo, entries[i++]) : oldFile;
+    parsed.push({ code, oldFile, file, renamed });
+  }
+  return parsed;
+}
+
+async function diskSource(repo, relative, configBytes) {
   const expected = path.join(repo.root, relative);
   try {
     const actual = await realpath(expected);
     const info = await lstat(expected);
     if (path.relative(expected, actual) || !info.isFile()) return null;
     if (info.size > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
-    const buffer = await readFile(actual);
-    if (buffer.length > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
-    return buffer;
+    if (configBytes === undefined) {
+      const buffer = await readFile(actual);
+      if (buffer.length > maxSourceBytes) throw new Error('Git 源码文件超过 8 MB：' + relative);
+      return buffer;
+    }
+    const file = await open(actual, 'r');
+    try {
+      const current = await file.stat();
+      if (!current.isFile()) return null;
+      addScheduleBytes(configBytes, current.size);
+      const buffer = Buffer.allocUnsafe(current.size);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) return Buffer.from(buffer.subarray(0, offset));
+        offset += bytesRead;
+      }
+      // fstat 后增长的文件最多再读一字节，避免重新越过预算。
+      const { bytesRead } = await file.read(Buffer.allocUnsafe(1), 0, 1, offset);
+      if (bytesRead) throw new Error('读取时调度配置已更改，请重试：' + relative);
+      return buffer;
+    } finally {
+      await file.close();
+    }
   } catch (error) {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
     throw error;
   }
 }
 
-async function workingFiles(repo, includeUntracked) {
-  const files = new Map();
-  const tracked = await indexFiles(repo, true);
-  const untracked = includeUntracked
-    ? records(await git(repo.repoRoot, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...scopeOf(repo)]))
-    : [];
-  const names = [...new Set([...tracked.keys(), ...untracked.map(file => projectSource(repo, file)).filter(Boolean)])].sort();
-  const hash = createHash('sha256');
-  let configBytes = 0;
-  for (const file of names) {
-    const data = await diskSource(repo, file);
-    if (data === null) continue;
-    if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, data.length);
-    files.set(file, data);
-    hash.update(JSON.stringify([file, data.length])).update(data);
+/** 校验工作区上的未改文件确实存在、非符号链接、父目录无 junction/符号链接且不超过 8 MB。 */
+function verifyCleanDisk(repo, relative, dirRealCache, { throwOversize = false } = {}) {
+  const abs = path.join(repo.root, relative);
+  let info;
+  try {
+    info = fs.lstatSync(abs);
+  } catch {
+    return null;
   }
-  return { files, fingerprint: hash.digest('hex') };
+  if (!info.isFile() || info.isSymbolicLink()) return null;
+  // 先校验父目录无 junction/符号链接，再判文件大小，避免工程外文件触发超限报错。
+  const dir = path.dirname(abs);
+  let dirOk = dirRealCache.get(dir);
+  if (dirOk === undefined) {
+    try {
+      dirOk = path.relative(dir, fs.realpathSync(dir)) === '';
+    } catch {
+      dirOk = false;
+    }
+    dirRealCache.set(dir, dirOk);
+  }
+  if (!dirOk) return null;
+  if (info.size > maxSourceBytes) {
+    if (throwOversize) throw new Error('Git 源码文件超过 8 MB：' + relative);
+    return null;
+  }
+  return { diskPath: abs, size: info.size, mtimeMs: info.mtimeMs };
 }
 
-async function changedFiles(repo, before, after, baseSha, targetRef, targetSha) {
+/**
+ * 增量构建工作区文件集合：仅从磁盘读取 Git 报告有变动或未跟踪的文件，
+ * 其余确实存在于工作区的未改文件沿用 baseSha 的 blob OID，避免在几千文件的大仓库里全量读盘。
+ */
+async function worktreeSnapshot(repo, baseSha, before, includeUntracked) {
+  const files = new Map();
+  const dirty = new Set();
+  let diffEntries = [];
+  const toRead = new Set();
+  const dirRealCache = new Map();
+  let configBytes = 0;
+
+  if (!baseSha) {
+    const [tracked, untracked] = await Promise.all([
+      indexFiles(repo, true),
+      includeUntracked ? untrackedFiles(repo) : [],
+    ]);
+    for (const file of tracked.keys()) toRead.add(file);
+    for (const file of untracked) toRead.add(file);
+  } else {
+    const [entries, untracked, assumed] = await Promise.all([
+      diffNameStatus(repo, [baseSha]),
+      includeUntracked ? untrackedFiles(repo) : [],
+      assumeUnchangedFiles(repo),
+    ]);
+    diffEntries = entries;
+    for (const { code, oldFile, file, renamed } of entries) {
+      if (renamed) {
+        if (oldFile) dirty.add(oldFile);
+        if (file) { toRead.add(file); dirty.add(file); }
+      } else if (code === 'D') {
+        if (oldFile) dirty.add(oldFile);
+      } else if (file) {
+        toRead.add(file);
+        dirty.add(file);
+      }
+    }
+    for (const file of untracked) {
+      toRead.add(file);
+      dirty.add(file);
+    }
+    for (const file of assumed) {
+      toRead.add(file);
+      dirty.add(file);
+    }
+    // 稀疏检出等场景下未落盘文件不在工作区，仅保留真实存在的常规文件；超 8 MB 直接报错不误判删除。
+    for (const [file, object] of before) {
+      if (dirty.has(file)) continue;
+      const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+      if (!info) continue;
+      if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, info.size);
+      files.set(file, object);
+    }
+  }
+
+  const readList = [...toRead].sort();
+  const scheduleFiles = readList.filter(isScheduleFile);
+  let preflightBytes = configBytes;
+  for (const file of scheduleFiles) {
+    const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+    if (info) preflightBytes = addScheduleBytes(preflightBytes, info.size);
+  }
+
+  const diffSet = new Set(diffEntries.flatMap(e => [e.file, e.oldFile]).filter(Boolean));
+  const record = (file, data) => {
+    if (data === null) files.delete(file);
+    else if (!diffSet.has(file) && before.has(file) && gitBlobOid(data) === before.get(file)) {
+      // assume-unchanged / skip-worktree 文件经核对内容与基准 blob 完全一致，避免误报修改。
+      files.set(file, before.get(file));
+    } else files.set(file, data);
+  };
+  // 依次按已保留的实际字节分配配置缓冲区，避免多个并发读取越过预算。
+  for (const file of scheduleFiles) {
+    const data = await diskSource(repo, file, configBytes);
+    if (data) configBytes = addScheduleBytes(configBytes, data.length);
+    record(file, data);
+  }
+  await mapLimit(readList.filter(file => !isScheduleFile(file)), ioConcurrency, async file =>
+    record(file, await diskSource(repo, file)));
+
+  // 基于未改文件的 OID 与改动文件的字节计算工作区指纹。
+  const hash = createHash('sha256');
+  const sortedNames = [...files.keys()].sort();
+  for (const file of sortedNames) {
+    const entry = files.get(file);
+    if (Buffer.isBuffer(entry)) {
+      hash.update(JSON.stringify([file, 'buf', entry.length])).update(entry);
+    } else {
+      hash.update(JSON.stringify([file, 'oid', entry]));
+    }
+  }
+
+  return { files, fingerprint: hash.digest('hex'), diffEntries, dirty };
+}
+
+async function changedFiles(repo, before, after, baseSha, targetRef, targetSha, precomputedDiff = null) {
   const result = new Map();
   const add = (file, status, oldFile = null) => result.set(file, { file, status, oldFile });
   for (const file of before.keys()) if (!after.has(file)) add(file, 'deleted');
   for (const [file, object] of after) {
     if (!before.has(file)) add(file, 'added');
-    else if (targetRef !== worktreeRef && object !== before.get(file)) add(file, 'modified');
+    else if (Buffer.isBuffer(object) || object !== before.get(file)) add(file, 'modified');
   }
-  if (!baseSha || (!targetSha && targetRef === 'HEAD')) return [...result.values()];
-  const diff = await git(repo.repoRoot, [
-    'diff', '--name-status', '-z', '--find-renames', '--no-ext-diff', '--no-textconv',
-    ...(targetRef === indexRef ? ['--cached'] : []), baseSha, ...(targetSha ? [targetSha] : []), '--', ...scopeOf(repo),
+  if (!baseSha || (!targetSha && targetRef === 'HEAD')) return [...result.values()].sort((a, b) => a.file.localeCompare(b.file));
+  const entries = precomputedDiff ?? await diffNameStatus(repo, [
+    ...(targetRef === indexRef ? ['--cached'] : []),
+    baseSha,
+    ...(targetSha ? [targetSha] : []),
   ]);
-  const entries = records(diff);
-  for (let i = 0; i < entries.length;) {
-    const code = entries[i++];
-    const old = projectSource(repo, entries[i++]);
-    const renamed = code.startsWith('R');
-    const file = renamed || code.startsWith('C') ? projectSource(repo, entries[i++]) : old;
-    if (renamed && old && file && result.get(old)?.status === 'deleted' && result.get(file)?.status === 'added') {
-      result.delete(old);
-      add(file, 'renamed', old);
-    } else if (targetRef === worktreeRef && file && before.has(file) && after.has(file)) add(file, 'modified');
+  for (const { oldFile, file, renamed } of entries) {
+    if (renamed && oldFile && file && result.get(oldFile)?.status === 'deleted' && result.get(file)?.status === 'added') {
+      result.delete(oldFile);
+      add(file, 'renamed', oldFile);
+    } else if (targetRef === worktreeRef && file && before.has(file) && after.has(file)) {
+      add(file, 'modified');
+    }
   }
   return [...result.values()].sort((a, b) => a.file.localeCompare(b.file));
 }
 
-async function fetchBlobs(repo, before, after) {
-  const blobs = new Map();
-  const ids = [...new Set([...before.values(), ...after.values()])].filter(id => typeof id === 'string');
-  if (!ids.length) return blobs;
-  const check = await git(repo.repoRoot, ['cat-file', '--batch-check'], { input: ids.join('\n') + '\n' });
-  const entries = singleLine(check).split('\n').map((line, i) => {
-    const [id, type, length] = line.split(' ');
-    const size = Number(length);
-    if (id !== ids[i] || type !== 'blob' || !Number.isSafeInteger(size) || size < 0 || size > maxSourceBytes) {
-      throw new Error('Git 源码对象无法读取或超过 8 MB：' + ids[i]);
+/**
+ * 仅对「before 与 after 指向同一 OID（未改动）」且在工作区干净无替换的文件复用磁盘路径：
+ * - 两边发生改动的文件一律从 Git 对象库取 blob，避免 ident / autocrlf 检出转换造成 blob 与磁盘字节错配；
+ * - 使用 --no-renames 防止暂存重命名后重建旧路径绕过脏检查；
+ * - 用 verifyCleanDisk 排除符号链接、父目录 junction 与超过 8 MB 的大文件。
+ */
+async function cleanDiskInfo(repo, before, after, hint = null) {
+  const clean = new Map();
+  const dirRealCache = new Map();
+  const unchangedOids = new Map();
+  for (const [file, object] of before) {
+    if (!isScheduleFile(file) && typeof object === 'string' && after.get(file) === object) unchangedOids.set(file, object);
+  }
+  if (!unchangedOids.size) return clean;
+
+  if (hint?.baseClean && hint.dirty) {
+    for (const [file, object] of unchangedOids) {
+      if (hint.dirty.has(file)) continue;
+      const disk = verifyCleanDisk(repo, file, dirRealCache);
+      if (disk) clean.set(file, { oid: object, ...disk });
     }
-    return { id, size };
-  });
-  if (entries.length !== ids.length) throw new Error('Git 返回的源码对象不完整');
-  const sizes = new Map(entries.map(({ id, size }) => [id, size]));
+    return clean;
+  }
+
+  const head = hint?.headSha ? { sha: hint.headSha } : await headOf(repo.repoRoot);
+  if (!head.sha) return clean;
+  const headFiles = hint?.headFiles ?? await commitFiles(repo, head.sha);
+  const [dirtyOutput, assumed] = await Promise.all([
+    git(repo.root, [
+      'diff', '--name-only', '--no-renames', '-z', '--no-ext-diff', '--no-textconv', head.sha, '--', ...sourcePathspecs,
+    ]),
+    assumeUnchangedFiles(repo),
+  ]);
+  const dirty = new Set([...records(dirtyOutput).map(file => projectSource(repo, file)).filter(Boolean), ...assumed]);
+  for (const [file, object] of unchangedOids) {
+    if (dirty.has(file) || headFiles.get(file) !== object) continue;
+    const disk = verifyCleanDisk(repo, file, dirRealCache);
+    if (disk) clean.set(file, { oid: object, ...disk });
+  }
+  return clean;
+}
+
+async function fetchBlobs(repo, before, after, cleanDisk) {
+  const blobs = new Map();
+  const ids = [...new Set([...before.entries(), ...after.entries()]
+    .filter(([file, entry]) => typeof entry === 'string' && cleanDisk.get(file)?.oid !== entry)
+    .map(([, entry]) => entry))];
+  const sizes = new Map();
+  let entries = [];
+  if (ids.length) {
+    const check = await git(repo.repoRoot, ['cat-file', '--batch-check'], { input: ids.join('\n') + '\n' });
+    entries = singleLine(check).split('\n').map((line, i) => {
+      const [id, type, length] = line.split(' ');
+      const size = Number(length);
+      if (id !== ids[i] || type !== 'blob' || !Number.isSafeInteger(size) || size < 0 || size > maxSourceBytes) {
+        throw new Error('Git 源码对象无法读取或超过 8 MB：' + ids[i]);
+      }
+      sizes.set(id, size);
+      return { id, size };
+    });
+    if (entries.length !== ids.length) throw new Error('Git 返回的源码对象不完整');
+  }
   for (const files of [before, after]) {
     let configBytes = 0;
     for (const [file, object] of files) {
-      if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, typeof object === 'string' ? sizes.get(object) : object.length);
+      if (!isScheduleFile(file)) continue;
+      const size = typeof object === 'string' ? sizes.get(object) : object.length;
+      configBytes = addScheduleBytes(configBytes, size);
     }
   }
   for (let i = 0; i < entries.length;) {
@@ -296,17 +618,53 @@ async function fetchBlobs(repo, before, after) {
   return blobs;
 }
 
-async function materialize(directory, entries, blobs) {
-  const files = new Map(), buffers = new Map();
-  for (const [relative, entry] of [...entries].sort(([a], [b]) => a.localeCompare(b))) {
+async function materialize(repo, directory, entries, blobs, cleanDisk) {
+  const files = new Map();
+  const bufferEntries = new Map();
+  const toWrite = [];
+  const sorted = [...entries].sort(([a], [b]) => a.localeCompare(b));
+  for (const [relative, entry] of sorted) {
+    const clean = typeof entry === 'string' ? cleanDisk.get(relative) : null;
+    if (clean && clean.oid === entry) {
+      files.set(relative, clean.diskPath);
+      if (!isScheduleFile(relative)) {
+        bufferEntries.set(relative, { oid: entry, diskPath: clean.diskPath, size: clean.size, mtimeMs: clean.mtimeMs });
+      }
+      continue;
+    }
     const bytes = typeof entry === 'string' ? blobs.get(entry) : entry;
     const target = path.join(directory, relative);
-    await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(target, bytes, { flag: 'wx' });
     files.set(relative, target);
-    if (!isScheduleFile(relative)) buffers.set(relative, bytes);
+    if (!isScheduleFile(relative)) bufferEntries.set(relative, { buffer: bytes });
+    toWrite.push({ target, bytes });
   }
-  return { files, buffers };
+  const dirPromises = new Map();
+  await mapLimit(toWrite, ioConcurrency, async ({ target, bytes }) => {
+    const dir = path.dirname(target);
+    let ready = dirPromises.get(dir);
+    if (!ready) {
+      ready = mkdir(dir, { recursive: true });
+      dirPromises.set(dir, ready);
+    }
+    await ready;
+    await writeFile(target, bytes, { flag: 'wx' });
+  });
+  return { files, bufferEntries, buffers: new SnapshotBuffers(repo.repoRoot, bufferEntries) };
+}
+
+function hasSameSources(before, after, blobs) {
+  const beforeSrc = [...before].filter(([file]) => !isScheduleFile(file));
+  const afterSrc = [...after].filter(([file]) => !isScheduleFile(file));
+  if (beforeSrc.length !== afterSrc.length) return false;
+  for (const [file, a] of beforeSrc) {
+    if (!after.has(file)) return false;
+    const b = after.get(file);
+    if (a === b) continue;
+    const bufA = typeof a === 'string' ? blobs.get(a) : a;
+    const bufB = typeof b === 'string' ? blobs.get(b) : b;
+    if (!bufA || !bufB || !bufA.equals(bufB)) return false;
+  }
+  return true;
 }
 
 const emptyFacts = () => ({ directIds: [], implicitImpactIds: [], chainImpactIds: [] });
@@ -335,40 +693,56 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
   if (!repo.isRepo) throw new Error(repo.reason === 'gitUnavailable' ? '未找到 Git 可执行程序' : '当前工程不在 Git 工作区中');
   const base = await resolveCommit(repo, baseRef);
   const target = targetRef === worktreeRef || targetRef === indexRef ? null : await resolveCommit(repo, targetRef);
-  const [before, worktree, targetFiles] = await Promise.all([
-    commitFiles(repo, base.sha),
-    targetRef === worktreeRef ? workingFiles(repo, includeUntracked) : null,
-    targetRef === indexRef ? indexFiles(repo) : target ? commitFiles(repo, target.sha) : null,
-  ]);
+  const before = await commitFiles(repo, base.sha);
+  let worktree = null;
+  let targetFiles = null;
+  if (targetRef === worktreeRef) worktree = await worktreeSnapshot(repo, base.sha, before, includeUntracked);
+  else if (targetRef === indexRef) targetFiles = await indexFiles(repo);
+  else if (target) targetFiles = await commitFiles(repo, target.sha);
+
   const after = worktree?.files ?? targetFiles;
-  const changes = await changedFiles(repo, before, after, base.sha, targetRef, target?.sha);
+  const changes = await changedFiles(repo, before, after, base.sha, targetRef, target?.sha, worktree?.diffEntries ?? null);
   const metadata = {
     mode: 'git', baseRef, baseLabel: base.shortSha ? baseRef + ' (' + base.shortSha + ')' : baseRef, baseSha: base.sha,
     targetRef, targetLabel: target?.shortSha ? targetRef + ' (' + target.shortSha + ')' : targetRef, targetSha: target?.sha ?? null,
     includeUntracked, changedFiles: changes, worktreeFingerprint: worktree?.fingerprint ?? null,
     noSourceChanges: !changes.length, importFacts: emptyFacts(), commentOnlyFiles: [],
   };
-  const analyze = () => analyzeGitSnapshot(repo, before, after, metadata, compareOptions);
+  const immediateHint = targetRef === worktreeRef && base.sha
+    ? { baseClean: true, dirty: worktree.dirty }
+    : baseRef === 'HEAD' && base.sha
+    ? { headSha: base.sha, headFiles: before }
+    : targetRef === 'HEAD' && target?.sha
+    ? { headSha: target.sha, headFiles: after }
+    : null;
+  // 延迟分析时工作区可能已继续编辑，不再沿用首次的 cleanDisk 提示，改为重新核对。
+  const analyze = (hint = null) => analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
   if (!changes.length && !compareOptions.allowEmptyRefresh) {
     return { projectPath: repo.root, git: metadata, summary: emptySummary(), roots: [], candidates: [],
       changePoints: [], impactIds: [], macroChanges: [], macroDetails: [], warnings: [], mappings: [], totalNodes: 0,
-      ...(compareOptions.deferUnchangedAnalysis ? { analyze } : {}) };
+      ...(compareOptions.deferUnchangedAnalysis ? { analyze: () => analyze(null) } : {}) };
   }
-  return analyze();
+  return analyze(immediateHint);
 }
 
-/** 两个版本各自固定源码及调度配置，延迟分析也使用首次读取的工作区缓冲与 Git 对象。 */
-async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions) {
+/** 两个版本各自固定源码及调度配置，仅对发生变动或工作区脏文件提取 Git blob 并写入临时目录。 */
+async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions, cleanHint = null) {
   const changes = metadata.changedFiles;
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'callgraph-git-'));
   try {
     const beforePath = path.join(temporary, 'before'), afterPath = path.join(temporary, 'after');
-    const blobs = await fetchBlobs(repo, before, after);
-    await Promise.all([mkdir(beforePath), mkdir(afterPath)]);
-    const beforeSnapshot = await materialize(beforePath, before, blobs);
-    const afterSnapshot = await materialize(afterPath, after, blobs);
-    const sameSources = beforeSnapshot.buffers.size === afterSnapshot.buffers.size &&
-      [...beforeSnapshot.buffers].every(([name, bytes]) => afterSnapshot.buffers.get(name)?.equals(bytes));
+    const cleanDisk = await cleanDiskInfo(repo, before, after, cleanHint);
+    const blobs = await fetchBlobs(repo, before, after, cleanDisk);
+    await mkdir(beforePath);
+    await mkdir(afterPath);
+    const settled = await Promise.allSettled([
+      materialize(repo, beforePath, before, blobs, cleanDisk),
+      materialize(repo, afterPath, after, blobs, cleanDisk),
+    ]);
+    const failed = settled.find(item => item.status === 'rejected');
+    if (failed) throw failed.reason;
+    const [beforeSnapshot, afterSnapshot] = settled.map(item => item.value);
+    const sameSources = hasSameSources(before, after, blobs);
     const comparison = await compareProjects(repo.root, beforePath, afterPath, {
       ...compareOptions,
       snapshots: { beforeFiles: beforeSnapshot.files, afterFiles: afterSnapshot.files, mappings: [], sameSources },
@@ -380,7 +754,8 @@ async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions)
       .map(({ file }) => file);
     retainSnapshot(comparison.beforeModel, beforeSnapshot.buffers);
     retainSnapshot(comparison.afterModel, afterSnapshot.buffers);
-    retainSnapshot(comparison.model, new Map([...beforeSnapshot.buffers, ...afterSnapshot.buffers]));
+    retainSnapshot(comparison.model, new SnapshotBuffers(repo.repoRoot,
+      new Map([...beforeSnapshot.bufferEntries, ...afterSnapshot.bufferEntries])));
     delete comparison.beforePath;
     delete comparison.afterPath;
     if (!changes.length) comparison.summary = emptySummary();

@@ -252,3 +252,229 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
   await select('#ctxMenu button[data-i="0"]');
   await waitFor(detailA);
 });
+
+test('无头浏览器：撤销与重做手工连线增量存档并保留视图之外的连线', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const { baseUrl, request } = await fixture(t);
+  const root = fn('a');
+  const outside = { from: fn('b'), to: fn('d') };
+  const original = { from: root, to: fn('b') };
+  const changed = { from: root, to: fn('c') };
+  await request('/api/layout', { root, mode: 'group', addManual: [outside] });
+  await request('/api/page', { roots: [root], up: 0, down: 1, group: true });
+  const chrome = await launchCdp({ url: `${baseUrl}/` });
+  t.after(() => chrome.close());
+  const { evaluate, waitFor } = chrome;
+  const snapshot = async () => {
+    const archive = await request('/api/session/export');
+    return archive.overlay.layout[`${root}::group`].manual;
+  };
+  await waitFor(`__cg.view?.nodes.some(n => n.id === ${JSON.stringify(original.to)})`);
+  const checkWrites = (commands, expected) => evaluate(`(async () => {
+    const h = await import('/lib/history.js');
+    const { api } = await import('/lib/api.js');
+    const { state } = await import('/lib/state.js');
+    const persist = api.layout;
+    const writes = [];
+    api.layout = (patch) => {
+      const pending = persist(patch);
+      writes.push(pending);
+      return pending;
+    };
+    try {
+      const original = ${JSON.stringify(original)};
+      const changed = ${JSON.stringify(changed)};
+      const reconnect = (id) => {
+        const edge = state.view.edges.find(edge => edge.manual);
+        const hover = state.view.nodes.find(node => node.id === id);
+        const y = edge.toSide === 'top' ? hover.y + hover.h : hover.y;
+        state.dragEnd = { edge, which: 'to', hover, pos: { x: hover.x + hover.w / 2, y } };
+        document.getElementById('cv').dispatchEvent(new PointerEvent('pointerup'));
+      };
+      ${commands}
+      await Promise.all(writes);
+      return state.view.edges.filter(edge => edge.manual).map(({ from, to }) => ({ from, to }));
+    } finally {
+      api.layout = persist;
+    }
+  })()`).then(edges => assert.deepEqual(edges, expected));
+
+  await checkWrites('await h.addManualEdge(original.from, original.to);', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('h.undo();', []);
+  assert.deepEqual(await snapshot(), [outside]);
+  await checkWrites('h.redo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('reconnect(original.to);', [original]);
+  assert.deepEqual(await snapshot(), [outside, original], '同节点换端口不能删除已存关系');
+  const reloaded = await request(`/api/view?root=${encodeURIComponent(root)}&up=0&down=1&group=1`);
+  assert.ok(reloaded.edges.some(edge => edge.manual && edge.from === root && edge.to === original.to));
+
+  await checkWrites('reconnect(changed.to);', [changed]);
+  await checkWrites('h.undo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('h.redo();', [changed]);
+  assert.deepEqual(await snapshot(), [outside, changed]);
+  await checkWrites('h.undo(); h.redo(); h.undo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+
+  await checkWrites(`
+    const pending = h.addManualEdge(changed.from, changed.to);
+    h.undo();
+    await pending;
+  `, [original]);
+  assert.deepEqual(await snapshot(), [outside, original], '新增尚未返回时也可以撤销');
+
+  await checkWrites(`
+    const cv = document.getElementById('cv');
+    const edge = { ...state.view.edges.find(edge => edge.manual) };
+    const hover = state.view.nodes.find(node => node.id === changed.to);
+    state.dragEnd = { edge, which: 'to', hover, pos: { x: hover.x, y: hover.y + hover.h / 2 } };
+    cv.dispatchEvent(new PointerEvent('pointerup'));
+
+    state.linkFrom = { ...state.view.nodes.find(node => node.id === original.from) };
+    state.linkMode = 'click';
+    const { cam } = await import('/lib/state.js');
+    const rect = cv.parentElement.getBoundingClientRect();
+    cv.dispatchEvent(new PointerEvent('pointerdown', {
+      button: 0, clientX: rect.left + cam.x + (hover.x + hover.w / 2) * cam.k,
+      clientY: rect.top + cam.y + (hover.y + hover.h / 2) * cam.k,
+    }));
+    if (writes.length) throw new Error('测试发现旧画布的手势发出了存档请求');
+  `, [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('h.redo(); reconnect(changed.to);', [original, changed]);
+  assert.deepEqual(await snapshot(), [outside, original, changed], '重连到已有关系不能吞掉原来的连线');
+});
+
+test('无头浏览器：手工节点增删绑定原工程和会话，切换后丢弃过期操作与响应', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const { baseUrl, request } = await fixture(t);
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-manual-delete-other-'));
+  t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(other, file), 'int value;');
+  const first = await request('/api/project');
+  const id = fn('Planned');
+  const addNode = () => request('/api/manual-nodes', { kind: 'fn', name: 'Planned', file });
+  const switchTo = (body) => request('/api/switch', body);
+  const marker = () => request('/api/page', { roots: [id], up: 0, down: 0 });
+  await addNode();
+  await marker();
+  await switchTo({ path: other });
+  const second = await request('/api/project');
+  const emptyView = await request('/api/view');
+  assert.equal(emptyView.projectId, second.id, '空画布也能从文件树打开创建窗口');
+  await addNode();
+  await marker();
+  await switchTo({ id: first.id });
+
+  const chrome = await launchCdp({ url: `${baseUrl}/` });
+  t.after(() => chrome.close());
+  const { evaluate, waitFor } = chrome;
+  const waitProject = (project) => waitFor(`(async () => {
+    const { state } = await import('/lib/state.js');
+    return state.view?.projectId === ${project} && state.roots.includes(${JSON.stringify(id)});
+  })()`);
+  const openDeletion = async () => {
+    await evaluate(`(async () => {
+      const { removeManualNodePermanently } = await import('/lib/manual-node.js');
+      window.pendingDeletion = removeManualNodePermanently({ id: ${JSON.stringify(id)} });
+    })()`);
+    await waitFor('document.querySelector(".confirm-modal [data-ok]") !== null');
+  };
+  const confirm = () => evaluate('document.querySelector(".confirm-modal [data-ok]").click()');
+
+  await waitProject(first.id);
+  await evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    window.originalDelete = api.deleteManualNode;
+    window.deleteCalls = [];
+    api.deleteManualNode = async body => {
+      window.deleteCalls.push(body);
+      return window.originalDelete(body);
+    };
+  })()`);
+  await openDeletion();
+  await switchTo({ id: second.id });
+  await waitProject(second.id);
+  await confirm();
+  assert.equal(await evaluate('window.pendingDeletion'), false);
+  assert.deepEqual(await evaluate('window.deleteCalls'), []);
+  assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === id));
+
+  await switchTo({ id: first.id });
+  await waitProject(first.id);
+  const oldRevision = await evaluate(`import('/lib/state.js').then(({ state }) => state.view.sessionRevision)`);
+  assert.ok(Number.isSafeInteger(oldRevision));
+  await evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    api.deleteManualNode = async body => {
+      window.deleteCalls.push(body);
+      window.deleteResponse = await window.originalDelete(body);
+      await new Promise(resolve => { window.releaseDeletion = resolve; });
+      return window.deleteResponse;
+    };
+  })()`);
+  await openDeletion();
+  await confirm();
+  await waitFor('window.deleteResponse?.ok === true && typeof window.releaseDeletion === "function"');
+  assert.deepEqual(await evaluate('window.deleteCalls'), [{ id, projectId: first.id, sessionRevision: oldRevision }]);
+
+  await switchTo({ id: second.id });
+  await waitProject(second.id);
+  await evaluate('window.releaseDeletion()');
+  assert.equal(await evaluate('window.pendingDeletion'), false);
+  await waitProject(second.id);
+  assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === id));
+  const stale = await fetch(`${baseUrl}/api/manual-nodes/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Callgraph-Project': String(second.id),
+      'X-Callgraph-Session': String(oldRevision) }, body: JSON.stringify({ id }),
+  });
+  assert.equal(stale.status, 409);
+
+  const active = (projectId) => waitFor(`import('/lib/state.js').then(({ state }) => state.view?.projectId === ${projectId})`);
+  const openCreation = (name) => evaluate(`(async () => {
+    const { openManualNodeDialog } = await import('/lib/manual-node.js');
+    openManualNodeDialog({ file: ${JSON.stringify(file)} });
+    document.getElementById('manualNodeName').value = ${JSON.stringify(name)};
+  })()`);
+  const submitCreation = () => evaluate("document.getElementById('manualNodeForm').requestSubmit()");
+  await evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    const add = api.addManualNode;
+    window.creations = [];
+    api.addManualNode = async (body) => {
+      const request = { body };
+      window.creations.push(request);
+      request.response = await add(body);
+      await new Promise(resolve => { request.release = resolve; });
+      return request.response;
+    };
+  })()`);
+
+  await openCreation('Stale');
+  await switchTo({ id: first.id });
+  await active(first.id);
+  await submitCreation();
+  assert.equal(await evaluate('window.creations.length'), 0);
+  assert.ok(!(await request('/api/session/export')).manualNodes.some(node => node.id === fn('Stale')));
+
+  await openCreation('FirstNew');
+  await submitCreation();
+  await waitFor('typeof window.creations[0]?.release === "function"');
+  assert.deepEqual(await evaluate('window.creations[0].body.projectId'), first.id);
+  assert.ok(await evaluate('Number.isSafeInteger(window.creations[0].body.sessionRevision)'));
+  await switchTo({ id: second.id });
+  await active(second.id);
+  await openCreation('SecondNew');
+  await submitCreation();
+  await waitFor('typeof window.creations[1]?.release === "function"');
+  assert.equal(await evaluate('window.creations[1].body.projectId'), second.id);
+  await evaluate('window.creations[0].release()');
+  assert.ok(await evaluate("document.getElementById('manualNodeModal').classList.contains('show') && document.getElementById('manualNodeSubmit').disabled"));
+  await evaluate('window.creations[1].release()');
+  await waitFor(`__cg.view?.nodes.some(n => n.id === ${JSON.stringify(fn('SecondNew'))})`);
+  assert.ok(!(await request('/api/session/export')).manualNodes.some(node => node.id === fn('FirstNew')));
+  await switchTo({ id: first.id });
+  assert.ok((await request('/api/session/export')).manualNodes.some(node => node.id === fn('FirstNew')));
+});

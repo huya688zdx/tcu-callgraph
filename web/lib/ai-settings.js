@@ -1,13 +1,47 @@
 /**
- * AI 访问（MCP）权限设置面板
- * 三档：off（禁用）/ readonly（只读+导出，默认）/ readwrite（读写）
- * 保存即生效：MCP 端点每个请求都重读权限，不用重启服务
+ * AI 助手抽屉：
+ * 1. 对话助手：直连本地/远程 OpenAI 兼容接口（含旧版无 tools 接口自动兼容），实时把找到的函数和 Git 改动加入画布；
+ * 2. 直连 API：配置 Base URL / Model / Key / 兼容模式，支持拉取模型与连通性测试；
+ * 3. 外部 MCP：保留原有三档权限控制、一键复制 CC 命令与精简指令。
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { openModal, esc } from './modal.js';
+import { esc } from './modal.js';
+import { state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
+const drawer = document.getElementById('aiDrawer');
+const closeBtn = document.getElementById('aiDrawerClose');
+const tabs = [...document.querySelectorAll('[data-ai-tab]')];
+const panes = {
+  chat: document.getElementById('aiPaneChat'),
+  api: document.getElementById('aiPaneApi'),
+  mcp: document.getElementById('aiPaneMcp'),
+};
+
+// 对话区 DOM
+const setupBanner = document.getElementById('aiSetupBanner');
+const goConfigBtn = document.getElementById('aiGoConfig');
+const messagesEl = document.getElementById('aiMessages');
+const inputEl = document.getElementById('aiPromptInput');
+const sendBtn = document.getElementById('aiSendChat');
+const stopBtn = document.getElementById('aiStopChat');
+const clearBtn = document.getElementById('aiClearChat');
+const modelBadge = document.getElementById('aiModelBadge');
+
+// API 配置区 DOM
+const baseUrlEl = document.getElementById('aiBaseUrl');
+const modelEl = document.getElementById('aiModel');
+const modelListEl = document.getElementById('aiModelList');
+const fetchModelsBtn = document.getElementById('aiFetchModels');
+const apiKeyEl = document.getElementById('aiApiKey');
+const clearKeyBtn = document.getElementById('aiClearKey');
+const toolModeEl = document.getElementById('aiToolMode');
+const testConnBtn = document.getElementById('aiTestConn');
+const saveApiBtn = document.getElementById('aiSaveApi');
+const apiStatusEl = document.getElementById('aiApiStatus');
+
+// MCP 区 DOM
 const levelsEl = document.getElementById('aiLevels');
 const lockedEl = document.getElementById('aiLocked');
 const saveBtn = document.getElementById('aiSave');
@@ -18,22 +52,20 @@ const LEVELS = [
   { key: 'readwrite', label: 'ai.level.readwrite', desc: 'ai.desc.readwrite' },
 ];
 const PROMPTS = [
-  {
-    title: 'ai.prompt.chain.title',
-    text: 'ai.prompt.chain.text',
-  },
-  {
-    title: 'ai.prompt.labels.title',
-    text: 'ai.prompt.labels.text',
-  },
-  {
-    title: 'ai.prompt.flow.title',
-    text: 'ai.prompt.flow.text',
-  },
+  { title: 'ai.prompt.chain.title', text: 'ai.prompt.chain.text' },
+  { title: 'ai.prompt.labels.title', text: 'ai.prompt.labels.text' },
+  { title: 'ai.prompt.flow.title', text: 'ai.prompt.flow.text' },
 ];
 
-let current = 'readonly';
+let currentTab = 'chat';
+let mcpLevel = 'readonly';
 let envLocked = false;
+let llmConfig = { baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false, toolMode: 'auto' };
+let clearApiKeyPending = false;
+let chatHistory = [];
+let chatGeneration = 0;
+let chatProjectId = null;
+let activeAbort = null;
 
 function ensurePanelStyle() {
   if (document.getElementById('aiPanelStyle')) return;
@@ -42,25 +74,66 @@ function ensurePanelStyle() {
   style.textContent = `
     #aiLevels .ai-section { border-top: 1px solid #dedbd2; padding: 10px 0; }
     #aiLevels .ai-section h3 { font-size: 13px; margin: 0 0 7px; }
-    #aiLevels .ai-endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-    #aiLevels code { user-select: all; overflow-wrap: anywhere; }
-    #aiLevels ul { list-style: '✓  '; margin: 0; padding-left: 1.4em; font-size: 12px; line-height: 1.6; }
+    #aiLevels .ai-endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    #aiLevels code { user-select: all; overflow-wrap: anywhere; font-size: 12px; }
     #aiLevels .ai-prompts { display: grid; gap: 6px; justify-items: start; }
     #aiLevels [data-ai-copy] { text-align: left; white-space: normal; }
-    #aiLevels [role=status] { font-size: 12px; margin-top: 5px; }
+    #aiLevels [role=status] { font-size: 12px; margin-top: 5px; color: #235326; }
   `;
   document.head.append(style);
 }
 
-function render() {
+function setTab(name) {
+  currentTab = name;
+  for (const tab of tabs) tab.classList.toggle('on', tab.dataset.aiTab === name);
+  for (const [key, pane] of Object.entries(panes)) if (pane) pane.hidden = key !== name;
+}
+
+function setApiStatus(text, isError = false) {
+  if (!apiStatusEl) return;
+  apiStatusEl.textContent = text;
+  apiStatusEl.classList.toggle('err', isError);
+}
+
+function syncApiForm() {
+  if (!baseUrlEl) return;
+  baseUrlEl.value = llmConfig.baseUrl || '';
+  modelEl.value = llmConfig.model || '';
+  apiKeyEl.value = '';
+  apiKeyEl.placeholder = llmConfig.hasApiKey ? '已保存（留空保持不变）' : '可选；本地模型留空即可';
+  clearApiKeyPending = false;
+  if (clearKeyBtn) clearKeyBtn.hidden = !llmConfig.hasApiKey;
+  if (toolModeEl) toolModeEl.value = llmConfig.toolMode || 'auto';
+  const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
+  if (setupBanner) setupBanner.hidden = configured;
+  if (modelBadge) {
+    modelBadge.textContent = configured
+      ? `${llmConfig.model}${llmConfig.toolMode === 'prompt' ? ' · 旧版兼容' : ''}`
+      : '未配置模型';
+  }
+}
+
+function readApiDraft() {
+  const draft = {
+    baseUrl: baseUrlEl.value.trim(),
+    model: modelEl.value.trim(),
+    toolMode: toolModeEl.value,
+  };
+  if (clearApiKeyPending) draft.apiKey = '';
+  else if (apiKeyEl.value.trim()) draft.apiKey = apiKeyEl.value.trim();
+  return draft;
+}
+
+function renderMcp() {
   if (!levelsEl) return;
   ensurePanelStyle();
   const endpoint = `${location.origin}/mcp`;
   const config = JSON.stringify({ mcpServers: { 'tcu-callgraph': { type: 'http', url: endpoint } } }, null, 2);
+  const ccCmd = `claude mcp add --transport http tcu-callgraph ${endpoint}`;
   const levels = LEVELS.map(
     (l) => `
     <label class="ai-level">
-      <input type="radio" name="aiLevel" value="${l.key}" ${l.key === current ? 'checked' : ''} ${envLocked ? 'disabled' : ''}>
+      <input type="radio" name="aiLevel" value="${l.key}" ${l.key === mcpLevel ? 'checked' : ''} ${envLocked ? 'disabled' : ''}>
       <span class="ai-level-text">
         <strong>${t(l.label)}${l.key === 'readwrite' ? t('ai.readwriteHint') : ''}</strong>
         <small>${t(l.desc)}</small>
@@ -70,19 +143,14 @@ function render() {
   levelsEl.innerHTML = `
     <section class="ai-section">
       <h3>${t('ai.localConnection')}</h3>
-      <div class="ai-endpoint"><code>${esc(endpoint)}</code><button type="button" data-ai-copy="config">${t('ai.copyConfig')}</button><span role="status"></span></div>
+      <div class="ai-endpoint">
+        <code>${esc(endpoint)}</code>
+        <button type="button" data-ai-copy="cc">${t('ai.copyCc')}</button>
+        <button type="button" data-ai-copy="config">${t('ai.copyConfig')}</button>
+      </div>
+      <span role="status"></span>
     </section>
     <section class="ai-section"><h3>${t('ai.access')}</h3>${levels}</section>
-    <section class="ai-section">
-      <h3>${t('ai.rules')}</h3>
-      <ul>
-        <li>${t('ai.rule.source')}</li>
-        <li>${t('ai.rule.functions')}</li>
-        <li>${t('ai.rule.colors')}</li>
-        <li>${t('ai.rule.labels')}</li>
-        <li>${t('ai.rule.history')}</li>
-      </ul>
-    </section>
     <section class="ai-section">
       <h3>${t('ai.prompts')}</h3>
       <div class="ai-prompts">${PROMPTS.map((prompt, index) => `<button type="button" data-ai-copy="${index}">${t(prompt.title)}</button>`).join('')}</div>
@@ -93,7 +161,8 @@ function render() {
       const key = button.dataset.aiCopy;
       const status = button.closest('.ai-section').querySelector('[role="status"]');
       try {
-        await navigator.clipboard.writeText(key === 'config' ? config : t(PROMPTS[Number(key)].text));
+        const content = key === 'config' ? config : key === 'cc' ? ccCmd : t(PROMPTS[Number(key)].text);
+        await navigator.clipboard.writeText(content);
         status.textContent = t('ai.copied');
       } catch {
         status.textContent = t('ai.clipboardError');
@@ -104,21 +173,260 @@ function render() {
   if (saveBtn) saveBtn.disabled = envLocked;
 }
 
-async function open() {
-  try {
-    const cfg = await api.mcpConfig();
-    current = cfg.level;
-    envLocked = cfg.source === 'env';
-  } catch {
-    /* 拿不到就按默认渲染，保存时再报错 */
-  }
-  render();
-  openModal('aiModal');
+function appendUserMessage(text) {
+  if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'ai-msg user';
+  div.textContent = text;
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-if (btn) btn.addEventListener('click', open);
+function createAssistantBox() {
+  if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
+  const box = document.createElement('div');
+  box.className = 'ai-msg assistant';
+  box.innerHTML = '<div class="ai-steps"></div><div class="ai-msg-text">正在连接模型…</div>';
+  messagesEl.appendChild(box);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return {
+    box,
+    steps: box.querySelector('.ai-steps'),
+    text: box.querySelector('.ai-msg-text'),
+  };
+}
+
+function addStep(stepsEl, label, cls = '') {
+  const row = document.createElement('div');
+  row.className = 'ai-step' + (cls ? ' ' + cls : '');
+  row.textContent = label;
+  stepsEl.appendChild(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return row;
+}
+
+async function sendPrompt(rawText) {
+  const text = String(rawText ?? inputEl.value).trim();
+  if (!text || activeAbort) return;
+  if (!llmConfig.baseUrl || !llmConfig.model) {
+    setTab('api');
+    setApiStatus('请先填写本地模型 API 地址和模型名称', true);
+    return;
+  }
+  const currentProjectId = state.view?.projectId ?? null;
+  if (chatProjectId !== null && currentProjectId !== chatProjectId) {
+    chatHistory = [];
+    chatGeneration++;
+  }
+  chatProjectId = currentProjectId;
+  const myGen = chatGeneration;
+
+  inputEl.value = '';
+  appendUserMessage(text);
+  const ui = createAssistantBox();
+  activeAbort = new AbortController();
+  sendBtn.disabled = true;
+  stopBtn.hidden = false;
+
+  const historySnapshot = chatHistory.slice(-8);
+  let lastPendingStep = null;
+  let terminalReceived = false;
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let ev;
+    try { ev = JSON.parse(line); } catch { return; }
+    if (ev.type === 'status') {
+      ui.text.textContent = ev.text;
+    } else if (ev.type === 'fallback') {
+      addStep(ui.steps, `↻ ${ev.text}`);
+    } else if (ev.type === 'tool_start') {
+      const argBrief = ev.arguments && Object.keys(ev.arguments).length
+        ? ` ${JSON.stringify(ev.arguments).slice(0, 80)}` : '';
+      lastPendingStep = addStep(ui.steps, `🔧 ${ev.name}${argBrief}…`);
+    } else if (ev.type === 'tool_end') {
+      if (lastPendingStep) {
+        lastPendingStep.textContent = `${ev.ok ? '✓' : '✕'} ${ev.name}：${ev.summary}`;
+        lastPendingStep.classList.add(ev.ok ? 'ok' : 'err');
+        lastPendingStep = null;
+      } else {
+        addStep(ui.steps, `${ev.ok ? '✓' : '✕'} ${ev.name}：${ev.summary}`, ev.ok ? 'ok' : 'err');
+      }
+    } else if (ev.type === 'done') {
+      terminalReceived = true;
+      if (ev.thinking) {
+        const details = document.createElement('details');
+        details.className = 'ai-think';
+        details.innerHTML = `<summary>查看模型思考过程</summary><pre>${esc(ev.thinking)}</pre>`;
+        ui.box.insertBefore(details, ui.text);
+      }
+      ui.text.textContent = ev.answer || '已完成。';
+      if (myGen === chatGeneration && (state.view?.projectId ?? null) === currentProjectId) {
+        chatHistory.push({ role: 'user', content: text }, { role: 'assistant', content: ev.answer || '' });
+      }
+    } else if (ev.type === 'error') {
+      terminalReceived = true;
+      ui.box.className = 'ai-msg error';
+      ui.text.textContent = ev.error || '执行失败';
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+  try {
+    const res = await api.aiChat({ prompt: text, history: historySnapshot, at: state.at || 0 }, activeAbort.signal);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) handleLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) handleLine(buffer);
+    if (!terminalReceived) {
+      ui.box.className = 'ai-msg error';
+      ui.text.textContent = '连接提前中断，请重试。';
+    }
+  } catch (err) {
+    ui.box.className = 'ai-msg error';
+    ui.text.textContent = err.name === 'AbortError' ? '已停止本次执行。' : (err.message || String(err));
+  } finally {
+    activeAbort = null;
+    sendBtn.disabled = false;
+    stopBtn.hidden = true;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+}
+
+async function openDrawer() {
+  if (!drawer) return;
+  if (drawer.classList.contains('show')) {
+    drawer.classList.remove('show');
+    return;
+  }
+  drawer.classList.add('show');
+  try {
+    const [mcpCfg, aiCfg] = await Promise.all([
+      api.mcpConfig().catch(() => null),
+      api.aiConfig().catch(() => null),
+    ]);
+    if (mcpCfg) {
+      mcpLevel = mcpCfg.level;
+      envLocked = mcpCfg.source === 'env';
+    }
+    if (aiCfg?.config) llmConfig = aiCfg.config;
+  } catch { /* 按默认渲染 */ }
+  syncApiForm();
+  renderMcp();
+  if (!llmConfig.baseUrl || !llmConfig.model) setTab('api');
+  else setTab(currentTab);
+}
+
+if (btn) btn.addEventListener('click', openDrawer);
+if (closeBtn) closeBtn.addEventListener('click', () => drawer?.classList.remove('show'));
+// 隔离抽屉内按键事件，防止 F / Delete / Esc 误触画布快捷键
+if (drawer) drawer.addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.key === 'Escape') drawer.classList.remove('show');
+});
+for (const tab of tabs) tab.addEventListener('click', () => setTab(tab.dataset.aiTab));
+if (goConfigBtn) goConfigBtn.addEventListener('click', () => setTab('api'));
+
+// 快捷任务按钮
+for (const quick of document.querySelectorAll('[data-ai-quick]')) {
+  quick.addEventListener('click', () => {
+    const kind = quick.dataset.aiQuick;
+    if (kind === 'git') {
+      sendPrompt('查看当前 Git 未提交改动，把修改的函数及上游 TASK 调用链直接加入画布，并简述改动影响。');
+    } else if (kind === 'find') {
+      inputEl.value = '帮我找出和 ';
+      inputEl.focus();
+      inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    } else if (kind === 'labels') {
+      sendPrompt('查看当前画布上的函数和调用关系，给有明确周期依据的调用连线补全 TASK 周期或 コール順 标签。');
+    }
+  });
+}
+
+if (sendBtn) sendBtn.addEventListener('click', () => sendPrompt());
+if (stopBtn) stopBtn.addEventListener('click', () => activeAbort?.abort());
+if (clearBtn) clearBtn.addEventListener('click', () => {
+  chatGeneration++;
+  chatHistory = [];
+  messagesEl.innerHTML = '<div class="empty">已清空对话。可直接让我找函数加入画布或分析 Git 改动。</div>';
+});
+if (inputEl) inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    sendPrompt();
+  }
+});
+
+// API 配置事件
+for (const preset of document.querySelectorAll('[data-ai-preset]')) {
+  preset.addEventListener('click', () => {
+    baseUrlEl.value = preset.dataset.aiPreset;
+    setApiStatus('');
+  });
+}
+if (apiKeyEl) apiKeyEl.addEventListener('input', () => {
+  if (apiKeyEl.value) clearApiKeyPending = false;
+});
+if (clearKeyBtn) clearKeyBtn.addEventListener('click', () => {
+  clearApiKeyPending = true;
+  apiKeyEl.value = '';
+  apiKeyEl.placeholder = '保存后将清除已存 Key';
+  clearKeyBtn.hidden = true;
+});
+if (fetchModelsBtn) fetchModelsBtn.addEventListener('click', async () => {
+  setApiStatus('正在拉取模型列表…');
+  fetchModelsBtn.disabled = true;
+  try {
+    const r = await api.aiModels(readApiDraft());
+    if (!r?.ok) throw new Error(r?.error || '拉取失败');
+    modelListEl.innerHTML = (r.models || []).map(id => `<option value="${esc(id)}"></option>`).join('');
+    if (!modelEl.value.trim() && r.models?.length) modelEl.value = r.models[0];
+    setApiStatus(r.models?.length ? `已获取 ${r.models.length} 个模型，可在下拉中选择` : '接口返回空列表，可手动输入模型名');
+  } catch (err) {
+    setApiStatus(err.message || String(err), true);
+  } finally {
+    fetchModelsBtn.disabled = false;
+  }
+});
+if (testConnBtn) testConnBtn.addEventListener('click', async () => {
+  setApiStatus('正在测试连接…');
+  testConnBtn.disabled = true;
+  try {
+    const r = await api.aiTest(readApiDraft());
+    if (!r?.ok) throw new Error(r?.error || '连接失败');
+    setApiStatus(`✓ 连接成功（${r.latencyMs}ms · ${r.model}）`);
+  } catch (err) {
+    setApiStatus(err.message || String(err), true);
+  } finally {
+    testConnBtn.disabled = false;
+  }
+});
+if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
+  setApiStatus('正在保存…');
+  try {
+    const r = await api.saveAiConfig(readApiDraft());
+    if (!r?.ok) throw new Error(r?.error || '保存失败');
+    llmConfig = r.config;
+    syncApiForm();
+    setApiStatus('✓ 配置已保存，可直接切到「对话助手」使用');
+  } catch (err) {
+    setApiStatus(err.message || String(err), true);
+  }
+});
+
 document.addEventListener('callgraph:langchange', () => {
-  if (levelsEl?.childElementCount) render();
+  if (levelsEl?.childElementCount) renderMcp();
 });
 
 if (saveBtn)
@@ -127,8 +435,8 @@ if (saveBtn)
     if (!checked) return;
     const r = await api.setMcpConfig(checked.value).catch((err) => ({ ok: false, error: String(err.message || err) }));
     if (r && r.ok) {
-      current = checked.value;
-      render();
+      mcpLevel = checked.value;
+      renderMcp();
       saveBtn.textContent = t('ai.save') + ' ✓';
       setTimeout(() => (saveBtn.textContent = t('ai.save')), 1500);
     } else if (lockedEl) {

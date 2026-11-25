@@ -144,6 +144,75 @@ test('历史比较以两个提交为准，识别删除和重命名，无关工�
   assert.match(decodeSource(comp.afterModel._sourceBuffers.get('lsb.h')), /10/);
 });
 
+test('大仓库未改动文件复盘与按需快照隔离：后续磁盘编辑不污染历史 _sourceBuffers', async t => {
+  const { root, put, commit } = repository(t);
+  for (let i = 0; i < 40; i++) put(`src/mod/f${i}.c`, `int fn_${i}(void) { return ${i}; }\n`);
+  commit('base');
+  put('src/mod/f0.c', 'int fn_0(void) { return 100; }\n');
+  put('src/mod/f1.c', 'int fn_1(void) { return 101; }\n');
+  commit('second');
+
+  const comp = await compareGitProject(root, { baseRef: 'HEAD~1', targetRef: 'HEAD' });
+  assert.deepEqual(comp.git.changedFiles.map(f => f.file), ['src/mod/f0.c', 'src/mod/f1.c']);
+  assert.equal(byId(comp, 'src/mod/f0.c::fn_0').change, 'modified');
+  assert.equal(byId(comp, 'src/mod/f1.c::fn_1').change, 'modified');
+  assert.equal(byId(comp, 'src/mod/f2.c::fn_2').change, 'existing');
+
+  // 比较完成后再修改磁盘上未改动的 f2.c，快照 _sourceBuffers 仍应返回提交时的内容。
+  put('src/mod/f2.c', 'int fn_2(void) { return 9999; }\n');
+  assert.match(decodeSource(comp.beforeModel._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
+  assert.match(decodeSource(comp.afterModel._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
+  assert.match(decodeSource(comp.model._sourceBuffers.get('src/mod/f2.c')), /return 2;/);
+});
+
+test('边界回归：diff.relative=true、暂存重命名重建旧路径、ident 转换均不污染比较结果', async t => {
+  // 1. diff.relative=true 下子目录工程仍正确检测修改与 intent-to-add
+  {
+    const { root, git, put, commit } = repository(t);
+    const sub = 'sub [x] 中';
+    put(`${sub}/a.C`, 'int a(void) { return 1; }\n');
+    commit('init');
+    git('config', 'diff.relative', 'true');
+    put(`${sub}/a.C`, 'int a(void) { return 2; }\n');
+    put(`${sub}/new.c`, 'int b(void) { return 3; }\n');
+    git('add', '-N', `${sub}/new.c`);
+    const project = path.join(root, sub);
+    const live = await compareGitProject(project);
+    assert.equal(live.git.noSourceChanges, false);
+    assert.equal(byId(live, 'a.C::a').change, 'modified');
+    const idx = await compareGitProject(project, { targetRef: 'INDEX' });
+    assert.equal(idx.git.noSourceChanges, true);
+  }
+  // 2. 暂存重命名后重建同名未跟踪文件，不污染 HEAD~1..HEAD 历史比较
+  {
+    const { root, git, put, commit } = repository(t);
+    put('a.c', 'int keep_a(void) { return 1; }\n');
+    put('b.c', 'int b(void) { return 1; }\n');
+    commit('c1');
+    put('b.c', 'int b(void) { return 2; }\n');
+    commit('c2');
+    git('mv', 'a.c', 'new.c');
+    put('a.c', 'int bogus_untracked(void) { return 99; }\n');
+    const hist = await compareGitProject(root, { baseRef: 'HEAD~1', targetRef: 'HEAD' });
+    assert.equal(byId(hist, 'a.c::keep_a').change, 'existing');
+    assert.equal(byId(hist, 'a.c::bogus_untracked'), undefined);
+  }
+  // 3. ident 检出转换下纯注释提交仍判定为 commentOnly，不误报函数修改
+  {
+    const { root, git, put, commit } = repository(t);
+    put('.gitattributes', 'a.c ident\n');
+    put('a.c', 'const char *id(void) { return "$Id$"; }\n');
+    commit('c1');
+    put('a.c', '// only comment\nconst char *id(void) { return "$Id$"; }\n');
+    commit('c2');
+    fs.unlinkSync(path.join(root, 'a.c'));
+    git('checkout', '--', 'a.c');
+    const hist = await compareGitProject(root, { baseRef: 'HEAD~1', targetRef: 'HEAD' });
+    assert.equal(byId(hist, 'a.c::id').change, 'existing');
+    assert.deepEqual(hist.git.commentOnlyFiles, ['a.c']);
+  }
+});
+
 test('未提交仓库以空 HEAD 为基准，识别首批 C/H 与空暂存区', async t => {
   const { root, git, put } = repository(t);
   put('start.c', 'int start(void) { return 1; }\n');

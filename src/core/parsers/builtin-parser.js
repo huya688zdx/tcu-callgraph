@@ -412,6 +412,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
         callee,
         kind: call.kind === 'unknown' ? 'fnptr' : call.kind,
         line: call.line, col: call.col, orderGroup: call.orderGroup,
+        ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
         cond: call.cond,
         via: call.via,
         macroChain: call.macroChain,

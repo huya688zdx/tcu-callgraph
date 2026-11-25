@@ -6,7 +6,7 @@ import { isDataEdge, svgMarkers } from './edge-flow.js';
 import { t } from '../i18n.js';
 import { state, els, FONT, THEME, hexToRgba, esc, shortFile } from './state.js';
 import { labelLayout } from './edge-labels.js';
-import { nodePeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from './period-text.js';
+import { canvasPeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from './period-text.js';
 import { deletedEdgeMarkSvg, labelSvg } from '/core/labels.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
@@ -27,6 +27,18 @@ function buildSVG() {
     minY = Math.min(minY, n.y);
     maxX = Math.max(maxX, n.x + n.w);
     maxY = Math.max(maxY, n.y + n.h);
+  }
+  // 将可能超出框宽的容器胶囊标题与文件组标题计入 SVG 视野范围，避免收缩后标题被裁切
+  for (const c of v.containers || []) {
+    const fs = 12;
+    els.ctx.save(); els.ctx.font = `600 ${fs}px ${FONT}`;
+    const tw = els.ctx.measureText(String(c.label)).width; els.ctx.restore();
+    maxX = Math.max(maxX, c.x + 6 + tw + fs);
+  }
+  for (const g of v.groups || []) {
+    els.ctx.save(); els.ctx.font = `500 12px ${FONT}`;
+    const tw = els.ctx.measureText(String(g.label)).width; els.ctx.restore();
+    maxX = Math.max(maxX, g.x + 12 + tw + 8);
   }
   for (const e of v.edges) {
     for (const p of e.points || []) {
@@ -123,6 +135,8 @@ function buildSVG() {
     const period = periodSubtitle(n);
     const sub = n.external
       ? t('node.external')
+      : n.manual
+      ? (isVar ? n.typeText || t('node.manualVar') : t('node.manualFn'))
       : isVar
       ? n.typeText || t('node.variable')
       : `${shortFile(n.file)}:${n.line}`;
@@ -132,7 +146,7 @@ function buildSVG() {
     out.push(
       `<text x="${(n.x + n.w / 2).toFixed(1)}" y="${(n.y + n.h / 2 + 10).toFixed(1)}" text-anchor="middle" dominant-baseline="middle" ${period ? 'font-size="11" font-weight="600" fill="#124B71"' : 'font-size="10.5" fill="#888780"'}>${esc(period || sub)}</text>`
     );
-    const badge = !v.comparison && !period && nodePeriodBadge(n);
+    const badge = !v.comparison && !period && canvasPeriodBadge(n);
     if (badge) out.push(periodBadgeSvg(n, badge, esc, (text, size) => {
       els.ctx.save();
       els.ctx.font = `600 ${size}px ${FONT}`;

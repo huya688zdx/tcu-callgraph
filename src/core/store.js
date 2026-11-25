@@ -196,7 +196,7 @@ export function resolveDbPath({ explicit, userData } = {}) {
  */
 export function fingerprintFiles(files = []) {
   const h = createHash('sha1');
-  const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  const list = [...files].filter((f) => !f.manual).sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
     h.update(`${f.rel}\u0000${f.bytes}\u0000${f.isHeader ? 1 : 0}\n`);
   }
@@ -211,7 +211,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v18-counter-write-sites\0');
+  h.update('analyzed-model-v20-pure-source\0');
   if (parserKey !== 'builtin') h.update(`parser\u0000${parserKey}\n`);
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
@@ -317,6 +317,7 @@ function applyEvent(ov, e) {
     // 携带全量状态的节点：直接整体替换
     case 'baseline':
     case 'restore_point':
+    case 'manual.variable.bind':
     case 'import':
     // 会话导入同样是「把这一刻的整个状态钉下来」：它的 after 里带着导入后的
     // 全量 overlay，不回放的话 at=这一刻 会显示成导入前的样子，
@@ -330,6 +331,7 @@ function applyEvent(ov, e) {
         edges: { ...((after.deleted || {}).edges || {}) },
       };
       ov.layout = { ...(after.layout || {}) };
+      ov.manualNodes = after.manualNodes && typeof after.manualNodes === 'object' ? { ...after.manualNodes } : {};
       return;
     }
     case 'node.annotate':
@@ -381,6 +383,33 @@ function applyEvent(ov, e) {
       if (after.edges) Object.assign(slot.edges, after.edges);
       if (after.manual) slot.manual = after.manual;
       ov.layout[e.target] = slot;
+      return;
+    }
+    case 'manual.node.add': {
+      ov.manualNodes = ov.manualNodes || {};
+      if (e.target && after && typeof after === 'object') {
+        ov.manualNodes[e.target] = {
+          id: e.target,
+          kind: after.kind === 'var' ? 'var' : 'fn',
+          file: after.file || '',
+          name: after.name || '',
+          typeText: after.typeText || '',
+        };
+      }
+      return;
+    }
+    case 'manual.node.delete': {
+      ov.manualNodes = ov.manualNodes || {};
+      delete ov.manualNodes[e.target];
+      if (!after?.keptSourceSymbol) {
+        delete ov.nodes[e.target];
+        delete ov.deleted.nodes[e.target];
+        for (const slot of Object.values(ov.layout || {})) {
+          if (Array.isArray(slot?.manual)) {
+            slot.manual = slot.manual.filter((m) => m.from !== e.target && m.to !== e.target);
+          }
+        }
+      }
       return;
     }
     case 'orphan.purge': {
@@ -979,8 +1008,21 @@ export function openStore({ dbPath, userData } = {}) {
      * 避免大工程仅因展开后的 token 较大就永远无法命中缓存。
      */
     putCachedModel(key, model, { maxBytes = 40 * 1024 * 1024, keep = 12 } = {}) {
-      // _index 里全是对象引用，存下来只会变成两份互不相干的副本
-      const { _index, _dfPending, scheduleConfig, ...plain } = model;
+      // _index 里全是对象引用；手工节点属于单工程持久化数据，绝不能写入共享源码解析缓存。
+      const { _index, _dfPending, scheduleConfig, ...rawPlain } = model;
+      const plain = {
+        ...rawPlain,
+        ...(Array.isArray(rawPlain.files) ? { files: rawPlain.files.filter((f) => !f.manual) } : {}),
+        ...(Array.isArray(rawPlain.functions) ? { functions: rawPlain.functions.filter((f) => !f.manual) } : {}),
+        ...(Array.isArray(rawPlain.variables) ? { variables: rawPlain.variables.filter((v) => !v.manual) } : {}),
+        ...(rawPlain._df ? {
+          _df: {
+            ...rawPlain._df,
+            defs: (rawPlain._df.defs || []).filter((d) => !d.manual),
+            byId: new Map([...(rawPlain._df.byId || [])].filter(([, d]) => !d?.manual)),
+          },
+        } : {}),
+      };
       let packed;
       try {
         packed = serialize(plain);
@@ -998,6 +1040,10 @@ export function openStore({ dbPath, userData } = {}) {
       q.cachePrune.run(keep);
     },
 
+    deleteAnnotation(projectId, kind, id) {
+      q.annDel.run(projectId, kind, id);
+    },
+
     /** 全量导出本工程存下来的目标，供孤儿标注检测使用 */
     listAllTargets(projectId) {
       return {
@@ -1009,6 +1055,7 @@ export function openStore({ dbPath, userData } = {}) {
           viewKey: r.view_key,
           mode: r.mode,
           nodes: parse(r.nodes, {}),
+          manual: parse(r.manual, []),
         })),
       };
     },

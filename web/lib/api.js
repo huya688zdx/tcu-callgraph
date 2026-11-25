@@ -7,22 +7,30 @@ import { state } from './state.js';
 export const clientId = crypto.randomUUID();
 
 const get = (url) => fetch(url).then((r) => r.json());
+let layoutWrites = Promise.resolve();
 
-const post = (url, body) =>
+async function parseView(response) {
+  const view = await response.json();
+  const revision = response.headers.get('X-Callgraph-Session');
+  return revision === null ? view : { ...view, sessionRevision: Number(revision) };
+}
+
+const post = (url, body, parse = (response) => response.json()) =>
   fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId,
       ...((body.projectId ?? state.view?.projectId) == null ? {} :
-        { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }) },
+        { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }),
+      ...(body.sessionRevision == null ? {} : { 'X-Callgraph-Session': String(body.sessionRevision) }) },
     body: JSON.stringify(body),
-  }).then((r) => r.json());
+  }).then(parse);
 
 /**
  * 回看模式下拦掉写操作。
  * 历史状态是重放出来的，如果这时还把改动写进当前库，用户会以为改的是过去，
  * 实际上改的是现在——所以干脆不允许，让他先点「回到最新」。
  */
-const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels', 'viewEvent']);
+const WRITE_OPS = new Set(['overlay', 'del', 'layout', 'orphans', 'bookmarks', 'session', 'labels', 'viewEvent', 'manualNodes']);
 const guardWrite = (name) => {
   if (state.view?.comparison && WRITE_OPS.has(name)) return Promise.resolve({ ok: false, error: '比较视图仅供查看' });
   if (state.at > 0 && WRITE_OPS.has(name)) {
@@ -49,7 +57,7 @@ export const api = {
     if (at > 0) q.set('at', String(at));
     const hasComma = [...(list.length > 1 ? list : []), ...(vars || []), ...(hiddenVars || [])]
       .some((id) => id.includes(','));
-    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return get('/api/view?' + q);
+    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return fetch('/api/view?' + q).then(parseView);
     for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
     return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId,
@@ -61,7 +69,7 @@ export const api = {
         ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
       layoutSlots: previous.layoutSlots,
-    } : null });
+    } : null }, parseView);
   },
   stats: () => get('/api/stats?summary=1'),
   parsers: () => fetch('/api/parsers').then(response => response.ok ? response.json() : null).catch(() => null),
@@ -115,7 +123,19 @@ export const api = {
   /** 删除 / 恢复函数与连线 */
   del: (body) => guardWrite('del') || post('/api/delete', body),
   /** 手动布局存档 */
-  layout: (body) => guardWrite('layout') || post('/api/layout', body),
+  layout(body) {
+    const blocked = guardWrite('layout');
+    if (blocked) return blocked;
+    const patch = { ...body, projectId: body.projectId ?? state.view?.projectId,
+      sessionRevision: body.sessionRevision ?? state.view?.sessionRevision };
+    // 连续撤销与重做的手工关系增量必须按触发顺序落库。
+    const write = layoutWrites.then(() => post('/api/layout', patch));
+    layoutWrites = write.catch(() => {});
+    return write;
+  },
+  /** 手工添加 / 永久删除文件内的函数或变量（即使源码中不存在） */
+  addManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes', body),
+  deleteManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes/delete', body),
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir)),
@@ -124,6 +144,22 @@ export const api = {
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
+  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试与对话 */
+  aiConfig: () => get('/api/ai/config'),
+  saveAiConfig: (body) => post('/api/ai/config', body),
+  aiModels: (body) => post('/api/ai/models', body),
+  aiTest: (body) => post('/api/ai/test', body),
+  aiChat: (body, signal) =>
+    fetch('/api/ai/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Callgraph-Client': clientId,
+        ...(state.view?.projectId == null ? {} : { 'X-Callgraph-Project': String(state.view.projectId) }),
+      },
+      body: JSON.stringify(body),
+      signal,
+    }),
   /** 上报并保存当前页面状态，AI 经 cg_page 工具读取；退出时等待保存结果。 */
   reportPage: (body) => post('/api/page', body),
   savedPage: () => get('/api/page?saved=1'),
