@@ -5,11 +5,33 @@ import { isUtf8 } from 'node:buffer';
 export const SRC_EXT = /\.(c|cc|cpp)$/i;
 export const HDR_EXT = /\.(h|hh|hpp)$/i;
 
+const CJK_KANA = /[\u3040-\u30ff\u3400-\u9fff\uff66-\uff9f]/g;
+const MOJIBAKE_HINT = /[\u0080-\u009f\ufffd]/;
+
+function preferCp932OverUtf8(buf, hint) {
+  if (!buf.some((b) => b >= 0x80)) return false;
+  let sjis;
+  try {
+    sjis = new TextDecoder('shift_jis', { fatal: true, ignoreBOM: true }).decode(buf);
+  } catch {
+    return false;
+  }
+  const sjisCjk = (sjis.match(CJK_KANA) || []).length;
+  if (!sjisCjk) return false;
+  const utf8 = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(buf);
+  if (MOJIBAKE_HINT.test(utf8)) return true;
+  if (hint === 'cp932') {
+    const utf8Cjk = (utf8.match(CJK_KANA) || []).length;
+    if (sjisCjk >= utf8Cjk) return true;
+  }
+  return false;
+}
+
 /**
- * 先识别文件 BOM。无 BOM 时，已知 CP932 的工程可显式指定，否则优先选择合法 UTF-8。
+ * 先识别文件 BOM。无 BOM 时，已知 CP932 的工程可显式指定，否则自动识别 UTF-8 与 CP932。
  * 同一文件的各个字节切片共用此解码器，防止将局部的半角假名重新猜成 UTF-8。
  */
-export function sourceDecoder(buf, preferred = 'auto', { fatal = false } = {}) {
+export function sourceDecoder(buf, preferred = 'auto', { fatal = false, hint = null } = {}) {
   if (!['auto', 'cp932', 'utf-8'].includes(preferred)) throw new Error('源码编码须为 auto、cp932 或 utf-8');
   let encoding = preferred, bomLength = 0;
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
@@ -22,15 +44,15 @@ export function sourceDecoder(buf, preferred = 'auto', { fatal = false } = {}) {
     encoding = 'utf-16be';
     bomLength = 2;
   } else if (preferred === 'auto') {
-    encoding = isUtf8(buf) ? 'utf-8' : 'cp932';
+    encoding = isUtf8(buf) && !preferCp932OverUtf8(buf, hint) ? 'utf-8' : 'cp932';
   }
   // 调用方只在文件开头跳过 BOM，Clang 的字节范围始终基于原文件。
   const decoder = new TextDecoder(encoding === 'cp932' ? 'shift_jis' : encoding, { fatal, ignoreBOM: true });
   return { encoding, bomLength, decode: bytes => decoder.decode(bytes) };
 }
 
-export function decodeSource(buf) {
-  const decoder = sourceDecoder(buf);
+export function decodeSource(buf, options = {}) {
+  const decoder = sourceDecoder(buf, 'auto', options);
   return decoder.decode(buf.subarray(decoder.bomLength));
 }
 
@@ -55,7 +77,7 @@ export function listSourceFiles(root) {
 }
 
 /**
- * 一次扫描取得路径、大小与 mtime，供解析缓存和冷启动共用。
+ * 一次扫描取得路径、大小与文件时间戳，供解析缓存和冷启动共用。
  */
 export function scanSources(root, warnings = []) {
   const out = [];
@@ -72,7 +94,8 @@ export function scanSources(root, warnings = []) {
       abs,
       rel,
       bytes: st.size,
-      mtimeMs: Math.round(st.mtimeMs),
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
       isHeader: HDR_EXT.test(abs),
     });
   }

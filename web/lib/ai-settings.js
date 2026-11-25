@@ -20,6 +20,10 @@ const panes = {
 };
 
 // 对话区 DOM
+const projectTagEl = document.getElementById('aiProjectTag');
+const chatSelectEl = document.getElementById('aiChatSelect');
+const newChatBtn = document.getElementById('aiNewChat');
+const deleteChatBtn = document.getElementById('aiDeleteChat');
 const setupBanner = document.getElementById('aiSetupBanner');
 const goConfigBtn = document.getElementById('aiGoConfig');
 const messagesEl = document.getElementById('aiMessages');
@@ -37,6 +41,7 @@ const fetchModelsBtn = document.getElementById('aiFetchModels');
 const apiKeyEl = document.getElementById('aiApiKey');
 const clearKeyBtn = document.getElementById('aiClearKey');
 const toolModeEl = document.getElementById('aiToolMode');
+const reasoningEffortEl = document.getElementById('aiReasoningEffort');
 const testConnBtn = document.getElementById('aiTestConn');
 const saveApiBtn = document.getElementById('aiSaveApi');
 const apiStatusEl = document.getElementById('aiApiStatus');
@@ -60,12 +65,189 @@ const PROMPTS = [
 let currentTab = 'chat';
 let mcpLevel = 'readonly';
 let envLocked = false;
-let llmConfig = { baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false, toolMode: 'auto' };
+const REASONING_LABELS = new Map([['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
+let llmConfig = {
+  baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
+  toolMode: 'auto', reasoningEffort: 'default',
+};
 let clearApiKeyPending = false;
-let chatHistory = [];
 let chatGeneration = 0;
+let chatMutation = 0;
 let chatProjectId = null;
+let chatProjectName = '';
+let chatThreads = []; // [{ id, title, updatedAt, messages }]
+let activeChatId = '';
 let activeAbort = null;
+
+function newThreadObject(title = '新对话') {
+  return {
+    id: (crypto.randomUUID ? crypto.randomUUID() : `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    title,
+    updatedAt: Date.now(),
+    messages: [],
+  };
+}
+
+function activeThread() {
+  let th = chatThreads.find((item) => item.id === activeChatId);
+  if (!th) {
+    th = newThreadObject();
+    chatThreads.unshift(th);
+    activeChatId = th.id;
+  }
+  return th;
+}
+
+function persistChats(projectId = chatProjectId) {
+  if (projectId == null) return;
+  chatMutation++;
+  const payload = { projectId, activeId: activeChatId, threads: chatThreads.slice(0, 30) };
+  void api.saveAiChats(payload).catch(() => {});
+}
+
+function renderChatBar() {
+  if (projectTagEl) {
+    projectTagEl.textContent = chatProjectName ? `工程：${chatProjectName}` : '工程';
+    projectTagEl.title = chatProjectName ? `当前工程：${chatProjectName}（不同工程对话完全隔离）` : '按工程隔离保存对话';
+  }
+  if (chatSelectEl) {
+    chatSelectEl.innerHTML = chatThreads.map((th) =>
+      `<option value="${esc(th.id)}"${th.id === activeChatId ? ' selected' : ''}>${esc(th.title)} (${th.messages.length})</option>`
+    ).join('');
+  }
+  if (deleteChatBtn) deleteChatBtn.disabled = chatThreads.length <= 1 && !(activeThread().messages.length);
+}
+
+function showThinking(box, before, thinking) {
+  if (!thinking) return;
+  let details = box.querySelector('.ai-think');
+  if (!details) {
+    details = document.createElement('details');
+    details.className = 'ai-think';
+    details.open = true;
+    details.innerHTML = '<summary>💭 思考过程（点击收起/展开）</summary><pre></pre>';
+    box.insertBefore(details, before);
+  }
+  details.querySelector('pre').textContent = thinking;
+}
+
+function renderQuestion(text, message, thread) {
+  const card = document.createElement('div');
+  card.className = 'ai-question';
+  text.before(card);
+  card.appendChild(text);
+
+  const options = document.createElement('div');
+  options.className = 'ai-question-opts';
+  if (message.questionOptions.length) card.appendChild(options);
+
+  const pending = thread.messages.at(-1) === message;
+  for (const [index, option] of message.questionOptions.entries()) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ai-q-opt';
+    button.textContent = option.label;
+    button.disabled = !pending;
+    button.classList.toggle('chosen', index === message.questionSelected);
+    if (option.description) {
+      const description = document.createElement('small');
+      description.textContent = option.description;
+      button.appendChild(description);
+    }
+    button.addEventListener('click', () => {
+      if (activeAbort || activeChatId !== thread.id || thread.messages.at(-1) !== message) return;
+      if (chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
+      if (!llmConfig.baseUrl || !llmConfig.model) {
+        void sendPrompt(option.label);
+        return;
+      }
+      message.questionSelected = index;
+      button.classList.add('chosen');
+      void sendPrompt(option.label);
+    });
+    options.appendChild(button);
+  }
+
+  if (pending && message.allowCustom !== false) {
+    const hint = document.createElement('p');
+    hint.className = 'ai-q-hint';
+    hint.textContent = '也可以直接在下方输入框自定义回复';
+    card.appendChild(hint);
+  }
+}
+
+function renderThreadMessages() {
+  if (!messagesEl) return;
+  const th = activeThread();
+  if (!th.messages.length) {
+    messagesEl.innerHTML = '<div class="empty">直接告诉我你想找什么函数、分析 Git 改动，或点上方快捷按钮，我会自动查找并加入当前画布。</div>';
+    return;
+  }
+  messagesEl.innerHTML = '';
+  for (const m of th.messages) {
+    if (m.role === 'user') {
+      const div = document.createElement('div');
+      div.className = 'ai-msg user';
+      div.textContent = m.text || '';
+      messagesEl.appendChild(div);
+    } else {
+      const box = document.createElement('div');
+      box.className = m.error ? 'ai-msg error' : 'ai-msg assistant';
+      if (Array.isArray(m.tools) && m.tools.length) {
+        const steps = document.createElement('div');
+        steps.className = 'ai-steps';
+        for (const tl of m.tools) {
+          const row = document.createElement('div');
+          row.className = `ai-step ${tl.ok !== false ? 'ok' : 'err'}`;
+          row.textContent = `${tl.ok !== false ? '✓' : '✕'} ${tl.name}：${tl.summary || ''}`;
+          steps.appendChild(row);
+        }
+        box.appendChild(steps);
+      }
+      const txt = document.createElement('div');
+      txt.className = 'ai-msg-text';
+      txt.textContent = m.text || '';
+      box.appendChild(txt);
+      showThinking(box, txt, m.thinking);
+      if (Array.isArray(m.questionOptions)) renderQuestion(txt, m, th);
+      messagesEl.appendChild(box);
+    }
+  }
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function loadProjectChats({ force = false } = {}) {
+  const currentId = state.view?.projectId ?? null;
+  if ((!force || activeAbort) && chatProjectId !== null && currentId === chatProjectId && chatThreads.length) {
+    renderChatBar();
+    return;
+  }
+  const gen = ++chatGeneration;
+  const mutation = chatMutation;
+  if (activeAbort) {
+    activeAbort.abort();
+    activeAbort = null;
+  }
+  try {
+    const res = await api.aiChats();
+    if (gen !== chatGeneration || mutation !== chatMutation || !res?.ok) return;
+    chatProjectId = res.projectId ?? currentId;
+    chatProjectName = res.projectName || '';
+    chatThreads = Array.isArray(res.threads) && res.threads.length ? res.threads : [newThreadObject()];
+    activeChatId = res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id;
+    renderChatBar();
+    renderThreadMessages();
+  } catch {
+    if (gen !== chatGeneration || mutation !== chatMutation) return;
+    if (!chatThreads.length) {
+      const th = newThreadObject();
+      chatThreads = [th];
+      activeChatId = th.id;
+    }
+    renderChatBar();
+    renderThreadMessages();
+  }
+}
 
 function ensurePanelStyle() {
   if (document.getElementById('aiPanelStyle')) return;
@@ -104,11 +286,13 @@ function syncApiForm() {
   clearApiKeyPending = false;
   if (clearKeyBtn) clearKeyBtn.hidden = !llmConfig.hasApiKey;
   if (toolModeEl) toolModeEl.value = llmConfig.toolMode || 'auto';
+  const reasoningLabel = REASONING_LABELS.get(llmConfig.reasoningEffort);
+  if (reasoningEffortEl) reasoningEffortEl.value = reasoningLabel ? llmConfig.reasoningEffort : 'default';
   const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
   if (setupBanner) setupBanner.hidden = configured;
   if (modelBadge) {
     modelBadge.textContent = configured
-      ? `${llmConfig.model}${llmConfig.toolMode === 'prompt' ? ' · 旧版兼容' : ''}`
+      ? `${llmConfig.model}${llmConfig.toolMode === 'prompt' ? ' · 旧版兼容' : ''}${reasoningLabel ? ` · 思考:${reasoningLabel}` : ''}`
       : '未配置模型';
   }
 }
@@ -118,6 +302,7 @@ function readApiDraft() {
     baseUrl: baseUrlEl.value.trim(),
     model: modelEl.value.trim(),
     toolMode: toolModeEl.value,
+    reasoningEffort: reasoningEffortEl?.value || 'default',
   };
   if (clearApiKeyPending) draft.apiKey = '';
   else if (apiKeyEl.value.trim()) draft.apiKey = apiKeyEl.value.trim();
@@ -213,13 +398,40 @@ async function sendPrompt(rawText) {
     setApiStatus('请先填写本地模型 API 地址和模型名称', true);
     return;
   }
-  const currentProjectId = state.view?.projectId ?? null;
-  if (chatProjectId !== null && currentProjectId !== chatProjectId) {
-    chatHistory = [];
-    chatGeneration++;
+  const currentProjectId = state.view?.projectId ?? chatProjectId;
+  if (chatProjectId === null || (currentProjectId !== null && currentProjectId !== chatProjectId)) {
+    await loadProjectChats({ force: true });
   }
-  chatProjectId = currentProjectId;
+  const thread = activeThread();
+  const threadId = thread.id;
+  const myProjectId = chatProjectId;
   const myGen = chatGeneration;
+
+  // 若是该对话首条消息，自动用问题摘要命名
+  if (!thread.messages.length) {
+    thread.title = text.replace(/\s+/g, ' ').slice(0, 22) || '新对话';
+  }
+  const historySnapshot = thread.messages
+    .filter((m) => !m.error && m.text)
+    .slice(-8)
+    .map((m) => {
+      let content = m.text;
+      if (m.role === 'assistant' && Array.isArray(m.questionOptions) && m.questionOptions.length) {
+        const optText = m.questionOptions.map((opt) => (opt.description ? `${opt.label}（${opt.description}）` : opt.label)).join(' / ');
+        content = `${content}\n[已提供选项：${optText}]`;
+      }
+      return { role: m.role, content };
+    });
+
+  const questionCard = messagesEl.lastElementChild?.querySelector('.ai-question');
+  if (questionCard) {
+    for (const button of questionCard.querySelectorAll('.ai-q-opt')) button.disabled = true;
+    questionCard.querySelector('.ai-q-hint')?.remove();
+  }
+  thread.messages.push({ role: 'user', text });
+  thread.updatedAt = Date.now();
+  renderChatBar();
+  persistChats(myProjectId);
 
   inputEl.value = '';
   appendUserMessage(text);
@@ -228,15 +440,30 @@ async function sendPrompt(rawText) {
   sendBtn.disabled = true;
   stopBtn.hidden = false;
 
-  const historySnapshot = chatHistory.slice(-8);
   let lastPendingStep = null;
   let terminalReceived = false;
+  let thinking = '';
+  const collectedTools = [];
+  const commitAssistantMsg = (entry) => {
+    if (myGen !== chatGeneration || chatProjectId !== myProjectId) return;
+    const target = chatThreads.find((x) => x.id === threadId);
+    if (!target) return;
+    target.messages.push(entry);
+    target.updatedAt = Date.now();
+    // 最近活跃对话排到最前
+    chatThreads.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    renderChatBar();
+    persistChats(myProjectId);
+  };
   const handleLine = (line) => {
-    if (!line.trim()) return;
+    if (terminalReceived || !line.trim()) return;
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
     if (ev.type === 'status') {
       ui.text.textContent = ev.text;
+    } else if (ev.type === 'thinking') {
+      if (ev.text) thinking = thinking ? `${thinking}\n\n${ev.text}` : ev.text;
+      showThinking(ui.box, ui.text, thinking);
     } else if (ev.type === 'fallback') {
       addStep(ui.steps, `↻ ${ev.text}`);
     } else if (ev.type === 'tool_start') {
@@ -244,6 +471,7 @@ async function sendPrompt(rawText) {
         ? ` ${JSON.stringify(ev.arguments).slice(0, 80)}` : '';
       lastPendingStep = addStep(ui.steps, `🔧 ${ev.name}${argBrief}…`);
     } else if (ev.type === 'tool_end') {
+      collectedTools.push({ name: ev.name, ok: ev.ok !== false, summary: ev.summary || '' });
       if (lastPendingStep) {
         lastPendingStep.textContent = `${ev.ok ? '✓' : '✕'} ${ev.name}：${ev.summary}`;
         lastPendingStep.classList.add(ev.ok ? 'ok' : 'err');
@@ -251,22 +479,27 @@ async function sendPrompt(rawText) {
       } else {
         addStep(ui.steps, `${ev.ok ? '✓' : '✕'} ${ev.name}：${ev.summary}`, ev.ok ? 'ok' : 'err');
       }
-    } else if (ev.type === 'done') {
+    } else if (ev.type === 'done' || ev.type === 'question') {
       terminalReceived = true;
-      if (ev.thinking) {
-        const details = document.createElement('details');
-        details.className = 'ai-think';
-        details.innerHTML = `<summary>查看模型思考过程</summary><pre>${esc(ev.thinking)}</pre>`;
-        ui.box.insertBefore(details, ui.text);
+      thinking = ev.thinking || thinking;
+      showThinking(ui.box, ui.text, thinking);
+      const entry = { role: 'assistant', thinking, tools: collectedTools };
+      if (ev.type === 'question') {
+        entry.text = ev.question || '请确认以下选项：';
+        entry.questionOptions = Array.isArray(ev.options) ? ev.options : [];
+        entry.allowCustom = ev.allowCustom !== false;
+      } else {
+        entry.text = ev.answer || '已完成。';
       }
-      ui.text.textContent = ev.answer || '已完成。';
-      if (myGen === chatGeneration && (state.view?.projectId ?? null) === currentProjectId) {
-        chatHistory.push({ role: 'user', content: text }, { role: 'assistant', content: ev.answer || '' });
-      }
+      ui.text.textContent = entry.text;
+      commitAssistantMsg(entry);
+      if (ev.type === 'question') renderQuestion(ui.text, entry, thread);
     } else if (ev.type === 'error') {
       terminalReceived = true;
       ui.box.className = 'ai-msg error';
-      ui.text.textContent = ev.error || '执行失败';
+      const msg = ev.error || '执行失败';
+      ui.text.textContent = msg;
+      commitAssistantMsg({ role: 'assistant', text: msg, thinking, tools: collectedTools, error: true });
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
@@ -315,6 +548,7 @@ async function openDrawer() {
     const [mcpCfg, aiCfg] = await Promise.all([
       api.mcpConfig().catch(() => null),
       api.aiConfig().catch(() => null),
+      loadProjectChats({ force: true }),
     ]);
     if (mcpCfg) {
       mcpLevel = mcpCfg.level;
@@ -327,6 +561,46 @@ async function openDrawer() {
   if (!llmConfig.baseUrl || !llmConfig.model) setTab('api');
   else setTab(currentTab);
 }
+
+// 切换工程时自动隔离并切换到目标工程的独立对话列表
+document.addEventListener('cg:project-changed', () => {
+  chatGeneration++;
+  chatProjectId = null;
+  chatThreads = [];
+  activeChatId = '';
+  if (activeAbort) {
+    activeAbort.abort();
+    activeAbort = null;
+  }
+  if (drawer?.classList.contains('show')) void loadProjectChats({ force: true });
+});
+
+if (chatSelectEl) chatSelectEl.addEventListener('change', () => {
+  if (activeAbort) activeAbort.abort();
+  activeChatId = chatSelectEl.value;
+  renderChatBar();
+  renderThreadMessages();
+  persistChats();
+});
+if (newChatBtn) newChatBtn.addEventListener('click', () => {
+  if (activeAbort) activeAbort.abort();
+  const th = newThreadObject();
+  chatThreads.unshift(th);
+  activeChatId = th.id;
+  renderChatBar();
+  renderThreadMessages();
+  persistChats();
+  inputEl?.focus();
+});
+if (deleteChatBtn) deleteChatBtn.addEventListener('click', () => {
+  if (activeAbort) activeAbort.abort();
+  chatThreads = chatThreads.filter((x) => x.id !== activeChatId);
+  if (!chatThreads.length) chatThreads.push(newThreadObject());
+  activeChatId = chatThreads[0].id;
+  renderChatBar();
+  renderThreadMessages();
+  persistChats();
+});
 
 if (btn) btn.addEventListener('click', openDrawer);
 if (closeBtn) closeBtn.addEventListener('click', () => drawer?.classList.remove('show'));
@@ -343,13 +617,13 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
   quick.addEventListener('click', () => {
     const kind = quick.dataset.aiQuick;
     if (kind === 'git') {
-      sendPrompt('查看当前 Git 未提交改动，把修改的函数及上游 TASK 调用链直接加入画布，并简述改动影响。');
+      sendPrompt('先调用 get_git_changes 查看当前 Git 未提交改动。如果改动包含多个互不关联的独立模块，请先用 ask_user 询问我是否按书签拆分成多个图（默认推荐按书签拆分）；如果只有单一改动链路，直接调用 add_to_canvas({ fromGit: true }) 加入画布并简述影响。');
     } else if (kind === 'find') {
       inputEl.value = '帮我找出和 ';
       inputEl.focus();
       inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
     } else if (kind === 'labels') {
-      sendPrompt('查看当前画布上的函数和调用关系，给有明确周期依据的调用连线补全 TASK 周期或 コール順 标签。');
+      sendPrompt('立即补全当前画布上缺失的 TASK 周期（含函数上方注释中的周期）和 コール順 标签：先调 find_symbols({}) 查看画布连线与自动识别的候选标签，再直接调用 apply_labels 把标签写入画布（コール順 不带注释），不要只口头列出。');
     }
   });
 }
@@ -357,9 +631,15 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
 if (sendBtn) sendBtn.addEventListener('click', () => sendPrompt());
 if (stopBtn) stopBtn.addEventListener('click', () => activeAbort?.abort());
 if (clearBtn) clearBtn.addEventListener('click', () => {
+  if (activeAbort) activeAbort.abort();
   chatGeneration++;
-  chatHistory = [];
-  messagesEl.innerHTML = '<div class="empty">已清空对话。可直接让我找函数加入画布或分析 Git 改动。</div>';
+  const th = activeThread();
+  th.messages = [];
+  th.title = '新对话';
+  th.updatedAt = Date.now();
+  renderChatBar();
+  renderThreadMessages();
+  persistChats();
 });
 if (inputEl) inputEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -369,12 +649,6 @@ if (inputEl) inputEl.addEventListener('keydown', (e) => {
 });
 
 // API 配置事件
-for (const preset of document.querySelectorAll('[data-ai-preset]')) {
-  preset.addEventListener('click', () => {
-    baseUrlEl.value = preset.dataset.aiPreset;
-    setApiStatus('');
-  });
-}
 if (apiKeyEl) apiKeyEl.addEventListener('input', () => {
   if (apiKeyEl.value) clearApiKeyPending = false;
 });

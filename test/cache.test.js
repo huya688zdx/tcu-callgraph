@@ -20,7 +20,7 @@ function tmpStore(t) {
   return store;
 }
 
-test('cacheKey：文件清单顺序无关，mtime 变化会换 key', () => {
+test('cacheKey：文件清单顺序无关，mtime 或 ctime 变化会换 key', () => {
   const files = [
     { rel: 'a.c', bytes: 10, mtimeMs: 1000, isHeader: false },
     { rel: 'b.h', bytes: 20, mtimeMs: 2000, isHeader: true },
@@ -31,18 +31,21 @@ test('cacheKey：文件清单顺序无关，mtime 变化会换 key', () => {
   // 大小没变但 mtime 变了：必须换 key，否则「同大小改写」会一直命中旧缓存
   const touched = [{ ...files[0], mtimeMs: 3000 }, files[1]];
   assert.notEqual(k1, cacheKey(touched));
+  const restoredMtime = [{ ...files[0], ctimeMs: 1001 }, files[1]];
+  assert.notEqual(k1, cacheKey(restoredMtime));
 
   // focusFile 不同也要区分：同一个目录下聚焦不同 .c 文件，模型里的 focusFile 不一样
   assert.notEqual(cacheKey(files), cacheKey(files, 'a.c'));
 });
 
-test('scanSources：返回 rel / bytes / mtime / isHeader', () => {
+test('scanSources：返回 rel / bytes / mtime / ctime / isHeader', () => {
   const files = scanSources(SAMPLE);
   assert.ok(files.length > 0);
   for (const f of files) {
     assert.equal(typeof f.rel, 'string');
     assert.ok(f.bytes > 0);
     assert.ok(f.mtimeMs > 0);
+    assert.ok(f.ctimeMs > 0);
     assert.equal(typeof f.isHeader, 'boolean');
   }
   assert.ok(files.some((f) => f.isHeader), '样例里有头文件');

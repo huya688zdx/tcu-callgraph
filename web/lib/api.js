@@ -8,6 +8,7 @@ export const clientId = crypto.randomUUID();
 
 const get = (url) => fetch(url).then((r) => r.json());
 let layoutWrites = Promise.resolve();
+let chatWrites = Promise.resolve();
 
 async function parseView(response) {
   const view = await response.json();
@@ -144,9 +145,16 @@ export const api = {
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
-  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试与对话 */
+  /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试、按工程隔离的对话管理与对话 */
   aiConfig: () => get('/api/ai/config'),
   saveAiConfig: (body) => post('/api/ai/config', body),
+  aiChats: () => chatWrites.then(() => get('/api/ai/chats')),
+  saveAiChats(body) {
+    const snapshot = structuredClone(body);
+    const write = chatWrites.then(() => post('/api/ai/chats', snapshot));
+    chatWrites = write.catch(() => {});
+    return write;
+  },
   aiModels: (body) => post('/api/ai/models', body),
   aiTest: (body) => post('/api/ai/test', body),
   aiChat: (body, signal) =>

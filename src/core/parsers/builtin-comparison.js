@@ -207,32 +207,84 @@ function functionWrites(fn, model, id, findMacros) {
   return results;
 }
 
-export async function definitionsOf(model, findMacros) {
+function fileAccessSummary(model) {
+  const byFile = new Map();
+  const accessSummary = records => [...records].map(([id, access]) => {
+    const { name, containsUnion } = model._df.byId.get(id);
+    // 读写映射的迭代顺序会影响保守依赖的顺序，也纳入签名。
+    return [id, name, containsUnion, [...access.fields], [...access.lines].sort((a, b) => a - b),
+      access.indirect, access.whole];
+  });
+  for (const [id, { reads, writes }] of model._df.fnAccess) {
+    const { file } = model._index.byId.get(id);
+    if (!byFile.has(file)) byFile.set(file, []);
+    const calls = (model._index.outAdj.get(id) || []).filter(e => e.kind !== 'var')
+      .map(e => [e.line, e.to, e.callee, e.via]);
+    byFile.get(file).push([id, accessSummary(reads), accessSummary(writes), calls]);
+  }
+  for (const entries of byFile.values()) entries.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return byFile;
+}
+
+function mergeDefinitions(target, definitions) {
+  for (const [id, d] of definitions) {
+    const prev = target.get(id);
+    if (!prev || (prev.isExtern && !d.isExtern)) target.set(id, d);
+  }
+}
+
+export async function definitionsOf(model, findMacros, prevDefs = null) {
   const { sources, failedFiles } = analysisSources(model);
   if (failedFiles) throw new Error('部分源码读取失败，无法完成工程比较');
   const parser = await getParser();
   const raw = new Map(), expanded = new Map(), other = new Map(), writes = new Map(), rawWrites = new Map();
+  const _byFile = new Map();
+  const accesses = fileAccessSummary(model);
   for (const f of sources) {
-    for (const [text, target] of [[f.src, raw], [f.expanded, expanded]]) {
-      const tree = parser.parse(text);
+    const sig = createHash('sha256').update(JSON.stringify([
+      f.src, f.expanded, accesses.get(f.rel), [...findMacros(f.src)].sort(),
+    ])).digest('hex');
+    let file = prevDefs?._byFile?.get(f.rel);
+    if (file?.sig !== sig) {
+      file = { sig, raw: new Map(), expanded: new Map(), writes: new Map(), rawWrites: new Map() };
+      const rawTree = parser.parse(f.src);
+      let expandedTree = rawTree;
       try {
-        const collected = collectDefinitions(tree.rootNode);
-        if (target === raw) other.set(f.rel, fingerprint(collected.other.join('\n')));
-        for (const d of collected.definitions) {
+        if (f.expanded !== f.src) expandedTree = parser.parse(f.expanded);
+        const rawDefs = collectDefinitions(rawTree.rootNode);
+        file.other = fingerprint(rawDefs.other.join('\n'));
+        const collect = definitions => definitions.map(d => {
           const id = d.kind === 'fn' ? `${f.rel}::${d.name}` : d.isStatic ? `var::${f.rel}::${d.name}` : `var::${d.name}`;
-          const prev = target.get(id);
-          if (!prev || (prev.isExtern && !d.isExtern)) target.set(id, { text: d.text, value: fingerprint(d.text), isExtern: d.isExtern });
-        }
-        for (const [name, fn] of collectFunctions(tree.rootNode)) {
+          return [id, { text: d.text, value: fingerprint(d.text), isExtern: d.isExtern }];
+        });
+        mergeDefinitions(file.raw, collect(rawDefs.definitions));
+        if (expandedTree === rawTree) file.expanded = file.raw;
+        else mergeDefinitions(file.expanded, collect(collectDefinitions(expandedTree.rootNode).definitions));
+        const rawFunctions = collectFunctions(rawTree.rootNode);
+        const expandedFunctions = expandedTree === rawTree ? rawFunctions : collectFunctions(expandedTree.rootNode);
+        for (const [name, fn] of rawFunctions) {
           const id = `${f.rel}::${name}`;
-          if (!model._df.fnAccess.get(id)?.writes.size) continue;
-          if (target === expanded) writes.set(id, functionWrites(fn, model, id));
-          else if (findMacros(fn.text).size) rawWrites.set(id, functionWrites(fn, model, id, findMacros));
+          if (model._df.fnAccess.get(id)?.writes.size && findMacros(fn.text).size) {
+            file.rawWrites.set(id, functionWrites(fn, model, id, findMacros));
+          }
         }
-      } finally { tree.delete(); }
+        for (const [name, fn] of expandedFunctions) {
+          const id = `${f.rel}::${name}`;
+          if (model._df.fnAccess.get(id)?.writes.size) file.writes.set(id, functionWrites(fn, model, id));
+        }
+      } finally {
+        if (expandedTree !== rawTree) expandedTree.delete();
+        rawTree.delete();
+      }
     }
+    _byFile.set(f.rel, file);
+    other.set(f.rel, file.other);
+    mergeDefinitions(raw, file.raw);
+    mergeDefinitions(expanded, file.expanded);
+    for (const [id, entries] of file.writes) writes.set(id, entries);
+    for (const [id, entries] of file.rawWrites) rawWrites.set(id, entries);
   }
-  return { raw, expanded, other, writes, rawWrites };
+  return { raw, expanded, other, writes, rawWrites, _byFile };
 }
 
 export function macroDiff(beforeModel, afterModel) {

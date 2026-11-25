@@ -88,9 +88,9 @@ export function normalizeLabel(raw) {
   if (!text) return null;
   const label = { preset, text, border, color, dx: Math.round(dx), dy: Math.round(dy) };
   if (preset === 'conn') label.num = num;
-  // 说明行：控制字符拍平、限长，任何预设都可以带（结合点挂解释说明是主场景）
+  // 说明行：控制字符拍平、限长；コール順（call）标签不附带注释说明。
   const note =
-    typeof raw.note === 'string' && raw.note.trim()
+    preset !== 'call' && typeof raw.note === 'string' && raw.note.trim()
       ? raw.note.replace(/[\r\n\t]/g, ' ').slice(0, LABEL_NOTE_MAX).trim()
       : '';
   if (note) label.note = note;
@@ -212,7 +212,6 @@ export function displayEdgeLabels(edge, labels = [], viewOrCaller) {
   }
   if (!orderNum) return labels;
   const label = normalizeLabel({ id: 'auto', preset: 'call', text: `${LABEL_PRESETS.call.text}${orderNum}` });
-  if (edge.versions?.length === 1) label.note = edge.versions.includes('after') ? '修改后' : '修改前';
   return [...labels, { ...label, id: 'auto', auto: true, orderNum }];
 }
 

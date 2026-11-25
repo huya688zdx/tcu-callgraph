@@ -18,6 +18,8 @@ const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const maxSourceBytes = 8 * 1024 * 1024;
 const defaultGitTimeoutMs = 120_000;
 const ioConcurrency = 16;
+const analyzedComparisons = new Map();
+const analyzedComparisonLimit = 4;
 
 // 只让 Git 扫描关心的 C/H 源码与调度配置，避免在大仓库里遍历海量非源码文件或构建产物。
 const sourcePathspecs = [
@@ -153,11 +155,11 @@ async function locateRepo(projectPath) {
     return { ok: true, isRepo: false, reason: 'projectNotDirectory' };
   }
   try {
-    const [top, prefix] = await Promise.all([
-      git(root, ['rev-parse', '--show-toplevel']),
-      git(root, ['rev-parse', '--show-prefix']),
-    ]);
-    return { ok: true, isRepo: true, root, repoRoot: singleLine(top), projectPrefix: singleLine(prefix) };
+    const output = await git(root, ['rev-parse', '--show-toplevel', '--show-prefix']);
+    const separator = output.indexOf('\n');
+    const repoRoot = singleLine(output.slice(0, separator + 1));
+    const projectPrefix = singleLine(output.slice(separator + 1));
+    return { ok: true, isRepo: true, root, repoRoot, projectPrefix };
   } catch (error) {
     return { ok: true, isRepo: false, reason: error.code === 'ENOENT' ? 'gitUnavailable' : 'notRepository' };
   }
@@ -205,6 +207,21 @@ function workingStatus(repo, output) {
   }
   summary.dirty = files.length > 0;
   return summary;
+}
+
+export async function quickGitDirtySummary(projectPath) {
+  try {
+    const repo = await locateRepo(projectPath);
+    if (repo.isRepo) {
+      const porcelain = await git(repo.root, [
+        'status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=normal', '--', ...sourcePathspecs,
+      ]);
+      return { isRepo: true, dirtyFiles: workingStatus(repo, porcelain).files.map(({ file }) => file) };
+    }
+  } catch {
+    // 快速查询失败时采用和非仓库相同的结果。
+  }
+  return { isRepo: false, dirtyFiles: [] };
 }
 
 export async function inspectGitRepo(projectPath) {
@@ -716,7 +733,30 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
     ? { headSha: target.sha, headFiles: after }
     : null;
   // 延迟分析时工作区可能已继续编辑，不再沿用首次的 cleanDisk 提示，改为重新核对。
-  const analyze = (hint = null) => analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
+  const analyze = async (hint = null) => {
+    const parserId = compareOptions.parserId || 'builtin';
+    if (parserId !== 'builtin') {
+      return analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
+    }
+    const key = JSON.stringify([repo.repoRoot, repo.projectPrefix, baseRef, base.sha, targetRef, target?.sha,
+      worktree?.fingerprint, includeUntracked, parserId, compareOptions.parserOptions || null]);
+    // INDEX 没有提交 SHA，需核对暂存对象。重命名结果也可能随 Git 配置变化。
+    const validation = JSON.stringify([targetRef === indexRef ? [...after].sort() : null, changes,
+      metadata.baseLabel, metadata.targetLabel]);
+    const entry = analyzedComparisons.get(key);
+    let cached;
+    if (entry?.validation === validation) {
+      cached = entry.result;
+    } else {
+      cached = await analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
+    }
+    analyzedComparisons.delete(key);
+    analyzedComparisons.set(key, { validation, result: cached });
+    if (analyzedComparisons.size > analyzedComparisonLimit) {
+      analyzedComparisons.delete(analyzedComparisons.keys().next().value);
+    }
+    return { ...cached, git: { ...cached.git } };
+  };
   if (!changes.length && !compareOptions.allowEmptyRefresh) {
     return { projectPath: repo.root, git: metadata, summary: emptySummary(), roots: [], candidates: [],
       changePoints: [], impactIds: [], macroChanges: [], macroDetails: [], warnings: [], mappings: [], totalNodes: 0,

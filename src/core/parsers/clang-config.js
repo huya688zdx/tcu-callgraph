@@ -5,15 +5,21 @@ import { SRC_EXT } from '../source-files.js';
 
 export const fileKey = (rel) => process.platform === 'win32' ? rel.toLowerCase() : rel;
 
+const clangDetectCache = new Map();
+
 export function detectClang(customBin) {
   const bin = customBin || process.env.CALLGRAPH_CLANG || 'clang';
+  if (clangDetectCache.has(bin)) return clangDetectCache.get(bin);
+  let result;
   try {
     const version = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true }).split(/\r?\n/)[0];
     if (!/clang version/i.test(version)) throw new Error('未返回 Clang 版本');
-    return { ok: true, bin, version, reason: null };
+    result = { ok: true, bin, version, reason: null };
   } catch (error) {
-    return { ok: false, bin, version: null, reason: `无法运行 Clang（${bin}）：${error.code || error.message}` };
+    result = { ok: false, bin, version: null, reason: `无法运行 Clang（${bin}）：${error.code || error.message}` };
   }
+  clangDetectCache.set(bin, result);
+  return result;
 }
 
 export function relativeFile(root, file) {

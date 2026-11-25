@@ -13,6 +13,7 @@ import {
   runAiAgent,
 } from '../src/core/ai-agent.js';
 import { launchServer } from '../scripts/lib/server.mjs';
+import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
 test('normalizeBaseUrl 兼容根地址、/v1 与完整 /chat/completions，并拒绝非法协议', () => {
   assert.deepEqual(normalizeBaseUrl('http://127.0.0.1:11434'), {
@@ -110,6 +111,49 @@ test('runAiAgent：兼容旧版 OpenAI function_call 字段', async () => {
   assert.equal(res.toolLog[0].name, 'find_symbols');
 });
 
+test('AI 对话保存按修改顺序上传，失败后继续写入，读取等待待保存快照', async t => {
+  const originalDocument = globalThis.document;
+  globalThis.document = { getElementById: () => ({ getContext: () => null }) };
+  t.after(() => { globalThis.document = originalDocument; });
+  const { api } = await import('../web/lib/api.js');
+  let releaseFirst;
+  const delay = new Promise(resolve => { releaseFirst = resolve; });
+  let saved;
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, '/api/ai/chats');
+    if (!options) {
+      requests.push('GET');
+      return Response.json(saved);
+    }
+    const snapshot = JSON.parse(options.body);
+    requests.push(snapshot.activeId);
+    if (snapshot.activeId === 'original') await delay;
+    if (snapshot.activeId === 'failed') throw new Error('连接断开');
+    saved = snapshot;
+    return Response.json({ ok: true });
+  });
+  const payload = { projectId: 1, activeId: 'original', threads: [{ id: 'original', messages: ['原始消息'] }] };
+  const first = api.saveAiChats(payload);
+  payload.threads[0].messages.push('晚于首次保存');
+  const failed = api.saveAiChats({ projectId: 1, activeId: 'failed', threads: [] });
+  const checkFailure = assert.rejects(failed, /连接断开/);
+  const cleared = api.saveAiChats({ projectId: 1, activeId: '', threads: [] });
+  const reload = api.aiChats();
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    assert.deepEqual(requests, ['original']);
+  } finally {
+    releaseFirst();
+  }
+  await first;
+  assert.deepEqual(saved.threads[0].messages, ['原始消息']);
+  await checkFailure;
+  await cleared;
+  assert.deepEqual(await reload, { projectId: 1, activeId: '', threads: [] });
+  assert.deepEqual(requests, ['original', 'failed', '', 'GET']);
+});
+
 test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Git 未提交改动与短函数名加入画布', async t => {
   // 1. 准备一个带未提交修改的临时 Git 仓库
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-direct-'));
@@ -118,7 +162,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
   git('init', '-q', '-b', 'main');
   git('config', 'user.name', 'Test');
   git('config', 'user.email', 'test@example.invalid');
-  const code = 'int g_oil;\nvoid range_gather(void) { g_oil = 1; }\nvoid task_10ms(void) { range_gather(); }\n';
+  const code = 'int g_oil;\nvoid verify_range(void) {}\nvoid range_gather(void) { g_oil = 1; }\nvoid task_10ms(void) { range_gather(); }\n';
   fs.writeFileSync(path.join(repoDir, 'app.c'), code);
   git('add', 'app.c');
   git('commit', '-q', '-m', 'init');
@@ -138,6 +182,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
 
   // 2. 起一个模拟旧版 OpenAI 兼容服务（拒绝 tools 字段，只认纯对话）
   let chatTurn = 0;
+  let addArgs = { fromGit: true, vars: ['g_oil'] };
   const mockLlm = http.createServer((req, res) => {
     if (req.url === '/v1/models' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -159,7 +204,13 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (chatTurn === 1) {
         return res.end(JSON.stringify({
-          choices: [{ message: { role: 'assistant', content: '<think>读取未提交改动并直接加入画布</think><tool_call>{"name":"add_to_canvas","arguments":{"fromGit":true,"vars":["g_oil"]}}</tool_call>' } }],
+          choices: [{ message: { role: 'assistant', content: '<think>读取未提交改动并直接加入画布</think><tool_call>' +
+            JSON.stringify({ name: 'add_to_canvas', arguments: addArgs }) + '</tool_call>' } }],
+        }));
+      }
+      if (chatTurn === 2) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '<tool_call>{"name":"get_git_changes","arguments":{"baseRef":"HEAD~1","targetRef":"HEAD"}}</tool_call>' } }],
         }));
       }
       return res.end(JSON.stringify({
@@ -203,10 +254,13 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     const active = await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: ['app.c::range_gather'] });
     assert.ok(active.ok, active.error);
     chatTurn = 0;
+    const viewResponse = await fetch(srv.baseUrl + '/api/view');
+    const session = viewResponse.headers.get('X-Callgraph-Session');
+    await viewResponse.text();
 
     const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Callgraph-Session': session },
       body: JSON.stringify({ prompt: '把 Git 改动加到画布' }),
     });
     assert.equal(chatRes.status, 200);
@@ -214,6 +268,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     assert.ok(events.some(e => e.type === 'fallback'), '旧接口应触发自动降级');
     const toolDone = events.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas');
     assert.equal(toolDone?.ok, true, JSON.stringify(events));
+    assert.equal(events.find(e => e.type === 'tool_end' && e.name === 'get_git_changes')?.ok, true, JSON.stringify(events));
     const done = events.find(e => e.type === 'done');
     assert.match(done?.answer || '', /range_gather/);
 
@@ -227,6 +282,91 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     assert.equal((await post('/api/compare/exit', {})).comparison, null);
     assert.deepEqual(await get('/api/page'), baseline);
   }
+
+  await t.test('发起比较切换的浏览器收到新画布后继续当前对话', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    const prepared = await post('/api/compare', { mode: 'git', baseRef: 'HEAD~1', targetRef: 'HEAD' });
+    assert.ok(prepared.preview?.id, prepared.error);
+    const active = await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: ['app.c::range_gather'] });
+    assert.ok(active.ok, active.error);
+    browserTest.after(() => post('/api/compare/exit', {}));
+    chatTurn = 0;
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const { evaluate, waitFor } = browser;
+    await waitFor(`window.__cg?.view?.comparison?.git?.targetRef === 'HEAD'`);
+    await evaluate(`document.querySelector('#aiBtn').click()`);
+    await waitFor(`document.querySelector('#aiModel').value === 'qwen3.8-27b'`);
+    await evaluate(`(() => {
+      window.__chatProjectChanges = 0;
+      document.addEventListener('cg:project-changed', () => { window.__chatProjectChanges++; });
+      document.querySelector('#aiPromptInput').value = '把工作区改动加入比较画布';
+      document.querySelector('#aiSendChat').click();
+    })()`);
+    await waitFor(`window.__cg?.view?.comparison?.git?.targetRef === 'WORKTREE'`);
+    await waitFor(`document.querySelector('#aiMessages').textContent.includes('已将改动函数 range_gather')`);
+    assert.equal(await evaluate('window.__chatProjectChanges'), 0);
+  });
+
+  // 4. 普通模式下调用 AI 组图：应停留在可编辑画布（非只读比较预览），自动标出变更色与 TASK:10ms 线段标签，且流程图带变更色并可缓存
+  // 工程已打开，仅在同样的两个函数 ID 之间新增调用，旧模型不应吞掉新增连线。
+  fs.writeFileSync(path.join(repoDir, 'app.c'), worktree.replace('g_oil = 3;', 'g_oil = 3; verify_range();'));
+  addArgs = { ...addArgs, functions: ['range_gather', 'verify_range'], mode: 'add' };
+  chatTurn = 0;
+  const normalChat = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '把 Git 未提交改动加到普通可编辑画布' }),
+  });
+  assert.equal(normalChat.status, 200);
+  const normalEvents = (await normalChat.text()).trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(normalEvents.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas')?.ok, true, JSON.stringify(normalEvents));
+  assert.equal(normalEvents.find(e => e.type === 'tool_end' && e.name === 'get_git_changes')?.ok, true, JSON.stringify(normalEvents));
+  const normalPage = await get('/api/page');
+  assert.ok(normalPage.page.roots.includes('app.c::task_10ms'), '应自动补齐上游 TASK 入口到画布');
+  assert.ok(normalPage.page.vars.includes('var::g_oil'), '应按短变量名自动解析并加入画布');
+
+  const proj = await get('/api/project');
+  assert.equal(proj.comparison, null, '普通模式下 AI 组图后不应卡在只读比较预览状态');
+  const expandedView = await get('/api/view?root=app.c%3A%3Atask_10ms&up=0&down=2&group=1');
+  const newCall = expandedView.edges.find(e => e.from === 'app.c::range_gather' && e.to === 'app.c::verify_range');
+  assert.equal(newCall?.change, 'added', '已存在函数之间的新增调用应进入可编辑画布并标为新增');
+  const view = await get('/api/view?root=' + encodeURIComponent('app.c::task_10ms') + '&up=0&down=1&group=1');
+  const changedFn = view.nodes.find((n) => n.id === 'app.c::range_gather');
+  assert.equal(changedFn?.change, 'modified', '普通可编辑画布应保留 Git 变更颜色');
+  const taskEdge = view.edges.find((e) => e.from === 'app.c::task_10ms' && e.to === 'app.c::range_gather');
+  assert.ok(taskEdge?.labels?.some((l) => l.preset === 'task' && l.text === 'TASK:10ms'), '应自动用线段标签标出 TASK:10ms');
+
+  const fc = await get('/api/flowchart?id=' + encodeURIComponent('app.c::range_gather') + '&version=after&expandMacros=0&projectId=' + proj.id);
+  assert.equal(fc.ok, true);
+  assert.ok(fc.nodes.some((n) => n.change === 'modified'), '修改函数的流程图节点应标出修改色');
+  const fc2 = await get('/api/flowchart?id=' + encodeURIComponent('app.c::range_gather') + '&version=after&expandMacros=0&projectId=' + proj.id);
+  assert.equal(fc2.cached, true, '有变更函数的流程图应持久化保存并命中缓存');
+
+  // 5. 验证 AI 对话管理与不同工程隔离
+  const saveChat1 = await post('/api/ai/chats', {
+    projectId: proj.id,
+    activeId: 't1',
+    threads: [{ id: 't1', title: '工程A对话', updatedAt: Date.now(), messages: [{ role: 'user', text: '分析 A' }] }],
+  });
+  assert.equal(saveChat1.ok, true);
+  const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-other-'));
+  t.after(() => fs.rmSync(otherDir, { recursive: true, force: true, maxRetries: 3 }));
+  fs.writeFileSync(path.join(otherDir, 'other.c'), 'void Other_Fn(void) {}\n');
+  assert.equal((await post('/api/switch', { path: otherDir })).ok, true);
+  const chatsB = await get('/api/ai/chats');
+  assert.equal(chatsB.threads.length, 0, '切换到新工程后对话列表必须与旧工程隔离');
+  // 用旧 projectId 保存必须被 409 拦截
+  const staleSave = await fetch(srv.baseUrl + '/api/ai/chats', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId: proj.id, activeId: 't1', threads: [] }),
+  });
+  assert.equal(staleSave.status, 409);
+  // 切回原工程后原对话完整恢复
+  assert.equal((await post('/api/switch', { path: repoDir })).ok, true);
+  const chatsA = await get('/api/ai/chats');
+  assert.equal(chatsA.threads.length, 1);
+  assert.equal(chatsA.threads[0].title, '工程A对话');
 });
 
 test('normalizeAiConfig 切换 baseUrl 时不继承旧 apiKey；mid-turn 降级不重复执行写工具', async () => {
@@ -305,4 +445,174 @@ test('runAiAgent：缺失 tool_calls[].id 时助手与回复成对规范化，�
   assert.equal(toolMsg.tool_call_id, assistantMsg.tool_calls[0].id, 'tool_call_id 必须与助手声明一致');
   const parsedTool = JSON.parse(toolMsg.content);
   assert.equal(parsedTool.truncated, true, '裁剪后的工具返回必须仍是合法 JSON');
+});
+
+test('runAiAgent：支持思考等级参数、旧接口 400 自动降级、实时 thinking 事件与 ask_user 交互提问', async () => {
+  const seen = [];
+  const events = [];
+  let turn = 0;
+  const fetchImpl = async (_url, opts) => {
+    turn++;
+    const body = JSON.parse(opts.body);
+    seen.push(body);
+    if (turn === 1) {
+      assert.equal(body.reasoning_effort, 'high');
+      return new Response(JSON.stringify({ error: { message: 'Unknown parameter: reasoning_effort' } }), { status: 400 });
+    }
+    assert.equal(body.reasoning_effort, undefined, '降级后不应再发 reasoning_effort');
+    assert.ok(Array.isArray(body.tools), '思考参数降级不应破坏标准 tools 模式');
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          role: 'assistant',
+          reasoning: '发现两组隔离改动，先询问用户是否拆书签',
+          content: '',
+          tool_calls: [{
+            id: 'q1',
+            type: 'function',
+            function: {
+              name: 'ask_user',
+              arguments: JSON.stringify({
+                question: '检测到 2 组互不关联的 Git 改动，要如何生成？',
+                options: [
+                  { label: '按书签拆分 2 个图', description: '推荐，避免画面杂乱' },
+                  { label: '合并到一个图' },
+                ],
+              }),
+            },
+          }],
+        },
+      }],
+    }), { status: 200 });
+  };
+  const res = await runAiAgent({
+    config: normalizeAiConfig({ baseUrl: 'http://127.0.0.1:8000/v1', model: 'qwen', toolMode: 'auto', reasoningEffort: 'high' }),
+    prompt: '分析 Git 改动',
+    executeTool: async () => { throw new Error('ask_user 不应执行普通工具'); },
+    onEvent: (ev) => events.push(ev),
+    fetchImpl,
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.awaitingUser, true);
+  assert.equal(res.options.length, 2);
+  assert.ok(events.some((e) => e.type === 'fallback'), '应发送思考参数降级提示');
+  assert.ok(events.some((e) => e.type === 'thinking' && /隔离改动/.test(e.text)), '应实时发送 thinking 事件');
+  assert.ok(events.some((e) => e.type === 'question' && e.options.length === 2), '应发送 question 卡片事件');
+});
+
+test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离的 Git 改动自动拆分书签', async t => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-groups-'));
+  t.after(() => fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 3 }));
+  const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], { windowsHide: true });
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.invalid');
+  const modA = [
+    'void oil_step1(void) {}',
+    'void oil_step2(void) {}',
+    '/* 10ms周期処理 */',
+    'void oil_entry(void) {',
+    '  oil_step1();',
+    '  oil_step2();',
+    '}',
+    '',
+  ].join('\n');
+  const modB = [
+    'void diag_leaf(void) {}',
+    '/* 起動周期 : 50ms */',
+    'void diag_entry(void) {',
+    '  diag_leaf();',
+    '}',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(repoDir, 'oil.c'), modA);
+  fs.writeFileSync(path.join(repoDir, 'diag.c'), modB);
+  git('add', 'oil.c', 'diag.c');
+  git('commit', '-q', '-m', 'init');
+  // 制造两处完全互不关联的未提交修改
+  fs.writeFileSync(path.join(repoDir, 'oil.c'), modA.replace('void oil_step1(void) {}', 'void oil_step1(void) { volatile int a = 1; (void)a; }'));
+  fs.writeFileSync(path.join(repoDir, 'diag.c'), modB.replace('void diag_leaf(void) {}', 'void diag_leaf(void) { volatile int b = 2; (void)b; }'));
+
+  let mode = 'split';
+  let turn = 0;
+  let lastToolOutput = null;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      const lastTool = [...(body.messages || [])].reverse().find((m) => m.role === 'tool');
+      if (lastTool) lastToolOutput = JSON.parse(lastTool.content);
+      turn++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (mode === 'split') {
+        if (turn === 1) {
+          return res.end(JSON.stringify({
+            choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_git_changes', arguments: '{}' } }] } }],
+          }));
+        }
+        if (turn === 2) {
+          return res.end(JSON.stringify({
+            choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ fromGit: true, splitByGroup: true }) } }] } }],
+          }));
+        }
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '已拆分为 2 个书签图。' } }],
+        }));
+      }
+      if (turn === 1) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'l1', type: 'function', function: { name: 'find_symbols', arguments: '{}' } }] } }],
+        }));
+      }
+      if (turn === 2) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'l2', type: 'function', function: { name: 'apply_labels', arguments: JSON.stringify({ autoDetect: true }) } }] } }],
+        }));
+      }
+      return res.end(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '已自动补全画布标签。' } }],
+      }));
+    });
+  });
+  await new Promise((resolve) => mockLlm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => mockLlm.close(resolve)));
+
+  const srv = await launchServer({ target: repoDir });
+  t.after(srv.close);
+  const get = (route) => fetch(srv.baseUrl + route).then((r) => r.json());
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock', toolMode: 'tools' });
+
+  // 1. 测试隔离改动自动拆分为 2 个书签
+  const splitRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '按书签拆分 Git 改动' }),
+  });
+  const splitEvents = (await splitRes.text()).trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(splitEvents.find((e) => e.type === 'tool_end' && e.name === 'add_to_canvas')?.ok, true, JSON.stringify(splitEvents));
+  const bms = await get('/api/bookmarks');
+  assert.equal(bms.list.length, 2, '两组互不关联的 Git 改动应拆分为 2 个书签');
+
+  // 2. 测试函数头注释 TASK 周期 + コール順 自动补全写入画布
+  await post('/api/page', { roots: ['oil.c::oil_entry'], up: 0, down: 1 });
+  mode = 'labels';
+  turn = 0;
+  lastToolOutput = null;
+  const labelRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '补全当前画布 TASK 和顺序标签' }),
+  });
+  const labelEvents = (await labelRes.text()).trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(labelEvents.find((e) => e.type === 'tool_end' && e.name === 'apply_labels')?.ok, true, JSON.stringify(labelEvents));
+  assert.ok((lastToolOutput?.applied || 0) >= 2, `应实际写入 TASK 与 コール順 标签: ${JSON.stringify(lastToolOutput)}`);
+  const oilView = await get('/api/view?root=' + encodeURIComponent('oil.c::oil_entry') + '&up=0&down=1&group=1');
+  const e1 = oilView.edges.find((e) => e.from === 'oil.c::oil_entry' && e.to === 'oil.c::oil_step1');
+  const e2 = oilView.edges.find((e) => e.from === 'oil.c::oil_entry' && e.to === 'oil.c::oil_step2');
+  assert.ok(e1?.labels?.some((l) => l.preset === 'task' && l.text === 'TASK:10ms'), '应从函数上方注释识别并写入 TASK:10ms');
+  assert.ok(e1?.labels?.some((l) => l.preset === 'call' && l.text === 'コール順1' && !l.note), 'コール順1 应写入且不带注释');
+  assert.ok(e2?.labels?.some((l) => l.preset === 'call' && l.text === 'コール順2' && !l.note), 'コール順2 应写入且不带注释');
 });

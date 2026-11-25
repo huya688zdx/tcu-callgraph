@@ -14,6 +14,8 @@ const btn = document.getElementById('projectBtn');
 const listEl = document.getElementById('projectList');
 const pathInput = document.getElementById('projectPath');
 const openBtn = document.getElementById('projectOpen');
+const switchOverlay = document.getElementById('projectSwitchOverlay');
+const switchOverlayText = document.getElementById('projectSwitchText');
 const projectError = document.getElementById('projectError') || (listEl && document.createElement('div'));
 if (projectError && !projectError.id) {
   projectError.id = 'projectError';
@@ -23,7 +25,14 @@ if (projectError && !projectError.id) {
   listEl.after(projectError);
 }
 let switching = false;
+let orphanTimer = 0;
 const lockedControls = new Set();
+
+function showSwitchBanner(text) {
+  if (!switchOverlay) return;
+  if (switchOverlayText) switchOverlayText.textContent = text || '';
+  switchOverlay.hidden = !text;
+}
 
 function lockProjectControls() {
   document.querySelectorAll('#projectNormalPane button, #projectNormalPane input, #projectModeCompare').forEach((control) => {
@@ -79,21 +88,36 @@ export async function syncProjectLabel() {
 
 async function switchTo(body) {
   if (switching) return;
+  clearTimeout(orphanTimer);
   switching = true;
   listEl?.setAttribute('aria-busy', 'true');
   lockProjectControls();
-  projectMessage(t('project.switching'));
+  const targetLabel = body.path
+    ? String(body.path).replace(/[\\/]+$/, '').split(/[\\/]/).pop()
+    : listEl?.querySelector(`.proj[data-id="${body.id}"] .nm`)?.textContent?.trim() || '';
+  const parseMsg = targetLabel ? `${t('project.switching')} ${targetLabel}…` : t('project.switching');
+  projectMessage(parseMsg);
+  showSwitchBanner(parseMsg);
+  // 立即收起弹窗让用户看到画布上的全屏切换进度提示（失败时再打开弹窗显示错误）
+  if (document.getElementById('projectModal')?.classList.contains('show')) closeModal();
   try {
     const result = await api.switchProject(body);
     if (!result?.ok) throw new Error(result?.error || t('common.unknown'));
+    const name = result.project?.name || targetLabel;
+    showSwitchBanner(name ? `正在加载 ${name} 的文件树与画布…` : '正在加载文件树与画布…');
+    if (btn && result.project) {
+      btn.textContent = result.project.name;
+      btn.title = result.project.path || result.project.name;
+    }
     await hooks.reloadAll();
-    await syncProjectLabel();
+    void syncProjectLabel();
     projectMessage('');
-    if (document.getElementById('projectModal')?.classList.contains('show')) closeModal();
   } catch (error) {
+    openModal('projectModal');
     projectMessage(`${t('project.failed')}：${error.message || error}`, true);
   } finally {
     switching = false;
+    showSwitchBanner('');
     listEl?.removeAttribute('aria-busy');
     for (const control of lockedControls) control.disabled = false;
     lockedControls.clear();
@@ -259,17 +283,30 @@ async function renderOrphans() {
 function open() {
   openModal('projectModal');
   render();
-  renderOrphans();
+  // 延迟检测旧工程失效标注：用户立刻点击切换工程时绝不触发旧工程全量数据流分析
+  clearTimeout(orphanTimer);
+  orphanTimer = setTimeout(() => {
+    if (!switching && document.getElementById('projectModal')?.classList.contains('show')) renderOrphans();
+  }, 300);
   pathInput?.focus();
 }
 
 btn?.addEventListener('click', open);
-openBtn?.addEventListener('click', () => {
+openBtn?.addEventListener('click', async () => {
   const p = pathInput?.value.trim();
-  // 填了路径直接切；空着则调起系统文件夹选择框（Electron 经 preload 暴露的能力）
+  // 填了路径直接切；空着则调起系统文件夹选择框并复用 switchTo 展示加载进度
   if (p) return switchTo({ path: p });
-  if (window.callgraph?.pickFolder) window.callgraph.pickFolder();
-  else pathInput?.focus();
+  if (window.callgraph?.pickFolder) {
+    const dir = await window.callgraph.pickFolder();
+    if (dir) return switchTo({ path: dir });
+  } else {
+    pathInput?.focus();
+  }
+});
+
+// Electron 菜单 / Ctrl+O 选目录后走同一套带进度提示的切换流程
+window.addEventListener('cg:switch-project-path', (ev) => {
+  if (ev?.detail) void switchTo({ path: String(ev.detail) });
 });
 
 // ---- 会话导出 / 导入 ----

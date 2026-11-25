@@ -22,7 +22,7 @@ export function statusControl(target) {
   const value = comparing && target.statusSource !== 'manual' ? 'auto' : target.change || 'existing';
   return `<label class="detail-meta">${t('status.title')} <select data-change-status ${state.at > 0 || window.__EXPORT ? 'disabled' : ''}>
     ${statusOptions(value, comparing ? target.detectedChange || target.change || 'existing' : null)}</select></label>
-    ${comparing ? `<div class="detail-meta">${target.statusSource === 'manual' ? t('compare.statusManual') : t('compare.statusDetected')} · ${t('compare.statusResult', { status: statusLabel(target.detectedChange || target.change) })}<br>${t('compare.statusHint')}</div>` : ''}`;
+    ${comparing && target.statusSource === 'manual' ? `<span class="compare-badge context">${t('compare.statusManual')}</span>` : ''}`;
 }
 
 export async function setStatus(target, value, isEdge = false) {

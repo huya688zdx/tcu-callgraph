@@ -54,6 +54,8 @@ function unionTypeResolver(parsedFiles) {
 
 /** 比较与数据流复用同一份逐文件宏展开口径和原始行号。 */
 export function analysisSources(model, { keepOriginal = true } = {}) {
+  const cached = model._analysisSources;
+  if (cached && (!keepOriginal || cached.sources.every(f => typeof f.src === 'string'))) return cached;
   const sources = [];
   let failedFiles = 0;
   for (const f of model.files) {
@@ -92,7 +94,9 @@ export async function buildBuiltinDataflow(model) {
   const parsedFiles = [];
   try {
     const defs = [];
-    let { sources, failedFiles } = analysisSources(model, { keepOriginal: false });
+    const keepOriginal = Boolean(model._keepAnalysisSources);
+    let { sources, failedFiles } = analysisSources(model, { keepOriginal });
+    if (keepOriginal) model._analysisSources = { sources: [...sources], failedFiles };
     const defsByName = new Map();
     const fnAccess = new Map(); // fnId -> { writes: Map, reads: Map }
     const readers = new Map(); // varId -> Set<fnId>
@@ -133,7 +137,7 @@ export async function buildBuiltinDataflow(model) {
         defsByName.set(g.name, [...prev, def]);
       }
     }
-    sources.length = 0;
+    if (!keepOriginal && sources !== model._analysisSources?.sources) sources.length = 0;
 
     const containsUnion = unionTypeResolver(parsedFiles);
     for (const def of defs) def.containsUnion = containsUnion(def.typeText);

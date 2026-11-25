@@ -314,7 +314,7 @@ hooks.applyBookmark = async (b) => {
 };
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
-hooks.reloadAll = async () => {
+hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
   pendingVarChoices.clear();
   comparisonPage = null;
   const seq = ++viewSeq;
@@ -336,9 +336,10 @@ hooks.reloadAll = async () => {
   resetVars();
   navStack.length = 0;
   deleteStack.length = 0;
-  await Promise.all([loadStats(), loadParsers()]);
-  await loadTree();
-  await restorePage(null, () => seq === viewSeq);
+  // 并行恢复统计、文件树与画布，解析器探测异步执行不阻塞首帧；并通知 AI 助手按新工程隔离切换对话。
+  if (!preserveAiChat) document.dispatchEvent(new CustomEvent('cg:project-changed'));
+  void loadParsers();
+  await Promise.all([loadStats(), loadTree(), restorePage(null, () => seq === viewSeq)]);
 };
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
