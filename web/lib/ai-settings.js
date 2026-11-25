@@ -538,6 +538,13 @@ function currentUiContext() {
   return canvasSelection ?? undefined;
 }
 
+const EMPTY_CHAT_HTML = `<div class="empty">
+  <div class="ai-empty-badge" aria-hidden="true">✦</div>
+  <div class="ai-empty-title">TCU 调用图 AI 助手</div>
+  <p class="ai-empty-desc">直接提问查找函数、分析 Git 改动或补全标签，选中的画布节点与连线会自动作为上下文。</p>
+  <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/compact 压缩</span></div>
+</div>`;
+
 function renderThreadMessages() {
   if (!messagesEl) return;
   const th = activeThread();
@@ -545,7 +552,7 @@ function renderThreadMessages() {
   updateChatControls();
   setChatStatus();
   if (!th.messages.length) {
-    messagesEl.innerHTML = '<div class="empty">直接告诉我你想找什么函数、分析 Git 改动，或点上方快捷按钮，我会自动查找并加入当前画布。</div>';
+    messagesEl.innerHTML = EMPTY_CHAT_HTML;
     return;
   }
   const scrollTop = messagesEl.scrollTop;
@@ -627,13 +634,15 @@ function ensurePanelStyle() {
   const style = document.createElement('style');
   style.id = 'aiPanelStyle';
   style.textContent = `
-    #aiLevels .ai-section { border-top: 1px solid #dedbd2; padding: 10px 0; }
-    #aiLevels .ai-section h3 { font-size: 13px; margin: 0 0 7px; }
-    #aiLevels .ai-endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-    #aiLevels code { user-select: all; overflow-wrap: anywhere; font-size: 12px; }
-    #aiLevels .ai-prompts { display: grid; gap: 6px; justify-items: start; }
-    #aiLevels [data-ai-copy] { text-align: left; white-space: normal; }
-    #aiLevels [role=status] { font-size: 12px; margin-top: 5px; color: #235326; }
+    #aiLevels .ai-section { border-top: 1px solid #ECEAE2; padding: 12px 0; }
+    #aiLevels .ai-section:first-child { border-top: 0; padding-top: 2px; }
+    #aiLevels .ai-section h3 { font-size: 12px; font-weight: 600; color: #5F5E5A; margin: 0 0 8px; letter-spacing: .01em; }
+    #aiLevels .ai-endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 9px; background: #FAF9F6; border: 1px solid #ECEAE2; }
+    #aiLevels code { user-select: all; overflow-wrap: anywhere; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; color: #1B3A5C; flex: 1 1 180px; }
+    #aiLevels .ai-endpoint button { height: 26px; padding: 0 9px; font-size: 11.5px; border-radius: 7px; }
+    #aiLevels .ai-prompts { display: grid; gap: 6px; }
+    #aiLevels [data-ai-copy] { text-align: left; white-space: normal; height: auto; min-height: 30px; padding: 5px 10px; border-radius: 8px; font-size: 12px; }
+    #aiLevels [role=status] { display: block; font-size: 11.5px; margin-top: 6px; color: #235326; }
   `;
   document.head.append(style);
 }
@@ -677,6 +686,7 @@ function syncApiForm() {
     modelBadge.textContent = configured
       ? `${llmConfig.model}${llmConfig.toolMode === 'prompt' ? ' · 旧版兼容' : ''}${reasoningLabel ? ` · 思考:${reasoningLabel}` : ''}`
       : '未配置模型';
+    modelBadge.title = modelBadge.textContent;
   }
 }
 
