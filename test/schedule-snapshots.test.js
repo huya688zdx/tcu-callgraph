@@ -83,6 +83,39 @@ test('Git 只改调度配置也形成周期差分，提交、INDEX 与 WORKTREE 
   assert.deepEqual((await inspectGitRepo(root)).workingTree.files.map(f => f.file), ['tcu-schedule.json']);
 });
 
+test('历史和 INDEX 两侧的调度配置均在 Git 读取任何 blob 前执行总量校验', async t => {
+  const { root, put } = tree(t);
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { windowsHide: true });
+  const commit = () => git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'schedule');
+  git('init', '--quiet');
+  put('app.c', source);
+  const bytes = Buffer.alloc(7 * 1024 * 1024, 32);
+  const names = Array.from({ length: 5 }, (_, index) => `task-${index}.arxml`);
+  for (const name of names) put(name, bytes);
+  git('add', '.');
+  commit();
+  git('rm', '--quiet', ...names);
+  commit();
+  for (const name of names) put(name, bytes);
+  git('add', ...names);
+
+  const trace = path.join(root, 'git-trace.jsonl');
+  const originalTrace = process.env.GIT_TRACE2_EVENT;
+  t.after(() => {
+    if (originalTrace === undefined) delete process.env.GIT_TRACE2_EVENT;
+    else process.env.GIT_TRACE2_EVENT = originalTrace;
+  });
+  process.env.GIT_TRACE2_EVENT = trace;
+  for (const refs of [{ baseRef: 'HEAD~1', targetRef: 'HEAD' }, { targetRef: 'INDEX' }]) {
+    fs.writeFileSync(trace, '');
+    await assert.rejects(compareGitProject(root, refs), /调度配置累计超过 32 MiB/);
+    const gitCommands = fs.readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+      .filter(row => row.event === 'start').map(row => row.argv);
+    assert.ok(gitCommands.some(argv => argv.includes('--batch-check')));
+    assert.ok(!gitCommands.some(argv => argv.includes('--batch')), '拒绝之前不得请求 blob 内容');
+  }
+});
+
 test('同尺寸调度配置改写后重开工程，命中 C 解析缓存并重新读取配置', t => {
   const { root, put } = tree(t);
   put('app.c', source);

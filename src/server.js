@@ -411,6 +411,96 @@ function manualNodesMap(list) {
   return Object.fromEntries((list || []).map((item) => [item.id, item]));
 }
 
+function variableConflicts(model, { id, file, name }) {
+  const get = (key) => model._df?.byId?.get(key) ?? model._index?.byId?.get(key);
+  return [get(id), get(`var::${name}`), ...(model.variables || []).filter((v) =>
+    v.name === name && (v.file === file || !v.isStatic))].filter(Boolean);
+}
+
+/** 将已由同文件源码实现的规划变量及其存档绑定迁移到真实符号。 */
+function reconcileManualVariables(model, projectId, list, savedPage) {
+  const bindings = new Map();
+  for (const item of list) {
+    if (item.kind !== 'var') continue;
+    const implementation = variableConflicts(model, item).find((v) =>
+      !v.manual && !v.isExtern && v.file === item.file);
+    if (implementation) bindings.set(item.id, implementation.id);
+  }
+  if (!bindings.size) return { list, page: savedPage };
+
+  const nodeId = (id) => bindings.get(id) ?? id;
+  const nodeIds = (ids) => [...new Set(ids.map(nodeId))];
+  const edgeId = (id) => {
+    const match = /^(.+?)->(.+?)(:-?\d+)?$/.exec(id);
+    return match ? `${nodeId(match[1])}->${nodeId(match[2])}${match[3] || ''}` : id;
+  };
+  const remapKeys = (entries, idFor) => {
+    const result = new Map();
+    for (const [key, data] of Object.entries(entries || {})) {
+      const id = idFor(key);
+      if (id === key) continue;
+      result.set(id, data);
+    }
+    for (const [key, data] of Object.entries(entries || {})) {
+      if (idFor(key) !== key) continue;
+      const old = result.get(key);
+      result.set(key, isPlainObject(old) && isPlainObject(data) ? { ...old, ...data } : data);
+    }
+    return Object.fromEntries(result);
+  };
+  const remapPage = (page) => page && {
+    ...page,
+    roots: nodeIds(page.roots || []),
+    vars: nodeIds(page.vars || []),
+    ...(page.hiddenVars && { hiddenVars: nodeIds(page.hiddenVars) }),
+    ...(page.expansions && { expansions: normalizeExpansions(page.expansions.map((scope) =>
+      ({ ...scope, root: nodeId(scope.root) }))) }),
+    ...(page.selected && { selected: nodeId(page.selected) }),
+    ...(page.selectedEdge && { selectedEdge: edgeId(page.selectedEdge) }),
+  };
+
+  const live = store.loadOverlay(projectId);
+  const layout = new Map();
+  const slots = Object.entries(live.layout).map(([key, slot]) => {
+    const mode = key.lastIndexOf('::');
+    const roots = nodeIds(key.slice(0, mode).split('+')).join('+');
+    return { key, id: roots + key.slice(mode), slot };
+  });
+  for (const { id, slot } of [...slots.filter((entry) => entry.id !== entry.key),
+    ...slots.filter((entry) => entry.id === entry.key)]) {
+    const prior = layout.get(id);
+    const edges = new Map();
+    for (const edge of [...(prior?.manual || []), ...(slot.manual || [])]) {
+      const from = nodeId(edge.from), to = nodeId(edge.to);
+      if (from !== to) edges.set(edgeKeyOf({ from, to, line: 0 }), { from, to });
+    }
+    layout.set(id, {
+      nodes: { ...prior?.nodes, ...remapKeys(slot.nodes, nodeId) },
+      edges: { ...prior?.edges, ...remapKeys(slot.edges, edgeId) },
+      manual: [...edges.values()],
+    });
+  }
+  const next = {
+    ...live,
+    nodes: remapKeys(live.nodes, nodeId),
+    edges: remapKeys(live.edges, edgeId),
+    deleted: {
+      nodes: remapKeys(live.deleted.nodes, nodeId),
+      edges: remapKeys(live.deleted.edges, edgeId),
+    },
+    layout: Object.fromEntries(layout),
+  };
+  const remaining = list.filter((item) => !bindings.has(item.id));
+  const page = remapPage(savedPage);
+  store.replaceOverlay(projectId, next);
+  saveManualNodes(projectId, remaining);
+  for (const bookmark of store.listBookmarks(projectId)) {
+    const updated = remapPage(bookmark);
+    if (JSON.stringify(updated) !== JSON.stringify(bookmark)) store.saveBookmark(projectId, updated);
+  }
+  return { list: remaining, page, overlay: { ...next, manualNodes: manualNodesMap(remaining) } };
+}
+
 /** 加载完成后整体切换会话，工程标注仍以 project_id 为准。 */
 async function openTarget(targetPath, { first = false, selection } = {}) {
   const abs = path.resolve(targetPath);
@@ -435,10 +525,24 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
     name: label,
     fingerprint: fingerprintFiles(model.files),
   });
-  applyManualNodes(model, project.id);
-  const st = stats(model);
-
   if (first) migrateLegacy(project);
+
+  const list = loadManualNodes(project.id);
+  if (model.source !== 'dot' && list.some((item) => item.kind === 'var')) await ensureAnalysis(model);
+  const pageKey = 'ui.last-view.' + project.id;
+  const reconciled = store.transaction(() => {
+    const result = reconcileManualVariables(model, project.id, list, store.getSetting(pageKey));
+    if (result.overlay) {
+      if (result.page) store.setSetting(pageKey, result.page);
+      store.appendEvent(project.id, {
+        op: 'manual.variable.bind', actor: 'system',
+        after: { ...result.overlay, ...(result.page && { view: viewSnapshot(result.page) }) },
+      });
+    }
+    return result;
+  });
+  applyManualNodes(model, project.id, reconciled.list);
+  const st = stats(model);
 
   const ov = store.loadOverlay(project.id);
   ov.deleted = ov.deleted || { nodes: {}, edges: {} };
@@ -463,7 +567,7 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   // 已有数据但还没钉过起点时，补一条 baseline：
   // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
   if (!store.hasAnchor(project.id)) {
-    store.appendEvent(project.id, { op: 'baseline', target: 'open', after: ov, actor: 'system' });
+    store.appendEvent(project.id, { op: 'baseline', target: 'open', after: { ...ov, manualNodes: manualNodesMap(reconciled.list) }, actor: 'system' });
   }
 
   console.log(
@@ -475,8 +579,6 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   await startGitWatch(abs, project.id);
   return { project, stats: st };
 }
-
-await openTarget(target, { first: true });
 
 /** 重新从库里载入 overlay 到内存镜像（清理孤儿标注后用） */
 function reloadOverlay() {
@@ -873,11 +975,13 @@ function composeMcpView(p) {
   // 所有检查在切换画布前完成，失败时不改变工程、预览或时间轴。
   const comparison = p.snapshotId === undefined ? COMPARISON : getMcpChangeSnapshot(p.snapshotId).comparison;
   const entering = comparison && !COMPARISON;
+  const switchingComparison = comparison && comparison !== COMPARISON;
   if (entering && p.mode !== 'replace') throw new Error('首次按 Git 快照组图请使用 replace 打开比较');
-  if (entering && !comparison.model) throw new Error('该 Git 快照没有源码变更');
+  if (switchingComparison && !comparison.model) throw new Error('该 Git 快照没有源码变更');
   const model = comparison?.model || MODEL;
+  const sourceOverlay = switchingComparison ? comparisonBase?.overlay ?? overlay : overlay;
   const isNode = (id) => typeof id === 'string' && !id.startsWith('ext::') &&
-    !model._index.byId.get(id)?.external && !overlay.deleted.nodes[id] && model._index.byId.has(id);
+    !model._index.byId.get(id)?.external && !sourceOverlay.deleted.nodes[id] && model._index.byId.has(id);
   const isFn = (id) => {
     const node = model._index.byId.get(id);
     return isNode(id) && node.kind !== 'var' && !node.headerSymbol;
@@ -926,7 +1030,17 @@ function composeMcpView(p) {
   const key = 'ui.last-view.' + PROJECT.id;
   const saved = COMPARISON ? COMPARISON.composedPage || { roots: COMPARISON.roots, up: 0, down: 0 } : store.getSetting(key);
   const before = pageState && !pageState.reviewing ? { ...saved, ...pageState } : saved;
-  const prior = mode === 'add' ? before : null;
+  let prior = mode === 'add' ? before : null;
+  if (prior && switchingComparison) {
+    prior = {
+      ...before,
+      roots: (before.roots || []).filter(isNode),
+      expansions: (before.expansions || []).filter(({ root }) => isNode(root)),
+      vars: (before.vars || []).filter(isNode),
+      hiddenVars: (before.hiddenVars || []).filter(isNode),
+      selected: isNode(before.selected) ? before.selected : null,
+    };
+  }
   const keepRoots = Boolean(prior?.roots?.length);
   const allRoots = keepRoots ? prior.roots : [...new Set(roots)];
   if (!allRoots.length) allRoots.push(functions[0]);
@@ -952,11 +1066,11 @@ function composeMcpView(p) {
   if (comparison) {
     const visible = [...new Set([...allRoots, ...expansions.map(scope => scope.root), ...page.vars])];
     if (visible.length > 600) throw new Error('比较画布最多支持 600 个显式选择的节点');
-    if (entering) {
+    if (switchingComparison) {
       const nextStats = stats(model);
-      const nextOverlay = structuredClone(overlay);
+      const nextOverlay = structuredClone(sourceOverlay);
       const next = { ...comparison, id: p.snapshotId, statusOverrides: { nodes: new Map(), edges: new Map() }, totalNodes: model._index.byId.size };
-      comparisonBase = { MODEL, S, overlay, pageState };
+      comparisonBase ??= { MODEL, S, overlay, pageState };
       COMPARISON = next;
       MODEL = model;
       S = nextStats;
@@ -969,7 +1083,7 @@ function composeMcpView(p) {
     COMPARISON.roots = visible;
     COMPARISON.composedPage = page;
     pageState = page;
-    broadcastChange(entering ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
+    broadcastChange(switchingComparison ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
     return { ok: true, page, ...scope.details, eventId: null };
   }
   store.transaction(() => {
@@ -1618,6 +1732,8 @@ function readRawBody(req, limit = 4 * 1024 * 1024) {
   });
 }
 
+await openTarget(target, { first: true });
+
 // 回调是 async：/mcp 端点里要 await body 读取；其他端点不受影响（同步 return 路径不变）
 export const server = http.createServer(async (req, res) => {
   if (!/^(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(req.headers.host || '')) {
@@ -1963,10 +2079,11 @@ export const server = http.createServer(async (req, res) => {
               snapshotId = gitRes.snapshotId;
               targetModel = snap.comparison.model;
             }
-            const directFns = (targetModel.functions || []).filter(n => !n.external && !overlay.deleted.nodes[n.id] && n.change !== 'existing');
-            const impactFns = directFns.length ? directFns : (targetModel.functions || []).filter(n => !n.external && !overlay.deleted.nodes[n.id] && (n.impact || n.macroImpact || n.periodImpact));
+            const hidden = (snapshotId ? comparisonBase?.overlay ?? overlay : overlay).deleted.nodes;
+            const directFns = (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && n.change !== 'existing');
+            const impactFns = directFns.length ? directFns : (targetModel.functions || []).filter(n => !n.external && !hidden[n.id] && (n.impact || n.macroImpact || n.periodImpact));
             defaultFnIds = impactFns.slice(0, 40).map(n => n.id);
-            defaultVarIds = (targetModel.variables || []).filter(v => !overlay.deleted.nodes[v.id] && v.change !== 'existing').slice(0, 20).map(v => v.id);
+            defaultVarIds = (targetModel.variables || []).filter(v => !hidden[v.id] && v.change !== 'existing').slice(0, 20).map(v => v.id);
           } else if (Array.isArray(args.vars) && args.vars.length && !COMPARISON && MODEL.source !== 'dot') {
             await ensureAnalysis(MODEL);
             assertActive();
@@ -2792,11 +2909,16 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/session/import' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res, 32 * 1024 * 1024)
-        .then((p) => {
+        .then(async (p) => {
           if (!p || p.format !== 'tcu-callgraph-session') return bad(res, '不是 .cgx 会话文件');
           if (Number(p.version) > 1) return bad(res, `会话文件版本 ${p.version} 高于当前支持的 1`);
           if (p.overlay !== undefined && !isPlainObject(p.overlay)) return bad(res, 'overlay 必须是对象');
           if (p.bookmarks !== undefined && !Array.isArray(p.bookmarks)) return bad(res, 'bookmarks 必须是数组');
+
+          if (MODEL.source !== 'dot' && Array.isArray(p.manualNodes) && p.manualNodes.some((item) => item?.kind === 'var')) {
+            await ensureAnalysis(MODEL);
+            if (!currentSession(req)) return sessionConflict(res);
+          }
 
           const ov = p.overlay || {};
           const nodes = isPlainObject(ov.nodes) ? ov.nodes : {};
@@ -2887,6 +3009,11 @@ export const server = http.createServer(async (req, res) => {
               saveManualNodes(PROJECT.id, [...mergedMap.values()]);
             }
 
+            const pageKey = 'ui.last-view.' + PROJECT.id;
+            const beforePage = store.getSetting(pageKey);
+            const reconciled = reconcileManualVariables(MODEL, PROJECT.id, loadManualNodes(PROJECT.id), beforePage);
+            if (reconciled.overlay && reconciled.page) store.setSetting(pageKey, reconciled.page);
+
             // 代码版本对不上时标注可能挂不到节点上，返回给前端提示
             const fp = fingerprintFiles(MODEL.files);
             const sameCode = !p.project?.fingerprint || p.project.fingerprint === fp;
@@ -2898,15 +3025,17 @@ export const server = http.createServer(async (req, res) => {
               target: p.project?.name || 'session',
               after: {
                 ...store.loadOverlay(PROJECT.id),
-                manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)),
+                manualNodes: manualNodesMap(reconciled.list),
+                ...(reconciled.overlay && reconciled.page && { view: viewSnapshot(reconciled.page) }),
                 summary: { annotations, layout, bookmarks, manualNodes: importedManual, sameCode },
               },
             });
 
-            return { annotations, layout, bookmarks, manualNodes: importedManual, delNodes, delEdges, sameCode };
+            return { annotations, layout, bookmarks, manualNodes: importedManual, delNodes, delEdges, sameCode, reconciled };
           });
 
-          applyManualNodes(MODEL, PROJECT.id);
+          applyManualNodes(MODEL, PROJECT.id, result.reconciled.list);
+          if (result.reconciled.overlay && result.reconciled.page) pageState = result.reconciled.page;
           S = stats(MODEL);
           reloadOverlay();
           broadcastChange('session.import', 'user');
@@ -2953,20 +3082,30 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/restore' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
-        .then((p) => {
+        .then(async (p) => {
           const at = Number(p.eventId);
           if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
           const latest = store.latestEventId(PROJECT.id);
           if (at > latest) return bad(res, 'eventId 超出范围');
-          const restored = store.overlayAt(PROJECT.id, at);
-          const restoredView = store.viewAt(PROJECT.id, at);
+          let restored = store.overlayAt(PROJECT.id, at);
+          let restoredView = store.viewAt(PROJECT.id, at);
           let restoredPage;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
-          const restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
+          let restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
+          if (MODEL.source !== 'dot' && restoredManualList.some((item) => item.kind === 'var')) {
+            await ensureAnalysis(MODEL);
+            if (!currentSession(req)) return sessionConflict(res);
+          }
           const eventId = store.transaction(() => {
             store.replaceOverlay(PROJECT.id, restored);
             saveManualNodes(PROJECT.id, restoredManualList);
+            const reconciled = reconcileManualVariables(MODEL, PROJECT.id, restoredManualList, restoredView);
+            if (reconciled.overlay) {
+              restored = reconciled.overlay;
+              restoredManualList = reconciled.list;
+              restoredView = reconciled.page;
+            }
             const eventId = store.appendEvent(PROJECT.id, {
               op: 'restore_point',
               target: `event#${at}`,
@@ -3333,11 +3472,7 @@ export const server = http.createServer(async (req, res) => {
         await ensureAnalysis(model);
         if (!currentSession(req) || MODEL !== model) return sessionConflict(res);
       }
-      const globalVarConflict = kind === 'var' && (
-        MODEL._index?.byId?.has(`var::${name}`) ||
-        MODEL._df?.byId?.has(`var::${name}`) ||
-        (MODEL.variables || []).some((v) => v.name === name && (v.file === file || !v.isStatic))
-      );
+      const globalVarConflict = kind === 'var' && variableConflicts(MODEL, { id, file, name }).length;
       if (MODEL._index?.byId?.has(id) || MODEL._df?.byId?.has(id) || globalVarConflict) {
         return json(res, { ok: false, error: `该文件中已存在同名${kind === 'var' ? '变量' : '函数'}：${name}` }, 409);
       }
@@ -3451,7 +3586,8 @@ export const server = http.createServer(async (req, res) => {
               const merged = [];
               const seen = new Set();
               const removed = new Set((patch.removeManual || []).map((m) => `${m?.from}\u0000${m?.to}`));
-              for (const m of [...(before.manual || []), ...(patch.addManual || [])]) {
+              const legacy = migrated.flatMap((key) => overlay.layout[key].manual);
+              for (const m of [...legacy, ...(before.manual || []), ...(patch.addManual || [])]) {
                 if (!m || typeof m.from !== 'string' || typeof m.to !== 'string') continue;
                 const mk = `${m.from}\u0000${m.to}`;
                 if (removed.has(mk) || seen.has(mk)) continue;

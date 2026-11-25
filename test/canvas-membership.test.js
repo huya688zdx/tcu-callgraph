@@ -252,3 +252,61 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
   await select('#ctxMenu button[data-i="0"]');
   await waitFor(detailA);
 });
+
+test('无头浏览器：撤销与重做手工连线增量存档并保留视图之外的连线', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const { baseUrl, request } = await fixture(t);
+  const root = fn('a');
+  const outside = { from: fn('b'), to: fn('d') };
+  const original = { from: root, to: fn('b') };
+  const changed = { from: root, to: fn('c') };
+  await request('/api/layout', { root, mode: 'group', addManual: [outside] });
+  await request('/api/page', { roots: [root], up: 0, down: 1, group: true });
+  const chrome = await launchCdp({ url: `${baseUrl}/` });
+  t.after(() => chrome.close());
+  const { evaluate, waitFor } = chrome;
+  const snapshot = async () => {
+    const archive = await request('/api/session/export');
+    return archive.overlay.layout[`${root}::group`].manual;
+  };
+  await waitFor(`__cg.view?.nodes.some(n => n.id === ${JSON.stringify(original.to)})`);
+  const checkWrites = (commands, expected) => evaluate(`(async () => {
+    const h = await import('/lib/history.js');
+    const { api } = await import('/lib/api.js');
+    const { state } = await import('/lib/state.js');
+    const persist = api.layout;
+    const writes = [];
+    api.layout = (patch) => {
+      const pending = persist(patch);
+      writes.push(pending);
+      return pending;
+    };
+    try {
+      const original = ${JSON.stringify(original)};
+      const changed = ${JSON.stringify(changed)};
+      ${commands}
+      await Promise.all(writes);
+      return state.view.edges.filter(edge => edge.manual).map(({ from, to }) => ({ from, to }));
+    } finally {
+      api.layout = persist;
+    }
+  })()`).then(edges => assert.deepEqual(edges, expected));
+
+  await checkWrites('await h.addManualEdge(original.from, original.to);', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('h.undo();', []);
+  assert.deepEqual(await snapshot(), [outside]);
+  await checkWrites('h.redo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites(`
+    state.view.edges.find(edge => edge.manual).to = changed.to;
+    await h.saveLayout({ removeManual: [original], addManual: [changed] });
+    h.pushHistory();
+  `, [changed]);
+  await checkWrites('h.undo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+  await checkWrites('h.redo();', [changed]);
+  assert.deepEqual(await snapshot(), [outside, changed]);
+  await checkWrites('h.undo(); h.redo(); h.undo();', [original]);
+  assert.deepEqual(await snapshot(), [outside, original]);
+});

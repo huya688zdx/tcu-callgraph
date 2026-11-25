@@ -503,7 +503,7 @@ async function cleanDiskInfo(repo, before, after, hint = null) {
   const dirRealCache = new Map();
   const unchangedOids = new Map();
   for (const [file, object] of before) {
-    if (typeof object === 'string' && after.get(file) === object) unchangedOids.set(file, object);
+    if (!isScheduleFile(file) && typeof object === 'string' && after.get(file) === object) unchangedOids.set(file, object);
   }
   if (!unchangedOids.size) return clean;
 
@@ -540,9 +540,10 @@ async function fetchBlobs(repo, before, after, cleanDisk) {
     .filter(([file, entry]) => typeof entry === 'string' && cleanDisk.get(file)?.oid !== entry)
     .map(([, entry]) => entry))];
   const sizes = new Map();
+  let entries = [];
   if (ids.length) {
     const check = await git(repo.repoRoot, ['cat-file', '--batch-check'], { input: ids.join('\n') + '\n' });
-    const entries = singleLine(check).split('\n').map((line, i) => {
+    entries = singleLine(check).split('\n').map((line, i) => {
       const [id, type, length] = line.split(' ');
       const size = Number(length);
       if (id !== ids[i] || type !== 'blob' || !Number.isSafeInteger(size) || size < 0 || size > maxSourceBytes) {
@@ -552,38 +553,35 @@ async function fetchBlobs(repo, before, after, cleanDisk) {
       return { id, size };
     });
     if (entries.length !== ids.length) throw new Error('Git 返回的源码对象不完整');
-    for (let i = 0; i < entries.length;) {
-      const batch = [];
-      let totalBytes = 0;
-      while (i < entries.length && totalBytes + entries[i].size + 100 <= 32 * 1024 * 1024) {
-        const entry = entries[i++];
-        totalBytes += entry.size + 100;
-        batch.push(entry);
-      }
-      const response = await git(repo.repoRoot, ['cat-file', '--batch'], {
-        binary: true, input: batch.map(({ id }) => id).join('\n') + '\n',
-      });
-      let offset = 0;
-      for (const { id, size } of batch) {
-        const newline = response.indexOf(10, offset);
-        const [actual, type, bytes] = response.toString('ascii', offset, newline).split(' ');
-        if (newline === -1 || actual !== id || type !== 'blob' || Number(bytes) !== size || response[newline + 1 + size] !== 10) {
-          throw new Error('Git 源码对象内容不完整：' + id);
-        }
-        offset = newline + 1 + size + 1;
-        blobs.set(id, response.subarray(newline + 1, offset - 1));
-      }
-    }
   }
   for (const files of [before, after]) {
     let configBytes = 0;
     for (const [file, object] of files) {
       if (!isScheduleFile(file)) continue;
-      let size;
-      if (Buffer.isBuffer(object)) size = object.length;
-      else if (sizes.has(object)) size = sizes.get(object);
-      else size = cleanDisk.get(file)?.size ?? (await stat(path.join(repo.root, file))).size;
+      const size = typeof object === 'string' ? sizes.get(object) : object.length;
       configBytes = addScheduleBytes(configBytes, size);
+    }
+  }
+  for (let i = 0; i < entries.length;) {
+    const batch = [];
+    let totalBytes = 0;
+    while (i < entries.length && totalBytes + entries[i].size + 100 <= 32 * 1024 * 1024) {
+      const entry = entries[i++];
+      totalBytes += entry.size + 100;
+      batch.push(entry);
+    }
+    const response = await git(repo.repoRoot, ['cat-file', '--batch'], {
+      binary: true, input: batch.map(({ id }) => id).join('\n') + '\n',
+    });
+    let offset = 0;
+    for (const { id, size } of batch) {
+      const newline = response.indexOf(10, offset);
+      const [actual, type, bytes] = response.toString('ascii', offset, newline).split(' ');
+      if (newline === -1 || actual !== id || type !== 'blob' || Number(bytes) !== size || response[newline + 1 + size] !== 10) {
+        throw new Error('Git 源码对象内容不完整：' + id);
+      }
+      offset = newline + 1 + size + 1;
+      blobs.set(id, response.subarray(newline + 1, offset - 1));
     }
   }
   return blobs;

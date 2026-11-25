@@ -7,6 +7,7 @@ import { state } from './state.js';
 export const clientId = crypto.randomUUID();
 
 const get = (url) => fetch(url).then((r) => r.json());
+let layoutWrites = Promise.resolve();
 
 const post = (url, body) =>
   fetch(url, {
@@ -115,7 +116,15 @@ export const api = {
   /** 删除 / 恢复函数与连线 */
   del: (body) => guardWrite('del') || post('/api/delete', body),
   /** 手动布局存档 */
-  layout: (body) => guardWrite('layout') || post('/api/layout', body),
+  layout(body) {
+    const blocked = guardWrite('layout');
+    if (blocked) return blocked;
+    const patch = { ...body, projectId: body.projectId ?? state.view?.projectId };
+    // 连续撤销与重做的手工关系增量必须按触发顺序落库。
+    const write = layoutWrites.then(() => post('/api/layout', patch));
+    layoutWrites = write.catch(() => {});
+    return write;
+  },
   /** 手工添加 / 永久删除文件内的函数或变量（即使源码中不存在） */
   addManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes', body),
   deleteManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes/delete', body),

@@ -90,6 +90,7 @@ function applySnapshot(str) {
   // 所以撤销时必须把标签差异也写回服务端，否则画布回退了、库里还是新值，
   // 刷新一下又变回来——看起来像撤销没生效。
   const before = new Map(v.edges.map((e) => [edgeKey(e), JSON.stringify(e.labels || null)]));
+  const previousManual = collectManual();
   const beforeNames = new Map(v.nodes.filter((n) => n.headerSymbol).map((n) => [n.id, n.nameModeOverride || null]));
   v.nodes = s.nodes;
   for (const n of v.nodes) if (n.headerSymbol) {
@@ -114,7 +115,11 @@ function applySnapshot(str) {
     const patch = { nodeId: n.id, projectId: v.projectId, data: { nameMode: n.nameModeOverride || null } };
     labelWrites = labelWrites.then(() => api.overlay(patch)).catch((err) => console.warn('[撤销] 名称写回失败：', err));
   }
-  saveLayout();
+  const currentManual = new Set(collectManual().map((e) => edgeKey({ ...e, line: 0 })));
+  const visible = new Set(s.nodes.map((n) => n.id));
+  const removeManual = previousManual.filter((e) => visible.has(e.from) && visible.has(e.to) &&
+    !currentManual.has(edgeKey({ ...e, line: 0 })));
+  saveLayout({ removeManual });
 }
 
 /** 把快照恢复后与恢复前的标签差异逐边写回；失败只打日志，不打断撤销流程 */

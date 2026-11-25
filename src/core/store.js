@@ -317,6 +317,7 @@ function applyEvent(ov, e) {
     // 携带全量状态的节点：直接整体替换
     case 'baseline':
     case 'restore_point':
+    case 'manual.variable.bind':
     case 'import':
     // 会话导入同样是「把这一刻的整个状态钉下来」：它的 after 里带着导入后的
     // 全量 overlay，不回放的话 at=这一刻 会显示成导入前的样子，

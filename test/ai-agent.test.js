@@ -122,7 +122,19 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
   fs.writeFileSync(path.join(repoDir, 'app.c'), code);
   git('add', 'app.c');
   git('commit', '-q', '-m', 'init');
-  fs.writeFileSync(path.join(repoDir, 'app.c'), code.replace('g_oil = 1', 'g_oil = 2'));
+  const committed = code.replace('g_oil = 1', 'g_oil = 2');
+  fs.writeFileSync(path.join(repoDir, 'app.c'), committed);
+  git('commit', '-qam', 'historical change');
+  const worktree = committed.replace('g_oil = 2', 'g_oil = 3') + 'void worktree_only(void) {}\n';
+  fs.writeFileSync(path.join(repoDir, 'app.c'), worktree);
+  const beforeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-directory-before-'));
+  const afterDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-directory-after-'));
+  t.after(() => {
+    fs.rmSync(beforeDir, { recursive: true, force: true });
+    fs.rmSync(afterDir, { recursive: true, force: true });
+  });
+  fs.writeFileSync(path.join(beforeDir, 'app.c'), code);
+  fs.writeFileSync(path.join(afterDir, 'app.c'), committed);
 
   // 2. 起一个模拟旧版 OpenAI 兼容服务（拒绝 tools 字段，只认纯对话）
   let chatTurn = 0;
@@ -178,22 +190,43 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
   const ping = await post('/api/ai/test', {});
   assert.equal(ping.ok, true);
 
-  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: '把 Git 改动加到画布' }),
-  });
-  assert.equal(chatRes.status, 200);
-  const events = (await chatRes.text()).trim().split('\n').map(line => JSON.parse(line));
-  assert.ok(events.some(e => e.type === 'fallback'), '旧接口应触发自动降级');
-  const toolDone = events.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas');
-  assert.equal(toolDone?.ok, true, JSON.stringify(events));
-  const done = events.find(e => e.type === 'done');
-  assert.match(done?.answer || '', /range_gather/);
+  const get = (route) => fetch(srv.baseUrl + route).then(r => r.json());
+  const initial = await post('/api/page', { roots: ['app.c::task_10ms'], vars: ['var::g_oil'], selected: 'app.c::task_10ms' });
+  assert.equal(initial.ok, true);
+  const baseline = await get('/api/page');
+  for (const options of [
+    { mode: 'git', baseRef: 'HEAD~1', targetRef: 'HEAD' },
+    { mode: 'dir', beforePath: beforeDir, afterPath: afterDir },
+  ]) {
+    const prepared = await post('/api/compare', options);
+    assert.ok(prepared.preview?.id, prepared.error);
+    const active = await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: ['app.c::range_gather'] });
+    assert.ok(active.ok, active.error);
+    chatTurn = 0;
 
-  const page = await (await fetch(srv.baseUrl + '/api/page')).json();
-  assert.ok(page.page.roots.includes('app.c::task_10ms'), '应自动补齐上游 TASK 入口到画布');
-  assert.ok(page.page.vars.includes('var::g_oil'), '应按短变量名自动解析并加入画布');
+    const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: '把 Git 改动加到画布' }),
+    });
+    assert.equal(chatRes.status, 200);
+    const events = (await chatRes.text()).trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(events.some(e => e.type === 'fallback'), '旧接口应触发自动降级');
+    const toolDone = events.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas');
+    assert.equal(toolDone?.ok, true, JSON.stringify(events));
+    const done = events.find(e => e.type === 'done');
+    assert.match(done?.answer || '', /range_gather/);
+
+    const { page } = await get('/api/page');
+    assert.notEqual(page.comparisonId, active.comparison.id);
+    assert.ok(page.roots.includes('app.c::task_10ms'), '应自动补齐上游 TASK 入口到画布');
+    assert.ok(page.vars.includes('var::g_oil'), '应按短变量名自动解析并加入画布');
+    const view = await get('/api/view');
+    assert.equal(view.comparison.git.targetRef, 'WORKTREE');
+    assert.ok(view.nodes.some(n => n.id === 'app.c::worktree_only' && n.change === 'added'));
+    assert.equal((await post('/api/compare/exit', {})).comparison, null);
+    assert.deepEqual(await get('/api/page'), baseline);
+  }
 });
 
 test('normalizeAiConfig 切换 baseUrl 时不继承旧 apiKey；mid-turn 降级不重复执行写工具', async () => {

@@ -702,6 +702,7 @@ const messages = [
   ["timeline.kindProject", "工程", "プロジェクト", "Project"],
   ["timeline.labelCount", "设置 {n} 个标签", "ラベル {n} 件を設定", "Set {n} labels"],
   ["timeline.labels", "设置标签：{labels}", "ラベルを設定：{labels}", "Set labels: {labels}"],
+  ["op.manual.variable.bind", "手工变量已绑定源码", "手動変数をソースコードに関連付け", "Manual variables linked to source"],
   ["timeline.layoutNodes", "调整布局（{n} 个节点）", "レイアウトを調整（{n} ノード）", "Adjusted layout ({n} nodes)"],
   ["timeline.legacy", "导入旧版 out/overlay.json", "旧版 out/overlay.json をインポート", "Imported legacy out/overlay.json"],
   ["timeline.more", "加载更多（还剩 {n} 条）", "さらに読み込む（残り {n} 件）", "Load more ({n} remaining)"],

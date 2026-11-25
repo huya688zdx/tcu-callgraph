@@ -128,6 +128,8 @@ function describe(e) {
     }
     case 'restore_point':
       return t('op.restore_point');
+    case 'manual.variable.bind':
+      return t('op.manual.variable.bind');
     case 'bookmark.save':
       return [t('op.bookmark.save'), b.roots ? t('common.scopeCount', { n: b.roots }) : ''].filter(Boolean).join(' · ');
     case 'bookmark.delete':

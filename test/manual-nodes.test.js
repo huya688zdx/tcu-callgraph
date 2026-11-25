@@ -176,3 +176,83 @@ test('手工添加函数与变量：跨重启持久化、支持手动连线、�
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+for (const parserId of ['builtin', 'clang-ast']) {
+  test(`手工变量由同文件全局变量实现后迁移存档与历史恢复（${parserId}）`, async (t) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-manual-binding-'));
+    const src = path.join(tmp, 'src');
+    const db = path.join(tmp, 'callgraph.db');
+    fs.mkdirSync(src);
+    let srv;
+    t.after(async () => {
+      await stopServer(srv?.child);
+      fs.rmSync(tmp, { recursive: true, force: true });
+    });
+    const file = path.join(src, 'app.c');
+    fs.writeFileSync(file, 'void Entry(void) {}\nvoid Write(void) {}\n');
+    fs.writeFileSync(path.join(src, 'other.c'), 'static int planned;\nvoid Other(void) { planned++; }\n');
+    srv = await startServer(src, db);
+    const get = (route) => fetch(srv.base + route).then(r => r.json());
+    const post = async (route, body) => {
+      const res = await fetch(srv.base + route, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      assert.equal(res.status, 200, `${route}: ${data.error}`);
+      return data;
+    };
+    if (parserId === 'clang-ast') {
+      const clang = (await get('/api/parsers')).parsers.find(parser => parser.id === parserId);
+      if (!clang.available) { t.skip(clang.reason); return; }
+      assert.equal((await post('/api/parsers', { parserId })).active, parserId);
+    }
+    const root = 'app.c::Entry';
+    const before = 'var::app.c::planned';
+    const after = 'var::planned';
+    const edge = (id) => `${root}->${id}:0`;
+    await post('/api/manual-nodes', { kind: 'var', file: 'app.c', name: 'planned', typeText: 'int' });
+    await post('/api/overlay', { nodeId: before, data: { note: 'planned variable', tag: 'planned' } });
+    await post('/api/layout', { root, addManual: [{ from: root, to: before }] });
+    await post('/api/overlay', { edgeKey: edge(before), data: { note: 'planned relation' } });
+    await post('/api/page', { roots: [root], vars: [before], selected: before, selectedEdge: edge(before) });
+    await post('/api/bookmarks', { name: 'planned', roots: [root], vars: [before] });
+    const priorEvent = (await get('/api/events')).latest;
+    const priorArchive = await get('/api/session/export');
+    await stopServer(srv.child);
+
+    fs.writeFileSync(file, 'int planned;\nvoid Entry(void) {}\nvoid Write(void) { planned++; }\n');
+    srv = await startServer(src, db);
+    assert.equal((await get('/api/parsers')).active, parserId);
+    const vars = (await get('/api/vars')).list.filter(v => v.name === 'planned');
+    assert.deepEqual(vars.map(v => v.id).sort(), ['var::other.c::planned', after]);
+    assert.ok(!vars.find(v => v.id === after).manual);
+    const saved = (await get('/api/page?saved')).page;
+    assert.deepEqual(saved.vars, [after]);
+    assert.equal(saved.selected, after);
+    assert.equal(saved.selectedEdge, edge(after));
+    let archive = await get('/api/session/export');
+    assert.ok(!archive.manualNodes.some(node => node.id === before));
+    assert.deepEqual(archive.bookmarks.find(bookmark => bookmark.name === 'planned').vars, [after]);
+    assert.equal(archive.overlay.nodes[after].note, 'planned variable');
+    assert.equal(archive.overlay.edges[edge(after)].note, 'planned relation');
+    assert.deepEqual(archive.overlay.layout[`${root}::flat`].manual, [{ from: root, to: after }]);
+    const view = await post('/api/view?up=0&down=0&group=0', {
+      roots: [root], vars: [after], expansions: [{ root: 'app.c::Write', up: 0, down: 0 }],
+    });
+    assert.ok(view.edges.some(e => e.from === root && e.to === after && e.manual));
+    assert.ok(view.edges.some(e => e.from === 'app.c::Write' && e.to === after && e.kind === 'var'));
+    const historical = await post(`/api/view?up=0&down=0&group=0&at=${priorEvent}`, { roots: [root], vars: [before] });
+    assert.ok(historical.nodes.some(node => node.id === before && node.manual));
+    assert.ok((await post('/api/restore', { eventId: priorEvent })).ok);
+    archive = await get('/api/session/export');
+    assert.ok(!archive.manualNodes.some(node => node.id === before));
+    assert.equal(archive.overlay.edges[edge(after)].note, 'planned relation');
+
+    priorArchive.overlay.nodes[after] = { note: 'source note' };
+    assert.ok((await post('/api/session/import', priorArchive)).ok);
+    archive = await get('/api/session/export');
+    assert.ok(!archive.manualNodes.some(node => node.id === before));
+    assert.equal(archive.overlay.nodes[after].note, 'source note');
+    assert.equal(archive.overlay.nodes[after].tag, 'planned');
+  });
+}
