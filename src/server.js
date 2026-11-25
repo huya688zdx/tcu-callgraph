@@ -1093,7 +1093,47 @@ function chainMatchesPathFilters(model, chain, targetSet, includePaths, excludeP
   return true;
 }
 
-function changedFunctionScope(model, comparison, changes, isNode, pathFilter = null) {
+function fallbackCallerPaths(model, id, isNode, includePaths, excludePaths) {
+  const maxNodes = 25; // 目标函数和最多 24 个上游调用者
+  const maxDepth = 6;
+  const matches = file => includePaths.some(prefix => fileMatchesPathPrefix(file, prefix));
+  const queue = [{ id, path: [], matched: !includePaths.length || matches(fileOfNodeId(model, id)) }];
+  const seenMatched = new Set([id]), seenUnmatched = new Set([id]);
+  const retained = new Set([id]), roots = new Set();
+
+  for (let qi = 0; qi < queue.length && retained.size < maxNodes; qi++) {
+    const current = queue[qi];
+    if (current.path.length >= maxDepth) continue;
+    const path = [current, ...current.path];
+    for (const edge of model._index.inAdj.get(current.id) || []) {
+      const caller = edge.from;
+      if (edge.kind === 'var' || edge.headerReference || !isNode(caller) || overlay.deleted.edges[edgeKeyOf(edge)]) continue;
+      const file = fileOfNodeId(model, caller);
+      if (excludePaths.some(prefix => fileMatchesPathPrefix(file, prefix))) continue;
+      const matched = current.matched || matches(file);
+      const seen = matched ? seenMatched : seenUnmatched;
+      if (seen.has(caller) || path.some(step => step.id === caller)) continue;
+      const next = { id: caller, path, matched };
+      if (matched) {
+        // 只有完整链路命中所选目录后才占用名额，共通中间函数随链路一起保留。
+        const newNodes = Number(!retained.has(caller)) + path.filter(step => !retained.has(step.id)).length;
+        if (retained.size + newNodes > maxNodes) continue;
+        retained.add(caller);
+        for (const step of path) {
+          retained.add(step.id);
+          roots.delete(step);
+        }
+        roots.add(next);
+      }
+      seen.add(caller);
+      queue.push(next);
+      if (retained.size === maxNodes) break;
+    }
+  }
+  return [...roots].map(root => [root.id, ...root.path.map(step => step.id)]);
+}
+
+function changedFunctionScope(model, comparison, changes, isNode, pathFilter = null, { fallbackCallers = false } = {}) {
   const taskRoots = new Set(), functionIds = new Set(changes), variableIds = new Set();
   const untracedIds = [], untracedVersions = [], omittedRelationTargets = new Set();
   const includePaths = normalizePathPrefixes(pathFilter?.includePaths);
@@ -1123,6 +1163,14 @@ function changedFunctionScope(model, comparison, changes, isNode, pathFilter = n
         }
         const hidden = chain.edges.find(edge => overlay.deleted.edges[edge.edgeKey]);
         if (hidden) throw new Error('入口路径包含已隐藏的调用线：' + hidden.edgeKey);
+      }
+      // AI 组图场景：若修改函数的上游没有正式 TASK/ISR 入口，自动沿直接调用关系回溯上级调用者（最多 6 层），避免只放孤立叶子函数。
+      if (fallbackCallers && !reached) {
+        for (const chainPath of fallbackCallerPaths(side, id, isNode, includePaths, excludePaths)) {
+          reached = true;
+          taskRoots.add(chainPath[0]);
+          for (const fn of chainPath) functionIds.add(fn);
+        }
       }
     }
     if (!reached) untracedIds.push(id);
@@ -1193,7 +1241,7 @@ function composeMcpView(p, { chatClientId } = {}) {
   const pathFilter = (p.includePaths?.length || p.excludePaths?.length)
     ? { includePaths: p.includePaths, excludePaths: p.excludePaths }
     : null;
-  const scope = changedFunctionScope(model, comparison, changes, isNode, pathFilter);
+  const scope = changedFunctionScope(model, comparison, changes, isNode, pathFilter, { fallbackCallers: Boolean(p.fallbackCallers) });
   if (changes.length) {
     roots = [...new Set([...scope.taskRoots, ...roots])];
     const rootSet = new Set(roots);
@@ -1416,7 +1464,8 @@ const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
  * Origin 为空时放行（curl、同源导航不带 Origin）；跨站带 application/json 的请求
  * 会先触发预检，这里不回应预检，浏览器侧根本发不出来，415 再兜住 text/plain 表单提交。
  */
-function guardWrite(req, res) {
+/** 全局配置写守卫（如 AI API 配置）：校验本机来源与 JSON 类型，不因工程切换/AI 刷新锁死全局配置保存。 */
+function guardLocalJson(req, res) {
   const origin = req.headers.origin;
   if (origin && !LOCAL_ORIGIN.test(origin)) {
     json(res, { ok: false, error: 'forbidden origin' }, 403);
@@ -1430,6 +1479,11 @@ function guardWrite(req, res) {
     json(res, { ok: false, error: 'unsupported media type' }, 415);
     return false;
   }
+  return true;
+}
+
+function guardWrite(req, res) {
+  if (!guardLocalJson(req, res)) return false;
   if (!currentSession(req) || (req.headers['x-callgraph-project'] !== undefined &&
       Number(req.headers['x-callgraph-project']) !== PROJECT.id)) {
     json(res, { ok: false, error: '工程正在切换或请求所属工程已改变，请刷新后重试' }, 409);
@@ -2004,7 +2058,7 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/ai/config') {
       const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
       if (req.method === 'POST') {
-        if (!guardWrite(req, res)) return;
+        if (!guardLocalJson(req, res)) return;
         let p;
         try { p = await readJson(req, res); } catch { return; }
         try {
@@ -2019,7 +2073,7 @@ export const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/ai/models' && req.method === 'POST') {
-      if (!guardWrite(req, res)) return;
+      if (!guardLocalJson(req, res)) return;
       let p;
       try { p = await readJson(req, res); } catch { return; }
       try {
@@ -2032,7 +2086,7 @@ export const server = http.createServer(async (req, res) => {
     }
 
     if (u.pathname === '/api/ai/test' && req.method === 'POST') {
-      if (!guardWrite(req, res)) return;
+      if (!guardLocalJson(req, res)) return;
       let p;
       try { p = await readJson(req, res); } catch { return; }
       try {
@@ -2151,6 +2205,7 @@ export const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
       });
+      res.flushHeaders?.();
       const abort = new AbortController();
       const cancel = () => { if (!res.writableEnded) abort.abort(new Error('用户已取消')); };
       req.on('close', cancel);
@@ -2414,65 +2469,72 @@ export const server = http.createServer(async (req, res) => {
         });
       };
 
-      // 检测改动/目标函数的上游调用链是否横跨多个车型/目录前缀（如 z145/ 与 z144/），便于 AI 提前询问筛选。
+      // 检测改动/目标函数的上游调用链是否横跨多个车型/目录前缀（兼容任意嵌套深度，如 z145/ 或 src/z145/ 与 src/z144/），便于 AI 提前询问筛选。
       const summarizeVehicleBranches = (model, fnIds) => {
         const targetSet = new Set(fnIds);
-        const targetDirs = new Set(fnIds.map((id) => {
-          const segs = fileOfNodeId(model, id).split('/').filter(Boolean);
-          return segs.length > 1 ? segs[0] : '';
-        }).filter(Boolean));
-        const byPrefix = new Map();
-        const recordNode = (prefix, fnId, isTask) => {
-          if (!prefix) return;
-          if (!byPrefix.has(prefix)) byPrefix.set(prefix, { prefix, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
-          const entry = byPrefix.get(prefix);
-          if (isTask) entry.taskIds.add(fnId);
-          else entry.sampleFunctions.add(fnId);
+        const dirSegsOf = (file) => {
+          const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
+          return parts.length > 1 ? parts.slice(0, -1) : [];
         };
-        const branchPrefixOf = (file) => {
-          const segs = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
-          if (segs.length <= 1) return '';
-          return segs[0];
-        };
+        const collectedNodes = []; // { id, file, segs, isTask }
+        const seenNode = new Set();
         for (const id of targetSet) {
           if (!model._index?.byId?.has(id)) continue;
-          let sawChains = false;
           try {
             const trace = traceToTasks(model, id, { limit: 60 });
             for (const chain of trace.upstreamChains || []) {
-              sawChains = true;
-              const chainPrefixes = new Set();
               for (const nodeId of chain.path || []) {
-                if (targetSet.has(nodeId)) continue;
-                const pref = branchPrefixOf(fileOfNodeId(model, nodeId));
-                if (!pref || targetDirs.has(pref)) continue;
-                chainPrefixes.add(pref);
-                recordNode(pref, nodeId, nodeId === chain.taskId);
-              }
-              for (const pref of chainPrefixes) {
-                if (byPrefix.has(pref)) byPrefix.get(pref).chainCount++;
+                if (targetSet.has(nodeId) || seenNode.has(nodeId)) continue;
+                seenNode.add(nodeId);
+                const file = fileOfNodeId(model, nodeId);
+                collectedNodes.push({ id: nodeId, file, segs: dirSegsOf(file), isTask: nodeId === chain.taskId });
               }
             }
           } catch { /* ignore */ }
-          if (!sawChains) {
-            // 若上游未定义正式 TASK，则向上回溯 4 层直接调用者识别目录分支
-            const queue = [{ node: id, depth: 0 }];
-            const visited = new Set([id]);
-            for (let qi = 0; qi < queue.length; qi++) {
-              const { node, depth } = queue[qi];
-              if (depth >= 4) continue;
-              for (const e of model._index.inAdj.get(node) || []) {
-                if (e.kind === 'var' || visited.has(e.from)) continue;
-                visited.add(e.from);
-                const pref = branchPrefixOf(fileOfNodeId(model, e.from));
-                if (pref && !targetDirs.has(pref)) {
-                  recordNode(pref, e.from, false);
-                  byPrefix.get(pref).chainCount++;
-                }
-                queue.push({ node: e.from, depth: depth + 1 });
+          // 同时向上回溯最多 6 层直接调用者，确保非标准命名（无正式 TASK）的多车型上游分支也能被发现
+          const queue = [{ node: id, depth: 0 }];
+          const visited = new Set([id]);
+          for (let qi = 0; qi < queue.length; qi++) {
+            const { node, depth } = queue[qi];
+            if (depth >= 6) continue;
+            for (const e of model._index.inAdj.get(node) || []) {
+              if (e.kind === 'var' || visited.has(e.from)) continue;
+              visited.add(e.from);
+              if (!targetSet.has(e.from) && !seenNode.has(e.from)) {
+                seenNode.add(e.from);
+                const file = fileOfNodeId(model, e.from);
+                collectedNodes.push({ id: e.from, file, segs: dirSegsOf(file), isTask: false });
               }
+              queue.push({ node: e.from, depth: depth + 1 });
             }
           }
+        }
+        const dirLists = [
+          ...[...targetSet].map((id) => dirSegsOf(fileOfNodeId(model, id))),
+          ...collectedNodes.map((n) => n.segs),
+        ].filter((segs) => segs.length > 0);
+        if (!dirLists.length) return [];
+        // 计算所有涉及文件的最长公共目录前缀（例如 src/ 或 app/ecu/），取其后的首级分叉目录作为车型/分支前缀
+        let commonLen = dirLists[0].length;
+        for (let i = 1; i < dirLists.length; i++) {
+          let k = 0;
+          while (k < commonLen && k < dirLists[i].length && dirLists[i][k].toLowerCase() === dirLists[0][k].toLowerCase()) k++;
+          commonLen = k;
+        }
+        const branchKeyOf = (segs) => {
+          if (segs.length <= commonLen) return '';
+          return segs.slice(0, commonLen + 1).join('/');
+        };
+        const targetKeys = new Set([...targetSet].map((id) => branchKeyOf(dirSegsOf(fileOfNodeId(model, id)))).filter(Boolean));
+        const byPrefix = new Map();
+        for (const item of collectedNodes) {
+          const pref = branchKeyOf(item.segs);
+          if (!pref || targetKeys.has(pref)) continue;
+          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          const entry = byPrefix.get(pref);
+          if (item.isTask) entry.taskIds.add(item.id);
+          else entry.sampleFunctions.add(item.id);
+          entry.chainCount++;
         }
         const branches = [...byPrefix.values()]
           .map((b) => ({
@@ -2867,6 +2929,18 @@ export const server = http.createServer(async (req, res) => {
             ? args.mode
             : (args.fromGit ? 'replace' : 'add');
           const groupModel = gitComparison?.afterModel || MODEL;
+          // 安全拦截：检测到共通/修改函数的上游横跨多个车型或目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
+          if (!COMPARISON && includeTasks && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
+            const branches = summarizeVehicleBranches(groupModel, actualFnIds);
+            if (branches.length > 1) {
+              return {
+                ok: false,
+                needsVehicleChoice: true,
+                pathBranches: branches,
+                error: `检测到上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
+              };
+            }
+          }
           const splitGroups = (!COMPARISON && !pureVars && args.fromGit && args.splitByGroup !== false && !hasExplicitFns && actualFnIds.length > 1)
             ? splitChangedGroups(groupModel, actualFnIds, varIds)
             : [];
@@ -2881,7 +2955,7 @@ export const server = http.createServer(async (req, res) => {
               ...(includePaths.length ? { includePaths } : {}),
               ...(excludePaths.length ? { excludePaths } : {}),
               ...(includeTasks
-                ? { changedFunctionIds: activeFnsForCanvas, functionIds: [] }
+                ? { changedFunctionIds: activeFnsForCanvas, functionIds: [], fallbackCallers: true }
                 : { roots: activeFnsForCanvas, changedFunctionIds: [] }),
               vars: activeVarsForCanvas,
               up,
@@ -2928,7 +3002,7 @@ export const server = http.createServer(async (req, res) => {
                 let bmExpansions = g.fnIds.slice(1).map((r) => ({ root: r, up: 0, down: 0 }));
                 let bmVars = g.varIds;
                 if (includeTasks) {
-                  const sc = changedFunctionScope(MODEL, null, g.fnIds, isNode, bmPathFilter);
+                  const sc = changedFunctionScope(MODEL, null, g.fnIds, isNode, bmPathFilter, { fallbackCallers: true });
                   const rList = sc.taskRoots.size ? [...sc.taskRoots] : g.fnIds;
                   const fList = [...sc.functionIds].filter((fid) => !rList.includes(fid));
                   bmRoots = rList;
@@ -3095,6 +3169,58 @@ export const server = http.createServer(async (req, res) => {
         const gitInfo = MODEL.parserId === 'dot' ? null : await quickGitDirtySummary(COMPARISON?.projectPath || root).catch(() => null);
         assertActive();
         const tasks = MODEL.parserId === 'dot' ? [] : projectTasks(MODEL).slice(0, 10).map(t => t.name);
+        const sanitizeUiContext = (raw) => {
+          if (!raw || typeof raw !== 'object') return null;
+          const sanitizeNode = (n) => (!n || typeof n !== 'object' ? null : {
+            kind: 'node',
+            id: String(n.id || '').slice(0, 200),
+            name: String(n.name || '').slice(0, 120),
+            nodeKind: n.nodeKind === 'var' || n.kind === 'var' ? 'var' : 'fn',
+            file: String(n.file || '').slice(0, 200),
+            line: Number(n.line) || 0,
+            change: String(n.change || 'existing').slice(0, 32),
+          });
+          const sanitizeEdge = (e) => (!e || typeof e !== 'object' ? null : {
+            kind: 'edge',
+            edgeKey: String(e.edgeKey || '').slice(0, 320),
+            from: String(e.from || '').slice(0, 200),
+            to: String(e.to || '').slice(0, 200),
+            fromName: String(e.fromName || '').slice(0, 120),
+            toName: String(e.toName || '').slice(0, 120),
+            line: Number(e.line) || 0,
+            edgeKind: String(e.edgeKind || 'direct').slice(0, 32),
+            change: String(e.change || 'existing').slice(0, 32),
+            labels: (Array.isArray(e.labels) ? e.labels : []).slice(0, 8).map((l) => ({
+              preset: String(l?.preset || '').slice(0, 24),
+              text: String(l?.text || '').slice(0, 80),
+              ...(l?.note ? { note: String(l.note).slice(0, 120) } : {}),
+            })),
+          });
+          const sanitizeFile = (f) => (!f || typeof f !== 'object' ? null : {
+            kind: 'file',
+            path: String(f.path || '').slice(0, 240),
+            containerKind: f.containerKind === 'dir' ? 'dir' : 'file',
+            label: String(f.label || '').slice(0, 120),
+          });
+          if (raw.kind === 'node') {
+            const node = sanitizeNode(raw);
+            return node ? { ...node, selectedNode: node } : null;
+          }
+          if (raw.kind === 'edge') {
+            const edge = sanitizeEdge(raw);
+            return edge ? { ...edge, selectedEdge: edge } : null;
+          }
+          if (raw.kind === 'file') {
+            const file = sanitizeFile(raw);
+            return file ? { ...file, selectedFile: file } : null;
+          }
+          const out = {};
+          if (raw.selectedNode) out.selectedNode = sanitizeNode(raw.selectedNode);
+          if (raw.selectedEdge) out.selectedEdge = sanitizeEdge(raw.selectedEdge);
+          if (raw.selectedFile) out.selectedFile = sanitizeFile(raw.selectedFile);
+          return Object.keys(out).length ? out : null;
+        };
+        const uiContext = sanitizeUiContext(p.uiContext);
         const context = {
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
@@ -3103,6 +3229,7 @@ export const server = http.createServer(async (req, res) => {
           isGitRepo: Boolean(gitInfo?.isRepo),
           gitDirtyFiles: gitInfo?.isRepo ? gitInfo.dirtyFiles : [],
           tasks,
+          ...(uiContext ? { uiContext } : {}),
         };
         await runAiAgent({
           config: cfg,

@@ -28,9 +28,9 @@ import {
 } from './menu.js';
 import { showMenu, showMenuSections, hideMenu } from './ctxmenu.js';
 import { saveLayout, pushHistory, addManualEdge } from './history.js';
-import { renderDetail, renderVars, revealInTree } from './panels.js';
+import { askAi, fileAiDetail, nodeAiDetail, publishAiSelection, renderDetail, renderVars, revealInTree } from './panels.js';
 import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
-import { renderLabelPanel } from './label-panel.js';
+import { edgeAiDetail, renderLabelPanel } from './label-panel.js';
 import { statusLabel } from './change-status.js';
 import { nearestSide } from '/core/routing.js';
 import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove, beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from './hierarchy.js';
@@ -283,13 +283,13 @@ let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
-function selectEdge(edge, { trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false } = {}) {
+function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false } = {}) {
   if (state.pairFlow) clearPairFlow({ paint: false });
   state.moveTarget = null;
   state.hoverRelation = null;
   state.selected = null;
   state.selectedEdge = edge;
-  state.selectedLabel = null;
+  state.selectedLabel = labelId ? `${edgeKey(edge)}#${labelId}` : null;
   state.trunkHits = trunkHits;
   state.prevTrunkHits = trunkHits;
   state.trunkFocusNode = focusNode;
@@ -405,6 +405,56 @@ function hitBox(e) {
   return null;
 }
 
+function boxAiDetail({ kind, box }) {
+  // 按周期生成的分组没有对应的源码路径。
+  if (state.groupMode === 'period' && !box.root) return null;
+  return fileAiDetail(box.id, kind, box.label || box.id);
+}
+
+function selectBox(hit) {
+  state.ctxBox = { kind: hit.kind, id: hit.box.id };
+  state.hoverRelation = null;
+  state.selected = null;
+  state.selectedEdge = null;
+  state.selectedLabel = null;
+  renderDetail(null, boxAiDetail(hit));
+  renderVars();
+  renderLabelPanel();
+  draw();
+}
+
+const askNodeItem = { value: 'askAi', label: '✨ 问 AI（关于此函数/变量）' };
+
+function addNodeAiAction(node) {
+  const menu = els.ctxMenu;
+  if (!menu || window.__EXPORT) return;
+  // 函数菜单由 showNodeMenu 渲染，追加按钮后重新校正可视区域。
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.dataset.askAi = '';
+  button.textContent = askNodeItem.label;
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    hideMenu();
+    askAi(nodeAiDetail(node));
+  });
+  menu.appendChild(button);
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth - 8) menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`;
+  if (rect.bottom > window.innerHeight - 8) menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`;
+}
+
+function openEdgeMenu(e, edge, selection) {
+  selectEdge(edge, selection);
+  const comparing = Boolean(state.view?.comparison);
+  const items = [...EDGE_ITEMS];
+  if (comparing) items.unshift({ value: 'auto', label: 'status.auto' });
+  if (!window.__EXPORT) items.push({ value: 'askAi', label: '✨ 问 AI（关于此连线/标签）' });
+  const current = comparing && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing';
+  showMenu(e.clientX, e.clientY, t('menu.edge'), items, current, (v) =>
+    v === 'askAi' ? askAi(edgeAiDetail(edge)) : setEdgeChange(edge, v));
+}
+
 els.cv.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   if (!state.view) return;
@@ -418,6 +468,12 @@ els.cv.addEventListener('contextmenu', (e) => {
   if (state.multiSelection) { state.multiSelection = null; draw(); }
   const comparing = Boolean(state.view?.comparison);
   const editable = !comparing && !state.at;
+
+  const label = hitLabel(worldPos(e));
+  if (label) {
+    openEdgeMenu(e, label.edge, { labelId: label.label.id });
+    return;
+  }
 
   const n = hitTest(e);
   if (n) {
@@ -438,7 +494,9 @@ els.cv.addEventListener('contextmenu', (e) => {
         }] : []),
         { id: 'change', label: 'status.title', items },
       ];
+      if (!window.__EXPORT) sections.push({ items: [askNodeItem] });
       showMenuSections(e.clientX, e.clientY, n.name || n.id, sections, (v) => {
+        if (v === 'askAi') return askAi(nodeAiDetail(n));
         if (v === 'connect') return hooks.startManualLink?.(n);
         if (v === 'deleteManual') return removeManualNodePermanently(n);
         return setNodeChange(n, v);
@@ -446,21 +504,19 @@ els.cv.addEventListener('contextmenu', (e) => {
       return;
     }
     showNodeMenu(e.clientX, e.clientY, n);
+    addNodeAiAction(n);
     return;
   }
 
-  if (pickEdgeAt(e, (edge, selection) => {
-    selectEdge(edge, selection);
-    showMenu(e.clientX, e.clientY, t('menu.edge'), state.view?.comparison ? [{ value: 'auto', label: 'status.auto' }, ...EDGE_ITEMS] : EDGE_ITEMS, state.view?.comparison && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing', (v) =>
-      setEdgeChange(edge, v)
-    );
-  }, true)) return;
+  if (pickEdgeAt(e, (edge, selection) => openEdgeMenu(e, edge, selection), true)) return;
 
   // 文件框 / 目录容器：添加手工函数或变量、调整大小、收缩空白、定位到文件树
   const box = hitBox(e);
   if (box) {
     state.ctxBox = { kind: box.kind, id: box.box.id };
     renderVars();
+    const detail = boxAiDetail(box);
+    if (detail) publishAiSelection(detail);
     const title = String(box.box.label || box.box.id || '');
     const sections = [];
     const isRealFileBox = box.kind === 'file' && state.groupMode !== 'period' &&
@@ -495,19 +551,14 @@ els.cv.addEventListener('contextmenu', (e) => {
         },
       ],
     });
+    if (detail && !window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: '✨ 问 AI（关于此文件/目录）' }] });
     showMenuSections(e.clientX, e.clientY, title, sections, (v) => {
+      if (v === 'askAi') return askAi(detail);
       if (v === 'addFn') return openManualNodeDialog({ file: box.box.id, kind: 'fn' });
       if (v === 'addVar') return openManualNodeDialog({ file: box.box.id, kind: 'var' });
       if (v === 'unlockBox') {
-        state.selected = null;
-        state.selectedEdge = null;
-        state.selectedLabel = null;
-        state.ctxBox = { kind: box.kind, id: box.box.id };
         state.moveTarget = { kind: box.kind, item: box.box, view: state.view };
-        renderDetail(null);
-        renderVars();
-        renderLabelPanel();
-        draw();
+        selectBox(box);
         return;
       }
       if (v === 'fitBox') {
@@ -567,7 +618,11 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
   const lb = hitLabel(worldPos(e));
-  if (lb && editable) {
+  if (lb) {
+    if (!editable) {
+      selectEdge(lb.edge, { labelId: lb.label.id });
+      return;
+    }
     clearTrunk();
     state.multiSelection = null;
     state.moveTarget = null;
@@ -639,16 +694,7 @@ els.cv.addEventListener('pointerdown', (e) => {
     } else state.moveTarget = null;
     state.flash = null;
     els.tooltip.style.opacity = '0';
-    // 点层级/文件标题 = 切换右侧变量面板的范围
-    state.ctxBox = { kind: title.kind === 'file' ? 'file' : 'dir', id: title.box.id };
-    state.hoverRelation = null;
-    state.selected = null;
-    state.selectedEdge = null;
-    state.selectedLabel = null;
-    renderDetail(null); // 收起节点详情 / 调用关系
-    renderVars();
-    renderLabelPanel();
-    draw();
+    selectBox(title);
     return;
   }
 
@@ -1013,13 +1059,12 @@ els.cv.addEventListener('pointerup', (e) => {
 
   if (panning) {
     finishPan();
-    if (!panMoved) {
-      if (!pickEdgeAt(e, selectEdge)) {
-        clearTrunk();
-        state.selectedEdge = null;
-        state.selectedLabel = null;
-        selectNode(null); // 内部会收起节点详情并刷新标签面板
-      }
+    if (!panMoved && !pickEdgeAt(e, selectEdge)) {
+      clearTrunk();
+      const box = hitBox(e);
+      // 工程根框铺底，其内部留白仍可用于清空选择。
+      if (box && !box.box.root && state.groupMode !== 'period') selectBox(box);
+      else selectNode(null);
     }
     return;
   }
@@ -1141,15 +1186,8 @@ els.cv.addEventListener('dblclick', (e) => {
   }, true)) return;
   const box = !state.view?.comparison ? hitBox(e) : null;
   if (box) {
-    state.selected = null;
-    state.selectedEdge = null;
-    state.selectedLabel = null;
-    state.ctxBox = { kind: box.kind, id: box.box.id };
     state.moveTarget = { kind: box.kind, item: box.box, view: state.view };
-    renderDetail(null);
-    renderVars();
-    renderLabelPanel();
-    draw();
+    selectBox(box);
   }
 });
 

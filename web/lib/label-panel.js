@@ -13,7 +13,7 @@ import { edgeCaption, edgeDirection } from './edge-flow.js';
  * 位置、避让、命中都在 edge-labels / core/labels 里，面板不碰几何。
  */
 import { t } from '../i18n.js';
-import { els, state, esc, edgeKey } from './state.js';
+import { els, state, esc, edgeKey, nodeById } from './state.js';
 import { draw } from './render.js';
 import { pushHistory } from './history.js';
 import { api } from './api.js';
@@ -77,6 +77,25 @@ function scheduleCommit(edge, delay = 160) {
 function nodeName(id) {
   const n = state.view?.nodes.find((x) => x.id === id);
   return n ? n.name || n.id : id;
+}
+
+export function edgeAiDetail(edge) {
+  const name = (id) => {
+    const node = nodeById(id);
+    return node?.displayName || node?.name || id;
+  };
+  return {
+    kind: 'edge',
+    edgeKey: edgeKey(edge),
+    from: edge.from,
+    to: edge.to,
+    fromName: name(edge.from),
+    toName: name(edge.to),
+    line: edge.line || 0,
+    edgeKind: edge.kind || 'direct',
+    change: edge.change || 'existing',
+    labels: edgeLabels(edge).map(({ preset, text, note }) => ({ preset, text, note: note || '' })),
+  };
 }
 
 /** 保存后统一收尾：重绘 + 记一步撤销（标签不在布局存档里，但快照里带着） */
@@ -359,6 +378,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const sel = selectedId(edge);
   let selLabel = labels.find((l) => l.id === sel) || null;
   if (!selLabel) state.selectedLabel = null;
+  document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: edgeAiDetail(edge) }));
   if (connPick !== edge || connMode !== 'fixed' || selLabel) connPick = null;
   if (detectResult && (detectResult.edge !== edge || detectResult.labelId !== selLabel?.id)) detectResult = null;
 
@@ -372,7 +392,8 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const trunkScrollTop = trunkHits === displayedTrunk ? box.querySelector('.trunk-list')?.scrollTop || 0 : 0;
   displayedTrunk = trunkHits;
   const navigator = trunkHits ? trunkNavigator(trunkHits, activeBranches, allTrunk, edge) : '';
-  const head = navigator + `<div class="lbl-head" title="${esc(caption)}">${esc(caption)}</div>${statusControl(edge, true)}`;
+  const askAiButton = window.__EXPORT ? '' : '<button type="button" class="lbl-add" data-edge-ask-ai>✨ 问 AI</button>';
+  const head = navigator + `<div class="lbl-head" title="${esc(caption)}">${esc(caption)}</div>${askAiButton}${statusControl(edge, true)}`;
 
   if (state.view?.comparison) {
     const rows = labels.map((label) => labelRow(label, false, true)).join('');
@@ -640,6 +661,13 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
     renderLabelPanel();
   });
 }
+
+els.labelPanel?.addEventListener('click', (event) => {
+  const edge = state.selectedEdge;
+  if (edge && event.target.closest('[data-edge-ask-ai]')) {
+    document.dispatchEvent(new CustomEvent('cg:ask-ai', { detail: edgeAiDetail(edge) }));
+  }
+});
 
 /** 面板首次渲染前把编号模式取回来（不阻塞渲染，取到后刷一次） */
 ensureMode().then(() => {
