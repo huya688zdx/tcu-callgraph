@@ -19,6 +19,7 @@ let win = null;
 let child = null;
 let currentTarget = null;
 let serverOrigin = null;
+let quitting = false;
 ipcMain.handle('cg:save-export', (event, payload) => {
   if (event.sender !== win?.webContents || event.senderFrame !== win.webContents.mainFrame ||
       new URL(event.senderFrame.url).origin !== serverOrigin) throw new Error('无效的导出来源');
@@ -108,7 +109,7 @@ function reportStartupFailure(code) {
   } catch {
     /* 对话框本身失败就算了，控制台里还有一份 */
   }
-  if (!win) app.quit(); // 没有窗口可重试时退出，释放单实例锁。
+  if (!serverOrigin) app.quit(); // 首次启动失败时退出，释放单实例锁。
 }
 
 let startQueue = Promise.resolve();
@@ -121,6 +122,7 @@ function startTarget(target) {
 
 async function startTargetNow(target) {
   await stopServer();
+  if (quitting || !win) return;
   currentTarget = target;
   serverLog = '';
 
@@ -140,17 +142,19 @@ async function startTargetNow(target) {
     return;
   }
 
+  const server = child;
   let ready = false;
-  child.stdout.on('data', (d) => {
+  server.stdout.on('data', (d) => {
     noteServerLog(String(d));
     process.stdout.write('[server] ' + d);
   });
-  child.stderr.on('data', (d) => {
+  server.stderr.on('data', (d) => {
     noteServerLog(String(d));
     process.stderr.write('[server] ' + d);
   });
 
-  child.on('message', (m) => {
+  server.on('message', (m) => {
+    if (quitting || stopping || child !== server) return;
     if (m && m.ready) {
       ready = true;
       const url = `http://127.0.0.1:${m.port}`;
@@ -161,14 +165,17 @@ async function startTargetNow(target) {
       }
       if (win) {
         maybeOpenPicker(win);
-        win.loadURL(url);
-      } else createWindow(url);
+        win.loadURL(url).catch((err) => {
+          if (!quitting && err.code !== 'ERR_ABORTED') console.error('[窗口] ' + err.message);
+        });
+      }
     }
   });
 
-  child.on('exit', (code, signal) => {
+  server.on('exit', (code, signal) => {
     // 主动停（切工程 / 退出）不算失败
-    if (stopping) return;
+    if (quitting || stopping || child !== server) return;
+    child = null;
     if (!ready) reportStartupFailure(code ?? signal ?? '未知');
     else if (code && code !== 0) {
       console.error('[server] exited with', code);
@@ -183,6 +190,7 @@ function maybeOpenPicker(w) {
   openPickerOnLoad = false;
   w.webContents.once('did-finish-load', () => {
     setTimeout(() => {
+      if (w.isDestroyed()) return;
       w.webContents
         .executeJavaScript("document.getElementById('projectBtn')?.click()")
         .catch(() => {
@@ -192,7 +200,21 @@ function maybeOpenPicker(w) {
   });
 }
 
-function createWindow(url) {
+const loadingPage = `<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><title>TCU 调用关系图 · ELK</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         background: #f7f6f2; color: #303c45; font: 16px system-ui, sans-serif; }
+  main { display: grid; justify-items: center; gap: 18px; }
+  .spinner { width: 28px; height: 28px; border: 3px solid #d9e0e4;
+             border-top-color: #376d86; border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+</style>
+<main role="status"><span class="spinner" aria-hidden="true"></span>正在启动本地解析服务并加载工程…</main>
+</html>`;
+
+function createWindow() {
   win = new BrowserWindow({
     width: 1560,
     height: 960,
@@ -208,8 +230,9 @@ function createWindow(url) {
     },
   });
 
-  maybeOpenPicker(win);
-  win.loadURL(url);
+  win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(loadingPage)).catch((err) => {
+    if (!quitting && err.code !== 'ERR_ABORTED') console.error('[窗口] ' + err.message);
+  });
   win.webContents.setWindowOpenHandler(({ url: u }) => {
     let protocol = '';
     try {
@@ -235,7 +258,7 @@ function createWindow(url) {
   });
   let savingClose = false, allowClose = false;
   win.on('close', (event) => {
-    if (allowClose) return;
+    if (allowClose || !serverOrigin || !win.webContents.getURL().startsWith(serverOrigin + '/')) return;
     event.preventDefault();
     if (savingClose) return;
     savingClose = true;
@@ -388,6 +411,7 @@ function buildMenu() {
 }
 
 app.whenReady().then(async () => {
+  createWindow();
   buildMenu();
 
   const arg = process.argv.slice(1).find((a) => {
@@ -405,21 +429,22 @@ app.whenReady().then(async () => {
   }
 
   // 没有命令行参数：优先回到最近打开的工程，并展开选择面板让用户换
-  const projects = readProjects(20).filter((p) => {
+  const projects = readProjects(20);
+  const recent = projects.find((p) => {
     try {
-      return fs.existsSync(p.path);
+      return fs.statSync(p.path).isDirectory();
     } catch {
       return false;
     }
   });
-  if (projects.length) {
+  if (recent) {
     openPickerOnLoad = projects.length > 1;
-    console.log(`[工程] 最近打开：${projects[0].name}（共 ${projects.length} 个）`);
-    startTarget(projects[0].path);
+    console.log(`[工程] 最近打开：${recent.name}`);
+    startTarget(recent.path);
     return;
   }
 
-  const r = await dialog.showOpenDialog({
+  const r = await dialog.showOpenDialog(win, {
     title: '选择 TCU 工程文件夹',
     properties: ['openDirectory'],
   });
@@ -439,13 +464,15 @@ app.on('second-instance', () => {
 });
 
 app.on('window-all-closed', async () => {
+  quitting = true;
   await stopServer();
   app.quit();
 });
 
 app.on('activate', () => {
   // macOS 点 Dock 图标：没有窗口时按当前目标重建
-  if (BrowserWindow.getAllWindows().length) return;
+  if (quitting || BrowserWindow.getAllWindows().length) return;
+  createWindow();
   if (currentTarget) startTarget(currentTarget);
   else pickFolder();
 });

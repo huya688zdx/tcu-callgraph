@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import ELK from 'elkjs/lib/elk.bundled.js';
-import { declaratorName, getParser } from './cparse.js';
+import { collectFunctions, declaratorName, getParser } from './cparse.js';
+import { findFunctions } from './extract.js';
 import { collectArgs, lex } from './lexer.js';
 import { expandSeq, fileMacroScope, preprocess } from './preproc.js';
 import { decodeSource, HDR_EXT } from './source-files.js';
@@ -16,25 +17,113 @@ const compact = text => text.replace(/("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\
 const point = ({ x, y }) => [x, y];
 const directive = token => /^#\s*(\w+)\s*([\s\S]*)/.exec(token.v);
 const isDecision = kind => kind === 'decision' || kind === 'preproc_decision';
+const isTerminal = kind => kind === 'start' || kind === 'end';
+const headerIndexes = new WeakMap();
+const sourceEntries = new WeakMap();
+const callTargetHashes = new WeakMap();
 
 export const isFlowchartFunction = fn => !!fn?.endLine && !fn.external && fn.kind !== 'var' && !fn.headerSymbol;
 
-const flowchartHeaders = (model, fn) => model.files.filter(file =>
-  file.rel !== fn.file && (file.isHeader || HDR_EXT.test(file.rel)));
+function flowchartHeaders(model, fn) {
+  const includes = model.includes;
+  const includeCount = includes?.length ?? 0;
+  let index = headerIndexes.get(model);
+  if (index?.files !== model.files || index.includes !== includes ||
+      index.fileCount !== model.files.length || index.includeCount !== includeCount) {
+    const headers = model.files.filter(file => file.isHeader || HDR_EXT.test(file.rel)).map(file => file.rel);
+    const direct = new Map();
+    if (includeCount) {
+      const paths = new Set(model.files.map(file => file.rel));
+      const suffixes = new Map();
+      for (const rel of headers) {
+        for (let i = rel.indexOf('/'); i !== -1; i = rel.indexOf('/', i + 1)) {
+          const suffix = rel.slice(i + 1);
+          suffixes.set(suffix, suffixes.has(suffix) ? null : rel);
+        }
+      }
+      for (const { file, target } of includes) {
+        const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
+        const relative = path.posix.join(path.posix.dirname(file), normalized);
+        // Clang 已给出项目相对路径。内置解析器保留 include 指令中的原始路径。
+        const resolved = model.parserId === 'clang-ast' && paths.has(normalized) ? normalized
+          : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+        if (!resolved) continue;
+        if (!direct.has(file)) direct.set(file, []);
+        direct.get(file).push(resolved);
+      }
+    }
+    index = { files: model.files, fileCount: model.files.length, includes, includeCount, headers, direct, bySource: new Map() };
+    headerIndexes.set(model, index);
+  }
+  if (!index.bySource.has(fn.file)) {
+    const reachable = new Set([fn.file]);
+    for (const file of reachable) {
+      for (const target of index.direct.get(file) || []) reachable.add(target);
+    }
+    index.bySource.set(fn.file, index.headers.filter(file => file !== fn.file && (!includeCount || reachable.has(file))));
+  }
+  return index.bySource.get(fn.file);
+}
 
-function sourceReader(model, sourceRoot) {
+function sourceReader(model, sourceRoot, fileStats) {
+  let entries = sourceEntries.get(model);
+  if (!entries) sourceEntries.set(model, entries = new Map());
+  const directories = new Map();
   let roots;
-  return file => {
-    const buffered = model._sourceBuffers?.get(file);
-    if (buffered) return decodeSource(buffered).replace(/\r\n?/g, '\n');
+  const withinRoots = realFile => {
     roots ??= [model.root, ...(sourceRoot ? [sourceRoot] : [])].map(root => fs.realpathSync(root));
-    const realFile = fs.realpathSync(model._sourceFiles?.get(file) ?? path.join(model.root, file));
-    const withinRoots = roots.some(root => {
+    return roots.some(root => {
       const rel = path.relative(root, realFile);
       return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
     });
-    if (!withinRoots || !fs.statSync(realFile).isFile()) throw new Error('源码文件必须位于当前工程或对照目录内');
-    return decodeSource(fs.readFileSync(realFile)).replace(/\r\n?/g, '\n');
+  };
+  const remember = (file, bytes, origin) => {
+    const source = decodeSource(bytes).replace(/\r\n?/g, '\n');
+    const entry = { ...origin, source, hash: createHash('sha256').update(source).digest('hex') };
+    entries.set(file, entry);
+    return entry;
+  };
+  return file => {
+    const cached = entries.get(file);
+    const buffered = model._sourceBuffers?.get(file);
+    if (buffered) return cached?.buffered === buffered ? cached : remember(file, buffered, { buffered });
+
+    const override = model._sourceFiles?.get(file);
+    let location = cached?.location;
+    if (!location || location.root !== model.root || location.override !== override) {
+      const filename = override ?? path.join(model.root, file);
+      location = { root: model.root, override, filename, directory: path.dirname(filename) };
+    }
+    const { filename, directory } = location;
+    const invalidPath = '源码文件必须位于当前工程或对照目录内';
+    let stat = fileStats?.get(filename);
+    if (!stat) {
+      stat = fs.lstatSync(filename, { bigint: true });
+      fileStats?.set(filename, stat);
+    }
+    let realFile;
+    if (stat.isSymbolicLink()) {
+      realFile = fs.realpathSync(filename);
+      if (!withinRoots(realFile)) throw new Error(invalidPath);
+      stat = fs.statSync(realFile, { bigint: true });
+    } else {
+      // 同一次查找按目录检查真实路径，常规文件只需要一次元数据查询。
+      let realDirectory = directories.get(directory);
+      if (!realDirectory) {
+        realDirectory = fs.realpathSync(directory);
+        if (!withinRoots(realDirectory)) throw new Error(invalidPath);
+        directories.set(directory, realDirectory);
+      }
+      realFile = directory === realDirectory ? filename : path.join(realDirectory, path.basename(filename));
+    }
+    if (!stat.isFile()) throw new Error(invalidPath);
+
+    // ctime 可识别保留原 mtime 的等长改写。
+    const previous = cached?.stat;
+    if (cached?.location === location && cached.realFile === realFile && previous.dev === stat.dev && previous.ino === stat.ino &&
+        previous.size === stat.size && previous.mtimeNs === stat.mtimeNs && previous.ctimeNs === stat.ctimeNs &&
+        previous.birthtimeNs === stat.birthtimeNs) return cached;
+    return remember(file, fs.readFileSync(realFile), { location, realFile, stat });
   };
 }
 
@@ -525,13 +614,20 @@ function buildGraph(body, fn, model, signature, originalOf) {
     edges: edges.filter(edge => seen.has(edge.from)).map((edge, i) => ({ id: 'e' + i, ...edge })) };
 }
 
+const DISPLAY_LINE_WIDTH = 46;
+
+function displayLineLength(chars) {
+  if (chars.length <= DISPLAY_LINE_WIDTH) return chars.length;
+  const space = chars.lastIndexOf(' ', DISPLAY_LINE_WIDTH);
+  return space > 16 ? space : DISPLAY_LINE_WIDTH;
+}
+
 function displayLines(text) {
   const lines = [];
   for (const original of text.split('\n')) {
     let remaining = Array.from(original);
-    while (remaining.length > 46 && lines.length < 3) {
-      const space = remaining.slice(0, 47).lastIndexOf(' ');
-      const split = space > 16 ? space : 46;
+    while (remaining.length > DISPLAY_LINE_WIDTH && lines.length < 3) {
+      const split = displayLineLength(remaining);
       lines.push(remaining.slice(0, split).join(''));
       remaining = remaining.slice(split);
       if (remaining[0] === ' ') remaining.shift();
@@ -548,10 +644,17 @@ function displayLines(text) {
 async function layout({ nodes, edges }) {
   const children = nodes.map(node => {
     node.lines = displayLines(node.text);
-    const textWidth = Math.max(...node.lines.map(line => Array.from(line).reduce((w, char) => w + (/[^\x00-\x7f]/.test(char) ? 14 : 8), 0)));
+    const lines = node.diffLines?.map(line => line.map(({ text }) => text).join('')) ?? node.lines;
+    const textWidth = lines.reduce((width, line) => {
+      const lineWidth = Array.from(line).reduce((w, char) => w + (/[^\x00-\x7f]/.test(char) ? 14 : 8), 0);
+      return Math.max(width, lineWidth);
+    }, 0);
     const diamond = isDecision(node.kind) || node.kind === 'switch';
-    const width = diamond ? Math.max(164, Math.ceil((textWidth + 34) * 1.45)) : Math.max(104, textWidth + 46);
-    const height = diamond ? Math.max(90, node.lines.length * 40 + 42) : Math.max(42, node.lines.length * 18 + 22);
+    const height = diamond ? Math.max(90, lines.length * 40 + 42) : Math.max(42, lines.length * 18 + 22);
+    // 菱形靠近顶点处更窄，按最外侧一行的截面留出文字空间。
+    const diamondScale = diamond && node.diffLines
+      ? Math.max(1.45, height / (height - (lines.length - 1) * 18 - 16)) : 1.45;
+    const width = diamond ? Math.max(164, Math.ceil((textWidth + 34) * diamondScale)) : Math.max(104, textWidth + 46);
     const port = (side, x, y) => ({ id: node.id + ':' + side, x, y, width: 0, height: 0,
       layoutOptions: { 'elk.port.side': side } });
     return {
@@ -613,65 +716,192 @@ function nodeSignature(node) {
   const macros = (node.macros || []).map(({ name, params, raw }) => [name, params, fingerprint(raw || '')]);
   // 展开后的不同语句可能回溯到同一段调用源码，保留各自的语句标识。
   const expanded = macros.length ? fingerprint(node.text || '') : '';
-  return JSON.stringify([node.kind, source, macros, expanded]);
+  // 单文件对照可能缺少可下钻目标，同一条调用语句仍应匹配。
+  const kind = node.kind === 'call' ? 'process' : node.kind;
+  return JSON.stringify([kind, source, macros, expanded]);
 }
 
-/** 用 LCS 对比修改前后两版流程图语句节点，给每个节点和连线标出 existing / modified / added / deleted。 */
-export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') {
-  const a = primaryNodes.map(nodeSignature);
-  const b = otherNodes.map(nodeSignature);
+const MAX_DIFF_CELLS = 250000;
+
+function alignSequence(a, b, score) {
   const m = a.length, n = b.length;
-  // 限制 DP 规模避免超大函数卡顿
-  if (m * n > 250000) {
-    const counts = new Map();
-    for (const sig of b) counts.set(sig, (counts.get(sig) || 0) + 1);
-    return primaryNodes.map((node, i) => {
-      const c = counts.get(a[i]) || 0;
-      if (c > 0) { counts.set(a[i], c - 1); return 'existing'; }
-      return version === 'before' ? 'deleted' : 'added';
-    });
-  }
   const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
   for (let i = m - 1; i >= 0; i--) {
     for (let j = n - 1; j >= 0; j--) {
-      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      const weight = score(a[i], b[j]);
+      dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1], weight ? dp[i + 1][j + 1] + weight : 0);
     }
   }
-  const anchors = [];
+  const pairs = [];
   let i = 0, j = 0;
   while (i < m && j < n) {
-    if (a[i] === b[j]) { anchors.push([i, j]); i++; j++; }
-    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    const weight = score(a[i], b[j]);
+    if (weight && dp[i][j] === dp[i + 1][j + 1] + weight) {
+      pairs.push([i++, j++]);
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
     else j++;
   }
-  anchors.push([m, n]);
-  const statuses = new Array(m).fill('existing');
+  return pairs;
+}
+
+function markModifiedBlocks(a, b, changes) {
+  if (!a.length || !b.length) return;
+  if (a.length * b.length > MAX_DIFF_CELLS) {
+    const byKind = new Map();
+    for (const { node } of b.toReversed()) {
+      if (!byKind.has(node.kind)) byKind.set(node.kind, []);
+      byKind.get(node.kind).push(node);
+    }
+    for (const { node, index } of a) {
+      const counterpartNode = byKind.get(node.kind)?.pop();
+      if (counterpartNode) changes[index] = { change: 'modified', counterpartNode };
+    }
+    return;
+  }
+
+  // 同类节点优先匹配相近的源码，避免把新分支中的语句错配给后面的修改。
+  const comparable = ({ node }) => ({ kind: node.kind, tokens: new Set(lex(node.code || node.text || '')
+    .filter(token => token.t !== 'punct').map(token => token.v)) });
+  const pairs = alignSequence(a.map(comparable), b.map(comparable), (x, y) => {
+    if (x.kind !== y.kind) return 0;
+    let shared = 0;
+    for (const token of x.tokens) if (y.tokens.has(token)) shared++;
+    return 1 + Math.round(40 * shared / (x.tokens.size + y.tokens.size || 1));
+  });
+  for (const [i, j] of pairs) changes[a[i].index] = { change: 'modified', counterpartNode: b[j].node };
+}
+
+/** 先对齐未变节点，再按类型和源码相似度比较锚点之间的节点。 */
+function matchFlowchartNodes(primaryNodes, otherNodes, version) {
+  const unmatched = version === 'before' ? 'deleted' : 'added';
+  const changes = primaryNodes.map(({ kind }) => ({ change: isTerminal(kind) ? 'existing' : unmatched }));
+  const blocks = nodes => nodes.flatMap((node, index) => isTerminal(node.kind) ? []
+    : [{ node, index, signature: nodeSignature(node) }]);
+  const a = blocks(primaryNodes), b = blocks(otherNodes);
+  if (!a.length || !b.length) return changes;
+  if (a.length * b.length > MAX_DIFF_CELLS) {
+    // 超大函数先按签名计数，保留变化块的空间给后续类型匹配。
+    const bySignature = new Map();
+    const remaining = new Set(b);
+    for (const block of b) {
+      if (!bySignature.has(block.signature)) bySignature.set(block.signature, []);
+      bySignature.get(block.signature).push(block);
+    }
+    const changed = a.filter(block => {
+      const match = bySignature.get(block.signature)?.pop();
+      if (!match) return true;
+      remaining.delete(match);
+      changes[block.index].change = 'existing';
+      return false;
+    });
+    markModifiedBlocks(changed, [...remaining], changes);
+    return changes;
+  }
+  const anchors = alignSequence(a, b, (x, y) => Number(x.signature === y.signature));
+  anchors.push([a.length, b.length]);
   let prevA = 0, prevB = 0;
   for (const [endA, endB] of anchors) {
-    const gapA = endA - prevA;
-    const gapB = endB - prevB;
-    const paired = Math.min(gapA, gapB);
-    for (let k = 0; k < gapA; k++) {
-      statuses[prevA + k] = k < paired ? 'modified' : (version === 'before' ? 'deleted' : 'added');
-    }
+    markModifiedBlocks(a.slice(prevA, endA), b.slice(prevB, endB), changes);
+    if (endA < a.length) changes[a[endA].index].change = 'existing';
     prevA = endA + 1;
     prevB = endB + 1;
   }
-  return statuses;
+  return changes;
 }
 
-async function extractFlowchartGraph(model, fn, { expandMacros = false, sourceRoot } = {}) {
+export function diffFlowchartNodes(primaryNodes, otherNodes, version = 'after') {
+  return matchFlowchartNodes(primaryNodes, otherNodes, version).map(({ change }) => change);
+}
+
+function displayTokens(text) {
+  // 把行首的 # 单独保留，让词法分析器逐个读取预处理指令里的标记。
+  const preproc = text.startsWith('#');
+  const code = preproc ? text.slice(1) : text;
+  const tokens = preproc ? ['#'] : [];
+  let offset = 0;
+  for (const { s, e } of lex(code)) {
+    if (s > offset) tokens.push(code.slice(offset, s));
+    tokens.push(code.slice(s, e));
+    offset = e;
+  }
+  if (offset < code.length) tokens.push(code.slice(offset));
+  return tokens;
+}
+
+function appendSegment(segments, text, op) {
+  if (!text) return;
+  const last = segments.at(-1);
+  if (last?.op === op) last.text += text;
+  else segments.push({ text, op });
+}
+
+function wrapDiffLines(segments) {
+  const chars = segments.flatMap(({ text, op }) => Array.from(text, char => ({ char, op })));
+  const lines = [];
+  for (let start = 0; start < chars.length;) {
+    const preview = chars.slice(start, start + DISPLAY_LINE_WIDTH + 1).map(({ char }) => char);
+    const newline = preview.indexOf('\n');
+    const length = newline < 0 ? displayLineLength(preview) : newline;
+    const line = [];
+    for (const { char, op } of chars.slice(start, start + length)) appendSegment(line, char, op);
+    lines.push(line);
+    start += length + (newline < 0 ? 0 : 1);
+  }
+  return lines;
+}
+
+function diffDisplayLines(beforeText, afterText) {
+  if (beforeText === afterText) return [];
+  const before = displayTokens(beforeText), after = displayTokens(afterText);
+  let start = 0, beforeEnd = before.length, afterEnd = after.length;
+  while (start < beforeEnd && start < afterEnd && before[start] === after[start]) start++;
+  while (beforeEnd > start && afterEnd > start && before[beforeEnd - 1] === after[afterEnd - 1]) {
+    beforeEnd--;
+    afterEnd--;
+  }
+  const removed = before.slice(start, beforeEnd), added = after.slice(start, afterEnd);
+  // 长表达式先保留共同首尾，限制中间部分的 LCS 计算量。
+  const pairs = removed.length && added.length && removed.length * added.length <= MAX_DIFF_CELLS
+    ? alignSequence(removed, added, (a, b) => Number(a === b)) : [];
+  pairs.push([removed.length, added.length]);
+  const segments = [];
+  appendSegment(segments, before.slice(0, start).join(''), 'same');
+  let i = 0, j = 0;
+  for (const [endA, endB] of pairs) {
+    appendSegment(segments, removed.slice(i, endA).join(''), 'del');
+    appendSegment(segments, added.slice(j, endB).join(''), 'add');
+    appendSegment(segments, removed[endA], 'same');
+    i = endA + 1;
+    j = endB + 1;
+  }
+  appendSegment(segments, before.slice(beforeEnd).join(''), 'same');
+  return wrapDiffLines(segments);
+}
+
+function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   if (!isFlowchartFunction(fn) || !model.files.some(file => file.rel === fn.file)) {
     throw new Error('无法找到函数源码');
   }
-  const parser = await getParser();
   const read = sourceReader(model, sourceRoot);
-  const source = read(fn.file);
+  const { source } = read(fn.file);
   const tokens = lex(source, fn.file);
   const headers = new Map();
   for (const file of flowchartHeaders(model, fn)) {
-    collectMacros(lex(read(file.rel), file.rel).filter(token => token.t === 'preproc'), headers, file.rel);
+    const entry = read(file);
+    if (!entry.macros) {
+      const scope = fileMacroScope(headers);
+      collectMacros(lex(entry.source, file).filter(token => token.t === 'preproc'), scope, file);
+      entry.macros = scope.changes;
+    }
+    for (const [name, def] of entry.macros) {
+      if (def) headers.set(name, def);
+      else headers.delete(name);
+    }
   }
+  return { ...buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros), headers };
+}
+
+function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros) {
   const local = fileMacroScope(headers);
   collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file);
   const bounds = locateBody(parser, source, tokens, fn, local);
@@ -707,53 +937,110 @@ async function extractFlowchartGraph(model, fn, { expandMacros = false, sourceRo
     tree.delete();
   }
   const macrosUsed = [...used].map(({ name, params, raw, file, line }) => ({ name, params, raw, file, line }));
-  return { graph, macrosUsed, source };
+  return { graph, macrosUsed };
+}
+
+function findSourceFunction(parser, source, tokens, fn, headers) {
+  const task = taskDeclarations(source, tokens);
+  const tree = parser.parse(task.source);
+  try {
+    const definition = collectFunctions(tree.rootNode).get(fn.name);
+    const close = field(definition, 'body')?.lastChild;
+    if (close?.type === '}' && !close.isMissing) {
+      return { ...fn, line: definition.startPosition.row + 1, endLine: close.startPosition.row + 1 };
+    }
+  } finally {
+    tree.delete();
+  }
+  // 宏封装的函数签名可能需要展开后才能从单文件中识别。
+  const scope = fileMacroScope(headers);
+  const input = task.names.size ? lex(task.source, fn.file) : tokens;
+  const { tokens: expanded } = preprocess(input, scope, fn.file, { expand: true });
+  const definition = findFunctions(expanded, fn.file).find(item => item.name === fn.name);
+  if (!definition) throw new Error(`无法定位对照函数定义：${fn.name}`);
+  return { ...fn, line: definition.line, endLine: definition.endLine };
+}
+
+function extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) {
+  const source = otherSourceText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const tokens = lex(source, fn.file);
+  const definition = findSourceFunction(parser, source, tokens, fn, headers);
+  // 对照文件复用工程符号，调用位置以对照源码为准。
+  const sourceModel = { _index: { ...model._index, outAdj: new Map() } };
+  return buildSourceGraph(parser, sourceModel, definition, source, tokens, headers, expandMacros);
+}
+
+function addCallInputs(hash, index, fn) {
+  if (!index?.byName) return;
+  let targetsHash = callTargetHashes.get(index);
+  if (!targetsHash) {
+    const targets = [...index.byName.values()].flat().map(target =>
+      [target.id, target.name, target.file, !!target.isStatic, isFlowchartFunction(target)]);
+    targetsHash = createHash('sha256').update(JSON.stringify(targets)).digest('hex');
+    callTargetHashes.set(index, targetsHash);
+  }
+  const calls = (index.outAdj.get(fn.id) || []).filter(call => call.kind !== 'var')
+    .map(({ to, callee, kind, line, col, via, macroChain }) => [to, callee, kind, line, col, via, macroChain]);
+  hash.update(targetsHash).update(JSON.stringify(calls));
 }
 
 export function flowchartCacheHash(model, fn, { version = 'after', expandMacros = false, fnChange = 'existing',
-  otherModel = null, otherFn = null, sourceRoot, otherSourceRoot } = {}) {
+  otherModel = null, otherFn = null, otherSourceText, sourceRoot, otherSourceRoot } = {}) {
   const h = createHash('sha1');
-  h.update(`fc-v4\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0`);
-  function addInputs(side, graphModel, graphFn, graphRoot) {
-    h.update(JSON.stringify([side, graphFn.id, graphFn.line, graphFn.endLine]));
-    const read = sourceReader(graphModel, graphRoot);
+  h.update(`fc-v6\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0`);
+  // 目录对照的两侧可映射到同一份工程文件，在本次调用内共用文件状态。
+  const fileStats = otherModel ? new Map() : undefined;
+  function fileInputs(graphModel, graphFn, graphRoot) {
+    const read = sourceReader(graphModel, graphRoot, fileStats);
     // 缓存键与生成图使用同一批文件，包括对照侧实际参与预处理的头文件。
-    for (const file of [graphFn.file, ...flowchartHeaders(graphModel, graphFn).map(entry => entry.rel)]) {
-      h.update(JSON.stringify(file));
-      try {
-        const source = read(file);
-        h.update(`${source.length}\0`).update(source);
-      } catch { h.update('missing\0'); }
-    }
+    return JSON.stringify([graphFn.file, ...flowchartHeaders(graphModel, graphFn)].map(file => {
+      try { return [file, read(file).hash]; }
+      catch { return [file, null]; }
+    }));
   }
-  addInputs('current', model, fn, sourceRoot);
-  if (otherModel && otherFn && isFlowchartFunction(otherFn)) {
-    addInputs('other', otherModel, otherFn, otherSourceRoot);
+  function addInputs(side, graphModel, graphFn, files) {
+    h.update(JSON.stringify([side, graphFn.id, graphFn.name, graphFn.file, graphFn.line, graphFn.endLine])).update(files);
+    addCallInputs(h, graphModel._index, graphFn);
+  }
+  const currentFiles = fileInputs(model, fn, sourceRoot);
+  addInputs('current', model, fn, currentFiles);
+  if (fnChange !== 'added' && fnChange !== 'deleted') {
+    if (otherModel && isFlowchartFunction(otherFn)) {
+      const sameFiles = otherModel === model && otherFn.file === fn.file && otherSourceRoot === sourceRoot;
+      addInputs('other', otherModel, otherFn, sameFiles ? currentFiles : fileInputs(otherModel, otherFn, otherSourceRoot));
+    } else if (typeof otherSourceText === 'string') h.update('otherSourceText\0').update(otherSourceText);
   }
   return h.digest('hex');
 }
 
 export async function buildFlowchart(model, fn, { expandMacros = false, version = 'after', hasBefore = false,
-  hasAfter = true, sourceRoot, fnChange = 'existing', otherModel = null, otherFn = null, otherSourceRoot } = {}) {
-  const { graph, macrosUsed } = await extractFlowchartGraph(model, fn, { expandMacros, sourceRoot });
-  // 按调用关系图一致的语义给每个流程图节点与连线标出变更颜色状态
-  let statuses = null;
-  if (fnChange === 'added' || fnChange === 'deleted') {
-    statuses = graph.nodes.map(() => fnChange);
-  } else if (otherModel && otherFn && isFlowchartFunction(otherFn)) {
+  hasAfter = true, sourceRoot, fnChange = 'existing', otherModel = null, otherFn = null,
+  otherSourceText, otherSourceRoot } = {}) {
+  const parser = await getParser();
+  const { graph, macrosUsed, headers } = extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot);
+  const defaultChange = fnChange === 'added' || fnChange === 'deleted' ? fnChange : 'existing';
+  let changes;
+  if (defaultChange === 'existing') {
     try {
-      const counterpart = await extractFlowchartGraph(otherModel, otherFn, { expandMacros, sourceRoot: otherSourceRoot });
-      statuses = diffFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
-    } catch { /* 对照版本无法解析时退回整体状态 */ }
-  }
-  if (!statuses) {
-    statuses = graph.nodes.map(() => (fnChange === 'modified' ? 'modified' : 'existing'));
+      const counterpart = otherModel && isFlowchartFunction(otherFn)
+        ? extractFlowchartGraph(parser, otherModel, otherFn, expandMacros, otherSourceRoot)
+        : typeof otherSourceText === 'string'
+          ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) : null;
+      if (counterpart) changes = matchFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
+    } catch { /* 对照版本无法解析时，仅保留函数级状态。 */ }
   }
   const nodeChangeById = new Map();
   graph.nodes = graph.nodes.map((node, idx) => {
-    const change = statuses[idx] || 'existing';
+    const { change = defaultChange, counterpartNode } = changes?.[idx] ?? {};
     nodeChangeById.set(node.id, change);
-    return { ...node, change };
+    const item = { ...node, change };
+    if (change === 'modified' && counterpartNode) {
+      // 两侧的 text 是生成 lines 的显示标签，在折行前比较可保留完整的 C 标记。
+      const [before, after] = version === 'before' ? [node, counterpartNode] : [counterpartNode, node];
+      const diffLines = diffDisplayLines(before.text, after.text);
+      if (diffLines.length) item.diffLines = diffLines;
+    }
+    return item;
   });
   graph.edges = graph.edges.map((edge) => {
     const fc = nodeChangeById.get(edge.from);

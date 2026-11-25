@@ -25,7 +25,13 @@ if (projectError && !projectError.id) {
   listEl.after(projectError);
 }
 let switching = false;
-let orphanTimer = 0;
+let orphanScanId = 0;
+const orphanBox = document.getElementById('orphanBox');
+const orphanCheck = document.createElement('button');
+orphanCheck.type = 'button';
+orphanCheck.textContent = t('orphan.title');
+orphanCheck.dataset.i18n = 'orphan.title';
+openBtn?.before(orphanCheck);
 const lockedControls = new Set();
 
 function showSwitchBanner(text) {
@@ -88,7 +94,9 @@ export async function syncProjectLabel() {
 
 async function switchTo(body) {
   if (switching) return;
-  clearTimeout(orphanTimer);
+  ++orphanScanId;
+  orphanBox?.classList.remove('show');
+  orphanBox?.replaceChildren();
   switching = true;
   listEl?.setAttribute('aria-busy', 'true');
   lockProjectControls();
@@ -162,7 +170,9 @@ async function render() {
       if (switching) return;
       const button = event.target.closest('button');
       if (!button) {
-        if (!event.target.closest('input') && !row.querySelector('.proj-rename')) switchTo({ id: project.id });
+        if (event.target.closest('input') || row.querySelector('.proj-rename')) return;
+        if (project.current) closeModal();
+        else switchTo({ id: project.id });
         return;
       }
       try {
@@ -229,20 +239,27 @@ function rename(row, project) {
 
 /** 失效标注：源码删了函数之后，标注还留在库里，必须给用户一个清理入口 */
 async function renderOrphans() {
-  const box = document.getElementById('orphanBox');
+  const box = orphanBox;
   if (!box) return;
+  const scanId = ++orphanScanId;
   let o;
   try {
     o = await api.orphans();
-  } catch {
+    if (o?.error) throw new Error(o.error);
+  } catch (error) {
+    if (scanId !== orphanScanId) return;
     box.classList.remove('show');
+    projectMessage(error.message || t('common.unknown'), true);
     return;
   }
+  if (scanId !== orphanScanId) return;
   if (!o || !o.total) {
     box.classList.remove('show');
     box.innerHTML = '';
+    projectMessage(`${t('orphan.title')} 0`);
     return;
   }
+  projectMessage('');
 
   const sample = [
     ...o.annotations.map((a) => a.id),
@@ -283,15 +300,16 @@ async function renderOrphans() {
 function open() {
   openModal('projectModal');
   render();
-  // 延迟检测旧工程失效标注：用户立刻点击切换工程时绝不触发旧工程全量数据流分析
-  clearTimeout(orphanTimer);
-  orphanTimer = setTimeout(() => {
-    if (!switching && document.getElementById('projectModal')?.classList.contains('show')) renderOrphans();
-  }, 300);
   pathInput?.focus();
 }
 
 btn?.addEventListener('click', open);
+orphanCheck.addEventListener('click', async () => {
+  if (switching) return;
+  orphanCheck.disabled = true;
+  try { await renderOrphans(); }
+  finally { orphanCheck.disabled = false; }
+});
 openBtn?.addEventListener('click', async () => {
   const p = pathInput?.value.trim();
   // 填了路径直接切；空着则调起系统文件夹选择框并复用 switchTo 展示加载进度

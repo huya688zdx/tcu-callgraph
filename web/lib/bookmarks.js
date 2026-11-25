@@ -60,6 +60,7 @@ async function render() {
     listEl.innerHTML = `<div class="empty">${t('bookmark.empty')}</div>`;
     return;
   }
+  const renameLabel = esc(t('project.rename'));
   listEl.innerHTML = rows
     .map(
       (b) => `
@@ -71,6 +72,7 @@ async function render() {
       <div class="bm-actions">
         <button type="button" class="bm-open">${esc(t('bookmark.open'))}</button>
         <button type="button" class="bm-update">${esc(t('bookmark.update'))}</button>
+        <button type="button" class="bm-rename icon-btn" title="${renameLabel}" aria-label="${renameLabel}">✎</button>
         <button type="button" class="bm-delete">${esc(t('bookmark.delete'))}</button>
       </div>
     </div>`
@@ -81,10 +83,12 @@ async function render() {
     const b = rows[index];
     const open = row.querySelector('.bm-open');
     const update = row.querySelector('.bm-update');
+    const rename = row.querySelector('.bm-rename');
     const remove = row.querySelector('.bm-delete');
+    rename.disabled = state.at > 0 || !!state.view?.comparison;
     row.addEventListener('click', async (event) => {
       const button = event.target.closest('button');
-      if ((button && button !== open) || open.disabled) return;
+      if ((button && button !== open) || open.disabled || row.querySelector('.bm-rename-input')) return;
       open.disabled = true;
       try {
         await hooks.applyBookmark(b);
@@ -96,12 +100,71 @@ async function render() {
       }
     });
     update.addEventListener('click', () => save(b.name, update));
+    rename.addEventListener('click', () => editName(row, b, rename));
     remove.addEventListener('click', () => write(remove, 'bookmark.deleteFailed', async () => {
       const result = await api.deleteBookmark(b.id);
       if (!result?.ok) throw new Error(result?.error);
       return t('bookmark.deleted');
     }));
   });
+}
+
+function editName(row, bookmark, renameButton) {
+  if (writing) return;
+  listEl.querySelector('.bm-rename-cancel')?.click();
+  feedback('');
+
+  const name = row.querySelector('.nm');
+  const actions = row.querySelector('.bm-actions');
+  const buttons = [...actions.children];
+  name.innerHTML = `<input class="bm-rename-input" type="text" maxlength="80"
+    aria-label="${esc(t('project.rename'))}" style="box-sizing: border-box; width: 100%; font: inherit">`;
+  actions.innerHTML = `
+    <button type="button" class="bm-rename-save primary">${esc(t('common.save'))}</button>
+    <button type="button" class="bm-rename-cancel">${esc(t('common.cancel'))}</button>`;
+  const input = name.querySelector('input');
+  const saveButton = actions.querySelector('.bm-rename-save');
+  const cancelButton = actions.querySelector('.bm-rename-cancel');
+  input.value = bookmark.name;
+
+  const onKey = (event) => {
+    if (event.key === 'Escape') {
+      event.stopPropagation();
+      if (!event.isComposing) cancelButton.click();
+    } else if (event.key === 'Enter' && event.target === input && !event.isComposing) {
+      event.preventDefault();
+      saveButton.click();
+    }
+  };
+  row.addEventListener('keydown', onKey);
+  cancelButton.addEventListener('click', () => {
+    row.removeEventListener('keydown', onKey);
+    name.textContent = bookmark.name;
+    actions.replaceChildren(...buttons);
+    feedback('');
+    renameButton.focus();
+  });
+  saveButton.addEventListener('click', async () => {
+    if (writing) return;
+    const nextName = input.value.trim();
+    if (!nextName) {
+      feedback(t('bookmark.needName'), true);
+      input.focus();
+      return;
+    }
+    input.readOnly = true;
+    cancelButton.disabled = true;
+    await write(saveButton, 'bookmark.failed', async () => {
+      const result = await api.renameBookmark(bookmark.id, nextName);
+      if (!result?.ok) throw new Error(result?.error);
+      return t('bookmark.updated');
+    });
+    input.readOnly = false;
+    cancelButton.disabled = false;
+    if (input.isConnected) input.focus();
+  });
+  input.focus();
+  input.select();
 }
 
 async function write(button, errorKey, action) {

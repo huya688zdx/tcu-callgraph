@@ -864,7 +864,7 @@
 
   /* ---- 右侧悬浮 AI 助手抽屉（不遮挡画布，支持边聊边看节点实时入图） ---- */
   #aiDrawer {
-    position: fixed; top: 52px; right: 12px; bottom: 12px; width: min(420px, calc(100vw - 24px));
+    position: fixed; top: 52px; right: 12px; bottom: 12px; width: 448px; max-width: calc(100vw - 24px);
     z-index: 45; display: none; flex-direction: column;
     background: #fff; border: 1px solid rgba(0, 0, 0, 0.14); border-radius: 12px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14); overflow: hidden;
@@ -886,24 +886,39 @@
   .ai-pane[hidden] { display: none; }
   .ai-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; }
   .ai-quick { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px 12px 0; }
-  .ai-quick button { height: 26px; padding: 0 8px; font-size: 11.5px; border-radius: 13px; background: #F4F8FC; border-color: #C7DDF3; color: #124B71; }
-  .ai-quick button:hover { background: #E6F1FB; }
+  .ai-quick button, .ai-followup-chip { height: 26px; padding: 0 8px; font-size: 11.5px; border-radius: 13px; background: #F4F8FC; border-color: #C7DDF3; color: #124B71; }
+  .ai-quick button:hover, .ai-followup-chip:hover { background: #E6F1FB; }
+  .ai-followups { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+  .ai-followup-chip { height: auto; min-height: 24px; padding-block: 3px; white-space: normal; text-align: left; }
   .ai-banner { margin: 8px 12px 0; padding: 8px 10px; border-radius: 8px; background: #FEF6E0; border: 1px solid #F3D185; color: #6D4300; font-size: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .ai-banner[hidden] { display: none; }
-  .ai-msg { margin-bottom: 10px; font-size: 12.5px; line-height: 1.55; }
-  .ai-msg.user { background: #E6F1FB; color: #0C447C; padding: 8px 10px; border-radius: 10px 10px 2px 10px; margin-left: 28px; white-space: pre-wrap; word-break: break-word; }
-  .ai-msg.assistant { background: #F7F6F2; color: #2C2C2A; padding: 8px 10px; border-radius: 10px 10px 10px 2px; margin-right: 12px; word-break: break-word; }
-  .ai-msg.error { background: #FCEBEB; color: #A32D2D; padding: 8px 10px; border-radius: 8px; }
+  .ai-msg { margin: 0 0 10px 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+  .ai-msg.user { border-left: 2px solid #185FA5; background: #F5F7FA; padding: 6px 10px; border-radius: 4px; white-space: pre-wrap; }
+  .ai-msg.user::before { content: ">"; margin-right: 7px; color: #61768A; font-family: monospace; }
+  .ai-msg.assistant { background: transparent; padding: 2px 2px 10px; border-bottom: 1px solid rgba(0,0,0,0.06); color: #2C2C2A; }
+  .ai-msg.error, .ai-chat-status.err { color: #A32D2D; }
   .ai-msg-text { white-space: pre-wrap; }
-  .ai-steps { display: grid; gap: 4px; margin-bottom: 6px; }
-  .ai-step { font-size: 11.5px; padding: 3px 7px; border-radius: 6px; background: #fff; border: 1px solid #E5E3DB; color: #5F5E5A; }
-  .ai-step.ok { border-color: #C4E2C6; color: #235326; background: #F3FAF3; }
-  .ai-step.err { border-color: #F2C4C4; color: #A32D2D; background: #FDF3F3; }
-  .ai-think { margin-bottom: 6px; border: 1px solid #DDD9CF; border-radius: 7px; background: #F0EEE8; font-size: 12px; color: #484640; }
-  .ai-think summary { padding: 5px 8px; border-radius: 6px; cursor: pointer; }
-  .ai-think summary:hover { background: #E7E4DC; }
-  .ai-think pre { margin: 0; padding: 7px 8px; border-top: 1px solid #DDD9CF; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font: inherit; }
-  .ai-question { border: 1px solid #CCDDEC; background: #F4F8FC; border-radius: 8px; padding: 8px; }
+  .ai-msg-text:empty, .ai-steps:empty { display: none; }
+  .ai-msg-text code { background: #F1F2F4; padding: 1px 4px; border-radius: 3px; font-size: .92em; }
+  .ai-msg-text ul, .ai-msg-text ol { margin: 4px 0; padding-left: 22px; }
+  .ai-steps { display: grid; gap: 4px; margin-bottom: 8px; }
+  .ai-step { color: #5F5E5A; font-size: 11.5px; }
+  .ai-step-head, .ai-step-result { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ai-step-head { font-family: ui-monospace, Consolas, monospace; }
+  .ai-step-head::before { content: "●"; color: #9A650A; margin-right: 6px; font-size: 9px; }
+  .ai-step.ok .ai-step-head::before { color: #2F7A47; }
+  .ai-step.err .ai-step-head::before { color: #A32D2D; }
+  .ai-step-result { margin-left: 14px; color: #66645E; }
+  .ai-think { border-left: 2px solid #C9C5B8; padding-left: 9px; margin: 4px 0 8px; font-size: 12px; color: #66645E; }
+  .ai-think summary { padding: 2px 0; cursor: pointer; }
+  .ai-think pre { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font: inherit; }
+  @media (prefers-reduced-motion: no-preference) {
+    @supports (interpolate-size: allow-keywords) {
+      .ai-think::details-content { block-size: 0; overflow: clip; interpolate-size: allow-keywords; transition: block-size 120ms ease, content-visibility 120ms allow-discrete; }
+      .ai-think[open]::details-content { block-size: auto; }
+    }
+  }
+  .ai-question { border: 1px solid #D6DEE8; background: #FAFBFC; border-radius: 5px; padding: 8px 10px; }
   .ai-question-opts { display: grid; gap: 5px; margin-top: 6px; }
   .ai-q-opt { height: auto; min-height: 28px; padding: 4px 8px; text-align: left; white-space: normal; overflow-wrap: anywhere; }
   .ai-q-opt small { display: block; color: #5F5E5A; }
@@ -911,6 +926,10 @@
   .ai-q-opt.chosen { background: #DFEEFA; border-color: #7CAED8; color: #124B71; opacity: 1; }
   .ai-q-hint { margin: 6px 0 0; font-size: 11.5px; color: #5F5E5A; }
   .ai-composer { border-top: 1px solid rgba(0, 0, 0, 0.08); padding: 8px 10px; display: grid; gap: 6px; background: #FAF9F6; }
+  .ai-telemetry { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; color: #595953; font-size: 11px; font-variant-numeric: tabular-nums; }
+  #aiSpeedBadge:empty, .ai-chat-status:empty { display: none; }
+  #aiCompactChat { margin-left: auto; height: 22px; padding: 0 7px; font-size: 11px; }
+  .ai-chat-status { color: #66645E; font-size: 11px; }
   .ai-composer textarea { width: 100%; min-height: 54px; max-height: 120px; resize: vertical; padding: 7px 9px; font: inherit; font-size: 12.5px; border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none; }
   .ai-composer textarea:focus { border-color: #185FA5; }
   .ai-composer-bar { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
@@ -975,10 +994,11 @@
     font-size: 11px; color: #0C447C; background: #E6F1FB; border-radius: 5px;
     padding: 2px 7px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .ai-chat-bar select {
+  .ai-chat-bar select, #aiRenameInput {
     flex: 1; min-width: 110px; height: 26px; font-size: 12px;
     border: 1px solid #D3D1C7; border-radius: 6px; background: #fff; padding: 0 6px;
   }
+  #aiRenameInput:focus { border-color: #185FA5; }
   .ai-chat-bar button { height: 26px; padding: 0 8px; font-size: 11.5px; border-radius: 6px; }
 </style>
 </head>
@@ -1420,7 +1440,9 @@
       <div class="ai-chat-bar">
         <span class="ai-project-tag" id="aiProjectTag" title="按工程隔离保存对话">工程</span>
         <select id="aiChatSelect" aria-label="切换历史对话"></select>
+        <input type="text" id="aiRenameInput" aria-label="对话名称" maxlength="80" hidden>
         <button type="button" id="aiNewChat" title="新建对话">+ 新建</button>
+        <button type="button" id="aiRenameChat" title="重命名当前对话" aria-label="重命名当前对话" aria-controls="aiRenameInput" disabled>✎</button>
         <button type="button" id="aiDeleteChat" title="删除当前对话">删</button>
       </div>
       <div id="aiSetupBanner" class="ai-banner" hidden>
@@ -1436,6 +1458,12 @@
         <div class="empty">直接告诉我你想找什么函数、分析 Git 改动，或点上方快捷按钮，我会自动查找并加入当前画布。</div>
       </div>
       <div class="ai-composer">
+        <div class="ai-telemetry">
+          <span id="aiContextBadge" title="当前对话估算上下文占用">上下文 0 / 32k</span>
+          <span id="aiSpeedBadge" title="最近一轮生成速度与 Token 统计"></span>
+          <button type="button" id="aiCompactChat" title="压缩早期对话以释放上下文（也支持输入 /compact）">压缩</button>
+        </div>
+        <div class="ai-chat-status" id="aiChatStatus" role="status"></div>
         <textarea id="aiPromptInput" placeholder="例如：把 Git 未提交改动的函数加入画布；或：找出油压控制相关函数和共享变量加到图里…"></textarea>
         <div class="ai-composer-bar">
           <span class="ai-composer-hint" id="aiModelBadge">未配置模型</span>
@@ -1482,6 +1510,9 @@
               <option value="medium">中（均衡）</option>
               <option value="high">高（深度思考）</option>
             </select>
+          </label>
+          <label>上下文窗口（tokens）
+            <input id="aiContextWindow" type="number" min="4096" max="1048576" step="1024" placeholder="32768">
           </label>
           <div class="ai-form-row">
             <button type="button" id="aiTestConn">测试连接</button>

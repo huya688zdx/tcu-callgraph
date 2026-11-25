@@ -365,108 +365,170 @@ const rectAt = (cx, cy, size) => ({
   h: size.h,
 });
 
-/**
- * 给标签找位置：优先「线中央 + 用户偏移」，压住节点/别的标签时沿法线与切线逐圈外扩。
- * 返回左上角矩形；全部候选都不干净时退化为重叠最少的那一个（有总比没有强）。
- */
-export function placeLabel({ label, size, pts = [], nodes = [], others = [], maxDist = LABEL_MAX_DIST } = {}) {
+const NODE_PAD = 5;
+const LABEL_GAP = 4;
+const AUTO_MAX_DIST = 88;
+const ESCAPE_MAX_DIST = 96;
+
+function limitLabelCenter(center, pts, maxDist) {
+  const near = nearestOnPolyline(center, pts);
+  if (near.d <= maxDist) return center;
+  const scale = maxDist / near.d;
+  return {
+    x: near.x + (center.x - near.x) * scale,
+    y: near.y + (center.y - near.y) * scale,
+  };
+}
+
+function overlapArea(a, b) {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+  return Math.max(0, w) * Math.max(0, h);
+}
+
+function nodeEscapeCenters(center, node, size) {
+  const gap = NODE_PAD + 1;
+  return [
+    { x: center.x, y: node.y - size.h / 2 - gap },
+    { x: center.x, y: node.y + node.h + size.h / 2 + gap },
+    { x: node.x - size.w / 2 - gap, y: center.y },
+    { x: node.x + node.w + size.w / 2 + gap, y: center.y },
+  ];
+}
+
+/** 自动标签遍历独立线段。手动偏移以整条折线的中点为基准。 */
+export function placeLabel({
+  label, size, pts = [], nodes = [], others = [], otherPaths = [],
+  maxDist = LABEL_MAX_DIST, preferredSide = -1,
+} = {}) {
+  return findLabelRect({
+    label, size, pts, nodes, others, maxDist, preferredSide,
+    paths: privateLabelPaths(pts, otherPaths),
+    centerUnstyled: otherPaths.length === 0,
+  });
+}
+
+function findLabelRect({ label, size, pts, nodes, others, maxDist, preferredSide, paths, centerUnstyled }) {
   const anchor = midAnchor(pts);
   if (!anchor || !size) return null;
   const dx = label?.dx || 0;
   const dy = label?.dy || 0;
-  const base = { x: anchor.x + dx, y: anchor.y + dy };
-  // 偏移可能是按旧几何存的（节点挪过 / 连线重布过）：先拉回线附近再找位置
-  const nearBase = nearestOnPolyline(base, pts);
-  let origin = base;
-  if (nearBase.d > maxDist) {
-    const len = nearBase.d || 1;
-    origin = {
-      x: nearBase.x + ((base.x - nearBase.x) / len) * maxDist,
-      y: nearBase.y + ((base.y - nearBase.y) / len) * maxDist,
-    };
-  }
-  const nx = -anchor.uy;
-  const ny = anchor.ux;
-  const stepV = size.h + 8;
-  const stepU = size.w / 2 + 10;
-
-  const cands = [origin];
-  for (let i = 1; i <= 3; i++) {
-    cands.push({ x: origin.x + nx * stepV * i, y: origin.y + ny * stepV * i });
-    cands.push({ x: origin.x - nx * stepV * i, y: origin.y - ny * stepV * i });
-  }
-  for (let j = 1; j <= 3; j++) {
-    for (const k of [-1, 1]) {
-      const ux = anchor.ux * stepU * j * k;
-      const uy = anchor.uy * stepU * j * k;
-      cands.push({ x: origin.x + ux, y: origin.y + uy });
-      cands.push({ x: origin.x + ux + nx * stepV, y: origin.y + uy + ny * stepV });
-      cands.push({ x: origin.x + ux - nx * stepV, y: origin.y + uy - ny * stepV });
-    }
+  const manual = dx !== 0 || dy !== 0;
+  const rectOnLine = !manual && centerUnstyled && !label?.preset;
+  const manualCenter = manual && limitLabelCenter({ x: anchor.x + dx, y: anchor.y + dy }, pts, maxDist);
+  if (manualCenter) {
+    const rect = rectAt(manualCenter.x, manualCenter.y, size);
+    if (!overlapCount(rect, nodes, NODE_PAD)) return rect;
+    paths = privateLabelPaths(pts, []);
   }
 
+  const candidateLimit = manual ? maxDist : AUTO_MAX_DIST;
+  const escapeLimit = manual ? maxDist : ESCAPE_MAX_DIST;
   let best = null;
-  let bestScore = Infinity;
-  for (const c of cands) {
-    const rect = rectAt(c.x, c.y, size);
-    const d = distToPolyline(c, pts);
-    if (d > maxDist) continue;
-    const hitNodes = overlapCount(rect, nodes, 4);
-    const hitLabels = overlapCount(rect, others, 3);
-    if (!hitNodes && !hitLabels) return rect;
-    // 压住函数框比压住别的标签更糟：权重差一个量级
-    const score =
-      hitNodes * 1000 + hitLabels * 100 + d + Math.hypot(c.x - origin.x, c.y - origin.y) * 0.05;
-    if (score < bestScore) {
-      bestScore = score;
+  let bestScore = null;
+
+  function evaluate(center, preferred, path, limit, preferencePenalty) {
+    const distance = distToPolyline(center, path);
+    if (distance > limit + 1e-6) return [];
+    const rect = rectAt(center.x, center.y, size);
+    const hits = nodes.filter((node) => rectsOverlap(rect, node, NODE_PAD));
+    let area = 0;
+    let titleArea = 0;
+    let titleGap = Infinity;
+    for (const node of hits) {
+      area += overlapArea(rect, node);
+      const title = { ...node, h: Math.min(22, node.h) };
+      titleArea += overlapArea(rect, title);
+      const gap = Math.max(title.y - rect.y - rect.h, rect.y - title.y - title.h, 0);
+      titleGap = Math.min(titleGap, gap);
+    }
+    const proximity = distance + Math.hypot(center.x - preferred.x, center.y - preferred.y) + preferencePenalty;
+    // 按优先级逐项比较，距离再近也不能抵消碰撞。
+    const score = [
+      Number(hits.length > 0), area, titleArea, hits.length ? -titleGap : 0,
+      overlapCount(rect, others, LABEL_GAP), Number(distance > maxDist + 1e-6), proximity,
+    ];
+    const firstDifference = bestScore && score.findIndex((value, i) => value !== bestScore[i]);
+    if (!bestScore || (firstDifference >= 0 && score[firstDifference] < bestScore[firstDifference])) {
       best = rect;
+      bestScore = score;
+    }
+    return hits;
+  }
+
+  function probe(center, preferred, path, preferencePenalty) {
+    const hits = evaluate(center, preferred, path, candidateLimit, preferencePenalty);
+    for (const node of hits) {
+      for (const escaped of nodeEscapeCenters(center, node, size)) {
+        evaluate(escaped, preferred, pts, escapeLimit, preferencePenalty);
+      }
     }
   }
-  return best || rectAt(origin.x, origin.y, size);
+
+  if (manualCenter) probe(manualCenter, manualCenter, pts, 0);
+  if (rectOnLine) probe(anchor, anchor, pts, 0);
+
+  for (const path of paths) {
+    const [a, b] = path;
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const ux = (b[0] - a[0]) / len;
+    const uy = (b[1] - a[1]) / len;
+    const nx = -uy;
+    const ny = ux;
+    const inset = Math.min(8, len / 2);
+    const distances = label?.preset === 'task'
+      ? [Math.min(20, len - inset), len / 2, len * 0.25, len * 0.75, inset, len - inset]
+      : [len / 2, len * 0.3, len * 0.7, len * 0.2, len * 0.8, inset, len - inset];
+    const along = (d) => ({ x: a[0] + ux * d, y: a[1] + uy * d });
+    const preferred = manualCenter || (rectOnLine ? anchor : along(distances[0]));
+    const baseOff = Math.abs(nx) * size.w / 2 + Math.abs(ny) * size.h / 2 + 6;
+    for (const [rank, d] of [...new Set(distances)].entries()) {
+      const point = along(d);
+      for (let step = 0; step < 4; step++) {
+        const desiredOffset = baseOff + step * (size.h + 6);
+        if (step > 0 && desiredOffset > candidateLimit) break;
+        // 宽标签的最小净距可能已超限，仍测试距离上限及节点外沿。
+        const offset = Math.min(desiredOffset, candidateLimit);
+        for (const side of [preferredSide, -preferredSide]) {
+          probe({ x: point.x + nx * offset * side, y: point.y + ny * offset * side },
+            preferred, path, rank + (side === preferredSide ? 0 : 1));
+        }
+      }
+    }
+  }
+  return best;
 }
 
-/**
- * 一条连线的成组摆放：多条标签默认交替放线的两侧（第 1 条上侧、第 2 条下侧……），
- * 手动拖过的（dx/dy 非零）保持用户位置。逐条避让，先放的矩形参与后者的避让。
- * items = [{label, size}]；返回同序矩形数组（null = 这条放不下）。
- */
+/** 依次摆放同一条边上的标签，让后放的标签避开已有标签。 */
 export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [], otherPaths = [], maxDist = LABEL_MAX_DIST } = {}) {
-  let paths;
   const placed = [...others];
-  const out = [];
-  items.forEach(({ label, size }, i) => {
-    if (!label || !size) {
-      out.push(null);
-      return;
-    }
-    const manual = (label.dx || 0) !== 0 || (label.dy || 0) !== 0;
-    const path = manual ? pts : (paths ??= privateLabelPaths(pts, otherPaths))[0];
-    const anchor = path && midAnchor(path);
-    if (!anchor) { out.push(null); return; }
-    const nx = -anchor.uy;
-    const ny = anchor.ux;
-    let probe = label;
-    if (!manual) {
-      // 两侧交替：沿法线偏出半个标签高 + 间隙，默认不压在线上
-      const side = i % 2 === 0 ? -1 : 1;
-      const off = Math.round(((Math.abs(anchor.ux) > 0.5 ? size.h : size.w) / 2 + 5) * side);
-      probe = { ...label, dx: Math.round(nx * off), dy: Math.round(ny * off) };
-    }
-    const rect = placeLabel({ label: probe, size, pts: path, nodes, others: placed, maxDist });
-    out.push(rect);
+  const paths = privateLabelPaths(pts, otherPaths);
+  return items.map(({ label, size }, i) => {
+    if (!label || !size) return null;
+    const rect = findLabelRect({
+      label, size, pts, nodes, others: placed, maxDist, paths,
+      preferredSide: i % 2 === 0 ? -1 : 1,
+      centerUnstyled: false,
+    });
     if (rect) placed.push(rect);
+    return rect;
   });
-  return out;
 }
 
-/** 从正交线段中减去其他边共用的部分，优先使用最长的独立分支。 */
+/** 从正交线段中扣除共用部分，保留沿原折线方向的所有独立线段。 */
 function privateLabelPaths(pts, otherPaths) {
-  let shared = false;
   const paths = [];
+  if (!Array.isArray(pts)) return paths;
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1], b = pts[i];
-    const axis = Math.abs(b[0] - a[0]) > Math.abs(b[1] - a[1]) ? 0 : 1;
+    if (a[0] === b[0] && a[1] === b[1]) continue;
+    if (a[0] !== b[0] && a[1] !== b[1]) {
+      paths.push([a, b]);
+      continue;
+    }
+    const axis = a[0] !== b[0] ? 0 : 1;
     const cross = 1 - axis;
+    const forward = b[axis] > a[axis];
     let parts = [[Math.min(a[axis], b[axis]), Math.max(a[axis], b[axis])]];
     for (const other of otherPaths) {
       if (!parts.length) break;
@@ -478,21 +540,19 @@ function privateLabelPaths(pts, otherPaths) {
         parts = parts.flatMap(([start, end]) => {
           const left = Math.max(start, lo), right = Math.min(end, hi);
           if (right - left <= 0.5) return [[start, end]];
-          shared = true;
           return [...(left > start ? [[start, left]] : []), ...(right < end ? [[right, end]] : [])];
         });
       }
     }
+    if (!forward) parts.reverse();
     for (const [lo, hi] of parts) {
-      if (hi - lo <= 0.5) continue;
       const start = [...a], end = [...b];
-      start[axis] = b[axis] >= a[axis] ? lo : hi;
-      end[axis] = b[axis] >= a[axis] ? hi : lo;
+      start[axis] = forward ? lo : hi;
+      end[axis] = forward ? hi : lo;
       paths.push([start, end]);
     }
   }
-  return shared ? paths.sort((a, b) => Math.hypot(...b[1].map((n, i) => n - b[0][i])) -
-    Math.hypot(...a[1].map((n, i) => n - a[0][i]))) : [pts];
+  return paths;
 }
 
 /**
@@ -504,17 +564,9 @@ export function clampLabelCenter(
   { size, pts = [], nodes = [], others = [], maxDist = LABEL_MAX_DIST } = {}
 ) {
   if (!size) return null;
-  const near = nearestOnPolyline(center, pts);
-  let c = { x: center.x, y: center.y };
-  if (near.d > maxDist) {
-    const len = near.d || 1;
-    c = {
-      x: near.x + ((center.x - near.x) / len) * maxDist,
-      y: near.y + ((center.y - near.y) / len) * maxDist,
-    };
-  }
+  const c = limitLabelCenter(center, pts, maxDist);
   const rect = rectAt(c.x, c.y, size);
-  if (overlapCount(rect, nodes, 4) || overlapCount(rect, others, 3)) return null;
+  if (overlapCount(rect, nodes, NODE_PAD) || overlapCount(rect, others, LABEL_GAP)) return null;
   return c;
 }
 

@@ -616,3 +616,148 @@ test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离�
   assert.ok(e1?.labels?.some((l) => l.preset === 'call' && l.text === 'コール順1' && !l.note), 'コール順1 应写入且不带注释');
   assert.ok(e2?.labels?.some((l) => l.preset === 'call' && l.text === 'コール順2' && !l.note), 'コール順2 应写入且不带注释');
 });
+
+test('e2e：多车型(z145/z144)共通代码分支检测、按路径过滤入图、局部移除、书签重命名与 /api/ai/compact + SSE 流式指标', async t => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-vehicles-'));
+  t.after(() => fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 3 }));
+  const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], { windowsHide: true });
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.name', 'Test');
+  git('config', 'user.email', 'test@example.invalid');
+
+  fs.mkdirSync(path.join(repoDir, 'common'), { recursive: true });
+  fs.mkdirSync(path.join(repoDir, 'z145'), { recursive: true });
+  fs.mkdirSync(path.join(repoDir, 'z144'), { recursive: true });
+  const commonBase = 'void shared_calc(void) { volatile int v = 1; (void)v; }\n';
+  fs.writeFileSync(path.join(repoDir, 'common', 'calc.c'), commonBase);
+  fs.writeFileSync(path.join(repoDir, 'z145', 'ctrl.c'), 'void shared_calc(void);\nvoid Task_10ms(void) { shared_calc(); }\n');
+  fs.writeFileSync(path.join(repoDir, 'z144', 'ctrl.c'), 'void shared_calc(void);\nvoid Task_10ms(void) { shared_calc(); }\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'init');
+  // 仅修改共通代码
+  fs.writeFileSync(path.join(repoDir, 'common', 'calc.c'), commonBase.replace('v = 1', 'v = 9'));
+
+  let scenario = 'filter_z145';
+  let turn = 0;
+  let observedGitResult = null;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      const lastTool = [...(body.messages || [])].reverse().find((m) => m.role === 'tool');
+      if (lastTool) {
+        const parsed = JSON.parse(lastTool.content);
+        if (parsed.pathBranches) observedGitResult = parsed;
+      }
+      turn++;
+      // 使用标准 SSE 流式响应，验证 thinking_delta / text_delta / metrics 链路
+      const sendSse = (chunks) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        for (const chunk of chunks) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      };
+      if (scenario === 'filter_z145') {
+        if (turn === 1) {
+          return sendSse([
+            { choices: [{ index: 0, delta: { reasoning_content: '先看改动并检查多车型路径' } }] },
+            { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'g1', type: 'function', function: { name: 'get_git_changes', arguments: '{}' } }] }, finish_reason: 'tool_calls' }] },
+          ]);
+        }
+        if (turn === 2) {
+          return sendSse([
+            { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'a1', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ fromGit: true, includePaths: ['z145'], bookmarkName: 'z145 油压改动' }) } }] }, finish_reason: 'tool_calls' }] },
+          ]);
+        }
+        return sendSse([
+          { choices: [{ index: 0, delta: { reasoning_content: '只保留 z145 已完成' } }] },
+          { choices: [{ index: 0, delta: { content: '已只将 ' } }] },
+          { choices: [{ index: 0, delta: { content: 'z145 与共通改动加入画布。' }, finish_reason: 'stop' }] },
+          { choices: [], usage: { prompt_tokens: 180, completion_tokens: 24, total_tokens: 204 } },
+        ]);
+      }
+      // scenario === 'remove_z144'
+      if (turn === 1) {
+        return sendSse([
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'r1', type: 'function', function: { name: 'remove_from_canvas', arguments: JSON.stringify({ excludePaths: ['z144'] }) } }] }, finish_reason: 'tool_calls' }] },
+        ]);
+      }
+      return sendSse([
+        { choices: [{ index: 0, delta: { content: '已移除 z144 路径函数。' }, finish_reason: 'stop' }] },
+        { choices: [], usage: { prompt_tokens: 120, completion_tokens: 12, total_tokens: 132 } },
+      ]);
+    });
+  });
+  await new Promise((resolve) => mockLlm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => mockLlm.close(resolve)));
+
+  const srv = await launchServer({ target: repoDir });
+  t.after(srv.close);
+  const get = (route) => fetch(srv.baseUrl + route).then((r) => r.json());
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-stream', toolMode: 'tools', contextWindow: 32768 });
+
+  // 1. 检测 z145 / z144 两个上游车型分支 + 仅将 z145 加入画布并生成书签 + 验证流式事件与指标
+  const res1 = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '只把 z145 的改动链路加入画布' }),
+  });
+  const ev1 = (await res1.text()).trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(observedGitResult?.pathBranches?.some((b) => b.prefix === 'z145'), 'get_git_changes 应识别 z145 分支');
+  assert.ok(observedGitResult?.pathBranches?.some((b) => b.prefix === 'z144'), 'get_git_changes 应识别 z144 分支');
+  assert.ok(ev1.some((e) => e.type === 'thinking_delta'), 'SSE 流式应发出 thinking_delta');
+  assert.ok(ev1.some((e) => e.type === 'text_delta'), 'SSE 流式应发出 text_delta');
+  assert.ok(ev1.some((e) => e.type === 'metrics' && e.promptTokens > 0), '应返回 token 用量指标');
+  const page1 = (await get('/api/page')).page;
+  const shown1 = [...(page1.roots || []), ...(page1.expansions || []).map((s) => s.root)];
+  assert.ok(shown1.includes('z145/ctrl.c::Task_10ms'), '画布应包含 z145 入口');
+  assert.ok(shown1.includes('common/calc.c::shared_calc'), '画布应保留共通改动函数');
+  assert.ok(!shown1.some((id) => id.startsWith('z144/')), '画布绝不应混入被排除的 z144');
+
+  // 2. 验证书签重命名接口 POST /api/bookmarks/rename
+  const bms = await get('/api/bookmarks');
+  assert.equal(bms.list.length, 1);
+  const renamed = await post('/api/bookmarks/rename', { id: bms.list[0].id, name: 'Z145-共通油压审查' });
+  assert.equal(renamed.ok, true);
+  assert.equal(renamed.bookmark.name, 'Z145-共通油压审查');
+
+  // 3. 验证 remove_from_canvas 能从混合画布中干净移除 z144
+  await post('/api/page', {
+    roots: ['z145/ctrl.c::Task_10ms', 'z144/ctrl.c::Task_10ms'],
+    expansions: [{ root: 'common/calc.c::shared_calc', up: 0, down: 0 }],
+    up: 0,
+    down: 1,
+  });
+  scenario = 'remove_z144';
+  turn = 0;
+  const res2 = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '去掉 z144 车型的函数' }),
+  });
+  const ev2 = (await res2.text()).trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(ev2.find((e) => e.type === 'tool_end' && e.name === 'remove_from_canvas')?.ok, true, JSON.stringify(ev2));
+  const page2 = (await get('/api/page')).page;
+  const shown2 = [...(page2.roots || []), ...(page2.expansions || []).map((s) => s.root)];
+  assert.ok(shown2.includes('z145/ctrl.c::Task_10ms'), '移除 z144 后应保留 z145');
+  assert.ok(shown2.includes('common/calc.c::shared_calc'), '移除 z144 后应保留共通函数');
+  assert.ok(!shown2.some((id) => id.startsWith('z144/')), '移除后画布不应再含 z144');
+
+  // 4. 验证 POST /api/ai/compact 上下文压缩接口
+  const compactRes = await post('/api/ai/compact', {
+    messages: [
+      { role: 'user', text: '查看 Git 改动' },
+      { role: 'assistant', text: '发现 z145 和 z144 两个车型分支', tools: [{ name: 'get_git_changes', ok: true, summary: '1 文件', digest: 'pathBranches=z145,z144' }] },
+      { role: 'user', text: '只要 z145' },
+      { role: 'assistant', text: '已只加入 z145' },
+      { role: 'user', text: '补全标签' },
+      { role: 'assistant', text: '已写入 TASK:10ms' },
+    ],
+  });
+  assert.equal(compactRes.ok, true);
+  assert.equal(compactRes.compacted, true);
+  assert.ok(compactRes.messages.length < 6, '压缩后消息条数应减少');
+});

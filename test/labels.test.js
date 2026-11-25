@@ -12,6 +12,8 @@ import {
   compactConnEntries,
   displayEdgeLabels,
   freeConnNumbers,
+  estimateTextWidth,
+  labelBoxSize,
   normalizeLabels,
   placeEdgeLabels,
   clampLabelCenter,
@@ -25,6 +27,7 @@ import {
   rectsOverlap,
   visibleCallOrderMap,
 } from '../src/core/labels.js';
+import { layoutExportEdgeLabels } from '../src/core/export-svg.js';
 
 /** 固定的文字测量桩：等宽字体，结果可预测 */
 const measure = (s) => String(s).length * 7;
@@ -285,4 +288,65 @@ test('placeEdgeLabels：没有独立线段时不自动挤入公共线，已有�
   assert.equal(rects[0], null);
   assert.equal(rects[1].x + rects[1].w / 2, 180);
   assert.equal(rects[1].y + rects[1].h / 2, 20);
+});
+
+test('placeEdgeLabels：短竖线上的 TASK 和コール順避开上下两个函数框', () => {
+  for (const gap of [12, 18, 24]) {
+    const nodes = [
+      { x: 0, y: 0, w: 120, h: 44 },
+      { x: 0, y: 44 + gap, w: 120, h: 44 },
+    ];
+    const pts = [[60, 44], [60, 44 + gap]];
+    const labels = [{ preset: 'task', text: 'TASK:10ms' }, { preset: 'call', text: 'コール順1' }];
+    const rects = placeEdgeLabels({
+      items: labels.map((label) => ({ label, size: labelBoxSize(label, estimateTextWidth) })),
+      pts,
+      nodes,
+    });
+    for (const rect of rects) {
+      assert.ok(rect);
+      for (const node of nodes) assert.ok(!rectsOverlap(rect, node, 5));
+      const center = { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+      assert.ok(nearestOnPolyline(center, pts).d <= 96);
+    }
+    assert.ok(!rectsOverlap(rects[0], rects[1], 4));
+  }
+});
+
+test('placeEdgeLabels：最长独立线段被邻居挡住时选用较短的独立线段', () => {
+  const longest = [[100, 0], [340, 0]];
+  const pts = [[0, 0], ...longest, [340, 220]];
+  const nodes = [{ x: -20, y: -110, w: 430, h: 200 }];
+  const items = [{ label: { preset: 'call', text: 'コール順1' }, size: { w: 60, h: 20 } }];
+  const [blocked] = placeEdgeLabels({ items, pts: longest, nodes });
+  assert.ok(rectsOverlap(blocked, nodes[0]));
+  assert.ok(blocked.y >= 22, '不得压住邻居节点的标题带');
+
+  const [rect] = placeEdgeLabels({ items, pts, nodes, otherPaths: [[[0, 0], [100, 0]]] });
+  assert.ok(rect);
+  assert.ok(!rectsOverlap(rect, nodes[0], 5));
+  const near = nearestOnPolyline({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 }, pts);
+  assert.equal(near.x, 340);
+  assert.ok(near.y > 90);
+});
+
+test('SVG 标签布局：同边的 TASK、コール順和結合点互相避让，并避开短竖线两端的函数框', () => {
+  const nodes = [
+    { id: 'A', x: 0, y: 0, w: 120, h: 44 },
+    { id: 'B', x: 0, y: 56, w: 120, h: 44 },
+  ];
+  const labels = normalizeLabels([
+    { preset: 'task', text: 'TASK:10ms' },
+    { preset: 'call', text: 'コール順1' },
+    { preset: 'conn', num: 1 },
+  ]);
+  const placed = layoutExportEdgeLabels({
+    nodes,
+    edges: [{ from: 'A', to: 'B', points: [[60, 44], [60, 56]], labels }],
+  });
+  assert.deepEqual(placed.map(({ label }) => label.preset), ['task', 'call', 'conn']);
+  for (const [index, { rect }] of placed.entries()) {
+    for (const node of nodes) assert.ok(!rectsOverlap(rect, node, 5));
+    for (const earlier of placed.slice(0, index)) assert.ok(!rectsOverlap(rect, earlier.rect, 4));
+  }
 });

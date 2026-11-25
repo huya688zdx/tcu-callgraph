@@ -40,7 +40,25 @@ function svgFor(data, interactive) {
       node.code, ...node.macros.map(macroText),
       ...(call ? [t('flowchart.callees') + ' ' + node.callees.map(item => item.name).join(', ')] : []),
     ].filter(Boolean).join('\n\n');
-    const lines = node.lines.map((line, i) => `<text x="${w / 2}" y="${h / 2 + (i - (node.lines.length - 1) / 2) * 18}"${terminal ? ' font-weight="700"' : ''}>${esc(line)}</text>`).join('');
+    const renderNodeLine = (line, i, total) => {
+      const yPos = h / 2 + (i - (total - 1) / 2) * 18;
+      const weight = terminal ? ' font-weight="700"' : '';
+      if (node.change === 'modified' && Array.isArray(node.diffLines) && Array.isArray(node.diffLines[i])) {
+        const spans = node.diffLines[i].map(seg => {
+          const text = esc(seg.text ?? '');
+          if (seg.op === 'add') return `<tspan fill="#CC0000" font-weight="600">${text}</tspan>`;
+          if (seg.op === 'del') return `<tspan fill="#CC0000" text-decoration="line-through">${text}</tspan>`;
+          return `<tspan>${text}</tspan>`;
+        }).join('');
+        return `<text x="${w / 2}" y="${yPos}"${weight}>${spans}</text>`;
+      }
+      return `<text x="${w / 2}" y="${yPos}"${weight}>${esc(line)}</text>`;
+    };
+    const lineCount = (node.change === 'modified' && Array.isArray(node.diffLines) && node.diffLines.length)
+      ? node.diffLines.length : node.lines.length;
+    const lines = (node.change === 'modified' && Array.isArray(node.diffLines) && node.diffLines.length)
+      ? node.diffLines.map((_, i) => renderNodeLine('', i, lineCount)).join('')
+      : node.lines.map((line, i) => renderNodeLine(line, i, lineCount)).join('');
     const badge = definition ? `<text x="${w / 2}" y="18" fill="${stroke}">#</text>`
       : call ? `<text x="${w - 13}" y="12" fill="${THEME.node.selected}">↗</text>` : '';
     const action = interactive && call ? ` data-call="${id}" tabindex="0" role="button" aria-label="${esc(title)}"` : '';

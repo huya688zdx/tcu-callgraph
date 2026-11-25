@@ -38,6 +38,7 @@ wireFlowchart();
  * @param {string|string[]|null} rootId 单个函数 id、多个函数 id（文件树多选）、或 null（默认入口）
  */
 let viewSeq = 0;
+let reloadEpoch = 0;
 const pendingVarChoices = new Map();
 const varRestores = new Map();
 
@@ -127,8 +128,9 @@ async function loadView(rootId, opts = {}) {
   }
   if (seq !== viewSeq) return; // 多选连点时丢弃过期响应
   pendingVarChoices.clear();
-  if (!Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
+  if (data?.error || !Array.isArray(data?.nodes) || !Array.isArray(data?.edges)) {
     renderVars();
+    if (opts.restore) return { error: data?.error || t('app.noView') };
     if (choices.length || addVars.length) throw new Error(data?.error || t('app.viewFailed'));
     console.warn(data?.error || t('app.viewFailed'));
     return;
@@ -315,6 +317,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
+  const epoch = ++reloadEpoch;
   pendingVarChoices.clear();
   comparisonPage = null;
   const seq = ++viewSeq;
@@ -339,7 +342,12 @@ hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
   // 并行恢复统计、文件树与画布，解析器探测异步执行不阻塞首帧；并通知 AI 助手按新工程隔离切换对话。
   if (!preserveAiChat) document.dispatchEvent(new CustomEvent('cg:project-changed'));
   void loadParsers();
-  await Promise.all([loadStats(), loadTree(), restorePage(null, () => seq === viewSeq)]);
+  const [result] = await Promise.all([
+    restorePage({ isCurrent: (started) => epoch === reloadEpoch && seq + Number(started) === viewSeq }),
+    loadTree(),
+    loadStats(),
+  ]);
+  if (epoch === reloadEpoch && result.status === 'error') throw new Error(result.error);
 };
 
 // 右侧变量清单：勾选后重新拉视图（变量节点由服务端排版，保证落在文件框里）
@@ -643,7 +651,9 @@ function renderParserSelect() {
   syncCanvasControls();
 }
 async function loadParsers() {
+  const epoch = reloadEpoch;
   const data = await api.parsers();
+  if (epoch !== reloadEpoch) return;
   activeParser = data?.active || '';
   parserList = Array.isArray(data?.parsers) ? data.parsers.filter(parser => typeof parser?.id === 'string' &&
     (parser.id === 'dot') === (activeParser === 'dot')) : [];
@@ -753,9 +763,12 @@ window.addEventListener('resize', () => { constrainCam(); resize(); });
 resize();
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {
+  const myEpoch = reloadEpoch;
   const seq = viewSeq;
+  void loadParsers();
   try {
     const p = await api.uiPrefs();
+    if (myEpoch !== reloadEpoch) return;
     if (seq === viewSeq && Number.isInteger(p?.down)) {
       state.down = p.down;
       state.addDepths.down = p.down;
@@ -767,12 +780,19 @@ resize();
   } catch {
     /* 服务端没有该接口或暂时不可达：用默认值 */
   }
-  await Promise.all([loadStats(), loadTree(), loadParsers()]);
-  await restorePage(new URLSearchParams(location.search).get('root'), () => seq === viewSeq);
-  if (!state.view) throw new Error(t('app.noView'));
-})().catch((error) => {
-  if (confirm(t('app.retryStart', { error: error.message }))) location.reload();
-});
+  if (myEpoch !== reloadEpoch) return;
+  const pendingRestore = restorePage({
+    root: new URLSearchParams(location.search).get('root'),
+    isCurrent: (started) => myEpoch === reloadEpoch && seq + Number(started) === viewSeq,
+  });
+  void loadTree();
+  void loadStats().catch((error) => console.warn(error));
+  const res = await pendingRestore;
+  if (myEpoch !== reloadEpoch || res.status === 'superseded') return;
+  if (res.status === 'error' || !state.view) {
+    if (confirm(t('app.retryStart', { error: res.error || t('app.noView') }))) location.reload();
+  }
+})();
 
 // 只读调试接口：供自动化测试读取当前视图状态（不提供任何写操作）
 window.__cg = {
