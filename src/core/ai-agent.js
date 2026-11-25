@@ -373,6 +373,7 @@ function buildSystemPrompt(context, promptToolMode) {
     '7. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
     '8. 准备写入画布且需要确认上游车型时，先用 trace_upstream 读取上游链。get_git_changes、trace_upstream 或 add_to_canvas 返回至少两个 pathBranches 分支或 needsVehicleChoice: true，且用户尚未明确范围时，下一步必须单独调用 ask_user。用每个分支的 prefix 作为一个选项，再加一个「全部保留」选项。等用户选择后再调用 add_to_canvas。',
     '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
+    '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
     '10. 用户提到当前选中的函数、连线或文件时，使用当前画布选中对象中的完整 ID、端点及文件路径定位。回答解释类问题时只读分析。',
     '',
     '当前上下文：',

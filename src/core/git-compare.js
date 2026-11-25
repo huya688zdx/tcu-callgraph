@@ -87,7 +87,7 @@ const emptySummary = () => Object.fromEntries(['functions', 'variables'].map(key
  * - 文件的大小、修改时间和状态变更时间均匹配快照记录时，直接读取普通文件；
  * - 若后续被编辑、删除或替换，则回退到 git cat-file blob 读取精确历史快照。
  */
-class SnapshotBuffers {
+export class SnapshotBuffers {
   constructor(repoRoot, entries) {
     this._repoRoot = repoRoot;
     this._entries = entries;
@@ -97,6 +97,25 @@ class SnapshotBuffers {
   get size() { return this._entries.size; }
   has(key) { return this._entries.has(key); }
   keys() { return this._entries.keys(); }
+  toSnapshot() { return { repoRoot: this._repoRoot, entries: this._entries }; }
+  async getAsync(key) {
+    const entry = this._entries.get(key);
+    if (!entry) return undefined;
+    if (entry.buffer) return entry.buffer;
+    if (entry.diskPath && entry.size !== undefined) {
+      try {
+        const info = await lstat(entry.diskPath);
+        if (info.isFile() && info.size === entry.size && info.mtimeMs === entry.mtimeMs && info.ctimeMs === entry.ctimeMs) {
+          const buf = await readFile(entry.diskPath);
+          if (buf.length === entry.size) return buf;
+        }
+      } catch {
+        // 文件改变时改读 Git 对象。
+      }
+    }
+    return entry.oid ? git(this._repoRoot, ['cat-file', 'blob', entry.oid], { binary: true, timeout: 30_000 })
+      : entry.diskPath ? readFile(entry.diskPath) : undefined;
+  }
   get(key) {
     const entry = this._entries.get(key);
     if (!entry) return undefined;
@@ -400,27 +419,21 @@ async function diskSource(repo, relative, configBytes) {
 }
 
 /** 校验工作区上的未改文件确实存在、非符号链接、父目录无 junction/符号链接且不超过 8 MB。 */
-function verifyCleanDisk(repo, relative, dirRealCache, { throwOversize = false } = {}) {
+async function verifyCleanDisk(repo, relative, dirRealCache, { throwOversize = false } = {}) {
   const abs = path.join(repo.root, relative);
   let info;
   try {
-    info = fs.lstatSync(abs);
+    info = await lstat(abs);
   } catch {
     return null;
   }
   if (!info.isFile() || info.isSymbolicLink()) return null;
   // 先校验父目录无 junction/符号链接，再判文件大小，避免工程外文件触发超限报错。
   const dir = path.dirname(abs);
-  let dirOk = dirRealCache.get(dir);
-  if (dirOk === undefined) {
-    try {
-      dirOk = path.relative(dir, fs.realpathSync(dir)) === '';
-    } catch {
-      dirOk = false;
-    }
-    dirRealCache.set(dir, dirOk);
+  if (!dirRealCache.has(dir)) {
+    dirRealCache.set(dir, realpath(dir).then(real => path.relative(dir, real) === '', () => false));
   }
-  if (!dirOk) return null;
+  if (!await dirRealCache.get(dir)) return null;
   if (info.size > maxSourceBytes) {
     if (throwOversize) throw new Error('Git 源码文件超过 8 MB：' + relative);
     return null;
@@ -474,9 +487,11 @@ async function worktreeSnapshot(repo, baseSha, before, includeUntracked) {
       dirty.add(file);
     }
     // 稀疏检出等场景下未落盘文件不在工作区，仅保留真实存在的常规文件；超 8 MB 直接报错不误判删除。
-    for (const [file, object] of before) {
-      if (dirty.has(file)) continue;
-      const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+    const unchanged = [...before].filter(([file]) => !dirty.has(file));
+    const verified = await mapLimit(unchanged, ioConcurrency, ([file]) =>
+      verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true }));
+    for (const [i, [file, object]] of unchanged.entries()) {
+      const info = verified[i];
       if (!info) continue;
       if (isScheduleFile(file)) configBytes = addScheduleBytes(configBytes, info.size);
       files.set(file, object);
@@ -487,7 +502,7 @@ async function worktreeSnapshot(repo, baseSha, before, includeUntracked) {
   const scheduleFiles = readList.filter(isScheduleFile);
   let preflightBytes = configBytes;
   for (const file of scheduleFiles) {
-    const info = verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
+    const info = await verifyCleanDisk(repo, file, dirRealCache, { throwOversize: true });
     if (info) preflightBytes = addScheduleBytes(preflightBytes, info.size);
   }
 
@@ -563,30 +578,26 @@ async function cleanDiskInfo(repo, before, after, hint = null) {
   }
   if (!unchangedOids.size) return clean;
 
-  if (hint?.baseClean && hint.dirty) {
-    for (const [file, object] of unchangedOids) {
-      if (hint.dirty.has(file)) continue;
-      const disk = verifyCleanDisk(repo, file, dirRealCache);
-      if (disk) clean.set(file, { oid: object, ...disk });
-    }
-    return clean;
+  let dirty = hint?.baseClean ? hint.dirty : null;
+  let headFiles = before;
+  if (!dirty) {
+    const head = hint?.headSha ? { sha: hint.headSha } : await headOf(repo.repoRoot);
+    if (!head.sha) return clean;
+    const [headEntries, dirtyOutput, assumed] = await Promise.all([
+      hint?.headFiles ?? commitFiles(repo, head.sha),
+      git(repo.root, [
+        'diff', '--name-only', '--no-renames', '-z', '--no-ext-diff', '--no-textconv', head.sha, '--', ...sourcePathspecs,
+      ]),
+      assumeUnchangedFiles(repo),
+    ]);
+    headFiles = headEntries;
+    dirty = new Set([...records(dirtyOutput).map(file => projectSource(repo, file)).filter(Boolean), ...assumed]);
   }
-
-  const head = hint?.headSha ? { sha: hint.headSha } : await headOf(repo.repoRoot);
-  if (!head.sha) return clean;
-  const headFiles = hint?.headFiles ?? await commitFiles(repo, head.sha);
-  const [dirtyOutput, assumed] = await Promise.all([
-    git(repo.root, [
-      'diff', '--name-only', '--no-renames', '-z', '--no-ext-diff', '--no-textconv', head.sha, '--', ...sourcePathspecs,
-    ]),
-    assumeUnchangedFiles(repo),
-  ]);
-  const dirty = new Set([...records(dirtyOutput).map(file => projectSource(repo, file)).filter(Boolean), ...assumed]);
-  for (const [file, object] of unchangedOids) {
-    if (dirty.has(file) || headFiles.get(file) !== object) continue;
-    const disk = verifyCleanDisk(repo, file, dirRealCache);
+  await mapLimit([...unchangedOids].filter(([file, object]) => !dirty.has(file) && headFiles.get(file) === object),
+    ioConcurrency, async ([file, object]) => {
+    const disk = await verifyCleanDisk(repo, file, dirRealCache);
     if (disk) clean.set(file, { oid: object, ...disk });
-  }
+  });
   return clean;
 }
 
@@ -800,21 +811,24 @@ async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions,
     const { beforeSnapshot, afterSnapshot, sameSources } = await materializeSnapshots(
       repo, before, after, beforePath, afterPath, cleanHint,
     );
-    const comparison = await compareProjects(repo.root, beforePath, afterPath, {
-      ...compareOptions,
+    const { runComparison = compareProjects, ...options } = compareOptions;
+    const comparison = await runComparison(repo.root, beforePath, afterPath, {
+      ...options,
       snapshots: { beforeFiles: beforeSnapshot.files, afterFiles: afterSnapshot.files, mappings: [], sameSources },
     });
     metadata.importFacts = importFacts(comparison);
     const semanticFiles = new Set(comparison.changePoints.map(point => point.file));
-    const snapshotFingerprint = (snapshot, file) => {
+    const snapshotFingerprint = async (snapshot, file) => {
       const entry = snapshot.bufferEntries.get(file);
-      const bytes = entry.diskPath ? snapshot.buffers.get(file)
-        : entry.buffer ?? fs.readFileSync(snapshot.files.get(file));
+      const bytes = entry.diskPath ? await snapshot.buffers.getAsync(file)
+        : entry.buffer ?? await readFile(snapshot.files.get(file));
       return fingerprint(decodeSource(bytes));
     };
-    metadata.commentOnlyFiles = changes.filter(({ file, status }) => status === 'modified' && sourceExtension.test(file) && !semanticFiles.has(file) &&
-      snapshotFingerprint(beforeSnapshot, file) === snapshotFingerprint(afterSnapshot, file))
-      .map(({ file }) => file);
+    const candidates = changes.filter(({ file, status }) => status === 'modified' && sourceExtension.test(file) && !semanticFiles.has(file));
+    metadata.commentOnlyFiles = (await mapLimit(candidates, ioConcurrency, async ({ file }) => {
+      const [before, after] = await Promise.all([snapshotFingerprint(beforeSnapshot, file), snapshotFingerprint(afterSnapshot, file)]);
+      return before === after ? file : null;
+    })).filter(Boolean);
     retainSnapshot(comparison.beforeModel, beforeSnapshot.buffers);
     retainSnapshot(comparison.afterModel, afterSnapshot.buffers);
     retainSnapshot(comparison.model, new SnapshotBuffers(repo.repoRoot,

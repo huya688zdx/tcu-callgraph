@@ -16,7 +16,10 @@ const nameInput = document.getElementById('bookmarkName');
 const saveBtn = document.getElementById('bookmarkSave');
 const summaryEl = document.getElementById('bookmarkSummary');
 const feedbackEl = document.getElementById('bookmarkFeedback');
+const modal = document.getElementById('bookmarkModal');
 let writing = false;
+let refreshPending = false;
+let renderSeq = 0;
 
 const modeLabel = (group) => t(group ? 'bookmark.grouped' : 'bookmark.flat');
 
@@ -40,6 +43,10 @@ function feedback(message, error = false) {
 
 async function render() {
   if (!listEl) return;
+  refreshPending = false;
+  const seq = ++renderSeq;
+  const projectId = state.view?.projectId;
+  const isCurrent = () => seq === renderSeq && state.view?.projectId === projectId;
   if (summaryEl) {
     const nodes = state.view?.nodes || [];
     const vars = nodes.filter((node) => node.kind === 'var').length;
@@ -51,9 +58,16 @@ async function render() {
   }
   let rows;
   try {
-    rows = (await api.bookmarks()).list || [];
+    const result = await api.bookmarks();
+    if (result?.ok === false) throw new Error(result.error);
+    rows = result.list || [];
   } catch {
-    listEl.innerHTML = `<div class="empty">${esc(t('bookmark.loadFailed'))}</div>`;
+    if (isCurrent()) listEl.innerHTML = `<div class="empty">${esc(t('bookmark.loadFailed'))}</div>`;
+    return;
+  }
+  if (!isCurrent()) return;
+  if (writing || listEl.querySelector('.bm-rename-input')) {
+    refreshPending = true;
     return;
   }
   if (!rows.length) {
@@ -92,7 +106,7 @@ async function render() {
       open.disabled = true;
       try {
         await hooks.applyBookmark(b);
-        if (document.getElementById('bookmarkModal')?.classList.contains('show')) closeModal();
+        if (modal?.classList.contains('show')) closeModal();
       } catch (err) {
         feedback(`${t('bookmark.openFailed')}：${err.message || err}`, true);
       } finally {
@@ -143,6 +157,7 @@ function editName(row, bookmark, renameButton) {
     actions.replaceChildren(...buttons);
     feedback('');
     renameButton.focus();
+    if (refreshPending) reloadBookmarks();
   });
   saveButton.addEventListener('click', async () => {
     if (writing) return;
@@ -154,32 +169,47 @@ function editName(row, bookmark, renameButton) {
     }
     input.readOnly = true;
     cancelButton.disabled = true;
-    await write(saveButton, 'bookmark.failed', async () => {
-      const result = await api.renameBookmark(bookmark.id, nextName);
-      if (!result?.ok) throw new Error(result?.error);
-      return t('bookmark.updated');
-    });
-    input.readOnly = false;
-    cancelButton.disabled = false;
-    if (input.isConnected) input.focus();
+    try {
+      const saved = await write(saveButton, 'bookmark.failed', async () => {
+        const result = await api.renameBookmark(bookmark.id, nextName);
+        if (!result?.ok) throw new Error(result?.error);
+        return t('bookmark.updated');
+      });
+      if (saved) {
+        row.removeEventListener('keydown', onKey);
+        name.textContent = nextName;
+      }
+    } finally {
+      input.readOnly = false;
+      cancelButton.disabled = false;
+      if (input.isConnected) input.focus();
+      if (refreshPending) reloadBookmarks();
+    }
   });
   input.focus();
   input.select();
 }
 
 async function write(button, errorKey, action) {
-  if (writing) return;
+  if (writing) return false;
   writing = true;
   button.disabled = true;
+  const projectId = state.view?.projectId;
   feedback('');
   try {
-    feedback(await action());
-    await render();
+    const message = await action();
+    if (projectId === state.view?.projectId && modal?.classList.contains('show')) {
+      feedback(message);
+      refreshPending = true;
+    }
+    return true;
   } catch (err) {
-    feedback([t(errorKey), err.message].filter(Boolean).join('：'), true);
+    if (projectId === state.view?.projectId) feedback([t(errorKey), err.message].filter(Boolean).join('：'), true);
+    return false;
   } finally {
     button.disabled = false;
     writing = false;
+    if (refreshPending) reloadBookmarks();
   }
 }
 
@@ -218,8 +248,14 @@ nameInput?.addEventListener('keydown', (e) => {
 });
 
 wireModals();
-document.addEventListener('callgraph:langchange', () => {
-  if (document.getElementById('bookmarkModal')?.classList.contains('show')) render();
+modal?.addEventListener('cg:modal-closed', () => {
+  renderSeq++;
+  listEl.replaceChildren();
 });
+document.addEventListener('callgraph:langchange', reloadBookmarks);
 
-export { render as renderBookmarks };
+export function reloadBookmarks() {
+  if (!modal?.classList.contains('show')) return;
+  if (writing || listEl.querySelector('.bm-rename-input')) refreshPending = true;
+  else void render();
+}

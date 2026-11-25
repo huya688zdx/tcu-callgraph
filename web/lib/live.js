@@ -19,7 +19,9 @@ import { loadStats, renderVars, renderDetail } from './panels.js';
 import { draw } from './render.js';
 import { constrainCam } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
-import { reloadTimeline } from './timeline.js';
+import { markReviewUpdated, reloadTimeline, reviewTransition } from './timeline.js';
+import { reloadBookmarks } from './bookmarks.js';
+import { closeModal } from './modal.js';
 import { syncProjectLabel } from './projects.js';
 import { notifyGitChanged } from './git-compare.js';
 
@@ -54,14 +56,13 @@ function scheduleReload() {
 async function flushReload() {
   flushTimer = null;
   if (!dirtyCount || applyingCompose) return;
+  if (reviewTransition()) return;
   if (state.view?.comparison && !pendingCompose) { dirtyCount = 0; return; }
   if (state.at > 0) {
     // 回看历史：画面是过去的重放，不能就地刷新，改完的量记在提示里
-    const n = dirtyCount;
     dirtyCount = 0;
-    toast(pendingCompose ? t('live.reviewCompose') :
-      t('live.reviewEdits', { n }));
-    reloadTimeline();
+    markReviewUpdated();
+    void reloadTimeline();
     return;
   }
   if (isInteracting() || (pendingCompose && restoring)) {
@@ -96,8 +97,8 @@ async function flushReload() {
       toast(n > 1 ? t('live.edits', { n }) : t('live.updated'));
     }
     failures = 0;
-    loadStats();
-    reloadTimeline(); // 时间轴面板开着时同步新事件
+    void loadStats().catch(() => {});
+    void reloadTimeline(); // 时间轴面板开着时同步新事件
   } catch {
     // 刷新失败（服务重启中等）：稍后重试，连续失败则放弃并提示手动刷新
     failures++;
@@ -119,9 +120,14 @@ if (es) {
     // SSE 无事件重放，重连时检查断线期间是否有新版画布。
     if (restoring || !state.view?.projectId) return;
     try {
-      const { page } = await api.savedPage();
-      if (page?.projectId === state.view?.projectId && page.comparisonId !== state.view?.comparison?.id) {
-        await hooks.reloadAll();
+      const { page, project, comparisonId } = await api.savedPage();
+      const sameProject = project?.id === state.view?.projectId;
+      if (project && (!sameProject || comparisonId !== (state.view?.comparison?.id ?? null))) {
+        if (state.at || reviewTransition()) markReviewUpdated(true);
+        else {
+          closeModal();
+          await hooks.reloadAll({ preserveAiChat: sameProject });
+        }
       } else if (page?.projectId === state.view?.projectId && page.revision > pageRevision &&
           page.revision > (pendingCompose?.page.revision ?? 0)) {
         pendingCompose = { page };
@@ -143,15 +149,32 @@ if (es) {
     }
     if (m.op === 'project.switch') {
       if (m.clientId === clientId) return;
+      if ((state.at || reviewTransition()) && m.actor === 'ai') {
+        markReviewUpdated(true);
+        return;
+      }
       dirtyCount = 0;
       pendingCompose = null;
       const preserveAiChat = m.chatClientId === clientId && m.projectId === state.view?.projectId;
+      closeModal();
       hooks.reloadAll({ preserveAiChat }).then(() => syncProjectLabel()).catch(() => toast(t('live.projectRefreshFailed')));
       toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }
     if (m.actor !== 'ai') return;
-    if (m.op === 'view.compose' && m.page) pendingCompose = m;
+    const projectId = m.projectId ?? m.page?.projectId;
+    if (projectId != null && projectId !== state.view?.projectId) return;
+    if (m.op.startsWith('bookmark.')) {
+      reloadBookmarks();
+      void reloadTimeline();
+      if (state.at || reviewTransition()) markReviewUpdated();
+      return;
+    }
+    if (m.op === 'view.compose' && m.page) {
+      if (m.page.revision <= Math.max(pageRevision, pendingCompose?.page.revision ?? 0)) return;
+      pendingCompose = m;
+    }
+    if (state.at || reviewTransition()) markReviewUpdated();
     scheduleReload();
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror
@@ -163,26 +186,27 @@ if (es) {
 let lastSig = '';
 let restoring = true;
 let restoreId = 0;
-let pendingSave = Promise.resolve();
+let pendingSave;
+let queuedPage;
+let reportingSig;
 
 export function acceptRestoredRevision(revision) {
   pageRevision = revision ?? pageRevision;
   if (pendingCompose && pendingCompose.page.projectId === state.view?.projectId && pendingCompose.page.revision <= pageRevision) {
     pendingCompose = null;
-    dirtyCount = 0;
   }
 }
 
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */
 export function savePage(force = false) {
-  if (restoring || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId ||
+  if (restoring || reviewTransition() || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId ||
       (!state.at && state.view.reviewSnapshot !== undefined) ||
       (!state.view.empty && !state.roots.length && !state.expansions.length) ||
-      (!force && isInteracting())) return pendingSave.catch(() => {});
+      (!force && isInteracting())) return Promise.resolve();
   const page = {
     projectId: state.view.projectId,
     comparisonId: state.view.comparison?.id ?? null,
-    revision: state.at && pendingCompose?.page.projectId === state.view.projectId ? pendingCompose.page.revision : pageRevision,
+    revision: pageRevision,
     roots: state.roots,
     expansions: state.expansions,
     empty: !!state.view.empty && !state.roots.length && !state.expansions.length,
@@ -199,18 +223,30 @@ export function savePage(force = false) {
     at: state.at,
   };
   const sig = JSON.stringify(page);
-  pendingSave = pendingSave.catch(() => {}).then(async () => {
-    if (sig === lastSig) return;
-    const result = await api.reportPage(page);
-    if (!result?.ok) throw new Error(result?.error || t('live.saveFailed'));
-    lastSig = sig;
-  });
-  return pendingSave;
+  if (sig !== queuedPage?.sig && (queuedPage || sig !== (reportingSig ?? lastSig))) queuedPage = { page, sig };
+  if (!pendingSave && queuedPage) {
+    pendingSave = Promise.resolve().then(async () => {
+      while (queuedPage) {
+        const next = queuedPage;
+        queuedPage = null;
+        if (next.sig === lastSig) continue;
+        reportingSig = next.sig;
+        try {
+          const result = await api.reportPage(next.page);
+          if (!result?.ok) throw new Error(result?.error || t('live.saveFailed'));
+          lastSig = next.sig;
+        } catch (error) {
+          if (!queuedPage) throw error;
+        }
+      }
+    }).finally(() => { pendingSave = null; reportingSig = null; });
+  }
+  return pendingSave ?? Promise.resolve();
 }
 setInterval(() => {
-  if (!state.view?.comparison && !state.at && (pendingCompose || dirtyCount) && !flushTimer) {
+  if ((pendingCompose || dirtyCount) && !state.at && !reviewTransition() && !flushTimer && !applyingCompose) {
+    dirtyCount ||= 1;
     flushTimer = setTimeout(flushReload, 400);
-    if (!dirtyCount) dirtyCount = 1;
   }
   savePage().catch(() => {});
 }, 800);

@@ -6,18 +6,25 @@ import { t } from '../i18n.js';
 
 const mask = document.getElementById('overlayMask');
 let wired = false;
+let cancelConfirm = null;
 
 export function openModal(id) {
   if (!mask) return;
+  const modal = document.getElementById(id);
+  if (!modal) return;
   closeModal();
   mask.classList.add('show');
-  document.getElementById(id)?.classList.add('show');
+  modal.classList.add('show');
 }
 
 export function closeModal() {
+  cancelConfirm?.();
   if (!mask) return;
   mask.classList.remove('show');
-  document.querySelectorAll('.modal.show').forEach((m) => m.classList.remove('show'));
+  document.querySelectorAll('.modal.show').forEach((modal) => {
+    modal.classList.remove('show');
+    modal.dispatchEvent(new Event('cg:modal-closed'));
+  });
 }
 
 export function isModalOpen() {
@@ -28,9 +35,7 @@ export function wireModals() {
   if (!mask || wired) return;
   wired = true;
   // 点遮罩空白处关闭：面板内部的点击要 stopPropagation 由调用方处理
-  mask.addEventListener('click', () => {
-    if (!document.querySelector('.confirm-modal.show')) closeModal();
-  });
+  mask.addEventListener('click', closeModal);
   document.querySelectorAll('.modal-close').forEach((b) => {
     b.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -58,15 +63,21 @@ export function esc(s) {
 
 /**
  * 应用内确认弹窗（替代原生 confirm）：叠在当前弹层之上，返回 Promise<boolean>。
- * 必须挂到 body 上而不是遮罩里——.mask 是 z-index:40 的层叠上下文，
- * 放进去会被 z-index:41 的普通弹窗整个盖住（弹了但看不见）。
+ * 确认框使用独立的遮罩，底层弹窗和 AI 抽屉都不会收到点击。
  * dangerous 操作把确认键标红，且默认焦点在取消上，回车不会误确认；
  * Escape 在捕获阶段拦下，只关本弹窗，不把底下打开的弹窗（如选择工程）一起带走。
  */
 export function confirmDialog({ title, message, okText = t('common.confirm'), cancelText = t('common.cancel'), danger = false }) {
+  cancelConfirm?.();
   return new Promise((resolve) => {
+    const focused = document.activeElement;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'confirm-backdrop';
     const box = document.createElement('div');
     box.className = 'modal confirm-modal show';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-label', title);
     box.innerHTML = `
       <div class="modal-head"><h2>${esc(title)}</h2><button class="modal-close">&times;</button></div>
       <div class="modal-body">${esc(message)}</div>
@@ -74,26 +85,33 @@ export function confirmDialog({ title, message, okText = t('common.confirm'), ca
         <button data-ok class="${danger ? 'danger' : 'primary'}">${esc(okText)}</button>
         <button data-cancel>${esc(cancelText)}</button>
       </div>`;
-    let onMaskClick = null;
     const end = (v) => {
       document.removeEventListener('keydown', onKey, true);
-      if (onMaskClick) mask?.removeEventListener('click', onMaskClick);
-      box.remove();
+      cancelConfirm = null;
+      backdrop.remove();
+      if (focused?.isConnected) focused.focus();
       resolve(v);
     };
     const onKey = (e) => {
-      if (e.key !== 'Escape') return;
-      e.stopPropagation();
-      end(false);
+      if (e.key === 'Escape') {
+        e.stopImmediatePropagation();
+        end(false);
+      } else if (e.key === 'Tab') {
+        const buttons = [...box.querySelectorAll('button')];
+        const index = buttons.indexOf(document.activeElement);
+        buttons[(index + (e.shiftKey ? -1 : 1) + buttons.length) % buttons.length].focus();
+        e.preventDefault();
+      }
     };
-    onMaskClick = () => end(false);
+    cancelConfirm = () => end(false);
     box.querySelector('[data-ok]').addEventListener('click', (e) => { e.stopPropagation(); end(true); });
     box.querySelector('[data-cancel]').addEventListener('click', (e) => { e.stopPropagation(); end(false); });
     box.querySelector('.modal-close').addEventListener('click', (e) => { e.stopPropagation(); end(false); });
     box.addEventListener('click', (e) => e.stopPropagation());
+    backdrop.addEventListener('click', cancelConfirm);
     document.addEventListener('keydown', onKey, true);
-    document.body.appendChild(box);
-    if (mask) mask.addEventListener('click', onMaskClick);
+    backdrop.appendChild(box);
+    document.body.appendChild(backdrop);
     box.querySelector('[data-cancel]').focus();
   });
 }

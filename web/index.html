@@ -542,13 +542,13 @@
   /* ---- 弹层（工程选择 / 时间轴） ---- */
   .mask {
     position: absolute; inset: 0; background: rgba(20, 20, 18, 0.28);
-    display: none; z-index: 40;
+    display: none; z-index: 48;
   }
   .mask.show { display: block; }
   .modal {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     width: 560px; max-height: 74vh; display: none; flex-direction: column;
-    background: #fff; border-radius: 14px; z-index: 41;
+    background: #fff; border-radius: 14px; z-index: 49;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2); overflow: hidden;
   }
   .modal.show { display: flex; }
@@ -618,7 +618,8 @@
     border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none;
   }
   /* 应用内确认弹窗（confirmDialog）：直挂 body，层级要盖过普通弹窗和右侧 AI 抽屉 */
-  .confirm-modal { width: 420px; z-index: 55; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22); }
+  .confirm-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(20, 20, 18, 0.28); }
+  .confirm-modal { width: min(420px, calc(100vw - 24px)); box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22); }
   .confirm-modal .modal-body { padding: 14px 16px 4px; font-size: 13px; line-height: 1.7; color: #2C2C2A; white-space: pre-line; }
   .confirm-modal .modal-foot { justify-content: flex-end; padding: 10px 16px 14px; }
   button.danger { background: #D9303E; border-color: #D9303E; color: #fff; }
@@ -1436,7 +1437,7 @@
     <div id="ctxMenu" class="ctx-menu"></div>
 
     <div id="reviewBar" class="review-bar">
-      <span id="reviewText"></span>
+      <span id="reviewText" aria-live="polite"></span>
       <button id="reviewRestore" class="primary" data-i18n="timeline.restore">恢复到此</button>
       <button id="reviewExit" data-i18n="timeline.exit">回到最新</button>
     </div>

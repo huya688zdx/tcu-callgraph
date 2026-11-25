@@ -6,9 +6,22 @@ import { state } from './state.js';
 // 页面标识用于识别延迟到达的自身切换广播，不依赖请求是否已经结束。
 export const clientId = crypto.randomUUID();
 
-const get = (url) => fetch(url).then(parseJson);
+const REQUEST_TIMEOUT = 15_000;
+const ANALYSIS_TIMEOUT = 300_000;
+const MODEL_TIMEOUT = 200_000;
+function request(url, init, parse, timeout = REQUEST_TIMEOUT) {
+  const deadline = AbortSignal.timeout(timeout);
+  const signal = init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
+  return fetch(url, { ...init, signal }).then(parse).catch(error => {
+    if (signal.reason === deadline.reason && deadline.aborted) {
+      throw new Error('请求超时，请重试');
+    }
+    throw error;
+  });
+}
+const get = (url, { parse = parseJson, timeout, signal } = {}) => request(url, { signal }, parse, timeout);
 let layoutWrites = Promise.resolve();
-let chatWrites = Promise.resolve();
+const chatWrites = new Map();
 
 async function parseJson(response) {
   if (response.ok) return response.json();
@@ -23,15 +36,16 @@ async function parseView(response) {
   return revision === null ? view : { ...view, sessionRevision: Number(revision) };
 }
 
-const post = (url, body, parse = (response) => response.json()) =>
-  fetch(url, {
+const post = (url, body, { parse = parseJson, timeout, signal } = {}) =>
+  request(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId,
       ...((body.projectId ?? state.view?.projectId) == null ? {} :
         { 'X-Callgraph-Project': String(body.projectId ?? state.view.projectId) }),
       ...(body.sessionRevision == null ? {} : { 'X-Callgraph-Session': String(body.sessionRevision) }) },
     body: JSON.stringify(body),
-  }).then(parse);
+    signal,
+  }, parse, timeout);
 
 /**
  * 回看模式下拦掉写操作。
@@ -51,7 +65,7 @@ const guardWrite = (name) => {
 export const api = {
   /** 取子图：root 为空时由服务端挑选入口函数；at>0 时渲染历史某一刻的状态 */
   view({ root, roots, up = 1, down = 1, group = true, groupMode = group ? 'file' : 'flat', vars, hiddenVars, expansions = [], at = 0, previous = null,
-    preview = false, empty = false, useSnapshot = false }) {
+    preview = false, empty = false, useSnapshot = false, signal }) {
     const q = new URLSearchParams({ down, up, group: groupMode === 'flat' ? '0' : '1', groupMode });
     if (preview) q.set('preview', '1');
     if (empty) q.set('empty', '1');
@@ -65,7 +79,9 @@ export const api = {
     if (at > 0) q.set('at', String(at));
     const hasComma = [...(list.length > 1 ? list : []), ...(vars || []), ...(hiddenVars || [])]
       .some((id) => id.includes(','));
-    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) return fetch('/api/view?' + q).then(parseView);
+    if (!previous && !expansions.length && !hasComma && q.toString().length <= 6000) {
+      return get('/api/view?' + q, { parse: parseView, timeout: ANALYSIS_TIMEOUT, signal });
+    }
     for (const key of ['root', 'roots', 'vars', 'novars']) q.delete(key);
     // 只带本次画面的几何信息，不把标注缓存等绘制数据发回服务端。
     return post('/api/view?' + q, { projectId: previous?.projectId ?? state.view?.projectId,
@@ -77,11 +93,11 @@ export const api = {
         ({ from, to, kind, line, change, points, custom, fromSide, toSide })),
       groups: previous.groups || [], containers: previous.containers || [],
       layoutSlots: previous.layoutSlots,
-    } : null }, parseView);
+    } : null }, { parse: parseView, timeout: ANALYSIS_TIMEOUT, signal });
   },
   stats: () => get('/api/stats?summary=1'),
-  parsers: () => fetch('/api/parsers').then(response => response.ok ? response.json() : null).catch(() => null),
-  setParser: parserId => post('/api/parsers', { parserId }),
+  parsers: () => get('/api/parsers').then(result => result?.ok === false ? null : result).catch(() => null),
+  setParser: parserId => post('/api/parsers', { parserId }, { timeout: ANALYSIS_TIMEOUT }),
   /** 当前工程身份（名字、路径、指纹是否变过） */
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */
@@ -89,10 +105,10 @@ export const api = {
   renameProject: (id, name) => post('/api/projects/rename', { id, name }),
   removeProject: (id) => post('/api/projects/remove', { id }),
   /** 切换工程：传 id 或绝对路径，服务端重新解析并整体替换会话状态 */
-  switchProject: (body) => post('/api/switch', body),
+  switchProject: (body) => post('/api/switch', body, { timeout: ANALYSIS_TIMEOUT }),
   gitStatus: () => get('/api/git/status'),
-  compare: (body) => post('/api/compare', body),
-  applyComparison: (body) => post('/api/compare/apply', body),
+  compare: (body) => post('/api/compare', body, { timeout: ANALYSIS_TIMEOUT }),
+  applyComparison: (body) => post('/api/compare/apply', body, { timeout: ANALYSIS_TIMEOUT }),
   comparisonStatus: (body) => post('/api/compare/status', body),
   cancelComparison: (previewId) => post('/api/compare/cancel', { previewId }),
   exitComparison: () => post('/api/compare/exit', {}),
@@ -118,14 +134,14 @@ export const api = {
   /** 导入 .cgx 会话（导出走浏览器直接下载，不需要接口封装） */
   importSession: (body) => guardWrite('session') || post('/api/session/import', body),
   /** 全工程全局变量 / 常量清单 */
-  vars: () => get('/api/vars'),
+  vars: () => get('/api/vars', { timeout: ANALYSIS_TIMEOUT }),
   tree: () => get('/api/tree'),
   search: (q) => get('/api/search?q=' + encodeURIComponent(q)),
   node: (id) => get('/api/node?id=' + encodeURIComponent(id)),
-  flowchart(id, { version, expandMacros, projectId, comparisonId }) {
+  flowchart(id, { version, expandMacros, projectId, comparisonId, signal }) {
     const query = new URLSearchParams({ id, version, expandMacros: expandMacros ? '1' : '0',
       projectId, comparisonId: comparisonId ?? '' });
-    return get('/api/flowchart?' + query);
+    return get('/api/flowchart?' + query, { timeout: ANALYSIS_TIMEOUT, signal });
   },
   /** 节点 / 连线的标注与变更分类 */
   overlay: (body) => guardWrite('overlay') || post('/api/overlay', body),
@@ -147,24 +163,32 @@ export const api = {
   deleteManualNode: (body) => guardWrite('manualNodes') || post('/api/manual-nodes/delete', body),
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
-    get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir)),
+    get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir), { timeout: ANALYSIS_TIMEOUT }),
   pairDataflow: (a, b) => post('/api/dataflow/pair', { a, b, projectId: state.view?.projectId,
-    comparisonId: state.view?.comparison?.id }),
+    comparisonId: state.view?.comparison?.id }, { timeout: ANALYSIS_TIMEOUT }),
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
   /** 内置直连 OpenAI 兼容模型配置、拉取模型、连通性测试、按工程隔离的对话管理与对话 */
   aiConfig: () => get('/api/ai/config'),
   saveAiConfig: (body) => post('/api/ai/config', body),
-  aiChats: () => chatWrites.then(() => get('/api/ai/chats')),
+  aiChats: () => Promise.resolve(chatWrites.get(state.view?.projectId)).catch(() => {}).then(() => get('/api/ai/chats')),
   saveAiChats(body) {
+    const id = body.projectId;
     const snapshot = structuredClone(body);
-    const write = chatWrites.then(() => post('/api/ai/chats', snapshot));
-    chatWrites = write.catch(() => {});
+    const write = Promise.resolve(chatWrites.get(id)).catch(() => {}).then(async () => {
+      const result = await post('/api/ai/chats', snapshot);
+      if (!result?.ok) throw new Error(result?.error || '保存对话失败');
+      return result;
+    }).finally(() => {
+      if (chatWrites.get(id) === write) chatWrites.delete(id);
+    });
+    chatWrites.set(id, write);
     return write;
   },
-  aiModels: (body) => post('/api/ai/models', body),
-  aiTest: (body) => post('/api/ai/test', body),
+  compactChat: (body, signal) => post('/api/ai/compact', body, { timeout: MODEL_TIMEOUT, signal }),
+  aiModels: (body, signal) => post('/api/ai/models', body, { timeout: MODEL_TIMEOUT, signal }),
+  aiTest: (body) => post('/api/ai/test', body, { timeout: MODEL_TIMEOUT }),
   aiChat: (body, signal) =>
     fetch('/api/ai/chat', {
       method: 'POST',
@@ -188,5 +212,5 @@ export const api = {
   /** 结合点重排：把算好的新编号整体写回 */
   renumberConns: (items) => guardWrite('labels') || post('/api/labels/renumber', { items }),
   /** 自动检测 task/コール順 候选（服务端扫源码，返回建议清单，应用走 overlay） */
-  detectTasks: (from) => get('/api/detect-tasks' + (from ? '?from=' + encodeURIComponent(from) : '')),
+  detectTasks: (from) => get('/api/detect-tasks' + (from ? '?from=' + encodeURIComponent(from) : ''), { timeout: ANALYSIS_TIMEOUT }),
 };

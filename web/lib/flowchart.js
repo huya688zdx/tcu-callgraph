@@ -8,6 +8,7 @@ import { deletedEdgeMarkSvg } from '/core/labels.js';
 const branchColors = { ON: ['#dcfce7', '#15803d'], OFF: ['#fef3c7', '#b45309'] };
 
 let ui, context, graph, trail = [], expand = false, request = 0, drag, suppressNextClick = false;
+let chartRequest;
 let camera = { x: 0, y: 0, zoom: 1, fitting: true };
 
 export const canOpenFlowchart = node => !!ui && !node.external && !node.manual && node.kind !== 'var' && !node.headerSymbol;
@@ -130,13 +131,16 @@ function refreshControls() {
 async function loadChart() {
   const current = trail.at(-1);
   const ticket = ++request;
+  chartRequest?.abort();
+  const controller = new AbortController();
+  chartRequest = controller;
   graph = null;
   ui.canvas.replaceChildren();
   ui.calls.hidden = true;
   refreshControls();
   setStatus(t('flowchart.loading'));
   try {
-    const result = await api.flowchart(current.id, { ...context, expandMacros: expand, version: current.version });
+    const result = await api.flowchart(current.id, { ...context, expandMacros: expand, version: current.version, signal: controller.signal });
     if (ticket !== request || !visible()) return;
     if (state.view?.projectId !== context.projectId || state.view?.comparison?.id !== context.comparisonId) {
       closeModal();
@@ -161,6 +165,8 @@ async function loadChart() {
     fit();
   } catch (error) {
     if (ticket === request && visible()) setStatus(`${t('flowchart.error')} ${error.message}`);
+  } finally {
+    if (chartRequest === controller) chartRequest = null;
   }
 }
 
@@ -241,6 +247,10 @@ export function wireFlowchart() {
   ui = Object.fromEntries(['Modal', 'Crumbs', 'Back', 'Expand', 'ExpandLabel', 'Version', 'VersionLabel', 'Macros',
     'MacroList', 'Viewport', 'Status', 'Calls', 'Canvas', 'Fit', 'ZoomIn', 'ZoomOut', 'Export']
     .map(name => [name[0].toLowerCase() + name.slice(1), get(name)]));
+  ui.modal.addEventListener('cg:modal-closed', () => {
+    request++;
+    chartRequest?.abort();
+  });
 
   ui.back.addEventListener('click', () => backTo(trail.length - 2));
   ui.expand.addEventListener('change', () => {

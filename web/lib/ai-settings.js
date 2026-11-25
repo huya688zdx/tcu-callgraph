@@ -140,7 +140,7 @@ let activeChatId = '';
 let renamingThread = null;
 let activeAbort = null;
 let pendingSteer = null;
-let compacting = false;
+let compacting = null;
 let stickToBottom = true;
 let displayedContext = { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
 let canvasSelection = null;
@@ -222,9 +222,13 @@ function activeThread() {
 
 function persistChats(projectId = chatProjectId) {
   if (projectId == null) return;
-  chatMutation++;
+  const mutation = ++chatMutation;
   const payload = { projectId, activeId: activeChatId, threads: chatThreads.slice(0, 30) };
-  void api.saveAiChats(payload).catch(() => {});
+  void api.saveAiChats(payload).catch(error => {
+    if (projectId === chatProjectId && mutation === chatMutation) {
+      setChatStatus(`对话保存失败：${error.message}`, true);
+    }
+  });
 }
 
 function finishThreadRename(save) {
@@ -894,15 +898,20 @@ async function saveQuickConfig(patch, okMessage) {
 
 function prefetchModelsForQuickPicker() {
   const baseUrl = String(llmConfig.baseUrl || '').trim();
-  if (!baseUrl || (fetchedModelsBaseUrl === baseUrl && fetchedModels.length) || backgroundModelFetch) return;
-  backgroundModelFetch = api.aiModels({ baseUrl })
+  if (backgroundModelFetch?.baseUrl === baseUrl) return;
+  backgroundModelFetch?.controller.abort();
+  if (!baseUrl || (fetchedModelsBaseUrl === baseUrl && fetchedModels.length)) return;
+  const controller = new AbortController();
+  const pending = { baseUrl, controller };
+  backgroundModelFetch = pending;
+  void api.aiModels({ baseUrl }, controller.signal)
     .then((r) => {
       if (r?.ok && Array.isArray(r.models) && r.models.length && llmConfig.baseUrl === baseUrl) {
         applyFetchedModels(r.models, baseUrl);
       }
     })
     .catch(() => {})
-    .finally(() => { backgroundModelFetch = null; });
+    .finally(() => { if (backgroundModelFetch === pending) backgroundModelFetch = null; });
 }
 
 function syncApiForm() {
@@ -1060,21 +1069,13 @@ async function compactChat() {
   if (!messages.length) return;
   const isCurrent = () => chatProjectId === projectId && chatThreads.includes(thread) && thread.messages === messages;
   const before = estimateContext(messages);
-  compacting = true;
+  const controller = new AbortController();
+  compacting = controller;
   updateChatControls();
   setChatStatus('正在压缩上下文…');
   try {
-    const res = await fetch('/api/ai/compact', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Callgraph-Client': clientId,
-        'X-Callgraph-Project': String(projectId),
-      },
-      body: JSON.stringify({ projectId, threadId: thread.id, messages }),
-    });
-    const result = await res.json().catch(() => null);
-    if (!res.ok || result?.ok === false) throw new Error(result?.error || `HTTP ${res.status}`);
+    const result = await api.compactChat({ projectId, threadId: thread.id, messages }, controller.signal);
+    if (result?.ok === false) throw new Error(result.error);
     if (!Array.isArray(result?.messages)) throw new Error('压缩接口返回了无效的对话数据');
     if (!isCurrent()) return;
     thread.messages = result.messages;
@@ -1102,8 +1103,10 @@ async function compactChat() {
   } catch (err) {
     if (isCurrent() && activeChatId === thread.id) setChatStatus(`压缩失败：${err.message}`, true);
   } finally {
-    compacting = false;
-    if (chatThreads.length) updateChatControls();
+    if (compacting === controller) {
+      compacting = null;
+      if (chatThreads.length) updateChatControls();
+    }
   }
 }
 
@@ -1361,6 +1364,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     if (isVisible()) followChatScroll();
   };
+  let streamTimer = setTimeout(() => controller.abort(new Error('连接 AI 服务超时')), 15_000);
+  let reader;
   try {
     const res = await api.aiChat({
       prompt: text, history: historySnapshot, at: state.at || 0, threadId, uiContext,
@@ -1369,10 +1374,12 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    const reader = res.body.getReader();
+    reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     while (true) {
+      clearTimeout(streamTimer);
+      streamTimer = setTimeout(() => controller.abort(new Error('等待 AI 响应超时')), 420_000);
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -1389,6 +1396,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
     }
   } finally {
+    clearTimeout(streamTimer);
+    if (reader) {
+      void reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
     let steer = null;
     if (activeAbort === controller) {
       activeAbort = null;
@@ -1468,6 +1480,8 @@ document.addEventListener('cg:project-changed', () => {
   setActiveChat('');
   renameChatBtn.disabled = true;
   pendingSteer = null;
+  compacting?.abort();
+  compacting = null;
   if (activeAbort) {
     activeAbort.abort();
     activeAbort = null;
