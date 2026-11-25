@@ -617,8 +617,8 @@
     flex: 1; height: 30px; padding: 0 10px; font-size: 12.5px; font-family: inherit;
     border: 1px solid rgba(0, 0, 0, 0.16); border-radius: 8px; outline: none;
   }
-  /* 应用内确认弹窗（confirmDialog）：直挂 body，层级要盖过 z-41 的普通弹窗 */
-  .confirm-modal { width: 420px; z-index: 45; }
+  /* 应用内确认弹窗（confirmDialog）：直挂 body，层级要盖过普通弹窗和右侧 AI 抽屉 */
+  .confirm-modal { width: 420px; z-index: 55; box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22); }
   .confirm-modal .modal-body { padding: 14px 16px 4px; font-size: 13px; line-height: 1.7; color: #2C2C2A; white-space: pre-line; }
   .confirm-modal .modal-foot { justify-content: flex-end; padding: 10px 16px 14px; }
   button.danger { background: #D9303E; border-color: #D9303E; color: #fff; }
@@ -1101,17 +1101,42 @@
     display: grid; gap: 6px; background: #FAF9F6; flex-shrink: 0;
   }
   .ai-telemetry {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+    display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0;
     color: #6E6C65; font-size: 11px; font-variant-numeric: tabular-nums;
   }
+  #aiContextBadge {
+    display: inline-flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto;
+    padding: 2px 7px 2px 6px; border-radius: 999px;
+    background: #F1EFE8; color: #52514B; cursor: default;
+  }
+  .ai-ctx-meter {
+    width: 40px; height: 5px; border-radius: 999px; background: rgba(31, 31, 29, 0.12);
+    overflow: hidden; flex: 0 0 auto;
+  }
+  .ai-ctx-fill {
+    display: block; height: 100%; width: 0%; border-radius: 999px;
+    background: #2B74B9; transition: width .24s ease, background-color .2s ease;
+  }
+  .ai-ctx-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ai-ctx-pct { color: #848178; margin-left: 2px; }
+  #aiContextBadge.warn { background: #FDF3DF; color: #8A5306; }
+  #aiContextBadge.warn .ai-ctx-fill { background: #D97706; }
+  #aiContextBadge.warn .ai-ctx-pct { color: #A66509; }
+  #aiContextBadge.danger { background: #FDECEC; color: #A52222; }
+  #aiContextBadge.danger .ai-ctx-fill { background: #C83232; }
+  #aiContextBadge.danger .ai-ctx-pct { color: #B42318; }
   #aiSpeedBadge {
-    padding: 1px 7px; border-radius: 999px; background: #EFECE3;
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    padding: 2px 7px; border-radius: 999px; background: #EFECE3;
     color: #595750; font-size: 10.5px;
   }
   #aiSpeedBadge:empty, .ai-chat-status:empty { display: none; }
   #aiDrawer #aiCompactChat {
-    margin-left: auto; height: 22px; padding: 0 8px; font-size: 11px; border-radius: 6px;
+    margin-left: auto; flex: 0 0 auto; height: 22px; padding: 0 8px; font-size: 11px; border-radius: 6px;
     background: #FFFFFF; border: 1px solid #E4E1D8; color: #55534D;
+  }
+  #aiDrawer #aiCompactChat.suggest:not(:disabled) {
+    background: #FFF6E0; border-color: #E7BC66; color: #7C4A03; font-weight: 500;
   }
   #aiDrawer #aiCompactChat:hover:not(:disabled) { background: #F2F0E8; border-color: #D2CEC2; }
   #aiDrawer #aiCompactChat:disabled { opacity: .45; cursor: default; }
@@ -1135,16 +1160,29 @@
     display: flex; align-items: center; gap: 6px; justify-content: space-between;
     margin-top: 6px; padding-top: 6px; border-top: 1px solid #F3F1EA;
   }
-  .ai-composer-hint {
-    max-width: 195px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    font-size: 11px; color: #6E6C65; background: #F5F4EF; padding: 2px 8px; border-radius: 999px;
+  .ai-composer-controls {
+    display: flex; align-items: center; gap: 5px; flex: 1 1 auto; min-width: 0;
   }
+  #aiDrawer .ai-inline-select {
+    height: 26px; padding: 0 21px 0 8px; border-radius: 7px; font-size: 11.5px; font-weight: 500;
+    color: #4A4945; border: 1px solid transparent;
+    background: #F5F4EF var(--chev-down) right 6px center / 9px no-repeat;
+    appearance: none; -webkit-appearance: none; outline: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    transition: background-color .14s ease, border-color .14s ease, color .14s ease, box-shadow .14s ease;
+  }
+  #aiDrawer .ai-inline-select:hover:not(:disabled) {
+    background-color: #ECEAE2; border-color: #DCD9CF; color: #1F1F1D;
+  }
+  #aiDrawer .ai-inline-select:focus {
+    background-color: #FFFFFF; border-color: #185FA5; color: #1F1F1D;
+    box-shadow: 0 0 0 2px rgba(24, 95, 165, 0.12);
+  }
+  #aiDrawer .ai-inline-select:disabled { opacity: .55; cursor: default; }
+  #aiDrawer #aiQuickModel { flex: 0 1 178px; min-width: 96px; max-width: 178px; }
+  #aiDrawer #aiQuickModel.unconfigured { background-color: #FFF6E0; color: #7C4A03; border-color: #F0D28C; }
+  #aiDrawer #aiQuickReasoning { flex: 0 0 auto; max-width: 108px; }
   .ai-composer-actions { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
-  #aiDrawer #aiClearChat {
-    height: 28px; padding: 0 9px; font-size: 12px; border: 0; border-radius: 8px;
-    background: transparent; color: #75736B;
-  }
-  #aiDrawer #aiClearChat:hover { background: #F3F2EC; color: #2C2C2A; }
   #aiDrawer #aiStopChat {
     height: 28px; padding: 0 11px; font-size: 12px; font-weight: 500; border-radius: 8px;
     background: #FEF2F2; border: 1px solid #F5B8B8; color: #B42318;
@@ -1726,7 +1764,7 @@
           <div class="ai-empty-badge" aria-hidden="true">✦</div>
           <div class="ai-empty-title">TCU 调用图 AI 助手</div>
           <p class="ai-empty-desc">直接提问查找函数、分析 Git 改动或补全标签，选中的画布节点与连线会自动作为上下文。</p>
-          <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/compact 压缩</span></div>
+          <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/new 新建</span><span>·</span><span>/compact 压缩</span></div>
         </div>
       </div>
       <div class="ai-selection-bar" id="aiSelectionBar" role="group" aria-label="画布选区" hidden>
@@ -1738,17 +1776,28 @@
       </div>
       <div class="ai-composer">
         <div class="ai-telemetry">
-          <span id="aiContextBadge" title="当前对话估算上下文占用">上下文 0 / 32k</span>
-          <span id="aiSpeedBadge" title="最近一轮生成速度与 Token 统计"></span>
+          <span id="aiContextBadge" title="当前对话上下文占用">
+            <span class="ai-ctx-meter" aria-hidden="true"><span class="ai-ctx-fill" id="aiContextFill"></span></span>
+            <span class="ai-ctx-text" id="aiContextText">上下文 0 / 32k</span>
+          </span>
+          <span id="aiSpeedBadge" title="最近一轮生成速度与输出 Token 统计"></span>
           <button type="button" id="aiCompactChat" title="压缩早期对话以释放上下文（也支持输入 /compact）">压缩</button>
         </div>
         <div class="ai-chat-status" id="aiChatStatus" role="status"></div>
         <div class="ai-input-shell">
           <textarea id="aiPromptInput" placeholder="例如：把 Git 未提交改动的函数加入画布；或：找出油压控制相关函数和共享变量加到图里…"></textarea>
           <div class="ai-composer-bar">
-            <span class="ai-composer-hint" id="aiModelBadge">未配置模型</span>
+            <div class="ai-composer-controls">
+              <select id="aiQuickModel" class="ai-inline-select" aria-label="切换模型" title="切换模型"></select>
+              <select id="aiQuickReasoning" class="ai-inline-select" aria-label="思考强度" title="思考强度">
+                <option value="default">思考：默认</option>
+                <option value="off">思考：关</option>
+                <option value="low">思考：低</option>
+                <option value="medium">思考：中</option>
+                <option value="high">思考：高</option>
+              </select>
+            </div>
             <div class="ai-composer-actions">
-              <button type="button" id="aiClearChat">清空</button>
               <button type="button" id="aiStopChat" hidden>停止</button>
               <button type="button" id="aiSendChat" class="primary">发送</button>
             </div>

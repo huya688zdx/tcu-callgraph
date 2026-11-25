@@ -6,7 +6,7 @@
  */
 import { t } from '../i18n.js';
 import { api, clientId } from './api.js';
-import { esc } from './modal.js';
+import { confirmDialog, esc } from './modal.js';
 import { state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
@@ -36,9 +36,11 @@ const clearSelectionBtn = document.getElementById('aiClearSelection');
 const inputEl = document.getElementById('aiPromptInput');
 const sendBtn = document.getElementById('aiSendChat');
 const stopBtn = document.getElementById('aiStopChat');
-const clearBtn = document.getElementById('aiClearChat');
-const modelBadge = document.getElementById('aiModelBadge');
+const quickModelEl = document.getElementById('aiQuickModel');
+const quickReasoningEl = document.getElementById('aiQuickReasoning');
 const contextBadge = document.getElementById('aiContextBadge');
+const contextFillEl = document.getElementById('aiContextFill');
+const contextTextEl = document.getElementById('aiContextText');
 const speedBadge = document.getElementById('aiSpeedBadge');
 const compactBtn = document.getElementById('aiCompactChat');
 const chatStatusEl = document.getElementById('aiChatStatus');
@@ -115,13 +117,18 @@ let apiConfigLoad = null;
 let showApiOnOpen = false;
 let mcpLevel = 'readonly';
 let envLocked = false;
-const REASONING_LABELS = new Map([['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
+const REASONING_LABELS = new Map([['default', '默认'], ['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
+const QUICK_CONFIG_ACTION = '__ai_open_config__';
 let llmConfig = {
   baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
   toolMode: 'auto', reasoningEffort: 'default', contextWindow: DEFAULT_CONTEXT_WINDOW,
   maxTokens: DEFAULT_MAX_TOKENS,
 };
 let clearApiKeyPending = false;
+let fetchedModels = [];
+let fetchedModelsBaseUrl = '';
+let backgroundModelFetch = null;
+let quickSaving = false;
 let chatGeneration = 0;
 let chatMutation = 0;
 let chatProjectId = null;
@@ -132,7 +139,7 @@ let renamingThread = null;
 let activeAbort = null;
 let compacting = false;
 let stickToBottom = true;
-let displayedContextTokens = 0;
+let displayedContext = { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
 let canvasSelection = null;
 const dismissedSelectionKeys = new Set();
 
@@ -271,31 +278,132 @@ function chatHistory(messages) {
     .map((m) => ({ role: m.role, content: messageContext(m) })).filter((m) => m.content);
 }
 
-function estimateContext(messages) {
-  const encoder = new TextEncoder();
-  return chatHistory(messages).reduce((total, { content }) =>
-    total + 4 + Math.ceil(encoder.encode(content).length / 4), 0);
+function estimateTextTokens(text) {
+  let weight = 0;
+  for (const ch of String(text ?? '')) {
+    weight += ch.charCodeAt(0) <= 0x7f ? 28 : 120;
+  }
+  return Math.ceil(weight / 100);
 }
 
-function tokenCount(value) {
-  return value >= 1000 ? `${Number((value / 1000).toFixed(1))}k` : String(value);
+function estimateContext(messages) {
+  return chatHistory(messages).reduce((total, { content }) => total + 4 + estimateTextTokens(content), 0);
+}
+
+function formatTokens(value) {
+  const n = Math.max(0, Math.round(Number(value) || 0));
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(2))}M`;
+  if (n >= 1000) return `${Number((n / 1000).toFixed(1))}k`;
+  return String(n);
+}
+
+function formatWindowSize(limit) {
+  const n = Math.max(1, Math.round(Number(limit) || DEFAULT_CONTEXT_WINDOW));
+  if (n >= 4096 && n % 1024 === 0) return `${n / 1024}k`;
+  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`;
+  return formatTokens(n);
+}
+
+function resolveMetricsTokens(metrics) {
+  if (!metrics || typeof metrics !== 'object') return null;
+  const promptTokens = Number(metrics.promptTokens ?? metrics.contextTokens) || 0;
+  const outputTokens = Number(metrics.outputTokens ?? metrics.completionTokens) || 0;
+  const total = Number(metrics.totalTokens) || (promptTokens + outputTokens) || Number(metrics.contextEstTokens) || 0;
+  if (total <= 0) return null;
+  return { total, promptTokens, outputTokens, estimated: Boolean(metrics.estimated) };
+}
+
+function computeContextState(thread, liveMetrics) {
+  const live = resolveMetricsTokens(liveMetrics);
+  if (live) {
+    return { used: live.total, promptTokens: live.promptTokens, outputTokens: live.outputTokens, estimated: live.estimated, hasMetrics: true };
+  }
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  if (!messages.length) {
+    return { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
+  }
+  let baseIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (resolveMetricsTokens(messages[i]?.metrics)) {
+      baseIdx = i;
+      break;
+    }
+  }
+  const saved = resolveMetricsTokens(baseIdx >= 0 ? messages[baseIdx].metrics : thread?.metrics);
+  if (saved) {
+    const trailing = baseIdx >= 0 ? messages.slice(baseIdx + 1) : [];
+    const extra = trailing.reduce((sum, msg) => sum + (msg.error ? 0 : 4 + estimateTextTokens(messageContext(msg))), 0);
+    return {
+      used: saved.total + extra,
+      promptTokens: saved.promptTokens,
+      outputTokens: saved.outputTokens,
+      estimated: saved.estimated || extra > 0,
+      hasMetrics: true,
+    };
+  }
+  return {
+    used: estimateContext(messages),
+    promptTokens: 0,
+    outputTokens: 0,
+    estimated: true,
+    hasMetrics: false,
+  };
 }
 
 function renderContextBadge() {
   const limit = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-  const used = displayedContextTokens;
-  contextBadge.textContent = `上下文 ${tokenCount(used)} / ${tokenCount(limit)} (${Math.round(used / limit * 100)}%)`;
+  const { used, promptTokens, outputTokens, estimated, hasMetrics } = displayedContext;
+  const rawPct = limit > 0 ? (used / limit) * 100 : 0;
+  const pct = used > 0 ? Math.max(1, Math.round(rawPct)) : 0;
+  const barPct = Math.min(100, Math.max(0, rawPct));
+  const prefix = used > 0 && estimated ? '~' : '';
+
+  if (contextFillEl) contextFillEl.style.width = `${barPct.toFixed(1)}%`;
+  if (contextTextEl) {
+    contextTextEl.innerHTML = `${prefix}${formatTokens(used)} / ${formatWindowSize(limit)}<span class="ai-ctx-pct"> · ${pct}%</span>`;
+  } else {
+    contextBadge.textContent = `上下文 ${prefix}${formatTokens(used)} / ${formatWindowSize(limit)} · ${pct}%`;
+  }
+  contextBadge.classList.toggle('warn', rawPct >= 65 && rawPct < 85);
+  contextBadge.classList.toggle('danger', rawPct >= 85);
+  compactBtn?.classList.toggle('suggest', rawPct >= 75);
+
+  const lines = [`上下文窗口占用：${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`];
+  if (hasMetrics && (promptTokens > 0 || outputTokens > 0)) {
+    lines.push(`最近一轮：输入 ${promptTokens.toLocaleString()} · 输出 ${outputTokens.toLocaleString()} tokens（${estimated ? '估算' : '模型实测'}）`);
+  } else if (used === 0) {
+    lines.push('当前暂无对话消息');
+  } else {
+    lines.push('基于当前对话文本估算（发送请求后将按模型接口返回更新）');
+  }
+  contextBadge.title = lines.join('\n');
 }
 
 function renderTelemetry(thread, liveMetrics) {
   const metrics = liveMetrics || thread.metrics || thread.messages.findLast((m) => m.metrics)?.metrics;
-  displayedContextTokens = liveMetrics?.totalTokens ?? liveMetrics?.contextTokens ?? liveMetrics?.promptTokens ??
-    liveMetrics?.contextEstTokens ?? estimateContext(thread.messages);
+  displayedContext = computeContextState(thread, liveMetrics);
   renderContextBadge();
-  const speed = metrics?.tokensPerSecond ?? metrics?.tokPerSec;
-  const tokens = metrics?.outputTokens ?? metrics?.completionTokens;
-  speedBadge.textContent = [Number.isFinite(speed) ? `${speed.toFixed(1)} tok/s` : '',
-    Number.isFinite(tokens) ? `${tokens} tok${metrics.estimated ? ' (估)' : ''}` : ''].filter(Boolean).join(' · ');
+
+  const speed = Number(metrics?.tokensPerSecond ?? metrics?.tokPerSec);
+  const tokens = Number(metrics?.outputTokens ?? metrics?.completionTokens);
+  const elapsedMs = Number(metrics?.elapsedMs);
+  const parts = [];
+  if (Number.isFinite(tokens) && tokens > 0) {
+    parts.push(`输出 ${metrics?.estimated ? '~' : ''}${formatTokens(tokens)}`);
+  }
+  if (Number.isFinite(speed) && speed > 0) {
+    parts.push(`${speed.toFixed(1)} tok/s`);
+  }
+  speedBadge.textContent = parts.join(' · ');
+  if (parts.length) {
+    const detail = [];
+    if (Number.isFinite(tokens) && tokens > 0) detail.push(`输出 ${tokens.toLocaleString()} tokens${metrics?.estimated ? '（估算）' : '（实测）'}`);
+    if (Number.isFinite(speed) && speed > 0) detail.push(`速度 ${speed.toFixed(1)} tok/s`);
+    if (Number.isFinite(elapsedMs) && elapsedMs >= 100) detail.push(`耗时 ${(elapsedMs / 1000).toFixed(1)}s`);
+    speedBadge.title = detail.join(' · ');
+  } else {
+    speedBadge.title = '';
+  }
 }
 
 function setChatStatus(text = '', error = false) {
@@ -542,7 +650,7 @@ const EMPTY_CHAT_HTML = `<div class="empty">
   <div class="ai-empty-badge" aria-hidden="true">✦</div>
   <div class="ai-empty-title">TCU 调用图 AI 助手</div>
   <p class="ai-empty-desc">直接提问查找函数、分析 Git 改动或补全标签，选中的画布节点与连线会自动作为上下文。</p>
-  <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/compact 压缩</span></div>
+  <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/new 新建</span><span>·</span><span>/compact 压缩</span></div>
 </div>`;
 
 function renderThreadMessages() {
@@ -665,29 +773,118 @@ function syncModelPicker() {
   if (modelSelectEl.selectedIndex < 0) modelSelectEl.value = '';
 }
 
+function applyFetchedModels(models, baseUrl = llmConfig.baseUrl || '') {
+  fetchedModels = [...new Set((Array.isArray(models) ? models : []).map(id => String(id || '').trim()).filter(Boolean))];
+  fetchedModelsBaseUrl = baseUrl;
+  const placeholder = new Option('选择已获取的模型', '');
+  placeholder.disabled = true;
+  modelSelectEl.replaceChildren(placeholder, ...fetchedModels.map(id => new Option(id, id)));
+  modelSelectEl.hidden = !fetchedModels.length;
+  syncModelPicker();
+  syncQuickControls();
+}
+
+function syncQuickControls() {
+  const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
+  if (quickModelEl) {
+    const current = String(llmConfig.model || '').trim();
+    const list = [];
+    if (current) list.push(current);
+    for (const id of fetchedModels) {
+      if (!list.includes(id)) list.push(id);
+    }
+    const options = [];
+    if (!current) {
+      const emptyOpt = new Option(llmConfig.baseUrl ? '选择或配置模型…' : '未配置模型 · 去配置', '');
+      options.push(emptyOpt);
+    }
+    for (const id of list) {
+      options.push(new Option(id, id));
+    }
+    options.push(new Option('⚙ 配置或刷新模型…', QUICK_CONFIG_ACTION));
+    quickModelEl.replaceChildren(...options);
+    quickModelEl.value = current || '';
+    quickModelEl.classList.toggle('unconfigured', !configured);
+    quickModelEl.title = configured
+      ? `当前模型：${current}${llmConfig.toolMode === 'prompt' ? '（旧版兼容）' : ''} · 点击切换`
+      : '尚未配置模型，点击前往配置';
+  }
+  if (quickReasoningEl) {
+    const effort = REASONING_LABELS.has(llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
+    quickReasoningEl.value = effort;
+    quickReasoningEl.title = `思考强度：${REASONING_LABELS.get(effort) || '默认'}（切换后下轮生效）`;
+  }
+}
+
+async function saveQuickConfig(patch, okMessage) {
+  if (quickSaving) return;
+  quickSaving = true;
+  if (quickModelEl) quickModelEl.disabled = true;
+  if (quickReasoningEl) quickReasoningEl.disabled = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch('/api/ai/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Callgraph-Client': clientId },
+      body: JSON.stringify(patch),
+      signal: controller.signal,
+    });
+    const r = await response.json().catch(() => null);
+    if (!response.ok || !r?.ok || !r.config) {
+      throw new Error(r?.error || (response.ok ? '保存失败' : `HTTP ${response.status}`));
+    }
+    llmConfig = r.config;
+    syncApiForm();
+    if (okMessage) setChatStatus(okMessage);
+  } catch (err) {
+    syncQuickControls();
+    setChatStatus(controller.signal.aborted ? '切换超时，请重试' : `切换失败：${err.message || err}`, true);
+  } finally {
+    clearTimeout(timeout);
+    quickSaving = false;
+    if (quickModelEl) quickModelEl.disabled = false;
+    if (quickReasoningEl) quickReasoningEl.disabled = false;
+  }
+}
+
+function prefetchModelsForQuickPicker() {
+  const baseUrl = String(llmConfig.baseUrl || '').trim();
+  if (!baseUrl || (fetchedModelsBaseUrl === baseUrl && fetchedModels.length) || backgroundModelFetch) return;
+  backgroundModelFetch = api.aiModels({ baseUrl })
+    .then((r) => {
+      if (r?.ok && Array.isArray(r.models) && r.models.length && llmConfig.baseUrl === baseUrl) {
+        applyFetchedModels(r.models, baseUrl);
+      }
+    })
+    .catch(() => {})
+    .finally(() => { backgroundModelFetch = null; });
+}
+
 function syncApiForm() {
   if (!baseUrlEl) return;
   baseUrlEl.value = llmConfig.baseUrl || '';
   modelEl.value = llmConfig.model || '';
+  if (fetchedModelsBaseUrl && fetchedModelsBaseUrl !== (llmConfig.baseUrl || '')) {
+    fetchedModels = [];
+    fetchedModelsBaseUrl = '';
+    modelSelectEl.replaceChildren();
+    modelSelectEl.hidden = true;
+  }
   syncModelPicker();
   apiKeyEl.value = '';
   apiKeyEl.placeholder = llmConfig.hasApiKey ? '已保存（留空保持不变）' : '可选；本地模型留空即可';
   clearApiKeyPending = false;
   if (clearKeyBtn) clearKeyBtn.hidden = !llmConfig.hasApiKey;
   if (toolModeEl) toolModeEl.value = llmConfig.toolMode || 'auto';
-  const reasoningLabel = REASONING_LABELS.get(llmConfig.reasoningEffort);
-  if (reasoningEffortEl) reasoningEffortEl.value = reasoningLabel ? llmConfig.reasoningEffort : 'default';
+  const effort = REASONING_LABELS.has(llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
+  if (reasoningEffortEl) reasoningEffortEl.value = effort;
   contextWindowEl.value = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   maxTokensEl.value = llmConfig.maxTokens ?? DEFAULT_MAX_TOKENS;
   renderContextBadge();
   const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
   if (setupBanner) setupBanner.hidden = configured;
-  if (modelBadge) {
-    modelBadge.textContent = configured
-      ? `${llmConfig.model}${llmConfig.toolMode === 'prompt' ? ' · 旧版兼容' : ''}${reasoningLabel ? ` · 思考:${reasoningLabel}` : ''}`
-      : '未配置模型';
-    modelBadge.title = modelBadge.textContent;
-  }
+  syncQuickControls();
 }
 
 function readApiDraft() {
@@ -837,14 +1034,26 @@ async function compactChat() {
     if (!Array.isArray(result?.messages)) throw new Error('压缩接口返回了无效的对话数据');
     if (!isCurrent()) return;
     thread.messages = result.messages;
-    delete thread.metrics;
+    const after = result.afterTokens ?? estimateContext(thread.messages);
+    const compactedMetrics = {
+      promptTokens: after,
+      completionTokens: 0,
+      totalTokens: after,
+      contextEstTokens: after,
+      contextWindow: llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      tokPerSec: 0,
+      elapsedMs: 0,
+      estimated: true,
+    };
+    for (const msg of thread.messages) delete msg.metrics;
+    if (thread.messages.length) thread.messages.at(-1).metrics = compactedMetrics;
+    thread.metrics = compactedMetrics;
     thread.updatedAt = Date.now();
     renderChatBar();
     persistChats();
     if (activeChatId === thread.id) {
       renderThreadMessages();
-      const after = estimateContext(thread.messages);
-      setChatStatus(`已压缩上下文：${result.beforeTokens ?? before} → ${result.afterTokens ?? after} tokens`);
+      setChatStatus(`已压缩上下文：${formatTokens(result.beforeTokens ?? before)} → ${formatTokens(after)} tokens`);
     }
   } catch (err) {
     if (isCurrent() && activeChatId === thread.id) setChatStatus(`压缩失败：${err.message}`, true);
@@ -888,10 +1097,13 @@ async function saveViewBookmark(name) {
 async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const text = String(rawText ?? inputEl.value).trim();
   if (!text) return;
-  if (text === '/clear' || text === '/compact') {
+  if (text === '/new' || text === '/clear' || text === '/compact') {
     inputEl.value = '';
     if (text === '/compact') await compactChat();
-    else if (await ensureChatProject()) clearChat();
+    else if (await ensureChatProject()) {
+      startNewThread();
+      setChatStatus('已新建空白对话，原对话保留在历史列表中');
+    }
     return;
   }
   if (activeAbort || compacting) return;
@@ -1117,6 +1329,7 @@ function showDrawer(showSetup = false) {
         if (result?.config) llmConfig = result.config;
         syncApiForm();
       }
+      prefetchModelsForQuickPicker();
       if (showApiOnOpen && (!llmConfig.baseUrl || !llmConfig.model)) setTab('api');
     }).finally(() => { apiConfigLoad = null; });
     void api.mcpConfig().catch(() => null).then((config) => {
@@ -1183,7 +1396,7 @@ if (chatSelectEl) chatSelectEl.addEventListener('change', () => {
   renderThreadMessages();
   persistChats();
 });
-if (newChatBtn) newChatBtn.addEventListener('click', () => {
+function startNewThread() {
   if (activeAbort) activeAbort.abort();
   const th = newThreadObject();
   chatThreads.unshift(th);
@@ -1192,7 +1405,9 @@ if (newChatBtn) newChatBtn.addEventListener('click', () => {
   renderThreadMessages();
   persistChats();
   inputEl?.focus();
-});
+}
+
+if (newChatBtn) newChatBtn.addEventListener('click', startNewThread);
 renameChatBtn.addEventListener('click', () => {
   if (renamingThread || chatProjectId == null || chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
   renamingThread = activeThread();
@@ -1212,9 +1427,21 @@ renameInputEl.addEventListener('keydown', (e) => {
   finishThreadRename(e.key === 'Enter');
   renameChatBtn.focus();
 });
-if (deleteChatBtn) deleteChatBtn.addEventListener('click', () => {
+if (deleteChatBtn) deleteChatBtn.addEventListener('click', async () => {
+  const th = activeThread();
+  const targetId = th?.id;
+  if (!targetId) return;
+  if (th.messages.length) {
+    const ok = await confirmDialog({
+      title: '删除对话',
+      message: `确定删除对话「${th.title || NEW_THREAD_TITLE}」（共 ${th.messages.length} 条记录）吗？\n删除后无法恢复；如只想开启新上下文，请点「+ 新建」。`,
+      okText: '删除对话',
+      danger: true,
+    });
+    if (!ok || activeChatId !== targetId) return;
+  }
   if (activeAbort) activeAbort.abort();
-  chatThreads = chatThreads.filter((x) => x.id !== activeChatId);
+  chatThreads = chatThreads.filter((x) => x.id !== targetId);
   if (!chatThreads.length) chatThreads.push(newThreadObject());
   setActiveChat(chatThreads[0].id);
   renderChatBar();
@@ -1252,18 +1479,22 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
 if (sendBtn) sendBtn.addEventListener('click', () => sendPrompt());
 if (stopBtn) stopBtn.addEventListener('click', () => activeAbort?.abort());
 compactBtn.addEventListener('click', compactChat);
-function clearChat() {
-  if (activeAbort) activeAbort.abort();
-  const th = activeThread();
-  th.messages = [];
-  delete th.metrics;
-  if (!th.customTitle) th.title = NEW_THREAD_TITLE;
-  th.updatedAt = Date.now();
-  renderChatBar();
-  renderThreadMessages();
-  persistChats();
-}
-if (clearBtn) clearBtn.addEventListener('click', clearChat);
+if (quickModelEl) quickModelEl.addEventListener('change', () => {
+  const val = quickModelEl.value;
+  if (!val || val === QUICK_CONFIG_ACTION) {
+    syncQuickControls();
+    setTab('api');
+    (llmConfig.baseUrl ? modelEl : baseUrlEl)?.focus();
+    return;
+  }
+  if (val === llmConfig.model) return;
+  void saveQuickConfig({ model: val }, `已切换模型：${val}`);
+});
+if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
+  const val = quickReasoningEl.value;
+  if (val === (llmConfig.reasoningEffort || 'default')) return;
+  void saveQuickConfig({ reasoningEffort: val }, `已切换思考强度：${REASONING_LABELS.get(val) || val}`);
+});
 if (inputEl) inputEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
@@ -1289,15 +1520,12 @@ if (fetchModelsBtn) fetchModelsBtn.addEventListener('click', async () => {
   setApiStatus('正在拉取模型列表…');
   fetchModelsBtn.disabled = true;
   try {
-    const r = await api.aiModels(readApiDraft());
+    const draft = readApiDraft();
+    const r = await api.aiModels(draft);
     if (!r?.ok) throw new Error(r?.error || '拉取失败');
     const models = r.models || [];
-    const placeholder = new Option('选择已获取的模型', '');
-    placeholder.disabled = true;
-    modelSelectEl.replaceChildren(placeholder, ...models.map(id => new Option(id, id)));
-    modelSelectEl.hidden = !models.length;
     if (!modelEl.value.trim() && models.length) modelEl.value = models[0];
-    syncModelPicker();
+    applyFetchedModels(models, draft.baseUrl);
     setApiStatus(models.length ? `已获取 ${models.length} 个模型，可在下拉中选择` : '接口返回空列表，可手动输入模型名');
   } catch (err) {
     setApiStatus(err.message || String(err), true);
@@ -1347,6 +1575,7 @@ if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
     }
     llmConfig = r.config;
     syncApiForm();
+    prefetchModelsForQuickPicker();
     setApiStatus('✓ 配置已保存，可直接切到「对话助手」使用');
   } catch (err) {
     setApiStatus(controller.signal.aborted ? '保存配置超时，请重试' : err.message || String(err), true);

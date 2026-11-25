@@ -770,28 +770,36 @@ async function readChatStream(body, signal, onDelta, onChunk, onProgress) {
   return { choices: [{ message: msg, finish_reason: finishReason }], usage };
 }
 
-function createMetrics(config, request, onEvent) {
+function createMetrics(config, request, onEvent, onReport = null) {
   const startedAt = Date.now();
   const contextEstTokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
   let firstTokenAt = null;
   let lastReport = null;
   let completionEstimate = 0;
-  const report = (usage, now = Date.now()) => {
-    const promptTokens = usage?.prompt_tokens ?? contextEstTokens;
-    const completionTokens = usage?.completion_tokens ?? Math.ceil(completionEstimate / 100);
+  const report = (usage, now = Date.now(), isFinal = false) => {
+    const rawPrompt = usage?.prompt_tokens ?? usage?.input_tokens;
+    const rawCompletion = usage?.completion_tokens ?? usage?.output_tokens;
+    const promptTokens = Number.isFinite(rawPrompt) ? rawPrompt : contextEstTokens;
+    const completionTokens = Number.isFinite(rawCompletion) ? rawCompletion : Math.ceil(completionEstimate / 100);
+    const totalTokens = Number.isFinite(usage?.total_tokens) ? usage.total_tokens : promptTokens + completionTokens;
     const elapsedMs = now - startedAt;
-    const generationMs = now - (firstTokenAt ?? startedAt);
-    onEvent({
+    const generationMs = firstTokenAt !== null ? now - firstTokenAt : elapsedMs;
+    const rateMs = isFinal && generationMs < 80 ? elapsedMs : generationMs;
+    const tokPerSec = completionTokens > 0 && rateMs >= 80
+      ? Math.round(completionTokens * 10000 / rateMs) / 10 : 0;
+    const payload = {
       type: 'metrics',
       promptTokens,
       completionTokens,
-      totalTokens: usage?.total_tokens ?? promptTokens + completionTokens,
+      totalTokens,
       contextEstTokens,
       contextWindow: config.contextWindow,
-      tokPerSec: generationMs > 0 ? Math.round(completionTokens * 10000 / generationMs) / 10 : 0,
+      tokPerSec,
       elapsedMs,
-      estimated: usage?.prompt_tokens == null || usage?.completion_tokens == null,
-    });
+      estimated: !Number.isFinite(rawPrompt) || !Number.isFinite(rawCompletion),
+    };
+    onReport?.(payload);
+    onEvent(payload);
     lastReport = now;
   };
   return {
@@ -799,7 +807,7 @@ function createMetrics(config, request, onEvent) {
       const now = Date.now();
       firstTokenAt ??= now;
       completionEstimate += tokenWeight(text);
-      if (lastReport === null || now - lastReport >= 250) report(null, now);
+      if (lastReport === null || now - lastReport >= 250) report(null, now, false);
     },
     finish(json) {
       const msg = json?.choices?.[0]?.message;
@@ -808,7 +816,7 @@ function createMetrics(config, request, onEvent) {
           msg.content, msg.reasoning_content ?? msg.reasoning ?? msg.thinking, msg.tool_calls ?? msg.function_call,
         ]));
       }
-      report(json?.usage);
+      report(json?.usage, Date.now(), true);
     },
   };
 }
@@ -1055,6 +1063,8 @@ export async function runAiAgent({
   let streamMode = 'stream_usage';
   let emptyThinkRetries = 0;
   let actionRetries = 0;
+  let lastMetrics = null;
+  const recordMetrics = (m) => { lastMetrics = m; };
   const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
   const maxTokens = config.maxTokens ?? DEFAULT_AI_CONFIG.maxTokens;
   const requestDefaults = {
@@ -1064,7 +1074,14 @@ export async function runAiAgent({
   };
   const finish = (answer) => {
     signal?.throwIfAborted();
-    const result = { ok: true, answer: normalizeLineBreaks(answer).trim(), thinking: allThoughts.join('\n\n'), toolLog, modeUsed: activeMode };
+    const result = {
+      ok: true,
+      answer: normalizeLineBreaks(answer).trim(),
+      thinking: allThoughts.join('\n\n'),
+      toolLog,
+      modeUsed: activeMode,
+      ...(lastMetrics ? { metrics: lastMetrics } : {}),
+    };
     onEvent({ type: 'done', ...result });
     return result;
   };
@@ -1082,7 +1099,7 @@ export async function runAiAgent({
       ...(streamMode === 'stream_usage' ? { stream_options: { include_usage: true } } : {}),
     };
 
-    const metrics = createMetrics(config, reqBody, onEvent);
+    const metrics = createMetrics(config, reqBody, onEvent, recordMetrics);
     const res = await fetchJson(chatUrl, {
       method: 'POST',
       headers: authHeaders(config.apiKey),
@@ -1243,8 +1260,19 @@ export async function runAiAgent({
       const options = parsedOptions.some(option => option.label === '全部保留') ? parsedOptions : parsedOptions.slice(0, 6);
       const allowCustom = ask.arguments?.allowCustom !== false;
       const thinking = allThoughts.join('\n\n');
-      onEvent({ type: 'question', question, options, allowCustom, thinking });
-      return { ok: true, awaitingUser: true, question, options, allowCustom, answer: question, thinking, toolLog, modeUsed: activeMode };
+      onEvent({ type: 'question', question, options, allowCustom, thinking, ...(lastMetrics ? { metrics: lastMetrics } : {}) });
+      return {
+        ok: true,
+        awaitingUser: true,
+        question,
+        options,
+        allowCustom,
+        answer: question,
+        thinking,
+        toolLog,
+        modeUsed: activeMode,
+        ...(lastMetrics ? { metrics: lastMetrics } : {}),
+      };
     }
 
     // 把模型本轮输出加入历史（确保 tool_calls 数量与后续 role:tool 回复一一对应）
@@ -1306,7 +1334,7 @@ export async function runAiAgent({
         ...(reasoningDegraded ? {} : reasoningPayload),
         messages: [...messages, { role: 'user', content: '请用 2-4 句简明中文总结以上已完成的操作结果，不要再调用工具。' }],
       };
-      const metrics = createMetrics(config, request, onEvent);
+      const metrics = createMetrics(config, request, onEvent, recordMetrics);
       const res = await fetchJson(chatUrl, {
         method: 'POST',
         headers: authHeaders(config.apiKey),
