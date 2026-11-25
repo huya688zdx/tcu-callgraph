@@ -192,6 +192,10 @@ export const AGENT_TOOLS = [
         includeAllBranches: { type: 'boolean', description: '当检测到多个车型/目录分支且用户明确要求全部保留时设为 true' },
         mode: { type: 'string', enum: ['add', 'replace'], description: 'add 追加到画布，replace 替换画布' },
         splitByGroup: { type: 'boolean', description: '当 Git 改动包含多个互不关联的独立模块时，自动拆分为多个视图书签（默认 true）' },
+        groups: { type: 'array', minItems: 2, items: { type: 'object', required: ['name', 'functions'], properties: {
+          name: { type: 'string' }, functions: { type: 'array', minItems: 1, items: { type: 'string' } },
+          vars: { type: 'array', items: { type: 'string' } },
+        } }, description: '用户指定的分组。每组独立保存书签，第一组替换当前画布' },
         bookmarkName: { type: 'string', description: '可选：同时将本次画布保存为该名称的书签' },
         includeTasks: { type: 'boolean', description: '是否自动补齐上游 TASK/ISR 调用链，默认 true' },
         up: { type: 'integer', description: '向上展开调用者层数 (0-3)，默认 0' },
@@ -361,6 +365,8 @@ function buildSystemPrompt(context, promptToolMode) {
     '1. 不要长篇空想，立刻动手调工具。',
     '2. 用户要求将 Git 改动加入画布时，先调用 get_git_changes 检查目录分支，再按第 8、9 条确定范围。调用 add_to_canvas 时传 fromGit: true 和已取得的 snapshotId，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块默认拆分为独立书签，若需要用户决定则用 ask_user 确认拆分或合并。用户要求合并时传 splitByGroup: false。',
     '3. 用户按功能/关键词找函数或变量时，先调 find_symbols，再调 add_to_canvas 加入画布（支持短函数名，默认自动补齐上游 TASK 链）。',
+    '用户要求拆成指定的 N 组时，一次调用 add_to_canvas，传 groups: [{name, functions, vars}, ...]，每个书签只包含本组范围。涉及 Git 时同时传 fromGit: true 和 snapshotId。',
+    '普通最终回复末尾用 <next_steps>[{"label":"简短按钮文案","prompt":"点击后执行的具体指令"}]</next_steps> 给出 2–3 个结合本轮具体函数、变量或发现的后续操作。label 最多 28 字。书签建议可用 draft 字段填写 "/bookmark 名称"。调用 ask_user 时省略建议。',
     '4. 补齐 TASK 周期或调用顺序时，先调用 find_symbols({}) 查看 canvasEdges 和 suggestedLabels（含从函数头注释提取的周期），再调用 apply_labels 传入 items 或 { autoDetect: true } 写入画布。手动标周期用 preset:"task"（如 text:"TASK:10ms"），标调用顺序用 preset:"call"（コール順N），且 call 标签禁止填写 note。',
     '5. 源码若为日文 CP932，调 read_function 可传 encoding:"cp932"，严禁将乱码写入标签注释或回复。',
     '6. 只使用已确认存在的函数名。遇到重名时，根据上下文选择完整「文件::函数名」；如果目标仍不明确，在修改画布前用 ask_user 提供候选项。仅在重大画布修改前确有歧义时提问，用户意图明确或已回答时直接执行。',
@@ -602,6 +608,18 @@ function normalizeLineBreaks(text) {
   return text.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n');
 }
 
+export function sanitizeSuggestions(items) {
+  const result = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const label = typeof item?.label === 'string' ? [...item.label.trim()].slice(0, 28).join('') : '';
+    const prompt = typeof item?.prompt === 'string' ? item.prompt.trim().slice(0, 2000) : '';
+    const draft = typeof item?.draft === 'string' ? item.draft.trim().slice(0, 2000) : '';
+    if (label && (prompt || draft)) result.push({ label, ...(prompt ? { prompt } : { draft }) });
+    if (result.length === 3) break;
+  }
+  return result;
+}
+
 // 暂存可能属于标签的尾部，直到下一段确认其用途。
 function createContentReader(emit) {
   let pending = '';
@@ -611,7 +629,8 @@ function createContentReader(emit) {
     while (pending) {
       const tags = channel === 'thinking' ? [['</think>', 'text']]
         : channel === 'tool' ? [['</tool_call>', 'text']]
-          : [['<think>', 'thinking'], ['<tool_call', 'tool']];
+        : channel === 'suggestions' ? [['</next_steps', 'text']]
+          : [['<think>', 'thinking'], ['<tool_call', 'tool'], ['<next_steps', 'suggestions'], ['</next_steps', 'text']];
       const lower = pending.toLowerCase();
       const start = pending.indexOf('<');
       if (start !== 0) {
@@ -640,6 +659,16 @@ function createContentReader(emit) {
   };
 }
 
+function readAnswer(raw) {
+  let text = '';
+  createContentReader((channel, delta) => { if (channel === 'text') text += delta; })(raw, true);
+  const block = /<next_steps\s*>([\s\S]*?)<\/next_steps\s*>/i.exec(raw);
+  const suggestions = sanitizeSuggestions(block && safeJsonParse(block[1]));
+  // 提示词工具模式只解析建议块之外的工具指令。
+  const toolText = raw.replace(/<next_steps\b[\s\S]*?(?:<\/next_steps\s*>|$)/gi, '');
+  return { text: text.trim(), suggestions, toolText };
+}
+
 function mergeFunctionDelta(target, delta) {
   for (const field of ['name', 'arguments']) {
     if (typeof delta?.[field] === 'string') target[field] = (target[field] || '') + delta[field];
@@ -656,7 +685,7 @@ async function readChatStream(body, signal, onDelta, onChunk, onProgress) {
   const readContent = createContentReader((channel, delta) => {
     signal.throwIfAborted();
     if (channel !== 'text') {
-      onDelta(channel, delta);
+      if (channel === 'thinking') onDelta(channel, delta);
       return;
     }
     // 推迟发送尾部空白，跨数据块合并换行并丢弃正文的首尾空白。
@@ -1072,11 +1101,12 @@ export async function runAiAgent({
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
     ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
   };
-  const finish = (answer) => {
+  const finish = (answer, suggestions = []) => {
     signal?.throwIfAborted();
     const result = {
       ok: true,
       answer: normalizeLineBreaks(answer).trim(),
+      ...(suggestions.length ? { suggestions } : {}),
       thinking: allThoughts.join('\n\n'),
       toolLog,
       modeUsed: activeMode,
@@ -1155,12 +1185,7 @@ export async function runAiAgent({
     const finishReason = choice.finish_reason;
 
     const { thinking, text: rawText } = extractThinkingAndText(msg.content ?? '', msg.reasoning_content ?? msg.reasoning ?? msg.thinking ?? '');
-    let text = rawText;
-    if (/<tool_call/i.test(rawText)) {
-      text = '';
-      createContentReader((channel, delta) => { if (channel === 'text') text += delta; })(rawText, true);
-      text = text.trim();
-    }
+    const { text, suggestions, toolText } = readAnswer(rawText);
     if (thinking) {
       allThoughts.push(thinking);
       onEvent({ type: 'thinking', step: step + 1, text: thinking });
@@ -1203,7 +1228,7 @@ export async function runAiAgent({
       }];
     } else if (activeMode === 'prompt' || config.toolMode === 'auto') {
       // 标准 tools 模式下仅接受显式 <tool_call> 标签，绝不把正文里的 JSON 示例当工具执行。
-      const parsed = parsePromptToolCalls(rawText, TOOL_NAME_SET, { tagOnly: activeMode === 'tools' });
+      const parsed = parsePromptToolCalls(toolText, TOOL_NAME_SET, { tagOnly: activeMode === 'tools' });
       if (parsed.length) {
         callStyle = 'prompt';
         calls = parsed.slice(0, 6).map((c, idx) => ({ id: `prompt_${step}_${idx}`, ...c }));
@@ -1245,7 +1270,7 @@ export async function runAiAgent({
         ? '模型只返回了思考过程，未给出回复或调用工具。'
         : finishReason === 'tool_calls' || finishReason === 'function_call'
           ? '模型以工具调用结束，但没有返回可用的调用内容。'
-          : '模型结束了本次请求，但没有返回回复或工具调用。'));
+          : '模型结束了本次请求，但没有返回回复或工具调用。'), suggestions);
     }
 
     if (ask) {
@@ -1363,5 +1388,6 @@ export async function runAiAgent({
   answer ||= toolLog.length
     ? `已完成 ${toolLog.length} 步操作：${toolLog.map(t => t.summary).join('；')}。如需继续，请发下一条指令。`
     : '已达到工具调用步数上限，可发送「继续」。';
-  return finish(answer);
+  const parsed = readAnswer(answer);
+  return finish(parsed.text, parsed.suggestions);
 }

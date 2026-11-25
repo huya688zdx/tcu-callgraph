@@ -500,7 +500,26 @@ test('runAiAgent：支持思考等级参数、旧接口 400 自动降级、实�
   assert.ok(events.some((e) => e.type === 'question' && e.options.length === 2), '应发送 question 卡片事件');
 });
 
-test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离的 Git 改动自动拆分书签', async t => {
+test('流式建议跨帧隐藏标签并校验操作，截断或损坏的建议仍从正文移除', async () => {
+  const items = [{ label: '', prompt: '无效' }, { label: '查'.repeat(30), prompt: '追踪 g_xxx' },
+    { label: '存书签', draft: '/bookmark 油压' }, { label: '查入口', prompt: '查看 oil_entry' }, { label: '超额', prompt: '忽略' }];
+  for (const [suffix, valid] of [[JSON.stringify(items) + '</next_steps>', true], ['{x}</next_steps>', false], [JSON.stringify(items), false]]) {
+    const events = [];
+    const chunks = ['已找到写入点。', '\n<ne', 'xt_steps>', suffix.slice(0, -4), suffix.slice(-4)];
+    const stream = chunks.map(content => 'data: ' + JSON.stringify({ choices: [{ delta: { content } }] }) + '\n\n').join('') + 'data: [DONE]\n\n';
+    const result = await runAiAgent({
+      config: normalizeAiConfig({ baseUrl: 'http://localhost/v1', model: 'mock', toolMode: 'tools' }),
+      prompt: '分析数据源', onEvent: e => events.push(e),
+      fetchImpl: async () => new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }),
+    });
+    assert.equal(events.filter(e => e.type === 'text_delta').map(e => e.delta).join(''), '已找到写入点。');
+    assert.equal(result.answer, '已找到写入点。');
+    assert.deepEqual(result.suggestions, valid ? [{ label: '查'.repeat(28), prompt: '追踪 g_xxx' }, items[2], items[3]] : undefined);
+    assert.deepEqual(events.find(e => e.type === 'done').suggestions, result.suggestions);
+  }
+});
+
+test('e2e：宏引用数据源、自动和自定义分组书签、顺序保存隔离及 TASK 周期', async t => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-groups-'));
   t.after(() => fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 3 }));
   const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], { windowsHide: true });
@@ -527,15 +546,19 @@ test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离�
   ].join('\n');
   fs.writeFileSync(path.join(repoDir, 'oil.c'), modA);
   fs.writeFileSync(path.join(repoDir, 'diag.c'), modB);
-  git('add', 'oil.c', 'diag.c');
+  fs.writeFileSync(path.join(repoDir, 'state.h'), '#define XXX_A (g_xxx.field)\n#define GET_XXX() ((int)XXX_A)\n');
+  fs.writeFileSync(path.join(repoDir, 'state.c'), 'struct X { int field; } g_xxx;\nvoid writer_fn(void) { g_xxx.field = 1; }\n');
+  git('add', '.');
   git('commit', '-q', '-m', 'init');
   // 制造两处完全互不关联的未提交修改
   fs.writeFileSync(path.join(repoDir, 'oil.c'), modA.replace('void oil_step1(void) {}', 'void oil_step1(void) { volatile int a = 1; (void)a; }'));
-  fs.writeFileSync(path.join(repoDir, 'diag.c'), modB.replace('void diag_leaf(void) {}', 'void diag_leaf(void) { volatile int b = 2; (void)b; }'));
+  fs.writeFileSync(path.join(repoDir, 'diag.c'), '#include "state.h"\n' + modB.replace('void diag_leaf(void) {}', 'void diag_leaf(void) { volatile int b = GET_XXX(); (void)b; }'));
 
   let mode = 'split';
   let turn = 0;
   let lastToolOutput = null;
+  let gitOutput;
+  let canvasArgs = [];
   const mockLlm = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => { raw += c; });
@@ -545,6 +568,11 @@ test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离�
       if (lastTool) lastToolOutput = JSON.parse(lastTool.content);
       turn++;
       res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (mode === 'canvas') {
+        const args = canvasArgs[turn - 1];
+        return res.end(JSON.stringify({ choices: [{ message: args ? { tool_calls: [{ id: 'b' + turn, type: 'function',
+          function: { name: 'add_to_canvas', arguments: JSON.stringify(args) } }] } : { content: '已保存。' } }] }));
+      }
       if (mode === 'split') {
         if (turn === 1) {
           return res.end(JSON.stringify({
@@ -552,6 +580,7 @@ test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离�
           }));
         }
         if (turn === 2) {
+          gitOutput = lastToolOutput;
           return res.end(JSON.stringify({
             choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ fromGit: true, splitByGroup: true }) } }] } }],
           }));
@@ -596,6 +625,48 @@ test('e2e：函数头注释 TASK 周期自动补全写入画布 + 相互隔离�
   assert.equal(splitEvents.find((e) => e.type === 'tool_end' && e.name === 'add_to_canvas')?.ok, true, JSON.stringify(splitEvents));
   const bms = await get('/api/bookmarks');
   assert.equal(bms.list.length, 2, '两组互不关联的 Git 改动应拆分为 2 个书签');
+  assert.deepEqual(gitOutput.newlyReferencedVars, [{ id: 'var::g_xxx', name: 'g_xxx', file: 'state.c', line: 1,
+    via: '读', usedBy: ['diag.c::diag_leaf'], writers: ['state.c::writer_fn'] }]);
+  const fnIds = view => [...view.roots, ...view.expansions.map(e => e.root)];
+  const checkDataSource = view => {
+    assert.ok(fnIds(view).includes('state.c::writer_fn'));
+    assert.ok(view.vars.includes('var::g_xxx'));
+  };
+  checkDataSource(bms.list.find(b => fnIds(b).includes('diag.c::diag_leaf')));
+  const callCanvas = async args => {
+    mode = 'canvas';
+    turn = 0;
+    canvasArgs = args;
+    const response = await fetch(srv.baseUrl + '/api/ai/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: '保存这些函数为书签' }) });
+    const events = (await response.text()).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(events.filter(e => e.type === 'tool_end').map(e => e.ok), args.map(() => true), JSON.stringify(events));
+  };
+  await callCanvas([{ fromGit: true, groups: [{ name: 'A', functions: ['diag_leaf'] }, { name: 'B', functions: ['oil_step1'] }] }]);
+  assert.deepEqual(lastToolOutput.bookmarks.map(b => b.name), ['A', 'B']);
+  const activePage = (await get('/api/page')).page;
+  checkDataSource(activePage);
+  assert.ok(!fnIds(activePage).includes('oil.c::oil_step1'));
+  const canvas = await post('/api/view?up=0&down=0', activePage);
+  assert.deepEqual(canvas.edges.filter(e => e.to === 'var::g_xxx').map(e => [e.from, e.via]).sort(),
+    [['diag.c::diag_leaf', '读'], ['state.c::writer_fn', '写']]);
+  assert.notEqual(canvas.nodes.find(n => n.id === 'state.c::writer_fn').change, 'modified');
+  const suggestions = [{ label: '追踪写入', prompt: '查看 writer_fn' }];
+  await post('/api/ai/chats', { threads: [{ id: 'data', messages: [{ role: 'assistant', text: '已找到数据源', suggestions }] }] });
+  assert.deepEqual((await get('/api/ai/chats')).threads[0].messages[0].suggestions, suggestions);
+  await callCanvas([{ functions: ['diag_leaf'], bookmarkName: 'A2' }, { functions: ['oil_step1'], bookmarkName: 'B2' }]);
+  const bookmarks = (await get('/api/bookmarks')).list;
+  for (const [name, own, other] of [['A', 'diag.c::diag_leaf', 'oil.c::oil_step1'], ['B', 'oil.c::oil_step1', 'diag.c::diag_leaf'],
+    ['A2', 'diag.c::diag_leaf', 'oil.c::oil_step1'], ['B2', 'oil.c::oil_step1', 'diag.c::diag_leaf']]) {
+    const bookmark = bookmarks.find(b => b.name === name);
+    assert.ok(fnIds(bookmark).includes(own));
+    assert.ok(!fnIds(bookmark).includes(other));
+    if (name === 'A') checkDataSource(bookmark);
+    if (name === 'B') {
+      assert.ok(!fnIds(bookmark).includes('state.c::writer_fn'));
+      assert.ok(!bookmark.vars.includes('var::g_xxx'));
+    }
+  }
 
   // 2. 测试函数头注释 TASK 周期 + コール順 自动补全写入画布
   await post('/api/page', { roots: ['oil.c::oil_entry'], up: 0, down: 1 });
