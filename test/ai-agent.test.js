@@ -849,6 +849,17 @@ test('e2e：宏引用数据源、自动和自定义分组书签、顺序保存�
     }
   }
 
+  const priorRoots = ['oil.c::oil_entry', 'diag.c::diag_entry'];
+  assert.equal((await post('/api/page', { roots: priorRoots, up: 0, down: 1 })).ok, true);
+  await callCanvas([{ vars: ['g_xxx'], bookmarkName: '追加变量' }]);
+  const appendedPage = (await get('/api/page?saved=1')).page;
+  const appendedBookmark = (await get('/api/bookmarks')).list.find(b => b.name === '追加变量');
+  for (const view of [appendedPage, appendedBookmark]) {
+    assert.deepEqual(view.roots, priorRoots);
+    assert.equal(view.down, 1);
+    assert.deepEqual(view.vars, ['var::g_xxx']);
+  }
+
   // 2. 测试函数头注释 TASK 周期 + コール順 自动补全写入画布
   await post('/api/page', { roots: ['oil.c::oil_entry'], up: 0, down: 1 });
   mode = 'labels';

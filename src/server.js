@@ -3138,7 +3138,7 @@ export const server = http.createServer(async (req, res) => {
           const activeFnsForCanvas = active.fnIds;
           const activeVarsForCanvas = active.varIds;
           const composePayload = pureVars
-            ? { mode, roots: currentPage.roots.slice(0, 1), changedFunctionIds: [], vars: varIds, up: 0, down: 0, reason: reason || 'AI 加入全局变量到画布' }
+            ? { mode: 'add', roots: currentPage.roots.slice(0, 1), changedFunctionIds: [], vars: varIds, up: 0, down: 0, reason: reason || 'AI 加入全局变量到画布' }
             : {
               mode,
               ...(snapshotId ? { snapshotId } : {}),
