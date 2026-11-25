@@ -13,6 +13,7 @@ import {
   runAiAgent,
 } from '../src/core/ai-agent.js';
 import { launchServer } from '../scripts/lib/server.mjs';
+import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
 test('normalizeBaseUrl 兼容根地址、/v1 与完整 /chat/completions，并拒绝非法协议', () => {
   assert.deepEqual(normalizeBaseUrl('http://127.0.0.1:11434'), {
@@ -110,6 +111,49 @@ test('runAiAgent：兼容旧版 OpenAI function_call 字段', async () => {
   assert.equal(res.toolLog[0].name, 'find_symbols');
 });
 
+test('AI 对话保存按修改顺序上传，失败后继续写入，读取等待待保存快照', async t => {
+  const originalDocument = globalThis.document;
+  globalThis.document = { getElementById: () => ({ getContext: () => null }) };
+  t.after(() => { globalThis.document = originalDocument; });
+  const { api } = await import('../web/lib/api.js');
+  let releaseFirst;
+  const delay = new Promise(resolve => { releaseFirst = resolve; });
+  let saved;
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(url, '/api/ai/chats');
+    if (!options) {
+      requests.push('GET');
+      return Response.json(saved);
+    }
+    const snapshot = JSON.parse(options.body);
+    requests.push(snapshot.activeId);
+    if (snapshot.activeId === 'original') await delay;
+    if (snapshot.activeId === 'failed') throw new Error('连接断开');
+    saved = snapshot;
+    return Response.json({ ok: true });
+  });
+  const payload = { projectId: 1, activeId: 'original', threads: [{ id: 'original', messages: ['原始消息'] }] };
+  const first = api.saveAiChats(payload);
+  payload.threads[0].messages.push('晚于首次保存');
+  const failed = api.saveAiChats({ projectId: 1, activeId: 'failed', threads: [] });
+  const checkFailure = assert.rejects(failed, /连接断开/);
+  const cleared = api.saveAiChats({ projectId: 1, activeId: '', threads: [] });
+  const reload = api.aiChats();
+  await new Promise(resolve => setImmediate(resolve));
+  try {
+    assert.deepEqual(requests, ['original']);
+  } finally {
+    releaseFirst();
+  }
+  await first;
+  assert.deepEqual(saved.threads[0].messages, ['原始消息']);
+  await checkFailure;
+  await cleared;
+  assert.deepEqual(await reload, { projectId: 1, activeId: '', threads: [] });
+  assert.deepEqual(requests, ['original', 'failed', '', 'GET']);
+});
+
 test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Git 未提交改动与短函数名加入画布', async t => {
   // 1. 准备一个带未提交修改的临时 Git 仓库
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-direct-'));
@@ -118,7 +162,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
   git('init', '-q', '-b', 'main');
   git('config', 'user.name', 'Test');
   git('config', 'user.email', 'test@example.invalid');
-  const code = 'int g_oil;\nvoid range_gather(void) { g_oil = 1; }\nvoid task_10ms(void) { range_gather(); }\n';
+  const code = 'int g_oil;\nvoid verify_range(void) {}\nvoid range_gather(void) { g_oil = 1; }\nvoid task_10ms(void) { range_gather(); }\n';
   fs.writeFileSync(path.join(repoDir, 'app.c'), code);
   git('add', 'app.c');
   git('commit', '-q', '-m', 'init');
@@ -138,6 +182,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
 
   // 2. 起一个模拟旧版 OpenAI 兼容服务（拒绝 tools 字段，只认纯对话）
   let chatTurn = 0;
+  let addArgs = { fromGit: true, vars: ['g_oil'] };
   const mockLlm = http.createServer((req, res) => {
     if (req.url === '/v1/models' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -159,7 +204,13 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
       res.writeHead(200, { 'Content-Type': 'application/json' });
       if (chatTurn === 1) {
         return res.end(JSON.stringify({
-          choices: [{ message: { role: 'assistant', content: '<think>读取未提交改动并直接加入画布</think><tool_call>{"name":"add_to_canvas","arguments":{"fromGit":true,"vars":["g_oil"]}}</tool_call>' } }],
+          choices: [{ message: { role: 'assistant', content: '<think>读取未提交改动并直接加入画布</think><tool_call>' +
+            JSON.stringify({ name: 'add_to_canvas', arguments: addArgs }) + '</tool_call>' } }],
+        }));
+      }
+      if (chatTurn === 2) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '<tool_call>{"name":"get_git_changes","arguments":{"baseRef":"HEAD~1","targetRef":"HEAD"}}</tool_call>' } }],
         }));
       }
       return res.end(JSON.stringify({
@@ -203,10 +254,13 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     const active = await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: ['app.c::range_gather'] });
     assert.ok(active.ok, active.error);
     chatTurn = 0;
+    const viewResponse = await fetch(srv.baseUrl + '/api/view');
+    const session = viewResponse.headers.get('X-Callgraph-Session');
+    await viewResponse.text();
 
     const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Callgraph-Session': session },
       body: JSON.stringify({ prompt: '把 Git 改动加到画布' }),
     });
     assert.equal(chatRes.status, 200);
@@ -214,6 +268,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     assert.ok(events.some(e => e.type === 'fallback'), '旧接口应触发自动降级');
     const toolDone = events.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas');
     assert.equal(toolDone?.ok, true, JSON.stringify(events));
+    assert.equal(events.find(e => e.type === 'tool_end' && e.name === 'get_git_changes')?.ok, true, JSON.stringify(events));
     const done = events.find(e => e.type === 'done');
     assert.match(done?.answer || '', /range_gather/);
 
@@ -228,7 +283,35 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     assert.deepEqual(await get('/api/page'), baseline);
   }
 
+  await t.test('发起比较切换的浏览器收到新画布后继续当前对话', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    const prepared = await post('/api/compare', { mode: 'git', baseRef: 'HEAD~1', targetRef: 'HEAD' });
+    assert.ok(prepared.preview?.id, prepared.error);
+    const active = await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: ['app.c::range_gather'] });
+    assert.ok(active.ok, active.error);
+    browserTest.after(() => post('/api/compare/exit', {}));
+    chatTurn = 0;
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const { evaluate, waitFor } = browser;
+    await waitFor(`window.__cg?.view?.comparison?.git?.targetRef === 'HEAD'`);
+    await evaluate(`document.querySelector('#aiBtn').click()`);
+    await waitFor(`document.querySelector('#aiModel').value === 'qwen3.8-27b'`);
+    await evaluate(`(() => {
+      window.__chatProjectChanges = 0;
+      document.addEventListener('cg:project-changed', () => { window.__chatProjectChanges++; });
+      document.querySelector('#aiPromptInput').value = '把工作区改动加入比较画布';
+      document.querySelector('#aiSendChat').click();
+    })()`);
+    await waitFor(`window.__cg?.view?.comparison?.git?.targetRef === 'WORKTREE'`);
+    await waitFor(`document.querySelector('#aiMessages').textContent.includes('已将改动函数 range_gather')`);
+    assert.equal(await evaluate('window.__chatProjectChanges'), 0);
+  });
+
   // 4. 普通模式下调用 AI 组图：应停留在可编辑画布（非只读比较预览），自动标出变更色与 TASK:10ms 线段标签，且流程图带变更色并可缓存
+  // 工程已打开，仅在同样的两个函数 ID 之间新增调用，旧模型不应吞掉新增连线。
+  fs.writeFileSync(path.join(repoDir, 'app.c'), worktree.replace('g_oil = 3;', 'g_oil = 3; verify_range();'));
+  addArgs = { ...addArgs, functions: ['range_gather', 'verify_range'], mode: 'add' };
   chatTurn = 0;
   const normalChat = await fetch(srv.baseUrl + '/api/ai/chat', {
     method: 'POST',
@@ -238,12 +321,16 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
   assert.equal(normalChat.status, 200);
   const normalEvents = (await normalChat.text()).trim().split('\n').map(line => JSON.parse(line));
   assert.equal(normalEvents.find(e => e.type === 'tool_end' && e.name === 'add_to_canvas')?.ok, true, JSON.stringify(normalEvents));
+  assert.equal(normalEvents.find(e => e.type === 'tool_end' && e.name === 'get_git_changes')?.ok, true, JSON.stringify(normalEvents));
   const normalPage = await get('/api/page');
   assert.ok(normalPage.page.roots.includes('app.c::task_10ms'), '应自动补齐上游 TASK 入口到画布');
   assert.ok(normalPage.page.vars.includes('var::g_oil'), '应按短变量名自动解析并加入画布');
 
   const proj = await get('/api/project');
   assert.equal(proj.comparison, null, '普通模式下 AI 组图后不应卡在只读比较预览状态');
+  const expandedView = await get('/api/view?root=app.c%3A%3Atask_10ms&up=0&down=2&group=1');
+  const newCall = expandedView.edges.find(e => e.from === 'app.c::range_gather' && e.to === 'app.c::verify_range');
+  assert.equal(newCall?.change, 'added', '已存在函数之间的新增调用应进入可编辑画布并标为新增');
   const view = await get('/api/view?root=' + encodeURIComponent('app.c::task_10ms') + '&up=0&down=1&group=1');
   const changedFn = view.nodes.find((n) => n.id === 'app.c::range_gather');
   assert.equal(changedFn?.change, 'modified', '普通可编辑画布应保留 Git 变更颜色');

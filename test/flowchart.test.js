@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildIndex, loadModel } from '../src/core/index.js';
-import { buildFlowchart } from '../src/core/flowchart.js';
+import { buildFlowchart, flowchartCacheHash } from '../src/core/flowchart.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
@@ -59,6 +59,38 @@ test('TCU 样例保留编译分支、运行期分支、宏提示和可下钻的�
   assert.equal(shift.line, invoke.line);
   assert.equal(shift.callees[0].name, 'Gear_ShiftUp');
   assert.equal(expanded.nodes.some(node => node.text.includes('INVOKE')), false);
+});
+
+test('同一目标切换仅头文件宏不同的基线时，流程图重新标注宏调用节点', async t => {
+  const source = 'void send(const char *s) {}\nvoid run(void) { send(MESSAGE); }\n';
+  const modelWith = message => buildIndex(project(t, { 'app.c': source, 'config.h': `#define MESSAGE "${message}"\n` }));
+  const after = modelWith('A  B');
+  const same = modelWith('A  B');
+  const changed = modelWith('A B');
+  const fn = model => model.functions.find(node => node.name === 'run');
+  const options = baseline => ({ expandMacros: true, otherModel: baseline, otherFn: fn(baseline) });
+
+  assert.notEqual(flowchartCacheHash(after, fn(after), options(same)),
+    flowchartCacheHash(after, fn(after), options(changed)));
+  const sameGraph = await buildFlowchart(after, fn(after), options(same));
+  const changedGraph = await buildFlowchart(after, fn(after), options(changed));
+  assert.equal(find(sameGraph, /send\("A  B"\)/).change, 'existing');
+  assert.equal(find(changedGraph, /send\("A  B"\)/).change, 'modified');
+});
+
+test('流程图比较保留字面量里的空白差异并忽略标记之间的排版', async t => {
+  const modelWith = body => buildIndex(project(t, {
+    'app.c': `void send(const char *s) {}\nvoid run(void) { ${body} }\n`,
+  }));
+  const before = modelWith(`send("A B"); int c = ' '; int x = c + 1;`);
+  const after = modelWith(`send("A  B"); int c = '\t'; int x=c+1;`);
+  const fn = model => model.functions.find(node => node.name === 'run');
+  for (const [primary, other, version] of [[after, before, 'after'], [before, after, 'before']]) {
+    const graph = await buildFlowchart(primary, fn(primary), { otherModel: other, otherFn: fn(other), version });
+    assert.equal(find(graph, /send\("A +B"\)/).change, 'modified');
+    assert.equal(find(graph, /int c = '[ \t]'/).change, 'modified');
+    assert.equal(find(graph, /int x/).change, 'existing');
+  }
 });
 
 test('局部 define/undef、条件宏、宏体回溯和一次执行的 do-while', async t => {

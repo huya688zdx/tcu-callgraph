@@ -145,7 +145,8 @@ if (es) {
       if (m.clientId === clientId) return;
       dirtyCount = 0;
       pendingCompose = null;
-      hooks.reloadAll().then(() => syncProjectLabel()).catch(() => toast(t('live.projectRefreshFailed')));
+      const preserveAiChat = m.chatClientId === clientId && m.projectId === state.view?.projectId;
+      hooks.reloadAll({ preserveAiChat }).then(() => syncProjectLabel()).catch(() => toast(t('live.projectRefreshFailed')));
       toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }

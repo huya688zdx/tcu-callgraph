@@ -6,16 +6,21 @@ import { declaratorName, getParser } from './cparse.js';
 import { collectArgs, lex } from './lexer.js';
 import { expandSeq, fileMacroScope, preprocess } from './preproc.js';
 import { decodeSource, HDR_EXT } from './source-files.js';
+import { fingerprint } from './source-fingerprint.js';
 import { taskDeclarations } from './task-declarations.js';
 
 const elk = new ELK();
 const field = (node, name) => node?.childForFieldName(name);
-const compact = text => text.replace(/\s+/g, ' ').trim();
+const compact = text => text.replace(/("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')|\s+/g,
+  (_, literal) => literal ?? ' ').trim();
 const point = ({ x, y }) => [x, y];
 const directive = token => /^#\s*(\w+)\s*([\s\S]*)/.exec(token.v);
 const isDecision = kind => kind === 'decision' || kind === 'preproc_decision';
 
 export const isFlowchartFunction = fn => !!fn?.endLine && !fn.external && fn.kind !== 'var' && !fn.headerSymbol;
+
+const flowchartHeaders = (model, fn) => model.files.filter(file =>
+  file.rel !== fn.file && (file.isHeader || HDR_EXT.test(file.rel)));
 
 function sourceReader(model, sourceRoot) {
   let roots;
@@ -604,7 +609,11 @@ async function layout({ nodes, edges }) {
 }
 
 function nodeSignature(node) {
-  return `${node.kind}\u0000${compact(node.code || node.text || '')}`;
+  const source = fingerprint(node.code || node.text || '');
+  const macros = (node.macros || []).map(({ name, params, raw }) => [name, params, fingerprint(raw || '')]);
+  // 展开后的不同语句可能回溯到同一段调用源码，保留各自的语句标识。
+  const expanded = macros.length ? fingerprint(node.text || '') : '';
+  return JSON.stringify([node.kind, source, macros, expanded]);
 }
 
 /** 用 LCS 对比修改前后两版流程图语句节点，给每个节点和连线标出 existing / modified / added / deleted。 */
@@ -660,8 +669,7 @@ async function extractFlowchartGraph(model, fn, { expandMacros = false, sourceRo
   const source = read(fn.file);
   const tokens = lex(source, fn.file);
   const headers = new Map();
-  for (const file of model.files) {
-    if (file.rel === fn.file || !(file.isHeader || HDR_EXT.test(file.rel))) continue;
+  for (const file of flowchartHeaders(model, fn)) {
     collectMacros(lex(read(file.rel), file.rel).filter(token => token.t === 'preproc'), headers, file.rel);
   }
   const local = fileMacroScope(headers);
@@ -705,24 +713,22 @@ async function extractFlowchartGraph(model, fn, { expandMacros = false, sourceRo
 export function flowchartCacheHash(model, fn, { version = 'after', expandMacros = false, fnChange = 'existing',
   otherModel = null, otherFn = null, sourceRoot, otherSourceRoot } = {}) {
   const h = createHash('sha1');
-  h.update(`fc-v3\0${fn.id}\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0${fn.line}:${fn.endLine}\0`);
-  try {
-    const read = sourceReader(model, sourceRoot);
-    h.update(read(fn.file));
-  } catch { /* fallback */ }
-  // 头文件宏改动会影响宏信息与展开结果，把当前模型的宏定义指纹纳入缓存键。
-  if (Array.isArray(model?.macros) && model.macros.length) {
-    h.update('\0macros:');
-    for (const m of model.macros) {
-      h.update(`${m.file}:${m.name}:${m.raw || ''}\0`);
+  h.update(`fc-v4\0${version}\0${expandMacros ? 1 : 0}\0${fnChange}\0`);
+  function addInputs(side, graphModel, graphFn, graphRoot) {
+    h.update(JSON.stringify([side, graphFn.id, graphFn.line, graphFn.endLine]));
+    const read = sourceReader(graphModel, graphRoot);
+    // 缓存键与生成图使用同一批文件，包括对照侧实际参与预处理的头文件。
+    for (const file of [graphFn.file, ...flowchartHeaders(graphModel, graphFn).map(entry => entry.rel)]) {
+      h.update(JSON.stringify(file));
+      try {
+        const source = read(file);
+        h.update(`${source.length}\0`).update(source);
+      } catch { h.update('missing\0'); }
     }
   }
+  addInputs('current', model, fn, sourceRoot);
   if (otherModel && otherFn && isFlowchartFunction(otherFn)) {
-    h.update(`\0other:${otherFn.line}:${otherFn.endLine}\0`);
-    try {
-      const readOther = sourceReader(otherModel, otherSourceRoot);
-      h.update(readOther(otherFn.file));
-    } catch { /* fallback */ }
+    addInputs('other', otherModel, otherFn, otherSourceRoot);
   }
   return h.digest('hex');
 }

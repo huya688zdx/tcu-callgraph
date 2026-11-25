@@ -205,8 +205,8 @@ export function fingerprintFiles(files = []) {
 
 /**
  * 解析缓存的 key。
- * 和工程指纹分开：这里必须带上 mtime，否则「大小没变的改写」会命中旧缓存，
- * 图就永远停在改动前。工程指纹不带 mtime，是为了避免 git checkout 之类的
+ * 和工程指纹分开：用完整的 mtime 和 ctime 区分等长改写及恢复 mtime 的文件。
+ * 工程指纹不带时间戳，是为了避免 git checkout 之类的
  * 时间戳抖动让界面上一直挂个「代码已变更」的星号。
  */
 export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
@@ -215,7 +215,7 @@ export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
   if (parserKey !== 'builtin') h.update(`parser\u0000${parserKey}\n`);
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
-    h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
+    h.update(`${f.rel}\u0000${f.bytes}\u0000${f.mtimeMs ?? 0}\u0000${f.ctimeMs ?? 0}\u0000${f.isHeader ? 1 : 0}\n`);
   }
   if (focus) h.update(`focus\u0000${focus}\n`);
   return h.digest('hex');

@@ -77,7 +77,7 @@ export function listSourceFiles(root) {
 }
 
 /**
- * 一次扫描取得路径、大小与 mtime，供解析缓存和冷启动共用。
+ * 一次扫描取得路径、大小与文件时间戳，供解析缓存和冷启动共用。
  */
 export function scanSources(root, warnings = []) {
   const out = [];
@@ -94,7 +94,8 @@ export function scanSources(root, warnings = []) {
       abs,
       rel,
       bytes: st.size,
-      mtimeMs: Math.round(st.mtimeMs),
+      mtimeMs: st.mtimeMs,
+      ctimeMs: st.ctimeMs,
       isHeader: HDR_EXT.test(abs),
     });
   }

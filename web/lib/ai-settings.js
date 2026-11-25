@@ -72,6 +72,7 @@ let llmConfig = {
 };
 let clearApiKeyPending = false;
 let chatGeneration = 0;
+let chatMutation = 0;
 let chatProjectId = null;
 let chatProjectName = '';
 let chatThreads = []; // [{ id, title, updatedAt, messages }]
@@ -99,6 +100,7 @@ function activeThread() {
 
 function persistChats(projectId = chatProjectId) {
   if (projectId == null) return;
+  chatMutation++;
   const payload = { projectId, activeId: activeChatId, threads: chatThreads.slice(0, 30) };
   void api.saveAiChats(payload).catch(() => {});
 }
@@ -216,18 +218,19 @@ function renderThreadMessages() {
 
 async function loadProjectChats({ force = false } = {}) {
   const currentId = state.view?.projectId ?? null;
-  if (!force && chatProjectId !== null && currentId !== null && currentId === chatProjectId && chatThreads.length) {
+  if ((!force || activeAbort) && chatProjectId !== null && currentId === chatProjectId && chatThreads.length) {
     renderChatBar();
     return;
   }
   const gen = ++chatGeneration;
+  const mutation = chatMutation;
   if (activeAbort) {
     activeAbort.abort();
     activeAbort = null;
   }
   try {
     const res = await api.aiChats();
-    if (gen !== chatGeneration || !res?.ok) return;
+    if (gen !== chatGeneration || mutation !== chatMutation || !res?.ok) return;
     chatProjectId = res.projectId ?? currentId;
     chatProjectName = res.projectName || '';
     chatThreads = Array.isArray(res.threads) && res.threads.length ? res.threads : [newThreadObject()];
@@ -235,7 +238,7 @@ async function loadProjectChats({ force = false } = {}) {
     renderChatBar();
     renderThreadMessages();
   } catch {
-    if (gen !== chatGeneration) return;
+    if (gen !== chatGeneration || mutation !== chatMutation) return;
     if (!chatThreads.length) {
       const th = newThreadObject();
       chatThreads = [th];
@@ -561,6 +564,7 @@ async function openDrawer() {
 
 // 切换工程时自动隔离并切换到目标工程的独立对话列表
 document.addEventListener('cg:project-changed', () => {
+  chatGeneration++;
   chatProjectId = null;
   chatThreads = [];
   activeChatId = '';

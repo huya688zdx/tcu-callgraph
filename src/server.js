@@ -595,7 +595,7 @@ function reconcileManualVariables(model, projectId, list, savedPage) {
 }
 
 /** 加载完成后整体切换会话，工程标注仍以 project_id 为准。 */
-async function openTarget(targetPath, { first = false, selection } = {}) {
+async function openTarget(targetPath, { first = false, selection, preservePage = false } = {}) {
   const abs = path.resolve(targetPath);
   const entry = fs.statSync(abs, { throwIfNoEntry: false });
   if (!entry) throw new Error(`路径不存在：${abs}`);
@@ -624,7 +624,9 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   if (model.source !== 'dot' && list.some((item) => item.kind === 'var')) await ensureAnalysis(model);
   const pageKey = 'ui.last-view.' + project.id;
   const reconciled = store.transaction(() => {
-    const result = reconcileManualVariables(model, project.id, list, store.getSetting(pageKey));
+    const savedPage = store.getSetting(pageKey);
+    const previousPage = preservePage && pageState ? { ...savedPage, ...pageState } : savedPage;
+    const result = reconcileManualVariables(model, project.id, list, previousPage);
     if (result.overlay) {
       if (result.page) store.setSetting(pageKey, result.page);
       store.appendEvent(project.id, {
@@ -655,7 +657,7 @@ async function openTarget(targetPath, { first = false, selection } = {}) {
   PROJECT = project;
   COMPARISON = null;
   overlay = ov;
-  pageState = null; // 旧工程的页面状态作废，前端重载后会重新上报
+  pageState = preservePage && pageState ? reconciled.page : null;
 
   // 已有数据但还没钉过起点时，补一条 baseline：
   // 没有它，时间轴只能从空状态开始回放，迁移/导入之前的数据就找不回来了
@@ -921,7 +923,8 @@ function getMcpChangeSnapshot(snapshotId) {
   throw new Error('查询快照已失效，请重新调用 cg_changes');
 }
 
-async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = false } = {}) {
+async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = false,
+  sessionCurrent = () => currentSession(req) } = {}) {
   const query = readChangeQuery(q);
   const hasRefs = q.has('baseRef') || q.has('targetRef');
   let snapshot, requestId;
@@ -939,7 +942,7 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
       baseRef: q.get('baseRef') ?? undefined, targetRef: q.get('targetRef') ?? undefined,
     }, { parserId: model.parserId, parserOptions: parserOptionsFor(model.parserId),
       allowEmptyRefresh: !!query.id, deferUnchangedAnalysis: true });
-    if (!currentSession(req) || MODEL !== model || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
+    if (!sessionCurrent() || MODEL !== model || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
     if (requestId !== latestSnapshotRequest) throw new Error('较新的 Git 查询已开始，请使用最新查询的快照');
     snapshot = { id: randomUUID(), comparison, revision: sessionRevision };
   }
@@ -948,7 +951,7 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
     snapshot.pending ??= snapshot.comparison.analyze();
     try {
       const analyzed = await snapshot.pending;
-      if (!currentSession(req) || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
+      if (!sessionCurrent() || (!bypassMcpAccess && mcpAccess() === 'off')) throw new Error('工程或访问权限已改变');
       getMcpChangeSnapshot(snapshot.id);
       snapshot.comparison = analyzed;
     } finally { delete snapshot.pending; }
@@ -1071,7 +1074,7 @@ function changedFunctionScope(model, comparison, changes, isNode) {
     details: { untracedIds, untracedVersions, omittedRelationTargets: [...omittedRelationTargets] } };
 }
 
-function composeMcpView(p) {
+function composeMcpView(p, { chatClientId } = {}) {
   // 所有检查在切换画布前完成，失败时不改变工程、预览或时间轴。
   const comparison = p.snapshotId === undefined ? COMPARISON : getMcpChangeSnapshot(p.snapshotId).comparison;
   const entering = comparison && !COMPARISON;
@@ -1183,7 +1186,9 @@ function composeMcpView(p) {
     COMPARISON.roots = visible;
     COMPARISON.composedPage = page;
     pageState = page;
-    broadcastChange(switchingComparison ? 'project.switch' : 'view.compose', 'ai', { project: PROJECT.name, projectId: PROJECT.id, page, reason });
+    broadcastChange(switchingComparison ? 'project.switch' : 'view.compose', 'ai', {
+      project: PROJECT.name, projectId: PROJECT.id, page, reason, ...(switchingComparison && chatClientId ? { chatClientId } : {}),
+    });
     return { ok: true, page, ...scope.details, eventId: null };
   }
   store.transaction(() => {
@@ -2025,6 +2030,7 @@ export const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       let p;
       try { p = await readJson(req, res); } catch { return; }
+      if (!currentSession(req)) return sessionConflict(res);
       const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
       let cfg;
       try { cfg = normalizeAiConfig(p.config || {}, saved); } catch (err) { return bad(res, err.message); }
@@ -2046,9 +2052,11 @@ export const server = http.createServer(async (req, res) => {
 
       const chatProjectId = PROJECT.id;
       let expectedSession = sessionRevision;
+      const sameSession = () => !switching && PROJECT?.id === chatProjectId && sessionRevision === expectedSession;
+      const sessionCurrent = () => !abort.signal.aborted && sameSession();
       const assertActive = () => {
         if (abort.signal.aborted) throw new Error('已取消');
-        if (switching || PROJECT?.id !== chatProjectId || sessionRevision !== expectedSession) {
+        if (!sameSession()) {
           throw new Error('工程或比较会话已切换，请重试');
         }
       };
@@ -2298,7 +2306,7 @@ export const server = http.createServer(async (req, res) => {
             q.set('baseRef', 'HEAD');
             q.set('targetRef', 'WORKTREE');
           }
-          const result = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit });
+          const result = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit, sessionCurrent });
           assertActive();
           const snap = getMcpChangeSnapshot(result.snapshotId);
           const allNodes = result.nodes || [];
@@ -2434,7 +2442,7 @@ export const server = http.createServer(async (req, res) => {
             const needFreshWorktree = !COMPARISON || COMPARISON.git?.targetRef !== 'WORKTREE';
             if (needFreshWorktree) {
               const q = new URLSearchParams({ limit: '80', baseRef: 'HEAD', targetRef: 'WORKTREE' });
-              const gitRes = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit: Boolean(COMPARISON) });
+              const gitRes = await readMcpChanges(q, req, { bypassMcpAccess: true, forceGit: Boolean(COMPARISON), sessionCurrent });
               assertActive();
               const snap = getMcpChangeSnapshot(gitRes.snapshotId);
               if (!snap.comparison.model) {
@@ -2455,20 +2463,18 @@ export const server = http.createServer(async (req, res) => {
             for (const e of targetModel.edges || []) {
               if (e.change === 'added') detectedAddedEdges.push(e);
             }
-            // 在普通模式下不切入只读比较预览：若工作区有新函数尚未进入当前 MODEL，先加锁刷新同一工程模型再直接写入可编辑画布。
+            // 普通画布要从同一份工作区源码解析调用边；符号 ID 未变时，调用和数据流也可能已更新。
             if (!COMPARISON && gitComparison) {
-              const missingInLive = [...defaultFnIds, ...defaultVarIds].some((id) => !MODEL._index?.byId?.has(id) && detectedNodeChanges.get(id) !== 'deleted');
-              if (missingInLive) {
-                assertActive();
-                switching = true;
-                try {
-                  await openTarget(root);
-                  if (PROJECT?.id === chatProjectId) expectedSession = sessionRevision;
-                } finally {
-                  switching = false;
-                }
-                assertActive();
+              assertActive();
+              switching = true;
+              try {
+                await openTarget(root, { preservePage: true });
+                comparisonPreview = null;
+                if (PROJECT?.id === chatProjectId) expectedSession = sessionRevision;
+              } finally {
+                switching = false;
               }
+              assertActive();
               if ((defaultVarIds.length || (Array.isArray(args.vars) && args.vars.length)) && !MODEL._df && MODEL.source !== 'dot') {
                 await ensureAnalysis(MODEL);
                 assertActive();
@@ -2527,8 +2533,9 @@ export const server = http.createServer(async (req, res) => {
             };
           let composed;
           let fallbackNote = '';
+          const composeOptions = { chatClientId: req.headers['x-callgraph-client'] };
           try {
-            composed = composeMcpView(composePayload);
+            composed = composeMcpView(composePayload, composeOptions);
           } catch (err) {
             if (includeTasks && !pureVars && /80|入口过多/.test(err.message)) {
               actualFnIds = activeFnsForCanvas.slice(0, 40);
@@ -2541,10 +2548,12 @@ export const server = http.createServer(async (req, res) => {
                 up: Math.min(up, 1),
                 down: Math.min(down, 1),
                 reason: reason || 'AI 加入函数到画布',
-              });
+              }, composeOptions);
               fallbackNote = '上游入口链超过 80 个函数，已直接加入前 40 个目标函数本体';
             } else throw err;
           }
+          // 此处同步组图已经完成，只有本工具引发的比较切换可以更新对话的会话版本。
+          if (snapshotId && COMPARISON?.id === snapshotId) expectedSession = sessionRevision;
           // 多个相互隔离的改动自动拆分为多个书签视图（或用户显式指定 bookmarkName 时保存书签）
           const createdBookmarks = [];
           const allGroupCanvasIds = new Set([
