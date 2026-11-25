@@ -1130,16 +1130,18 @@ function changedFunctionScope(model, comparison, changes, isNode, pathFilter = n
         const parentChains = new Map([[id, [id]]]);
         const queue = [{ node: id, depth: 0 }];
         const leafRoots = [];
+        const maxCallers = 24;
         let collected = 0;
-        for (let qi = 0; qi < queue.length && collected < 24; qi++) {
+        for (let qi = 0; qi < queue.length; qi++) {
           const { node, depth } = queue[qi];
-          const inEdges = (side._index.inAdj.get(node) || []).filter(
-            (e) => e.kind !== 'var' && !e.headerReference && isNode(e.from) && !overlay.deleted.edges[edgeKeyOf(e)]
-          );
-          if (depth >= 6 || !inEdges.length) {
+          // 到达数量上限后停止向上扩展，队列里已有的节点仍是截断处的入口。
+          if (depth >= 6 || collected >= maxCallers) {
             if (node !== id) leafRoots.push(node);
             continue;
           }
+          const inEdges = (side._index.inAdj.get(node) || []).filter(
+            (e) => e.kind !== 'var' && !e.headerReference && isNode(e.from) && !overlay.deleted.edges[edgeKeyOf(e)]
+          );
           let expanded = false;
           for (const e of inEdges) {
             if (visited.has(e.from)) continue;
@@ -1150,7 +1152,7 @@ function changedFunctionScope(model, comparison, changes, isNode, pathFilter = n
             queue.push({ node: e.from, depth: depth + 1 });
             collected++;
             expanded = true;
-            if (collected >= 24) break;
+            if (collected >= maxCallers) break;
           }
           if (!expanded && node !== id) leafRoots.push(node);
         }

@@ -266,6 +266,33 @@ test('e2e：CP932 日文源码原样引用到标注，显式编码区分可兼�
   assert.deepEqual(fs.readFileSync(path.join(root, file)), raw);
 });
 
+test('组图在 24 个上游调用者处截断时保留已收集链路', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-caller-cap-'));
+  const counts = [23, 24, 26];
+  const source = counts.flatMap(count => [
+    `void target_${count}(void) {}`,
+    ...Array.from({ length: count }, (_, i) => `void caller_${count}_${i}(void) { target_${count}(); }`),
+  ]).join('\n');
+  fs.writeFileSync(path.join(root, 'callers.c'), source);
+  const { baseUrl: base, close } = await launchServer({ target: root });
+  t.after(async () => {
+    await close();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 });
+  });
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+
+  for (const count of counts) {
+    const target = `callers.c::target_${count}`;
+    const result = await postJson(base, '/api/mcp-compose', {
+      mode: 'replace', changedFunctionIds: [target], fallbackCallers: true,
+    });
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.page.roots.length, Math.min(count, 24), `${count} 个直接调用者时应保留已收集的入口`);
+    assert.ok(result.page.roots.every(id => id.startsWith(`callers.c::caller_${count}_`)));
+    assert.ok(result.page.expansions.some(({ root }) => root === target), '保留调用链所指向的目标函数');
+  }
+});
+
 test('e2e：比较模式的 cg_source 读取映射后的修改和新增源码', async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-compare-'));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
