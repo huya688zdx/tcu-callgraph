@@ -1093,6 +1093,46 @@ function chainMatchesPathFilters(model, chain, targetSet, includePaths, excludeP
   return true;
 }
 
+function fallbackCallerPaths(model, id, isNode, includePaths, excludePaths) {
+  const maxNodes = 25; // 目标函数和最多 24 个上游调用者
+  const maxDepth = 6;
+  const matches = file => includePaths.some(prefix => fileMatchesPathPrefix(file, prefix));
+  const queue = [{ id, path: [], matched: !includePaths.length || matches(fileOfNodeId(model, id)) }];
+  const seenMatched = new Set([id]), seenUnmatched = new Set([id]);
+  const retained = new Set([id]), roots = new Set();
+
+  for (let qi = 0; qi < queue.length && retained.size < maxNodes; qi++) {
+    const current = queue[qi];
+    if (current.path.length >= maxDepth) continue;
+    const path = [current, ...current.path];
+    for (const edge of model._index.inAdj.get(current.id) || []) {
+      const caller = edge.from;
+      if (edge.kind === 'var' || edge.headerReference || !isNode(caller) || overlay.deleted.edges[edgeKeyOf(edge)]) continue;
+      const file = fileOfNodeId(model, caller);
+      if (excludePaths.some(prefix => fileMatchesPathPrefix(file, prefix))) continue;
+      const matched = current.matched || matches(file);
+      const seen = matched ? seenMatched : seenUnmatched;
+      if (seen.has(caller) || path.some(step => step.id === caller)) continue;
+      const next = { id: caller, path, matched };
+      if (matched) {
+        // 只有完整链路命中所选目录后才占用名额，共通中间函数随链路一起保留。
+        const newNodes = Number(!retained.has(caller)) + path.filter(step => !retained.has(step.id)).length;
+        if (retained.size + newNodes > maxNodes) continue;
+        retained.add(caller);
+        for (const step of path) {
+          retained.add(step.id);
+          roots.delete(step);
+        }
+        roots.add(next);
+      }
+      seen.add(caller);
+      queue.push(next);
+      if (retained.size === maxNodes) break;
+    }
+  }
+  return [...roots].map(root => [root.id, ...root.path.map(step => step.id)]);
+}
+
 function changedFunctionScope(model, comparison, changes, isNode, pathFilter = null, { fallbackCallers = false } = {}) {
   const taskRoots = new Set(), functionIds = new Set(changes), variableIds = new Set();
   const untracedIds = [], untracedVersions = [], omittedRelationTargets = new Set();
@@ -1126,43 +1166,9 @@ function changedFunctionScope(model, comparison, changes, isNode, pathFilter = n
       }
       // AI 组图场景：若修改函数的上游没有正式 TASK/ISR 入口，自动沿直接调用关系回溯上级调用者（最多 6 层），避免只放孤立叶子函数。
       if (fallbackCallers && !reached) {
-        const visited = new Set([id]);
-        const parentChains = new Map([[id, [id]]]);
-        const queue = [{ node: id, depth: 0 }];
-        const leafRoots = [];
-        const maxCallers = 24;
-        let collected = 0;
-        for (let qi = 0; qi < queue.length; qi++) {
-          const { node, depth } = queue[qi];
-          // 到达数量上限后停止向上扩展，队列里已有的节点仍是截断处的入口。
-          if (depth >= 6 || collected >= maxCallers) {
-            if (node !== id) leafRoots.push(node);
-            continue;
-          }
-          const inEdges = (side._index.inAdj.get(node) || []).filter(
-            (e) => e.kind !== 'var' && !e.headerReference && isNode(e.from) && !overlay.deleted.edges[edgeKeyOf(e)]
-          );
-          let expanded = false;
-          for (const e of inEdges) {
-            if (visited.has(e.from)) continue;
-            const callerFile = fileOfNodeId(side, e.from);
-            if (excludePaths.length && excludePaths.some((p) => fileMatchesPathPrefix(callerFile, p))) continue;
-            visited.add(e.from);
-            parentChains.set(e.from, [e.from, ...(parentChains.get(node) || [])]);
-            queue.push({ node: e.from, depth: depth + 1 });
-            collected++;
-            expanded = true;
-            if (collected >= maxCallers) break;
-          }
-          if (!expanded && node !== id) leafRoots.push(node);
-        }
-        for (const rootId of leafRoots) {
-          const chainPath = parentChains.get(rootId) || [rootId, id];
-          if (includePaths.length && !chainPath.some((fnId) => includePaths.some((p) => fileMatchesPathPrefix(fileOfNodeId(side, fnId), p)))) {
-            continue;
-          }
+        for (const chainPath of fallbackCallerPaths(side, id, isNode, includePaths, excludePaths)) {
           reached = true;
-          taskRoots.add(rootId);
+          taskRoots.add(chainPath[0]);
           for (const fn of chainPath) functionIds.add(fn);
         }
       }

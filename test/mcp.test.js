@@ -293,6 +293,57 @@ test('组图在 24 个上游调用者处截断时保留已收集链路', async t
   }
 });
 
+test('组图优先保留所选车型的完整调用链，再限制显示节点数', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-caller-branch-'));
+  const callers = Array.from({ length: 24 }, (_, i) => i);
+  for (const dir of ['common', 'z144', 'z145']) fs.mkdirSync(path.join(root, 'src', dir), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/common/target.c'), [
+    'void target(void) {}',
+    'void shared_bridge(void) { target(); }',
+    'void crowded_target(void) {}',
+    ...callers.map(i => `void bridge_${i}(void) { crowded_target(); }`),
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'src/z144/callers.c'), [
+    'void target(void);',
+    ...callers.map(i => `void branch_144_${i}(void) { target(); }`),
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'src/z145/callers.c'), [
+    'void target(void);',
+    'void shared_bridge(void);',
+    'void branch_145_direct(void) { target(); }',
+    'void branch_145_indirect(void) { shared_bridge(); }',
+    ...callers.map(i => `void bridge_${i}(void); void branch_145_${i}(void) { bridge_${i}(); }`),
+  ].join('\n'));
+  const { baseUrl: base, close } = await launchServer({ target: root });
+  t.after(async () => {
+    await close();
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 3 });
+  });
+  await postJson(base, '/api/mcp-config', { level: 'readwrite' });
+  const compose = async name => {
+    const result = await postJson(base, '/api/mcp-compose', {
+      mode: 'replace', changedFunctionIds: [`src/common/target.c::${name}`],
+      fallbackCallers: true, includePaths: ['src/z145'],
+    });
+    assert.equal(result.ok, true, result.error);
+    return result.page;
+  };
+  const scoped = await compose('target');
+  assert.deepEqual(scoped.roots.toSorted(), ['src/z145/callers.c::branch_145_direct', 'src/z145/callers.c::branch_145_indirect']);
+  assert.ok(scoped.expansions.some(({ root }) => root === 'src/common/target.c::shared_bridge'));
+  assert.ok(!scoped.expansions.some(({ root }) => root.startsWith('src/z144/')));
+
+  const crowded = await compose('crowded_target');
+  const ids = new Set([...crowded.roots, ...crowded.expansions.map(({ root }) => root)]);
+  assert.equal(ids.size, 25, '最多保留目标及 24 个上游节点');
+  assert.equal(crowded.roots.length, 12, '每个已选车型入口都保留对应的共通中间函数');
+  for (const entry of crowded.roots) {
+    const index = /^src\/z145\/callers\.c::branch_145_(\d+)$/.exec(entry)?.[1];
+    assert.ok(index !== undefined);
+    assert.ok(ids.has(`src/common/target.c::bridge_${index}`));
+  }
+});
+
 test('e2e：比较模式的 cg_source 读取映射后的修改和新增源码', async (t) => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mcp-compare-'));
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
