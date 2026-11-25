@@ -16,10 +16,11 @@ const indexRef = 'INDEX';
 const regularBlob = /^100(?:644|755)$/;
 const oid = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const maxSourceBytes = 8 * 1024 * 1024;
+const snapshotCacheBytes = 24 * 1024 * 1024;
 const defaultGitTimeoutMs = 120_000;
 const ioConcurrency = 16;
 const analyzedComparisons = new Map();
-const analyzedComparisonLimit = 4;
+const analyzedComparisonLimit = 1;
 
 // 只让 Git 扫描关心的 C/H 源码与调度配置，避免在大仓库里遍历海量非源码文件或构建产物。
 const sourcePathspecs = [
@@ -83,13 +84,15 @@ const emptySummary = () => Object.fromEntries(['functions', 'variables'].map(key
 
 /**
  * 按需读取未落临时盘的快照内容：
- * - 文件未被后续磁盘编辑改动（size + mtimeMs 匹配快照记录且非符号链接）时直接读盘（0.1ms，不阻塞流程图）；
+ * - 文件的大小、修改时间和状态变更时间均匹配快照记录时，直接读取普通文件；
  * - 若后续被编辑、删除或替换，则回退到 git cat-file blob 读取精确历史快照。
  */
 class SnapshotBuffers {
   constructor(repoRoot, entries) {
     this._repoRoot = repoRoot;
     this._entries = entries;
+    this._cache = new Map();
+    this._cachedBytes = 0;
   }
   get size() { return this._entries.size; }
   has(key) { return this._entries.has(key); }
@@ -98,38 +101,43 @@ class SnapshotBuffers {
     const entry = this._entries.get(key);
     if (!entry) return undefined;
     if (entry.buffer) return entry.buffer;
+    const cached = this._cache.get(key);
+    if (cached) {
+      this._cache.delete(key);
+      this._cache.set(key, cached);
+      return cached;
+    }
     if (entry.diskPath && entry.size !== undefined && entry.mtimeMs !== undefined) {
       try {
         const info = fs.lstatSync(entry.diskPath);
         if (info.isFile() && !info.isSymbolicLink() && info.size === entry.size && info.mtimeMs === entry.mtimeMs &&
-            info.size <= maxSourceBytes) {
+            info.ctimeMs === entry.ctimeMs && info.size <= maxSourceBytes) {
           const buf = fs.readFileSync(entry.diskPath);
-          if (buf.length === entry.size) {
-            entry.buffer = buf;
-            return buf;
-          }
+          if (buf.length === entry.size) return buf;
         }
       } catch {
         // 文件被删或无法访问时回退到 Git 对象库
       }
     }
-    if (entry.oid) {
-      const buf = execFileSync('git', ['-c', 'core.quotePath=false', '-C', this._repoRoot, 'cat-file', 'blob', entry.oid], {
+    if (!entry.oid && !entry.diskPath) return undefined;
+    const buf = entry.oid
+      ? execFileSync('git', ['-c', 'core.quotePath=false', '-C', this._repoRoot, 'cat-file', 'blob', entry.oid], {
         encoding: 'buffer',
         env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
         maxBuffer: maxSourceBytes + 4096,
         timeout: 30_000,
         windowsHide: true,
-      });
-      entry.buffer = buf;
-      return buf;
+      })
+      : fs.readFileSync(entry.diskPath);
+    if (buf.length > snapshotCacheBytes) return buf;
+    while (this._cachedBytes + buf.length > snapshotCacheBytes) {
+      const oldest = this._cache.keys().next().value;
+      this._cachedBytes -= this._cache.get(oldest).length;
+      this._cache.delete(oldest);
     }
-    if (entry.diskPath) {
-      const buf = fs.readFileSync(entry.diskPath);
-      entry.buffer = buf;
-      return buf;
-    }
-    return undefined;
+    this._cache.set(key, buf);
+    this._cachedBytes += buf.length;
+    return buf;
   }
   [Symbol.iterator]() {
     const self = this;
@@ -417,7 +425,7 @@ function verifyCleanDisk(repo, relative, dirRealCache, { throwOversize = false }
     if (throwOversize) throw new Error('Git 源码文件超过 8 MB：' + relative);
     return null;
   }
-  return { diskPath: abs, size: info.size, mtimeMs: info.mtimeMs };
+  return { diskPath: abs, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs };
 }
 
 /**
@@ -645,14 +653,17 @@ async function materialize(repo, directory, entries, blobs, cleanDisk) {
     if (clean && clean.oid === entry) {
       files.set(relative, clean.diskPath);
       if (!isScheduleFile(relative)) {
-        bufferEntries.set(relative, { oid: entry, diskPath: clean.diskPath, size: clean.size, mtimeMs: clean.mtimeMs });
+        bufferEntries.set(relative, clean);
       }
       continue;
     }
     const bytes = typeof entry === 'string' ? blobs.get(entry) : entry;
     const target = path.join(directory, relative);
     files.set(relative, target);
-    if (!isScheduleFile(relative)) bufferEntries.set(relative, { buffer: bytes });
+    if (!isScheduleFile(relative)) {
+      // Git blob 可按 OID 重读，未提交的工作区内容需要保留比较当时的字节。
+      bufferEntries.set(relative, typeof entry === 'string' ? { oid: entry } : { buffer: bytes });
+    }
     toWrite.push({ target, bytes });
   }
   const dirPromises = new Map();
@@ -765,32 +776,44 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
   return analyze(immediateHint);
 }
 
-/** 两个版本各自固定源码及调度配置，仅对发生变动或工作区脏文件提取 Git blob 并写入临时目录。 */
+/** 固定两侧的源码及调度配置，批量提取的 blob 在写完临时文件后即可释放。 */
+async function materializeSnapshots(repo, before, after, beforePath, afterPath, cleanHint) {
+  const cleanDisk = await cleanDiskInfo(repo, before, after, cleanHint);
+  const blobs = await fetchBlobs(repo, before, after, cleanDisk);
+  await mkdir(beforePath);
+  await mkdir(afterPath);
+  const settled = await Promise.allSettled([
+    materialize(repo, beforePath, before, blobs, cleanDisk),
+    materialize(repo, afterPath, after, blobs, cleanDisk),
+  ]);
+  const failed = settled.find(item => item.status === 'rejected');
+  if (failed) throw failed.reason;
+  const [beforeSnapshot, afterSnapshot] = settled.map(item => item.value);
+  return { beforeSnapshot, afterSnapshot, sameSources: hasSameSources(before, after, blobs) };
+}
+
 async function analyzeGitSnapshot(repo, before, after, metadata, compareOptions, cleanHint = null) {
   const changes = metadata.changedFiles;
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'callgraph-git-'));
   try {
     const beforePath = path.join(temporary, 'before'), afterPath = path.join(temporary, 'after');
-    const cleanDisk = await cleanDiskInfo(repo, before, after, cleanHint);
-    const blobs = await fetchBlobs(repo, before, after, cleanDisk);
-    await mkdir(beforePath);
-    await mkdir(afterPath);
-    const settled = await Promise.allSettled([
-      materialize(repo, beforePath, before, blobs, cleanDisk),
-      materialize(repo, afterPath, after, blobs, cleanDisk),
-    ]);
-    const failed = settled.find(item => item.status === 'rejected');
-    if (failed) throw failed.reason;
-    const [beforeSnapshot, afterSnapshot] = settled.map(item => item.value);
-    const sameSources = hasSameSources(before, after, blobs);
+    const { beforeSnapshot, afterSnapshot, sameSources } = await materializeSnapshots(
+      repo, before, after, beforePath, afterPath, cleanHint,
+    );
     const comparison = await compareProjects(repo.root, beforePath, afterPath, {
       ...compareOptions,
       snapshots: { beforeFiles: beforeSnapshot.files, afterFiles: afterSnapshot.files, mappings: [], sameSources },
     });
     metadata.importFacts = importFacts(comparison);
     const semanticFiles = new Set(comparison.changePoints.map(point => point.file));
+    const snapshotFingerprint = (snapshot, file) => {
+      const entry = snapshot.bufferEntries.get(file);
+      const bytes = entry.diskPath ? snapshot.buffers.get(file)
+        : entry.buffer ?? fs.readFileSync(snapshot.files.get(file));
+      return fingerprint(decodeSource(bytes));
+    };
     metadata.commentOnlyFiles = changes.filter(({ file, status }) => status === 'modified' && sourceExtension.test(file) && !semanticFiles.has(file) &&
-      fingerprint(decodeSource(beforeSnapshot.buffers.get(file))) === fingerprint(decodeSource(afterSnapshot.buffers.get(file))))
+      snapshotFingerprint(beforeSnapshot, file) === snapshotFingerprint(afterSnapshot, file))
       .map(({ file }) => file);
     retainSnapshot(comparison.beforeModel, beforeSnapshot.buffers);
     retainSnapshot(comparison.afterModel, afterSnapshot.buffers);

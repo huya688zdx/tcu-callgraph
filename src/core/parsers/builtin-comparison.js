@@ -233,19 +233,20 @@ function mergeDefinitions(target, definitions) {
   }
 }
 
-export async function definitionsOf(model, findMacros, prevDefs = null) {
+export async function definitionsOf(model, findMacros, prevDefs = null, { retainByFile = true } = {}) {
   const { sources, failedFiles } = analysisSources(model);
   if (failedFiles) throw new Error('部分源码读取失败，无法完成工程比较');
   const parser = await getParser();
   const raw = new Map(), expanded = new Map(), other = new Map(), writes = new Map(), rawWrites = new Map();
-  const _byFile = new Map();
-  const accesses = fileAccessSummary(model);
+  const _byFile = retainByFile ? new Map() : null;
+  const previousFiles = prevDefs?._byFile;
+  const accesses = retainByFile || previousFiles ? fileAccessSummary(model) : null;
   for (const f of sources) {
-    const sig = createHash('sha256').update(JSON.stringify([
+    const sig = accesses && createHash('sha256').update(JSON.stringify([
       f.src, f.expanded, accesses.get(f.rel), [...findMacros(f.src)].sort(),
     ])).digest('hex');
-    let file = prevDefs?._byFile?.get(f.rel);
-    if (file?.sig !== sig) {
+    let file = previousFiles?.get(f.rel);
+    if (!file || file.sig !== sig) {
       file = { sig, raw: new Map(), expanded: new Map(), writes: new Map(), rawWrites: new Map() };
       const rawTree = parser.parse(f.src);
       let expandedTree = rawTree;
@@ -277,14 +278,14 @@ export async function definitionsOf(model, findMacros, prevDefs = null) {
         rawTree.delete();
       }
     }
-    _byFile.set(f.rel, file);
+    _byFile?.set(f.rel, file);
     other.set(f.rel, file.other);
     mergeDefinitions(raw, file.raw);
     mergeDefinitions(expanded, file.expanded);
     for (const [id, entries] of file.writes) writes.set(id, entries);
     for (const [id, entries] of file.rawWrites) rawWrites.set(id, entries);
   }
-  return { raw, expanded, other, writes, rawWrites, _byFile };
+  return { raw, expanded, other, writes, rawWrites, ...(_byFile && { _byFile }) };
 }
 
 export function macroDiff(beforeModel, afterModel) {
