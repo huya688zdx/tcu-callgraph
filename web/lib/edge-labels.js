@@ -111,7 +111,7 @@ export function promoteAutoLabel(edge, autoLabel = null, view = state.view) {
 
 /**
  * 算出当前视图里所有标签的矩形，写回 edge._lbs 供命中测试复用。
- * 同一条线的多条标签由 placeEdgeLabels 交替放线的两侧并互相避让；
+ * 同一条线的多条标签优先分放两侧，并避开节点与已放标签；
  * 不同线之间先放的矩形参与后者的避让。
  */
 export function labelLayout(view = state.view, reuse = false) {
@@ -138,7 +138,6 @@ export function labelLayout(view = state.view, reuse = false) {
       others: placed,
       otherPaths: paths.filter((other) => other.edge !== e && boundsMeet(bounds, other.bounds, 0.501))
         .map(({ edge }) => edge.points || []),
-      maxDist: LABEL_MAX_DIST,
     });
     const own = [];
     labels.forEach((label, i) => {

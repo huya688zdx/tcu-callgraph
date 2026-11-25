@@ -16,6 +16,8 @@ import { canvasPeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle
 
 export function layoutExportEdgeLabels(view) {
   const placed = [];
+  const occupied = [];
+  const nodes = view.nodes || [];
   const edges = view.edges || [];
   for (const e of edges) {
     const rawLabels = e.labels?.length ? e.labels : e.label ? [e.label] : [];
@@ -24,12 +26,15 @@ export function layoutExportEdgeLabels(view) {
     const rects = placeEdgeLabels({
       items: labels.map(label => ({ label, size: labelBoxSize(label, estimateTextWidth) })),
       pts: e.points || [],
-      nodes: view.nodes || [],
-      others: placed.map(entry => entry.rect),
+      nodes,
+      others: occupied,
       otherPaths: edges.filter(other => other !== e).map(other => other.points || []),
     });
     labels.forEach((label, i) => {
-      if (rects[i]) placed.push({ label, rect: rects[i] });
+      const rect = rects[i];
+      if (!rect) return;
+      occupied.push(rect);
+      placed.push({ label, rect });
     });
   }
   return placed;
