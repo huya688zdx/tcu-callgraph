@@ -1,7 +1,7 @@
 import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
 import { discoverBuildProfiles, materializeCompileCommands } from '../src/core/build-config.js';
 import { resolveBuildProfileOptions } from '../src/core/build-profile-options.js';
-import { scanSources } from '../src/core/index.js';
+import { buildIndex, scanSources } from '../src/core/index.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -166,4 +166,50 @@ test('Make 响应文件参数使用编译工作目录', t => {
   const files = scanSources(root);
   const model = loadModel(root, { parserId: 'builtin', parserOptions: resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile) });
   assert.ok(model.functions.some(f => f.name === 'yes'));
+});
+
+test('快照排除的工程内头文件不从工作区补回', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-excluded-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'config.h'), '#define FEATURE 1\nvoid leaked(void) {}');
+  fs.writeFileSync(path.join(root, 'main.c'), '#include "config.h"\n#if FEATURE\nvoid yes(void) {}\n#else\nvoid no(void) {}\n#endif');
+  const model = buildIndex(root, new Map([['main.c', path.join(root, 'main.c')]]), null,
+    { parserId: 'builtin', parserOptions: { buildProfileId: 'snapshot' } });
+  assert.deepEqual(model.functions.map(f => f.name), ['no']);
+  assert.ok(!model.files.some(f => f.rel === 'config.h'));
+});
+
+test('字符数组字符串初始化不挤占后续回调', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-string-init-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), `
+typedef void (*Fn)(void);
+typedef struct { char name[2]; Fn first; Fn second; } Ops;
+void foo(void) {} void bar(void) {}
+static const Ops ops = { "A", foo, bar };
+void first(void) { ops.first(); }
+void second(void) { ops.second(); }
+`);
+  const model = loadModel(root, { parserId: 'builtin' });
+  assert.ok(model.edges.some(e => e.from === 'main.c::first' && e.to === 'main.c::foo'));
+  assert.ok(model.edges.some(e => e.from === 'main.c::second' && e.to === 'main.c::bar'));
+  assert.ok(!model.edges.some(e => e.from === 'main.c::first' && e.to === 'main.c::bar'));
+});
+
+test('模式规则候选被隔离，转义引号保留在宏值中', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-quotes-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'pattern.mak'), 'all: main.o\n%.o: %.c\n\tgcc -DFEATURE=1 -c $<');
+  fs.writeFileSync(path.join(root, 'Makefile'), String.raw`all:
+	gcc -DCONFIG_HEADER=\"config.h\" main.c`);
+  fs.writeFileSync(path.join(root, 'config.h'), '#define FEATURE 1');
+  fs.writeFileSync(path.join(root, 'main.c'), '#include CONFIG_HEADER\n#if FEATURE\nvoid yes(void) {}\n#endif');
+  const profiles = discoverBuildProfiles(root).profiles;
+  assert.equal(profiles.length, 1);
+  assert.deepEqual(profiles[0].defines, ['CONFIG_HEADER="config.h"']);
+  const files = scanSources(root);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profiles[0].id }, files, profiles[0]) });
+  assert.ok(model.functions.some(f => f.name === 'yes'));
+  const exported = materializeCompileCommands(root, profiles[0], { files, exportPath: 'compile_commands.json' });
+  assert.ok(JSON.parse(fs.readFileSync(exported.compileCommandsPath, 'utf8'))[0].arguments.includes('CONFIG_HEADER="config.h"'));
 });

@@ -117,6 +117,11 @@ function tokenizeArgs(line) {
   let quote = '';
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
+    if (ch === '\\' && quote !== "'" && line[i + 1] === '"') {
+      cur += '"';
+      i++;
+      continue;
+    }
     if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
       quote = quote ? '' : ch;
       continue;
@@ -357,6 +362,8 @@ export function parseMakefileTree(entryAbs, rootDir) {
 
       const rule = /^[^:]+::?\s*([^;]*)(?:;(.*))?$/.exec(line);
       if (rule) {
+        // 尚未实例化模式规则的目标，拒绝该候选，避免发布含 %.c 的空配置。
+        if (line.slice(0, line.indexOf(':')).includes('%')) throw new Error('暂不支持 Make 模式规则');
         // 普通规则的依赖在读入时展开；命令（包括分号后的内联命令）等所有定义收齐。
         prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
         if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites });

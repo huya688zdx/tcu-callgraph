@@ -565,6 +565,9 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     // 省略聚合括号时，已知标量继续下沉。未知表达式可能复制整个结构体。
     while (!braced) {
       if (child?.element) {
+        // 字符串消耗整个字符数组，仍需下沉多维数组的外层。
+        if (!child.element.element && !child.element.pointer && !child.element.names &&
+            val.every(t => t.t === 'str' && t.v.startsWith('"'))) break;
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
