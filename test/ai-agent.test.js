@@ -1874,7 +1874,10 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     'void worker_step(void) { ghh(); }',
     '/* ',
   ].join('\n')), Buffer.from([0xc2, 0xa9]), Buffer.from(' */\n')]));
-  fs.writeFileSync(path.join(dir, 'bom.h'), '\uFEFF/* 周期 */\n');
+  for (const folder of ['Src/Dispatch', 'Src/DispatchExtra', 'Backup/Src/Dispatch']) {
+    fs.mkdirSync(path.join(dir, folder), { recursive: true });
+    fs.writeFileSync(path.join(dir, folder, 'bom.h'), '\uFEFF/* 周期 */\n');
+  }
 
   const toolResults = [];
   let turn = 0;
@@ -1893,7 +1896,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
       if (turn === 1) return reply('inspect_indirect_calls', { function: 'ghh' });
       if (turn === 2) return reply('read_source', { file: 'dispatch.c', startLine: 8, endLine: 13 });
       if (turn === 3) return reply('read_source', { query: cp932Text, file: 'worker.c', encoding: 'cp932' });
-      if (turn === 4) return reply('read_source', { query: '周期', file: 'bom.h', encoding: 'cp932' });
+      if (turn === 4) return reply('read_source', { query: '周期', paths: ['sRC\\Dispatch/'], file: 'bom.h', encoding: 'cp932' });
       if (turn === 5) return reply('apply_labels', {
         items: [{ from: 'worker_step', to: 'ghh', line: 2, preset: 'task', text: 'TASK:10ms' }],
       });
@@ -1954,7 +1957,8 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
   assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
   const searches = toolResults.filter(r => r.name === 'read_source').slice(1).map(r => r.data);
   assert.deepEqual(searches[0]?.matches?.map(({ line, text }) => [line, text]), [[3, `/* ${cp932Text} */`]], JSON.stringify(searches));
-  assert.deepEqual(searches[1]?.matches?.map(({ line, text }) => [line, text]), [[1, '/* 周期 */']], JSON.stringify(searches));
+  assert.deepEqual(searches[1]?.matches?.map(({ file, line, text }) => [file, line, text]),
+    [['Src/Dispatch/bom.h', 1, '/* 周期 */']], JSON.stringify(searches));
   const addRes = toolResults.find((r) => r.name === 'add_call_edge')?.data;
   assert.equal(addRes?.ok, true);
   assert.equal(addRes?.addedCount, 1);

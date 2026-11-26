@@ -1214,13 +1214,17 @@ async function readMcpSource(q) {
   };
 }
 
+function normalizeFilterPath(value) {
+  return value.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
 function normalizePathPrefixes(raw) {
   const arr = Array.isArray(raw) ? raw : typeof raw === 'string' && raw.trim() ? [raw] : [];
-  return [...new Set(arr.map((s) => String(s || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase()).filter(Boolean))];
+  return [...new Set(arr.map(s => normalizeFilterPath(String(s || '').trim())).filter(Boolean))];
 }
 
 function fileMatchesPathPrefix(filePath, prefix) {
-  const norm = String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+  const norm = normalizeFilterPath(String(filePath || ''));
   if (!norm || !prefix) return false;
   return norm === prefix || norm.startsWith(prefix + '/') || norm.includes('/' + prefix + '/');
 }
@@ -3937,7 +3941,11 @@ export const server = http.createServer(async (req, res) => {
           const candidateFiles = (model.files || [])
             .filter(f => !f.manual && f.rel)
             .filter(f => !fileArg || f.rel === fileArg || f.rel.endsWith('/' + fileArg))
-            .filter(f => !pathPrefixes.length || pathPrefixes.some(p => f.rel === p || f.rel.startsWith(p + '/')));
+            .filter(f => {
+              if (!pathPrefixes.length) return true;
+              const rel = normalizeFilterPath(f.rel);
+              return pathPrefixes.some(p => rel === p || rel.startsWith(p + '/'));
+            });
           const needle = query.toLowerCase();
           const matches = [];
           for (const f of candidateFiles) {
