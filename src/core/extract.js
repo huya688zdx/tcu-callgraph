@@ -261,11 +261,13 @@ function splitTopCommas(tokens) {
 
 /** 解析常量整数索引（如 0, 1, 0x02），非常量返回 null */
 function parseConstIndex(tokens) {
-  if (!tokens.length) return null;
-  const s = tokens.map((t) => t.v).join('').replace(/[uUlL]+$/, '');
-  if (/^0[xX][0-9a-fA-F]+$/.test(s)) return Number.parseInt(s, 16);
-  if (/^\d+$/.test(s)) return Number.parseInt(s, 10);
-  return null;
+  if (tokens.length !== 1 || tokens[0].t !== 'num') return null;
+  const s = tokens[0].v.replace(/[uUlL]+$/, '');
+  let value;
+  if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = Number(s);
+  else if (/^0[0-7]*$/.test(s)) value = Number.parseInt(s, 8);
+  else if (/^[1-9]\d*$/.test(s)) value = Number(s);
+  return Number.isSafeInteger(value) ? value : null;
 }
 
 /** 递归提取结构体 / 1D / 2D 数组初始化列表里的函数指针槽位 */
@@ -334,14 +336,14 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
  *   const fn_t e[2][3] = { {vvv, ggg, jjj}, {ghh, jkk, kkk} };
  *   const Entry tbl[] = { { .enter = Enter_A, .run = Run_A }, ... };
  */
-export function findFnPtrTables(tokens, file = '') {
+export function findFnPtrTables(tokens, file = '', functionId = null) {
   const tables = new Map();
-  let braceDepth = 0;
+  const scopes = [{ end: null }];
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
-    if (tk.v === '{') { braceDepth++; continue; }
-    if (tk.v === '}') { braceDepth = Math.max(0, braceDepth - 1); continue; }
-    if (braceDepth !== 0 || tk.v !== '=') continue;
+    if (tk.v === '{') { scopes.push({ end: null }); continue; }
+    if (tk.v === '}' && scopes.length > 1) { scopes.pop().end = tk; continue; }
+    if (tk.v !== '=' || (!functionId && scopes.length !== 1)) continue;
     if (!tokens[i + 1] || tokens[i + 1].v !== '{') continue;
 
     // 向前解析声明名与数组维度，兼容：
@@ -407,7 +409,7 @@ export function findFnPtrTables(tokens, file = '') {
     const slotLines = {};
     collectInitSlots(inner, '', dims === 0, map, slotLines);
     if (Object.keys(map).length) {
-      tables.set(nameTok.v, {
+      tables.set(functionId ? i : nameTok.v, {
         name: nameTok.v,
         file,
         line: nameTok.line,
@@ -416,6 +418,7 @@ export function findFnPtrTables(tokens, file = '') {
         dims,
         map,
         slotLines,
+        ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
       });
     }
     i = close;
@@ -455,20 +458,17 @@ function formatIndexedVia(recv, indexExprs, member) {
 /** 粗略判断是否为块内局部函数原型声明，如 `void proto(void);` / `extern int foo(int x);` */
 function isLocalPrototype(tokens, idIdx) {
   const prev = tokens[idIdx - 1];
-  if (!prev || !(TYPE_WORDS.has(prev.v) || prev.v === '*' || prev.v === 'extern')) return false;
+  if (!prev || !(TYPE_WORDS.has(prev.v) || prev.v === '*')) return false;
   const [args, next] = collectArgs(tokens, idIdx + 1);
   if (!args || tokens[next]?.v !== ';') return false;
-  // 排除 return foo(); 等关键字引导的调用
-  if (KEYWORDS.has(prev.v) && !TYPE_WORDS.has(prev.v) && prev.v !== 'extern') return false;
-  // 检查参数列表是否为空/void/以类型名开头
+  let start = idIdx - 1;
+  while (start > 0 && ![';', '{', '}'].includes(tokens[start - 1].v)) start--;
+  // 初始化表达式中也可能出现 `*f()`，声明前缀只能包含类型、标签和指针修饰。
+  const prefix = tokens.slice(start, idIdx);
+  if (!prefix.every(t => TYPE_WORDS.has(t.v) || t.v === '*' || (t.t === 'id' && !KEYWORDS.has(t.v)))) return false;
   if (args.length === 1 && args[0].length === 1 && args[0][0].v === 'void') return true;
-  if (args.every((arg) => !arg.length || arg.some((t) => TYPE_WORDS.has(t.v) || t.v === '*'))) {
-    // 若声明首 token 为类型/存储类，基本可确认为局部原型
-    let s = idIdx - 1;
-    while (s > 0 && ![';', '{', '}'].includes(tokens[s - 1].v)) s--;
-    if (TYPE_WORDS.has(tokens[s].v) || tokens[s].v === 'extern') return true;
-  }
-  return false;
+  return TYPE_WORDS.has(prefix[0].v) &&
+    args.every(arg => !arg.length || arg.some(t => TYPE_WORDS.has(t.v) || t.v === '*'));
 }
 
 /**

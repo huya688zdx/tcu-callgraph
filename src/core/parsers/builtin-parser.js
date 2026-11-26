@@ -289,6 +289,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
       const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      for (const table of findFnPtrTables(body, rel, fn.id).values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
       for (const call of calls) {
@@ -407,6 +408,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   const cleanedTables = [];
   const staticTablesByFile = new Map();
   const globalTablesByName = new Map();
+  const localTablesByFunction = new Map();
   for (const raw of fnptrTablesList) {
     const filteredMap = {};
     for (const [slot, target] of Object.entries(raw.map)) {
@@ -424,18 +426,28 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       isConst: raw.isConst,
       dims: raw.dims,
       map: filteredMap,
+      ...(raw.functionId && { functionId: raw.functionId }),
     };
     cleanedTables.push(entry);
-    if (entry.isStatic) {
+    if (entry.functionId) {
+      if (!localTablesByFunction.has(entry.functionId)) localTablesByFunction.set(entry.functionId, new Map());
+      const byName = localTablesByFunction.get(entry.functionId);
+      if (!byName.has(entry.name)) byName.set(entry.name, []);
+      byName.get(entry.name).push({ entry, declaration: raw.declaration, end: raw.scope.end });
+    } else if (entry.isStatic) {
       if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
       staticTablesByFile.get(entry.file).set(entry.name, entry);
     } else {
       globalTablesByName.set(entry.name, entry);
     }
   }
-  const lookupTable = (name, fromFile) => {
+  const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
+  const lookupTable = (fn, call) => {
+    const name = call.receiver;
     if (!name) return null;
-    return staticTablesByFile.get(fromFile)?.get(name) || globalTablesByName.get(name) || null;
+    const local = localTablesByFunction.get(fn.id)?.get(name)?.findLast(table =>
+      compareLocation(call, table.declaration) >= 0 && (!table.end || compareLocation(call, table.end) < 0));
+    return local?.entry || staticTablesByFile.get(fn.file)?.get(name) || globalTablesByName.get(name) || null;
   };
   const matchTableSlots = (table, indices = [], member = null) => {
     const matched = [];
@@ -488,7 +500,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
         });
         continue;
       }
-      const table = lookupTable(call.receiver, fn.file);
+      const table = lookupTable(fn, call);
       const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
       const allConstIndices = (call.indices || []).every((idx) => idx !== null);

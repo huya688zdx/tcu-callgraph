@@ -382,3 +382,46 @@ void call_b(void) {
   assert.deepEqual(site2d.candidates.map((c) => c.name).sort(), ['ggg', 'ghh', 'jjj', 'jkk', 'kkk', 'vvv']);
   assert.ok(site2d.candidates.some((c) => c.slot === '[1][0]' && c.name === 'ghh'));
 });
+
+test('保留初始化式调用，解析函数内分派表作用域和八进制下标', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-local-tables-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t run; } Ops;
+void global_target(void) {}
+void first_local(void) {}
+void second_local(void) {}
+void inner_local(void) {}
+int number(void) { return 1; }
+int *pointer(void) { return 0; }
+static const Ops ops = { .run = global_target };
+static const fn_t table[11] = { [010u] = first_local, [10] = second_local };
+void first(void) {
+  ops.run();
+  static const Ops ops = { .run = first_local };
+  ops.run();
+  { static const Ops ops = { .run = inner_local }; ops.run(); }
+  ops.run();
+}
+void second(void) { static const Ops ops = { .run = second_local }; ops.run(); }
+void global_only(void) { ops.run(); }
+void octal(void) { table[010](); table[8](); table[10](); }
+int initialize(void) {
+  typedef int Value;
+  extern int *prototype(void);
+  extern Value *typedef_prototype(void);
+  int x = 2 * number();
+  int y = *pointer();
+  return x + y;
+}
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('first'), ['global_target', 'first_local', 'inner_local', 'first_local']);
+  assert.deepEqual(calls('second'), ['second_local']);
+  assert.deepEqual(calls('global_only'), ['global_target']);
+  assert.deepEqual(calls('octal'), ['first_local', 'first_local', 'second_local']);
+  assert.deepEqual(calls('initialize'), ['number', 'pointer']);
+});
