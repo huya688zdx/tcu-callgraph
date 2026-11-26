@@ -320,6 +320,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
   const recipes = [];
   const rules = new Map();
+  const suffixes = new Set(['.o', '.c', '.cc', '.C', '.cpp']);
   const targetVariables = new Map();
   let defaultGoal;
   const collected = compilerConfig();
@@ -452,6 +453,10 @@ export function parseMakefileTree(entryAbs, rootDir) {
         ruleDeps = { normal, orderOnly, separate: line[colon + 1] === ':' };
         targets = tokenizeArgs(expandMakeVars(line.slice(0, colon), vars));
         for (const target of targets) {
+          if (target === '.SUFFIXES') {
+            if (!normal.length) suffixes.clear();
+            else for (const suffix of normal) suffixes.add(suffix);
+          }
           if (!target.startsWith('.')) defaultGoal ??= target;
           if (!rules.has(target)) rules.set(target, []);
           rules.get(target).push(ruleDeps);
@@ -469,6 +474,31 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const compilers = new Set();
   const compilationUnits = {};
   const reachable = new Map();
+  const explicitRecipes = new Set(recipes.flatMap(recipe => recipe.targets));
+  const suffixRecipes = new Map();
+  for (const recipe of recipes) {
+    const name = recipe.targets[0];
+    if (recipe.targets.length !== 1 || !recipe.ruleDeps || recipe.ruleDeps.separate ||
+        recipe.ruleDeps.normal.length || recipe.ruleDeps.orderOnly.length) continue;
+    const [, from, to] = /^(\.[^.]+)(\.[^.]+)$/.exec(name) || [];
+    if (!suffixes.has(from) || !suffixes.has(to) || !SRC_EXT.test(from)) continue;
+    if (!suffixRecipes.has(name)) suffixRecipes.set(name, []);
+    suffixRecipes.get(name).push(recipe);
+  }
+  const instantiated = [];
+  const findSuffixRule = target => {
+    const extension = path.extname(target);
+    if (!suffixes.has(extension) || explicitRecipes.has(target)) return;
+    const stem = target.slice(0, -extension.length);
+    for (const suffix of suffixes) {
+      const selected = suffixRecipes.get(suffix + extension);
+      if (!selected) continue;
+      const source = stem + suffix;
+      if (rules.has(source) || fs.statSync(path.resolve(entryDir, source), { throwIfNoEntry: false })?.isFile()) {
+        return { source, stem, selected };
+      }
+    }
+  };
   const visitTarget = (target, inherited = vars) => {
     if (reachable.has(target)) return;
     const environment = new Map(inherited);
@@ -481,21 +511,30 @@ export function parseMakefileTree(entryAbs, rootDir) {
       environment.set(name, { value, simple });
     }
     reachable.set(target, environment);
+    const suffixRule = findSuffixRule(target);
+    if (suffixRule) {
+      const { source, stem, selected } = suffixRule;
+      const ruleDeps = { normal: [source], orderOnly: [] };
+      for (const { command } of selected) instantiated.push({ command, ruleDeps, stem, targets: [target] });
+      visitTarget(source, environment);
+    }
     for (const { normal, orderOnly } of rules.get(target) || []) {
       for (const dependency of [...normal, ...orderOnly]) visitTarget(dependency, environment);
     }
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
-  for (const { command, ruleDeps, targets } of recipes) {
+  for (const { command, ruleDeps, targets, stem } of [...recipes, ...instantiated]) {
     const target = targets.find(name => reachable.has(name));
     if (goal && !target) continue;
     // GNU Make 将有命令的规则的依赖放在同一目标的其他依赖之前。
     const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
       ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
     const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(target) || vars)
-      .replace(/\$[<^+]/g, ref => {
-        const paths = ref === '$<' ? deps.slice(0, 1) : ref === '$^' ? [...new Set(deps)] : deps;
+      .replace(/\$[@*<^+]/g, ref => {
+        if (ref === '$*' && stem === undefined) return ref;
+        const paths = ref === '$@' ? [target || ''] : ref === '$*' ? [stem] : ref === '$<' ? deps.slice(0, 1)
+          : ref === '$^' ? [...new Set(deps)] : deps;
         return paths.map(dep => /\s/.test(dep) ? '"' + dep.replaceAll('"', '\\"') + '"' : dep).join(' ');
       });
     const { commands, ambiguous } = splitRecipeCommands(expanded);

@@ -778,3 +778,29 @@ test('Make 复合配方的每个编译调用独立收集参数，引号中的分
   assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
     ['first_correct', 'second_correct']);
 });
+
+test('Make 将 .c.o 后缀规则应用到可达目标，并保留显式编译规则', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all: main.o custom.o',
+    'CFLAGS = -DFEATURE=1',
+    'main.o: types.h',
+    '.c.o:',
+    '\t$(CC) $(CFLAGS) -DSTEM=$* -c $< -o $@',
+    'custom.o: custom.c',
+    '\t$(CC) -DFEATURE=0 -c $<',
+  ].join('\n'));
+  write(root, 'types.h', 'typedef int Value;');
+  for (const [rel, feature] of [['main', 1], ['custom', 0]]) {
+    write(root, rel + '.c', '#if FEATURE == ' + feature + '\nvoid ' + rel + '_correct(void) {}\n#endif');
+  }
+  write(root, 'debug.c', 'void unused(void) {}');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(sorted(profile.sourceFiles), ['custom.c', 'main.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['FEATURE=1', 'STEM=main']);
+  assert.deepEqual(profile.compilationUnits['custom.c'].defines, ['FEATURE=0']);
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
+    ['custom_correct', 'main_correct']);
+});
