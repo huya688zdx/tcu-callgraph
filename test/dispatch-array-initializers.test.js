@@ -144,3 +144,26 @@ void call(void) {
   const targets = model._index.outAdj.get('table.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(targets.map(edge => edge.callee), ['c', 'a', 'c', 'd', 'b', 'd', 'a', 'c']);
 });
+
+test('结构体成员数组在声明位置展开头文件宏，省略花括号时保留后续回调', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-width-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.h'), [
+    'typedef void (*Fn)(void);',
+    '#define WIDTH(n) (n)',
+    'typedef struct { Fn slots[WIDTH(2)]; Fn next; } Ops;',
+    '#undef WIDTH',
+    '#define WIDTH(n) (1)',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    '#include "ops.h"',
+    'static void first(void) {} static void second(void) {} static void next(void) {}',
+    'static const Ops ops = {first, second, next};',
+    'void call(void) { ops.slots[0](); ops.slots[1](); ops.next(); }',
+  ].join('\n'));
+  for (const parserOptions of [{}, { buildProfileId: 'test' }]) {
+    const model = loadModel(dir, { parserId: 'builtin', parserOptions });
+    const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+    assert.deepEqual(edges.map(edge => edge.callee), ['first', 'second', 'next']);
+  }
+});

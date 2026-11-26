@@ -376,12 +376,12 @@ function declarationType(tokens) {
 }
 
 /** 保留初始化器需要的声明形状，包括声明顺序、数组维度和指针。 */
-function initializerDeclarations(statement) {
+function initializerDeclarations(statement, macros) {
   const parts = splitAtTopLevel(statement);
   const first = parts[0] || [];
   const base = declarationType(first.slice(0, first.indexOf(declarationName(first))));
   const open = first.findIndex(t => t.v === '{');
-  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open))) : null;
+  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), macros) : null;
   const shapes = new Map();
   for (const part of parts) {
     const token = declarationName(part);
@@ -396,7 +396,7 @@ function initializerDeclarations(statement) {
         if (part[j].v === '[') depth++;
         if (part[j].v === ']') depth--;
       }
-      extents.push(parseConstIndex(part.slice(start, j - 1)));
+      extents.push(parseConstIndex(part.slice(start, j - 1), macros));
     }
     let before = name - 1;
     while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
@@ -405,16 +405,16 @@ function initializerDeclarations(statement) {
   return shapes;
 }
 
-function initializerMembers(body) {
+function initializerMembers(body, macros) {
   const fields = new Map();
   for (const part of splitAtTopLevel(body, ';')) {
-    for (const [name, shape] of initializerDeclarations(part)) fields.set(name, shape);
+    for (const [name, shape] of initializerDeclarations(part, macros)) fields.set(name, shape);
   }
   return fields;
 }
 
 /** 收集类型声明及作用域；成员声明帮助区分标量与只初始化了一项的数组。 */
-export function findTypedefs(tokens) {
+export function findTypedefs(tokens, macros) {
   const aliases = new Map();
   const scopes = [{ end: null }];
   const record = (name, declaration, shape) => {
@@ -427,7 +427,9 @@ export function findTypedefs(tokens) {
     if (token.v === '}' && scopes.length > 1) { scopes.pop().end = token; continue; }
     if ((token.v === 'struct' || token.v === 'union') && tokens[i + 1]?.t === 'id' && tokens[i + 2]?.v === '{') {
       const close = matchBrace(tokens, i + 2);
-      record(token.v + ' ' + tokens[i + 1].v, token, { union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close)) });
+      record(token.v + ' ' + tokens[i + 1].v, token, {
+        union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close), macros),
+      });
       i = close;
       continue;
     }
@@ -440,7 +442,7 @@ export function findTypedefs(tokens) {
       if ([')', ']', '}'].includes(value)) depth--;
     }
     if (tokens[end]?.v !== ';') continue;
-    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end))) {
+    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end), macros)) {
       record(name, shape.token, shape);
       if (shape.fields && shape.type && !aliases.get(shape.type)?.some(entry => entry.declaration === token)) {
         record(shape.type, token, { fields: shape.fields, union: shape.union });
@@ -640,7 +642,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     return localFunctions.has(token.v);
   };
   const localLookup = (_, name, at) => {
-    localTypes ??= findTypedefs(tokens);
+    localTypes ??= findTypedefs(tokens, macros);
     const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     return entry && { file, shape: entry.shape };
   };
@@ -705,7 +707,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         if (tokens[open].v === '{') depth--;
       }
       if (['struct', 'union'].includes(tokens[open]?.v) || ['struct', 'union'].includes(tokens[open - 1]?.v)) {
-        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration));
+        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration), macros);
         for (let j = open; j >= 0 && ![';', '{', '}'].includes(tokens[j].v); j--) {
           if (['static', 'STATIC'].includes(tokens[j].v)) isStatic = true;
           if (['const', 'CONST'].includes(tokens[j].v)) isConst = true;

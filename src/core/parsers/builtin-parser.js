@@ -313,7 +313,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     return { tokens: input, taskDefs, bytes: src.length };
   };
   const recordFile = ({ rel, isHeader }, { taskDefs, bytes }, { tokens, includes: inc }, fileMacros) => {
-    const typedefs = findTypedefs(tokens);
+    const typedefs = findTypedefs(tokens, fileMacros);
     if (typedefs.size) typedefsByFile.set(rel, typedefs);
     if (isHeader) for (const [name, entries] of typedefs) {
       if (!entries.some(entry => entry.fileScope)) continue;
@@ -820,9 +820,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:5';
     return JSON.stringify([
-      'builtin:10',
+      'builtin:11',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
