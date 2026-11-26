@@ -139,7 +139,7 @@ function tokenizeArgs(line) {
 
 function compilerConfig() {
   return { includeDirs: new Set(), includeOptions: new Map(), defines: new Set(),
-    forcedIncludes: new Set(), sourceFiles: new Set() };
+    forcedIncludes: new Set(), macroIncludes: [], sourceFiles: new Set() };
 }
 
 function addInclude(out, flag, dir) {
@@ -162,6 +162,7 @@ function extractedOptions(config) {
     defines: [...config.defines],
     macroArgs: config.macroArgs || [],
     forcedIncludes: [...config.forcedIncludes],
+    macroIncludes: [...config.macroIncludes],
   };
 }
 
@@ -235,14 +236,16 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       continue;
     }
 
-    // -include / -preinclude / -fi (QAC forced include)
-    if (/^(?:-include|-preinclude|--preinclude|-fi)=?$/.test(tok) || /^(?:-include|-preinclude|--preinclude)=/.test(tok)) {
+    // -imacros 只导入宏；-preinclude 和 -fi 是其他工具链的强制包含选项。
+    if (/^(?:-include|-imacros|-preinclude|--preinclude|-fi)(?:=|$)/.test(tok)) {
       let val = '';
       if (tok.includes('=')) val = stripQuotes(tok.slice(tok.indexOf('=') + 1));
       else val = stripQuotes(rawTokens[++i] || '');
       if (val && !val.startsWith('-')) {
         const abs = path.isAbsolute(val) ? path.normalize(val) : path.resolve(baseDir, val);
-        out.forcedIncludes.add(fs.existsSync(abs) ? abs : val);
+        const include = fs.existsSync(abs) ? abs : val;
+        if (tok.startsWith('-imacros')) out.macroIncludes.push(include);
+        else out.forcedIncludes.add(include);
       }
       continue;
     }
@@ -569,7 +572,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       const attrs = m[1];
       const val = stripQuotes(m[2]);
       const sc = extractXmlAttr(attrs, 'superClass');
-      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter)|@|-f\s)/.test(val)) {
+      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter|macros)|@|-f\s)/.test(val)) {
         extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
       }
     }
@@ -676,6 +679,7 @@ export function discoverBuildProfiles(rootDir) {
       macroArgs: item.parsed.macroArgs,
       compilationUnits: item.parsed.compilationUnits,
       forcedIncludes: item.parsed.forcedIncludes,
+      macroIncludes: item.parsed.macroIncludes,
       sourceRoots: [],
       exclusions: [],
       sourceFiles: item.parsed.sourceFiles,
@@ -885,6 +889,7 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     if (config.languageStandard) args.push('-std=' + config.languageStandard);
     if (config.macroArgs?.length) args.push(...config.macroArgs);
     else for (const def of config.defines || []) args.push('-D', def);
+    for (const inc of config.macroIncludes || []) args.push('-imacros', inc);
     if (shimPath) args.push('-include', shimPath);
     for (const inc of config.forcedIncludes || []) args.push('-include', inc);
     return args;

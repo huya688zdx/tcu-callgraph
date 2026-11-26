@@ -62,7 +62,8 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const search = [...dirsFor('-I').filter(dir => !systemKeys.has(key(dir))), ...system, ...after];
     if (!includeOptions.length) search.push(path.resolve(root));
     const quotedSearch = [...dirsFor('-iquote'), ...search];
-    const forced = config.forcedIncludes || [];
+    const forced = [...(config.macroIncludes || []).map(target => [target, true]),
+      ...(config.forcedIncludes || []).map(target => [target, false])];
     const stdVersion = cStandardVersions.get(unit?.languageStandard);
     const predefined = buildMacros([
       ...(path.extname(source.rel) === '.c' ? ['__STDC__=1'] : []),
@@ -75,14 +76,14 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     buildMacros(config.defines, predefined);
 
     const stack = new Set(), once = new Set();
-    function processFile(file, base) {
+    function processFile(file, base, macroOnly = false) {
       if (stack.has(file) || once.has(file)) return null;
       if (file.isHeader && !inputs.has(file)) inputs.set(file, load(file));
       const input = file.isHeader ? inputs.get(file) : load(file);
       if (!input) return null;
       stack.add(file);
       const scope = fileMacroScope(base, new Map(), { trackPositions: true });
-      function include({ target, line }, quoted, fromDir = path.dirname(path.resolve(root, file.rel))) {
+      function include({ target, line }, quoted, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
         for (const dir of quoted ? [fromDir, ...quotedSearch] : search) {
           const abs = path.resolve(dir, target.replaceAll('\\', '/'));
           const relative = path.relative(root, abs);
@@ -93,7 +94,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
             byPath.set(key(abs), header);
           }
           if (!header) { if (external || options.allowLocalIncludes) options.onMissingInclude?.(abs); continue; }
-          const changed = processFile(header, { get: name => scope.get(name, line) });
+          const changed = processFile(header, { get: name => scope.get(name, line) }, macrosOnly);
           if (changed) for (const [name, def] of changed) {
             if (def) scope.set(name, def, line);
             else scope.delete(name, line);
@@ -102,15 +103,15 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
         }
       }
       const implicit = [];
-      if (!file.isHeader) forced.forEach((target, i) => {
+      if (!file.isHeader) forced.forEach(([target, macrosOnly], i) => {
         const entry = { file: file.rel, target, line: i - forced.length };
-        entry.resolved = include(entry, true, root) ?? null;
+        entry.resolved = include(entry, true, root, macrosOnly) ?? null;
         implicit.push(entry);
       });
       const result = preprocess(input.tokens, scope, file.rel, {
         expand, pruneInactive: true, onInclude: include, onPragmaOnce: () => once.add(file),
       });
-      if (file.isHeader) rememberHeader(file, input, result, scope);
+      if (file.isHeader) rememberHeader(file, input, macroOnly ? { ...result, tokens: [] } : result, scope);
       else {
         result.includes.unshift(...implicit);
         visit(file, input, result, scope);

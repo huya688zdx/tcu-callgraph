@@ -810,7 +810,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
     ...(pruneInactive ? {
       pruneInactive: true, includeDirs: parserOptions.includeDirs || [], includeOptions: parserOptions.includeOptions,
-      forcedIncludes: parserOptions.forcedIncludes || [], macroArgs: parserOptions.macroArgs,
+      forcedIncludes: parserOptions.forcedIncludes || [], macroIncludes: parserOptions.macroIncludes,
+      macroArgs: parserOptions.macroArgs,
     } : {}),
   };
 
@@ -825,13 +826,13 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:6';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:7';
     return JSON.stringify([
-      'builtin:13',
+      'builtin:14',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
-      options.includeOptions, options.macroArgs,
+      options.includeOptions, options.macroArgs, options.macroIncludes,
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),

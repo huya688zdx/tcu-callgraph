@@ -185,3 +185,22 @@ test('覆盖整个结构体成员的初始化会清除被省略的旧回调', t 
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'bar']);
 });
+
+test('切换联合体成员会作废重叠的回调槽，保留同一成员的其他字段', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-union-override-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { struct { Fn x; Fn y; } pair; Fn single; } u; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void baz(void) {}',
+    'static const Ops switched = { .u.pair.x = foo, .u.pair.y = bar, .u.single = baz };',
+    'static const Ops unchanged = { .u.pair.x = foo, .u.pair.y = bar };',
+    'void call(void) { switched.u.pair.x(); switched.u.single(); unchanged.u.pair.x(); unchanged.u.pair.y(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = name => model.fnptrTables.find(entry => entry.name === name);
+  assert.deepEqual(table('switched').map, { 'u.single': 'baz' });
+  assert.deepEqual(table('unchanged').map, { 'u.pair.x': 'foo', 'u.pair.y': 'bar' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'foo', 'bar']);
+});

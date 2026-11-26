@@ -645,3 +645,25 @@ test('流程图接口读取构建配置选中的外部 SDK 头与嵌套头', asy
     assert.ok(result.nodes.some(node => node.callees?.some(callee => callee.name === 'selected')));
   }
 });
+
+test('构建配置在强制包含前处理 -imacros，且丢弃宏文件子树的声明', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -include startup.h -I flags -imacros options.h -c main.c\n');
+  write(root, 'flags/options.h', '#include "nested.h"\nstatic void ignored(void) {}\n');
+  write(root, 'flags/nested.h', '#define FEATURE 1\nstatic void also_ignored(void) {}\n');
+  write(root, 'startup.h', '#if FEATURE\n#define ACTIVE 1\n#endif\nstatic void startup(void) {}\n');
+  write(root, 'main.c', '#if ACTIVE\nvoid correct(void) {}\n#else\nvoid wrong(void) {}\n#endif\n');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  const builtin = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(sorted(builtin.functions.map(fn => fn.name)), ['correct', 'startup']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [{ args }] = readCompileCommands(root, compileCommandsPath);
+  assert.deepEqual(args.slice(args.indexOf('-imacros')), ['-imacros', 'options.h', '-include', path.join(root, 'startup.h')]);
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(sorted(clang.functions.map(fn => fn.name)), ['correct', 'startup']);
+  }
+});

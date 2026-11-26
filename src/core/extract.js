@@ -531,17 +531,22 @@ function nextInitPath(path, root) {
   return null;
 }
 
+function appendInitSlot(slot, part) {
+  return slot + (typeof part === 'string' ? (slot ? '.' : '') + part : formatInitIndex(part));
+}
+
+function clearInitSlot(slot, table, status) {
+  delete table.map[slot];
+  delete table.slotLines[slot];
+  table.slots.delete(slot);
+  status.unresolvedSlots.delete(slot);
+}
+
 function clearAggregateSlots(slot, table, status) {
-  const remove = key => {
-    delete table.map[key];
-    delete table.slotLines[key];
-    table.slots.delete(key);
-    status.unresolvedSlots.delete(key);
-  };
-  remove(slot);
+  clearInitSlot(slot, table, status);
   if (!status.initializedAggregates.delete(slot)) return;
   for (const key of table.slots.keys()) {
-    if (key.startsWith(slot + '.') || key.startsWith(slot + '[')) remove(key);
+    if (key.startsWith(slot + '.') || key.startsWith(slot + '[')) clearInitSlot(key, table, status);
   }
 }
 
@@ -599,9 +604,22 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     }
     const slotPath = [...prefix, ...parts];
     let slot = '';
+    let parent = layout;
     for (let i = 0; i < slotPath.length; i++) {
       const part = slotPath[i];
-      slot += typeof part === 'string' ? (slot ? '.' : '') + part : formatInitIndex(part);
+      if (i >= prefix.length) {
+        if (parent?.union && typeof part === 'string') {
+          // union 成员重叠。切换成员后，前一个成员的值不再能确定调用目标。
+          clearInitSlot(slot, table, status);
+          const previous = status.activeUnionMembers.get(slot);
+          if (previous !== undefined && previous !== part) {
+            clearAggregateSlots(appendInitSlot(slot, previous), table, status);
+          }
+          status.activeUnionMembers.set(slot, part);
+        }
+        parent = initChild(parent, part);
+      }
+      slot = appendInitSlot(slot, part);
       if (i < slotPath.length - 1) status.initializedAggregates.add(slot);
     }
     // 新的聚合初始化覆盖整个子对象，包括没有显式列出的成员。
@@ -726,8 +744,10 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         if (tokens[open].v === '}') depth++;
         if (tokens[open].v === '{') depth--;
       }
-      if (['struct', 'union'].includes(tokens[open]?.v) || ['struct', 'union'].includes(tokens[open - 1]?.v)) {
+      const kind = ['struct', 'union'].includes(tokens[open]?.v) ? tokens[open].v : tokens[open - 1]?.v;
+      if (['struct', 'union'].includes(kind)) {
         rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration), macros);
+        rootShape.union = kind === 'union';
         for (let j = open; j >= 0 && ![';', '{', '}'].includes(tokens[j].v); j--) {
           if (['static', 'STATIC'].includes(tokens[j].v)) isStatic = true;
           if (['const', 'CONST'].includes(tokens[j].v)) isConst = true;
@@ -752,6 +772,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         enumNames,
         unresolvedSlots: new Set(),
         initializedAggregates: new Set(),
+        activeUnionMembers: new Map(),
         isFunction: token => isFunction(token, file, functionId),
       };
       const layout = initializerLayout(rootShape, file, lookup);
