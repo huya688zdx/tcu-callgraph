@@ -1,0 +1,32 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { lex } from '../src/core/lexer.js';
+import { expandSeq, preprocess } from '../src/core/preproc.js';
+import { scanCalls } from '../src/core/extract.js';
+
+test('变参参与普通 ## 拼接时，只拼接交界处的两个 token', () => {
+  const macros = new Map();
+  preprocess(lex(`#define CALL(...) run_ ## __VA_ARGS__
+#define NAMED(rest...) run_ ## rest
+#define CAT(a, b) a ## b
+#define WRAP(prefix, ...) wrap(prefix ## __VA_ARGS__)`), macros, 'test.c');
+  const expand = (source) => expandSeq(lex(source), macros).map((token) => token.v);
+  assert.deepEqual(expand('CALL(A)()'), ['run_A', '(', ')']);
+  assert.deepEqual(expand('NAMED(A(), other())'), ['run_A', '(', ')', ',', 'other', '(', ')']);
+  assert.deepEqual(expand('WRAP(, run_A())'), ['wrap', '(', 'run_A', '(', ')', ')']);
+  assert.deepEqual(expand('WRAP(run_A)'), ['wrap', '(', 'run_A', ')']);
+  assert.deepEqual(expand('CAT(run_, A())'), ['run_A', '(', ')']);
+  assert.deepEqual(expandSeq(lex('CAT(1, 2) CAT(+, =)'), macros).map(({ t, v }) => [t, v]),
+    [['num', '12'], ['punct', '+=']]);
+  const calls = scanCalls(lex('CALL(A)()'), { macros }, []);
+  assert.deepEqual(calls.map(({ callee, kind, via }) => [callee, kind, via]), [['run_A', 'macro', 'CALL']]);
+});
+
+test('GNU 逗号拼接只在变参省略时移除逗号', () => {
+  const macros = new Map();
+  preprocess(lex('#define LOG(tag, ...) notify(tag, ## __VA_ARGS__)'), macros, 'test.c');
+  const expand = (source) => expandSeq(lex(source), macros).map((token) => token.v);
+  assert.deepEqual(expand('LOG(tag)'), ['notify', '(', 'tag', ')']);
+  assert.deepEqual(expand('LOG(tag,)'), ['notify', '(', 'tag', ',', ')']);
+  assert.deepEqual(expand('LOG(tag, a(), b)'), ['notify', '(', 'tag', ',', 'a', '(', ')', ',', 'b', ')']);
+});

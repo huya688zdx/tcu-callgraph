@@ -232,45 +232,47 @@ function substitute(m, args, siteTok) {
     return joined;
   };
   const isVa = (name) => Boolean(m.variadic && name === (m.variadicName || '__VA_ARGS__'));
+  let operandStart = 0;
   for (let i = 0; i < body.length; i++) {
     const tk = body[i];
 
+    if (tk.v === '##' && body[i + 1]) {
+      const right = body[i + 1];
+      const variadic = isVa(right.v);
+      const param = m.params.indexOf(right.v);
+      let rightTokens = [right];
+      if (variadic) rightTokens = vaTokens();
+      else if (param >= 0) rightTokens = args[param] || [];
+      let tail = 0;
+      if (variadic && body[i - 1]?.v === ',') {
+        // GNU 扩展仅对宏体中的字面逗号生效，显式传入空实参时保留逗号。
+        if (args.length <= m.params.length) out.pop();
+      } else if (rightTokens.length) {
+        // 空左实参不产生 token，不能取走宏体中更早的标点。
+        const left = out.length > operandStart ? out.pop() : null;
+        const first = rightTokens[0];
+        const value = (left?.v || '') + first.v;
+        out.push({
+          t: left ? (lex(value)[0]?.t || left.t) : first.t,
+          v: value, line: siteTok.line, col: siteTok.col, cond: siteTok.cond, macroOrigins,
+        });
+        tail = 1;
+      }
+      for (let j = tail; j < rightTokens.length; j++) {
+        const t = rightTokens[j];
+        out.push({ ...t, line: siteTok.line, col: siteTok.col,
+          cond: siteTok.cond ?? t.cond, macroOrigins: t.macroOrigins || [] });
+      }
+      i++;
+      continue;
+    }
+    operandStart = out.length;
     if (tk.v === '#' && body[i + 1] && (m.params.includes(body[i + 1].v) || isVa(body[i + 1].v))) {
       const targetName = body[i + 1].v;
       const argToks = isVa(targetName) ? vaTokens() : (args[m.params.indexOf(targetName)] || []);
       out.push({
         t: 'str',
         v: `"${stringifyTokens(argToks)}"`,
-        line: siteTok.line,
-        col: siteTok.col,
-        cond: siteTok.cond,
-        macroOrigins,
-      });
-      i++;
-      continue;
-    }
-
-    if (tk.v === '##' && out.length && body[i + 1]) {
-      const right = body[i + 1];
-      if (isVa(right.v)) {
-        const va = vaTokens();
-        if (!va.length) {
-          if (out[out.length - 1]?.v === ',') out.pop();
-        } else {
-          for (const t of va) {
-            out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond, macroOrigins: t.macroOrigins || [] });
-          }
-        }
-        i++;
-        continue;
-      }
-      const left = out.pop();
-      const rv = m.params.includes(right.v)
-        ? (args[m.params.indexOf(right.v)] || []).map((t) => t.v).join('')
-        : right.v;
-      out.push({
-        t: 'id',
-        v: left.v + rv,
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
