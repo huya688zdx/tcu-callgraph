@@ -907,6 +907,22 @@
     box-shadow: 0 18px 44px rgba(24, 24, 22, 0.14), 0 2px 8px rgba(24, 24, 22, 0.06);
     overflow: hidden; contain: layout style paint; transform: translateZ(0);
   }
+  #aiDrawer.resizing { user-select: none; transition: none; }
+  .ai-resize-handle {
+    position: absolute; top: 0; left: 0; bottom: 0; width: 7px; z-index: 8;
+    cursor: ew-resize; touch-action: none; background: transparent;
+    transition: background-color .14s ease;
+  }
+  .ai-resize-handle::after {
+    content: ""; position: absolute; top: 50%; left: 2px; width: 3px; height: 34px;
+    transform: translateY(-50%); border-radius: 999px;
+    background: rgba(31, 31, 29, 0.16); opacity: 0; transition: opacity .14s ease, background-color .14s ease;
+  }
+  .ai-resize-handle:hover, #aiDrawer.resizing .ai-resize-handle { background: rgba(24, 95, 165, 0.08); }
+  .ai-resize-handle:hover::after, #aiDrawer.resizing .ai-resize-handle::after { opacity: 1; background: #185FA5; }
+  @media (max-width: 480px) {
+    .ai-resize-handle { display: none; }
+  }
   #aiDrawer.show { display: flex; animation: aiDrawerIn .18s cubic-bezier(.16, 1, .3, 1); }
   @keyframes aiDrawerIn {
     from { opacity: 0; transform: translateX(8px) scale(.99); }
@@ -1021,7 +1037,7 @@
   }
   #aiDrawer #aiGoConfig:hover { background: #FEF2D1; }
 
-  .ai-msg { margin: 0; font-size: 13px; line-height: 1.66; overflow-wrap: anywhere; }
+  .ai-msg { margin: 0; min-width: 0; max-width: 100%; box-sizing: border-box; font-size: 13px; line-height: 1.66; overflow-wrap: anywhere; }
   .ai-msg.user {
     align-self: flex-end; max-width: 90%;
     background: #F3F2EC; border: 1px solid rgba(31, 31, 29, 0.07); color: #1F1F1D;
@@ -1035,16 +1051,48 @@
   .ai-msg.assistant:not(.error):last-child { border-bottom: 0; padding-bottom: 2px; }
   .ai-msg.error {
     background: #FEF2F2; border: 1px solid #FECACA; border-radius: 10px;
-    padding: 9px 12px; color: #991B1B;
+    padding: 9px 12px; color: #991B1B; overflow-wrap: anywhere; word-break: break-word;
   }
   .ai-chat-status.err { color: #B42318; }
-  .ai-msg-text { white-space: normal; word-break: break-word; }
+  .ai-msg-text { min-width: 0; max-width: 100%; white-space: normal; word-break: break-word; overflow-wrap: anywhere; }
   .ai-msg-text:empty, .ai-steps:empty { display: none; }
   .ai-msg-text code {
     font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
     background: #F4F3EE; border: 1px solid #E7E4DC; color: #1B3A5C;
     padding: 1px 5px; border-radius: 5px; font-size: 0.89em;
   }
+  .ai-msg-text .ai-md-h {
+    margin: 9px 0 5px; font-size: 13px; font-weight: 600; color: #1B1B19; line-height: 1.4;
+  }
+  .ai-msg-text .ai-md-h:first-child { margin-top: 0; }
+  .ai-msg-text .ai-md-pre {
+    margin: 7px 0; padding: 8px 10px; border-radius: 8px;
+    background: #F7F6F2; border: 1px solid #E5E2D9;
+    overflow-x: auto; max-width: 100%; font-size: 11.5px; line-height: 1.5;
+  }
+  .ai-msg-text .ai-md-pre code { background: transparent; border: 0; padding: 0; font-size: inherit; color: #1F2937; }
+  .ai-msg-text .ai-md-quote {
+    margin: 6px 0; padding: 4px 10px; border-left: 3px solid #9DC5EC;
+    background: #F7FAFD; color: #4A5568; border-radius: 0 6px 6px 0;
+  }
+  .ai-table-wrap {
+    width: 100%; max-width: 100%; overflow-x: auto; margin: 8px 0;
+    border: 1px solid #E2DFD6; border-radius: 8px; background: #FFFFFF;
+  }
+  .ai-md-table {
+    width: 100%; border-collapse: collapse; font-size: 12px; line-height: 1.5; text-align: left;
+  }
+  .ai-md-table th, .ai-md-table td {
+    padding: 6px 9px; border-bottom: 1px solid #ECEAE2; vertical-align: top;
+    overflow-wrap: anywhere; word-break: break-word;
+  }
+  .ai-md-table th + th, .ai-md-table td + td { border-left: 1px solid #F0EEE7; }
+  .ai-md-table thead th {
+    background: #F6F5F0; font-weight: 600; color: #2D2C28; white-space: nowrap;
+  }
+  .ai-md-table tbody tr:nth-child(even) { background: #FCFCFA; }
+  .ai-md-table tbody tr:hover { background: #F2F7FC; }
+  .ai-md-table tbody tr:last-child td { border-bottom: 0; }
   #aiDrawer .ai-sym-link {
     display: inline; height: auto; padding: 0 5px; margin: 0 1px;
     font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
@@ -1060,14 +1108,16 @@
   .ai-msg-text ul, .ai-msg-text ol { margin: 5px 0 7px; padding-left: 19px; }
   .ai-msg-text li + li { margin-top: 3px; }
 
-  .ai-steps { display: grid; gap: 5px; margin-bottom: 10px; }
+  .ai-steps { display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; margin-bottom: 10px; max-width: 100%; }
   .ai-step {
+    min-width: 0; max-width: 100%; overflow: hidden; box-sizing: border-box;
     padding: 6px 9px; border-radius: 8px; background: #FAFAF7; border: 1px solid #ECEAE2;
     color: #4A4945; font-size: 11.5px;
   }
   .ai-step.err { border-color: #F4C7C7; background: #FFF8F8; }
-  .ai-step-head, .ai-step-result { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ai-step.blocked { border-color: #E7C87E; background: #FFFBF0; }
   .ai-step-head {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
     display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #363532;
   }
@@ -1077,11 +1127,18 @@
   }
   .ai-step.ok .ai-step-head::before { background: #1F8A4C; animation: none; }
   .ai-step.err .ai-step-head::before { background: #C83232; animation: none; }
+  .ai-step.blocked .ai-step-head::before { background: #D97706; animation: none; }
   @keyframes aiStepPulse {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: .4; transform: scale(.82); }
   }
-  .ai-step-result { margin: 2px 0 0 13px; color: #75726B; font-size: 11px; }
+  .ai-step-result {
+    margin: 3px 0 0 13px; color: #75726B; font-size: 11px; line-height: 1.45;
+    white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .ai-step.err .ai-step-result { color: #991B1B; }
+  .ai-step.blocked .ai-step-result { color: #8A5306; }
 
   .ai-think {
     margin: 0 0 9px; padding: 6px 10px; border-radius: 8px;
@@ -2012,6 +2069,7 @@
   </div>
 
   <div id="aiDrawer" aria-label="AI 助手">
+    <div id="aiResizeHandle" class="ai-resize-handle" title="左右拖动调整 AI 助手宽度（双击恢复默认）" aria-label="调整 AI 助手宽度" role="separator" aria-orientation="vertical"></div>
     <div class="ai-drawer-head">
       <h2 data-i18n="ai.assistantTitle">AI 助手</h2>
       <div class="ai-tabs" role="tablist">

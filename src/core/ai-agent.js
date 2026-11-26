@@ -259,7 +259,8 @@ export const AGENT_TOOLS = [
             required: ['from', 'to'],
           },
         },
-        addToCanvas: { type: 'boolean', description: '是否同时将端点函数加入当前画布（默认 true）' },
+        addToCanvas: { type: 'boolean', description: '是否同时将端点函数及上游调用链加入当前画布（默认 true）' },
+        includeTasks: { type: 'boolean', description: 'addToCanvas 为 true 时是否自动沿调用方（from）补齐上游 TASK/ISR 及上级调用者（默认 true）' },
         remove: { type: 'boolean', description: '为 true 时移除已添加的推断调用边' },
         reason: { type: 'string', description: '画布提示栏显示的简短理由' },
       },
@@ -590,9 +591,9 @@ function buildSystemPrompt(context, promptToolMode) {
     '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
     '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
     '10. 指代锚定规则（最高优先级）：当本轮消息附带「本轮画布当前选中对象」时，任何指代词（“这个函数”、“它”、“这个变量”、“这条线”、“当前对象”）或未显式点名其他符号的提问，必须严格锚定到本轮画布选中对象的完整 ID、端点及文件路径；严禁因上一轮回复刚提过其他函数/连线（近因偏差）而把目标换成上轮对象。仅当用户本轮明确点名其他符号时，才以用户点名为准。',
-    '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径（如上轮提过的某条调用链或其他相关函数）当成本轮隐含需求去追查或写入画布。回答“为什么没有上游调用链/为什么未连线/这个函数做什么”等解释排查类问题时，只使用只读工具（read_function、trace_upstream、find_symbols），不得擅自修改画布。',
+    '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径当成本轮隐含需求去追查或写入画布。纯解释类提问（“为什么没有/这个函数做什么”）只使用只读工具回答；如果用户反馈画布有问题（如“这一块有点问题/不对/漏了/乱了”）但未指明具体改法或尚未选中目标，先只读排查定位问题，再用 ask_user 给出具体修复方案征询用户确认，不要直接失败或盲目改动。',
     '12. 整理画布布局时：用户要求“整理画布/排版/排整齐/减少交叉”时优先调用 arrange_canvas({ action: "tidy", direction: "LR" })（或 "TB"）；移动/对齐整个文件框或目录容器用 move_group / align_groups；精调单个节点时先 inspect 再 move/align。附有画布截图时结合图像与坐标操作。',
-    '13. 间接调用链（函数指针、1D/2D 常量结构体数组如 z[idx]() / e[r][c]()、回调注册、状态机/中断派发、复杂宏）：当静态图缺少调用链或用户问“为什么找不到上游/调用关系”时，先用 inspect_indirect_calls 和 read_source 核查实际源码与分派表初始化代码，按代码逻辑精准判断真正会调用哪些目标。纯排查提问时只解释查证结果；用户要求补齐/加入调用链（或确认后），调用 add_call_edge 只加入经源码确认的具体边（切勿把无关的表项全量写入）。',
+    '13. 间接调用链（静态结构体、函数指针、1D/2D 常量结构体数组如 z[idx]() / e[r][c]() / s_tbl[i].fn()、回调注册、状态机/中断派发、复杂宏）：当用户要求将函数、调用链或 Git 改动加入画布，且源码核实存在静态图遗漏的静态结构体或间接调用时，不要只口头回答“静态解析没有”就结束，更不要只用 add_to_canvas 孤立加入目标节点！请在同一轮用 inspect_indirect_calls 和 read_source 核实确切的 from -> to 调用关系后，直接调用 add_call_edge({ edges: [{ from, to, via, reason }], addToCanvas: true, includeTasks: true })，一次性持久化连线、把端点连上画布并自动补齐调用方（from）的上游 TASK/上级调用链（仅限经源码确认的具体目标，切勿把无关表项全量写入）。仅当用户纯问原因且未要求构图/修改时，才只做只读解释。',
     '14. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
     '15. 除调用 ask_user 外，每次普通最终回复的末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（给出 2–3 个结合本轮函数/变量/发现的后续建议）。',
     '',
@@ -1353,13 +1354,17 @@ export async function runAiAgent({
     /待确认选项|已提供选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
   const requiredTool = removal ? 'remove_from_canvas'
     : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
-  const hasEditIntent = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u.test(userText);
+  const pureWhyWithoutAction = /(?:为什么(?:没有|没|不)|为何(?:没有|没|不)|怎么(?:没有|没|不))/u.test(userText) &&
+    !/(?:请|帮我|给我|把.+?(?:加|连|补|改|修|移|删|排|调)|直接|顺便|顺手|同时|并且|并把)/u.test(userText);
+  const hasEditIntent = !pureWhyWithoutAction && /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u.test(userText);
+  const hasProblemReport = /(?:有点问题|有问题|不对|错了|漏了|少了|缺了|没连上|没加上|乱了|重了|重叠|挤在一起)/u.test(userText);
   const readOnlyQuestion = !requiredTool && !hasEditIntent && (
+    pureWhyWithoutAction ||
     /(?:为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|为何没有|为什么没有|为什么会|怎么没有)/u.test(userText) ||
     /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText)
   );
   const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
-  const unanchoredDeictic = !requiredTool && !hasSelectionContext &&
+  const unanchoredDeictic = !requiredTool && !hasSelectionContext && !hasProblemReport &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
     !/[A-Za-z_][A-Za-z0-9_]{2,}/u.test(userText);
   const isCanvasWriteTool = (call) =>
@@ -1647,13 +1652,13 @@ export async function runAiAgent({
           output = {
             ok: false,
             blocked: true,
-            error: '用户本轮只是排查/解释类提问，并未要求修改画布。禁止擅自调用写工具修改画布；请只使用 read_function / trace_upstream / find_symbols 只读查证后回答，若确实需要修改画布请先调用 ask_user 征询用户确认。',
+            error: '当前属于排查/解释类提问，尚未明确确认直接改图。请立即调用 ask_user 简述你的发现和拟修改方案，提供「确认执行修改 / 仅查看不修改」选项让用户决定。',
           };
-        } else if (unanchoredDeictic && isCanvasWriteTool(call)) {
+        } else if ((unanchoredDeictic || (hasProblemReport && !hasEditIntent && !hasSelectionContext)) && isCanvasWriteTool(call)) {
           output = {
             ok: false,
             blocked: true,
-            error: '当前画布未选中任何对象，且用户提问仅使用指代词而未明确指名具体函数/变量，指代不明。禁止直接修改画布，请先调用 ask_user 向用户确认目标对象。',
+            error: '尚未确认要修改画布的具体区域或方案。请立即调用 ask_user 向用户列出你发现的问题与修复选项，待用户确认后再修改画布。',
           };
         } else {
           output = await executeTool(call.name, call.arguments || {});
@@ -1664,8 +1669,9 @@ export async function runAiAgent({
       signal?.throwIfAborted();
       const summary = summarizeToolResult(call.name, output);
       const digest = summarizeToolDigest(call.name, call.arguments, output);
-      toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, summary, digest });
-      onEvent({ type: 'tool_end', name: call.name, ok: output?.ok !== false, summary, digest });
+      const blocked = Boolean(output?.blocked);
+      toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
+      onEvent({ type: 'tool_end', name: call.name, ok: output?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
 
       const layoutBudget = Math.max(12000, Math.min(72000, config.contextWindow * 2));
       const clipped = clipToolOutput(output, call.name === 'arrange_canvas' ? layoutBudget : 12000);

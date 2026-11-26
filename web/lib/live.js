@@ -76,7 +76,7 @@ async function flushReload() {
   pendingCompose = null;
   try {
     if (compose && compose.page.projectId === state.view?.projectId &&
-        compose.page.comparisonId === state.view?.comparison?.id) {
+        (compose.page.comparisonId ?? null) === (state.view?.comparison?.id ?? null)) {
       const { page, reason } = compose;
       const prevNodes = state.view?.nodes || [];
       const prevIds = new Set(prevNodes.map((node) => node.id));

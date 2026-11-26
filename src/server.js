@@ -2187,7 +2187,7 @@ async function buildView(
   const recommendations = (nodes, edges) => g.root ? {
     recommendations: previewRecommendations(g.root, model, COMPARISON, viewOverlay.deleted.nodes, nodes, edges),
   } : {};
-  // 局部范围补当前已显示节点之间的关系，不带入邻接函数。
+  // 局部范围补当前已显示节点之间的关系，不带入邻接函数；同时补齐当前可见节点之间经 AI 核实的推断调用边。
   const allowedIds = new Set(nodeMap.keys());
   for (const scope of cleanExpansions) {
     const part = subgraph(model, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
@@ -2195,6 +2195,11 @@ async function buildView(
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
       if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
     }
+  }
+  for (const e of model.edges) {
+    if (!e.inferred || !allowedIds.has(e.from) || !allowedIds.has(e.to)) continue;
+    const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
+    if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
   }
   truncated ||= g.nodes.length > 600;
   if (g.nodes.length > 600) {
@@ -4131,6 +4136,7 @@ export const server = http.createServer(async (req, res) => {
           if (!rawEdges.length) return { ok: false, error: 'edges 不能为空' };
           const removing = args.remove === true;
           const addToCanvas = args.addToCanvas !== false;
+          const includeTasks = args.includeTasks !== false;
           const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
           const resolvedEdges = [];
           const ambiguous = [];
@@ -4167,58 +4173,81 @@ export const server = http.createServer(async (req, res) => {
           }
           const currentList = loadInferredEdges(PROJECT.id);
           let nextList;
+          let newlyAddedCount = 0;
+          let alreadyExistedCount = 0;
           if (removing) {
             const rmSet = new Set(resolvedEdges.map(e => `${e.from}|${e.to}`));
             nextList = currentList.filter(e => !rmSet.has(`${e.from}|${e.to}`));
           } else {
             const byPair = new Map(currentList.map(e => [`${e.from}|${e.to}|${e.line}`, e]));
-            for (const e of resolvedEdges) byPair.set(`${e.from}|${e.to}|${e.line}`, e);
+            for (const e of resolvedEdges) {
+              const key = `${e.from}|${e.to}|${e.line}`;
+              if (byPair.has(key)) alreadyExistedCount++;
+              else newlyAddedCount++;
+              byPair.set(key, e);
+            }
             nextList = [...byPair.values()];
           }
           saveInferredEdges(PROJECT.id, nextList);
           applyInferredEdges(MODEL, PROJECT.id, nextList);
           S = stats(MODEL);
 
-          const review = reviewWriteResult();
+          let review = reviewWriteResult();
+          let canvasNodeCount = 0;
+          let upstreamCount = 0;
           if (!removing && addToCanvas) {
-            const page = latestPage() || {
-              projectId: PROJECT.id, comparisonId: null, roots: [], expansions: [], vars: [], hiddenVars: [],
-              up: 0, down: 0, group: true, groupMode: 'file', empty: true,
+            const fromIds = [...new Set(resolvedEdges.map((e) => e.from))];
+            const toIds = [...new Set(resolvedEdges.map((e) => e.to))];
+            const isAliveFn = (id) => {
+              const n = MODEL._index.byId.get(id);
+              return Boolean(n && n.kind !== 'var' && !n.external && !overlay.deleted.nodes[id]);
             };
-            const existingRoots = Array.isArray(page.roots) ? [...page.roots] : [];
-            const rootSet = new Set(existingRoots);
-            let addedNodes = false;
-            for (const e of resolvedEdges) {
-              for (const id of [e.from, e.to]) {
-                if (!rootSet.has(id)) {
-                  rootSet.add(id);
-                  existingRoots.push(id);
-                  addedNodes = true;
+            const aliveFrom = fromIds.filter(isAliveFn);
+            const aliveTo = toIds.filter(isAliveFn);
+            const endpointIds = [...new Set([...aliveFrom, ...aliveTo])];
+            if (endpointIds.length) {
+              // 复用 composeMcpView(mode:'add')，自动补齐调用方（from）的上游 TASK/上级调用链，并保留被调方（to）与连线
+              let composed = null;
+              if (includeTasks && aliveFrom.length) {
+                try {
+                  composed = composeMcpView({
+                    mode: 'add',
+                    changedFunctionIds: aliveFrom,
+                    functionIds: aliveTo.filter((id) => !aliveFrom.includes(id)),
+                    fallbackCallers: true,
+                    up: 0,
+                    down: 0,
+                    reason: reason || '补全间接调用链及上游调用者',
+                  });
+                } catch {
+                  composed = null;
                 }
               }
-            }
-            if (addedNodes) {
-              const key = 'ui.last-view.' + PROJECT.id;
-              const nextPage = {
-                ...page,
-                projectId: PROJECT.id,
-                comparisonId: null,
-                roots: existingRoots,
-                empty: false,
-                ts: Date.now(),
-              };
-              store.transaction(() => {
-                nextPage.revision = store.appendEvent(PROJECT.id, {
-                  op: 'view.compose',
-                  actor: 'ai',
-                  target: resolvedEdges[0].from,
-                  before: page,
-                  after: { ...nextPage, count: existingRoots.length, rootCount: existingRoots.length, reason: reason || '补全间接调用链', view: viewSnapshot(nextPage) },
-                });
-                store.setSetting(key, nextPage);
-              });
-              if (!review.updatedWhileReviewing) pageState = nextPage;
-              broadcastChange('view.compose', 'ai', { page: nextPage, reason: reason || '补全间接调用链' });
+              if (!composed) {
+                try {
+                  composed = composeMcpView({
+                    mode: 'add',
+                    changedFunctionIds: [],
+                    functionIds: endpointIds,
+                    up: 0,
+                    down: 0,
+                    reason: reason || '补全间接调用链',
+                  });
+                } catch {
+                  composed = null;
+                }
+              }
+              if (composed?.page) {
+                const visibleSet = new Set([
+                  ...(composed.page.roots || []),
+                  ...(composed.page.expansions || []).map((s) => s.root),
+                ]);
+                canvasNodeCount = visibleSet.size;
+                upstreamCount = Math.max(0, (composed.taskRoots?.length || 0) + (composed.upstreamFunctions?.length || 0));
+                if (composed.updatedWhileReviewing) review = { updatedWhileReviewing: true, reviewNote: composed.reviewNote };
+              } else {
+                broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
+              }
             } else {
               broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
             }
@@ -4230,6 +4259,10 @@ export const server = http.createServer(async (req, res) => {
             ok: true,
             removed: removing,
             addedCount: resolvedEdges.length,
+            newlyAddedCount,
+            alreadyExistedCount,
+            canvasNodeCount,
+            upstreamCount,
             edges: resolvedEdges,
             notFound,
             ...review,
