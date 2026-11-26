@@ -603,3 +603,70 @@ void shadow(Fn runtime) {
   assert.ok(model.externals.some(node => node.id === 'ext::api_only'));
   assert.ok(!model.fnptrTables.some(table => ['data', 'values'].includes(table.name)));
 });
+
+test('形参和块内指针按声明位置遮蔽分派表，离开块后恢复外层绑定', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-shadow-table-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef void (*Fn)(void);\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+static void file_fn(void) {}
+static void local_fn(void) {}
+static const Fn table[] = {file_fn};
+void param(const Fn *table) { table[0](); }
+void array_param(unsigned n, Fn table[n]) { table[0](); }
+void pointer(const Fn *other) { const Fn *table = other; table[0](); }
+void block(Fn *other) {
+  table[0]();
+  { Fn *table = other; table[0](); }
+  table[0]();
+}
+void nested(Fn *table) {
+  table[0]();
+  { const Fn table[] = {local_fn};
+    table[0](); { Fn *table = 0; table[0](); } table[0]();
+  }
+  table[0]();
+}
+void loop(Fn *other) {
+  for (Fn *table = other; table; table = 0) { table[0](); }
+  table[0]();
+  for (Fn *table = other; table; table = 0) if (other) table[0](); else table[0]();
+  for (Fn table[] = {local_fn}; other; other = 0) table[0]();
+  table[0]();
+}
+`);
+  const model = loadModel(dir);
+  const resolved = name => (model._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.callee);
+  for (const name of ['param', 'array_param', 'pointer']) assert.deepEqual(resolved(name), [], name);
+  assert.deepEqual(resolved('block'), ['file_fn', 'file_fn']);
+  assert.deepEqual(resolved('nested'), ['local_fn', 'local_fn']);
+  assert.deepEqual(resolved('loop'), ['file_fn', 'local_fn', 'file_fn']);
+  const unresolved = model.indirectCalls.filter(call => call.receiver === 'table');
+  assert.equal(unresolved.length, 10);
+  assert.ok(unresolved.every(call => !call.table && !call.candidates.length));
+});
+
+test('静态分派表仅在直接或间接包含其头文件的调用点可见', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-header-table-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const name of ['first', 'second']) {
+    fs.writeFileSync(path.join(dir, name + '.h'), `
+typedef struct { void (*run)(void); } Ops;
+static void target(void) {}
+static const Ops ops = {.run = target};
+`);
+  }
+  fs.writeFileSync(path.join(dir, 'wrapper.h'), '#include "second.h"\n');
+  fs.writeFileSync(path.join(dir, 'one.c'), '#include "first.h"\nvoid run(void) { ops.run(); }\n');
+  fs.writeFileSync(path.join(dir, 'two.c'), '#include "wrapper.h"\nvoid run(void) { ops.run(); }\n');
+  fs.writeFileSync(path.join(dir, 'three.c'), 'typedef struct { void (*run)(void); } Ops;\nextern Ops ops;\nvoid run(void) { ops.run(); }\n');
+  const model = loadModel(dir);
+  const targets = file => (model._index.outAdj.get(file + '::run') || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.to);
+  assert.deepEqual(targets('one.c'), ['first.h::target']);
+  assert.deepEqual(targets('two.c'), ['second.h::target']);
+  assert.deepEqual(targets('three.c'), []);
+  assert.deepEqual(model.indirectCalls.find(call => call.caller === 'three.c::run').candidates, []);
+});

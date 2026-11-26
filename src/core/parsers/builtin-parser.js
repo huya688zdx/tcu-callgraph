@@ -302,7 +302,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (!typedefHeadersByName.has(name)) typedefHeadersByName.set(name, []);
       typedefHeadersByName.get(name).push(rel);
     }
-    const localTableScopes = new Set();
+    const dispatchScopes = new Set();
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -318,10 +318,10 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       seenFnId.add(fn.id);
       const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
       const localTables = findFnPtrTables(body, rel, { functionId: fn.id, macros: fileMacros, pendingFields: pendingFieldInitializers });
-      if (localTables.size) localTableScopes.add(tokens[fn.bodyStart]);
       for (const table of localTables.values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
+      if (localTables.size || calls.some(call => call.receiver)) dispatchScopes.add(tokens[fn.bodyStart]);
       const record = { fn, calls, mentions: variableMentions(body) };
       functionRecords.push(record);
       // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
@@ -332,9 +332,10 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     for (const table of findFnPtrTables(tokens, rel, { macros: fileMacros, pendingFields: pendingFieldInitializers }).values()) {
       fnptrTablesList.push(table);
     }
-    collectDispatchDeclarations(tokens, localTableScopes, (declaration, scope, fileScope, isFunction) => {
+    collectDispatchDeclarations(tokens, dispatchScopes, binding => {
+      const { declaration } = binding;
       if (!dispatchDeclarations.has(declaration.v)) dispatchDeclarations.set(declaration.v, []);
-      dispatchDeclarations.get(declaration.v).push({ file: rel, declaration, scope, fileScope, isFunction, isHeader });
+      dispatchDeclarations.get(declaration.v).push({ ...binding, file: rel, isHeader });
     });
     for (const v of findGlobalVars(tokens, rel)) {
       // static 变量按文件区分；普通全局变量跨文件同名即同一个
@@ -457,20 +458,23 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   // 过滤并按文件/作用域索引函数指针分派表：
   // - 单结构体 `.field = fn` 保持原有兼容；
   // - 数组/嵌套表只保留可见的函数定义或原型，避免把普通常量数据表误认成函数指针表；
-  // - 同名 static 表严格按文件隔离，杜绝跨文件污染。
+  // - static 表只在本文件和包含其定义的翻译单元可见。
   const cleanedTables = [];
   const staticTablesByFile = new Map();
+  const headerTablesByName = new Map();
   const globalTablesByName = new Map();
   const localTablesByFunction = new Map();
   const tablesWithFilteredTargets = new Set();
+  const declarationAt = (name, file, location) => dispatchDeclarations.get(name)?.findLast(p =>
+    p.file === file && compareLocation(location, p.declaration) > 0 && (!p.scope.end || compareLocation(location, p.scope.end) < 0) &&
+    (!p.typeToCheck || isTypedefAt(file, p.typeToCheck.v, p.typeToCheck)));
   for (const raw of fnptrTablesList) {
     const filteredMap = {};
     const location = raw.declaration ?? { line: raw.line, col: Infinity };
     const params = byId.get(raw.functionId)?.params;
     for (const [slot, target] of Object.entries(raw.map)) {
       const declarations = dispatchDeclarations.get(target);
-      const local = declarations?.findLast(p => p.file === raw.file && compareLocation(location, p.declaration) > 0 &&
-        (!p.scope.end || compareLocation(location, p.scope.end) < 0));
+      const local = declarationAt(target, raw.file, location);
       if (local && !local.isFunction) continue;
       if ((!local || local.fileScope) && params?.includes(target)) continue;
       const isStructField = !slot.startsWith('[');
@@ -500,10 +504,15 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       const byName = localTablesByFunction.get(entry.functionId);
       if (!byName.has(entry.name)) byName.set(entry.name, []);
       // 同名局部数组即便全由运行时回调初始化，也会遮蔽外层表。
-      byName.get(entry.name).push({ entry: matchedSlots ? entry : null, declaration: raw.declaration, end: raw.scope.end });
+      const binding = dispatchDeclarations.get(entry.name)?.find(p => p.declaration === raw.declaration);
+      byName.get(entry.name).push({ entry: matchedSlots ? entry : null, declaration: raw.declaration, end: (binding?.scope || raw.scope).end });
     } else if (entry.isStatic) {
       if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
       staticTablesByFile.get(entry.file).set(entry.name, entry);
+      if (HDR_EXT.test(entry.file)) {
+        if (!headerTablesByName.has(entry.name)) headerTablesByName.set(entry.name, []);
+        headerTablesByName.get(entry.name).push(entry);
+      }
     } else {
       globalTablesByName.set(entry.name, entry);
     }
@@ -513,7 +522,18 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (!name) return null;
     const local = localTablesByFunction.get(fn.id)?.get(name)?.findLast(table =>
       compareLocation(call, table.declaration) >= 0 && (!table.end || compareLocation(call, table.end) < 0));
-    return local ? local.entry : staticTablesByFile.get(fn.file)?.get(name) || globalTablesByName.get(name) || null;
+    const binding = declarationAt(name, fn.file, call);
+    if (binding && !binding.fileScope && (!local || compareLocation(binding.declaration, local.declaration) > 0)) {
+      if (!binding.isExtern) return null;
+    } else {
+      if (local) return local.entry;
+      if (fn.params.includes(name)) return null;
+    }
+    const own = staticTablesByFile.get(fn.file)?.get(name);
+    if (own) return own;
+    const visible = headerTablesByName.get(name)?.filter(table => includesHeader(fn.file, table.file));
+    if (visible?.length) return visible.length === 1 ? visible[0] : null;
+    return globalTablesByName.get(name) || null;
   };
   const matchTableSlots = (table, indices = [], member = null) => {
     const matched = [];

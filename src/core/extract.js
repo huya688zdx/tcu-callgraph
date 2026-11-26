@@ -37,6 +37,24 @@ export function matchBrace(tokens, openIdx) {
   return tokens.length - 1;
 }
 
+/** 返回一条完整 C 语句后的下标，包括复合语句、else 分支和 do-while 尾部。 */
+export function statementEnd(tokens, i, end = tokens.length) {
+  const op = tokens[i]?.v;
+  if (op === '{') return matchBrace(tokens, i) + 1;
+  if (['if', 'for', 'while', 'switch'].includes(op) && tokens[i + 1]?.v === '(') {
+    const start = collectArgs(tokens, i + 1)[1];
+    const next = statementEnd(tokens, start, end);
+    return op === 'if' && tokens[next]?.v === 'else' ? statementEnd(tokens, next + 1, end) : next;
+  }
+  if (op === 'do') {
+    const next = statementEnd(tokens, i + 1, end);
+    if (tokens[next]?.v !== 'while' || tokens[next + 1]?.v !== '(') return next;
+    return Math.min(end, collectArgs(tokens, next + 1)[1] + 1);
+  }
+  while (i < end && tokens[i].v !== ';') i++;
+  return Math.min(i + 1, end);
+}
+
 /** 从 closeIdx 处的 ')' 反向找到匹配的 '(' */
 function matchParenBack(tokens, closeIdx) {
   let depth = 0;
@@ -96,12 +114,11 @@ function isKnRDecls(tokens, from, to) {
 /** 从一段参数 token 里取参数名，追加进 names（重名只留一个） */
 function pushParamName(names, toks) {
   if (!toks.length) return;
-  const ids = toks.filter((t) => t.t === 'id' && !TYPE_WORDS.has(t.v));
-  if (!ids.length) {
+  const name = declarationName(toks)?.v;
+  if (!name) {
     names.push('_');
     return;
   }
-  const name = ids[ids.length - 1].v;
   if (!names.includes(name)) names.push(name);
 }
 
@@ -285,31 +302,49 @@ function isStandardTypeName(name) {
   return standardTypeNames.has(name) || /^u?int(?:_least|_fast)?(?:8|16|32|64)_t$/.test(name);
 }
 
-/** 记录函数原型；仅在有局部分派表的函数内保留可能遮蔽目标的对象声明。 */
-export function collectDispatchDeclarations(tokens, localTableScopes, record) {
+/** 记录函数原型，以及分派表初始化或调用所在函数中的局部对象声明。 */
+export function collectDispatchDeclarations(tokens, dispatchScopes, record) {
   const scopes = [{ end: null, trackObjects: false }];
+  const recordStatement = (statement, scope, fileScope) => {
+    const [first, second] = statement;
+    const typePrefix = first?.t === 'id' && (TYPE_WORDS.has(first.v) || (!KEYWORDS.has(first.v) &&
+      (second?.t === 'id' || second?.v === '*')));
+    if (!typePrefix) return;
+    // 在块内，T *obj 同时也可能是乘法，等包含的头文件收齐后再确认 T 是否为类型。
+    const typeToCheck = !fileScope && second?.v === '*' && !TYPE_WORDS.has(first.v) && !isStandardTypeName(first.v) ? first : null;
+    const isExtern = statement.some(t => t.v === 'extern');
+    for (const part of splitAtTopLevel(statement)) {
+      const eq = part.findIndex(t => t.v === '=');
+      const declarator = eq < 0 ? part : part.slice(0, eq);
+      const name = declarationName(declarator);
+      if (!name || name === first) continue;
+      const isFunction = declarator[declarator.indexOf(name) + 1]?.v === '(';
+      if (isFunction || scope.trackObjects) record({ declaration: name, scope, fileScope, isFunction, typeToCheck, isExtern });
+    }
+  };
   let start = 0, hasParen = false;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
+    if (token.v === 'for' && scopes.at(-1).trackObjects && tokens[i + 1]?.v === '(') {
+      const body = collectArgs(tokens, i + 1)[1];
+      if (tokens[i + 2]?.t === 'id') {
+        const [initializer] = splitAtTopLevel(tokens.slice(i + 2, body - 1), ';');
+        if (initializer) recordStatement(initializer, { trackObjects: true, end: tokens[statementEnd(tokens, body) - 1] }, false);
+      }
+      start = body;
+      i = body - 1;
+      hasParen = false;
+      continue;
+    }
     if (token.v === '(') hasParen = true;
     if (![';', '{', '}'].includes(token.v)) continue;
     const scope = scopes.at(-1);
     const fileScope = scopes.length === 1;
     // 左花括号也可能开始初始化，此时声明名已经可见。
     if ((token.v === ';' || (token.v === '{' && tokens[i - 1]?.v === '=')) && (hasParen || scope.trackObjects)) {
-      const first = tokens[start], second = tokens[start + 1];
-      const typePrefix = first?.t === 'id' && (TYPE_WORDS.has(first.v) || (!KEYWORDS.has(first.v) &&
-        (second?.t === 'id' || (fileScope && second?.v === '*'))));
-      if (typePrefix) for (const part of splitAtTopLevel(tokens.slice(start, i))) {
-        const eq = part.findIndex(t => t.v === '=');
-        const declarator = eq < 0 ? part : part.slice(0, eq);
-        const name = declarationName(declarator);
-        if (!name || name === first) continue;
-        const isFunction = declarator[declarator.indexOf(name) + 1]?.v === '(';
-        if (isFunction || scope.trackObjects) record(name, scope, fileScope, isFunction);
-      }
+      recordStatement(tokens.slice(start, i), scope, fileScope);
     }
-    if (token.v === '{') scopes.push({ end: null, trackObjects: scope.trackObjects || localTableScopes.has(token) });
+    if (token.v === '{') scopes.push({ end: null, trackObjects: scope.trackObjects || dispatchScopes.has(token) });
     if (token.v === '}' && !fileScope) scopes.pop().end = token;
     start = i + 1;
     hasParen = false;
