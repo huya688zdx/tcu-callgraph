@@ -43,6 +43,7 @@ import { getParser, listParsers, resolveParserForTarget } from './core/parsers/r
 import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
 import { readBuildConfigFile, resolveBuildFile, scanBuildConfig, summarizeCproject, summarizeDotProject } from './core/build-inspect.js';
 import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from './core/build-config.js';
+import { resolveBuildProfileOptions } from './core/build-profile-options.js';
 import { scheduleConfig } from './core/tcu-schedule.js';
 import { applyDataflow, diffParserModels } from './core/parsers/ir.js';
 import {
@@ -145,25 +146,6 @@ const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => {
   }
   return buildProfileId ? { buildProfileId } : {};
 };
-function resolveBuildProfileOptions(scanRoot, parserId, rawOptions = {}, scanFiles = []) {
-  const opts = { ...(rawOptions || {}) };
-  if (!opts.buildProfileId || parserId === 'dot') return opts;
-  const discovered = discoverBuildProfiles(scanRoot);
-  const profile = discovered.profiles.find((p) => p.id === opts.buildProfileId);
-  if (!profile) {
-    delete opts.buildProfileId;
-    return opts;
-  }
-  if (parserId === 'clang-ast') {
-    const mat = materializeCompileCommands(scanRoot, profile, { files: scanFiles });
-    opts.compileCommandsPath = mat.compileCommandsPath;
-    if (opts.strictCompileCommands === undefined) opts.strictCompileCommands = true;
-  } else if (parserId === 'builtin') {
-    opts.activeFiles = selectProfileSourceFiles(profile, scanFiles);
-    opts.defines = profile.defines || [];
-  }
-  return opts;
-}
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
 async function compareProjects(...args) {

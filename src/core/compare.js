@@ -1,8 +1,11 @@
 /** 在总代码工程上应用局部 before/after 对照，分析定义差分与潜在影响。 */
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { buildIndex, rebuildIndex } from './index.js';
 import { comparisonFiles } from './compare-files.js';
+import { resolveBuildProfileOptions, selectedBuildProfile } from './build-profile-options.js';
+import { HDR_EXT } from './source-files.js';
 import { isScheduleFile, readScheduleFiles } from './tcu-schedule.js';
 import { buildDataflowIndex, dataflowFor } from './dataflow.js';
 import { getParser } from './parsers/registry.js';
@@ -163,6 +166,8 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
     throw new Error('总代码、修改前对照、修改后对照必须是三个不同的目录');
   }
   const snapshots = options.snapshots;
+  const profile = options.buildProfile === undefined
+    ? selectedBuildProfile(projectPath, options.parserOptions) : options.buildProfile;
   const { baseFiles, beforeFiles, afterFiles, mappings } = snapshots || comparisonFiles(projectPath, beforePath, afterPath);
   const scope = new Set([...beforeFiles.keys(), ...afterFiles.keys()]);
   if (!snapshots && !scope.size) throw new Error('对照目录中没有可解析的 C 文件或调度配置');
@@ -183,10 +188,26 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
       (isScheduleFile(rel) ? schedules : sources).set(rel, abs);
     }
     // 同一份 C/H 只分析一次；调度目录、来源映射和按模型缓存的周期仍按版本独立。
-    const model = reuse ? { ...reuse, _sourceFiles: sources } : await buildIndex(projectPath, sources, null, options);
+    let model;
+    if (reuse) {
+      model = { ...reuse, _sourceFiles: sources };
+    } else {
+      // Clang 在构建快照时会重映射工程路径，数据库中的源文件和包含目录须使用原工程坐标。
+      const files = profile ? [...sources.keys()].map(rel => ({
+        rel, abs: path.join(projectPath, rel), isHeader: HDR_EXT.test(rel),
+      })) : [];
+      const parserId = options.parserId || 'builtin';
+      const cacheDir = profile && parserId === 'clang-ast' ? fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compare-db-')) : null;
+      try {
+        const parserOptions = resolveBuildProfileOptions(projectPath, parserId, options.parserOptions, files, profile, cacheDir);
+        model = await buildIndex(projectPath, sources, null, { parserId, parserOptions });
+      } finally {
+        if (cacheDir) fs.rmSync(cacheDir, { recursive: true, force: true });
+      }
+    }
     model.scheduleConfig = readScheduleFiles(schedules);
     if (model.warnings.length) throw new Error(`部分源码未能完整读取，未发布比较结果：${model.warnings.map((w) => `${w.file}：${w.error}`).join('；')}`);
-    if (!snapshots && !model.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${model.root}`);
+    if (!snapshots && !profile && !model.files.some((f) => /\.(c|h)$/i.test(f.rel))) throw new Error(`目录中没有可解析的 C 文件：${model.root}`);
     if (model.files.some((f) => /\.(cc|cpp|hh|hpp)$/i.test(f.rel))) throw new Error('工程比较目前只支持 C 文件（.c / .h）');
     return model;
   };

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { compareProjects, fingerprint } from './compare.js';
+import { selectedBuildProfile } from './build-profile-options.js';
 import { decodeSource, listSourceFiles } from './index.js';
 import { addScheduleBytes, isScheduleFile, listScheduleFiles } from './tcu-schedule.js';
 
@@ -730,6 +731,8 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
   const includeUntracked = gitOptions.includeUntracked !== false;
   const repo = await locateRepo(projectPath);
   if (!repo.isRepo) throw new Error(repo.reason === 'gitUnavailable' ? '未找到 Git 可执行程序' : '当前工程不在 Git 工作区中');
+  const buildProfile = selectedBuildProfile(repo.root, compareOptions.parserOptions);
+  compareOptions = { ...compareOptions, buildProfile };
   const base = await resolveCommit(repo, baseRef);
   const target = targetRef === worktreeRef || targetRef === indexRef ? null : await resolveCommit(repo, targetRef);
   const before = await commitFiles(repo, base.sha);
@@ -761,7 +764,7 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
       return analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
     }
     const key = JSON.stringify([repo.repoRoot, repo.projectPrefix, baseRef, base.sha, targetRef, target?.sha,
-      worktree?.fingerprint, includeUntracked, parserId, compareOptions.parserOptions || null]);
+      worktree?.fingerprint, includeUntracked, parserId, compareOptions.parserOptions || null, buildProfile]);
     // INDEX 没有提交 SHA，需核对暂存对象。重命名结果也可能随 Git 配置变化。
     const validation = JSON.stringify([targetRef === indexRef ? [...after].sort() : null, changes,
       metadata.baseLabel, metadata.targetLabel]);

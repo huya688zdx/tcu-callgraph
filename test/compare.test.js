@@ -15,6 +15,60 @@ const requests = (srv) => ({
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json()),
 });
 
+test('目录比较按当前构建配置解析两侧，并为严格 Clang 重映射每侧的文件', async t => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compare-profile-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const [project, before, after] = ['project', 'before', 'after'].map(name => path.join(tmp, name));
+  for (const [version, dir] of [project, before, after].entries()) {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'active.c'), `#if ENABLE\nint active(void) { return ${version}; }\n#else\nint inactive(void) { return ${version}; }\n#endif\n`);
+    fs.writeFileSync(path.join(dir, 'other.c'), `int other(void) { return ${version}; }\n`);
+  }
+  fs.writeFileSync(path.join(project, 'Makefile'), 'all:\n\tcc -DENABLE=1 -c active.c\n');
+  const srv = await launchServer({ target: project });
+  t.after(srv.close);
+  const { post } = requests(srv);
+  const profileId = 'make::Makefile';
+  const selected = await post('/api/build-configs', { profileId, parserId: 'builtin' });
+  assert.equal(selected.ok, true, selected.error);
+  const result = await post('/api/compare', { beforePath: before, afterPath: after });
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.preview.candidates.map(node => node.id), ['active.c::active']);
+
+  const versions = [];
+  await compareProjects(project, before, after, { parserId: 'clang-ast', parserOptions: {
+    buildProfileId: profileId, strictCompileCommands: true,
+    execClang: async (file, args) => {
+      assert.equal(path.basename(file), 'active.c');
+      assert.notEqual(path.dirname(file), project);
+      assert.ok(args.includes('ENABLE=1'));
+      versions.push(fs.readFileSync(file, 'utf8').match(/return (\d+);/)[1]);
+      return { kind: 'TranslationUnitDecl', inner: [] };
+    },
+  } });
+  assert.deepEqual(versions, ['1', '2']);
+
+  // 修改前仅有其他配置的源文件，本次才首次加入选中配置的编译单元。
+  fs.unlinkSync(path.join(before, 'active.c'));
+  const added = 'void new_entry(void) {}';
+  fs.writeFileSync(path.join(after, 'active.c'), added);
+  const compiled = [];
+  const firstUnit = await compareProjects(project, before, after, { parserId: 'clang-ast', parserOptions: {
+    buildProfileId: profileId, strictCompileCommands: true,
+    execClang: async file => {
+      compiled.push(path.basename(file));
+      return { kind: 'TranslationUnitDecl', inner: [{
+        kind: 'FunctionDecl', id: 'added', name: 'new_entry', loc: { line: 1, offset: 5, tokLen: 9 },
+        range: { begin: { offset: 0, line: 1, tokLen: 4 }, end: { offset: added.length - 1, line: 1, tokLen: 1 } },
+        inner: [{ kind: 'CompoundStmt' }],
+      }] };
+    },
+  } });
+  assert.deepEqual(compiled, ['active.c']);
+  assert.deepEqual(firstUnit.beforeModel.functions, []);
+  assert.equal(firstUnit.model._index.byId.get('active.c::new_entry').change, 'added');
+});
+
 test('总代码加局部差分：保留对照外的调用者和读取者，退出仍回总代码工程', async (t) => {
   const result = await compareProjects(projectPath, beforePath, afterPath);
   assert.deepEqual(result.summary.functions, { existing: 5, modified: 1, added: 1, deleted: 1 });
