@@ -138,20 +138,20 @@ function screenRect(box, padding, camera = cam, dpr = window.devicePixelRatio ||
   return right > x && bottom > y ? { x, y, right, bottom } : null;
 }
 
-export function pulseAdded(nodes, edges) {
+export function pulseAdded(nodes, edges, { highlightMs = RECENT_HIGHLIGHT_MS, rippleMs = RECENT_RIPPLE_MS } = {}) {
   clearTimeout(recentTimer);
   const count = nodes.length + edges.length;
   const now = performance.now();
   const recent = count ? {
     nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
-    started: now, until: now + RECENT_HIGHLIGHT_MS, rippleUntil: now + RECENT_RIPPLE_MS,
+    started: now, until: now + highlightMs, rippleUntil: now + rippleMs, rippleDur: rippleMs,
   } : null;
   state.recent = recent;
   if (recent) recentTimer = setTimeout(() => {
     if (state.recent !== recent) return;
     state.recent = null;
     if (!document.hidden) draw({ geometryUnchanged: true });
-  }, RECENT_HIGHLIGHT_MS);
+  }, highlightMs);
   draw();
 }
 function scheduleDraw() {
@@ -1084,7 +1084,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
       ctx.fillText('NEW', bx + bw / 2, by + bh / 2);
     }
     if (collectingEffects && performance.now() < state.recent.rippleUntil) {
-      effects.push({ kind: 'ripple', box: n, started: state.recent.started, dur: RECENT_RIPPLE_MS, color: RECENT_COLOR });
+      effects.push({ kind: 'ripple', box: n, started: state.recent.started, dur: state.recent.rippleDur || RECENT_RIPPLE_MS, color: RECENT_COLOR });
     }
   }
   ctx.restore();

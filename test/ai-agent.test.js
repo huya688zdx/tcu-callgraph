@@ -1351,3 +1351,140 @@ test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者�
   assert.ok(shown.includes('src/common/step.c::common_step'), '被修改的共通函数应保留在画布');
   assert.ok(!shown.some((id) => id.includes('src/z144/')), '被排除的 src/z144 不应加入画布');
 });
+
+test('指代锚定防近因偏差、解释类提问禁止擅自改画布、多车型同名文件/函数强制询问', async (t) => {
+  // 1. 单元测试：turnUserText 紧贴当前提问锚定选中函数 a，历史轮次保留上轮选中 b，且解释提问拦截写工具
+  const seenRequests = [];
+  let executedWrite = false;
+  let step = 0;
+  const mockFetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    seenRequests.push(body);
+    step++;
+    if (step === 1) {
+      // 模型企图在用户问“为什么没有上游调用链”时擅自调用 add_to_canvas
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{ id: 'tc_write', type: 'function', function: { name: 'add_to_canvas', arguments: '{"functions":["func_b"]}' } }],
+          },
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: '已核查 `a.c::func_a`，它没有直接调用者。' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  const agentRes = await runAiAgent({
+    config: { baseUrl: 'http://127.0.0.1:1/v1', model: 'mock-local', toolMode: 'tools', maxTokens: 1024 },
+    prompt: '这个函数为什么没有上游的调用链条',
+    history: [
+      { role: 'user', text: '看一下这个函数', selectionSummary: '节点 b.c::func_b' },
+      { role: 'assistant', text: 'func_b 由 task_10ms 调用，另外还存在 extra_x -> extra_y 的链路。' },
+    ],
+    context: {
+      projectName: 'demo',
+      uiContext: { kind: 'node', id: 'a.c::func_a', name: 'func_a', file: 'a.c', line: 12 },
+    },
+    executeTool: async (name) => {
+      if (name === 'add_to_canvas') executedWrite = true;
+      return { ok: true };
+    },
+    fetchImpl: mockFetch,
+  });
+  assert.equal(executedWrite, false, '用户仅问“为什么没有上游调用链”时，运行时必须拦截写工具 add_to_canvas');
+  assert.equal(agentRes.toolLog[0].ok, false);
+  assert.match(agentRes.toolLog[0].summary, /排查\/解释类提问/);
+  const firstReqMsgs = seenRequests[0].messages;
+  assert.match(firstReqMsgs[1].content, /\[当时画布选中：节点 b\.c::func_b\]/, '历史用户轮次应保留当时的选中锚点');
+  assert.match(firstReqMsgs.at(-1).content, /\[本轮画布当前选中对象（指代最高优先级）\]/, '本轮用户消息必须紧贴注入当前选中对象');
+  assert.match(firstReqMsgs.at(-1).content, /节点 a\.c::func_a，a\.c:12/);
+  assert.match(firstReqMsgs.at(-1).content, /这个函数为什么没有上游的调用链条/);
+  assert.match(firstReqMsgs[0].content, /指代锚定规则|严格作用域边界/);
+
+  // 2. 端到端：多车型不同路径同名文件同名函数（z144/ctrl.c::calc_gear 与 z145/ctrl.c::calc_gear），模型无论猜选单个还是全选都必须拦截要求询问
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-dup-vehicle-'));
+  fs.mkdirSync(path.join(dir, 'z144'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'z145'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'z144', 'ctrl.c'), 'void calc_gear(void) {}\nvoid z144_run(void) { calc_gear(); }\n');
+  fs.writeFileSync(path.join(dir, 'z145', 'ctrl.c'), 'void calc_gear(void) {}\nvoid z145_run(void) { calc_gear(); }\n');
+
+  const capturedToolOutputs = [];
+  let llmTurn = 0;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      const lastTool = body.messages.findLast((m) => m.role === 'tool');
+      if (lastTool) capturedToolOutputs.push(JSON.parse(lastTool.content));
+      llmTurn++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (llmTurn === 1) {
+        // 情况 A：模型直接同时传入两个车型的同名函数且设 includeTasks: false
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ functions: ['z144/ctrl.c::calc_gear', 'z145/ctrl.c::calc_gear'], includeTasks: false }) } }],
+            },
+          }],
+        }));
+      } else if (llmTurn === 2) {
+        // 情况 B：模型不问用户，私自猜选 z144/ctrl.c::calc_gear 单个加入
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'c2', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ functions: ['z144/ctrl.c::calc_gear'], includeTasks: false }) } }],
+            },
+          }],
+        }));
+      } else {
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                id: 'c3',
+                type: 'function',
+                function: {
+                  name: 'ask_user',
+                  arguments: JSON.stringify({ question: 'calc_gear 存在多个车型版本，需要加入哪一个？', options: [{ label: 'z144' }, { label: 'z145' }, { label: '全部保留' }] }),
+                },
+              }],
+            },
+          }],
+        }));
+      }
+    });
+  });
+  await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+  const srv = await launchServer({ target: dir });
+  t.after(async () => {
+    await new Promise((r) => mockLlm.close(r));
+    await srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-dup', toolMode: 'tools', maxTokens: 4096 });
+  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '把 calc_gear 加入画布' }),
+  });
+  assert.equal(chatRes.status, 200);
+  const events = (await chatRes.text()).trim().split('\n').map(JSON.parse);
+  assert.ok(events.some((e) => e.type === 'question'), '多车型同名函数拦截后应转向 ask_user 询问');
+  assert.equal(capturedToolOutputs.length, 2);
+  assert.equal(capturedToolOutputs[0].needsVehicleChoice, true, '同时传入多车型同名函数必须拦截并要求询问');
+  assert.equal(capturedToolOutputs[1].needsVehicleChoice, true, '用户未指定车型时私自猜选单个车型版本也必须拦截');
+  assert.deepEqual(capturedToolOutputs[1].pathBranches.map((b) => b.prefix).sort(), ['z144', 'z145']);
+});

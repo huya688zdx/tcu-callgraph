@@ -2362,6 +2362,8 @@ export const server = http.createServer(async (req, res) => {
             .map((m) => ({
               role: m.role,
               text: String(m.text || '').slice(0, 8000),
+              ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
+                ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
               ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
               ...(Array.isArray(m.tools) && m.tools.length ? {
@@ -2742,69 +2744,145 @@ export const server = http.createServer(async (req, res) => {
         });
       };
 
-      // 检测改动/目标函数的上游调用链是否横跨多个车型/目录前缀（兼容任意嵌套深度，如 z145/ 或 src/z145/ 与 src/z144/），便于 AI 提前询问筛选。
-      const summarizeVehicleBranches = (model, fnIds) => {
-        const targetSet = new Set(fnIds);
-        const dirSegsOf = (file) => {
-          const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
-          return parts.length > 1 ? parts.slice(0, -1) : [];
-        };
-        const collectedNodes = []; // { id, file, segs, isTask }
-        const seenNode = new Set();
-        for (const id of targetSet) {
-          if (!model._index?.byId?.has(id)) continue;
-          try {
-            const trace = traceToTasks(model, id, { limit: 60 });
-            for (const chain of trace.upstreamChains || []) {
-              for (const nodeId of chain.path || []) {
-                if (targetSet.has(nodeId) || seenNode.has(nodeId)) continue;
-                seenNode.add(nodeId);
-                const file = fileOfNodeId(model, nodeId);
-                collectedNodes.push({ id: nodeId, file, segs: dirSegsOf(file), isTask: nodeId === chain.taskId });
-              }
-            }
-          } catch { /* ignore */ }
-          // 同时向上回溯最多 6 层直接调用者，确保非标准命名（无正式 TASK）的多车型上游分支也能被发现
-          const queue = [{ node: id, depth: 0 }];
-          const visited = new Set([id]);
-          for (let qi = 0; qi < queue.length; qi++) {
-            const { node, depth } = queue[qi];
-            if (depth >= 6) continue;
-            for (const e of model._index.inAdj.get(node) || []) {
-              if (e.kind === 'var' || visited.has(e.from)) continue;
-              visited.add(e.from);
-              if (!targetSet.has(e.from) && !seenNode.has(e.from)) {
-                seenNode.add(e.from);
-                const file = fileOfNodeId(model, e.from);
-                collectedNodes.push({ id: e.from, file, segs: dirSegsOf(file), isTask: false });
-              }
-              queue.push({ node: e.from, depth: depth + 1 });
-            }
-          }
-        }
-        const dirLists = [
-          ...[...targetSet].map((id) => dirSegsOf(fileOfNodeId(model, id))),
-          ...collectedNodes.map((n) => n.segs),
-        ].filter((segs) => segs.length > 0);
-        if (!dirLists.length) return [];
-        // 计算所有涉及文件的最长公共目录前缀（例如 src/ 或 app/ecu/），取其后的首级分叉目录作为车型/分支前缀
+      // 检测改动/目标函数自身同名多车型副本或上游调用链是否横跨多个车型/目录前缀（兼容任意嵌套深度，如 z145/ 或 src/z145/ 与 src/z144/），便于 AI 提前询问筛选。
+      const dirSegsOfFile = (file) => {
+        const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
+        return parts.length > 1 ? parts.slice(0, -1) : [];
+      };
+      const commonDirLenOf = (dirLists) => {
+        if (!dirLists.length) return 0;
         let commonLen = dirLists[0].length;
         for (let i = 1; i < dirLists.length; i++) {
           let k = 0;
           while (k < commonLen && k < dirLists[i].length && dirLists[i][k].toLowerCase() === dirLists[0][k].toLowerCase()) k++;
           commonLen = k;
         }
+        return commonLen;
+      };
+      const branchesFromIds = (model, ids) => {
+        const items = ids.map((id) => ({ id, file: fileOfNodeId(model, id) }))
+          .map((item) => ({ ...item, segs: dirSegsOfFile(item.file) }))
+          .filter((item) => item.segs.length > 0);
+        if (items.length < 2) return [];
+        const commonLen = commonDirLenOf(items.map((item) => item.segs));
+        const byPrefix = new Map();
+        for (const item of items) {
+          if (item.segs.length <= commonLen) continue;
+          const pref = item.segs.slice(0, commonLen + 1).join('/');
+          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          const entry = byPrefix.get(pref);
+          entry.sampleFunctions.add(item.id);
+          entry.chainCount++;
+        }
+        const out = [...byPrefix.values()]
+          .map((b) => ({ prefix: b.prefix, taskIds: [], sampleFunctions: [...b.sampleFunctions].slice(0, 8), chainCount: b.chainCount }))
+          .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
+        return out.length > 1 ? out : [];
+      };
+      const summarizeVehicleBranches = (model, fnIds, { includeUpstream = true } = {}) => {
+        const targetSet = new Set(fnIds);
+        const collectedNodes = []; // { id, file, segs, isTask }
+        const seenNode = new Set();
+        if (includeUpstream) {
+          for (const id of targetSet) {
+            if (!model._index?.byId?.has(id)) continue;
+            try {
+              const trace = traceToTasks(model, id, { limit: 60 });
+              for (const chain of trace.upstreamChains || []) {
+                for (const nodeId of chain.path || []) {
+                  if (targetSet.has(nodeId) || seenNode.has(nodeId)) continue;
+                  seenNode.add(nodeId);
+                  const file = fileOfNodeId(model, nodeId);
+                  collectedNodes.push({ id: nodeId, file, segs: dirSegsOfFile(file), isTask: nodeId === chain.taskId });
+                }
+              }
+            } catch { /* ignore */ }
+            // 同时向上回溯最多 6 层直接调用者，确保非标准命名（无正式 TASK）的多车型上游分支也能被发现
+            const queue = [{ node: id, depth: 0 }];
+            const visited = new Set([id]);
+            for (let qi = 0; qi < queue.length; qi++) {
+              const { node, depth } = queue[qi];
+              if (depth >= 6) continue;
+              for (const e of model._index.inAdj.get(node) || []) {
+                if (e.kind === 'var' || visited.has(e.from)) continue;
+                visited.add(e.from);
+                if (!targetSet.has(e.from) && !seenNode.has(e.from)) {
+                  seenNode.add(e.from);
+                  const file = fileOfNodeId(model, e.from);
+                  collectedNodes.push({ id: e.from, file, segs: dirSegsOfFile(file), isTask: false });
+                }
+                queue.push({ node: e.from, depth: depth + 1 });
+              }
+            }
+          }
+        }
+        const targetEntries = [...targetSet]
+          .filter((id) => model._index?.byId?.has(id))
+          .map((id) => {
+            const fn = model._index.byId.get(id);
+            const file = fileOfNodeId(model, id);
+            const norm = file.replace(/\\/g, '/');
+            return {
+              id,
+              name: fn?.name || id.split('::').pop() || '',
+              base: norm.split('/').pop() || '',
+              file,
+              segs: dirSegsOfFile(file),
+            };
+          });
+        const dirLists = [
+          ...targetEntries.map((item) => item.segs),
+          ...collectedNodes.map((n) => n.segs),
+        ].filter((segs) => segs.length > 0);
+        if (!dirLists.length) return [];
+        const commonLen = commonDirLenOf(dirLists);
         const branchKeyOf = (segs) => {
           if (segs.length <= commonLen) return '';
           return segs.slice(0, commonLen + 1).join('/');
         };
-        const targetKeys = new Set([...targetSet].map((id) => branchKeyOf(dirSegsOf(fileOfNodeId(model, id)))).filter(Boolean));
+        // 若目标集合本身就包含不同路径下的同名函数或同名文件，直接识别为多车型分支。
+        const dupTargetIds = new Set();
+        const byFnName = new Map();
+        const byBase = new Map();
+        for (const item of targetEntries) {
+          const pref = branchKeyOf(item.segs);
+          if (!pref) continue;
+          if (item.name) {
+            if (!byFnName.has(item.name)) byFnName.set(item.name, new Map());
+            byFnName.get(item.name).set(pref, [...(byFnName.get(item.name).get(pref) || []), item.id]);
+          }
+          if (item.base) {
+            if (!byBase.has(item.base)) byBase.set(item.base, new Map());
+            byBase.get(item.base).set(pref, [...(byBase.get(item.base).get(pref) || []), item.id]);
+          }
+        }
+        for (const groups of [byFnName, byBase]) {
+          for (const prefMap of groups.values()) {
+            if (prefMap.size > 1) {
+              for (const ids of prefMap.values()) for (const id of ids) dupTargetIds.add(id);
+            }
+          }
+        }
         const byPrefix = new Map();
+        const ensurePrefix = (pref) => {
+          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          return byPrefix.get(pref);
+        };
+        if (dupTargetIds.size) {
+          for (const item of targetEntries) {
+            if (!dupTargetIds.has(item.id)) continue;
+            const pref = branchKeyOf(item.segs);
+            if (!pref) continue;
+            const entry = ensurePrefix(pref);
+            entry.sampleFunctions.add(item.id);
+            entry.chainCount++;
+          }
+        }
+        const targetKeys = new Set(targetEntries.map((item) => branchKeyOf(item.segs)).filter(Boolean));
         for (const item of collectedNodes) {
           const pref = branchKeyOf(item.segs);
-          if (!pref || targetKeys.has(pref)) continue;
-          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
-          const entry = byPrefix.get(pref);
+          if (!pref || (!dupTargetIds.size && targetKeys.has(pref))) continue;
+          const entry = ensurePrefix(pref);
           if (item.isTask) entry.taskIds.add(item.id);
           else entry.sampleFunctions.add(item.id);
           entry.chainCount++;
@@ -2819,6 +2897,50 @@ export const server = http.createServer(async (req, res) => {
           .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
         return branches.length > 1 ? branches : [];
       };
+      const findCrossVehicleDuplicateBranches = (model, fnIds, { selectedIds, promptText }) => {
+        const lowerPrompt = String(promptText || '').toLowerCase();
+        const mentionsBranch = (file, prefix) => {
+          const normFile = String(file || '').replace(/\\/g, '/').toLowerCase();
+          const normPref = String(prefix || '').toLowerCase();
+          const leaf = normPref.split('/').pop() || '';
+          if (normFile && lowerPrompt.includes(normFile)) return true;
+          if (normPref && lowerPrompt.includes(normPref)) return true;
+          if (leaf && leaf.length >= 2) {
+            const escaped = leaf.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(lowerPrompt)) return true;
+          }
+          return false;
+        };
+        const byPrefix = new Map();
+        for (const id of fnIds) {
+          if (selectedIds.has(id)) continue;
+          const fn = model._index?.byId?.get(id);
+          if (!fn?.name) continue;
+          const siblings = (model._index.byName.get(fn.name) || [])
+            .filter((n) => !n.external && !overlay.deleted.nodes[n.id]);
+          if (siblings.length < 2) continue;
+          const siblingBranches = branchesFromIds(model, siblings.map((n) => n.id));
+          if (siblingBranches.length < 2) continue;
+          const chosenFile = fileOfNodeId(model, id);
+          const chosenBranch = siblingBranches.find((b) => b.sampleFunctions.includes(id));
+          if (chosenBranch && mentionsBranch(chosenFile, chosenBranch.prefix)) continue;
+          for (const b of siblingBranches) {
+            if (!byPrefix.has(b.prefix)) byPrefix.set(b.prefix, { prefix: b.prefix, taskIds: [], sampleFunctions: new Set(), chainCount: 0 });
+            const entry = byPrefix.get(b.prefix);
+            for (const sid of b.sampleFunctions) entry.sampleFunctions.add(sid);
+            entry.chainCount += b.chainCount;
+          }
+        }
+        const out = [...byPrefix.values()]
+          .map((b) => ({ prefix: b.prefix, taskIds: [], sampleFunctions: [...b.sampleFunctions].slice(0, 8), chainCount: b.chainCount }))
+          .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
+        return out.length > 1 ? out : [];
+      };
+      let uiSelectedIds = new Set();
+      const recentUserPromptText = [
+        ...(Array.isArray(p.history) ? p.history.filter((m) => m?.role === 'user').slice(-3).map((m) => String(m.content || m.text || '')) : []),
+        prompt,
+      ].join('\n');
 
       const arrangeCanvas = async (args) => {
         const fail = error => ({ ok: false, error });
@@ -3356,31 +3478,52 @@ export const server = http.createServer(async (req, res) => {
           const varRes = hasExplicitVars ? resolveGroupSymbols(args.vars, 'var') : { resolved: filterByPath(defaultVarIds), ambiguous: [], notFound: [] };
           let actualFnIds = custom ? [...new Set(explicitGroups.flatMap(g => g.fnIds))] : fnRes.resolved.slice(0, 80);
           const varIds = custom ? [...new Set(explicitGroups.flatMap(g => g.varIds))] : varRes.resolved.slice(0, 40);
+          // 重名函数/变量（如不同车型目录下同名文件/同名函数）绝不静默跳过或私自猜选：先拦截要求询问。
+          const allAmbiguous = [...fnRes.ambiguous, ...varRes.ambiguous];
+          if (allAmbiguous.length) {
+            const candidateIds = allAmbiguous.flatMap((entry) => entry.candidates || []);
+            const ambBranches = branchesFromIds(targetModel, candidateIds);
+            return {
+              ok: false,
+              needsVehicleChoice: true,
+              ...(ambBranches.length > 1 ? { pathBranches: ambBranches } : {}),
+              ambiguous: allAmbiguous,
+              notFound: [...fnRes.notFound, ...varRes.notFound],
+              error: ambBranches.length > 1
+                ? `检测到重名函数/变量横跨多个车型或目录分支（${ambBranches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入完整「文件::函数名」、includePaths 或 includeAllBranches:true。`
+                : '检测到重名函数/变量，请先用 ask_user 向用户确认具体候选「文件::函数名」，再重试。',
+            };
+          }
           // 支持仅追加全局变量到已有画布
           const currentPage = latestPage();
           const pureVars = !actualFnIds.length && varIds.length > 0 && !args.fromGit && (currentPage?.roots?.length > 0);
           if (!actualFnIds.length && !pureVars) {
             return {
               ok: false,
-              error: fnRes.ambiguous.length ? '函数名重名，请改用完整「文件::函数名」或传入 includePaths 指定车型目录'
-                : varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
+              error: varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
                 : '未匹配到可加入画布的函数',
-              ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
+              ambiguous: [],
               notFound: [...fnRes.notFound, ...varRes.notFound],
             };
           }
           const mode = custom ? 'replace' : args.mode === 'replace' || args.mode === 'add'
             ? args.mode
             : (args.fromGit || (typeof args.bookmarkName === 'string' && args.bookmarkName.trim()) ? 'replace' : 'add');
-          // 安全拦截：检测到共通/修改函数的上游横跨多个车型或目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
-          if (!COMPARISON && includeTasks && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
-            const branches = summarizeVehicleBranches(groupModel, actualFnIds);
+          // 安全拦截：检测到多车型同名文件/函数或上游调用链横跨多个车型目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
+          if (!COMPARISON && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
+            let branches = summarizeVehicleBranches(groupModel, actualFnIds, { includeUpstream: includeTasks });
+            if (!branches.length && !args.fromGit && hasExplicitFns) {
+              branches = findCrossVehicleDuplicateBranches(groupModel, actualFnIds, {
+                selectedIds: uiSelectedIds,
+                promptText: recentUserPromptText,
+              });
+            }
             if (branches.length > 1) {
               return {
                 ok: false,
                 needsVehicleChoice: true,
                 pathBranches: branches,
-                error: `检测到上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
+                error: `检测到目标函数或上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
               };
             }
           }
@@ -3557,10 +3700,16 @@ export const server = http.createServer(async (req, res) => {
               prewarmChangedFlowcharts(PROJECT.id, MODEL, changedEntries, gitComparison.beforeModel, gitComparison.beforePath);
             }
           }
+          const addedIds = [...new Set([...actualFnIds, ...scopes.flatMap(g => [...g.varIds, ...g.sourceWriterIds])])];
+          const addedNames = addedIds.map((id) => {
+            const node = targetModel._index?.byId?.get(id);
+            return node?.name || String(id).replace(/^var::/, '').split('::').pop();
+          }).filter(Boolean);
           return {
             ok: true,
             editable: !COMPARISON,
-            addedCount: new Set([...actualFnIds, ...scopes.flatMap(g => [...g.varIds, ...g.sourceWriterIds])]).size,
+            addedCount: addedIds.length,
+            addedNames: [...new Set(addedNames)].slice(0, 30),
             autoTaskLabels,
             ...(createdBookmarks.length ? { bookmarks: createdBookmarks, activeBookmark: createdBookmarks[0].name } : {}),
             roots: composed.page.roots.slice(0, 30),
@@ -3689,6 +3838,14 @@ export const server = http.createServer(async (req, res) => {
           return Object.keys(out).length ? out : null;
         };
         const uiContext = sanitizeUiContext(p.uiContext);
+        uiSelectedIds = new Set([
+          ...(uiContext?.selectedNode?.id ? [uiContext.selectedNode.id] : []),
+          ...(uiContext?.selectedEdge?.from ? [uiContext.selectedEdge.from] : []),
+          ...(uiContext?.selectedEdge?.to ? [uiContext.selectedEdge.to] : []),
+          ...((uiContext?.items || []).flatMap((item) => item?.kind === 'node' && item.id
+            ? [item.id]
+            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean) : [])),
+        ]);
         const context = {
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,

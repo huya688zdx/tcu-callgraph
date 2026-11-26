@@ -16,8 +16,8 @@ import { state, cam, els, edgeKey } from './state.js';
 import { api, clientId } from './api.js';
 import { hooks } from './hooks.js';
 import { loadStats, renderVars, renderDetail } from './panels.js';
-import { draw } from './render.js';
-import { constrainCam } from './camera.js';
+import { draw, pulseAdded } from './render.js';
+import { constrainCam, focusBox } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { markReviewUpdated, reloadTimeline, reviewTransition } from './timeline.js';
 import { reloadBookmarks } from './bookmarks.js';
@@ -77,6 +77,9 @@ async function flushReload() {
     if (compose && compose.page.projectId === state.view?.projectId &&
         compose.page.comparisonId === state.view?.comparison?.id) {
       const { page, reason } = compose;
+      const prevNodes = state.view?.nodes || [];
+      const prevIds = new Set(prevNodes.map((node) => node.id));
+      const prevEdges = new Set((state.view?.edges || []).map(edgeKey));
       applyingCompose = true;
       // loadView 成功后才安装新范围，并用旧范围生成画布的返回记录。
       const view = await hooks.loadView(page.roots, {
@@ -87,11 +90,46 @@ async function flushReload() {
       if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
       state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
+      const nextIds = new Set(view.nodes.map((node) => node.id));
+      const addedNodes = view.nodes.filter((node) => !prevIds.has(node.id));
+      const addedEdges = view.edges.filter((edge) => !prevEdges.has(edgeKey(edge)));
+      const removedNodes = prevNodes.filter((node) => !nextIds.has(node.id));
       renderVars();
       renderLabelPanel();
-      draw();
+      if (addedNodes.length || addedEdges.length) {
+        pulseAdded(addedNodes, addedEdges, { highlightMs: 6500, rippleMs: 1600 });
+      } else {
+        draw();
+      }
       renderDetail(state.selected).catch(() => {});
-      toast([t('live.composed'), reason].filter(Boolean).join(' · '));
+      const formatNames = (list) => {
+        const names = list.map((n) => n.name || String(n.id).split('::').pop()).filter(Boolean);
+        if (!names.length) return '';
+        const shown = names.slice(0, 4).join('、');
+        return names.length > 4 ? `${shown} 等 ${names.length} 个` : shown;
+      };
+      const diffParts = [];
+      if (addedNodes.length) diffParts.push(`+${addedNodes.length}（${formatNames(addedNodes)}）`);
+      if (removedNodes.length) diffParts.push(`-${removedNodes.length}（${formatNames(removedNodes)}）`);
+      const summaryText = diffParts.length
+        ? `${t('live.composed')}：${diffParts.join('，')}${reason ? ` · ${reason}` : ''}`
+        : [t('live.composed'), reason].filter(Boolean).join(' · ');
+      toast(summaryText, {
+        duration: diffParts.length ? 5500 : 2800,
+        ...(addedNodes.length ? {
+          actionLabel: '定位新增',
+          onAction: () => {
+            const currentAdded = (state.view?.nodes || []).filter((n) => addedNodes.some((a) => a.id === n.id));
+            if (!currentAdded.length) return;
+            const x0 = Math.min(...currentAdded.map((n) => n.x));
+            const y0 = Math.min(...currentAdded.map((n) => n.y));
+            const x1 = Math.max(...currentAdded.map((n) => n.x + n.w));
+            const y1 = Math.max(...currentAdded.map((n) => n.y + n.h));
+            focusBox({ x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }, 90, { keepZoom: false });
+            pulseAdded(currentAdded, [], { highlightMs: 4000, rippleMs: 1400 });
+          },
+        } : {}),
+      });
     } else {
       await hooks.reloadKeepCam();
       toast(n > 1 ? t('live.edits', { n }) : t('live.updated'));
@@ -320,22 +358,40 @@ export async function restorePage({ root = null, isCurrent = () => true } = {}) 
 let toastEl = null;
 let toastTimer = null;
 
-function toast(text) {
+function toast(text, { duration = 2600, actionLabel = '', onAction = null } = {}) {
   if (!toastEl) {
     toastEl = document.createElement('div');
     toastEl.setAttribute('role', 'status');
     toastEl.style.cssText =
       'position:fixed;left:50%;bottom:56px;transform:translateX(-50%);' +
-      'padding:8px 16px;border-radius:8px;background:rgba(38,39,48,.92);color:#fff;' +
-      'font:13px -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
-      'box-shadow:0 4px 16px rgba(0,0,0,.25);opacity:0;pointer-events:none;' +
-      'transition:opacity .25s;z-index:99;';
+      'display:inline-flex;align-items:center;gap:10px;max-width:min(680px,calc(100vw - 32px));' +
+      'padding:8px 14px;border-radius:9px;background:rgba(28,33,44,.94);color:#fff;' +
+      'font:13px/1.4 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;' +
+      'box-shadow:0 6px 20px rgba(0,0,0,.28);opacity:0;pointer-events:none;' +
+      'transition:opacity .25s;z-index:1200;';
     document.body.appendChild(toastEl);
   }
-  toastEl.textContent = text;
+  toastEl.replaceChildren();
+  const msg = document.createElement('span');
+  msg.textContent = text;
+  toastEl.appendChild(msg);
+  if (actionLabel && typeof onAction === 'function') {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = actionLabel;
+    btn.style.cssText =
+      'padding:2px 9px;border-radius:6px;border:1px solid rgba(255,255,255,.32);' +
+      'background:rgba(2,132,199,.9);color:#fff;font-size:12px;cursor:pointer;flex-shrink:0;';
+    btn.addEventListener('click', () => onAction());
+    toastEl.appendChild(btn);
+    toastEl.style.pointerEvents = 'auto';
+  } else {
+    toastEl.style.pointerEvents = 'none';
+  }
   toastEl.style.opacity = '1';
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     toastEl.style.opacity = '0';
-  }, 2600);
+    toastEl.style.pointerEvents = 'none';
+  }, duration);
 }
