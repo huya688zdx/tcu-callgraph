@@ -776,7 +776,8 @@ const taggedTypes = new Set(['struct', 'union', 'enum']);
 const conditionKeywords = new Set(['if', 'for', 'while', 'switch']);
 
 /** sizeof 的数组类型名可以求值维度，普通表达式和指向 VLA 的指针类型不求值。 */
-function scanSizeofBounds(operand, ctx, out, macroChain) {
+function scanSizeofBounds(tokens, ctx, out, macroChain) {
+  const operand = expandSeq(tokens, ctx.macros);
   let index = operand.findIndex(t => t.v === '[');
   if (index < 1) return;
   let type = null;

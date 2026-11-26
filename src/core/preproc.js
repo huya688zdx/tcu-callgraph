@@ -322,36 +322,38 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set(), onExpand)
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
     const m = tk.t === 'id' ? macros.get(tk.v, tk.line) : undefined;
-    if (m && !seen.has(tk.v)) {
-      if (m.params === null) {
-        onExpand?.(m, tk, tk);
-        const body = m.body.map((b) => ({
-          ...b,
-          line: tk.line,
-          col: tk.col,
-          cond: tk.cond ?? b.cond,
-          macroOrigins: [...(tk.macroOrigins || []), m.name],
-        }));
-        const nextSeen = new Set(seen);
-        nextSeen.add(tk.v);
-        out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
-        continue;
-      }
-
-      if (tokens[i + 1] && tokens[i + 1].v === '(') {
-        const [args, next] = collectArgs(tokens, i + 1);
-        if (args) {
-          onExpand?.(m, tk, tokens[next - 1]);
-          const body = substitute(m, args, tk);
-          const nextSeen = new Set(seen);
-          nextSeen.add(tk.v);
-          out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
-          i = next - 1;
-          continue;
-        }
-      }
+    if (!m || seen.has(tk.v) || (m.params !== null && tokens[i + 1]?.v !== '(')) {
+      out.push(tk);
+      continue;
     }
-    out.push(tk);
+    let body;
+    if (m.params === null) {
+      onExpand?.(m, tk, tk);
+      body = m.body.map(b => ({
+        ...b, line: tk.line, col: tk.col, cond: tk.cond ?? b.cond,
+        macroOrigins: [...(tk.macroOrigins || []), m.name],
+      }));
+    } else {
+      const [args, next] = collectArgs(tokens, i + 1);
+      onExpand?.(m, tk, tokens[next - 1]);
+      body = substitute(m, args, tk);
+      i = next - 1;
+    }
+    const nextSeen = new Set(seen).add(tk.v);
+    let expanded = expandSeq(body, macros, depth + 1, nextSeen, onExpand);
+    // 替换结果末尾的函数式宏可以使用原序列中紧跟的实参，例如 MAKE -> MATRIX。
+    while (tokens[i + 1]?.v === '(') {
+      const tail = expanded.at(-1);
+      const fn = tail?.t === 'id' && macros.get(tail.v, tail.line);
+      if (!fn?.params || nextSeen.has(tail.v) || tail.macroOrigins?.includes(tail.v)) break;
+      const [args, next] = collectArgs(tokens, i + 1);
+      onExpand?.(fn, tail, tokens[next - 1]);
+      out.push(...expanded.slice(0, -1));
+      nextSeen.add(tail.v);
+      expanded = expandSeq(substitute(fn, args, tail), macros, depth + 1, nextSeen, onExpand);
+      i = next - 1;
+    }
+    out.push(...expanded);
   }
   return out;
 }

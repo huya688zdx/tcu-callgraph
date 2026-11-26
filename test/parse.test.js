@@ -529,6 +529,38 @@ int conditional(int index) { if (index) (run)(42); return 0; }
   assert.deepEqual(calls('conditional'), ['run']);
 });
 
+test('sizeof 在调用处展开宏，只记录变长数组类型中求值的维度', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-sizeof-macro-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), '#define TYPE int[next()]\n#define ALIAS TYPE\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+static int next(void) { return 2; }
+static int second(void) { return 3; }
+#define MATRIX(n) int[n][second()]
+int first(void) { return sizeof(ALIAS); }
+int matrix(void) { return sizeof(MATRIX(next())); }
+#undef TYPE
+#define TYPE values[next()]
+int expr(int *values) { return sizeof(ALIAS); }
+#undef TYPE
+#define TYPE int (*)[next()]
+int ptr(void) { return sizeof(ALIAS); }
+#define MAKE_MATRIX MATRIX
+int matrix_alias(void) { return sizeof(MAKE_MATRIX(next())); }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls('first').map(edge => [edge.callee, edge.line, edge.via]), [
+    ['next', 6, 'ALIAS > TYPE'],
+  ]);
+  assert.deepEqual(calls('matrix').map(edge => edge.callee), ['next', 'second']);
+  assert.deepEqual(calls('matrix_alias').map(edge => edge.callee), ['next', 'second']);
+  assert.deepEqual(calls('expr'), []);
+  assert.deepEqual(calls('ptr'), []);
+});
+
 test('括号内的函数名按调用处展开对象宏，保留函数式宏的同名函数', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-parenthesized-alias-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
