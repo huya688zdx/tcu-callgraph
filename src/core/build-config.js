@@ -251,6 +251,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
   const recipes = [];
   const rules = new Map();
+  const targetVariables = new Map();
   let defaultGoal;
   const collected = {
     includeDirs: new Set(),
@@ -342,7 +343,9 @@ export function parseMakefileTree(entryAbs, rootDir) {
         for (const token of tokenizeArgs(expanded)) {
           const clean = stripQuotes(token);
           if (!clean || /\$\(/.test(clean)) continue;
-          const candidates = [path.resolve(dir, clean), path.resolve(entryDir, clean), path.resolve(rootDir, clean)];
+          const candidates = line.startsWith('!')
+            ? [path.resolve(dir, clean), path.resolve(entryDir, clean), path.resolve(rootDir, clean)]
+            : [path.resolve(entryDir, clean)];
           const found = candidates.find((p) => fs.statSync(p, { throwIfNoEntry: false })?.isFile());
           if (found) processFile(found, depth + 1);
         }
@@ -360,6 +363,17 @@ export function parseMakefileTree(entryAbs, rootDir) {
         if (simple) value = expandMakeVars(value, vars);
         if (op === '+=' && previous) value = `${previous.value} ${value}`.trim();
         vars.set(varName, { value, simple });
+        continue;
+      }
+
+      const scoped = /^([^:]+):\s*([\w.-]+)\s*([:+?]?=)\s*(.*)$/.exec(line);
+      if (scoped) {
+        const [, names, name, op, rhs] = scoped;
+        if (names.includes('%')) throw new Error('暂不支持 Make 模式变量');
+        for (const target of tokenizeArgs(expandMakeVars(names, vars))) {
+          if (!targetVariables.has(target)) targetVariables.set(target, []);
+          targetVariables.get(target).push({ name, op, value: op === ':=' ? expandMakeVars(rhs, vars) : rhs });
+        }
         continue;
       }
 
@@ -386,18 +400,27 @@ export function parseMakefileTree(entryAbs, rootDir) {
   processFile(entryAbs, 0);
   const compilers = new Set();
   const compilationUnits = {};
-  const reachable = new Set();
-  const visitTarget = target => {
+  const reachable = new Map();
+  const visitTarget = (target, inherited = vars) => {
     if (reachable.has(target)) return;
-    reachable.add(target);
-    for (const dependency of rules.get(target) || []) visitTarget(dependency);
+    const environment = new Map(inherited);
+    for (const { name, op, value: raw } of targetVariables.get(target) || []) {
+      const previous = environment.get(name);
+      if (op === '?=' && previous) continue;
+      const simple = op === ':=' || (op === '+=' && Boolean(previous?.simple));
+      let value = op === '+=' && simple ? expandMakeVars(raw, environment) : raw;
+      if (op === '+=' && previous) value = `${previous.value} ${value}`.trim();
+      environment.set(name, { value, simple });
+    }
+    reachable.set(target, environment);
+    for (const dependency of rules.get(target) || []) visitTarget(dependency, environment);
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
   for (const { command, prerequisites, targets } of recipes) {
     if (goal && !targets.some(target => reachable.has(target))) continue;
     const deps = prerequisites.split('|')[0];
-    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), vars)
+    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(targets.find(target => reachable.has(target))) || vars)
       .replace(/\$[<^+]/g, ref => ref === '$<' ? `"${tokenizeArgs(deps)[0] || ''}"` : deps);
     const args = tokenizeArgs(expanded);
     const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));

@@ -515,3 +515,33 @@ test('坏 Makefile 不影响其他配置，保留快照独有的源文件', t =>
   assert.deepEqual(profiles[0].sourceFiles, ['keep.c', 'deleted.c']);
   assert.deepEqual(selectProfileSourceFiles(profiles[0], [{ rel: 'keep.c' }, { rel: 'deleted.c' }]), ['keep.c', 'deleted.c']);
 });
+
+test('Make 目标变量传递给依赖且不污染其他目标', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-target-vars-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const name of ['main', 'other']) fs.writeFileSync(path.join(root, name + '.c'), 'int value;');
+  fs.writeFileSync(path.join(root, 'Makefile'), [
+    'CFLAGS = -DGLOBAL=1', 'all: main.o other.o',
+    'main.o: CFLAGS = -DFEATURE=1', 'main.o: EXTRA = -DEXTRA=1',
+    'main.o: child', 'child: CFLAGS += $(EXTRA)',
+    'child: main.c', '\tcc $(CFLAGS) -c main.c',
+    'other.o: other.c', '\tcc $(CFLAGS) -c other.c',
+  ].join('\n'));
+  const result = parseMakefileTree(path.join(root, 'Makefile'), root);
+  assert.deepEqual(result.compilationUnits['main.c'].defines, ['FEATURE=1', 'EXTRA=1']);
+  assert.deepEqual(result.compilationUnits['other.c'].defines, ['GLOBAL=1']);
+});
+
+test('GNU Make 嵌套 include 使用构建目录', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-include-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'build'));
+  fs.writeFileSync(path.join(root, 'main.c'), 'int value;');
+  fs.writeFileSync(path.join(root, 'common.mk'), 'CFLAGS = -DFEATURE=1');
+  fs.writeFileSync(path.join(root, 'build/common.mk'), 'CFLAGS = -DFEATURE=0');
+  fs.writeFileSync(path.join(root, 'build/flags.mk'), 'include common.mk');
+  fs.writeFileSync(path.join(root, 'Makefile'), 'include build/flags.mk\nall: main.c\n\tcc $(CFLAGS) -c main.c'.replaceAll('\\n', '\n').replaceAll('\\t', '\t'));
+  const result = parseMakefileTree(path.join(root, 'Makefile'), root);
+  assert.deepEqual(result.defines, ['FEATURE=1']);
+  assert.deepEqual(result.includedFiles, ['Makefile', 'build/flags.mk', 'common.mk']);
+});
