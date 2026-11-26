@@ -32,11 +32,26 @@ export function fileMacroScope(base, changes = new Map(), { trackPositions = fal
 }
 
 function parseDefineParams(text) {
-  // text 形如 "(a, b) body..."
+  // text 形如 "(a, b) body..." 或 "(fmt, ...) body..." 或 "(args...) body..."
   const params = [];
+  let variadic = false;
+  let variadicName = '__VA_ARGS__';
   let depth = 0;
   let i = 0;
   let cur = '';
+  const pushParam = (raw) => {
+    const p = raw.trim();
+    if (!p) return;
+    if (p === '...') {
+      variadic = true;
+      variadicName = '__VA_ARGS__';
+    } else if (p.endsWith('...')) {
+      variadic = true;
+      variadicName = p.slice(0, -3).trim() || '__VA_ARGS__';
+    } else {
+      params.push(p);
+    }
+  };
   for (; i < text.length; i++) {
     const c = text[i];
     if (c === '(') {
@@ -48,14 +63,14 @@ function parseDefineParams(text) {
       if (depth === 0) break;
     }
     if (c === ',' && depth === 1) {
-      params.push(cur.trim());
+      pushParam(cur);
       cur = '';
       continue;
     }
     cur += c;
   }
-  if (cur.trim()) params.push(cur.trim());
-  return { params, rest: text.slice(i + 1) };
+  pushParam(cur);
+  return { params, variadic, variadicName, rest: text.slice(i + 1) };
 }
 
 /**
@@ -116,16 +131,21 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       const name = nm[1];
       const after = rest.slice(name.length);
       let params = null;
+      let variadic = false;
+      let variadicName = '__VA_ARGS__';
       let bodyText = after;
       if (after.startsWith('(')) {
         const p = parseDefineParams(after);
         params = p.params;
+        variadic = p.variadic;
+        variadicName = p.variadicName;
         bodyText = p.rest;
       }
       const body = lex(bodyText, file);
       macros.set(name, {
         name,
         params,
+        ...(variadic ? { variadic: true, variadicName } : {}),
         body,
         file,
         line: tk.line,
@@ -202,14 +222,25 @@ function substitute(m, args, siteTok) {
   const out = [];
   const body = m.body;
   const macroOrigins = [...(siteTok.macroOrigins || []), m.name];
+  const vaTokens = () => {
+    const rest = args.slice(m.params ? m.params.length : 0);
+    const joined = [];
+    for (let r = 0; r < rest.length; r++) {
+      if (r > 0) joined.push({ t: 'op', v: ',', line: siteTok.line, col: siteTok.col, cond: siteTok.cond });
+      for (const tok of rest[r]) joined.push(tok);
+    }
+    return joined;
+  };
+  const isVa = (name) => Boolean(m.variadic && name === (m.variadicName || '__VA_ARGS__'));
   for (let i = 0; i < body.length; i++) {
     const tk = body[i];
 
-    if (tk.v === '#' && body[i + 1] && m.params.includes(body[i + 1].v)) {
-      const ai = m.params.indexOf(body[i + 1].v);
+    if (tk.v === '#' && body[i + 1] && (m.params.includes(body[i + 1].v) || isVa(body[i + 1].v))) {
+      const targetName = body[i + 1].v;
+      const argToks = isVa(targetName) ? vaTokens() : (args[m.params.indexOf(targetName)] || []);
       out.push({
         t: 'str',
-        v: `"${stringifyTokens(args[ai] || [])}"`,
+        v: `"${stringifyTokens(argToks)}"`,
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
@@ -221,6 +252,18 @@ function substitute(m, args, siteTok) {
 
     if (tk.v === '##' && out.length && body[i + 1]) {
       const right = body[i + 1];
+      if (isVa(right.v)) {
+        const va = vaTokens();
+        if (!va.length) {
+          if (out[out.length - 1]?.v === ',') out.pop();
+        } else {
+          for (const t of va) {
+            out.push({ ...t, line: siteTok.line, col: siteTok.col, cond: siteTok.cond ?? t.cond, macroOrigins: t.macroOrigins || [] });
+          }
+        }
+        i++;
+        continue;
+      }
       const left = out.pop();
       const rv = m.params.includes(right.v)
         ? (args[m.params.indexOf(right.v)] || []).map((t) => t.v).join('')
@@ -234,6 +277,19 @@ function substitute(m, args, siteTok) {
         macroOrigins,
       });
       i++;
+      continue;
+    }
+
+    if (isVa(tk.v)) {
+      for (const t of vaTokens()) {
+        out.push({
+          ...t,
+          line: siteTok.line,
+          col: siteTok.col,
+          cond: siteTok.cond ?? t.cond,
+          macroOrigins: [...macroOrigins, ...(t.macroOrigins || [])],
+        });
+      }
       continue;
     }
 
@@ -263,7 +319,7 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set(), onExpand)
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
-    const m = tk.t === 'id' ? macros.get(tk.v) : undefined;
+    const m = tk.t === 'id' ? macros.get(tk.v, tk.line) : undefined;
     if (m && !seen.has(tk.v)) {
       if (m.params === null) {
         onExpand?.(m, tk, tk);

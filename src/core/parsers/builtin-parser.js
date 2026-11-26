@@ -237,7 +237,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   const functions = [];
   const functionRecords = [];
-  const fnptrTables = new Map();
+  const fnptrTablesList = [];
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
@@ -293,11 +293,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       scanCalls(body, { macros: fileMacros }, calls);
       for (const call of calls) {
         call.macroDefinitions = (call.macroChain || []).map((name) => {
-          const def = fileMacros.get(name);
+          const def = fileMacros.get(name, call.line);
           return def ? `header::${def.file}::${name}` : null;
         }).filter(Boolean);
       }
-      const deferred = calls.length > 1 && calls.some((c) => c.kind === 'unknown');
+      const deferred = calls.length > 1 && calls.some((c) => ['unknown', 'fnptr_indexed', 'fnptr_ptr'].includes(c.kind));
       if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
       const nesting = deferred ? callNestingTokens(body) : null;
       assignCallGroups(body, calls);
@@ -305,8 +305,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
         taskEvidence: collectTaskEvidence(fn, body, fileMacros, calls) });
       functions.push(fn);
     }
-    for (const [name, map] of findFnPtrTables(tokens)) {
-      fnptrTables.set(name, { ...map });
+    for (const table of findFnPtrTables(tokens, rel).values()) {
+      fnptrTablesList.push(table);
     }
     for (const v of findGlobalVars(tokens, rel)) {
       // static 变量按文件区分；普通全局变量跨文件同名即同一个
@@ -400,24 +400,132 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     return (glob || list[0]).id;
   };
 
+  // 过滤并按文件/作用域索引函数指针分派表：
+  // - 单结构体 `.field = fn` 保持原有兼容；
+  // - 数组/嵌套表只保留指向真实已定义函数的槽位，避免把普通常量数据表误认成函数指针表；
+  // - 同名 static 表严格按文件隔离，杜绝跨文件污染。
+  const cleanedTables = [];
+  const staticTablesByFile = new Map();
+  const globalTablesByName = new Map();
+  for (const raw of fnptrTablesList) {
+    const filteredMap = {};
+    for (const [slot, target] of Object.entries(raw.map)) {
+      const isStructField = !slot.startsWith('[');
+      if (byName.has(target) || isStructField) {
+        filteredMap[slot] = target;
+      }
+    }
+    if (!Object.keys(filteredMap).length) continue;
+    const entry = {
+      name: raw.name,
+      file: raw.file,
+      line: raw.line,
+      isStatic: raw.isStatic,
+      isConst: raw.isConst,
+      dims: raw.dims,
+      map: filteredMap,
+    };
+    cleanedTables.push(entry);
+    if (entry.isStatic) {
+      if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
+      staticTablesByFile.get(entry.file).set(entry.name, entry);
+    } else {
+      globalTablesByName.set(entry.name, entry);
+    }
+  }
+  const lookupTable = (name, fromFile) => {
+    if (!name) return null;
+    return staticTablesByFile.get(fromFile)?.get(name) || globalTablesByName.get(name) || null;
+  };
+  const matchTableSlots = (table, indices = [], member = null) => {
+    const matched = [];
+    for (const [slot, target] of Object.entries(table.map)) {
+      if (!indices.length) {
+        if (member && slot === member) matched.push({ slot, target });
+        continue;
+      }
+      // 解析槽位路径，例如 "[1][0]" / "[0].fn" / "[1][2].handler"
+      const m = /^((?:\[\d+\])+)(?:\.([A-Za-z_]\w*))?$/.exec(slot);
+      if (!m) continue;
+      const slotIndices = [...m[1].matchAll(/\[(\d+)\]/g)].map((x) => Number.parseInt(x[1], 10));
+      const slotField = m[2] || null;
+      if (member) {
+        if (slotField !== member) continue;
+      } else if (slotField) {
+        // 结构体数组元素中无成员名调用时（例如 e[r][c]() 对应的非结构体表）不匹配带字段名的槽；
+        // 但若是一维位置初始化结构体数组（无指定字段名），slotField 本身为 null。
+        continue;
+      }
+      if (slotIndices.length < indices.length) continue;
+      let ok = true;
+      for (let d = 0; d < indices.length; d++) {
+        if (indices[d] !== null && slotIndices[d] !== indices[d]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) matched.push({ slot, target });
+    }
+    return matched;
+  };
+
+  const indirectCalls = [];
   for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
     const edgeStart = edges.length;
     for (const call of calls) {
-      const table = call.receiver ? fnptrTables.get(call.receiver) : null;
-      const callee = call.callee || (table && Object.hasOwn(table, call.member) ? table[call.member] : null);
-      if (!callee) continue;
-      edges.push({
-        from: fn.id,
-        to: resolveCallee(callee, fn.file),
-        callee,
-        kind: call.kind === 'unknown' ? 'fnptr' : call.kind,
-        line: call.line, col: call.col, orderGroup: call.orderGroup,
-        ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
-        cond: call.cond,
-        via: call.via,
-        macroChain: call.macroChain,
-        macroDefinitions: call.macroDefinitions,
-      });
+      if (call.callee) {
+        edges.push({
+          from: fn.id,
+          to: resolveCallee(call.callee, fn.file),
+          callee: call.callee,
+          kind: call.kind,
+          line: call.line, col: call.col, orderGroup: call.orderGroup,
+          ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
+          cond: call.cond,
+          via: call.via,
+          macroChain: call.macroChain,
+          macroDefinitions: call.macroDefinitions,
+        });
+        continue;
+      }
+      const table = lookupTable(call.receiver, fn.file);
+      const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
+      const uniqueTargets = [...new Set(matched.map((s) => s.target))];
+      const allConstIndices = (call.indices || []).every((idx) => idx !== null);
+      if (uniqueTargets.length === 1 && (allConstIndices || !call.indices?.length || matched.length === 1)) {
+        const callee = uniqueTargets[0];
+        edges.push({
+          from: fn.id,
+          to: resolveCallee(callee, fn.file),
+          callee,
+          kind: 'fnptr',
+          line: call.line, col: call.col, orderGroup: call.orderGroup,
+          ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
+          cond: call.cond,
+          via: call.via,
+          macroChain: call.macroChain,
+          macroDefinitions: call.macroDefinitions,
+        });
+      } else {
+        // 多候选动态分派表（如 z[idx]()、e[r][c]()）或未解析函数指针：
+        // 不盲目画死所有候选，而是保留调用点与候选槽位供 LLM 结合源码精准判断后补边。
+        indirectCalls.push({
+          caller: fn.id,
+          callerName: fn.name,
+          file: fn.file,
+          line: call.line,
+          expr: call.via || '',
+          receiver: call.receiver || null,
+          member: call.member || null,
+          indices: call.indexExprs || [],
+          table: table ? { name: table.name, file: table.file, line: table.line, isStatic: table.isStatic } : null,
+          candidates: matched.map((s) => ({
+            slot: s.slot,
+            name: s.target,
+            id: resolveCallee(s.target, table?.file || fn.file),
+          })),
+        });
+      }
     }
     const resolvedCalls = edges.slice(edgeStart);
     if (nesting && resolvedCalls.length > 1 && hasNestedCall(nesting, resolvedCalls)) fn.hasNestedCalls = true;
@@ -512,7 +620,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     externals: [...externals.values()],
     edges,
     macros: [...macroDefs.values()],
-    fnptrTables: [...fnptrTables.entries()].map(([name, map]) => ({ name, map })),
+    fnptrTables: cleanedTables,
+    indirectCalls,
     includes,
     warnings,
   };

@@ -284,3 +284,101 @@ const Ops ops = { .tick = tick };
   assert.deepEqual(entry.varAccess.map(({ id, read, write }) => [id, read, write]),
     [['var::later', true, true], ['var::caller.c::local_count', true, true]]);
 });
+
+test('宏复合表达式 #define x (a()+b())、同文件重定义、变参宏、外层括号调用与假边过滤', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-macro-edge-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'macro.c'), `
+int a(void) { return 1; }
+int b(void) { return 2; }
+void one(void) {}
+void two(void) {}
+int never_called(void) { return 0; }
+#define X (a() + b())
+#define WRAP(...) (__VA_ARGS__)
+#define ID(fn) fn
+#define M one
+int use_x(void) {
+  void local_proto(void);
+  int sz = (int)sizeof(never_called());
+  M();
+  WRAP(two());
+  ID(one)();
+  (a)();
+  return X + sz;
+}
+#undef M
+#define M two
+void use_m_after(void) {
+  M();
+}
+`);
+  const model = loadModel(dir);
+  const out = (name) => (model._index.outAdj.get(`macro.c::${name}`) || []).filter((e) => e.kind !== 'var');
+  const useX = out('use_x');
+  assert.ok(useX.some((e) => e.to === 'macro.c::a' && e.kind === 'macro'), '#define X (a()+b()) 应提取到 a()');
+  assert.ok(useX.some((e) => e.to === 'macro.c::b' && e.kind === 'macro'), '#define X (a()+b()) 应提取到 b()');
+  assert.ok(useX.some((e) => e.to === 'macro.c::one' && e.kind === 'macro'), 'M() 在重定义前应指向 one');
+  assert.ok(useX.some((e) => e.to === 'macro.c::two' && e.kind === 'macro'), '变参宏 WRAP(two()) 应提取到 two');
+  assert.ok(useX.some((e) => e.to === 'macro.c::a' && e.kind === 'direct'), '(a)() 应识别为直接调用');
+  assert.ok(!useX.some((e) => e.to === 'macro.c::never_called'), 'sizeof(never_called()) 不求值不应建边');
+  assert.ok(!useX.some((e) => e.callee === 'local_proto'), '块内局部函数原型不应被当成调用');
+  const after = out('use_m_after');
+  assert.deepEqual(after.map((e) => e.to), ['macro.c::two'], '#undef 重定义后应指向 two');
+});
+
+test('1D/2D 常量函数指针数组与结构体表：常量下标直连、动态下标保留候选且 static 表按文件隔离', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-fnptr-2d-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t step; } Ops;
+void fnA(void) {}
+void vvv(void) {}
+void ggg(void) {}
+void jjj(void) {}
+void ghh(void) {}
+void jkk(void) {}
+void kkk(void) {}
+static const Ops ops = { .step = fnA };
+const fn_t z[] = { vvv, ghh };
+const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, kkk } };
+const Ops tbl[] = { { .step = vvv }, { .step = ghh } };
+void call_const(void) {
+  ops.step();
+  z[1]();
+  e[1][0]();
+  tbl[0].step();
+}
+void call_dyn(int r, int c) {
+  z[r]();
+  e[r][c]();
+  tbl[r].step();
+}
+`);
+  fs.writeFileSync(path.join(dir, 'b.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t step; } Ops;
+void fnB(void) {}
+static const Ops ops = { .step = fnB };
+void call_b(void) {
+  ops.step();
+}
+`);
+  const model = loadModel(dir);
+  const out = (id) => (model._index.outAdj.get(id) || []).filter((e) => e.kind !== 'var');
+  const constTargets = out('a.c::call_const').map((e) => e.to);
+  assert.ok(constTargets.includes('a.c::fnA'), 'a.c static ops.step() 不应被 b.c 同名 static 表污染');
+  assert.ok(constTargets.includes('a.c::ghh'), '常量下标 z[1]() 与 e[1][0]() 应直接连到 ghh');
+  assert.ok(constTargets.includes('a.c::vvv'), '结构体数组常量下标 tbl[0].step() 应直接连到 vvv');
+  assert.deepEqual(out('b.c::call_b').map((e) => e.to), ['b.c::fnB'], 'b.c static ops 应独立指向 fnB');
+
+  // 动态下标不盲目画死所有候选，而是在 indirectCalls 保留完整候选供 LLM 判断
+  assert.equal(out('a.c::call_dyn').length, 0);
+  const dynSites = (model.indirectCalls || []).filter((ic) => ic.caller === 'a.c::call_dyn');
+  assert.equal(dynSites.length, 3);
+  const site2d = dynSites.find((ic) => ic.table?.name === 'e');
+  assert.ok(site2d);
+  assert.deepEqual(site2d.candidates.map((c) => c.name).sort(), ['ggg', 'ghh', 'jjj', 'jkk', 'kkk', 'vvv']);
+  assert.ok(site2d.candidates.some((c) => c.slot === '[1][0]' && c.name === 'ghh'));
+});
