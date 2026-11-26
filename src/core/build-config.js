@@ -369,6 +369,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
 
   processFile(entryAbs, 0);
   const compilers = new Set();
+  const compilationUnits = {};
   for (const { command, prerequisites } of recipes) {
     const deps = prerequisites.split('|')[0];
     const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), vars)
@@ -381,6 +382,12 @@ export function parseMakefileTree(entryAbs, rootDir) {
     if (!compilerVar.test(command) &&
         !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
     if (args.length) compilers.add(compiler);
+    const unit = { includeDirs: new Set(), defines: new Set(), forcedIncludes: new Set(), sourceFiles: new Set() };
+    extractCompilerFlags(args, entryDir, rootDir, unit);
+    for (const rel of unit.sourceFiles) compilationUnits[rel] = {
+      includeDirs: [...unit.includeDirs], defines: [...unit.defines],
+      forcedIncludes: [...unit.forcedIncludes], macroArgs: unit.macroArgs || [],
+    };
     extractCompilerFlags(args, entryDir, rootDir, collected);
   }
   if (!recipes.length) {
@@ -399,6 +406,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     forcedIncludes: [...collected.forcedIncludes],
     sourceFiles: [...collected.sourceFiles],
     includedFiles: collected.includedFiles,
+    compilationUnits,
   };
 }
 
@@ -596,6 +604,7 @@ export function discoverBuildProfiles(rootDir) {
       includeDirs: item.parsed.includeDirs,
       defines: item.parsed.defines,
       macroArgs: item.parsed.macroArgs,
+      compilationUnits: item.parsed.compilationUnits,
       forcedIncludes: item.parsed.forcedIncludes,
       sourceRoots: [],
       exclusions: [],
@@ -802,11 +811,15 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
   }
 
   const baseArgs = ['clang', '-fsyntax-only', '-fms-extensions', '-fgnu-keywords', '-Wno-unknown-pragmas', '-Wno-attributes'];
-  for (const dir of allIncludeDirs) baseArgs.push('-I', dir);
-  if (profile.macroArgs?.length) baseArgs.push(...profile.macroArgs);
-  else for (const def of profile.defines || []) baseArgs.push('-D', def);
-  if (shimPath) baseArgs.push('-include', shimPath);
-  for (const inc of profile.forcedIncludes || []) baseArgs.push('-include', inc);
+  const argsFor = config => {
+    const args = [...baseArgs];
+    for (const dir of config === profile ? allIncludeDirs : config.includeDirs || []) args.push('-I', dir);
+    if (config.macroArgs?.length) args.push(...config.macroArgs);
+    else for (const def of config.defines || []) args.push('-D', def);
+    if (shimPath) args.push('-include', shimPath);
+    for (const inc of config.forcedIncludes || []) args.push('-include', inc);
+    return args;
+  };
 
   const cwd = profile.dir && profile.dir !== '.' ? path.resolve(absRoot, profile.dir) : absRoot;
   const entries = activeRels.map((rel) => {
@@ -814,7 +827,7 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     return {
       directory: cwd,
       file: absFile,
-      arguments: [...baseArgs, absFile],
+      arguments: [...argsFor(profile.compilationUnits?.[rel] || profile), absFile],
     };
   });
 

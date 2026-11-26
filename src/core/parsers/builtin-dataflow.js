@@ -97,7 +97,7 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
   };
   if (model.pruneInactive) {
     preprocessProfile(model.root, sources, {
-      defines: model.buildDefines, includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
+      compilationUnits: model.compilationUnits, defines: model.buildDefines, includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
     }, loadInput, saveExpanded, true);
   } else {
     const macros = new Map();

@@ -1,3 +1,4 @@
+import { dependencyStamp } from './clang-config.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { preprocessProfile } from './builtin-includes.js';
@@ -241,6 +242,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const parsed = [];
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
+  const externalDeps = new Map();
   const macros = new Map();
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
   const macroDefs = new Map();
@@ -283,7 +285,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         warnings.push({ file: rel, error: `文件过大（${(size / 1048576).toFixed(1)} MB），已跳过` });
         return;
       }
+      const stamp = dependencyStamp(abs);
       buf = fs.readFileSync(abs);
+      if (stamp) externalDeps.set(abs, stamp);
       if (buf.length > MAX_FILE_BYTES) {
         warnings.push({ file: rel, error: `文件过大（${(buf.length / 1048576).toFixed(1)} MB），已跳过` });
         return;
@@ -794,6 +798,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     indirectCalls,
     includes,
     warnings,
+    externalDeps: [...externalDeps.values()],
+    compilationUnits: parserOptions?.compilationUnits || {},
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
     ...(pruneInactive ? { pruneInactive: true, includeDirs: parserOptions.includeDirs || [], forcedIncludes: parserOptions.forcedIncludes || [] } : {}),
   };
@@ -811,10 +817,10 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
     return JSON.stringify([
-      'builtin:5',
+      'builtin:6',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
-      hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [],
+      hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),

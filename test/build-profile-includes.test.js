@@ -1,3 +1,7 @@
+import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
+import { discoverBuildProfiles, materializeCompileCommands } from '../src/core/build-config.js';
+import { resolveBuildProfileOptions } from '../src/core/build-profile-options.js';
+import { scanSources } from '../src/core/index.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -69,6 +73,14 @@ test('配置路径加载工程外的 SDK 头文件及嵌套包含', t => {
   const model = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'sdk', includeDirs: [sdk] } });
   assert.ok(model.functions.some(f => f.name === 'yes'));
   assert.ok(!model.functions.some(f => f.name === 'no'));
+  assert.equal(externalDependenciesCurrent(model), true);
+  assert.ok(model.externalDeps.some(dep => dep.file === path.join(sdk, 'nested.h')));
+  fs.writeFileSync(path.join(sdk, 'nested.h'), '#define FEATURE 0\n');
+  assert.equal(externalDependenciesCurrent(model), false);
+  const refreshed = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'sdk', includeDirs: [sdk] } });
+  assert.ok(refreshed.functions.some(f => f.name === 'no'));
+  fs.unlinkSync(path.join(sdk, 'config.h'));
+  assert.equal(externalDependenciesCurrent(refreshed), false);
 });
 
 test('union 省略花括号后转到下一个结构体成员', t => {
@@ -84,4 +96,24 @@ void run(void) { ops.u.a(); ops.next(); }
   const edges = model.edges.filter(e => e.from === 'main.c::run');
   assert.ok(edges.some(e => e.to === 'main.c::foo'));
   assert.ok(edges.some(e => e.to === 'main.c::bar'));
+});
+
+test('Make 不同编译单元保持各自宏环境并分别导出', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unit-flags-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all:\n\tcc -DMODE=1 a.c\n\tcc -DMODE=2 b.c');
+  for (const [name, mode] of [['a', 1], ['b', 2]]) fs.writeFileSync(path.join(root, name + '.c'),
+    `#if MODE == ${mode}\nvoid ${name}_yes(void) {}\n#else\nvoid ${name}_no(void) {}\n#endif`);
+  const profile = discoverBuildProfiles(root).profiles.find(p => p.source === 'makefile');
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.functions.map(f => f.name).sort(), ['a_yes', 'b_yes']);
+  const exported = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const entries = JSON.parse(fs.readFileSync(exported.compileCommandsPath, 'utf8'));
+  for (const entry of entries) {
+    const args = entry.arguments;
+    assert.equal(args.filter(v => v === '-D').length, 1);
+    assert.equal(args[args.indexOf('-D') + 1], path.basename(entry.file) === 'a.c' ? 'MODE=1' : 'MODE=2');
+  }
 });

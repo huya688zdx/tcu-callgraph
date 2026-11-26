@@ -17,6 +17,7 @@ export function resolveBuildProfileOptions(root, parserId, options = {}, files =
   } else if (parserId === 'builtin') {
     resolved.activeFiles = selectProfileSourceFiles(profile, files);
     resolved.defines = profile.defines || [];
+    resolved.compilationUnits = profile.compilationUnits || {};
     resolved.includeDirs = profile.includeDirs || [];
     resolved.forcedIncludes = profile.forcedIncludes || [];
   }

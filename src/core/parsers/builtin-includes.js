@@ -19,10 +19,6 @@ export function buildMacros(defines = []) {
 export function preprocessProfile(root, files, options, load, visit, expand = false) {
   const key = s => process.platform === 'win32' ? s.toLowerCase() : s;
   const byPath = new Map(files.filter(f => f.isHeader).map(f => [key(path.resolve(root, f.rel)), f]));
-  const search = (options.includeDirs || []).map(dir => path.resolve(root, dir));
-  if (!search.length) search.push(path.resolve(root));
-  const forced = options.forcedIncludes || [];
-  const predefined = buildMacros(options.defines);
   const inputs = new Map();
   const headers = new Map();
 
@@ -46,6 +42,12 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
 
   for (const source of files) {
     if (source.isHeader) continue;
+    const config = options.compilationUnits?.[source.rel] || options;
+    const search = (config.includeDirs || []).map(dir => path.resolve(root, dir));
+    if (!search.length) search.push(path.resolve(root));
+    const forced = config.forcedIncludes || [];
+    const predefined = buildMacros(config.defines);
+
     const stack = new Set(), once = new Set();
     function processFile(file, base) {
       if (stack.has(file) || once.has(file)) return null;
