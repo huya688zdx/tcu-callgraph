@@ -21,6 +21,7 @@ export function resolveBuildProfileOptions(root, parserId, options = {}, files =
     resolved.compilationUnits = profile.compilationUnits || {};
     resolved.includeDirs = profile.includeDirs || [];
     resolved.includeOptions = profile.includeOptions;
+    resolved.languageStandard = profile.languageStandard;
     resolved.forcedIncludes = profile.forcedIncludes || [];
     resolved.macroIncludes = profile.macroIncludes || [];
   }

@@ -892,6 +892,7 @@ function flowchartMacroConfig(model, fn) {
   return model.compilationUnits?.[fn.file] || {
     defines: model.buildDefines, macroArgs: model.macroArgs, includeDirs: model.includeDirs,
     includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes, macroIncludes: model.macroIncludes,
+    languageStandard: model.languageStandard,
   };
 }
 

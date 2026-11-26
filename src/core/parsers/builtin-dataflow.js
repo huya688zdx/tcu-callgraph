@@ -103,7 +103,7 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
     const profile = {
       compilationUnits: model.compilationUnits, defines: model.buildDefines,
       includeDirs: model.includeDirs, includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes,
-      macroArgs: model.macroArgs, macroIncludes: model.macroIncludes,
+      macroArgs: model.macroArgs, macroIncludes: model.macroIncludes, languageStandard: model.languageStandard,
     };
     if (keepOriginal) preprocessProfile(model.root, sources, profile, loadInput,
       (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)));

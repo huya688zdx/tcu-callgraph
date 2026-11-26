@@ -258,3 +258,25 @@ test('宽字符串及其拼接占用整个字符数组，后续回调保持原�
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar']);
 });
+
+test('无名位域不消耗初始化位置，命名位域仍消耗一个位置', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-bit-field-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef unsigned U;',
+    'typedef void (*Fn)(void);',
+    '#define BITS 3',
+    'typedef struct { U : 0; Fn run; Fn next; } Ops;',
+    'typedef struct { U : 0; U flag : BITS; Fn run; Fn next; } FlagOps;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops ops = { foo, bar };',
+    'static const FlagOps flags = { 1, foo, bar };',
+    'void call(void) { ops.run(); ops.next(); flags.run(); flags.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  for (const name of ['ops', 'flags']) {
+    assert.deepEqual(model.fnptrTables.find(table => table.name === name).map, { run: 'foo', next: 'bar' });
+  }
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar', 'foo', 'bar']);
+});

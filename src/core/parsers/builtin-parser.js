@@ -870,7 +870,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     ...(pruneInactive ? {
       pruneInactive: true, includeDirs: parserOptions.includeDirs || [], includeOptions: parserOptions.includeOptions,
       forcedIncludes: parserOptions.forcedIncludes || [], macroIncludes: parserOptions.macroIncludes,
-      macroArgs: parserOptions.macroArgs,
+      macroArgs: parserOptions.macroArgs, languageStandard: parserOptions.languageStandard,
     } : {}),
   };
 
@@ -885,13 +885,13 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:10';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:11';
     return JSON.stringify([
-      'builtin:20',
+      'builtin:21',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
-      options.includeOptions, options.macroArgs, options.macroIncludes,
+      options.includeOptions, options.macroArgs, options.macroIncludes, options.languageStandard,
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),

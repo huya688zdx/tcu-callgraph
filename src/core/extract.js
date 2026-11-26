@@ -379,14 +379,20 @@ function declarationType(tokens) {
 function initializerDeclarations(statement, macros) {
   const parts = splitAtTopLevel(statement);
   const first = parts[0] || [];
-  const base = declarationType(first.slice(0, first.indexOf(declarationName(first))));
+  const splitBitField = part => part.some(token => token.v === ':') ? splitAtTopLevel(part, ':') : [part];
+  const firstParts = splitBitField(first);
+  const firstDeclarator = firstParts[0] || [];
+  const base = declarationType(firstDeclarator.slice(0, firstDeclarator.indexOf(declarationName(firstDeclarator))));
   const open = first.findIndex(t => t.v === '{');
   const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), macros) : null;
   const shapes = new Map();
   for (const part of parts) {
-    const token = declarationName(part);
+    const [declarator = [], bitWidth] = part === first ? firstParts : splitBitField(part);
+    const token = declarationName(declarator);
     if (!token) continue;
-    const name = part.indexOf(token);
+    const name = declarator.indexOf(token);
+    if (bitWidth && part === first && (['enum', 'struct', 'union'].includes(declarator[name - 1]?.v) ||
+        declarator.slice(0, name).every(t => ['const', 'volatile', 'restrict'].includes(t.v) || ANNOTATIONS.has(t.v)))) continue;
     let j = name + 1;
     const extents = [];
     while (part[j]?.v === '[') {

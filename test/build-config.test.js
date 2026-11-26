@@ -882,3 +882,22 @@ test('Make 单冒号目标只采用最后一个配方，双冒号规则独立收
   assert.deepEqual(parsed.compilationUnits['a.c'].defines, ['A']);
   assert.deepEqual(parsed.compilationUnits['b.c'].defines, ['B']);
 });
+
+test('QAC 配置保留语言标准，内置解析和导出的编译命令选择同一分支', async t => {
+  const root = temporaryProject(t);
+  write(root, 'analysis.via', '-std=c99 -DFEATURE=1 main.c\n');
+  write(root, 'main.c', [
+    '#if FEATURE && __STDC_VERSION__ == 199901L',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles.find(item => item.source === 'qac');
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  assert.equal(profile.languageStandard, 'c99');
+  const build = parserId => loadModel(root, { parserId,
+    parserOptions: resolveBuildProfileOptions(root, parserId, options, files, profile, path.dirname(root)) });
+  assert.deepEqual((await build('builtin')).functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  assert.ok(readCompileCommands(root, compileCommandsPath)[0].args.includes('-std=c99'));
+  if (detectClang().ok) assert.deepEqual((await build('clang-ast')).functions.map(fn => fn.name), ['correct']);
+});

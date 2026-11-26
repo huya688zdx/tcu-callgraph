@@ -205,6 +205,7 @@ function extractedOptions(config) {
     macroArgs: config.macroArgs || [],
     forcedIncludes: [...config.forcedIncludes],
     macroIncludes: [...config.macroIncludes],
+    ...(config.languageStandard ? { languageStandard: config.languageStandard } : {}),
   };
 }
 
@@ -579,10 +580,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (args.length) compilers.add(compiler);
       const unit = compilerConfig();
       extractCompilerFlags(args, entryDir, rootDir, unit);
-      for (const rel of unit.sourceFiles) compilationUnits[rel] = {
-        ...extractedOptions(unit),
-        ...(unit.languageStandard ? { languageStandard: unit.languageStandard } : {}),
-      };
+      for (const rel of unit.sourceFiles) compilationUnits[rel] = extractedOptions(unit);
       extractCompilerFlags(args, entryDir, rootDir, collected);
     }
   };
@@ -714,6 +712,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
         ...compilerConfig(), includeDirs: new Set(config.includeDirs), includeOptions: new Map(config.includeOptions),
         defines: new Set(config.defines), macroArgs: [...(config.macroArgs || [])],
         forcedIncludes: new Set(config.forcedIncludes), macroIncludes: [...config.macroIncludes],
+        languageStandard: config.languageStandard,
       };
       readOptions(body, unit);
       compilationUnits[rel] = extractedOptions(unit);
@@ -766,7 +765,7 @@ function parseQacProfile(rootDir, rel, abs) {
     if (!line || line.startsWith('#') || line.startsWith(';')) continue;
     extractCompilerFlags(tokenizeArgs(line), dir, rootDir, collected);
   }
-  if (!collected.includeDirs.size && !collected.defines.size && !collected.sourceFiles.size) return null;
+  if (!collected.includeDirs.size && !collected.defines.size && !collected.sourceFiles.size && !collected.languageStandard) return null;
   const meta = detectArchAndCompiler(text);
   return {
     id: `qac::${rel}`,
