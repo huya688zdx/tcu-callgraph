@@ -259,6 +259,54 @@ function splitTopCommas(tokens) {
   return items;
 }
 
+const standardTypeNames = new Set([
+  'bool', 'size_t', 'ptrdiff_t', 'max_align_t', 'wchar_t', 'wint_t', 'char8_t', 'char16_t', 'char32_t',
+  'intptr_t', 'uintptr_t', 'intmax_t', 'uintmax_t', 'time_t', 'clock_t', 'sig_atomic_t', 'va_list',
+]);
+
+function isStandardTypeName(name) {
+  return standardTypeNames.has(name) || /^u?int(?:_least|_fast)?(?:8|16|32|64)_t$/.test(name);
+}
+
+/** 从 typedef 声明收集别名及其作用域，供括号中的单个标识符消歧。 */
+export function findTypedefs(tokens) {
+  const aliases = new Map();
+  const scopes = [{ end: null }];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.v === '{') { scopes.push({ end: null }); continue; }
+    if (token.v === '}' && scopes.length > 1) { scopes.pop().end = token; continue; }
+    if (token.v !== 'typedef') continue;
+    let end = i + 1, depth = 0;
+    for (; end < tokens.length; end++) {
+      const value = tokens[end].v;
+      if (!depth && (value === ';' || value === '}')) break;
+      if (['(', '[', '{'].includes(value)) depth++;
+      if ([')', ']', '}'].includes(value)) depth--;
+    }
+    if (tokens[end]?.v !== ';') continue;
+    for (const part of splitTopCommas(tokens.slice(i + 1, end))) {
+      let name = null, depth = 0;
+      for (let j = 0; j < part.length; j++) {
+        const t = part[j];
+        if (!depth && t.t === 'id' && !KEYWORDS.has(t.v) && !ANNOTATIONS.has(t.v)) name = t;
+        if (!depth && t.v === '(' && part[j + 1]?.v === '*') {
+          let k = j + 2;
+          while (part[k]?.v === '*' || TYPE_WORDS.has(part[k]?.v)) k++;
+          if (part[k]?.t === 'id') name = part[k];
+        }
+        if (['(', '[', '{'].includes(t.v)) depth++;
+        if ([')', ']', '}'].includes(t.v)) depth--;
+      }
+      if (!name) continue;
+      if (!aliases.has(name.v)) aliases.set(name.v, []);
+      aliases.get(name.v).push({ declaration: name, scope: scopes.at(-1), fileScope: scopes.length === 1 });
+    }
+    i = end;
+  }
+  return aliases;
+}
+
 /** 解析常量整数索引（如 0, 1, 0x02），非常量返回 null */
 function parseConstIndex(tokens) {
   if (tokens.length !== 1 || tokens[0].t !== 'num') return null;
@@ -500,11 +548,12 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
       }
       if (depth === 0 && tokens[close]?.v === '(') {
         const inner = tokens.slice(i + 1, close - 1);
-        if (inner.length === 1 && inner[0].t === 'id' && !KEYWORDS.has(inner[0].v)) {
+        if (inner.length === 1 && inner[0].t === 'id' && !KEYWORDS.has(inner[0].v) && !isStandardTypeName(inner[0].v)) {
           const calleeTok = inner[0];
           const origins = calleeTok.macroOrigins || macroChain;
           out.push({
             callee: calleeTok.v,
+            parenthesized: true,
             kind: origins.length ? 'macro' : 'direct',
             line: calleeTok.line, col: calleeTok.col,
             cond: calleeTok.cond,
@@ -535,6 +584,8 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
           if (deref[deref.length - 1]?.v === ']') {
             const { recv, indices, indexExprs } = extractIndexedReceiver(deref, deref.length - 1);
             if (recv && indices.length) {
+              // 下标本身可能调用函数，跳过接收表达式前先扫描它。
+              scanCalls(deref, ctx, out, macroChain);
               out.push({
                 callee: null,
                 receiver: recv,

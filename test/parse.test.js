@@ -425,3 +425,40 @@ int initialize(void) {
   assert.deepEqual(calls('octal'), ['first_local', 'first_local', 'second_local']);
   assert.deepEqual(calls('initialize'), ['number', 'pointer']);
 });
+
+test('区分 typedef 转换和括号调用，并保留解引用分派表下标里的调用', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-casts-and-indices-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef unsigned short Reading, *ReadingPtr;\n');
+  fs.writeFileSync(path.join(dir, 'api.h'), '#include "types.h"\n#define READ_CAST() (Reading)(read_value())\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "api.h"
+#include <stdint.h>
+typedef void (*Handler)(void);
+static unsigned short read_value(void) { return 5; }
+static void first(void) {}
+static void second(void) {}
+static int next(void) { return 0; }
+static int column(void) { return 1; }
+static int handler_t(void) { return 0; }
+static const Handler arr[2][2] = { { first, second }, { second, first } };
+unsigned int cast_values(void) {
+  typedef unsigned int LocalCount;
+  return (uint16_t)(read_value()) + (LocalCount)(read_value()) + READ_CAST() + (handler_t)();
+}
+Handler cast_handler(void) { return (Handler)(0); }
+void dispatch(void) { (*arr[next()][column()])(); }
+`);
+  fs.writeFileSync(path.join(dir, 'other.c'), 'int Reading(void) { return 3; }\nint use(void) { return (Reading)(); }\n');
+  const model = loadModel(dir);
+  const calls = id => (model._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('app.c::cast_values'), ['read_value', 'read_value', 'read_value', 'handler_t']);
+  assert.deepEqual(calls('app.c::cast_handler'), []);
+  assert.deepEqual(calls('other.c::use'), ['Reading']);
+  assert.deepEqual(calls('app.c::dispatch'), ['next', 'column']);
+  const sites = model.indirectCalls.filter(call => call.caller === 'app.c::dispatch');
+  assert.equal(sites.length, 1);
+  assert.deepEqual(sites[0].indices, ['next()', 'column()']);
+  assert.deepEqual(new Set(sites[0].candidates.map(candidate => candidate.name)), new Set(['first', 'second']));
+  assert.ok(!(model.headerEdges || []).some(edge => edge.to === 'ext::Reading'));
+});

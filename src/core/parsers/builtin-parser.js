@@ -6,7 +6,7 @@ import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
-import { findFunctions, findFnPtrTables, scanCalls } from '../extract.js';
+import { findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
 
@@ -237,11 +237,29 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   const functions = [];
   const functionRecords = [];
+  const deferredTypedefCalls = [];
+  const typedefsByFile = new Map();
+  const typedefHeadersByName = new Map();
   const fnptrTablesList = [];
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
   const varById = new Map();
+
+  const recordFunctionCalls = (record, body, fileMacros) => {
+    const { fn, calls } = record;
+    for (const call of calls) {
+      call.macroDefinitions = (call.macroChain || []).map((name) => {
+        const def = fileMacros.get(name, call.line);
+        return def ? `header::${def.file}::${name}` : null;
+      }).filter(Boolean);
+    }
+    const deferred = calls.length > 1 && calls.some((c) => ['unknown', 'fnptr_indexed', 'fnptr_ptr'].includes(c.kind));
+    if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
+    record.nesting = deferred ? callNestingTokens(body) : null;
+    assignCallGroups(body, calls);
+    record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
+  };
 
   const parseFile = ({ rel, abs, isHeader, bytes }) => {
     let buf;
@@ -275,6 +293,13 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
     const fileMacros = fileMacroScope(macros, new Map(), { trackPositions: true });
     const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
+    const typedefs = findTypedefs(tokens);
+    if (typedefs.size) typedefsByFile.set(rel, typedefs);
+    if (isHeader) for (const [name, entries] of typedefs) {
+      if (!entries.some(entry => entry.fileScope)) continue;
+      if (!typedefHeadersByName.has(name)) typedefHeadersByName.set(name, []);
+      typedefHeadersByName.get(name).push(rel);
+    }
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -292,18 +317,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       for (const table of findFnPtrTables(body, rel, fn.id).values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
-      for (const call of calls) {
-        call.macroDefinitions = (call.macroChain || []).map((name) => {
-          const def = fileMacros.get(name, call.line);
-          return def ? `header::${def.file}::${name}` : null;
-        }).filter(Boolean);
-      }
-      const deferred = calls.length > 1 && calls.some((c) => ['unknown', 'fnptr_indexed', 'fnptr_ptr'].includes(c.kind));
-      if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
-      const nesting = deferred ? callNestingTokens(body) : null;
-      assignCallGroups(body, calls);
-      functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body),
-        taskEvidence: collectTaskEvidence(fn, body, fileMacros, calls) });
+      const record = { fn, calls, mentions: variableMentions(body) };
+      functionRecords.push(record);
+      // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
+      if (calls.some(call => call.parenthesized)) deferredTypedefCalls.push({ record, body, fileMacros });
+      else recordFunctionCalls(record, body, fileMacros);
       functions.push(fn);
     }
     for (const table of findFnPtrTables(tokens, rel).values()) {
@@ -335,6 +353,18 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   for (const file of headers) parseFile(file);
   for (const file of sources) parseFile(file);
   const includesHeader = includedHeaders(headers, includes);
+  const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
+  const isTypedefCall = (file, call) => {
+    if (!call.parenthesized) return false;
+    return typedefsByFile.get(file)?.get(call.callee)?.some(({ declaration, scope }) =>
+      compareLocation(call, declaration) > 0 && (!scope.end || compareLocation(call, scope.end) < 0)) ||
+      typedefHeadersByName.get(call.callee)?.some(header => header !== file && includesHeader(file, header));
+  };
+  for (const { record, body, fileMacros } of deferredTypedefCalls) {
+    record.calls = record.calls.filter(call => record.fn.params.includes(call.callee) || !isTypedefCall(record.fn.file, call));
+    recordFunctionCalls(record, body, fileMacros);
+  }
+  deferredTypedefCalls.length = 0;
 
   const byId = new Map();
   const byName = new Map();
@@ -441,7 +471,6 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       globalTablesByName.set(entry.name, entry);
     }
   }
-  const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
   const lookupTable = (fn, call) => {
     const name = call.receiver;
     if (!name) return null;
@@ -603,7 +632,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (!callsByMacro.has(id)) callsByMacro.set(id, []);
     callsByMacro.get(id).push(e);
   }
-  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.filter((e) => e.kind !== 'var').map((e) => e.callee)]), macros, callsByMacro);
+  const symbols = headerSymbols(parsed, resolveCallee,
+    new Set([...byName.keys(), ...edges.filter(e => e.kind !== 'var').map(e => e.callee)]), macros, callsByMacro, isTypedefCall);
   for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
     const id = symbol.targetIds[i];
     if (!allNodes.has(id) && id.startsWith('ext::')) {
