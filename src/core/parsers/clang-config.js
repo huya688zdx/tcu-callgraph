@@ -1,15 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { SRC_EXT } from '../source-files.js';
+import { decodeSource, SRC_EXT } from '../source-files.js';
 
 export const fileKey = (rel) => process.platform === 'win32' ? rel.toLowerCase() : rel;
 
 const clangDetectCache = new Map();
 
-export function detectClang(customBin) {
+export function detectClang(customBin, { refresh = false } = {}) {
   const bin = customBin || process.env.CALLGRAPH_CLANG || 'clang';
-  if (clangDetectCache.has(bin)) return clangDetectCache.get(bin);
+  if (!refresh && clangDetectCache.has(bin)) return clangDetectCache.get(bin);
   let result;
   try {
     const version = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true }).split(/\r?\n/)[0];
@@ -36,7 +36,10 @@ export function findCompileCommands(root, explicit) {
 export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
-  return JSON.stringify(['clang-ast', 'v5', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
+  return JSON.stringify([
+    'clang-ast', 'v6', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
+    Boolean(options.strictCompileCommands), options.buildProfileId || null,
+  ]);
 }
 
 /** 只拆分参数，不展开变量、重定向或执行编译数据库里的命令。 */
@@ -80,14 +83,44 @@ const pathFlags = new Set(['-I', '-isystem', '-iquote', '-idirafter', '-include'
 const valueFlags = new Set(['-D', '-U', '-std', '-x', '-target', '--target']);
 const flags = [...pathFlags, ...valueFlags].sort((a, b) => b.length - a.length);
 
-function clangArguments(args, directory, remap) {
+function expandResponseTokens(args, directory, seen = new Set(), depth = 0) {
+  if (depth > 6) return args;
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const isCompilerSlot = depth === 0 && i === 0;
+    const prev = i > 0 ? args[i - 1] : null;
+    const isOptionOperand = typeof prev === 'string' && (pathFlags.has(prev) || valueFlags.has(prev));
+    if (!isCompilerSlot && !isOptionOperand && typeof arg === 'string' && arg.length > 1 &&
+        (arg.startsWith('@') || arg.startsWith('-@'))) {
+      const rawPath = arg.startsWith('-@') ? arg.slice(2) : arg.slice(1);
+      const target = path.resolve(directory, rawPath);
+      const key = fileKey(target);
+      if (!seen.has(key) && fs.statSync(target, { throwIfNoEntry: false })?.isFile()) {
+        seen.add(key);
+        const text = decodeSource(fs.readFileSync(target)).replace(/^\uFEFF/, '');
+        const nested = splitCommand(text.replace(/\r?\n/g, ' '));
+        out.push(...expandResponseTokens(nested, path.dirname(target), seen, depth + 1));
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+function clangArguments(rawArgs, directory, remap) {
+  const args = expandResponseTokens(rawArgs, directory);
   const result = [];
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     const flag = flags.find((f) => arg === f || arg.startsWith(f + '=')
       || (['-I', '-D', '-U', '-isystem', '-iquote', '-idirafter'].includes(f) && arg.startsWith(f)));
     if (!flag) {
-      if (/^-f(?:no-)?(?:ms-extensions|ms-compatibility|short-enums|short-wchar|signed-char|unsigned-char|freestanding|builtin)$/.test(arg)) result.push(arg);
+      if (/^-f(?:no-)?(?:ms-extensions|ms-compatibility|gnu-keywords|short-enums|short-wchar|signed-char|unsigned-char|freestanding|builtin)$/.test(arg) ||
+          /^-Wno-(?:unknown-pragmas|attributes|gnu|incompatible-pointer-types)$/.test(arg)) {
+        result.push(arg);
+      }
       continue;
     }
     const value = arg === flag ? args[++i] : arg.slice(flag.length).replace(/^=/, '');

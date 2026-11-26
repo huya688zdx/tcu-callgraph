@@ -45,6 +45,42 @@
   .tool-group + .tool-group { padding-left: 12px; border-left: 1px solid #DEDDD6; }
   .tool-label { margin-right: 2px; font-size: 11px; color: #888780; }
   .toolbar-select { max-width: 165px; color: #234361; background-color: #F6F9FC; }
+  #buildConfigBtn { max-width: 190px; overflow: hidden; text-overflow: ellipsis; color: #234361; background: #F6F9FC; }
+  #buildConfigBtn.active { background: #E6F1FB; border-color: #85B7EB; color: #185FA5; font-weight: 500; }
+  #buildConfigModal { width: min(580px, calc(100vw - 24px)); }
+  .build-form { display: grid; gap: 12px; padding: 12px 16px; }
+  .build-field { display: grid; gap: 5px; font-size: 12.5px; color: #2C2C2A; }
+  .build-field > span { font-weight: 500; color: #444740; }
+  .build-field select, .build-field input[type="text"] {
+    width: 100%; height: 32px; padding: 0 10px; font-size: 12.5px;
+    border: 1px solid rgba(0,0,0,.18); border-radius: 8px; background: #fff; color: #2C2C2A;
+  }
+  .build-field input[type="text"]:focus, .build-field select:focus { outline: none; border-color: #185FA5; }
+  .build-summary {
+    padding: 9px 11px; border-radius: 8px; background: #F7F6F2; border: 1px solid #E5E4DE;
+    font-size: 12px; color: #444740; line-height: 1.6; overflow-wrap: anywhere;
+  }
+  .build-summary .build-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+  .build-summary .build-tag {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    background: #fff; border: 1px solid #DEDDD6; font-size: 11px; color: #365572;
+  }
+  .build-hint {
+    padding: 7px 10px; border-radius: 8px; background: #FFF8E6; border: 1px solid #F0D48A;
+    font-size: 11.5px; color: #7A4F01; line-height: 1.5;
+  }
+  .build-check { display: flex; align-items: flex-start; gap: 7px; font-size: 12px; color: #444740; cursor: pointer; line-height: 1.5; }
+  .build-check input { margin-top: 3px; flex: 0 0 auto; }
+  .build-status { font-size: 11.5px; line-height: 1.5; color: #5F5E5A; overflow-wrap: anywhere; }
+  .build-status.ok { color: #166534; }
+  .build-status.warn { color: #9A3412; }
+  #buildConfigMessage { font-size: 12px; line-height: 1.5; padding: 7px 10px; border-radius: 8px; overflow-wrap: anywhere; }
+  #buildConfigMessage.ok { background: #ECFDF3; color: #166534; border: 1px solid #BBF7D0; }
+  #buildConfigMessage.err { background: #FEF2F2; color: #B42318; border: 1px solid #FECACA; }
+  #buildConfigModal .modal-foot { align-items: center; flex-wrap: wrap; }
+  #buildConfigModal .fsel { width: 100%; }
+  #buildConfigModal .fsel-btn { width: 100%; justify-content: space-between; overflow: hidden; text-overflow: ellipsis; }
+  #buildExportDb { margin-right: auto; }
   .period-detail { margin: 8px 0 6px; padding-top: 6px; border-top: 1px solid rgba(0,0,0,.08); font-size: 11.5px; color: #5F5E5A; overflow-wrap: anywhere; }
   .period-detail summary { display: flex; align-items: baseline; gap: 6px; cursor: pointer; list-style: none; user-select: none; }
   .period-detail summary::-webkit-details-marker { display: none; }
@@ -1531,6 +1567,7 @@
           <option value="flat" data-i18n="toolbar.layoutFlat">平铺</option>
         </select>
         <select id="parserSelect" class="toolbar-select" aria-label="解析引擎" data-i18n-aria-label="toolbar.parser" data-i18n-title="toolbar.parser" hidden></select>
+        <button id="buildConfigBtn" type="button" title="选择机种构建配置（.cproject / .mak / QAC）、设置便携版 Clang 路径或导出 compile_commands.json" hidden>⚙ 构建配置</button>
       </div>
       <div class="tool-group">
         <button id="resetLayout" class="primary" title="使用 ELK 重新计算节点与连线路径" data-i18n-title="toolbar.relayoutHint" data-i18n="btn.reset">重新排版</button>
@@ -1705,6 +1742,43 @@
       <div id="flowchartStatus" role="status" hidden></div>
       <div id="flowchartCalls" hidden></div>
       <div id="flowchartCanvas" style="width: 100%; height: 100%"></div>
+    </div>
+  </div>
+
+  <div id="buildConfigModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="buildConfigTitle">
+    <div class="modal-head">
+      <h2 id="buildConfigTitle">构建配置与编译环境</h2>
+      <button class="modal-close" type="button" data-close="buildConfigModal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body build-form">
+      <label class="build-field">
+        <span>机种 / 构建配置（自动识别 .cproject / .mak / QAC）</span>
+        <select id="buildProfileSelect"></select>
+      </label>
+      <div id="buildProfileInfo" class="build-summary">正在扫描工程构建配置…</div>
+      <div id="buildMultiCoreHint" class="build-hint" hidden></div>
+      <label class="build-field">
+        <span>解析引擎</span>
+        <select id="buildParserSelect">
+          <option value="builtin">内置快速解析 (Lexer + Tree-sitter)</option>
+          <option value="clang-ast">Clang AST 编译器前端 (100% 预处理/类型级)</option>
+        </select>
+      </label>
+      <label class="build-check">
+        <input type="checkbox" id="buildStrictCheck" checked>
+        <span>严格单机种编译数据库模式（仅解析当前所选配置包含的 .c 文件，防止多机种同名函数串扰）</span>
+      </label>
+      <label class="build-field">
+        <span>Clang 可执行文件路径（可选，支持内网便携版 clang.exe）</span>
+        <input id="buildClangBin" type="text" autocomplete="off" spellcheck="false" placeholder="留空自动查 PATH；或填写便携版路径如 D:\tools\llvm\bin\clang.exe">
+        <div id="buildClangStatus" class="build-status"></div>
+      </label>
+      <div id="buildConfigMessage" role="status" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <button id="buildExportDb" type="button" title="按当前所选构建配置在工程根目录生成 compile_commands.json 及 GHS 兼容垫片">导出 compile_commands.json</button>
+      <button id="buildConfigCancel" type="button" data-close="buildConfigModal">取消</button>
+      <button id="buildConfigApply" type="button" class="primary">应用并重新解析</button>
     </div>
   </div>
 

@@ -218,19 +218,36 @@ function variableMentions(bodyTokens) {
  * @param {string} root 工程根目录
  * @returns {object} model
  */
-function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
+function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions = {}) {
   const t0 = Date.now();
   // 比较时仅替换文件来源，符号身份和层级仍相对于总代码目录。
-  const files = scan?.files ?? (sourceFiles
+  const rawFiles = scan?.files ?? (sourceFiles
     ? [...sourceFiles].map(([rel, abs]) => ({ rel, abs, isHeader: HDR_EXT.test(rel) }))
     : listSourceFiles(root).map((abs) => ({ rel: path.relative(root, abs).replace(/\\/g, '/'), abs, isHeader: HDR_EXT.test(abs) })));
+  const activeSet = Array.isArray(parserOptions?.activeFiles)
+    ? new Set(parserOptions.activeFiles.map((rel) => (process.platform === 'win32' ? rel.toLowerCase() : rel)))
+    : null;
+  const files = activeSet
+    ? rawFiles.filter((file) => file.isHeader || activeSet.has(process.platform === 'win32' ? file.rel.toLowerCase() : file.rel))
+    : rawFiles;
   const headers = files.filter((file) => file.isHeader);
   const sources = files.filter((file) => !file.isHeader);
+  const pruneInactive = Boolean(
+    parserOptions?.buildProfileId ||
+    (Array.isArray(parserOptions?.defines) && parserOptions.defines.length > 0),
+  );
 
   const parsed = [];
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
   const macros = new Map();
+  for (const rawDef of Array.isArray(parserOptions?.defines) ? parserOptions.defines : []) {
+    const eq = String(rawDef || '').indexOf('=');
+    const name = (eq >= 0 ? rawDef.slice(0, eq) : rawDef).trim();
+    const val = eq >= 0 ? rawDef.slice(eq + 1).trim() : '1';
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+    macros.set(name, { name, params: null, body: lex(val, '<build-config>'), file: '<build-config>', line: 0, raw: val });
+  }
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
   const macroDefs = new Map();
   const MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -294,7 +311,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     const taskDefs = taskDeclarations(src, original);
     const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
     const fileMacros = fileMacroScope(macros, new Map(), { trackPositions: true });
-    const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
+    const { tokens, includes: inc } = preprocess(input, fileMacros, rel, { pruneInactive });
     const typedefs = findTypedefs(tokens);
     if (typedefs.size) typedefsByFile.set(rel, typedefs);
     if (isHeader) for (const [name, entries] of typedefs) {
@@ -750,6 +767,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     indirectCalls,
     includes,
     warnings,
+    ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
+    ...(pruneInactive ? { pruneInactive: true } : {}),
   };
 
   return model;
@@ -759,7 +778,19 @@ export const builtinParser = {
   id: 'builtin',
   name: '内置快速解析 (Lexer + Tree-sitter)',
   available: () => ({ ok: true }),
-  parse: (root, { sourceFiles, scan }) => buildBuiltinIndex(root, sourceFiles, scan),
+  cacheKey: (root, options = {}) => {
+    const hasProfile = Boolean(options?.buildProfileId);
+    const hasActive = Array.isArray(options?.activeFiles);
+    const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
+    return JSON.stringify([
+      'builtin:4',
+      options?.buildProfileId || null,
+      hasActive ? options.activeFiles : null,
+      hasDefines ? options.defines : [],
+    ]);
+  },
+  parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),
   buildDataflow: buildBuiltinDataflow,
   compareDefinitions: definitionsOf,
   compareMacros: macroDiff,

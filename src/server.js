@@ -42,6 +42,7 @@ import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
 import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
 import { readBuildConfigFile, resolveBuildFile, scanBuildConfig, summarizeCproject, summarizeDotProject } from './core/build-inspect.js';
+import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from './core/build-config.js';
 import { scheduleConfig } from './core/tcu-schedule.js';
 import { applyDataflow, diffParserModels } from './core/parsers/ir.js';
 import {
@@ -124,8 +125,45 @@ const analysisPending = new WeakMap();
 const configuredParser = () => store.getSetting('parser.active', 'builtin');
 const scanRootFor = target => fs.statSync(target, { throwIfNoEntry: false })?.isFile() ? path.dirname(target) : target;
 const compileCommandsKey = scanRoot => 'parser.compileCommandsPath.' + fileKey(path.resolve(scanRoot));
-const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => id === 'clang-ast'
-  ? { compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)) } : {};
+const clangBinKey = 'parser.clangBin';
+const buildProfileKey = scanRoot => 'parser.buildProfile.' + fileKey(path.resolve(scanRoot));
+const strictCompileCommandsKey = scanRoot => 'parser.strictCompileCommands.' + fileKey(path.resolve(scanRoot));
+const configuredClangBin = () => String(store.getSetting(clangBinKey) || '').trim();
+const configuredBuildProfile = scanRoot => store.getSetting(buildProfileKey(scanRoot)) || null;
+const configuredStrictCompile = scanRoot => store.getSetting(strictCompileCommandsKey(scanRoot));
+const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => {
+  const buildProfileId = configuredBuildProfile(scanRoot) || undefined;
+  if (id === 'clang-ast') {
+    const clangBin = configuredClangBin() || undefined;
+    const strictSaved = configuredStrictCompile(scanRoot);
+    return {
+      compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)),
+      ...(clangBin ? { clangBin } : {}),
+      ...(buildProfileId ? { buildProfileId } : {}),
+      ...(strictSaved !== undefined && strictSaved !== null ? { strictCompileCommands: Boolean(strictSaved) } : {}),
+    };
+  }
+  return buildProfileId ? { buildProfileId } : {};
+};
+function resolveBuildProfileOptions(scanRoot, parserId, rawOptions = {}, scanFiles = []) {
+  const opts = { ...(rawOptions || {}) };
+  if (!opts.buildProfileId || parserId === 'dot') return opts;
+  const discovered = discoverBuildProfiles(scanRoot);
+  const profile = discovered.profiles.find((p) => p.id === opts.buildProfileId);
+  if (!profile) {
+    delete opts.buildProfileId;
+    return opts;
+  }
+  if (parserId === 'clang-ast') {
+    const mat = materializeCompileCommands(scanRoot, profile, { files: scanFiles });
+    opts.compileCommandsPath = mat.compileCommandsPath;
+    if (opts.strictCompileCommands === undefined) opts.strictCompileCommands = true;
+  } else if (parserId === 'builtin') {
+    opts.activeFiles = selectProfileSourceFiles(profile, scanFiles);
+    opts.defines = profile.defines || [];
+  }
+  return opts;
+}
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
 async function compareProjects(...args) {
@@ -306,7 +344,8 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const scanRoot = isFile ? path.dirname(abs) : abs;
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
   const scan = isDot ? null : await analysisJob('scan', () => scanRoot);
-  const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id + ':2';
+  const resolvedOptions = isDot ? (parserOptions || {}) : resolveBuildProfileOptions(scanRoot, parser.id, parserOptions, scan?.files || []);
+  const parserKey = parser.cacheKey?.(scanRoot, resolvedOptions, status) ?? parser.id + ':2';
   const key = scan && !scan.warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
   const scanMs = performance.now() - t0;
 
@@ -322,9 +361,9 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
     if (focus) model.focusFile = focus;
     rebuildIndex(model);
   } else if (parser.id === 'builtin' || parser.id === 'clang-ast') {
-    model = rebuildIndex(await scanInProcess(abs, scan, { parserId: parser.id, parserOptions }));
+    model = rebuildIndex(await scanInProcess(abs, scan, { parserId: parser.id, parserOptions: resolvedOptions }));
   } else {
-    model = await loadModel(abs, scan, { parserId: parser.id, parserOptions });
+    model = await loadModel(abs, scan, { parserId: parser.id, parserOptions: resolvedOptions });
   }
   const analyzeMs = performance.now() - parseAt;
 
@@ -759,7 +798,7 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
     if (selection || parserId === 'builtin' || (isFile && /\.(dot|gv)$/i.test(abs))) throw error;
     fallback = `${parserId} 加载失败，已回退到内置快速解析：${error.message}`;
     console.warn(`[解析器] ${fallback}`);
-    loaded = await loadTargetModel(abs, isFile, 'builtin', {});
+    loaded = await loadTargetModel(abs, isFile, 'builtin', parserOptionsFor('builtin', isFile ? path.dirname(abs) : abs));
   }
   const { model, fromCache, loadMs } = loaded;
   // 同工程刷新期间照常接受写入。先在局部构建模型，发布前再检查会话并读最新存档。
@@ -803,7 +842,15 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
 
   if (selection) store.transaction(() => {
     store.setSetting('parser.active', selection.parserId);
-    if (selection.parserId === 'clang-ast') store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
+    if (selection.saveBuildConfig) {
+      const cfg = selection.saveBuildConfig;
+      if (cfg.clangBin !== undefined) store.setSetting(clangBinKey, cfg.clangBin || '');
+      if (cfg.buildProfileId !== undefined) store.setSetting(buildProfileKey(model.root), cfg.buildProfileId || null);
+      if (cfg.strictCompileCommands !== undefined) store.setSetting(strictCompileCommandsKey(model.root), Boolean(cfg.strictCompileCommands));
+      if (cfg.compileCommandsPath !== undefined) store.setSetting(compileCommandsKey(model.root), cfg.compileCommandsPath || null);
+    } else if (selection.parserId === 'clang-ast') {
+      store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
+    }
   });
   if (!refreshCurrent) sessionRevision++;
   root = abs;
@@ -2417,7 +2464,7 @@ export const server = http.createServer(async (req, res) => {
   try {
     u = new URL(req.url, `http://127.0.0.1:${PORT}`);
     req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/apply', '/api/compare/exit',
-      '/api/parsers', '/api/parsers/diff'].includes(u.pathname);
+      '/api/parsers', '/api/parsers/diff', '/api/build-configs'].includes(u.pathname);
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
@@ -4927,6 +4974,209 @@ export const server = http.createServer(async (req, res) => {
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
         });
+      return;
+    }
+
+    if (u.pathname === '/api/build-configs' && req.method === 'GET') {
+      const scanRoot = scanRootFor(root);
+      const isDot = fs.statSync(root, { throwIfNoEntry: false })?.isFile() && /\.(dot|gv)$/i.test(root);
+      if (isDot) {
+        return json(res, { ok: true, unsupported: true, activeParser: MODEL.parserId, profiles: [] });
+      }
+      const scan = await analysisJob('scan', () => scanRoot);
+      const discovered = discoverBuildProfiles(scanRoot);
+      const activeProfileId = configuredBuildProfile(scanRoot);
+      const clangBin = configuredClangBin();
+      const clangStatus = detectClang(clangBin || undefined, { refresh: true });
+      const strictSaved = configuredStrictCompile(scanRoot);
+      const strictCompileCommands = strictSaved === undefined || strictSaved === null
+        ? Boolean(activeProfileId) : Boolean(strictSaved);
+      const customCompileCommandsPath = store.getSetting(compileCommandsKey(scanRoot)) || '';
+      const detectedCompileCommands = findCompileCommands(scanRoot, customCompileCommandsPath || undefined);
+      const profiles = discovered.profiles.map((p) => {
+        const activeFiles = selectProfileSourceFiles(p, scan.files);
+        return {
+          id: p.id,
+          label: p.label,
+          source: p.source,
+          configFile: p.configFile,
+          dir: p.dir,
+          arch: p.arch,
+          compiler: p.compiler,
+          includeCount: (p.includeDirs || []).length,
+          defineCount: (p.defines || []).length,
+          exclusionCount: (p.exclusions || []).length,
+          activeFileCount: activeFiles.length,
+          sampleDefines: (p.defines || []).slice(0, 8),
+          sampleIncludes: (p.includeDirs || []).slice(0, 4).map((d) => {
+            const rel = path.relative(scanRoot, d).replace(/\\/g, '/');
+            return rel && !rel.startsWith('..') ? rel : d;
+          }),
+        };
+      });
+      return json(res, {
+        ok: true,
+        activeParser: MODEL.parserId,
+        configuredParser: configuredParser(),
+        clangBin,
+        clangStatus,
+        activeProfileId,
+        strictCompileCommands,
+        compileCommandsPath: customCompileCommandsPath,
+        detectedCompileCommands,
+        totalSourceFiles: scan.files.filter((f) => !f.isHeader).length,
+        multiCoreHint: discovered.multiCoreHint,
+        cprojectCount: discovered.cprojectCount,
+        profiles,
+      });
+    }
+
+    if (u.pathname === '/api/build-configs' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      switching = true;
+      try {
+        const body = await readJson(req, res);
+        const scanRoot = scanRootFor(root);
+        const isDot = fs.statSync(root).isFile() && /\.(dot|gv)$/i.test(root);
+        if (isDot) return bad(res, 'DOT 文件不支持构建配置');
+
+        const {
+          profileId,
+          parserId,
+          clangBin,
+          strictCompileCommands,
+          compileCommandsPath,
+          exportCompileCommands,
+          exportPath,
+        } = body || {};
+
+        if (clangBin !== undefined && (typeof clangBin !== 'string' || clangBin.includes('\0'))) {
+          return bad(res, 'clangBin 必须是有效的可执行文件路径');
+        }
+        if (profileId !== undefined && profileId !== null && (typeof profileId !== 'string' || profileId.includes('\0'))) {
+          return bad(res, 'profileId 无效');
+        }
+        if (compileCommandsPath !== undefined && compileCommandsPath !== null &&
+            (typeof compileCommandsPath !== 'string' || compileCommandsPath.includes('\0'))) {
+          return bad(res, 'compileCommandsPath 无效');
+        }
+
+        const discovered = discoverBuildProfiles(scanRoot);
+
+        if (exportCompileCommands) {
+          const targetId = profileId !== undefined ? (profileId || null) : configuredBuildProfile(scanRoot);
+          let profile = targetId ? discovered.profiles.find((p) => p.id === targetId) : null;
+          if (targetId && !profile) return bad(res, `未找到构建配置：${targetId}`);
+          if (!profile) {
+            profile = {
+              id: 'default:all',
+              label: '全部源码',
+              dir: '.',
+              arch: 'generic',
+              compiler: 'C',
+              includeDirs: [],
+              defines: [],
+              forcedIncludes: [],
+              exclusions: [],
+              sourceRoots: [],
+              explicitSources: [],
+            };
+          }
+          const relExport = String(exportPath || 'compile_commands.json').trim();
+          const absExport = path.resolve(scanRoot, relExport);
+          const relCheck = path.relative(scanRoot, absExport).replace(/\\/g, '/');
+          if (!relCheck || relCheck.startsWith('..') || path.isAbsolute(relCheck) || !/\.json$/i.test(relCheck)) {
+            return bad(res, '导出路径必须位于工程目录内且以 .json 结尾');
+          }
+          // 二次校验真实路径，阻止符号链接或目录联接跳出工程根目录
+          const realRoot = fs.realpathSync(scanRoot);
+          let ancestor = path.dirname(absExport);
+          while (!fs.existsSync(ancestor)) {
+            const parent = path.dirname(ancestor);
+            if (parent === ancestor) break;
+            ancestor = parent;
+          }
+          const realAncestor = fs.realpathSync(ancestor);
+          const realRel = path.relative(realRoot, realAncestor).replace(/\\/g, '/');
+          if (realRel === '..' || realRel.startsWith('../') || path.isAbsolute(realRel)) {
+            return bad(res, '导出目标真实路径超出工程目录范围');
+          }
+          if (fs.lstatSync(absExport, { throwIfNoEntry: false })?.isSymbolicLink()) {
+            return bad(res, '不允许覆盖符号链接文件');
+          }
+          const scan = await analysisJob('scan', () => scanRoot);
+          const mat = materializeCompileCommands(scanRoot, profile, { files: scan.files, exportPath: relCheck });
+          return json(res, {
+            ok: true,
+            exportedPath: mat.compileCommandsPath,
+            shimPath: mat.shimPath,
+            unitCount: mat.unitCount,
+            includeCount: mat.includeCount,
+            defineCount: mat.defineCount,
+          });
+        }
+
+        const nextParserId = parserId ?? MODEL.parserId ?? configuredParser();
+        if (typeof nextParserId !== 'string' || !getParser(nextParserId) || nextParserId === 'dot') {
+          return bad(res, '未知源码解析器');
+        }
+        const nextClangBin = clangBin !== undefined ? clangBin.trim() : configuredClangBin();
+        const nextProfileId = profileId !== undefined
+          ? (typeof profileId === 'string' && profileId.trim() ? profileId.trim() : null)
+          : configuredBuildProfile(scanRoot);
+        if (nextProfileId && !discovered.profiles.some((p) => p.id === nextProfileId)) {
+          return bad(res, `未找到构建配置：${nextProfileId}`);
+        }
+        const nextStrict = strictCompileCommands !== undefined
+          ? Boolean(strictCompileCommands)
+          : (nextProfileId ? true : Boolean(configuredStrictCompile(scanRoot)));
+        const nextDbPath = compileCommandsPath !== undefined
+          ? (compileCommandsPath && compileCommandsPath.trim() ? path.resolve(scanRoot, compileCommandsPath.trim()) : null)
+          : (store.getSetting(compileCommandsKey(scanRoot)) || null);
+
+        const clangStatus = detectClang(nextClangBin || undefined, { refresh: true });
+        if (nextParserId === 'clang-ast' && !clangStatus.ok) {
+          return json(res, { ok: false, error: clangStatus.reason || 'Clang 不可用', clangStatus }, 400);
+        }
+
+        const nextParserOptions = nextParserId === 'clang-ast'
+          ? {
+              compileCommandsPath: nextDbPath,
+              strictCompileCommands: nextStrict,
+              ...(nextClangBin ? { clangBin: nextClangBin } : {}),
+              ...(nextProfileId ? { buildProfileId: nextProfileId } : {}),
+            }
+          : { ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
+
+        const { stats: st } = await openTarget(root, {
+          selection: {
+            parserId: nextParserId,
+            parserOptions: nextParserOptions,
+            saveBuildConfig: {
+              clangBin: nextClangBin,
+              buildProfileId: nextProfileId,
+              strictCompileCommands: nextStrict,
+              compileCommandsPath: nextDbPath,
+            },
+          },
+        });
+        comparisonPreview = null;
+        comparisonBase = null;
+        broadcastChange('project.switch', 'user', { project: ROOT_LABEL, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
+        return json(res, {
+          ok: true,
+          activeParser: MODEL.parserId,
+          activeProfileId: nextProfileId,
+          strictCompileCommands: nextStrict,
+          clangBin: nextClangBin,
+          clangStatus,
+          parser: parserInfo(),
+          stats: st,
+          warnings: MODEL.warnings,
+        });
+      } catch (error) {
+        if (!res.headersSent) return json(res, { ok: false, error: error.message }, 400);
+      } finally { switching = false; }
       return;
     }
 

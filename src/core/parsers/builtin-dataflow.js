@@ -77,12 +77,20 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
     }
   }
   const headerMacros = new Map();
-  for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
+  const pruneInactive = Boolean(model.pruneInactive || (Array.isArray(model.buildDefines) && model.buildDefines.length));
+  for (const rawDef of Array.isArray(model.buildDefines) ? model.buildDefines : []) {
+    const eq = String(rawDef || '').indexOf('=');
+    const name = (eq >= 0 ? rawDef.slice(0, eq) : rawDef).trim();
+    const val = eq >= 0 ? rawDef.slice(eq + 1).trim() : '1';
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
+    headerMacros.set(name, { name, params: null, body: lex(val, '<build-config>'), file: '<build-config>', line: 0, raw: val });
+  }
+  for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel, { pruneInactive });
   for (const f of sources) {
     const original = lex(f.src, f.rel);
     const taskDefs = taskDeclarations(f.src, original);
     f.src = taskDefs.source;
-    const { tokens } = preprocess(taskDefs.names.size ? lex(f.src, f.rel) : original, fileMacroScope(headerMacros), f.rel, { expand: true });
+    const { tokens } = preprocess(taskDefs.names.size ? lex(f.src, f.rel) : original, fileMacroScope(headerMacros), f.rel, { expand: true, pruneInactive });
     const parts = [];
     let line = 1;
     for (const tk of tokens) {

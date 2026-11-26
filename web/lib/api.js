@@ -98,6 +98,8 @@ export const api = {
   stats: () => get('/api/stats?summary=1'),
   parsers: () => get('/api/parsers').then(result => result?.ok === false ? null : result).catch(() => null),
   setParser: parserId => post('/api/parsers', { parserId }, { timeout: ANALYSIS_TIMEOUT }),
+  buildConfigs: () => get('/api/build-configs').then(result => result?.ok === false ? null : result).catch(() => null),
+  saveBuildConfig: (body) => post('/api/build-configs', body, { timeout: ANALYSIS_TIMEOUT }),
   /** 当前工程身份（名字、路径、指纹是否变过） */
   project: () => get('/api/project'),
   /** 最近打开的工程列表 */

@@ -73,13 +73,130 @@ function parseDefineParams(text) {
   return { params, variadic, variadicName, rest: text.slice(i + 1) };
 }
 
+/** 仅用于构建配置裁剪模式的轻量 C 预处理器常量表达式求值（支持 defined、!、&&、||、==、!=、<、<=、>、>=、位/算术运算）。 */
+function evalPreprocExpr(exprText, macros) {
+  let raw = String(exprText || '').trim();
+  if (!raw) return 0;
+  raw = raw.replace(/\bdefined\s*\(\s*([A-Za-z_]\w*)\s*\)/g, (_, name) => (macros.get(name) ? '1' : '0'));
+  raw = raw.replace(/\bdefined\s+([A-Za-z_]\w*)/g, (_, name) => (macros.get(name) ? '1' : '0'));
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    raw = raw.replace(/\b([A-Za-z_]\w*)\b/g, (word) => {
+      const m = macros.get(word);
+      if (!m || m.params !== null) return word;
+      const body = (m.raw ?? m.body?.map((t) => t.v).join(' ') ?? '').trim();
+      const repl = body || '1';
+      if (repl !== word) changed = true;
+      return `(${repl})`;
+    });
+    if (!changed) break;
+  }
+  const toks = [];
+  const re = /0[xX][0-9a-fA-F]+[uUlL]*|0[0-7]*[uUlL]*|[1-9]\d*[uUlL]*|[A-Za-z_]\w*|&&|\|\||==|!=|<=|>=|<<|>>|[()!~+\-*/%&|^<>?:]/g;
+  for (const m of raw.matchAll(re)) toks.push(m[0]);
+  if (!toks.length) return 0;
+  let pos = 0;
+  const peek = () => toks[pos];
+  const next = () => toks[pos++];
+  const parsePrimary = () => {
+    const tk = peek();
+    if (!tk) return 0;
+    if (tk === '(') {
+      next();
+      const v = parseTernary();
+      if (peek() === ')') next();
+      return v;
+    }
+    if (tk === '!') { next(); return parseUnary() ? 0 : 1; }
+    if (tk === '~') { next(); return ~parseUnary(); }
+    if (tk === '+') { next(); return +parseUnary(); }
+    if (tk === '-') { next(); return -parseUnary(); }
+    next();
+    if (/^[A-Za-z_]/.test(tk)) return 0;
+    const cleaned = tk.replace(/[uUlL]+$/, '');
+    if (/^0[xX]/.test(cleaned)) return Number.parseInt(cleaned, 16) || 0;
+    if (/^0[0-7]+$/.test(cleaned)) return Number.parseInt(cleaned, 8) || 0;
+    return Number.parseInt(cleaned, 10) || 0;
+  };
+  const parseUnary = () => parsePrimary();
+  const parseMul = () => {
+    let v = parseUnary();
+    while (peek() === '*' || peek() === '/' || peek() === '%') {
+      const op = next();
+      const r = parseUnary();
+      if (op === '*') v = Math.trunc(v * r);
+      else if (op === '/') v = r ? Math.trunc(v / r) : 0;
+      else v = r ? v % r : 0;
+    }
+    return v;
+  };
+  const parseAdd = () => {
+    let v = parseMul();
+    while (peek() === '+' || peek() === '-') v = next() === '+' ? v + parseMul() : v - parseMul();
+    return v;
+  };
+  const parseShift = () => {
+    let v = parseAdd();
+    while (peek() === '<<' || peek() === '>>') v = next() === '<<' ? (v << parseAdd()) : (v >> parseAdd());
+    return v;
+  };
+  const parseRel = () => {
+    let v = parseShift();
+    while (['<', '<=', '>', '>='].includes(peek())) {
+      const op = next();
+      const r = parseShift();
+      if (op === '<') v = v < r ? 1 : 0;
+      else if (op === '<=') v = v <= r ? 1 : 0;
+      else if (op === '>') v = v > r ? 1 : 0;
+      else v = v >= r ? 1 : 0;
+    }
+    return v;
+  };
+  const parseEq = () => {
+    let v = parseRel();
+    while (peek() === '==' || peek() === '!=') {
+      const op = next();
+      const r = parseRel();
+      v = (op === '==' ? v === r : v !== r) ? 1 : 0;
+    }
+    return v;
+  };
+  const parseBitAnd = () => { let v = parseEq(); while (peek() === '&') { next(); v &= parseEq(); } return v; };
+  const parseBitXor = () => { let v = parseBitAnd(); while (peek() === '^') { next(); v ^= parseBitAnd(); } return v; };
+  const parseBitOr = () => { let v = parseBitXor(); while (peek() === '|') { next(); v |= parseBitXor(); } return v; };
+  const parseLogAnd = () => {
+    let v = parseBitOr();
+    while (peek() === '&&') { next(); const r = parseBitOr(); v = (v && r) ? 1 : 0; }
+    return v;
+  };
+  const parseLogOr = () => {
+    let v = parseLogAnd();
+    while (peek() === '||') { next(); const r = parseLogAnd(); v = (v || r) ? 1 : 0; }
+    return v;
+  };
+  const parseTernary = () => {
+    const c = parseLogOr();
+    if (peek() !== '?') return c;
+    next();
+    const t = parseTernary();
+    if (peek() === ':') next();
+    const f = parseTernary();
+    return c ? t : f;
+  };
+  try {
+    return parseTernary();
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * 处理单个文件的 token 流
  * @param {Array} tokens
  * @param {Map} macros  全局宏表（跨文件共享）
  * @param {string} file
  */
-export function preprocess(tokens, macros, file, { expand = false } = {}) {
+export function preprocess(tokens, macros, file, { expand = false, pruneInactive = false } = {}) {
   const out = [];
   let pending = [];
   // 遇到指令前展开，保证 #define / #undef 只作用于后面的代码。
@@ -88,7 +205,7 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     pending = [];
   };
   const includes = [];
-  const frames = []; // {expr}
+  const frames = []; // {expr, inactive, definitelyTaken}
 
   // 识别 include guard：#ifndef X 紧跟 #define X，不参与 condition 计算
   let guardName = null;
@@ -106,12 +223,14 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     const parts = frames.map((f) => f.expr).filter(Boolean);
     return parts.length ? parts.join(' && ') : undefined;
   };
+  const isInactive = () => frames.some((f) => f.inactive);
   let cond;
 
   for (let k = 0; k < tokens.length; k++) {
     const tk = tokens[k];
 
     if (tk.t !== 'preproc') {
+      if (pruneInactive && isInactive()) continue;
       (expand ? pending : out).push(cond ? { ...tk, cond } : tk);
       continue;
     }
@@ -123,7 +242,7 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
     const dir = m[1].toLowerCase();
     const rest = m[2].trim();
 
-    if ((dir === 'define' || dir === 'undef') && frames.some((f) => f.inactive)) continue;
+    if ((dir === 'define' || dir === 'undef') && isInactive()) continue;
 
     if (dir === 'define') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
@@ -163,15 +282,24 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
 
     if (dir === 'include') {
       const im = /^[<"]([^>"]+)[>"]/.exec(rest);
-      if (im && !frames.some(f => f.inactive)) includes.push({ file, target: im[1], line: tk.line });
+      if (im && !isInactive()) includes.push({ file, target: im[1], line: tk.line });
       continue;
     }
 
     if (dir === 'ifdef' || dir === 'ifndef') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
       const n = nm ? nm[1] : '?';
+      const parentInactive = isInactive();
       if (guardName && n === guardName && frames.length === 0) {
-        frames.push({ expr: null });
+        frames.push({ expr: null, inactive: parentInactive, definitelyTaken: !parentInactive });
+      } else if (pruneInactive) {
+        const defined = Boolean(nm && macros.get(n));
+        const taken = dir === 'ifdef' ? defined : !defined;
+        frames.push({
+          expr: dir === 'ifdef' ? n : `!${n}`,
+          inactive: parentInactive || !taken,
+          definitelyTaken: !parentInactive && taken,
+        });
       } else {
         frames.push({ expr: dir === 'ifdef' ? n : `!${n}` });
       }
@@ -179,26 +307,48 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       continue;
     }
     if (dir === 'if') {
-      frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
+      const parentInactive = isInactive();
+      if (pruneInactive) {
+        const taken = !parentInactive && evalPreprocExpr(rest, macros) !== 0;
+        frames.push({
+          expr: rest.replace(/\s+/g, ' '),
+          inactive: parentInactive || !taken,
+          definitelyTaken: taken,
+        });
+      } else {
+        frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
+      }
       cond = currentCond();
       continue;
     }
     if (dir === 'elif') {
       if (frames.length) {
         const frame = frames[frames.length - 1];
+        const parentInactive = frames.slice(0, -1).some((f) => f.inactive);
         frame.expr = rest.replace(/\s+/g, ' ');
-        frame.inactive = frame.definitelyTaken || rest === '0';
-        frame.definitelyTaken ||= rest === '1';
+        if (pruneInactive) {
+          if (parentInactive || frame.definitelyTaken) {
+            frame.inactive = true;
+          } else {
+            const taken = evalPreprocExpr(rest, macros) !== 0;
+            frame.inactive = !taken;
+            frame.definitelyTaken = taken;
+          }
+        } else {
+          frame.inactive = frame.definitelyTaken || rest === '0';
+          frame.definitelyTaken ||= rest === '1';
+        }
         cond = currentCond();
       }
       continue;
     }
     if (dir === 'else') {
       if (frames.length) {
-        const cur = frames[frames.length - 1].expr || '';
         const frame = frames[frames.length - 1];
+        const parentInactive = frames.slice(0, -1).some((f) => f.inactive);
+        const cur = frame.expr || '';
         frame.expr = cur.startsWith('!') ? cur.slice(1) : `!(${cur})`;
-        frame.inactive = !!frame.definitelyTaken;
+        frame.inactive = parentInactive || !!frame.definitelyTaken;
         cond = currentCond();
       }
       continue;
