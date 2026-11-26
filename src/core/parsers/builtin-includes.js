@@ -89,24 +89,31 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const predefined = profilePredefinedMacros(source.rel, config);
 
     const stack = new Set(), once = new Set();
+    let unresolvedIncludes = false;
+    const markUnresolved = () => { unresolvedIncludes = true; };
     function processFile(file, base, macroOnly = false, origin) {
       const fileKey = key(file.rel);
       if (stack.has(fileKey) || once.has(fileKey)) return null;
       if (file.isHeader && !inputs.has(file)) inputs.set(file, load(file));
       const input = file.isHeader ? inputs.get(file) : load(file);
-      if (!input) return null;
+      if (!input) {
+        markUnresolved();
+        return null;
+      }
       stack.add(fileKey);
       const scope = fileMacroScope(base, new Map(), { trackPositions: true });
-      function include({ target, line }, quoted, next, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
+      function include({ target, line }, quoted, next, uncertain, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
         const resume = next && origin;
         const dirs = resume ? origin.dirs : quoted ? [fromDir, ...quotedSearch] : search;
         const supplyingDir = resume ? key(origin.dirs[origin.index]) : null;
+        let mayBeExternal = !quoted;
         for (let index = resume ? origin.index + 1 : 0; index < dirs.length; index++) {
           if (supplyingDir !== null && key(dirs[index]) === supplyingDir) continue;
           const abs = path.resolve(dirs[index], target.replaceAll('\\', '/'));
           const absKey = key(abs);
           const relative = path.relative(root, abs);
           const external = relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
+          mayBeExternal ||= external;
           let header = byPath.get(absKey);
           if (header && !header.isHeader) {
             header = { ...header, isHeader: true };
@@ -119,20 +126,23 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
           if (!header) { if (external || options.allowLocalIncludes) options.onMissingInclude?.(abs); continue; }
           const changed = processFile(header, { get: name => scope.get(name, line) }, macrosOnly, { dirs, index });
           if (changed) for (const [name, def] of changed) {
-            if (def) scope.set(name, def, line);
+            if (uncertain || def === undefined) scope.forget(name, line);
+            else if (def) scope.set(name, def, line);
             else scope.delete(name, line);
           }
           return header.rel;
         }
+        if (mayBeExternal) markUnresolved();
       }
       const implicit = [];
       if (!file.isHeader) forced.forEach(([target, macrosOnly], i) => {
         const entry = { file: file.rel, target, line: i - forced.length };
-        entry.resolved = include(entry, true, false, root, macrosOnly) ?? null;
+        entry.resolved = include(entry, true, false, false, root, macrosOnly) ?? null;
         implicit.push(entry);
       });
       const result = preprocess(input.tokens, scope, file.rel, {
         expand, pruneInactive: true, onInclude: include, onPragmaOnce: () => once.add(fileKey),
+        hasUnresolvedIncludes: () => unresolvedIncludes, onUnresolvedInclude: markUnresolved,
       });
       if (file.isHeader) {
         if (!macroOnly) options.onHeaderContext?.(file, input, result.tokens, scope, source.rel);

@@ -60,6 +60,33 @@ test('Git 预览和 MCP 读取遵守活动构建配置，同标识的配置内�
   assert.deepEqual((await readChanges()).nodes.map(node => node.id), ['app.c::disabled']);
 });
 
+test('Git 对照缓存检查外部 SDK 头文件的修改和更早的包含候选', async t => {
+  const { root, put, commit } = repository(t);
+  const sdk = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-git-sdk-'));
+  t.after(() => fs.rmSync(sdk, { recursive: true, force: true }));
+  const first = path.join(sdk, 'preferred');
+  const second = path.join(sdk, 'fallback');
+  fs.mkdirSync(first);
+  fs.mkdirSync(second);
+  const external = path.join(second, 'config.h');
+  fs.writeFileSync(external, '#define MODE 1\n');
+  const code = value => '#include <config.h>\n#if MODE\nint enabled(void) { return ' + value +
+    '; }\n#else\nint disabled(void) { return ' + value + '; }\n#endif\n';
+  put('Makefile', 'all:\n\tcc -I"' + first + '" -I"' + second + '" -c app.c\n');
+  put('app.c', code(1));
+  commit('baseline');
+  put('app.c', code(2));
+  const compare = () => compareGitProject(root, { baseRef: 'HEAD', targetRef: 'WORKTREE' },
+    { parserOptions: { buildProfileId: 'make::Makefile' } });
+  const initial = await compare();
+  assert.deepEqual(initial.git.importFacts.directIds, ['app.c::enabled']);
+  assert.equal((await compare()).beforeModel, initial.beforeModel, '依赖未变时继续复用分析');
+  fs.writeFileSync(external, '#define MODE 0\n');
+  assert.deepEqual((await compare()).git.importFacts.directIds, ['app.c::disabled']);
+  fs.writeFileSync(path.join(first, 'config.h'), '#define MODE 1\n');
+  assert.deepEqual((await compare()).git.importFacts.directIds, ['app.c::enabled']);
+});
+
 test('工作区读取最新内容，区分暂存区、未跟踪源码、注释与编码', async t => {
   const { root, git, put, commit } = repository(t);
   const file = '制御/変速.c', active = file + '::shift', notes = 'notes.c::stable', fresh = 'new.c::diag';

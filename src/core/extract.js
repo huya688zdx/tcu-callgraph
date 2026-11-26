@@ -559,6 +559,14 @@ function clearAggregateSlots(slot, table, status) {
   }
 }
 
+function isStringInitializer(tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    if (['L', 'u', 'U', 'u8'].includes(tokens[i].v)) i++;
+    if (tokens[i]?.t !== 'str' || !tokens[i].v.startsWith('"')) return false;
+  }
+  return true;
+}
+
 /** 每一对花括号都有独立的游标。数组按维度进位，结构体按字段声明顺序进位。 */
 function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false, parentUnions = []) {
   const items = splitAtTopLevel(inner);
@@ -590,6 +598,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     const parts = path ?? [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
     if (parts.some(p => typeof p === 'object')) status.incomplete = true;
     const operand = braced ? null : simpleInitializerOperand(val);
+    const stringInitializer = !braced && isStringInitializer(val);
     let child = parts.reduce(initChild, layout);
     let descended;
     // 省略聚合括号时，已知标量继续下沉。未知表达式可能复制整个结构体。
@@ -597,12 +606,12 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
       if (child?.element) {
         // 字符串消耗整个字符数组，仍需下沉多维数组的外层。
         if (!child.element.element && !child.element.pointer && !child.element.names &&
-            val.every(t => t.t === 'str' && t.v.startsWith('"'))) break;
+            stringInitializer) break;
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
           (operand?.t === 'id' && (status.isFunction(operand) || status.enumNames.has(operand.v))) ||
-          (val[0].t === 'str' || val[0].v === 'sizeof'))) {
+          (stringInitializer || val[0].t === 'str' || val[0].v === 'sizeof'))) {
         descended ??= new Set();
         if (descended.has(child)) { status.incomplete = true; break; }
         descended.add(child);

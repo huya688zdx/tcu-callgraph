@@ -241,3 +241,20 @@ test('运行时写入联合体其他成员会作废重叠槽，独立实例和�
   assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'keep']);
   assert.equal(model.indirectCalls.filter(call => call.caller === 'ops.c::call').length, 1);
 });
+
+test('宽字符串及其拼接占用整个字符数组，后续回调保持原位置', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-wide-string-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef int wchar_t;',
+    'typedef void (*Fn)(void);',
+    'typedef struct { wchar_t label[2]; Fn run; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops ops = { L"x" L"", foo, bar };',
+    'void call(void) { ops.run(); ops.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  assert.deepEqual(model.fnptrTables.find(table => table.name === 'ops').map, { run: 'foo', next: 'bar' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar']);
+});

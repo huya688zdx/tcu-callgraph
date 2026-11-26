@@ -21,13 +21,15 @@ export function fileMacroScope(base, changes = new Map(), { trackPositions = fal
   return {
     changes,
     get(name, line) {
-      const value = history && line !== undefined
-        ? history.get(name)?.findLast(entry => entry.line < line)?.value
-        : changes.get(name);
-      return value === undefined ? base.get(name) : value;
+      if (history && line !== undefined) {
+        const entry = history.get(name)?.findLast(change => change.line < line);
+        return entry ? entry.value : base.get(name);
+      }
+      return changes.has(name) ? changes.get(name) : base.get(name);
     },
     set(name, def, line = def.line) { update(name, def, line); },
     delete(name, line) { update(name, null, line); },
+    forget(name, line) { update(name, undefined, line); },
   };
 }
 
@@ -86,7 +88,7 @@ export function parseMacroDefinition(text, file, line, cond) {
 }
 
 /** 仅用于构建配置裁剪模式的轻量 C 预处理器常量表达式求值（支持 defined、!、&&、||、==、!=、<、<=、>、>=、位/算术运算）。 */
-function evalPreprocExpr(exprText, macros, line) {
+function evalPreprocExpr(exprText, macros, line, keepUnknown = false) {
   const tokens = lex(exprText);
   const input = [];
   for (let i = 0; i < tokens.length; i++) {
@@ -96,13 +98,18 @@ function evalPreprocExpr(exprText, macros, line) {
       const grouped = tokens[i + 1]?.v === '(';
       const name = tokens[i + (grouped ? 2 : 1)];
       if (name?.t !== 'id' || (grouped && tokens[i + 3]?.v !== ')')) return 0;
-      input.push({ ...token, t: 'num', v: macros.get(name.v, line) ? '1' : '0' });
+      const def = macros.get(name.v, line);
+      if (keepUnknown && def === undefined) return undefined;
+      input.push({ ...token, t: 'num', v: def ? '1' : '0' });
       i += grouped ? 3 : 1;
     } else {
       input.push(token);
     }
   }
-  const toks = expandSeq(input, macros).map(token => token.v);
+  const expanded = expandSeq(input, macros);
+  if (keepUnknown && expanded.some((token, i) => token.t === 'id' && macros.get(token.v, line) === undefined &&
+      !(/^(?:u8|[LuU])$/.test(token.v) && expanded[i + 1]?.v.startsWith("'")))) return undefined;
+  const toks = expanded.map(token => token.v);
   if (!toks.length) return 0;
   // C 预处理表达式按 intmax_t/uintmax_t 求值，避免 JS 的 32 位截断。
   const integer = (v, unsigned = false) => ({ v: unsigned ? BigInt.asUintN(64, v) : BigInt.asIntN(64, v), unsigned });
@@ -183,7 +190,9 @@ function evalPreprocExpr(exprText, macros, line) {
  * @param {Map} macros  全局宏表（跨文件共享）
  * @param {string} file
  */
-export function preprocess(tokens, macros, file, { expand = false, pruneInactive = false, onInclude, onPragmaOnce } = {}) {
+export function preprocess(tokens, macros, file, {
+  expand = false, pruneInactive = false, onInclude, onPragmaOnce, hasUnresolvedIncludes, onUnresolvedInclude,
+} = {}) {
   const out = [];
   let pending = [];
   // 遇到指令前展开，保证 #define / #undef 只作用于后面的代码。
@@ -211,6 +220,7 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
     return parts.length ? parts.join(' && ') : undefined;
   };
   const isInactive = () => frames.some((f) => f.inactive);
+  const isUncertain = () => frames.some((f) => f.uncertain);
   let cond;
 
   for (let k = 0; k < tokens.length; k++) {
@@ -233,13 +243,19 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
 
     if (dir === 'define') {
       const def = parseMacroDefinition(rest, file, tk.line, currentCond());
-      if (def) macros.set(def.name, def);
+      if (def) {
+        if (isUncertain()) macros.forget(def.name, tk.line);
+        else macros.set(def.name, def);
+      }
       continue;
     }
 
     if (dir === 'undef') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
-      if (nm) macros.delete(nm[1], tk.line);
+      if (nm) {
+        if (isUncertain()) macros.forget(nm[1], tk.line);
+        else macros.delete(nm[1], tk.line);
+      }
       continue;
     }
 
@@ -251,13 +267,13 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
       const im = /^[<"]([^>"]+)[>"]/.exec(operand);
       if (im) {
         const entry = { file, target: im[1], line: tk.line };
-        if (onInclude) entry.resolved = onInclude(entry, operand.startsWith('"'), dir === 'include_next') ?? null;
+        if (onInclude) entry.resolved = onInclude(entry, operand.startsWith('"'), dir === 'include_next', isUncertain()) ?? null;
         includes.push(entry);
-      }
+      } else onUnresolvedInclude?.();
       continue;
     }
 
-    if (dir === 'pragma' && rest === 'once' && !isInactive()) {
+    if (dir === 'pragma' && rest === 'once' && !isInactive() && !isUncertain()) {
       onPragmaOnce?.();
       continue;
     }
@@ -270,12 +286,15 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
         const taken = !parentInactive && (!pruneInactive || !macros.get(n));
         frames.push({ expr: null, inactive: !taken, definitelyTaken: taken });
       } else if (pruneInactive) {
-        const defined = Boolean(nm && macros.get(n));
+        const definition = nm ? macros.get(n, tk.line) : null;
+        const uncertain = definition === undefined && !!hasUnresolvedIncludes?.();
+        const defined = Boolean(definition);
         const taken = dir === 'ifdef' ? defined : !defined;
         frames.push({
           expr: dir === 'ifdef' ? n : `!${n}`,
-          inactive: parentInactive || !taken,
-          definitelyTaken: !parentInactive && taken,
+          inactive: parentInactive || (!uncertain && !taken),
+          definitelyTaken: !parentInactive && !uncertain && taken,
+          uncertain,
         });
       } else {
         frames.push({ expr: dir === 'ifdef' ? n : `!${n}` });
@@ -286,11 +305,12 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
     if (dir === 'if') {
       const parentInactive = isInactive();
       if (pruneInactive) {
-        const taken = !parentInactive && evalPreprocExpr(rest, macros, tk.line) !== 0;
+        const decision = parentInactive ? 0 : evalPreprocExpr(rest, macros, tk.line, hasUnresolvedIncludes?.());
         frames.push({
           expr: rest.replace(/\s+/g, ' '),
-          inactive: parentInactive || !taken,
-          definitelyTaken: taken,
+          inactive: decision === 0,
+          definitelyTaken: decision !== undefined && decision !== 0,
+          uncertain: decision === undefined,
         });
       } else {
         frames.push({ expr: rest.replace(/\s+/g, ' '), inactive: rest === '0', definitelyTaken: rest === '1' });
@@ -307,9 +327,10 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
           if (parentInactive || frame.definitelyTaken) {
             frame.inactive = true;
           } else {
-            const taken = evalPreprocExpr(rest, macros, tk.line) !== 0;
-            frame.inactive = !taken;
-            frame.definitelyTaken = taken;
+            const decision = evalPreprocExpr(rest, macros, tk.line, hasUnresolvedIncludes?.());
+            frame.inactive = decision === 0;
+            frame.definitelyTaken = decision !== undefined && decision !== 0;
+            frame.uncertain ||= decision === undefined;
           }
         } else {
           frame.inactive = frame.definitelyTaken || rest === '0';
