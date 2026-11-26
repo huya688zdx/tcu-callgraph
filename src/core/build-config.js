@@ -337,6 +337,10 @@ export function parseMakefileTree(entryAbs, rootDir) {
     PROJECT_DIR: entryDir,
   };
   const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
+  vars.set('COMPILE.c', { value: '$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c', simple: false });
+  vars.set('COMPILE.cc', { value: '$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c', simple: false });
+  for (const suffix of ['.C', '.cpp']) vars.set('COMPILE' + suffix, { value: '$(COMPILE.cc)', simple: false });
+  vars.set('OUTPUT_OPTION', { value: '-o $@', simple: true });
   const recipes = [];
   const rules = new Map();
   const suffixes = new Set(['.o', '.c', '.cc', '.C', '.cpp']);
@@ -514,18 +518,28 @@ export function parseMakefileTree(entryAbs, rootDir) {
     suffixRecipes.get(name).push(recipe);
   }
   const instantiated = [];
+  const builtInRules = !tokenizeArgs(expandMakeVars('$(MAKEFLAGS)', vars)).some(flag =>
+    /^-?[a-z]*[rR][a-z]*$/i.test(flag) || ['--no-builtin-rules', '--no-builtin-variables'].includes(flag));
   const findSuffixRule = target => {
     const extension = path.extname(target);
     if (!suffixes.has(extension) || explicitRecipes.has(target)) return;
     const stem = target.slice(0, -extension.length);
+    let fallback;
     for (const suffix of suffixes) {
+      if (!SRC_EXT.test(suffix)) continue;
       const selected = suffixRecipes.get(suffix + extension);
-      if (!selected) continue;
+      if (!selected && (fallback || extension !== '.o' || !builtInRules || !vars.has('COMPILE' + suffix))) continue;
       const source = stem + suffix;
       if (rules.has(source) || fs.statSync(path.resolve(entryDir, source), { throwIfNoEntry: false })?.isFile()) {
-        return { source, stem, selected };
+        // 用户定义的后缀规则优先于 Make 自带的 C/C++ 对象文件规则。
+        if (selected) return { source, stem, selected };
+        fallback = {
+          source, stem,
+          selected: [{ command: '$(COMPILE' + suffix + ') $(OUTPUT_OPTION) $<', builtIn: true }],
+        };
       }
     }
+    return fallback;
   };
   const visitTarget = (target, inherited = vars) => {
     if (reachable.has(target)) return;
@@ -543,7 +557,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     if (suffixRule) {
       const { source, stem, selected } = suffixRule;
       const ruleDeps = { normal: [source], orderOnly: [] };
-      for (const { command } of selected) instantiated.push({ command, ruleDeps, stem, targets: [target] });
+      for (const { command, builtIn } of selected) instantiated.push({ command, builtIn, ruleDeps, stem, targets: [target] });
       visitTarget(source, environment);
     }
     for (const { normal, orderOnly } of rules.get(target) || []) {
@@ -552,7 +566,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
-  const collectRecipe = ({ command, ruleDeps, stem }, target) => {
+  const collectRecipe = ({ command, ruleDeps, stem, builtIn }, target) => {
     // GNU Make 将有命令的规则的依赖放在同一目标的其他依赖之前。
     const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
       ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
@@ -565,7 +579,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       });
     const { commands, ambiguous } = splitRecipeCommands(expanded);
     const original = commands.length === 1 ? [command] : splitRecipeCommands(command).commands;
-    const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER)\)|\$\{(?:CC|CXX|C_COMPILER)\})(?:\s|$)/i;
+    const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER|COMPILE\.(?:c|cc|cpp))\)|\$\{(?:CC|CXX|C_COMPILER|COMPILE\.(?:c|cc|cpp))\})(?:\s|$)/i;
     let changedDirectory = false;
     for (const [index, invocation] of commands.entries()) {
       const args = tokenizeArgs(invocation);
@@ -580,7 +594,10 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (args.length) compilers.add(compiler);
       const unit = compilerConfig();
       extractCompilerFlags(args, entryDir, rootDir, unit);
-      for (const rel of unit.sourceFiles) compilationUnits[rel] = extractedOptions(unit);
+      // 同一源文件已有明确配方时，隐式规则只用于补齐其他编译单元。
+      const sources = [...unit.sourceFiles].filter(rel => !builtIn || !Object.hasOwn(compilationUnits, rel));
+      if (builtIn && !sources.length) continue;
+      for (const rel of sources) compilationUnits[rel] = extractedOptions(unit);
       extractCompilerFlags(args, entryDir, rootDir, collected);
     }
   };
@@ -589,7 +606,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     for (const target of targets) collectRecipe(recipe, target);
     if (!goal && !recipe.targets.length) collectRecipe(recipe);
   }
-  if (!recipes.length) {
+  if (!recipes.length && !instantiated.length) {
     // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。
     compilers.add(expandMakeVars('$(CC) $(CXX)', vars));
     for (const key of ['CPPFLAGS', 'CFLAGS', 'CXXFLAGS', 'INCLUDES', 'DEFINES', 'SRCS', 'C_SRCS', 'SOURCES']) {

@@ -901,3 +901,26 @@ test('QAC 配置保留语言标准，内置解析和导出的编译命令选择�
   assert.ok(readCompileCommands(root, compileCommandsPath)[0].args.includes('-std=c99'));
   if (detectClang().ok) assert.deepEqual((await build('clang-ast')).functions.map(fn => fn.name), ['correct']);
 });
+
+test('Make 只有链接配方时从内置规则恢复实际编译单元', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'CFLAGS = -DFEATURE=1', 'CPPFLAGS = -DEXTRA=1',
+    'app: main.o', '\t$(CC) -o $@ $^', 'main.o: CFLAGS += -DUNIT',
+  ].join('\n'));
+  write(root, 'main.c', [
+    '#if FEATURE && EXTRA && UNIT',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  write(root, 'debug.c', 'void unused(void) {}');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.sourceFiles, ['main.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['FEATURE=1', 'UNIT', 'EXTRA=1']);
+  const files = scanSources(root);
+  const parserOptions = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(loadModel(root, { parserId: 'builtin', parserOptions }).functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [unit] = readCompileCommands(root, compileCommandsPath);
+  assert.equal(unit.rel, 'main.c');
+  assert.deepEqual(unit.args.slice(unit.args.indexOf('-D')), ['-D', 'FEATURE=1', '-D', 'UNIT', '-D', 'EXTRA=1']);
+});
