@@ -210,6 +210,10 @@ export function dependencyStamp(file) {
 }
 
 export function externalDependenciesCurrent(model) {
+  for (const file of model.missingIncludes || []) {
+    try { if (fs.statSync(file, { throwIfNoEntry: false })?.isFile()) return false; }
+    catch { return false; }
+  }
   for (const [file, digest] of model.responseFiles || []) {
     try {
       const current = fs.statSync(file, { throwIfNoEntry: false })?.isFile()

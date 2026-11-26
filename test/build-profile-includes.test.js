@@ -117,3 +117,53 @@ test('Make 不同编译单元保持各自宏环境并分别导出', t => {
     assert.equal(args[args.indexOf('-D') + 1], path.basename(entry.file) === 'a.c' ? 'MODE=1' : 'MODE=2');
   }
 });
+
+test('更早的外部 include 候选出现时缓存失效', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-search-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = path.join(base, 'project'), a = path.join(base, 'a'), b = path.join(base, 'b');
+  for (const dir of [root, a, b]) fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(root, 'main.c'), '#include <config.h>\n#if FEATURE\nvoid yes(void) {}\n#else\nvoid no(void) {}\n#endif');
+  fs.writeFileSync(path.join(b, 'config.h'), '#define FEATURE 0');
+  const parse = () => loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'sdk', includeDirs: [a, b] } });
+  const model = parse();
+  assert.equal(externalDependenciesCurrent(model), true);
+  fs.writeFileSync(path.join(a, 'config.h'), '#define FEATURE 1');
+  assert.equal(externalDependenciesCurrent(model), false);
+  assert.ok(parse().functions.some(f => f.name === 'yes'));
+});
+
+test('枚举标量在省略括号的结构体中占一个成员', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-enum-init-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), `
+enum { MODE = 1 };
+typedef void (*Fn)(void);
+typedef struct { int mode; Fn fn; } Inner;
+typedef struct { Inner inner; Fn next; int tail; } Outer;
+void foo(void) {} void bar(void) {}
+Outer ops = { MODE, foo, bar };
+void first(void) { ops.inner.fn(); }
+void second(void) { ops.next(); }
+`);
+  const model = loadModel(root, { parserId: 'builtin' });
+  assert.ok(model.edges.some(e => e.from === 'main.c::first' && e.to === 'main.c::foo'));
+  assert.ok(model.edges.some(e => e.from === 'main.c::second' && e.to === 'main.c::bar'));
+  assert.ok(!model.edges.some(e => e.from === 'main.c::second' && e.to === 'main.c::foo'));
+});
+
+test('Make 响应文件参数使用编译工作目录', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rsp-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'build')); fs.mkdirSync(path.join(root, 'inc'));
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all:\n\tgcc @build/flags.rsp -c main.c');
+  fs.writeFileSync(path.join(root, 'build/flags.rsp'), '-Iinc -include inc/config.h');
+  fs.writeFileSync(path.join(root, 'inc/config.h'), '#define FEATURE 1');
+  fs.writeFileSync(path.join(root, 'main.c'), '#if FEATURE\nvoid yes(void) {}\n#endif');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.includeDirs, [path.join(root, 'inc')]);
+  assert.deepEqual(profile.forcedIncludes, [path.join(root, 'inc/config.h')]);
+  const files = scanSources(root);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile) });
+  assert.ok(model.functions.some(f => f.name === 'yes'));
+});

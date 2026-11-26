@@ -568,7 +568,8 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
-          (operand?.t === 'id' && status.isFunction(operand)))) {
+          (operand?.t === 'id' && (status.isFunction(operand) || status.enumNames.has(operand.v))) ||
+          (val[0].t === 'str' || val[0].v === 'sizeof'))) {
         descended ??= new Set();
         if (descended.has(child)) { status.incomplete = true; break; }
         descended.add(child);
@@ -605,7 +606,8 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         });
       }
     }
-    cursor = unknownPosition ? null : nextInitPath(parts, layout);
+    // 无法判定是聚合复制还是标量时，后续位置保持不确定，避免生成错误确定边。
+    cursor = unknownPosition || (!braced && child?.names) ? null : nextInitPath(parts, layout);
   }
 }
 
@@ -620,6 +622,14 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
 export function findFnPtrTables(tokens, file = '', { functionId = null, macros, pendingFields } = {}) {
   const tables = new Map();
   const scopes = [{ end: null }];
+  const enumNames = new Set();
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i].v !== 'enum') continue;
+    const open = tokens[i + 1]?.v === '{' ? i + 1 : tokens[i + 2]?.v === '{' ? i + 2 : -1;
+    if (open < 0) continue;
+    const close = matchBrace(tokens, open);
+    for (const part of splitAtTopLevel(tokens.slice(open + 1, close))) if (part[0]?.t === 'id') enumNames.add(part[0].v);
+  }
   let localTypes;
   let localFunctions;
   const localFunction = token => {
@@ -714,6 +724,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     const fill = (lookup, isFunction = localFunction) => {
       const status = {
         incomplete: false,
+        enumNames,
         unresolvedSlots: new Set(),
         isFunction: token => isFunction(token, file, functionId),
       };

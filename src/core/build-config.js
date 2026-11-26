@@ -149,7 +149,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
           const rspText = safeReadText(rspPath);
           if (rspText) {
             const cleaned = rspText.replace(/(?:^|\s)#[^\r\n]*/g, ' ');
-            extractCompilerFlags(tokenizeArgs(cleaned), path.dirname(rspPath), rootDir, out, seenRsp, depth + 1);
+            extractCompilerFlags(tokenizeArgs(cleaned), baseDir, rootDir, out, seenRsp, depth + 1);
           }
           seenRsp.delete(fileKey(rspPath));
         }

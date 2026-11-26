@@ -243,6 +243,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
   const externalDeps = new Map();
+  const missingIncludes = new Set();
   const macros = new Map();
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
   const macroDefs = new Map();
@@ -389,7 +390,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
 
   // 构建配置按翻译单元处理 include，普通扫描沿用先头文件后源文件的顺序。
   if (pruneInactive) {
-    preprocessProfile(root, files, parserOptions, loadInput, recordFile);
+    preprocessProfile(root, files, { ...parserOptions, onMissingInclude: file => missingIncludes.add(file) }, loadInput, recordFile);
   } else {
     for (const file of [...headers, ...sources]) {
       const input = loadInput(file);
@@ -799,6 +800,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     includes,
     warnings,
     externalDeps: [...externalDeps.values()],
+    missingIncludes: [...missingIncludes],
     compilationUnits: parserOptions?.compilationUnits || {},
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
     ...(pruneInactive ? { pruneInactive: true, includeDirs: parserOptions.includeDirs || [], forcedIncludes: parserOptions.forcedIncludes || [] } : {}),
@@ -817,7 +819,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
     return JSON.stringify([
-      'builtin:6',
+      'builtin:7',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

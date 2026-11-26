@@ -64,7 +64,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
             header = { abs, rel: path.relative(root, abs).replaceAll('\\', '/'), isHeader: true };
             byPath.set(key(abs), header);
           }
-          if (!header) continue;
+          if (!header) { options.onMissingInclude?.(abs); continue; }
           const changed = processFile(header, { get: name => scope.get(name, line) });
           if (changed) for (const [name, def] of changed) {
             if (def) scope.set(name, def, line);
