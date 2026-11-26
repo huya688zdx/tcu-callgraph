@@ -2542,6 +2542,7 @@ export const server = http.createServer(async (req, res) => {
               ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                 ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
               ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
+              ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
               ...(Array.isArray(m.tools) && m.tools.length ? {
                 tools: m.tools.slice(0, 20).map((tl) => ({
@@ -2632,6 +2633,18 @@ export const server = http.createServer(async (req, res) => {
             !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) continue;
         images.push({ dataUrl, ...(typeof item?.label === 'string' ? { label: item.label.slice(0, 120) } : {}) });
         if (images.length === 2) break;
+      }
+      const attachments = [];
+      for (const item of Array.isArray(p.attachments) ? p.attachments : []) {
+        if (!item || typeof item !== 'object') continue;
+        const name = String(item.name || '').trim().slice(0, 160);
+        const content = typeof item.content === 'string' ? item.content.slice(0, 24_000) : '';
+        if (!name || !content.trim()) continue;
+        const startLine = Number.isInteger(item.startLine) && item.startLine > 0 ? item.startLine : 1;
+        const endLine = Number.isInteger(item.endLine) && item.endLine >= startLine ? item.endLine : undefined;
+        const totalLines = Number.isInteger(item.totalLines) && item.totalLines > 0 ? item.totalLines : undefined;
+        attachments.push({ name, content, startLine, ...(endLine ? { endLine } : {}), ...(totalLines ? { totalLines } : {}) });
+        if (attachments.length === 4) break;
       }
       const canvasLayoutRoots = (ids) => ids.map(id => remapLegacyExt(id, MODEL)).filter(Boolean);
       let canvasSnapshot = reviewingPage(pageState) ? null : sanitizeCanvasLayout(p.canvasLayout);
@@ -4602,6 +4615,7 @@ export const server = http.createServer(async (req, res) => {
           config: cfg,
           prompt,
           images,
+          attachments,
           history: p.history || [],
           context,
           executeTool: executeAiTool,

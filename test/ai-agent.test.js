@@ -55,6 +55,55 @@ test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 �
   }
 });
 
+test('e2e：窄窗口下 AI 助手的停止和引导按钮完整可点击', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+  await browser.waitFor('Boolean(window.__cg?.view)');
+  await browser.evaluate(`(async () => {
+    document.getElementById('aiBtn').click();
+    document.querySelector('[data-ai-tab="chat"]').click();
+    await document.fonts.ready;
+  })()`);
+
+  const cases = [];
+  for (const [width, height, streaming] of [[1024, 700, true], [420, 600, false], [360, 600, true], [320, 360, true]]) {
+    await browser.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    const clipped = await browser.evaluate(`(() => {
+      const model = document.getElementById('aiQuickModel');
+      model.replaceChildren(new Option('organization/very-long-model-name-for-code-analysis', 'test-model'));
+      model.value = 'test-model';
+      const stop = document.getElementById('aiStopChat');
+      const send = document.getElementById('aiSendChat');
+      stop.hidden = ${!streaming};
+      send.textContent = ${JSON.stringify(streaming ? '引导' : '发送')};
+      if (${height} === 360) {
+        for (let i = 0; i < 16; i++) {
+          const path = 'src/a-long-folder-name/model-context-' + i + '.c';
+          document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: { kind: 'file', path } }));
+          document.getElementById('aiPinSelection').click();
+        }
+      }
+      const drawer = document.getElementById('aiDrawer').getBoundingClientRect();
+      const ids = ['aiQuickModel', 'aiQuickReasoning', 'aiAttachShot', 'aiSendChat'];
+      if (!stop.hidden) ids.push('aiStopChat');
+      return ids.flatMap(id => {
+        const control = document.getElementById(id);
+        const element = control.closest('.fsel')?.querySelector('.fsel-btn') ?? control;
+        const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(left + width / 2, top + height / 2);
+        return left >= drawer.left && top >= drawer.top && right <= drawer.right && bottom <= drawer.bottom &&
+          element.contains(hit) ? [] : [{ id, top, bottom, left, right, hit: hit?.id }];
+      });
+    })()`);
+    cases.push({ width, height, streaming, clipped });
+  }
+  assert.ok(cases.every(({ clipped }) => clipped.length === 0), JSON.stringify(cases));
+});
+
 test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重置画布布局', async t => {
   const srv = await launchServer();
   t.after(srv.close);
@@ -1801,4 +1850,99 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
   const tidyRes = toolResults.find((r) => r.name === 'arrange_canvas')?.data;
   assert.equal(tidyRes?.ok, true, JSON.stringify(tidyRes));
   assert.ok(tidyRes?.updatedCount >= 2, '分组模式下 tidy 应成功重排全部节点而不报容器重叠');
+});
+
+test('e2e：双击已选两点连线不误切其他共线、输入框动态建议 Tab 补全与分层截图可见缩略图', async (t) => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  await fetch(srv.baseUrl + '/api/page', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roots: ['main.c::main'], up: 0, down: 1, groupMode: 'file' }),
+  });
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+  await browser.waitFor('Boolean(window.__cg?.view?.nodes?.length)');
+
+  // 1. 测试双击已选中的直连边不会切换到同一共线干线上的其他边
+  const dblResult = await browser.evaluate(`(async () => {
+    const { state, edgeKey } = await import('/lib/state.js');
+    const { hooks } = await import('/lib/hooks.js');
+    const edges = state.view.edges;
+    if (edges.length < 2) return { skipped: true };
+    const e0 = edges[0], e1 = edges[1];
+    // 构造两条共享同一水平干线的边，先通过 directPair 选中 e1
+    const sharedPts = [[120, 120], [320, 120]];
+    e0.points = sharedPts.map(p => [...p]);
+    e1.points = sharedPts.map(p => [...p]);
+    hooks.selectEdge(e1, { directPair: true });
+    const cv = document.getElementById('cv');
+    const rect = cv.parentElement.getBoundingClientRect();
+    const { x, y, k } = window.__cg.cam;
+    const cx = rect.left + x + 220 * k;
+    const cy = rect.top + y + 120 * k;
+    cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerup', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerup', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new MouseEvent('dblclick', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    return {
+      expected: edgeKey(e1),
+      selected: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
+      moveKind: state.moveTarget?.kind || null,
+      moveItem: state.moveTarget?.item ? edgeKey(state.moveTarget.item) : null,
+    };
+  })()`);
+  if (!dblResult.skipped) {
+    assert.equal(dblResult.selected, dblResult.expected, '双击已选连线不应切换到共线上的其他边');
+    assert.equal(dblResult.moveKind, 'edge');
+    assert.equal(dblResult.moveItem, dblResult.expected, '解锁编辑的目标必须是原选中连线');
+  }
+
+  // 2. 测试动态建议 placeholder + Tab 补全 + 分层/视图截图缩略图预览
+  const uiResult = await browser.evaluate(`(async () => {
+    document.getElementById('aiBtn').click();
+    document.querySelector('[data-ai-tab="chat"]').click();
+    const input = document.getElementById('aiPromptInput');
+    const tabHint = document.getElementById('aiGhostTabHint');
+    const placeholderBefore = input.placeholder;
+    const hintVisibleBefore = !tabHint.hidden;
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+    const filledAfterTab = input.value;
+    const hintHiddenAfter = tabHint.hidden;
+
+    // 打开截图/附件菜单，截取当前画布并验证缩略图真实可见且可点击放大
+    document.getElementById('aiAttachShot').click();
+    const menu = document.getElementById('aiAttachMenu');
+    const menuOpen = !menu.hidden;
+    const firstBtn = menu.querySelector('button:not(:disabled)');
+    firstBtn.click();
+    const tray = document.getElementById('aiAttachments');
+    const thumb = tray.querySelector('img.ai-att-thumb');
+    const thumbSrc = thumb?.getAttribute('src') || '';
+    thumb?.click();
+    const lightboxOpen = !document.getElementById('aiImageLightbox').hidden;
+    document.getElementById('aiLightboxClose').click();
+    return {
+      placeholderBefore,
+      hintVisibleBefore,
+      filledAfterTab,
+      hintHiddenAfter,
+      menuOpen,
+      trayVisible: !tray.hidden,
+      hasDataUrl: thumbSrc.startsWith('data:image/'),
+      lightboxOpen,
+    };
+  })()`);
+  assert.ok(uiResult.placeholderBefore.length > 0 && !uiResult.placeholderBefore.includes('油压控制'), '输入框应使用动态上下文建议而非固定示例文案');
+  assert.equal(uiResult.hintVisibleBefore, true);
+  assert.equal(uiResult.filledAfterTab, uiResult.placeholderBefore, '按 Tab 应补全当前建议提问');
+  assert.equal(uiResult.hintHiddenAfter, true);
+  assert.equal(uiResult.menuOpen, true);
+  assert.equal(uiResult.trayVisible, true, '截图后应显示可见附件预览区');
+  assert.equal(uiResult.hasDataUrl, true, '缩略图应包含真实图片 DataURL');
+  assert.equal(uiResult.lightboxOpen, true, '点击缩略图应弹出大图预览');
 });

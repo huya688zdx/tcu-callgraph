@@ -487,22 +487,31 @@ function formatUiContextSelections(ui) {
   };
 }
 
-function buildTurnUserText(userText, uiContext) {
+function buildTurnUserText(userText, uiContext, attachments = []) {
+  const sections = [];
   const { selections } = formatUiContextSelections(uiContext);
-  if (!selections.length) return userText;
-  const multi = selections.length > 1;
-  const header = multi
-    ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
-    : '[本轮画布当前选中对象（指代最高优先级）]';
-  const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
-  return [
-    header,
-    body,
-    '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
-    '',
-    '用户本轮提问：',
-    userText,
-  ].join('\n');
+  if (selections.length) {
+    const multi = selections.length > 1;
+    const header = multi
+      ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
+      : '[本轮画布当前选中对象（指代最高优先级）]';
+    const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
+    sections.push(
+      header,
+      body,
+      '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
+    );
+  }
+  if (Array.isArray(attachments) && attachments.length) {
+    sections.push('[用户附带的外部文件/代码片段]');
+    for (const file of attachments) {
+      const range = file.endLine ? ` (L${file.startLine || 1}-L${file.endLine}${file.totalLines ? ` / 共 ${file.totalLines} 行` : ''})` : '';
+      sections.push(`--- 文件：${file.name}${range} ---`, file.content, '--- 结束 ---');
+    }
+  }
+  if (!sections.length) return userText;
+  sections.push('', '用户本轮提问：', userText);
+  return sections.join('\n');
 }
 
 function buildSystemPrompt(context, promptToolMode) {
@@ -785,8 +794,10 @@ function normalizeLineBreaks(text) {
 export function sanitizeSuggestions(items) {
   const result = [];
   for (const item of Array.isArray(items) ? items : []) {
-    const label = typeof item?.label === 'string' ? [...item.label.trim()].slice(0, 28).join('') : '';
-    const prompt = typeof item?.prompt === 'string' ? item.prompt.trim().slice(0, 2000) : '';
+    const rawLabel = item?.label ?? item?.title ?? item?.text;
+    const rawPrompt = item?.prompt ?? item?.query ?? item?.message ?? item?.question;
+    const label = typeof rawLabel === 'string' ? [...rawLabel.trim()].slice(0, 28).join('') : '';
+    const prompt = typeof rawPrompt === 'string' ? rawPrompt.trim().slice(0, 2000) : '';
     const draft = typeof item?.draft === 'string' ? item.draft.trim().slice(0, 2000) : '';
     if (label && (prompt || draft)) result.push({ label, ...(prompt ? { prompt } : { draft }) });
     if (result.length === 3) break;
@@ -837,7 +848,8 @@ function readAnswer(raw) {
   let text = '';
   createContentReader((channel, delta) => { if (channel === 'text') text += delta; })(raw, true);
   const block = /<next_steps\s*>([\s\S]*?)<\/next_steps\s*>/i.exec(raw);
-  const suggestions = sanitizeSuggestions(block && safeJsonParse(block[1]));
+  const blockInner = block ? block[1].trim().replace(/^```(?:json)?\s*\r?\n?/i, '').replace(/\r?\n?```\s*$/, '').trim() : '';
+  const suggestions = sanitizeSuggestions(blockInner && safeJsonParse(blockInner));
   // 提示词工具模式只解析建议块之外的工具指令。
   const toolText = raw.replace(/<next_steps\b[\s\S]*?(?:<\/next_steps\s*>|$)/gi, '');
   return { text: text.trim(), suggestions, toolText };
@@ -1254,6 +1266,7 @@ export async function runAiAgent({
   config,
   prompt,
   images = [],
+  attachments = [],
   history = [],
   context = {},
   executeTool,
@@ -1304,7 +1317,7 @@ export async function runAiAgent({
     (call.name === 'arrange_canvas' && call.arguments?.action !== 'inspect');
 
   let imagesDegraded = false;
-  const turnUserText = buildTurnUserText(userText, context.uiContext);
+  const turnUserText = buildTurnUserText(userText, context.uiContext, attachments);
   const userMessage = {
     role: 'user',
     content: images.length > 0 && !imagesDegraded

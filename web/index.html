@@ -926,9 +926,10 @@
 
   .ai-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #FFFFFF; }
   .ai-pane[hidden] { display: none; }
+  #aiPaneChat { overflow-y: auto; }
   .ai-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 14px; }
   #aiMessages {
-    display: flex; flex-direction: column; gap: 12px;
+    display: flex; flex-direction: column; gap: 12px; min-height: 72px;
     padding: 12px 14px 16px; background: #FFFFFF; contain: layout style;
   }
   #aiMessages > * { flex-shrink: 0; }
@@ -1098,8 +1099,10 @@
   .ai-selection-bar {
     display: flex; flex-direction: column; gap: 5px;
     padding: 7px 12px; border-top: 1px solid #E1ECF6; background: #F7FAFD; flex-shrink: 0;
+    max-height: min(140px, 30vh); overflow-y: auto;
   }
   .ai-selection-bar[hidden] { display: none; }
+  .ai-selection-bar > * { flex-shrink: 0; }
   .ai-pinned-list {
     display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
   }
@@ -1179,8 +1182,9 @@
   .pair-flow-float button.primary:hover { background: #0369A1; }
 
   .ai-composer {
+    position: sticky; bottom: 0; z-index: 1;
     border-top: 1px solid #ECEAE3; padding: 8px 12px 11px;
-    display: grid; gap: 6px; background: #FAF9F6; flex-shrink: 0;
+    display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; background: #FAF9F6; flex-shrink: 0;
   }
   .ai-telemetry {
     display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0;
@@ -1222,15 +1226,114 @@
   }
   #aiDrawer #aiCompactChat:hover:not(:disabled) { background: #F2F0E8; border-color: #D2CEC2; }
   #aiDrawer #aiCompactChat:disabled { opacity: .45; cursor: default; }
-  .ai-chat-status { color: #5F5E5A; font-size: 11.5px; padding: 0 2px; }
+  .ai-chat-status { color: #5F5E5A; font-size: 11.5px; padding: 0 2px; overflow-wrap: anywhere; }
 
   .ai-input-shell {
+    position: relative;
     background: #FFFFFF; border: 1px solid #DCD9CF; border-radius: 12px;
     padding: 8px 9px 7px; box-shadow: 0 2px 8px rgba(31, 31, 29, 0.04);
     transition: border-color .15s ease, box-shadow .15s ease;
   }
+  .ai-input-shell.drag-over {
+    border-color: #0284C7; background: #F0F9FF; box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.16);
+  }
   .ai-input-shell:focus-within {
     border-color: #185FA5; box-shadow: 0 0 0 3px rgba(24, 95, 165, 0.11);
+  }
+  .ai-attachments {
+    display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px;
+    margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #F1EFE8;
+    max-height: 112px; overflow-y: auto;
+  }
+  .ai-attachments[hidden] { display: none; }
+  .ai-att-img {
+    position: relative; display: flex; align-items: center; gap: 6px;
+    padding: 3px 22px 3px 4px; border-radius: 8px;
+    background: #F6F5F0; border: 1px solid #E1DFD5; max-width: 196px;
+  }
+  .ai-att-thumb {
+    width: 48px; height: 36px; object-fit: cover; border-radius: 5px;
+    border: 1px solid #D5D2C7; cursor: zoom-in; flex-shrink: 0; background: #FAF9F6;
+  }
+  .ai-att-meta { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+  .ai-att-name {
+    font-size: 11px; font-weight: 500; color: #2D2C28;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ai-att-sub { font-size: 10px; color: #78756C; white-space: nowrap; }
+  .ai-att-file {
+    position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+    padding: 4px 22px 4px 7px; border-radius: 8px;
+    background: #F3F8FD; border: 1px solid #C8DFEF; max-width: 100%; font-size: 11px; color: #1B496B;
+  }
+  .ai-att-range {
+    display: inline-flex; align-items: center; gap: 3px; font-size: 10.5px; color: #4A6A82;
+  }
+  .ai-att-range input {
+    width: 44px; height: 19px; padding: 0 3px; border-radius: 4px;
+    border: 1px solid #BDD4E7; background: #FFFFFF; color: #1F1F1D; font-size: 10.5px; text-align: center;
+  }
+  .ai-att-rm {
+    position: absolute; top: 2px; right: 2px; width: 17px; height: 17px; padding: 0;
+    border: 0; border-radius: 50%; background: rgba(31,31,29,.08); color: #55534D;
+    font-size: 12px; line-height: 17px; text-align: center; cursor: pointer;
+  }
+  .ai-att-rm:hover { background: #E11D48; color: #FFFFFF; }
+  .ai-prompt-wrap { position: relative; }
+  .ai-ghost-tab {
+    position: absolute; right: 2px; bottom: 2px;
+    height: 20px; padding: 0 6px; border-radius: 5px; font-size: 10.5px; font-weight: 500;
+    background: #F4F3EE; border: 1px solid #DCD9CF; color: #6B6961; cursor: pointer;
+    opacity: .88; transition: background-color .12s, color .12s, border-color .12s;
+  }
+  .ai-ghost-tab[hidden] { display: none; }
+  .ai-ghost-tab:hover { background: #E6F1FB; border-color: #9DC5EC; color: #0C447C; opacity: 1; }
+  .ai-attach-menu {
+    position: absolute; left: 8px; right: 8px; bottom: 42px; z-index: 20;
+    display: flex; flex-direction: column; gap: 2px; padding: 6px;
+    border-radius: 10px; background: #FFFFFF; border: 1px solid #D8D5CA;
+    box-shadow: 0 10px 28px rgba(24, 24, 22, 0.16); max-height: 260px; overflow-y: auto;
+  }
+  .ai-attach-menu[hidden] { display: none; }
+  .ai-attach-menu-title {
+    font-size: 10.5px; font-weight: 600; color: #7C7970; padding: 3px 7px 2px;
+  }
+  .ai-attach-menu button {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; text-align: left; padding: 6px 8px; border: 0; border-radius: 7px;
+    background: transparent; color: #1F1F1D; font-size: 12px; cursor: pointer;
+  }
+  .ai-attach-menu button:hover:not(:disabled) { background: #F1F5F9; color: #0C447C; }
+  .ai-attach-menu button:disabled { opacity: .45; cursor: default; }
+  .ai-attach-menu button small { color: #7C7970; font-size: 10.5px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ai-attach-sep { height: 1px; background: #EFECE4; margin: 3px 4px; }
+  .ai-msg-atts {
+    display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 5px;
+  }
+  .ai-msg-att-img {
+    width: 72px; height: 52px; object-fit: cover; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,.45); cursor: zoom-in; background: #FAF9F6;
+  }
+  .ai-msg-att-file {
+    display: inline-flex; align-items: center; gap: 3px; padding: 2px 7px; border-radius: 5px;
+    background: rgba(255,255,255,.18); font-size: 11px;
+  }
+  .ai-lightbox {
+    position: fixed; inset: 0; z-index: 3000; background: rgba(15, 23, 42, 0.78);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    padding: 24px;
+  }
+  .ai-lightbox[hidden] { display: none; }
+  .ai-lightbox img {
+    max-width: min(92vw, 1280px); max-height: 82vh; border-radius: 10px;
+    background: #FFFFFF; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  }
+  .ai-lightbox-bar {
+    display: flex; align-items: center; gap: 12px; color: #F8FAFC; font-size: 12.5px;
+  }
+  .ai-lightbox-bar button {
+    padding: 4px 12px; border-radius: 7px; border: 1px solid rgba(255,255,255,.35);
+    background: rgba(255,255,255,.14); color: #FFFFFF; cursor: pointer;
   }
   .ai-composer textarea {
     display: block; width: 100%; min-height: 46px; max-height: 132px; resize: vertical;
@@ -1239,31 +1342,33 @@
   }
   .ai-composer textarea::placeholder { color: #A09D94; }
   .ai-composer-bar {
-    display: flex; align-items: center; gap: 6px; justify-content: space-between;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
     margin-top: 6px; padding-top: 6px; border-top: 1px solid #F3F1EA;
   }
   .ai-composer-controls {
-    display: flex; align-items: center; gap: 5px; flex: 1 1 auto; min-width: 0;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 5px; flex: 1 1 250px; min-width: 0;
   }
-  #aiDrawer .ai-inline-select {
-    height: 26px; padding: 0 21px 0 8px; border-radius: 7px; font-size: 11.5px; font-weight: 500;
+  #aiDrawer .ai-composer-controls .fsel-btn {
+    width: 100%; height: 26px; padding: 0 8px; justify-content: space-between;
+    border-radius: 7px; font-size: 11.5px; font-weight: 500;
     color: #4A4945; border: 1px solid transparent;
-    background: #F5F4EF var(--chev-down) right 6px center / 9px no-repeat;
-    appearance: none; -webkit-appearance: none; outline: none;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    background: #F5F4EF; outline: none;
     transition: background-color .14s ease, border-color .14s ease, color .14s ease, box-shadow .14s ease;
   }
-  #aiDrawer .ai-inline-select:hover:not(:disabled) {
+  #aiDrawer .ai-composer-controls .fsel-btn > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  #aiDrawer .ai-composer-controls .fsel-btn:hover:not(:disabled) {
     background-color: #ECEAE2; border-color: #DCD9CF; color: #1F1F1D;
   }
-  #aiDrawer .ai-inline-select:focus {
+  #aiDrawer .ai-composer-controls .fsel-btn:focus {
     background-color: #FFFFFF; border-color: #185FA5; color: #1F1F1D;
     box-shadow: 0 0 0 2px rgba(24, 95, 165, 0.12);
   }
-  #aiDrawer .ai-inline-select:disabled { opacity: .55; cursor: default; }
-  #aiDrawer #aiQuickModel { flex: 1 1 130px; min-width: 78px; max-width: 162px; }
-  #aiDrawer #aiQuickModel.unconfigured { background-color: #FFF6E0; color: #7C4A03; border-color: #F0D28C; }
-  #aiDrawer #aiQuickReasoning { flex: 0 0 auto; max-width: 96px; }
+  #aiDrawer .ai-composer-controls .fsel-btn:disabled { opacity: .55; cursor: default; }
+  .ai-composer-controls .fsel:has(#aiQuickModel) { flex: 1 1 78px; min-width: 78px; max-width: 162px; }
+  #aiDrawer .fsel:has(#aiQuickModel.unconfigured) > .fsel-btn {
+    background-color: #FFF6E0; color: #7C4A03; border-color: #F0D28C;
+  }
+  .ai-composer-controls .fsel:has(#aiQuickReasoning) { flex: 0 0 auto; max-width: 96px; }
   #aiDrawer .ai-inline-btn {
     flex: 0 0 auto; height: 26px; padding: 0 8px; border-radius: 7px; font-size: 11.5px; font-weight: 500;
     color: #55534D; border: 1px solid transparent; background: #F5F4EF;
@@ -1273,7 +1378,7 @@
   #aiDrawer .ai-inline-btn[aria-pressed="true"] {
     background: #E6F1FB; border-color: #9DC5EC; color: #0C447C; font-weight: 600;
   }
-  .ai-composer-actions { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+  .ai-composer-actions { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; margin-left: auto; }
   #aiDrawer #aiStopChat {
     height: 28px; padding: 0 11px; font-size: 12px; font-weight: 500; border-radius: 8px;
     background: #FEF2F2; border: 1px solid #F5B8B8; color: #B42318;
@@ -1896,19 +2001,26 @@
           <button type="button" id="aiCompactChat" title="压缩早期对话以释放上下文（也支持输入 /compact）">压缩</button>
         </div>
         <div class="ai-chat-status" id="aiChatStatus" role="status"></div>
-        <div class="ai-input-shell">
-          <textarea id="aiPromptInput" placeholder="例如：把 Git 未提交改动的函数加入画布；或：找出油压控制相关函数和共享变量加到图里…"></textarea>
+        <div class="ai-input-shell" id="aiInputShell">
+          <div class="ai-attachments" id="aiAttachments" hidden></div>
+          <div class="ai-prompt-wrap">
+            <textarea id="aiPromptInput" placeholder=""></textarea>
+            <button type="button" id="aiGhostTabHint" class="ai-ghost-tab" hidden title="按 Tab 补全建议提问">Tab 补全</button>
+          </div>
+          <div class="ai-attach-menu" id="aiAttachMenu" role="menu" hidden></div>
+          <input type="file" id="aiImageFileInput" accept="image/*" multiple hidden>
+          <input type="file" id="aiTextFileInput" multiple hidden>
           <div class="ai-composer-bar">
             <div class="ai-composer-controls">
-              <select id="aiQuickModel" class="ai-inline-select" aria-label="切换模型" title="切换模型"></select>
-              <select id="aiQuickReasoning" class="ai-inline-select" aria-label="思考强度" title="思考强度">
+              <select id="aiQuickModel" aria-label="切换模型" title="切换模型"></select>
+              <select id="aiQuickReasoning" aria-label="思考强度" title="思考强度">
                 <option value="default">思考：默认</option>
                 <option value="off">思考：关</option>
                 <option value="low">思考：低</option>
                 <option value="medium">思考：中</option>
                 <option value="high">思考：高</option>
               </select>
-              <button type="button" id="aiAttachShot" class="ai-inline-btn" aria-pressed="false" title="附带当前画布截图发给支持图片的模型（便于看图分析与调整排版）">📷 画布图</button>
+              <button type="button" id="aiAttachShot" class="ai-inline-btn" aria-pressed="false" aria-haspopup="menu" aria-expanded="false" title="画布截图（整图/选中层级/文件框）、粘贴外部截图或导入外部文件片段">📎 截图/文件</button>
             </div>
             <div class="ai-composer-actions">
               <button type="button" id="aiStopChat" hidden>停止</button>
@@ -1918,6 +2030,14 @@
         </div>
       </div>
     </section>
+
+    <div class="ai-lightbox" id="aiImageLightbox" hidden role="dialog" aria-modal="true" aria-label="图片预览">
+      <img id="aiLightboxImg" alt="附件预览">
+      <div class="ai-lightbox-bar">
+        <span id="aiLightboxCaption"></span>
+        <button type="button" id="aiLightboxClose">关闭 (Esc)</button>
+      </div>
+    </div>
 
     <section class="ai-pane" id="aiPaneApi" hidden>
       <div class="ai-scroll">

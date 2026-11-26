@@ -1098,6 +1098,64 @@ function isNeighbor(id) {
     (e) => (e.from === state.selected && e.to === id) || (e.to === state.selected && e.from === id)
   );
 }
+/** 将画布中指定世界坐标区域（文件框、目录层级或整图）离屏高清渲染为 JPEG DataURL，不干扰当前镜头。 */
+function captureBoxImage(box, { padding = 28, maxDim = 1280, quality = 0.85 } = {}) {
+  const v = state.view;
+  if (!v || !box || !Number.isFinite(box.w) || !Number.isFinite(box.h) || box.w <= 0 || box.h <= 0) return null;
+  const worldW = box.w + padding * 2;
+  const worldH = box.h + padding * 2;
+  const scale = Math.min(2, maxDim / Math.max(worldW, worldH));
+  const outW = Math.max(64, Math.min(maxDim, Math.round(worldW * scale)));
+  const outH = Math.max(64, Math.min(maxDim, Math.round(worldH * scale)));
+  const off = document.createElement('canvas');
+  off.width = outW;
+  off.height = outH;
+  const ctx = off.getContext('2d');
+  if (!ctx) return null;
+
+  const prevCam = { x: cam.x, y: cam.y, k: cam.k };
+  const prevCollecting = collectingEffects;
+  try {
+    collectingEffects = false;
+    cam.k = scale;
+    cam.x = (padding - box.x) * scale;
+    cam.y = (padding - box.y) * scale;
+
+    ctx.fillStyle = THEME.bg || '#F7F6F2';
+    ctx.fillRect(0, 0, outW, outH);
+    ctx.save();
+    ctx.translate(cam.x, cam.y);
+    ctx.scale(cam.k, cam.k);
+
+    const area = {
+      left: box.x - padding,
+      right: box.x + box.w + padding,
+      top: box.y - padding,
+      bottom: box.y + box.h + padding,
+    };
+    const groupVisible = (b) => boxVisible(b, area, groupPaintWidth(b));
+    for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c, false);
+    for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g, false);
+    for (const e of v.edges || []) {
+      if (pathVisible(edgePoints(e), area)) drawEdge(ctx, e, false, false, null, false, false);
+    }
+    for (const n of v.nodes || []) {
+      if (boxVisible(n, area)) drawNode(ctx, n, null, null, null, false);
+    }
+    drawEdgeLabels(ctx, v, { visible: (r) => boxVisible(r, area), reuse: true });
+    ctx.restore();
+    const dataUrl = off.toDataURL('image/jpeg', quality);
+    return dataUrl.startsWith('data:image/') ? { dataUrl, width: outW, height: outH } : null;
+  } catch {
+    return null;
+  } finally {
+    cam.x = prevCam.x;
+    cam.y = prevCam.y;
+    cam.k = prevCam.k;
+    collectingEffects = prevCollecting;
+  }
+}
+
 export {
   resize,
   roundRect,
@@ -1106,6 +1164,7 @@ export {
   viewport,
   boxVisible,
   compositeEffects,
+  captureBoxImage,
   panCanvas,
   finishPan,
   drawContainer,
