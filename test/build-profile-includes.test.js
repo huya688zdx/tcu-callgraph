@@ -260,3 +260,30 @@ test('原始比较定义只包含活动分支并保留宏调用', t => {
   assert.ok(file.src.includes('VALUE'));
   assert.ok(file.expanded.includes('42'));
 });
+
+test('快照配置允许活动源文件包含非独立编译的 C 文件', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unity-snapshot-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = path.join(base, 'worktree');
+  const snapshot = path.join(base, 'snapshot');
+  fs.mkdirSync(root);
+  fs.mkdirSync(snapshot);
+  fs.writeFileSync(path.join(root, 'impl.c'), 'static void diskOnly(void) {}');
+  const sources = new Map(Object.entries({
+    'main.c': '#include "impl.c"\nvoid run(void) { helper(); }',
+    'impl.c': 'static void helper(void) {}',
+    'unused.c': 'void unused(void) {}',
+  }).map(([rel, text]) => {
+    const file = path.join(snapshot, rel);
+    fs.writeFileSync(file, text);
+    return [rel, file];
+  }));
+  for (const activeFiles of [['main.c'], ['main.c', 'impl.c']]) {
+    const model = buildIndex(root, sources, null, { parserId: 'builtin',
+      parserOptions: { buildProfileId: 'unity', activeFiles } });
+    assert.deepEqual(model.functions.map(fn => fn.name).sort(), ['helper', 'run']);
+    assert.deepEqual(model.edges.filter(edge => edge.from === 'main.c::run').map(edge => edge.to), ['impl.c::helper']);
+    assert.deepEqual(model.files.map(file => file.rel).sort(), ['impl.c', 'main.c']);
+    assert.ok(analysisSources(model).sources.find(file => file.rel === 'impl.c').src.includes('helper'));
+  }
+});

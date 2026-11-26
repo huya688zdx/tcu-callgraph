@@ -712,3 +712,26 @@ test('流程图按编译单元展开构建宏，并绑定 .inc 中可见的静�
     assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === '<build-config>'));
   }
 });
+
+test('构建配置从找到包装头的目录之后解析 include_next', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -Iwrap -Isdk -c main.c');
+  write(root, 'wrap/pkg/config.h', '#pragma once\n#include_next <pkg/config.h>\n');
+  write(root, 'sdk/pkg/config.h', '#define FEATURE 1\n');
+  write(root, 'main.c', [
+    '#include <pkg/config.h>', '#if FEATURE',
+    'void wrapped(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  const builtin = loadModel(root, { parserId: 'builtin',
+    parserOptions: resolveBuildProfileOptions(root, 'builtin', options, files, profile) });
+  assert.deepEqual(builtin.functions.map(fn => fn.name), ['wrapped']);
+  assert.ok(builtin.includes.some(inc => inc.file === 'wrap/pkg/config.h' && inc.resolved === 'sdk/pkg/config.h'));
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: resolveBuildProfileOptions(root, 'clang-ast', options, files, profile, path.dirname(root)) });
+    assert.deepEqual(clang.functions.map(fn => fn.name), ['wrapped']);
+  }
+});

@@ -41,9 +41,10 @@ export function profilePredefinedMacros(file, config) {
 /** 按编译单元顺序执行 include。头文件自己的行号与它在调用方引入宏的位置分别记录。 */
 export function preprocessProfile(root, files, options, load, visit, expand = false) {
   const key = s => process.platform === 'win32' ? s.toLowerCase() : s;
-  const byPath = new Map(files.filter(f => f.isHeader).map(f => [key(path.resolve(root, f.rel)), f]));
+  const byPath = new Map((options.availableFiles || files).map(f => [key(path.resolve(root, f.rel)), f]));
   const inputs = new Map();
   const headers = new Map();
+  const compiled = new Set();
 
   function rememberHeader(file, input, result, scope) {
     let entry = headers.get(file);
@@ -79,25 +80,32 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const predefined = profilePredefinedMacros(source.rel, config);
 
     const stack = new Set(), once = new Set();
-    function processFile(file, base, macroOnly = false) {
-      if (stack.has(file) || once.has(file)) return null;
+    function processFile(file, base, macroOnly = false, origin) {
+      const fileKey = key(file.rel);
+      if (stack.has(fileKey) || once.has(fileKey)) return null;
       if (file.isHeader && !inputs.has(file)) inputs.set(file, load(file));
       const input = file.isHeader ? inputs.get(file) : load(file);
       if (!input) return null;
-      stack.add(file);
+      stack.add(fileKey);
       const scope = fileMacroScope(base, new Map(), { trackPositions: true });
-      function include({ target, line }, quoted, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
-        for (const dir of quoted ? [fromDir, ...quotedSearch] : search) {
-          const abs = path.resolve(dir, target.replaceAll('\\', '/'));
+      function include({ target, line }, quoted, next, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
+        const resume = next && origin;
+        const dirs = resume ? origin.dirs : quoted ? [fromDir, ...quotedSearch] : search;
+        for (let index = resume ? origin.index + 1 : 0; index < dirs.length; index++) {
+          const abs = path.resolve(dirs[index], target.replaceAll('\\', '/'));
+          const absKey = key(abs);
           const relative = path.relative(root, abs);
           const external = relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
-          let header = byPath.get(key(abs));
-          if (!header && (external || options.allowLocalIncludes) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
+          let header = byPath.get(absKey);
+          if (header && !header.isHeader) {
+            header = { ...header, isHeader: true };
+            byPath.set(absKey, header);
+          } else if (!header && (external || options.allowLocalIncludes) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
             header = { abs, rel: path.relative(root, abs).replaceAll('\\', '/'), isHeader: true };
-            byPath.set(key(abs), header);
+            byPath.set(absKey, header);
           }
           if (!header) { if (external || options.allowLocalIncludes) options.onMissingInclude?.(abs); continue; }
-          const changed = processFile(header, { get: name => scope.get(name, line) }, macrosOnly);
+          const changed = processFile(header, { get: name => scope.get(name, line) }, macrosOnly, { dirs, index });
           if (changed) for (const [name, def] of changed) {
             if (def) scope.set(name, def, line);
             else scope.delete(name, line);
@@ -108,23 +116,25 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       const implicit = [];
       if (!file.isHeader) forced.forEach(([target, macrosOnly], i) => {
         const entry = { file: file.rel, target, line: i - forced.length };
-        entry.resolved = include(entry, true, root, macrosOnly) ?? null;
+        entry.resolved = include(entry, true, false, root, macrosOnly) ?? null;
         implicit.push(entry);
       });
       const result = preprocess(input.tokens, scope, file.rel, {
-        expand, pruneInactive: true, onInclude: include, onPragmaOnce: () => once.add(file),
+        expand, pruneInactive: true, onInclude: include, onPragmaOnce: () => once.add(fileKey),
       });
       if (file.isHeader) rememberHeader(file, input, macroOnly ? { ...result, tokens: [] } : result, scope);
       else {
         result.includes.unshift(...implicit);
         visit(file, input, result, scope);
+        compiled.add(fileKey);
       }
-      stack.delete(file);
+      stack.delete(fileKey);
       return scope.changes;
     }
     processFile(source, predefined);
   }
   for (const [file, entry] of headers) {
+    if (compiled.has(key(file.rel))) continue;
     const tokens = [...entry.lines].sort(([a], [b]) => a - b).flatMap(([, line]) => line.tokens);
     visit(file, entry.input, { tokens, includes: [...entry.includes.values()] }, {
       changes: entry.changes,

@@ -243,7 +243,7 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
       continue;
     }
 
-    if (dir === 'include') {
+    if (dir === 'include' || (onInclude && dir === 'include_next')) {
       if (isInactive()) continue;
       const operand = onInclude && !/^[<"]/.test(rest)
         ? expandSeq(lex(rest, file).map(t => ({ ...t, line: tk.line })), macros).map(t => t.v).join('')
@@ -251,7 +251,7 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
       const im = /^[<"]([^>"]+)[>"]/.exec(operand);
       if (im) {
         const entry = { file, target: im[1], line: tk.line };
-        if (onInclude) entry.resolved = onInclude(entry, operand.startsWith('"')) ?? null;
+        if (onInclude) entry.resolved = onInclude(entry, operand.startsWith('"'), dir === 'include_next') ?? null;
         includes.push(entry);
       }
       continue;
