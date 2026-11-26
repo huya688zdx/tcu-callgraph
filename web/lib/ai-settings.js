@@ -92,9 +92,21 @@ const PROMPTS = [
 const NEW_THREAD_TITLE = '新对话';
 const GIT_THREAD_TITLE = 'Git 改动分析';
 const LABELS_THREAD_TITLE = '补全 TASK / 顺序标签';
-const GENERIC_THREAD_TITLES = new Set([NEW_THREAD_TITLE, GIT_THREAD_TITLE, LABELS_THREAD_TITLE]);
+const BUILD_DIAG_THREAD_TITLE = '构建配置诊断';
+const GENERIC_THREAD_TITLES = new Set([NEW_THREAD_TITLE, GIT_THREAD_TITLE, LABELS_THREAD_TITLE, BUILD_DIAG_THREAD_TITLE]);
 const GIT_QUICK_PROMPT = '先调用 get_git_changes 查看当前 Git 未提交改动。如果改动涉及多个独立模块或多个车型目录（如不同路径前缀），先用 ask_user 询问我保留哪些车型或是否按书签拆分；如果范围唯一明确，直接调用 add_to_canvas({ fromGit: true }) 加入画布并简述影响。';
 const LABELS_QUICK_PROMPT = '立即补全当前画布上缺失的 TASK 周期（含函数上方注释中的周期）和 コール順 标签：先调 find_symbols({}) 查看画布连线与自动识别的候选标签，再直接调用 apply_labels 把标签写入画布（コール順 不带注释），不要只口头列出。';
+const BUILD_DIAG_QUICK_PROMPT = [
+  '请调用 inspect_build_config（先 action:"scan"，再按需用 summarize_cproject 或 read 查看代表性的 .cproject/.mak/QAC 文件）做只读摸底。',
+  '重要：我只能手打转述，请把最终回复严格压到 7 行、总字数不超过 120 字，且全部脱敏（不写真实机种/业务/公司名），严格按下面极简格式输出：',
+  '1.cproject：个数(位置)、配置数、有无linkedResources',
+  '2.编译器/架构：如 ccv850/ccrh/gcc + v800',
+  '3.路径/宏：主要标签/变量(${...})、有无excluding',
+  '4.mak：单/多mak、-I/-D/@rsp/-f 写法',
+  '5.扩展语法：是否见到 __interrupt/__near/__far/@地址/#pragma/内联汇编',
+  '6.QAC/pl：有无及主要扩展名(.via/.prj/xml/.pl)',
+  '7.Clang：本机有/无、重名函数数',
+].join('\n');
 const BOOKMARK_COMMAND = '/bookmark';
 const DEFAULT_CONTEXT_WINDOW = 32768;
 const DEFAULT_MAX_TOKENS = 8192;
@@ -215,6 +227,7 @@ function deriveThreadTitle(prompt, tools = []) {
     .replace(/^(?:(?:请(?:你)?(?:帮我)?|帮我|麻烦(?:帮我|你)?|能否)\s*[，,:：]?\s*)+/u, '');
   if (/^(?:先)?(?:调用|调)\s*`?get_git_changes\b/iu.test(request)) return GIT_THREAD_TITLE;
   if (/^(?:立即)?补全当前画布.*\bTASK\b.*(?:コール順|顺序)/isu.test(request)) return LABELS_THREAD_TITLE;
+  if (/^(?:先)?(?:调用|调)\s*`?inspect_build_config\b/iu.test(request)) return BUILD_DIAG_THREAD_TITLE;
   const subject = request
     .replace(/^(?:(?:查看当前|(?:先)?(?:调用|调)\s*`?[A-Za-z_]\w*`?(?:\([^)]*\))?)[\s，、。:：,；;]*)+/u, '')
     .split(/[。！？!?；;\n]/u, 1)[0].trim().replace(/\s+/g, ' ');
@@ -2020,6 +2033,8 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
       prefillPrompt('帮我找出和 ');
     } else if (kind === 'labels') {
       sendPrompt(LABELS_QUICK_PROMPT);
+    } else if (kind === 'build') {
+      sendPrompt(BUILD_DIAG_QUICK_PROMPT);
     }
   });
 }

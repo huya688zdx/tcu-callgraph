@@ -39,7 +39,8 @@ import { contentPadding, inside } from '../web/lib/hierarchy.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
-import { fileKey, findCompileCommands } from './core/parsers/clang-config.js';
+import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
+import { readBuildConfigFile, resolveBuildFile, scanBuildConfig, summarizeCproject, summarizeDotProject } from './core/build-inspect.js';
 import { scheduleConfig } from './core/tcu-schedule.js';
 import { applyDataflow, diffParserModels } from './core/parsers/ir.js';
 import {
@@ -3377,6 +3378,49 @@ export const server = http.createServer(async (req, res) => {
             roots: nextRoots.slice(0, 20),
             ...review,
           };
+        }
+        if (name === 'inspect_build_config') {
+          const action = ['scan', 'summarize_cproject', 'read'].includes(args.action) ? args.action : 'scan';
+          const scanRoot = scanRootFor(MODEL.root);
+          if (action === 'scan') {
+            const report = scanBuildConfig(scanRoot);
+            const clangStatus = detectClang();
+            const byName = MODEL._index?.byName;
+            const duplicateFnNames = byName ? [...byName.values()].filter((list) => list.length > 1).length : 0;
+            return {
+              ...report,
+              parserStatus: {
+                activeParser: MODEL.parserId,
+                activeParserName: MODEL.parserName,
+                clangAvailable: Boolean(clangStatus.ok),
+                clangVersion: clangStatus.version || null,
+                clangReason: clangStatus.reason || null,
+                files: MODEL.files?.length || 0,
+                functions: MODEL.functions?.length || 0,
+                duplicateFnNames,
+                warnings: MODEL.warnings?.length || 0,
+              },
+            };
+          }
+          if (action === 'summarize_cproject') {
+            const fileArg = typeof args.file === 'string' ? args.file.trim() : '';
+            if (!fileArg) return { ok: false, error: 'summarize_cproject 需要提供 file（如 ".cproject" 或 "CPU0/.cproject"）' };
+            const resolved = resolveBuildFile(scanRoot, fileArg);
+            if (!resolved) return { ok: false, error: `未找到构建文件：${fileArg}` };
+            const raw = fs.readFileSync(resolved.abs);
+            const summary = summarizeCproject(decodeSource(raw));
+            const sibRel = path.posix.join(path.posix.dirname(resolved.rel) === '.' ? '' : path.posix.dirname(resolved.rel), '.project');
+            const sib = resolveBuildFile(scanRoot, sibRel);
+            const dotProject = sib ? { file: sib.rel, ...summarizeDotProject(decodeSource(fs.readFileSync(sib.abs))) } : null;
+            return { ok: true, file: resolved.rel, ...summary, ...(dotProject ? { dotProject } : {}) };
+          }
+          return readBuildConfigFile(scanRoot, {
+            file: args.file,
+            startLine: args.startLine,
+            endLine: args.endLine,
+            query: args.query,
+            encoding: args.encoding,
+          });
         }
         if (name === 'find_symbols') {
           const query = String(args.query || '').trim();

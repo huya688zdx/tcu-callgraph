@@ -168,6 +168,21 @@ export const AGENT_TOOLS = [
     },
   },
   {
+    name: 'inspect_build_config',
+    description: '只读摸底工程的构建配置与多核项目结构：支持 action="scan" 递归扫描全部 .cproject/.project（含多核多 .cproject、各机种 configurationName、路径映射、排除规则）、.mak/Makefile、QAC 目录及 .pl 脚本；action="summarize_cproject" 深度摘要指定 .cproject；action="read" 按行读取或关键词检索单个构建/配置文件。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['scan', 'summarize_cproject', 'read'], description: '默认 scan；read 时需传 file' },
+        file: { type: 'string', description: '工程内相对路径，如 "CPU0/.cproject"、"Debug/app.mak"、"qac/run.pl"' },
+        startLine: { type: 'integer', description: 'action=read 时的起始行号（从 1 开始）' },
+        endLine: { type: 'integer', description: 'action=read 时的结束行号（单次最多 200 行）' },
+        query: { type: 'string', description: 'action=read 时在目标构建文件内按关键词检索匹配行' },
+        encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], description: '文本编码，默认 auto' },
+      },
+    },
+  },
+  {
     name: 'find_symbols',
     description: '按关键词搜索工程中的函数或全局变量；不传 query 时返回当前画布摘要和顶层 TASK/ISR 入口。',
     parameters: {
@@ -478,6 +493,7 @@ function buildSystemPrompt(context, promptToolMode) {
     '10. 指代锚定规则（最高优先级）：当本轮消息附带「本轮画布当前选中对象」时，任何指代词（“这个函数”、“它”、“这个变量”、“这条线”、“当前对象”）或未显式点名其他符号的提问，必须严格锚定到本轮画布选中对象的完整 ID、端点及文件路径；严禁因上一轮回复刚提过其他函数/连线（近因偏差）而把目标换成上轮对象。仅当用户本轮明确点名其他符号时，才以用户点名为准。',
     '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径（如上轮提过的某条调用链或其他相关函数）当成本轮隐含需求去追查或写入画布。回答“为什么没有上游调用链/为什么未连线/这个函数做什么”等解释排查类问题时，只使用只读工具（read_function、trace_upstream、find_symbols），不得擅自修改画布。',
     '12. 使用 arrange_canvas({ action: "inspect" }) 查看画布坐标，再按用户要求使用 move、align 或 reset。附有画布截图时，结合图像和 inspect 返回的节点坐标确定目标后再移动。',
+    '13. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -1009,6 +1025,18 @@ function summarizeToolResult(name, result) {
   if (name === 'get_git_changes') {
     if (result.noChanges) return 'Git 工作区无 C/H 源码改动';
     return `发现 ${result.changedFiles?.length || 0} 个文件、${result.changedFunctions?.length || 0} 个变更函数`;
+  }
+  if (name === 'inspect_build_config') {
+    if (result.counts) {
+      const c = result.counts;
+      return `扫描构建配置：${c.cprojects} 个 .cproject、${c.makefiles} 个 .mak/Makefile、${c.qacFiles} 个 QAC 配置、${c.perlScripts} 个 .pl 脚本`;
+    }
+    if (result.file && Array.isArray(result.configurations)) {
+      return `已解析 ${result.file}（${result.configurations.length} 套机种配置）`;
+    }
+    if (result.file && result.matches) return `在 ${result.file} 中找到 ${result.matches.length} 处匹配`;
+    if (result.file) return `已读构建文件 ${result.file}:${result.startLine}-${result.endLine}`;
+    return '已检查构建配置';
   }
   if (name === 'find_symbols') {
     const summary = result.matches
