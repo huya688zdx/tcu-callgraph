@@ -6,8 +6,12 @@
  */
 import { t } from '../i18n.js';
 import { api, clientId } from './api.js';
+import { focusBox } from './camera.js';
+import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
-import { state } from './state.js';
+import { runSearch } from './panels.js';
+import { draw } from './render.js';
+import { els, state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
 const drawer = document.getElementById('aiDrawer');
@@ -30,7 +34,10 @@ const setupBanner = document.getElementById('aiSetupBanner');
 const goConfigBtn = document.getElementById('aiGoConfig');
 const messagesEl = document.getElementById('aiMessages');
 const selectionBar = document.getElementById('aiSelectionBar');
+const pinnedListEl = document.getElementById('aiPinnedList');
+const selectionRowEl = document.getElementById('aiSelectionRow');
 const selectionText = document.getElementById('aiSelectionText');
+const pinSelectionBtn = document.getElementById('aiPinSelection');
 const selectionQuestions = document.getElementById('aiSelectionQuestions');
 const clearSelectionBtn = document.getElementById('aiClearSelection');
 const inputEl = document.getElementById('aiPromptInput');
@@ -38,6 +45,7 @@ const sendBtn = document.getElementById('aiSendChat');
 const stopBtn = document.getElementById('aiStopChat');
 const quickModelEl = document.getElementById('aiQuickModel');
 const quickReasoningEl = document.getElementById('aiQuickReasoning');
+const attachShotBtn = document.getElementById('aiAttachShot');
 const contextBadge = document.getElementById('aiContextBadge');
 const contextFillEl = document.getElementById('aiContextFill');
 const contextTextEl = document.getElementById('aiContextText');
@@ -144,7 +152,18 @@ let compacting = null;
 let stickToBottom = true;
 let displayedContext = { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
 let canvasSelection = null;
+const pinnedSelections = [];
+const MAX_PINNED_SELECTIONS = 16;
 const dismissedSelectionKeys = new Set();
+let attachCanvasShot = false;
+let activeStreamFlush = null;
+
+function isCanvasDragging() {
+  return Boolean(
+    state.panning || state.dragBox || state.dragNode || state.dragSeg ||
+    state.dragLabel || state.resizeBox || state.marquee
+  );
+}
 
 function toolTitleSubject(tool, { prefix, symbols, paths = [] }) {
   const digest = typeof tool.digest === 'string' ? tool.digest : '';
@@ -438,10 +457,70 @@ function followChatScroll() {
   if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+const NON_SYMBOL_CODE_WORDS = new Set([
+  'true', 'false', 'null', 'undefined', 'auto', 'replace', 'add', 'tools', 'prompt',
+  'fromGit', 'splitByGroup', 'includePaths', 'excludePaths', 'includeAllBranches',
+  'bookmarkName', 'snapshotId', 'autoDetect', 'allowCustom', 'utf-8', 'cp932',
+  'inspect', 'move', 'align', 'reset', 'groups', 'items', 'functions', 'vars',
+]);
+
+function findCanvasNodeBySymbol(rawSym) {
+  const nodes = state.view?.nodes;
+  if (!Array.isArray(nodes) || !nodes.length) return null;
+  const clean = String(rawSym || '').trim().replace(/\(\s*\)$/, '');
+  if (!clean) return null;
+  return nodes.find((n) => n.id === clean)
+    || nodes.find((n) => n.id === `var::${clean}`)
+    || nodes.find((n) => n.name === clean)
+    || nodes.find((n) => n.name?.toLowerCase() === clean.toLowerCase())
+    || null;
+}
+
+function isClickableSymbolToken(raw) {
+  const token = String(raw || '').trim();
+  if (!token || token.length < 2 || token.length > 160 || /\s/.test(token)) return false;
+  if (token.startsWith('/') || token.startsWith('-')) return false;
+  const clean = token.replace(/\(\s*\)$/, '');
+  if (NON_SYMBOL_CODE_WORDS.has(clean)) return false;
+  if (findCanvasNodeBySymbol(clean)) return true;
+  if (/^(?:var::)?(?:[\w./-]+\.(?:c|h)::)??[A-Za-z_][A-Za-z0-9_]*$/.test(clean)) {
+    return clean.includes('::') || clean.includes('_') || token.endsWith('()');
+  }
+  return false;
+}
+
+function locateSymbolFromChat(rawSym) {
+  const clean = String(rawSym || '').trim().replace(/\(\s*\)$/, '');
+  if (!clean) return;
+  const node = findCanvasNodeBySymbol(clean);
+  if (node) {
+    selectNode(node.id);
+    focusBox(node, 110, { keepZoom: true });
+    state.flash = { box: node, until: performance.now() + 900, dur: 900 };
+    draw({ geometryUnchanged: true });
+    setChatStatus(`已定位到画布${node.kind === 'var' ? '变量' : '函数'}：${node.name}`);
+    return;
+  }
+  if (els.search) {
+    const query = clean.replace(/^var::/, '').split('::').pop();
+    els.search.value = query;
+    els.search.focus();
+    void runSearch();
+    setChatStatus(`当前画布暂无「${query}」，已在左侧搜索定位`);
+  }
+}
+
 function formatAssistantText(text) {
   const inline = (line) => line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, index) => {
     if (index % 2 === 0) return esc(part);
-    if (part.startsWith('`')) return `<code>${esc(part.slice(1, -1))}</code>`;
+    if (part.startsWith('`')) {
+      const inner = part.slice(1, -1);
+      if (isClickableSymbolToken(inner)) {
+        const clean = inner.trim().replace(/\(\s*\)$/, '');
+        return `<button type="button" class="ai-sym-link" data-ai-sym="${esc(clean)}" title="点击在画布中定位「${esc(clean)}」">${esc(inner)}</button>`;
+      }
+      return `<code>${esc(inner)}</code>`;
+    }
     return `<strong>${esc(part.slice(2, -2))}</strong>`;
   }).join('');
   const lines = String(text || '').replace(/\r\n?/g, '\n')
@@ -655,17 +734,66 @@ function describeSelection(selection) {
   };
 }
 
-function setCanvasSelection(selection, explicit = false) {
-  const key = selectionKey(selection);
-  if (explicit) dismissedSelectionKeys.delete(key);
-  const next = key && !dismissedSelectionKeys.has(key) ? selection : null;
-  if (canvasSelection === next) return;
-  canvasSelection = next;
-  selectionBar.hidden = !next;
+function renderSelectionBar() {
+  const hasPinned = pinnedSelections.length > 0;
+  const hasActive = Boolean(canvasSelection);
+  selectionBar.hidden = !hasPinned && !hasActive;
+
+  if (pinnedListEl) {
+    pinnedListEl.hidden = !hasPinned;
+    pinnedListEl.replaceChildren();
+    if (hasPinned) {
+      for (const item of pinnedSelections) {
+        const key = selectionKey(item);
+        const { caption } = describeSelection(item);
+        const chip = document.createElement('span');
+        chip.className = 'ai-pinned-chip';
+        chip.title = caption;
+        const label = document.createElement('span');
+        label.textContent = caption;
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.className = 'ai-pinned-rm';
+        rm.setAttribute('aria-label', `移除暂存：${caption}`);
+        rm.textContent = '×';
+        rm.addEventListener('click', () => {
+          const idx = pinnedSelections.findIndex((x) => selectionKey(x) === key);
+          if (idx >= 0) pinnedSelections.splice(idx, 1);
+          renderSelectionBar();
+        });
+        chip.append(label, rm);
+        pinnedListEl.appendChild(chip);
+      }
+      if (pinnedSelections.length >= 2) {
+        const clearAll = document.createElement('button');
+        clearAll.type = 'button';
+        clearAll.className = 'ai-pinned-clear';
+        clearAll.textContent = `清空暂存 (${pinnedSelections.length})`;
+        clearAll.addEventListener('click', () => {
+          pinnedSelections.length = 0;
+          renderSelectionBar();
+        });
+        pinnedListEl.appendChild(clearAll);
+      }
+    }
+  }
+
+  if (selectionRowEl) selectionRowEl.hidden = !hasActive;
   selectionQuestions.replaceChildren();
-  if (next) {
-    const { caption, questions } = describeSelection(next);
+  if (hasActive) {
+    const { caption, questions } = describeSelection(canvasSelection);
     selectionText.textContent = selectionText.title = `📎 ${caption}`;
+    const activeKey = selectionKey(canvasSelection);
+    const alreadyPinned = pinnedSelections.some((item) => selectionKey(item) === activeKey);
+    if (pinSelectionBtn) {
+      pinSelectionBtn.disabled = alreadyPinned || pinnedSelections.length >= MAX_PINNED_SELECTIONS;
+      pinSelectionBtn.textContent = alreadyPinned ? '✓' : '+';
+      pinSelectionBtn.title = alreadyPinned
+        ? '已暂存到待提问列表'
+        : pinnedSelections.length >= MAX_PINNED_SELECTIONS
+          ? `最多暂存 ${MAX_PINNED_SELECTIONS} 项`
+          : '暂存到待提问列表，可继续点选多个画布关系';
+    }
     for (const [label, prompt] of questions) {
       const chip = document.createElement('button');
       chip.type = 'button';
@@ -679,8 +807,99 @@ function setCanvasSelection(selection, explicit = false) {
   followChatScroll();
 }
 
+function setCanvasSelection(selection, explicit = false) {
+  const key = selectionKey(selection);
+  if (explicit) dismissedSelectionKeys.delete(key);
+  const next = key && !dismissedSelectionKeys.has(key) ? selection : null;
+  if (canvasSelection === next) return;
+  canvasSelection = next;
+  renderSelectionBar();
+}
+
+function pinCurrentSelection() {
+  if (!canvasSelection) return;
+  const key = selectionKey(canvasSelection);
+  if (!key || pinnedSelections.some((item) => selectionKey(item) === key)) return;
+  if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
+    setChatStatus(`最多同时暂存 ${MAX_PINNED_SELECTIONS} 个画布关系`, true);
+    return;
+  }
+  pinnedSelections.push({ ...canvasSelection });
+  renderSelectionBar();
+  setChatStatus(`已暂存到上下文（共 ${pinnedSelections.length} 项），可继续点选其他关系`);
+}
+
 function currentUiContext() {
-  return canvasSelection ?? undefined;
+  const items = [];
+  const seen = new Set();
+  for (const item of [...pinnedSelections, ...(canvasSelection ? [canvasSelection] : [])]) {
+    const key = selectionKey(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    items.push(item);
+    if (items.length >= MAX_PINNED_SELECTIONS) break;
+  }
+  if (!items.length) return undefined;
+  return { ...items[0], items };
+}
+
+function buildCanvasLayoutSnapshot() {
+  const v = state.view;
+  if (!v || !Array.isArray(v.nodes) || !v.nodes.length) return undefined;
+  return {
+    root: state.roots?.[0] || v.root || '',
+    mode: state.groupMode === 'flat' ? 'flat' : 'group',
+    width: Math.round(v.width || 0),
+    height: Math.round(v.height || 0),
+    nodes: v.nodes.slice(0, 200).map((n) => ({
+      id: n.id,
+      name: n.name,
+      kind: n.kind === 'var' ? 'var' : 'fn',
+      file: n.file || '',
+      group: n.group || '',
+      x: Math.round(n.x),
+      y: Math.round(n.y),
+      w: Math.round(n.w),
+      h: Math.round(n.h),
+    })),
+    groups: (v.groups || []).slice(0, 100).map((g) => ({
+      id: g.id,
+      x: Math.round(g.x),
+      y: Math.round(g.y),
+      w: Math.round(g.w),
+      h: Math.round(g.h),
+    })),
+  };
+}
+
+function captureCanvasImage() {
+  const cv = els.cv;
+  if (!cv || !cv.width || !cv.height) return null;
+  try {
+    const maxDim = 1280;
+    const scale = Math.min(1, maxDim / Math.max(cv.width, cv.height));
+    const w = Math.max(1, Math.round(cv.width * scale));
+    const h = Math.max(1, Math.round(cv.height * scale));
+    const off = document.createElement('canvas');
+    off.width = w;
+    off.height = h;
+    const ctx = off.getContext('2d');
+    if (!ctx) return null;
+    ctx.fillStyle = '#F7F6F2';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(cv, 0, 0, w, h);
+    const dataUrl = off.toDataURL('image/jpeg', 0.82);
+    return dataUrl.startsWith('data:image/') ? { dataUrl, label: '当前画布截图' } : null;
+  } catch {
+    return null;
+  }
+}
+
+function setAttachShot(on) {
+  attachCanvasShot = Boolean(on);
+  if (!attachShotBtn) return;
+  attachShotBtn.setAttribute('aria-pressed', String(attachCanvasShot));
+  attachShotBtn.textContent = attachCanvasShot ? '📷 已附带图' : '📷 画布图';
 }
 
 const EMPTY_CHAT_HTML = `<div class="empty">
@@ -1234,11 +1453,57 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let streamedText = '';
   let metrics;
   const collectedTools = [];
+  let dirtyText = false;
+  let dirtyThinking = false;
+  let dirtyMetrics = false;
+  let dirtyScroll = false;
+  let paintTimer = 0;
+  let lastPaintAt = 0;
   const isCurrent = () => myGen === chatGeneration && chatProjectId === myProjectId &&
     thread.messages === turnMessages && chatThreads.includes(thread);
   const isVisible = () => isCurrent() && activeChatId === threadId;
   const joinThinking = (part) => [thinking, part].filter(Boolean).join('\n\n');
+  const flushStreamPaint = (force = false) => {
+    if (paintTimer) {
+      clearTimeout(paintTimer);
+      paintTimer = 0;
+    }
+    if (!force && isCanvasDragging()) {
+      // 画布正在平移或拖拽节点/容器时暂缓流式 DOM 重排，避免抢占主线程造成画布掉帧；松手后立刻补刷。
+      paintTimer = setTimeout(() => flushStreamPaint(false), 120);
+      return;
+    }
+    if (dirtyThinking) {
+      dirtyThinking = false;
+      const seconds = thinkingSince !== null ? thinkingSeconds + (performance.now() - thinkingSince) / 1000 : thinkingSeconds;
+      showThinking(ui.box, ui.text, joinThinking(thinkingDelta), seconds, thinkingSince !== null);
+    }
+    if (dirtyText) {
+      dirtyText = false;
+      ui.text.innerHTML = formatAssistantText(streamedText);
+    }
+    if (dirtyMetrics) {
+      dirtyMetrics = false;
+      if (isVisible()) renderTelemetry(thread, metrics);
+    }
+    if (dirtyScroll) {
+      dirtyScroll = false;
+      if (isVisible()) followChatScroll();
+    }
+    lastPaintAt = performance.now();
+  };
+  const scheduleStreamPaint = () => {
+    if (paintTimer) return;
+    if (isCanvasDragging()) {
+      paintTimer = setTimeout(() => flushStreamPaint(false), 120);
+      return;
+    }
+    const wait = Math.max(16, 48 - (performance.now() - lastPaintAt));
+    paintTimer = setTimeout(() => flushStreamPaint(false), wait);
+  };
+  activeStreamFlush = () => flushStreamPaint(true);
   const stopThinking = () => {
+    dirtyThinking = false;
     if (thinkingSince !== null) {
       thinkingSeconds += (performance.now() - thinkingSince) / 1000;
       thinkingSince = null;
@@ -1299,38 +1564,55 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
     if (ev.type === 'status') {
-      if (!streamedText) ui.text.textContent = ev.text;
+      if (!streamedText) {
+        ui.text.textContent = ev.text;
+        dirtyScroll = true;
+        scheduleStreamPaint();
+      }
     } else if (ev.type === 'thinking_delta') {
       thinkingSince ??= performance.now();
       thinkingDelta += ev.delta || '';
-      const seconds = thinkingSeconds + (performance.now() - thinkingSince) / 1000;
-      showThinking(ui.box, ui.text, joinThinking(thinkingDelta), seconds, true);
+      dirtyThinking = true;
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'thinking') {
       thinking = joinThinking(ev.text || thinkingDelta);
       thinkingDelta = '';
       stopThinking();
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'text_delta') {
       if (thinkingSince !== null) stopThinking();
       streamedText += ev.delta || '';
-      ui.text.innerHTML = formatAssistantText(streamedText);
+      dirtyText = true;
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'fallback') {
       addStep(ui.steps, `↻ ${ev.text}`);
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'tool_start') {
       if (thinkingSince !== null) stopThinking();
       const argBrief = ev.arguments && Object.keys(ev.arguments).length
         ? `(${JSON.stringify(ev.arguments).slice(0, 80)})` : '';
       pendingSteps.push({ name: ev.name, row: addStep(ui.steps, `${ev.name}${argBrief}…`) });
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'tool_end') {
       const tool = { name: ev.name, ok: ev.ok !== false, summary: ev.summary || '', digest: ev.digest || '' };
       collectedTools.push(tool);
       const index = pendingSteps.findIndex((step) => step.name === tool.name);
       const row = index >= 0 ? pendingSteps.splice(index, 1)[0].row : addStep(ui.steps, tool.name);
       finishStep(row, tool);
+      dirtyScroll = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'metrics') {
       metrics = ev;
-      if (isVisible()) renderTelemetry(thread, metrics);
+      dirtyMetrics = true;
+      scheduleStreamPaint();
     } else if (ev.type === 'done' || ev.type === 'question') {
       terminalReceived = true;
+      flushStreamPaint(true);
       if (ev.thinking) {
         thinking = ev.thinking;
         thinkingDelta = '';
@@ -1357,18 +1639,33 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         if (!messagesEl.contains(ui.box)) renderThreadMessages();
         else if (Array.isArray(saved.questionOptions)) renderQuestion(ui.text, saved, thread);
         else renderFollowups(ui.box, saved, thread);
+        followChatScroll();
       }
     } else if (ev.type === 'error') {
       terminalReceived = true;
+      flushStreamPaint(true);
       finishInterrupted(ev.error || '执行失败');
+      if (isVisible()) followChatScroll();
     }
-    if (isVisible()) followChatScroll();
   };
+  const images = [];
+  if (attachCanvasShot) {
+    const shot = captureCanvasImage();
+    if (shot) images.push(shot);
+    setAttachShot(false);
+  }
+  const canvasLayout = buildCanvasLayoutSnapshot();
   let streamTimer = setTimeout(() => controller.abort(new Error('连接 AI 服务超时')), 15_000);
   let reader;
   try {
     const res = await api.aiChat({
-      prompt: text, history: historySnapshot, at: state.at || 0, threadId, uiContext,
+      prompt: text,
+      history: historySnapshot,
+      at: state.at || 0,
+      threadId,
+      uiContext,
+      ...(images.length ? { images } : {}),
+      ...(canvasLayout ? { canvasLayout } : {}),
     }, controller.signal);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -1396,6 +1693,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
     }
   } finally {
+    if (paintTimer) {
+      clearTimeout(paintTimer);
+      paintTimer = 0;
+    }
+    activeStreamFlush = null;
     clearTimeout(streamTimer);
     if (reader) {
       void reader.cancel().catch(() => {});
@@ -1458,6 +1760,7 @@ document.addEventListener('cg:ask-ai', async (event) => {
     await sendPrompt(prompt, uiContext);
   }
 });
+if (pinSelectionBtn) pinSelectionBtn.addEventListener('click', pinCurrentSelection);
 clearSelectionBtn.addEventListener('click', () => {
   const key = selectionKey(canvasSelection);
   if (!key) return;
@@ -1465,6 +1768,18 @@ clearSelectionBtn.addEventListener('click', () => {
   setCanvasSelection(null);
   inputEl.focus({ preventScroll: true });
 });
+if (attachShotBtn) attachShotBtn.addEventListener('click', () => {
+  setAttachShot(!attachCanvasShot);
+  if (attachCanvasShot) setChatStatus('下次发送将附带当前画布截图（支持视觉的模型可看图分析与排版）');
+});
+messagesEl.addEventListener('click', (event) => {
+  const symBtn = event.target?.closest?.('.ai-sym-link[data-ai-sym]');
+  if (!symBtn) return;
+  locateSymbolFromChat(symBtn.dataset.aiSym);
+});
+// 画布拖拽松手后立刻补刷被暂缓的 AI 流式 DOM 更新，保证拖动零卡顿且松手即时同步。
+window.addEventListener('pointerup', () => { if (activeStreamFlush) activeStreamFlush(); }, { passive: true });
+window.addEventListener('pointercancel', () => { if (activeStreamFlush) activeStreamFlush(); }, { passive: true });
 messagesEl.addEventListener('scroll', () => {
   if (messagesEl.clientHeight) stickToBottom = isNearBottom(messagesEl);
 }, { passive: true });
@@ -1473,7 +1788,10 @@ messagesEl.addEventListener('scroll', () => {
 document.addEventListener('cg:project-changed', () => {
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
+  pinnedSelections.length = 0;
+  setAttachShot(false);
   setCanvasSelection(null);
+  renderSelectionBar();
   chatGeneration++;
   chatProjectId = null;
   chatThreads = [];
