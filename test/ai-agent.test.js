@@ -1707,3 +1707,98 @@ test('指代锚定防近因偏差、解释类提问禁止擅自改画布、多�
   assert.equal(capturedToolOutputs[1].needsVehicleChoice, true, '用户未指定车型时私自猜选单个车型版本也必须拦截');
   assert.deepEqual(capturedToolOutputs[1].pathBranches.map((b) => b.prefix).sort(), ['z144', 'z145']);
 });
+
+test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，以及 tidy/move_group 整理分组画布', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-indirect-tidy-'));
+  fs.writeFileSync(path.join(dir, 'dispatch.c'), [
+    'typedef void (*fn_t)(void);',
+    'void vvv(void) {}',
+    'void ggg(void) {}',
+    'void jjj(void) {}',
+    'void ghh(void) {}',
+    'void jkk(void) {}',
+    'void kkk(void) {}',
+    'const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, kkk } };',
+    '/* 10ms周期 */',
+    'void dispatch_x(int mode) {',
+    '  int row = mode ? 1 : 0;',
+    '  e[row][0]();',
+    '}',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'worker.c'), [
+    'void ghh(void);',
+    'void worker_step(void) { ghh(); }',
+  ].join('\n'));
+
+  const toolResults = [];
+  let turn = 0;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      const last = body.messages?.at(-1);
+      if (last?.role === 'tool') toolResults.push({ name: last.name, data: JSON.parse(last.content) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      turn++;
+      const reply = (name, args) => res.end(JSON.stringify({
+        choices: [{ message: { content: '', tool_calls: [{ id: `t_${turn}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }],
+      }));
+      if (turn === 1) return reply('inspect_indirect_calls', { function: 'ghh' });
+      if (turn === 2) return reply('read_source', { file: 'dispatch.c', startLine: 8, endLine: 13 });
+      if (turn === 3) return reply('add_call_edge', {
+        edges: [{ from: 'dispatch_x', to: 'ghh', line: 12, via: 'e[1][0]', reason: 'mode!=0 时调用 e[1][0] 即 ghh' }],
+        addToCanvas: true,
+      });
+      if (turn === 4) return reply('trace_upstream', { functions: ['ghh'] });
+      if (turn === 5) return reply('arrange_canvas', { action: 'tidy', direction: 'LR' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: '已补全 dispatch_x → ghh 间接调用边并整理画布。\n<next_steps>\n```json\n[{"label":"检查另一分支","prompt":"查看 dispatch_x 的 vvv 分支"}]\n```\n</next_steps>',
+          },
+        }],
+      }));
+    });
+  });
+  await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+  const srv = await launchServer({ target: dir });
+  t.after(async () => {
+    await new Promise((r) => mockLlm.close(r));
+    await srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-2d', toolMode: 'tools', maxTokens: 4096 });
+  await post('/api/page', { roots: ['dispatch.c::dispatch_x', 'worker.c::worker_step'], up: 0, down: 0, groupMode: 'file' });
+
+  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: '请查明 dispatch_x 如何调用 ghh 并补全这条调用边，再整理画布',
+      attachments: [{ name: 'notes.txt', startLine: 1, endLine: 2, totalLines: 2, content: 'mode=1 -> row=1 -> ghh' }],
+    }),
+  });
+  assert.equal(chatRes.status, 200);
+  const events = (await chatRes.text()).trim().split('\n').map(JSON.parse);
+  const done = events.find((e) => e.type === 'done');
+  assert.ok(done, '应正常完成对话');
+  assert.equal(done.suggestions?.[0]?.label, '检查另一分支', '应兼容带 ```json 代码块的 <next_steps>');
+
+  const inspectRes = toolResults.find((r) => r.name === 'inspect_indirect_calls')?.data;
+  assert.ok(inspectRes?.tables?.some((tb) => tb.name === 'e' && tb.slots.some((s) => s.slot === '[1][0]' && s.target === 'ghh')));
+  const srcRes = toolResults.find((r) => r.name === 'read_source')?.data;
+  assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
+  const addRes = toolResults.find((r) => r.name === 'add_call_edge')?.data;
+  assert.equal(addRes?.ok, true);
+  assert.equal(addRes?.addedCount, 1);
+  const traceRes = toolResults.find((r) => r.name === 'trace_upstream')?.data;
+  assert.ok(JSON.stringify(traceRes).includes('dispatch_x'), '补边后 trace_upstream 应立刻追踪到 dispatch_x');
+  assert.ok(!JSON.stringify(traceRes).includes('vvv'), '无关槽位 vvv 不应被误连');
+  const tidyRes = toolResults.find((r) => r.name === 'arrange_canvas')?.data;
+  assert.equal(tidyRes?.ok, true, JSON.stringify(tidyRes));
+  assert.ok(tidyRes?.updatedCount >= 2, '分组模式下 tidy 应成功重排全部节点而不报容器重叠');
+});
