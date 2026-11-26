@@ -5,6 +5,7 @@
  * 3. 外部 MCP：保留原有三档权限控制、一键复制 CC 命令与精简指令。
  */
 import { t } from '../i18n.js';
+import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
 import { focusBox } from './camera.js';
 import { hooks } from './hooks.js';
@@ -174,7 +175,7 @@ const REASONING_LABELS = new Map([['default', '默认'], ['off', '关'], ['low',
 const QUICK_CONFIG_ACTION = '__ai_open_config__';
 const STEERING_PROMPT_PLACEHOLDER = '生成中可随时输入并按 Enter 中途引导或纠正…';
 const MAX_PENDING_IMAGES = 2;
-const MAX_PENDING_FILES = 4;
+const MAX_PENDING_FILES = MAX_CODE_ATTACHMENTS;
 let currentGhostSuggestion = '';
 const pendingImages = []; // [{ id, dataUrl, label, width, height }]
 const pendingFiles = [];  // [{ id, name, lines, startLine, endLine }]
@@ -292,8 +293,9 @@ function persistChats(projectId = chatProjectId) {
   const mutation = ++chatMutation;
   const threads = chatThreads.slice(0, 30).map((th) => ({
     ...th,
-    messages: (th.messages || []).map(({ attachedImages, ...rest }) => rest),
+    messages: (th.messages || []).slice(-80).map(({ attachedImages, ...rest }) => rest),
   }));
+  boundSavedCodeAttachments(threads, activeChatId);
   const payload = { projectId, activeId: activeChatId, threads };
   void api.saveAiChats(payload).catch(error => {
     if (projectId === chatProjectId && mutation === chatMutation) {
@@ -356,8 +358,13 @@ function messageContext(message) {
 }
 
 function chatHistory(messages) {
-  return messages.filter((m) => !m.error).slice(-16)
-    .map((m) => ({ role: m.role, content: messageContext(m) })).filter((m) => m.content);
+  const history = messages.filter((m) => !m.error).slice(-16).map((m) => ({
+    role: m.role,
+    content: messageContext(m),
+    ...(m.attachedFiles?.length ? { attachedFiles: m.attachedFiles } : {}),
+  })).filter(m => m.content || m.attachedFiles?.length);
+  boundSavedCodeAttachments([{ messages: history }]);
+  return history;
 }
 
 function estimateTextTokens(text) {
@@ -369,7 +376,13 @@ function estimateTextTokens(text) {
 }
 
 function estimateContext(messages) {
-  return chatHistory(messages).reduce((total, { content }) => total + 4 + estimateTextTokens(content), 0);
+  return chatHistory(messages).reduce((total, { content, attachedFiles }) =>
+    total + estimateHistoryMessage(content, attachedFiles), 0);
+}
+
+function estimateHistoryMessage(content, files = []) {
+  return 4 + estimateTextTokens(content) + files.reduce((total, file) =>
+    total + estimateTextTokens(file.name) + estimateTextTokens(file.content), 0);
 }
 
 function formatTokens(value) {
@@ -414,7 +427,8 @@ function computeContextState(thread, liveMetrics) {
   const saved = resolveMetricsTokens(baseIdx >= 0 ? messages[baseIdx].metrics : thread?.metrics);
   if (saved) {
     const trailing = baseIdx >= 0 ? messages.slice(baseIdx + 1) : [];
-    const extra = trailing.reduce((sum, msg) => sum + (msg.error ? 0 : 4 + estimateTextTokens(messageContext(msg))), 0);
+    const extra = trailing.reduce((sum, msg) =>
+      sum + (msg.error ? 0 : estimateHistoryMessage(messageContext(msg), msg.attachedFiles)), 0);
     return {
       used: saved.total + extra,
       promptTokens: saved.promptTokens,
@@ -1873,6 +1887,8 @@ async function compactChat() {
   const projectId = chatProjectId;
   const messages = thread.messages;
   if (!messages.length) return;
+  const compactMessages = messages.map(message => ({ ...message }));
+  boundSavedCodeAttachments([{ messages: compactMessages }]);
   const isCurrent = () => chatProjectId === projectId && chatThreads.includes(thread) && thread.messages === messages;
   const before = estimateContext(messages);
   const controller = new AbortController();
@@ -1880,7 +1896,7 @@ async function compactChat() {
   updateChatControls();
   setChatStatus('正在压缩上下文…');
   try {
-    const result = await api.compactChat({ projectId, threadId: thread.id, messages }, controller.signal);
+    const result = await api.compactChat({ projectId, threadId: thread.id, messages: compactMessages }, controller.signal);
     if (result?.ok === false) throw new Error(result.error);
     if (!Array.isArray(result?.messages)) throw new Error('压缩接口返回了无效的对话数据');
     if (!isCurrent()) return;
@@ -2017,7 +2033,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     questionCard.querySelector('.ai-q-hint')?.remove();
   }
   const images = pendingImages.splice(0, MAX_PENDING_IMAGES).map(({ dataUrl, label }) => ({ dataUrl, label }));
-  const attachments = pendingFiles.splice(0, MAX_PENDING_FILES).map((file) => {
+  const attachments = sanitizeCodeAttachments(pendingFiles.splice(0, MAX_PENDING_FILES).map((file) => {
     const start = Math.max(1, file.startLine || 1);
     const end = Math.max(start, Math.min(file.lines.length, file.endLine || file.lines.length));
     return {
@@ -2025,18 +2041,17 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       startLine: start,
       endLine: end,
       totalLines: file.lines.length,
-      content: file.lines.slice(start - 1, end).join('\n').slice(0, 24_000),
+      content: file.lines.slice(start - 1, end).join('\n'),
     };
-  });
+  }));
   renderAttachments();
   const selectionSummary = summarizeUiContext(uiContext);
-  const fileMeta = attachments.map(({ name, startLine, endLine }) => ({ name, startLine, endLine }));
   thread.messages.push({
     role: 'user',
     text,
     ...(selectionSummary ? { selectionSummary } : {}),
     ...(images.length ? { attachedImages: images } : {}),
-    ...(fileMeta.length ? { attachedFiles: fileMeta } : {}),
+    ...(attachments.length ? { attachedFiles: attachments } : {}),
   });
   thread.updatedAt = Date.now();
   renderChatBar();
@@ -2044,7 +2059,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
 
   inputEl.value = '';
   stickToBottom = true;
-  appendUserMessage(text, images, fileMeta);
+  appendUserMessage(text, images, attachments);
   const ui = createAssistantBox();
   const controller = new AbortController();
   activeAbort = controller;

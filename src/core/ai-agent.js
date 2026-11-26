@@ -5,6 +5,8 @@
  * - 自动兼容旧版 OpenAI 接口：支持标准 tool_calls、旧版 function_call，以及不传 tools / role:"tool" 的纯对话工具调用回退。
  */
 
+import { MAX_CODE_ATTACHMENT_CHARS, sanitizeCodeAttachments } from '../../web/lib/ai-code-attachments.js';
+
 const VALID_TOOL_MODES = new Set(['auto', 'tools', 'prompt']);
 const VALID_REASONING_EFFORTS = new Set(['default', 'off', 'low', 'medium', 'high']);
 const MAX_AGENT_STEPS = 24;
@@ -487,6 +489,19 @@ function formatUiContextSelections(ui) {
   };
 }
 
+function formatCodeAttachments(files, maxChars = MAX_CODE_ATTACHMENT_CHARS * files.length) {
+  if (!files.length) return [];
+  const lines = ['[用户附带的外部文件/代码片段]'];
+  const perFile = Math.floor(maxChars / files.length);
+  for (const file of files) {
+    const range = file.endLine ? ` (L${file.startLine || 1}-L${file.endLine}${file.totalLines ? ` / 共 ${file.totalLines} 行` : ''})` : '';
+    lines.push(`--- 文件：${file.name}${range} ---`, file.content.slice(0, perFile));
+    if (file.truncated || file.content.length > perFile) lines.push('（片段已截断）');
+    lines.push('--- 结束 ---');
+  }
+  return lines;
+}
+
 function buildTurnUserText(userText, uiContext, attachments = []) {
   const sections = [];
   const { selections } = formatUiContextSelections(uiContext);
@@ -502,13 +517,7 @@ function buildTurnUserText(userText, uiContext, attachments = []) {
       '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
     );
   }
-  if (Array.isArray(attachments) && attachments.length) {
-    sections.push('[用户附带的外部文件/代码片段]');
-    for (const file of attachments) {
-      const range = file.endLine ? ` (L${file.startLine || 1}-L${file.endLine}${file.totalLines ? ` / 共 ${file.totalLines} 行` : ''})` : '';
-      sections.push(`--- 文件：${file.name}${range} ---`, file.content, '--- 结束 ---');
-    }
-  }
+  sections.push(...formatCodeAttachments(attachments));
   if (!sections.length) return userText;
   sections.push('', '用户本轮提问：', userText);
   return sections.join('\n');
@@ -1185,7 +1194,7 @@ export function summarizeToolDigest(name, args, result) {
   return [header, ...values].join(' ');
 }
 
-function historyContent(message, maxLength = Infinity) {
+function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_000) {
   const rawText = String(message.text ?? message.content ?? '').trim();
   const selectionPrefix = message.role === 'user' && message.selectionSummary
     ? `[当时画布选中：${String(message.selectionSummary).trim()}]`
@@ -1206,7 +1215,8 @@ function historyContent(message, maxLength = Infinity) {
   }
   const metadata = details.join('\n').slice(0, maxLength);
   const textBudget = metadata ? Math.max(0, maxLength - metadata.length - 1) : maxLength;
-  return [text.slice(0, textBudget), metadata].filter(Boolean).join('\n');
+  const files = message.role === 'user' ? sanitizeCodeAttachments(message.attachedFiles) : [];
+  return [text.slice(0, textBudget), metadata, ...formatCodeAttachments(files, maxAttachmentChars)].filter(Boolean).join('\n');
 }
 
 export async function compactConversation({ config, messages, fetchImpl = fetch, signal = null }) {
@@ -1228,7 +1238,7 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
       const references = text.match(/[\p{L}\d_.:/\\-]+\.(?:c|h|cc|cpp|hpp|arxml|oil|json)(?:::[\w$]+)?|\b(?:z\d+|[\w.-]+(?:[/\\][\w.-]+)+)\b/giu);
       if (references?.length) facts.push('文件或路径：' + [...new Set(references)].join('、'));
     }
-    const structured = historyContent({ ...message, text: '' });
+    const structured = historyContent({ ...message, text: '' }, Infinity, 0);
     if (structured) facts.push(structured);
   }
 
@@ -1288,12 +1298,13 @@ export async function runAiAgent({
     contextWindow: validContextWindow(config.contextWindow) ? config.contextWindow : DEFAULT_AI_CONFIG.contextWindow,
   };
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
+  const historyBudget = Math.floor(config.contextWindow * 0.65);
+  const historyAttachmentChars = Math.min(MAX_CODE_ATTACHMENT_CHARS, Math.floor(historyBudget / 3));
   const cleanHistory = (Array.isArray(history) ? history : [])
     .filter(m => m && ['user', 'assistant'].includes(m.role))
-    .map(m => ({ role: m.role, content: historyContent(m, 4000) }))
+    .map(m => ({ role: m.role, content: historyContent(m, 4000, historyAttachmentChars) }))
     .filter(m => m.content)
     .slice(-20);
-  const historyBudget = Math.floor(config.contextWindow * 0.65);
   while (estimateMessagesTokens(cleanHistory) > historyBudget) cleanHistory.shift();
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
   const removal = /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);

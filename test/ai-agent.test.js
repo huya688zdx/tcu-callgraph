@@ -437,6 +437,53 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     assert.match(text, /1\. 节点 main\.c::main/);
     assert.doesNotMatch(text, /pinned\.c::f15\b/);
   });
+
+  await t.test('外部代码选段在重载对话后仍可用于追问', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const openChat = async () => {
+      await browser.waitFor("Boolean(window.__cg?.view) && !document.getElementById('aiDrawer').classList.contains('show')");
+      await browser.evaluate("document.getElementById('aiBtn').click()");
+      await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+      await browser.evaluate(`document.querySelector('[data-ai-tab="chat"]').click()`);
+    };
+    const countBefore = requests.length;
+    await openChat();
+    await browser.evaluate(`(() => {
+      document.getElementById('aiNewChat').click();
+      const input = document.getElementById('aiTextFileInput');
+      const files = new DataTransfer();
+      files.items.add(new File(['outside_first\\nint saved_excerpt(void) { return 37; }\\noutside_last'], 'external.c'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change'));
+    })()`);
+    await browser.waitFor("document.querySelectorAll('.ai-att-range input').length === 2");
+    await browser.evaluate(`(() => {
+      const [start, end] = document.querySelectorAll('.ai-att-range input');
+      start.value = end.value = '2';
+      start.dispatchEvent(new Event('change'));
+      document.getElementById('aiPromptInput').value = '请读一下这段代码';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    const saved = await get('/api/ai/chats');
+    const thread = saved.threads.find(item => item.id === saved.activeId);
+    assert.deepEqual(thread.messages[0].attachedFiles, [{ name: 'external.c', startLine: 2, endLine: 2, totalLines: 3,
+      content: 'int saved_excerpt(void) { return 37; }' }]);
+    await browser.send('Page.reload');
+    await openChat();
+    await browser.waitFor("document.querySelector('.ai-msg-att-file')?.textContent.includes('external.c')");
+    await browser.evaluate(`(() => {
+      document.getElementById('aiPromptInput').value = '上面附件中的函数返回什么？';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.querySelectorAll('#aiMessages .ai-msg.assistant .ai-msg-text').length >= 2 && document.getElementById('aiStopChat').hidden");
+    assert.equal(requests.length, countBefore + 2);
+    const priorTurn = requests.at(-1).messages.find(m => m.role === 'user' && m.content.includes('请读一下这段代码'));
+    assert.match(priorTurn?.content || '', /external\.c \(L2-L2.*\)[\s\S]*saved_excerpt\(void\) \{ return 37; \}/);
+    assert.doesNotMatch(priorTurn.content, /outside_first|outside_last/);
+  });
 });
 
 test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async t => {
@@ -1774,10 +1821,13 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     '  e[row][0]();',
     '}',
   ].join('\n'));
-  fs.writeFileSync(path.join(dir, 'worker.c'), [
+  const cp932Text = new TextDecoder('shift_jis').decode(Uint8Array.of(0xc2, 0xa9));
+  fs.writeFileSync(path.join(dir, 'worker.c'), Buffer.concat([Buffer.from([
     'void ghh(void);',
     'void worker_step(void) { ghh(); }',
-  ].join('\n'));
+    '/* ',
+  ].join('\n')), Buffer.from([0xc2, 0xa9]), Buffer.from(' */\n')]));
+  fs.writeFileSync(path.join(dir, 'bom.h'), '\uFEFF/* 周期 */\n');
 
   const toolResults = [];
   let turn = 0;
@@ -1795,12 +1845,20 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
       }));
       if (turn === 1) return reply('inspect_indirect_calls', { function: 'ghh' });
       if (turn === 2) return reply('read_source', { file: 'dispatch.c', startLine: 8, endLine: 13 });
-      if (turn === 3) return reply('add_call_edge', {
+      if (turn === 3) return reply('read_source', { query: cp932Text, file: 'worker.c', encoding: 'cp932' });
+      if (turn === 4) return reply('read_source', { query: '周期', file: 'bom.h', encoding: 'cp932' });
+      if (turn === 5) return reply('apply_labels', {
+        items: [{ from: 'worker_step', to: 'ghh', line: 2, preset: 'task', text: 'TASK:10ms' }],
+      });
+      if (turn === 6) return reply('add_call_edge', {
         edges: [{ from: 'dispatch_x', to: 'ghh', line: 12, via: 'e[1][0]', reason: 'mode!=0 时调用 e[1][0] 即 ghh' }],
         addToCanvas: true,
       });
-      if (turn === 4) return reply('trace_upstream', { functions: ['ghh'] });
-      if (turn === 5) return reply('arrange_canvas', { action: 'tidy', direction: 'LR' });
+      if (turn === 7) return reply('apply_labels', {
+        items: [{ from: 'dispatch_x', to: 'ghh', line: 12, preset: 'task', text: 'TASK:10ms' }],
+      });
+      if (turn === 8) return reply('trace_upstream', { functions: ['ghh'] });
+      if (turn === 9) return reply('arrange_canvas', { action: 'tidy', direction: 'LR' });
       res.end(JSON.stringify({
         choices: [{
           message: {
@@ -1827,7 +1885,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      prompt: '请查明 dispatch_x 如何调用 ghh 并补全这条调用边，再整理画布',
+      prompt: '请查明 dispatch_x 如何调用 ghh 并补全这条调用边，加上 TASK 标签，再整理画布',
       attachments: [{ name: 'notes.txt', startLine: 1, endLine: 2, totalLines: 2, content: 'mode=1 -> row=1 -> ghh' }],
     }),
   });
@@ -1841,9 +1899,16 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
   assert.ok(inspectRes?.tables?.some((tb) => tb.name === 'e' && tb.slots.some((s) => s.slot === '[1][0]' && s.target === 'ghh')));
   const srcRes = toolResults.find((r) => r.name === 'read_source')?.data;
   assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
+  const searches = toolResults.filter(r => r.name === 'read_source').slice(1).map(r => r.data);
+  assert.deepEqual(searches[0]?.matches?.map(({ line, text }) => [line, text]), [[3, `/* ${cp932Text} */`]], JSON.stringify(searches));
+  assert.deepEqual(searches[1]?.matches?.map(({ line, text }) => [line, text]), [[1, '/* 周期 */']], JSON.stringify(searches));
   const addRes = toolResults.find((r) => r.name === 'add_call_edge')?.data;
   assert.equal(addRes?.ok, true);
   assert.equal(addRes?.addedCount, 1);
+  const labels = toolResults.filter(r => r.name === 'apply_labels').map(r => r.data);
+  assert.deepEqual(labels.map(r => r.edgeKeys), [
+    ['worker.c::worker_step->dispatch.c::ghh:2'], ['dispatch.c::dispatch_x->dispatch.c::ghh:12'],
+  ]);
   const traceRes = toolResults.find((r) => r.name === 'trace_upstream')?.data;
   assert.ok(JSON.stringify(traceRes).includes('dispatch_x'), '补边后 trace_upstream 应立刻追踪到 dispatch_x');
   assert.ok(!JSON.stringify(traceRes).includes('vvv'), '无关槽位 vvv 不应被误连');

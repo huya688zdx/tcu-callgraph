@@ -36,6 +36,7 @@ import {
 import { normalizeExpansions } from './core/expansion.js';
 import { routeEdges } from './core/routing.js';
 import { contentPadding, inside } from '../web/lib/hierarchy.js';
+import { boundSavedCodeAttachments, sanitizeCodeAttachments } from '../web/lib/ai-code-attachments.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
@@ -493,14 +494,11 @@ function saveInferredEdges(projectId, list) {
 
 function applyInferredEdges(model, projectId, list = loadInferredEdges(projectId)) {
   if (!model) return;
-  const hadInferred = Boolean(model.edges?.some((e) => e.inferred));
+  const hadInferred = model.edges.some(e => e.inferred);
   if (!list.length && !hadInferred) return;
-  if (hadInferred) {
-    model.edges = (model.edges || []).filter((e) => !e.inferred);
-  }
+  let edges = hadInferred ? model.edges.filter(e => !e.inferred) : model.edges;
   const byId = model._index?.byId;
-  const existingKeys = new Set((model.edges || []).map((e) => `${e.from}|${e.to}|${e.line || 0}`));
-  let injected = false;
+  const existingKeys = new Set(edges.map(e => `${e.from}|${e.to}|${e.line || 0}`));
   for (const item of list) {
     const fromNode = byId?.get(item.from);
     const toNode = byId?.get(item.to);
@@ -508,7 +506,9 @@ function applyInferredEdges(model, projectId, list = loadInferredEdges(projectId
     const key = `${item.from}|${item.to}|${item.line || 0}`;
     if (existingKeys.has(key)) continue;
     existingKeys.add(key);
-    model.edges.push({
+    // 源码连线索引以边数组为键，补边时换用新数组。
+    if (edges === model.edges) edges = [...edges];
+    edges.push({
       from: item.from,
       to: item.to,
       callee: toNode.name || item.to.split('::').pop(),
@@ -518,9 +518,11 @@ function applyInferredEdges(model, projectId, list = loadInferredEdges(projectId
       ...(item.reason ? { reason: item.reason } : {}),
       inferred: true,
     });
-    injected = true;
   }
-  if (hadInferred || injected) rebuildIndex(model);
+  if (edges !== model.edges) {
+    model.edges = edges;
+    rebuildIndex(model);
+  }
 }
 
 // ---- 流程图持久化缓存 + 有变更函数默认预加载保存 ----
@@ -1149,6 +1151,22 @@ function traceContext(id, version = null) {
   return { model: COMPARISON[traceVersion + 'Model'], traceVersion };
 }
 
+async function readIndexedSourceBytes(model, file, comparison) {
+  const source = await model._sourceBuffers?.getAsync(file);
+  if (source) return source;
+  const realRoot = await fs.promises.realpath(model.root);
+  const realFile = await fs.promises.realpath(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
+  const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
+  const withinRoots = roots.some(root => {
+    const rel = path.relative(root, realFile);
+    return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+  });
+  if (!withinRoots || !(await fs.promises.stat(realFile)).isFile()) {
+    throw new Error('源码文件必须位于当前工程或对照目录内');
+  }
+  return fs.promises.readFile(realFile);
+}
+
 async function readMcpSource(q) {
   const id = q.get('id');
   if (q.has('id') === ['file', 'startLine', 'endLine'].some((key) => q.has(key))) {
@@ -1171,20 +1189,7 @@ async function readMcpSource(q) {
   if (!model.files?.some((entry) => entry.rel === file)) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
-  let source = await model._sourceBuffers?.getAsync(file);
-  if (!source) {
-    const realRoot = await fs.promises.realpath(model.root);
-    const realFile = await fs.promises.realpath(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
-    const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
-    const withinRoots = roots.some(root => {
-      const rel = path.relative(root, realFile);
-      return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
-    });
-    if (!withinRoots || !(await fs.promises.stat(realFile)).isFile()) {
-      throw new Error('源码文件必须位于当前工程或对照目录内');
-    }
-    source = await fs.promises.readFile(realFile);
-  }
+  const source = await readIndexedSourceBytes(model, file, comparison);
   const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
   let decoded;
   try { decoded = decoder.decode(source.subarray(decoder.bomLength)); }
@@ -2541,6 +2546,7 @@ export const server = http.createServer(async (req, res) => {
               text: String(m.text || '').slice(0, 8000),
               ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                 ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
+              ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
               ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
               ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
@@ -2579,6 +2585,7 @@ export const server = http.createServer(async (req, res) => {
         }
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
+        boundSavedCodeAttachments(threads, activeId);
         return { activeId, threads };
       };
       if (req.method === 'POST') {
@@ -2634,18 +2641,7 @@ export const server = http.createServer(async (req, res) => {
         images.push({ dataUrl, ...(typeof item?.label === 'string' ? { label: item.label.slice(0, 120) } : {}) });
         if (images.length === 2) break;
       }
-      const attachments = [];
-      for (const item of Array.isArray(p.attachments) ? p.attachments : []) {
-        if (!item || typeof item !== 'object') continue;
-        const name = String(item.name || '').trim().slice(0, 160);
-        const content = typeof item.content === 'string' ? item.content.slice(0, 24_000) : '';
-        if (!name || !content.trim()) continue;
-        const startLine = Number.isInteger(item.startLine) && item.startLine > 0 ? item.startLine : 1;
-        const endLine = Number.isInteger(item.endLine) && item.endLine >= startLine ? item.endLine : undefined;
-        const totalLines = Number.isInteger(item.totalLines) && item.totalLines > 0 ? item.totalLines : undefined;
-        attachments.push({ name, content, startLine, ...(endLine ? { endLine } : {}), ...(totalLines ? { totalLines } : {}) });
-        if (attachments.length === 4) break;
-      }
+      const attachments = sanitizeCodeAttachments(p.attachments);
       const canvasLayoutRoots = (ids) => ids.map(id => remapLegacyExt(id, MODEL)).filter(Boolean);
       let canvasSnapshot = reviewingPage(pageState) ? null : sanitizeCanvasLayout(p.canvasLayout);
       const snapshotPage = canvasSnapshot && latestPage();
@@ -3929,21 +3925,22 @@ export const server = http.createServer(async (req, res) => {
           if (!query) return { ok: false, error: 'read_source 需要提供 file（按行读取）或 query（全文检索）' };
           const limit = Math.max(1, Math.min(50, Math.trunc(Number(args.limit) || 25)));
           const pathPrefixes = normalizePathPrefixes(args.paths);
-          const candidateFiles = (MODEL.files || [])
+          const comparison = COMPARISON;
+          const { model } = traceContext(null);
+          const candidateFiles = (model.files || [])
             .filter(f => !f.manual && f.rel)
             .filter(f => !fileArg || f.rel === fileArg || f.rel.endsWith('/' + fileArg))
             .filter(f => !pathPrefixes.length || pathPrefixes.some(p => f.rel === p || f.rel.startsWith(p + '/')));
           const needle = query.toLowerCase();
           const matches = [];
-          const decoder = encoding === 'cp932' ? sourceDecoder('cp932') : null;
           for (const f of candidateFiles) {
             if (matches.length >= limit) break;
-            const abs = resolveProjectFile(MODEL.root, f.rel);
-            if (!abs) continue;
-            let raw;
-            try { raw = await fs.promises.readFile(abs); } catch { continue; }
             assertActive();
-            const text = decoder ? decoder.decode(raw) : decodeSource(raw);
+            let raw;
+            try { raw = await readIndexedSourceBytes(model, f.rel, comparison); } catch { continue; }
+            assertActive();
+            const decoder = sourceDecoder(raw, encoding);
+            const text = decoder.decode(raw.subarray(decoder.bomLength));
             const lines = text.split(/\r\n|\r|\n/);
             for (let idx = 0; idx < lines.length; idx++) {
               if (!lines[idx].toLowerCase().includes(needle)) continue;
