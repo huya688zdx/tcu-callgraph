@@ -443,7 +443,7 @@ export function needsCounterAnalysis(model) {
 
 export function taskPeriods(model) {
   const cached = cache.get(model);
-  if (cached && cached.df === model._df) return cached.contexts;
+  if (cached && cached.df === model._df && cached.index === model._index) return cached.contexts;
   const collected = new Map();
   const tasks = projectTasks(model);
   const byEntry = new Map();
@@ -567,7 +567,7 @@ export function taskPeriods(model) {
     }
     return [id, [...unique.values()].sort(contextOrder)];
   }));
-  cache.set(model, { df, contexts });
+  cache.set(model, { df, index: model._index, contexts });
   return contexts;
 }
 

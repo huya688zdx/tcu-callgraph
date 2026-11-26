@@ -1820,6 +1820,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     '  int row = mode ? 1 : 0;',
     '  e[row][0]();',
     '}',
+    'void Task10ms(void) { dispatch_x(1); }',
   ].join('\n'));
   const cp932Text = new TextDecoder('shift_jis').decode(Uint8Array.of(0xc2, 0xa9));
   fs.writeFileSync(path.join(dir, 'worker.c'), Buffer.concat([Buffer.from([
@@ -1880,6 +1881,12 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
   }).then((r) => r.json());
   await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-2d', toolMode: 'tools', maxTokens: 4096 });
   await post('/api/page', { roots: ['dispatch.c::dispatch_x', 'worker.c::worker_step'], up: 0, down: 0, groupMode: 'file' });
+  const targetPeriods = async () => {
+    const response = await fetch(srv.baseUrl + '/api/source?id=dispatch.c::ghh');
+    assert.equal(response.status, 200);
+    return (await response.json()).taskPeriods.map(context => context.us);
+  };
+  assert.deepEqual(await targetPeriods(), []);
 
   const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
     method: 'POST',
@@ -1912,6 +1919,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
   const traceRes = toolResults.find((r) => r.name === 'trace_upstream')?.data;
   assert.ok(JSON.stringify(traceRes).includes('dispatch_x'), '补边后 trace_upstream 应立刻追踪到 dispatch_x');
   assert.ok(!JSON.stringify(traceRes).includes('vvv'), '无关槽位 vvv 不应被误连');
+  assert.deepEqual(await targetPeriods(), [10000], '补边后再次查看源码应显示新增的 10ms 上游任务');
   const tidyRes = toolResults.find((r) => r.name === 'arrange_canvas')?.data;
   assert.equal(tidyRes?.ok, true, JSON.stringify(tidyRes));
   assert.ok(tidyRes?.updatedCount >= 2, '分组模式下 tidy 应成功重排全部节点而不报容器重叠');
