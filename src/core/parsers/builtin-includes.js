@@ -134,7 +134,10 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       const result = preprocess(input.tokens, scope, file.rel, {
         expand, pruneInactive: true, onInclude: include, onPragmaOnce: () => once.add(fileKey),
       });
-      if (file.isHeader) rememberHeader(file, input, macroOnly ? { ...result, tokens: [] } : result, scope);
+      if (file.isHeader) {
+        if (!macroOnly) options.onHeaderContext?.(file, input, result.tokens, scope, source.rel);
+        rememberHeader(file, input, macroOnly ? { ...result, tokens: [] } : result, scope);
+      }
       else {
         result.includes.unshift(...implicit);
         visit(file, input, result, scope);

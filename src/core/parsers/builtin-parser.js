@@ -1,4 +1,5 @@
 import { dependencyStamp } from './clang-config.js';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { preprocessProfile } from './builtin-includes.js';
@@ -7,7 +8,7 @@ import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
 import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
-import { fileMacroScope, preprocess } from '../preproc.js';
+import { expandSeq, fileMacroScope, preprocess } from '../preproc.js';
 import { collectDispatchDeclarations, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
@@ -252,6 +253,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const functions = [];
   const functionRecords = [];
   const deferredTypedefCalls = [];
+  const headerVariants = new Map();
   const typedefsByFile = new Map();
   const typedefHeadersByName = new Map();
   const fnptrTablesList = [];
@@ -276,6 +278,30 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     record.nesting = deferred ? callNestingTokens(body) : null;
     assignCallGroups(body, calls);
     record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
+  };
+
+  const recordHeaderContext = (file, input, tokens, macros, source) => {
+    // 大多数头文件只声明符号；只有包含函数定义的头才需要比对宏展开后的调用。
+    input.hasHeaderFunctions ??= findFunctions(input.tokens.filter(token => token.t !== 'preproc'), file.rel).length > 0;
+    if (!input.hasHeaderFunctions) return;
+    const expanded = expandSeq(tokens, macros);
+    const key = createHash('sha256')
+      .update(JSON.stringify(expanded.map(token => [token.v, token.line, token.col]))).digest('hex');
+    if (!headerVariants.has(file.rel)) headerVariants.set(file.rel, new Map());
+    const variants = headerVariants.get(file.rel);
+    let variant = variants.get(key);
+    if (!variant) {
+      variant = { callsByName: new Map(), sources: new Set() };
+      variants.set(key, variant);
+      for (const fn of findFunctions(tokens, file.rel)) {
+        const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+        const calls = [];
+        scanCalls(body, { macros }, calls);
+        recordFunctionCalls({ fn, calls }, body, macros);
+        if (!variant.callsByName.has(fn.name)) variant.callsByName.set(fn.name, calls.filter(call => call.callee));
+      }
+    }
+    variant.sources.add(source);
   };
 
   const loadInput = ({ rel, abs, bytes, isHeader }) => {
@@ -396,6 +422,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     preprocessProfile(root, files, {
       ...parserOptions, availableFiles: rawFiles, allowLocalIncludes: !sourceFiles,
       onMissingInclude: file => missingIncludes.add(file),
+      onHeaderContext: recordHeaderContext,
     }, loadInput, recordFile);
   } else {
     for (const file of [...headers, ...sources]) {
@@ -449,11 +476,15 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
 
   const callCounts = new Map(functionRecords.filter(({ fn }) => byName.get(fn.name).length > 1)
     .map(({ fn, calls }) => [fn.id, calls.length]));
-  const resolveCallee = (name, fromFile) => {
+  const resolveCallee = (name, fromFile, sourceFile) => {
     const all = byName.get(name);
     if (!all) return `ext::${name}`;
     const local = all.find((f) => f.file === fromFile);
     if (local) return local.id;
+    if (sourceFile && sourceFile !== fromFile) {
+      const inSource = all.find(f => f.file === sourceFile);
+      if (inSource) return inSource.id;
+    }
     const visibleStatic = f => f.isStatic && headerPaths.has(f.file) && includesHeader(fromFile, f.file);
     if (all.length === 1) return !all[0].isStatic || visibleStatic(all[0]) ? all[0].id : `ext::${name}`;
     const visibleStatics = all.filter(visibleStatic);
@@ -644,14 +675,35 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     return sources;
   };
 
+  const headerCalls = (fn, calls) => {
+    const variants = headerVariants.get(fn.file);
+    if (!variants) return calls;
+    const direct = new Map();
+    let found = false;
+    for (const { callsByName, sources } of variants.values()) {
+      const fromVariant = callsByName.get(fn.name);
+      if (!fromVariant) continue;
+      found = true;
+      for (const call of fromVariant) {
+        if (skipTypeDependentCall(fn.file, call, fn.params)) continue;
+        for (const source of sources) {
+          const resolvedTarget = resolveCallee(call.callee, fn.file, source);
+          const key = JSON.stringify([call.line, call.col, call.kind, resolvedTarget]);
+          if (!direct.has(key)) direct.set(key, { ...call, resolvedTarget });
+        }
+      }
+    }
+    return found ? [...calls.filter(call => !call.callee), ...direct.values()] : calls;
+  };
+
   const indirectCalls = [];
   for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
     const edgeStart = edges.length;
-    for (const call of calls) {
+    for (const call of headerCalls(fn, calls)) {
       if (call.callee) {
         edges.push({
           from: fn.id,
-          to: resolveCallee(call.callee, fn.file),
+          to: call.resolvedTarget ?? resolveCallee(call.callee, fn.file),
           callee: call.callee,
           kind: call.kind,
           line: call.line, col: call.col, orderGroup: call.orderGroup,
@@ -835,7 +887,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:9';
     return JSON.stringify([
-      'builtin:18',
+      'builtin:19',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

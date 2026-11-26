@@ -804,3 +804,44 @@ test('Make 将 .c.o 后缀规则应用到可达目标，并保留显式编译规
   assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
     ['custom_correct', 'main_correct']);
 });
+
+test('Make 展开编译用 wildcard，并隔离仍含不支持表达式的候选配置', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'SRC_DIR = src', 'SOURCES := $(wildcard $(SRC_DIR)/*.c)', 'all:', '\tcc -DFEATURE=1 -c $(SOURCES)',
+  ].join('\n'));
+  write(root, 'other.mak', 'INPUT = $(filter %.c,src/main.c)\nall:\n\tcc -c $(INPUT)');
+  write(root, 'src/main.c', '#if FEATURE\nvoid active(void) {}\n#endif');
+  write(root, 'debug.c', 'void debug_only(void) {}');
+  const profiles = discoverBuildProfiles(root).profiles;
+  assert.deepEqual(profiles.map(p => p.configFile), ['Makefile']);
+  assert.deepEqual(profiles[0].sourceFiles, ['src/main.c']);
+});
+
+test('CDT 的 fileInfo 编译选项只作用于对应源码', async t => {
+  const root = temporaryProject(t);
+  write(root, '.cproject', [
+    '<cproject><cconfiguration><configuration name="target">',
+    '<folderInfo resourcePath=""><tool><option valueType="definedSymbols">',
+    '<listOptionValue value="FEATURE=0"/></option></tool></folderInfo>',
+    '<fileInfo resourcePath="b.c"><tool><option valueType="definedSymbols">',
+    '<listOptionValue value="FEATURE=1"/></option></tool></fileInfo>',
+    '</configuration></cconfiguration></cproject>',
+  ].join('\n'));
+  for (const name of ['a', 'b']) {
+    write(root, name + '.c', [
+      '#if FEATURE', 'void ' + name + '_on(void) {}',
+      '#else', 'void ' + name + '_off(void) {}', '#endif',
+    ].join('\n'));
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  assert.deepEqual(profile.defines, ['FEATURE=0']);
+  assert.deepEqual(profile.compilationUnits['b.c'].defines, ['FEATURE=1']);
+  const options = { buildProfileId: profile.id };
+  for (const parserId of detectClang().ok ? ['builtin', 'clang-ast'] : ['builtin']) {
+    const parserOptions = resolveBuildProfileOptions(root, parserId, options, files, profile, path.dirname(root));
+    const model = await loadModel(root, { parserId, parserOptions });
+    assert.deepEqual(sorted(model.functions.map(fn => fn.name)), ['a_off', 'b_on']);
+  }
+});

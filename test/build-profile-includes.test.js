@@ -287,3 +287,22 @@ test('快照配置允许活动源文件包含非独立编译的 C 文件', t => 
     assert.ok(analysisSources(model).sources.find(file => file.rel === 'impl.c').src.includes('helper'));
   }
 });
+
+test('共用头文件按各翻译单元保留不同的宏调用目标', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-header-invocations-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'common.h'), 'static inline void invoke(void) { TARGET(); }\n');
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all:\n\tcc -DTARGET=foo -c a.c\n\tcc -DTARGET=bar -c b.c\n');
+  for (const [file, callee] of [['a', 'foo'], ['b', 'bar']]) {
+    fs.writeFileSync(path.join(root, file + '.c'),
+      'static void ' + callee + '(void) {}\n#include "common.h"\nvoid ' + file + '_caller(void) { invoke(); }');
+  }
+  const files = scanSources(root);
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.edges.filter(edge => edge.from === 'common.h::invoke').map(edge => edge.to).sort(),
+    ['a.c::foo', 'b.c::bar']);
+  assert.deepEqual(model.edges.filter(edge => edge.to === 'common.h::invoke').map(edge => edge.from).sort(),
+    ['a.c::a_caller', 'b.c::b_caller']);
+});

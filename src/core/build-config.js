@@ -295,18 +295,24 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
   }
 }
 
-function expandMakeVars(str, vars, depth = 0) {
-  if (!str || depth > 8 || !str.includes('$')) return str;
-  return str.replace(/\$\(([\w.-]+)\)|\$\{([\w.-]+)\}/g, (_, a, b) => {
-    const variable = vars.get(a || b);
-    if (!variable) return '';
-    return variable.simple ? variable.value : expandMakeVars(variable.value, vars, depth + 1);
-  });
+function requireResolvedMake(text) {
+  if (/\$(?:\(|\{)/.test(text)) throw new Error('暂不支持未解析的 Make 表达式');
+  return text;
 }
 
 /** 递归解析 .mak / .mac / Makefile（支持 !include、include、-include、$(CDIR) 与 @rsp）。 */
 export function parseMakefileTree(entryAbs, rootDir) {
   const entryDir = path.dirname(entryAbs);
+  function expandMakeVars(str, vars, depth = 0) {
+    if (!str || depth > 8 || !str.includes('$')) return str;
+    const expanded = str.replace(/\$\(([\w.-]+)\)|\$\{([\w.-]+)\}/g, (_, a, b) => {
+      const variable = vars.get(a || b);
+      if (!variable) return '';
+      return variable.simple ? variable.value : expandMakeVars(variable.value, vars, depth + 1);
+    });
+    return expanded.replace(/\$\(wildcard[ \t]+([^()]*)\)|\$\{wildcard[ \t]+([^{}]*)\}/g, (_, a, b) =>
+      tokenizeArgs(a ?? b).flatMap(pattern => fs.globSync(pattern, { cwd: entryDir }).sort()).join(' '));
+  }
   const defaults = {
     CC: 'cc',
     CXX: 'g++',
@@ -550,6 +556,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (!(original.length === commands.length && compilerVar.test(original[index])) &&
           !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
       if (ambiguous || changedDirectory) throw new Error('暂不支持含管道、替代分支或切换目录的 Make 编译命令');
+      requireResolvedMake(invocation);
       if (args.length) compilers.add(compiler);
       const unit = compilerConfig();
       extractCompilerFlags(args, entryDir, rootDir, unit);
@@ -564,7 +571,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。
     compilers.add(expandMakeVars('$(CC) $(CXX)', vars));
     for (const key of ['CPPFLAGS', 'CFLAGS', 'CXXFLAGS', 'INCLUDES', 'DEFINES', 'SRCS', 'C_SRCS', 'SOURCES']) {
-      extractCompilerFlags(tokenizeArgs(expandMakeVars(`$(${key})`, vars)), entryDir, rootDir, collected);
+      extractCompilerFlags(tokenizeArgs(requireResolvedMake(expandMakeVars(`$(${key})`, vars))), entryDir, rootDir, collected);
     }
   }
   const meta = detectArchAndCompiler([...compilers].join('\n'));
@@ -629,39 +636,63 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
     const sourceRoots = [];
     const sourceEntries = [];
 
-    for (const m of block.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?)(?<!\/)>([\s\S]*?)<\/option>/gi)) {
-      const attrs = m[1];
-      const body = m[2];
-      const vt = extractXmlAttr(attrs, 'valueType');
-      const sc = extractXmlAttr(attrs, 'superClass');
-      const values = [...body.matchAll(/<listOptionValue\b[^>]*\bvalue="([^"]*)"/gi)].map((x) => x[1]);
-      if (!values.length) continue;
-      if (/includePath/i.test(vt) || /include\.?paths?/i.test(sc)) {
-        for (const raw of values) {
-          const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) addInclude(config, '-I', abs);
-        }
-      } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
-        for (const raw of values) {
-          const clean = stripQuotes(raw).replace(/^-D/, '');
-          addDefine(config, clean);
-        }
-      } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
-        for (const raw of values) {
-          const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) config.forcedIncludes.add(abs);
+    const readOptions = (scope, config) => {
+      for (const m of scope.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?)(?<!\/)>([\s\S]*?)<\/option>/gi)) {
+        const attrs = m[1];
+        const body = m[2];
+        const vt = extractXmlAttr(attrs, 'valueType');
+        const sc = extractXmlAttr(attrs, 'superClass');
+        const values = [...body.matchAll(/<listOptionValue\b[^>]*\bvalue="([^"]*)"/gi)].map((x) => x[1]);
+        if (!values.length) continue;
+        if (/includePath/i.test(vt) || /include\.?paths?/i.test(sc)) {
+          for (const raw of values) {
+            const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
+            if (abs) addInclude(config, '-I', abs);
+          }
+        } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
+          for (const raw of values) {
+            const clean = stripQuotes(raw).replace(/^-D/, '');
+            addDefine(config, clean);
+          }
+        } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
+          for (const raw of values) {
+            const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
+            if (abs) config.forcedIncludes.add(abs);
+          }
         }
       }
-    }
 
-    // 兜底：部分厂商 CDT 插件把额外参数写在 valueType="string" 的 misc/flags 选项里
-    for (const m of block.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?\bvalue="([^"]+)"(?:[^>"']|"[^"]*"|'[^']*')*?)\/?>/gi)) {
-      const attrs = m[1];
-      const val = stripQuotes(m[2]);
-      const sc = extractXmlAttr(attrs, 'superClass');
-      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter|macros)|@|-f\s)/.test(val)) {
-        extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
+      // 兜底：部分厂商 CDT 插件把额外参数写在 valueType="string" 的 misc/flags 选项里
+      for (const m of scope.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?\bvalue="([^"]+)"(?:[^>"']|"[^"]*"|'[^']*')*?)\/?>/gi)) {
+        const attrs = m[1];
+        const val = stripQuotes(m[2]);
+        const sc = extractXmlAttr(attrs, 'superClass');
+        if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter|macros)|@|-f\s)/.test(val)) {
+          extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
+        }
       }
+    };
+
+    const resources = new Map();
+    const projectScope = block.replace(/<fileInfo\b([^>]*?)(?<!\/)>([\s\S]*?)<\/fileInfo>/gi, (_, attrs, body) => {
+      const resource = toPosix(stripQuotes(extractXmlAttr(attrs, 'resourcePath')));
+      if (!SRC_EXT.test(resource)) return '';
+      const abs = path.resolve(projectDir, resource);
+      const projectRel = path.relative(projectDir, abs);
+      if (projectRel === '..' || projectRel.startsWith('..' + path.sep) || path.isAbsolute(projectRel)) return '';
+      resources.set(toPosix(path.relative(rootDir, abs)), body);
+      return '';
+    });
+    readOptions(projectScope, config);
+    const compilationUnits = {};
+    for (const [rel, body] of resources) {
+      const unit = {
+        ...compilerConfig(), includeDirs: new Set(config.includeDirs), includeOptions: new Map(config.includeOptions),
+        defines: new Set(config.defines), macroArgs: [...(config.macroArgs || [])],
+        forcedIncludes: new Set(config.forcedIncludes), macroIncludes: [...config.macroIncludes],
+      };
+      readOptions(body, unit);
+      compilationUnits[rel] = extractedOptions(unit);
     }
 
     for (const m of block.matchAll(/<entry\b[^>]*\bkind="sourcePath"[^>]*>/gi)) {
@@ -690,6 +721,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       arch,
       compiler,
       ...extractedOptions(config),
+      compilationUnits,
       sourceRoots,
       sourceEntries,
       exclusions,
@@ -972,7 +1004,14 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
   const baseArgs = ['clang', '-fsyntax-only', '-fms-extensions', '-fgnu-keywords', '-Wno-unknown-pragmas', '-Wno-attributes'];
   const argsFor = config => {
     const args = [...baseArgs];
-    for (const entry of config === profile ? [...includeOptions, ...fallbackOptions] : profileIncludeOptions(config)) args.push(...entry);
+    const configured = config === profile ? includeOptions : profileIncludeOptions(config);
+    for (const entry of configured) args.push(...entry);
+    if (config === profile) {
+      for (const entry of fallbackOptions) args.push(...entry);
+    } else if (profile.source === 'cproject') {
+      const configuredDirs = new Set(configured.map(([, dir]) => fileKey(path.normalize(dir))));
+      for (const entry of fallbackOptions) if (!configuredDirs.has(fileKey(entry[1]))) args.push(...entry);
+    }
     if (config.languageStandard) args.push('-std=' + config.languageStandard);
     if (config.macroArgs?.length) args.push(...config.macroArgs);
     else for (const def of config.defines || []) args.push('-D', def);
