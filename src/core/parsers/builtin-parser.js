@@ -6,7 +6,7 @@ import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
-import { collectDispatchDeclarations, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
+import { collectDispatchDeclarations, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
 
@@ -321,8 +321,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       for (const table of localTables.values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
-      if (localTables.size || calls.some(call => call.receiver)) dispatchScopes.add(tokens[fn.bodyStart]);
-      const record = { fn, calls, mentions: variableMentions(body) };
+      const writes = findDispatchWrites(body, fileMacros);
+      if (localTables.size || writes.length || calls.some(call => call.receiver)) dispatchScopes.add(tokens[fn.bodyStart]);
+      const record = { fn, calls, writes, mentions: variableMentions(body) };
       functionRecords.push(record);
       // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
       if (calls.some(call => call.parenthesized || call.requiresTypes)) deferredTypedefCalls.push({ record, body, fileMacros });
@@ -536,18 +537,36 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (visible?.length) return visible.length === 1 ? visible[0] : null;
     return globalTablesByName.get(name) || null;
   };
-  const matchTableSlots = (table, indices = [], member = null) => {
+  const writtenSlots = new Map();
+  const tableNames = new Set(cleanedTables.map(table => table.name));
+  for (const { fn, writes } of functionRecords) {
+    for (const write of writes) {
+      if (!tableNames.has(write.receiver)) continue;
+      // 声明名本身已进入其局部作用域，不能把局部指针的初始化算到外层同名表。
+      const table = lookupTable(fn, { ...write, col: write.col + 1 });
+      if (!table || (write.escape && table.isConst)) continue;
+      if (write.escape === 'array' && (write.member || write.indices.length >= table.dims)) continue;
+      if (!writtenSlots.has(table)) writtenSlots.set(table, []);
+      writtenSlots.get(table).push({ ...write, file: fn.file });
+    }
+  }
+  const possiblyWritten = (writes, indices, member) => writes?.some(write => {
+    if (write.escape) return true;
+    if (write.member && member && write.member !== member) return false;
+    return write.indices.every((index, d) => index == null || indices[d] == null || index === indices[d]);
+  });
+  const matchTableSlots = (table, indices = [], member = null, writes) => {
     const matched = [];
     const slots = Object.entries(table.map);
     for (const slot of table.unresolvedSlots || []) slots.push([slot, null]);
     for (const [slot, target] of slots) {
       if (!indices.length) {
-        if (member && slot === member) matched.push({ slot, target });
+        if (member && slot === member) matched.push({ slot, target: possiblyWritten(writes, [], member) ? null : target });
         continue;
       }
       if (slot.includes('[?')) {
         if (slot.endsWith(member ? '.' + member : ']') || (target === null && slot.endsWith(']'))) {
-          matched.push({ slot, target });
+          matched.push({ slot, target: possiblyWritten(writes, indices, member) ? null : target });
         }
         continue;
       }
@@ -572,7 +591,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
           break;
         }
       }
-      if (ok) matched.push({ slot, target });
+      if (ok) matched.push({ slot, target: possiblyWritten(writes, slotIndices, slotField) ? null : target });
     }
     return matched;
   };
@@ -597,10 +616,16 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
         continue;
       }
       const table = lookupTable(fn, call);
-      const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
+      let writes = writtenSlots.get(table);
+      if (writes && table.isStatic && HDR_EXT.test(table.file) && !HDR_EXT.test(fn.file)) {
+        // 头文件里的 static 对象在每个翻译单元有独立实例。
+        writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
+      }
+      const matched = table ? matchTableSlots(table, call.indices || [], call.member || null, writes) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
       const allConstIndices = (call.indices || []).every((idx) => idx !== null);
-      if (!table?.incomplete && uniqueTargets.length === 1 && uniqueTargets[0] !== null &&
+      if (!table?.incomplete && !possiblyWritten(writes, call.indices || [], call.member) &&
+          uniqueTargets.length === 1 && uniqueTargets[0] !== null &&
           (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
         const callee = uniqueTargets[0];
         edges.push({

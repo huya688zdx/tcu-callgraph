@@ -5,6 +5,49 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadModel } from '../src/core/index.js';
 
+test('分派表写入后保留间接调用，未受影响的下标、字段和同名表仍可解析', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-table-write-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'api.h'), 'typedef void (*Fn)(void);\nextern Fn shared[2];\nvoid b(void);\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "api.h"
+static void a(void) {}
+void b(void) {}
+static Fn table[] = {a, a};
+Fn shared[2] = {a, a};
+typedef struct { Fn run, stop; } Ops;
+static Ops rows[2] = {{.run=a,.stop=a}, {.run=a,.stop=a}};
+#define UPDATE(slot, value) ((slot) = (value))
+void dispatch(void) { table[0] = b; table[0](); table[1](); }
+void edit(int i) { UPDATE(rows[i].run, b); }
+void call(void) { rows[0].run(); rows[0].stop(); shared[0](); shared[1](); }
+void shadow(Fn *table) { table[1] = b; }
+void local(void) { Fn table[] = {a, a}; (table[1]) = b; table[0](); table[1](); }
+void alias(void) { Fn slots[] = {a}; Fn *p = slots; *p = b; slots[0](); }
+void address(void) { Fn slots[] = {a}; Fn *p = &slots[0]; *p = b; slots[0](); }
+void dynamic(int i) { table[i](); }
+`);
+  fs.writeFileSync(path.join(dir, 'writer.c'), '#include "api.h"\nvoid edit_shared(void) { shared[1] = b; }\n');
+  const model = loadModel(dir);
+  const resolved = name => (model._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.via);
+  const unresolved = name => model.indirectCalls.filter(site => site.caller === 'app.c::' + name)
+    .map(site => site.expr);
+  assert.deepEqual(resolved('dispatch'), ['table[1]']);
+  assert.deepEqual(unresolved('dispatch'), ['table[0]']);
+  assert.deepEqual(resolved('call'), ['rows[0].stop', 'shared[0]']);
+  assert.deepEqual(unresolved('call'), ['rows[0].run', 'shared[1]']);
+  assert.deepEqual(resolved('local'), ['table[0]']);
+  assert.deepEqual(unresolved('local'), ['table[1]']);
+  for (const name of ['alias', 'address']) {
+    assert.deepEqual(resolved(name), []);
+    assert.deepEqual(unresolved(name), ['slots[0]']);
+  }
+  const candidates = name => model.indirectCalls.find(site => site.caller === 'app.c::' + name).candidates;
+  assert.deepEqual(candidates('dispatch'), []);
+  assert.deepEqual(candidates('dynamic').map(candidate => candidate.slot), ['[1]']);
+});
+
 test('下标可能命中未解析的初始化值时保留间接调用，已知位置仍能直连', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-unknown-target-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

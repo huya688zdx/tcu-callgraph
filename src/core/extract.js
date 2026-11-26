@@ -749,6 +749,51 @@ function extractIndexedReceiver(tokens, endIdx, macros) {
   return { recv: receiverBefore(tokens, j), indices, indexExprs };
 }
 
+/** 收集可能改写分派表的位置，等其他文件的定义和块作用域收齐后再绑定。 */
+export function findDispatchWrites(body, macros) {
+  const tokens = expandSeq(body, macros);
+  const writes = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const name = tokens[i];
+    if (name.t !== 'id' || KEYWORDS.has(name.v) || ['.', '->'].includes(tokens[i - 1]?.v)) continue;
+    let start = i, end = i + 1, member = null;
+    const indices = [];
+    for (;;) {
+      if (tokens[end]?.v === '[') {
+        const first = ++end;
+        let depth = 1;
+        while (end < tokens.length && depth) {
+          if (tokens[end].v === '[') depth++;
+          if (tokens[end].v === ']') depth--;
+          end++;
+        }
+        indices.push(parseConstIndex(tokens.slice(first, end - 1)));
+      } else if (['.', '->'].includes(tokens[end]?.v) && tokens[end + 1]?.t === 'id') {
+        member ??= tokens[end + 1].v;
+        end += 2;
+      } else if (tokens[end]?.v === ')' && tokens[start - 1]?.v === '(' &&
+          (tokens[start - 2]?.t !== 'id' || tokens[start - 2]?.v === 'return')) {
+        start--;
+        end++;
+      } else if (tokens[end]?.v === ')' && tokens[start - 1]?.v === '*' && tokens[start - 2]?.v === '(') {
+        start -= 2;
+        end++;
+      } else break;
+    }
+    const prev = tokens[start - 1]?.v, next = tokens[end]?.v;
+    // 表的声明初始化不是一次运行时覆写。数组退化或取地址交给外部时也可能经别名写回。
+    const assigned = next === '=' && tokens[end + 1]?.v !== '{';
+    const addressed = prev === '&';
+    const decayed = ['=', '(', ',', 'return'].includes(prev) && [')', ',', ';', '+'].includes(next) &&
+      !(prev === '(' && CONTROL.has(tokens[start - 2]?.v));
+    if (assigned || addressed || decayed) writes.push({
+      receiver: name.v, line: name.line, col: name.col,
+      indices, member, escape: addressed ? 'address' : !assigned && decayed ? 'array' : null,
+    });
+  }
+  return writes;
+}
+
 function formatIndexedVia(recv, indexExprs, member) {
   const base = recv || '?';
   const idxPart = (indexExprs || []).map((e) => `[${e || '*'}]`).join('');
