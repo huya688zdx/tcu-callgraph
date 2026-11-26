@@ -72,7 +72,7 @@ function matchOpenBack(tokens, closeIdx) {
 
 /** 函数声明/定义前后的注解关键字：void f(void) __attribute__((noreturn)) { } */
 const ANNOTATIONS = new Set([
-  '__attribute__', '__attribute', '__declspec', '__asm', '__asm__', 'asm', '_Pragma',
+  '__attribute__', '__attribute', '_attribute', '__declspec', '__asm', '__asm__', 'asm', '_Pragma',
 ]);
 
 /** 若 idx 处的 ')' 是 __attribute__((..)) / __declspec(..) 这类注解块的右括号，返回注解关键字下标 */
@@ -301,7 +301,7 @@ function isStandardTypeName(name) {
 }
 
 /** 记录函数原型，以及分派表初始化或调用所在函数中的局部对象声明。 */
-export function collectDispatchDeclarations(tokens, dispatchScopes, record) {
+export function collectDispatchDeclarations(tokens, dispatchScopes, record, macros) {
   const scopes = [{ end: null, trackObjects: false }];
   const recordStatement = (statement, scope, fileScope) => {
     const [first, second] = statement;
@@ -317,7 +317,11 @@ export function collectDispatchDeclarations(tokens, dispatchScopes, record) {
       const name = declarationName(declarator);
       if (!name || name === first) continue;
       const isFunction = declarator[declarator.indexOf(name) + 1]?.v === '(';
-      if (isFunction || scope.trackObjects) record({ declaration: name, scope, fileScope, isFunction, typeToCheck, isExtern });
+      if (isFunction || scope.trackObjects) {
+        const alias = scope.trackObjects && eq >= 0 && pointerBefore(declarator, declarator.indexOf(name))
+          ? aliasReference(part.slice(eq + 1), macros) : null;
+        record({ declaration: name, scope, fileScope, isFunction, typeToCheck, isExtern, alias });
+      }
     }
   };
   let start = 0, hasParen = false;
@@ -371,11 +375,11 @@ function declarationType(tokens) {
   return tokens.find(t => t.t === 'id' && !KEYWORDS.has(t.v))?.v ?? null;
 }
 
-/** 只保留辨别标量括号所需的信息：指针、数组层数和记录成员。 */
+/** 保留初始化器需要的声明形状，包括声明顺序、数组维度和指针。 */
 function initializerDeclarations(statement) {
   const parts = splitAtTopLevel(statement);
   const first = parts[0] || [];
-  const base = declarationType(first);
+  const base = declarationType(first.slice(0, first.indexOf(declarationName(first))));
   const open = first.findIndex(t => t.v === '{');
   const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open))) : null;
   const shapes = new Map();
@@ -383,18 +387,20 @@ function initializerDeclarations(statement) {
     const token = declarationName(part);
     if (!token) continue;
     const name = part.indexOf(token);
-    let j = name + 1, rank = 0;
+    let j = name + 1;
+    const extents = [];
     while (part[j]?.v === '[') {
+      const start = j + 1;
       let depth = 1;
       for (j++; j < part.length && depth; j++) {
         if (part[j].v === '[') depth++;
         if (part[j].v === ']') depth--;
       }
-      rank++;
+      extents.push(parseConstIndex(part.slice(start, j - 1)));
     }
     let before = name - 1;
     while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
-    shapes.set(token.v, { token, type: base, rank, pointer: part[before]?.v === '*', fields });
+    shapes.set(token.v, { token, type: base, extents, pointer: part[before]?.v === '*', fields });
   }
   return shapes;
 }
@@ -463,128 +469,143 @@ function formatInitIndex(index) {
   return `[?${index.expr}${index.offset ? '+' + index.offset : ''}]`;
 }
 
-function scalarInitializerField(slot, shape, file, lookup) {
-  let rank = 0;
-  // 每个字段都先还原 typedef，保留别名自身声明的数组层数。
-  const resolve = () => {
+/** 延迟展开成员类型，遇到指针就停止，递归结构体不会无限展开。 */
+function initializerLayout(root, file, lookup) {
+  const cache = new Map();
+  const resolve = (declaration, source) => {
+    if (!declaration) return null;
+    if (cache.has(declaration)) return cache.get(declaration);
+    const extents = [];
     const seen = new Set();
+    let shape = declaration;
     while (shape && !seen.has(shape)) {
       seen.add(shape);
-      rank += shape.rank || 0;
-      if (shape.fields || shape.pointer) break;
-      const found = shape.type && lookup(file, shape.type, shape.token);
-      file = found?.file;
-      shape = found?.shape;
+      extents.push(...(shape.extents || []));
+      if (shape.fields || shape.pointer || !shape.type) break;
+      let found = lookup(source, shape.type, shape.token);
+      if (!found && /^(struct|union) /.test(shape.type)) {
+        // typedef 可先引用不完整标签，等到表定义时才需要完整的字段列表。
+        if (source !== file) found = lookup(source, shape.type, { s: Infinity });
+        found ??= lookup(file, shape.type, root.token);
+      }
+      if (!found) break;
+      source = found.file;
+      shape = found.shape;
     }
+    const fields = shape?.pointer ? null : shape?.fields;
+    let layout = fields ? {
+      names: [...fields.keys()],
+      field: name => resolve(fields.get(name), source),
+    } : { pointer: !!shape?.pointer };
+    for (let i = extents.length - 1; i >= 0; i--) layout = { element: layout, length: extents[i] };
+    cache.set(declaration, layout);
+    return layout;
   };
-  resolve();
-  for (const [, name, indices] of slot.matchAll(/(?:^|\.)([A-Za-z_]\w*)((?:\[[^\]]*\])*)/g)) {
-    shape = shape?.fields?.get(name);
-    if (!shape) return false;
-    rank = 0;
-    resolve();
-    if (rank !== (indices.match(/\[/g)?.length || 0)) return false;
-  }
-  return !!shape?.pointer;
+  return resolve(root, file);
 }
 
-/** 消耗一个标量或整个子数组后，进位到同一对花括号里的下一个子对象。 */
-function nextInitIndices(indices, extents) {
-  const next = indices.slice();
-  while (next.length) {
-    const depth = next.length - 1;
-    const index = next[depth];
-    if (depth && (typeof index !== 'number' || extents[depth] == null)) return null;
-    if (!depth || index + 1 < extents[depth]) {
-      next[depth] = typeof index === 'number' ? index + 1 : { ...index, offset: index.offset + 1 };
-      break;
+function initChild(layout, part) {
+  return typeof part === 'string' ? layout?.field?.(part) : layout?.element;
+}
+
+/** 消耗一个子对象，将游标进位到下一个成员或数组元素。 */
+function nextInitPath(path, root) {
+  const parents = [root];
+  for (const part of path) parents.push(initChild(parents.at(-1), part));
+  for (let depth = path.length - 1; depth >= 0; depth--) {
+    const part = path[depth], parent = parents[depth];
+    if (typeof part === 'string') {
+      const pos = parent?.names?.indexOf(part) ?? -1;
+      if (pos < 0) return null;
+      if (pos + 1 < parent.names.length) return [...path.slice(0, depth), parent.names[pos + 1]];
+    } else {
+      if (depth && (typeof part !== 'number' || parent?.length == null)) return null;
+      if (!depth || part + 1 < parent.length) {
+        const next = typeof part === 'number' ? part + 1 : { ...part, offset: part.offset + 1 };
+        return [...path.slice(0, depth), next];
+      }
     }
-    next.pop();
   }
-  return next;
+  return null;
 }
 
-/** 递归提取结构体和数组中的函数指针槽位，省略花括号时按声明维度逐项填充。 */
-function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status, scalarBrace = false) {
+/** 每一对花括号都有独立的游标。数组按维度进位，结构体按字段声明顺序进位。 */
+function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false) {
   const items = splitAtTopLevel(inner);
-  let cursor = [0];
+  let cursor = layout?.names?.length ? [layout.names[0]] : scalarBrace && items.length === 1 ? [] : [0];
   for (const item of items) {
-    if (!item.length) continue;
-    // 检测 C99 指定初始化器：[idx] = val 或 .field = val 或 [idx].field = val
-    let k = 0;
     const designators = [];
-    let hasEq = false;
+    let k = 0;
     while (k < item.length) {
       if (item[k].v === '.' && item[k + 1]?.t === 'id') {
-        designators.push({ kind: 'field', value: item[k + 1].v });
+        designators.push(item[k + 1].v);
         k += 2;
       } else if (item[k].v === '[') {
-        let depth = 1, m = k + 1;
-        for (; m < item.length && depth > 0; m++) {
-          if (item[m].v === '[') depth++;
-          else if (item[m].v === ']') depth--;
+        const start = ++k;
+        let depth = 1;
+        for (; k < item.length && depth; k++) {
+          if (item[k].v === '[') depth++;
+          if (item[k].v === ']') depth--;
         }
-        const expr = item.slice(k + 1, m - 1);
-        const idx = parseConstIndex(expr, macros);
-        designators.push({ kind: 'index', value: idx ?? { expr: expr.map(t => t.v).join(''), offset: 0 } });
-        k = m;
-      } else {
-        break;
-      }
+        const expr = item.slice(start, k - 1);
+        designators.push(parseConstIndex(expr) ?? { expr: expr.map(t => t.v).join(''), offset: 0 });
+      } else break;
     }
-    if (designators.length && item[k]?.v === '=') {
-      hasEq = true;
-      k++;
-      if (designators.some(d => d.kind === 'index' && typeof d.value !== 'number')) status.incomplete = true;
-    }
-    const val = hasEq ? item.slice(k) : item;
+    const designated = designators.length && item[k]?.v === '=';
+    const val = designated ? item.slice(k + 1) : item;
     if (!val.length) continue;
     const braced = val[0].v === '{' && val.at(-1).v === '}';
-    let indices = cursor?.slice();
-    let fields = [];
-    if (hasEq) {
-      const field = designators.findIndex(d => d.kind === 'field');
-      const count = field < 0 ? designators.length : field;
-      indices = designators.slice(0, count).map(d => d.value);
-      fields = designators.slice(count);
-    } else if (scalarBrace && items.length === 1) {
-      indices = [];
+    const path = designated ? designators : cursor?.slice();
+    const unknownPosition = !path;
+    const parts = path ?? [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
+    if (parts.some(p => typeof p === 'object')) status.incomplete = true;
+    const operand = braced ? null : simpleInitializerOperand(val);
+    let child = parts.reduce(initChild, layout);
+    let descended;
+    // 省略聚合括号时，已知标量继续下沉。未知表达式可能复制整个结构体。
+    while (!braced) {
+      if (child?.element) {
+        parts.push(0);
+        child = child.element;
+      } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
+          (operand?.t === 'id' && status.isFunction(operand)))) {
+        descended ??= new Set();
+        if (descended.has(child)) { status.incomplete = true; break; }
+        descended.add(child);
+        const first = child.names[0];
+        parts.push(first);
+        child = child.field(first);
+      } else break;
     }
-    // 内层宽度未知时，无法判断上一标量是否填满该行，保留候选直到下一个显式指定位置。
-    const unknownPosition = indices == null;
-    if (unknownPosition) {
-      status.incomplete = true;
-      indices = [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
-    } else if (!braced && !fields.length) {
-      while (indices.length < extents.length) indices.push(0);
-    }
-    let nextPrefix = prefix + indices.map(formatInitIndex).join('');
-    for (const d of fields) {
-      if (d.kind === 'index') nextPrefix += formatInitIndex(d.value);
-      else nextPrefix += (nextPrefix ? '.' : '') + d.value;
-    }
+    const slotPath = [...prefix, ...parts];
     if (braced) {
-      const remaining = fields.length || unknownPosition ? [] : extents.slice(indices.length);
-      const atElement = fields.length ? status.isScalarField(nextPrefix)
-        : !remaining.length && (extents.length > 0 || scalarBrace);
-      collectInitSlots(val.slice(1, -1), nextPrefix, remaining, map, slotLines, macros, status, atElement);
+      const scalar = !child?.element && !child?.names &&
+        (child?.pointer || (typeof parts.at(-1) !== 'string' && (!!layout?.element || scalarBrace)));
+      collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated);
     } else {
-      const operand = simpleInitializerOperand(val);
-      // 重复指定一个槽位时，后面的初始化值覆盖先前的函数或未知值。
-      status.unresolvedSlots.delete(nextPrefix);
-      if (operand?.t === 'id' && !TYPE_WORDS.has(operand.v) && !KEYWORDS.has(operand.v) && !NON_FN_IDENTS.has(operand.v)) {
-        map[nextPrefix] = operand.v;
-        slotLines[nextPrefix] = operand.line;
+      let slot = '';
+      for (const p of slotPath) slot += typeof p === 'string' ? (slot ? '.' : '') + p : formatInitIndex(p);
+      // 同一槽位的后一个初始化覆盖前一个。未知的整个结构体可能提供任一成员。
+      status.unresolvedSlots.delete(slot);
+      if (!child?.names && operand?.t === 'id' && !KEYWORDS.has(operand.v) && !NON_FN_IDENTS.has(operand.v)) {
+        table.map[slot] = operand.v;
+        table.slotLines[slot] = operand.line;
       } else {
-        delete map[nextPrefix];
-        delete slotLines[nextPrefix];
-        // 条件表达式和强转得到的非零地址可能指向别处；(Fn)0 等空值没有调用目标。
-        if (!operand || (operand.t === 'num' && val.length > 1 && parseConstIndex([operand]) !== 0)) {
-          status.unresolvedSlots.add(nextPrefix);
+        delete table.map[slot];
+        delete table.slotLines[slot];
+        if (child?.names || !operand || (operand.t === 'num' && val.length > 1 && parseConstIndex([operand]) !== 0)) {
+          status.unresolvedSlots.add(slot);
         }
       }
+      if (Object.hasOwn(table.map, slot) || status.unresolvedSlots.has(slot)) {
+        table.slots.set(slot, {
+          parts: slotPath.map(p => typeof p === 'object' ? null : p),
+          unknownPosition: slotPath.some(p => typeof p === 'object' && p.expr.startsWith('@')),
+          designated: designatedParent || designated,
+        });
+      }
     }
-    if (!unknownPosition) cursor = nextInitIndices(indices.length ? indices : cursor ?? [0], extents);
+    cursor = unknownPosition ? null : nextInitPath(parts, layout);
   }
 }
 
@@ -600,6 +621,11 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
   const tables = new Map();
   const scopes = [{ end: null }];
   let localTypes;
+  let localFunctions;
+  const localFunction = token => {
+    localFunctions ??= new Set(findFunctions(tokens, file).map(fn => fn.name));
+    return localFunctions.has(token.v);
+  };
   const localLookup = (_, name, at) => {
     localTypes ??= findTypedefs(tokens);
     const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
@@ -618,6 +644,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     //   void (*const name[N])(void) = { ... }
     let p = i - 1;
     const extents = [];
+    for (let start; (start = annotationStartAt(tokens, p)) >= 0;) p = start - 1;
     if (p >= 0 && tokens[p].v === ')') {
       // 函数指针数组声明器：跳过形参列表 (...) 再进左侧 (*name[...])
       let d = 1;
@@ -654,8 +681,9 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     }
 
     const close = matchBrace(tokens, i + 1);
-    const inner = tokens.slice(i + 2, close);
-    const rootShape = { type: declarationType(tokens.slice(beforeDeclaration + 1, p)), token: nameTok };
+    const source = tokens.slice(i + 2, close);
+    const inner = macros ? expandSeq(source, macros) : source;
+    const rootShape = { type: declarationType(tokens.slice(beforeDeclaration + 1, p)), token: nameTok, extents };
     if (!rootShape.type && tokens[beforeDeclaration]?.v === '}') {
       // struct { ... } ops = { ... } 将类型定义与变量声明写在同一处。
       let open = beforeDeclaration - 1, depth = 1;
@@ -680,20 +708,24 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       dims: extents.length,
       map: {},
       slotLines: {},
+      slots: new Map(),
       ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
     };
-    const fill = lookup => {
+    const fill = (lookup, isFunction = localFunction) => {
       const status = {
         incomplete: false,
         unresolvedSlots: new Set(),
-        isScalarField: slot => scalarInitializerField(slot, rootShape, file, lookup),
+        isFunction: token => isFunction(token, file, functionId),
       };
-      collectInitSlots(inner, '', extents, table.map, table.slotLines, macros, status);
+      const layout = initializerLayout(rootShape, file, lookup);
+      collectInitSlots(inner, [], layout, table, status);
+      table.dims = 0;
+      for (let dim = layout; dim?.element; dim = dim.element) table.dims++;
       if (status.incomplete) table.incomplete = true;
       if (status.unresolvedSlots.size) table.unresolvedSlots = [...status.unresolvedSlots];
     };
-    // 仅有指定项带花括号时才需要等待头文件关系，普通表仍当场完成。
-    if (pendingFields && inner.some((t, j) => t.v === '=' && inner[j + 1]?.v === '{')) {
+    // 表和它的嵌套成员都可能引用头文件中定义的类型。
+    if (pendingFields && (rootShape.type || rootShape.fields)) {
       pendingFields.push(fill);
     } else {
       fill(localLookup);
@@ -730,34 +762,77 @@ function receiverBefore(tokens, end) {
   if ((memberOp === '->' && inner[0]?.v === '&') || (memberOp === '.' && inner[0]?.v === '*')) {
     inner = stripOuterParens(inner.slice(1));
   }
-  return inner.length === 1 && inner[0].t === 'id' ? inner[0].v : expr.map(t => t.v).join('');
+  const name = inner.length === 1 && inner[0].t === 'id' ? inner[0].v : expr.map(t => t.v).join('');
+  return { name, start };
 }
 
-/** 从下标或成员左侧回溯提取接收表达式及各维下标。 */
-function extractIndexedReceiver(tokens, endIdx, macros) {
-  let j = endIdx;
-  const indices = [];
+/** 从调用位置回溯到根对象，保留下标与成员交错出现的顺序。 */
+function dispatchReference(tokens, end, macros) {
+  let j = end;
+  const path = [];
   const indexExprs = [];
-  while (j >= 0 && tokens[j].v === ']') {
-    const open = matchOpenBack(tokens, j);
-    if (open < 0) break;
-    const exprToks = tokens.slice(open + 1, j);
-    indices.unshift(parseConstIndex(exprToks, macros));
-    indexExprs.unshift(exprToks.map((t) => t.v).join(''));
-    j = open - 1;
+  while (j >= 0) {
+    if (tokens[j].v === ']') {
+      const open = matchOpenBack(tokens, j);
+      if (open < 0) return null;
+      const expr = tokens.slice(open + 1, j);
+      path.unshift(parseConstIndex(expr, macros));
+      indexExprs.unshift(expr.map(t => t.v).join(''));
+      j = open - 1;
+    } else if (tokens[j].t === 'id' && ['.', '->'].includes(tokens[j - 1]?.v)) {
+      path.unshift(tokens[j].v);
+      j -= 2;
+    } else break;
   }
-  return { recv: receiverBefore(tokens, j), indices, indexExprs };
+  const base = receiverBefore(tokens, j);
+  if (!base) return null;
+  return {
+    receiver: base.name, start: base.start, firstOp: tokens[j + 1]?.v, path, indexExprs,
+    member: path.filter(p => typeof p === 'string').join('.') || null,
+    via: tokens.slice(base.start, end + 1).map(t => t.v).join(''),
+  };
 }
 
-/** 收集可能改写分派表的位置，等其他文件的定义和块作用域收齐后再绑定。 */
-export function findDispatchWrites(body, macros) {
+function pointerBefore(tokens, index) {
+  while (index > 0 && typeQualifiers.has(tokens[index - 1].v)) index--;
+  return tokens[index - 1]?.v === '*';
+}
+
+/** 只跟踪取址和裸数组退化，调用、算术及条件表达式都没有唯一的静态来源。 */
+function aliasReference(tokens, macros) {
+  let value = stripOuterParens(macros ? expandSeq(tokens, macros) : tokens);
+  const address = value[0]?.v === '&';
+  if (address) value = stripOuterParens(value.slice(1));
+  if (value[0]?.t !== 'id' || (!address && value.length !== 1)) return null;
+  const ref = dispatchReference(value, value.length - 1);
+  if (!ref || ref.start !== 0 || ref.receiver !== value[0].v) return null;
+  return { receiver: ref.receiver, path: ref.path, indexExprs: ref.indexExprs, address, line: value[0].line, col: value[0].col };
+}
+
+/** 收集可能改写分派表或改变局部指针绑定的位置，等作用域收齐后再绑定。 */
+export function findDispatchWrites(body, macros, aliasUses = []) {
   const tokens = expandSeq(body, macros);
   const writes = [];
+  const pointerNames = new Set();
+  for (let i = 1; i < tokens.length; i++) {
+    if (tokens[i].v === '=' && tokens[i - 1].t === 'id' && pointerBefore(tokens, i - 1)) pointerNames.add(tokens[i - 1].v);
+  }
   for (let i = 0; i < tokens.length; i++) {
     const name = tokens[i];
     if (name.t !== 'id' || KEYWORDS.has(name.v) || ['.', '->'].includes(tokens[i - 1]?.v)) continue;
+    if (pointerNames.has(name.v) && tokens[i + 1]?.v !== '->') {
+      // 仅通过 -> 读取成员不会改变绑定；其余用法（包括宏里的逃逸和自增）保守降级。
+      let alternative = null;
+      if (tokens[i + 1]?.v === '=' && !pointerBefore(tokens, i)) {
+        let end = i + 2;
+        while (end < tokens.length && ![';', ',', '}'].includes(tokens[end].v)) end++;
+        alternative = aliasReference(tokens.slice(i + 2, end));
+      }
+      aliasUses.push({ name: name.v, line: name.line, col: name.col, alternative });
+    }
     let start = i, end = i + 1, member = null;
     const indices = [];
+    const path = [];
     for (;;) {
       if (tokens[end]?.v === '[') {
         const first = ++end;
@@ -767,9 +842,12 @@ export function findDispatchWrites(body, macros) {
           if (tokens[end].v === ']') depth--;
           end++;
         }
-        indices.push(parseConstIndex(tokens.slice(first, end - 1)));
+        const index = parseConstIndex(tokens.slice(first, end - 1));
+        indices.push(index);
+        path.push(index);
       } else if (['.', '->'].includes(tokens[end]?.v) && tokens[end + 1]?.t === 'id') {
         member ??= tokens[end + 1].v;
+        path.push(tokens[end + 1].v);
         end += 2;
       } else if (tokens[end]?.v === ')' && tokens[start - 1]?.v === '(' &&
           (tokens[start - 2]?.t !== 'id' || tokens[start - 2]?.v === 'return')) {
@@ -788,16 +866,10 @@ export function findDispatchWrites(body, macros) {
       !(prev === '(' && CONTROL.has(tokens[start - 2]?.v));
     if (assigned || addressed || decayed) writes.push({
       receiver: name.v, line: name.line, col: name.col,
-      indices, member, escape: addressed ? 'address' : !assigned && decayed ? 'array' : null,
+      indices, member, path, escape: addressed ? 'address' : !assigned && decayed ? 'array' : null,
     });
   }
   return writes;
-}
-
-function formatIndexedVia(recv, indexExprs, member) {
-  const base = recv || '?';
-  const idxPart = (indexExprs || []).map((e) => `[${e || '*'}]`).join('');
-  return member ? `${base}${idxPart}.${member}` : `${base}${idxPart}`;
 }
 
 /** 粗略判断是否为块内局部函数原型声明，如 `void proto(void);` / `extern int foo(int x);` */
@@ -865,9 +937,26 @@ function scanSizeofBounds(tokens, ctx, out, macroChain) {
  */
 export function scanCalls(tokens, ctx, out, macroChain = []) {
   const chainedArgs = new Map();
+  const recordDispatch = (ref, token, requirements) => {
+    const { receiver, member, path, indexExprs, via, firstOp } = ref;
+    const table = ctx.fnptr?.get(receiver);
+    const map = table?.map || table;
+    const target = path.length === 1 && member && map && Object.hasOwn(map, member) ? map[member] : null;
+    out.push({
+      callee: target, receiver, member, path, indexExprs, firstOp,
+      kind: target ? 'fnptr' : indexExprs.length ? 'fnptr_indexed' : member ? 'unknown' : 'fnptr_ptr',
+      ...requirements, line: token.line, col: token.col, cond: token.cond,
+      via: path.length ? via : `(*${receiver})`,
+      macroChain: (token.macroOrigins || macroChain).slice(),
+    });
+  };
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
 
+    if (['__attribute__', '__attribute', '_attribute', '__declspec'].includes(tk.v) && tokens[i + 1]?.v === '(') {
+      i = collectArgs(tokens, i + 1)[1] - 1;
+      continue;
+    }
     // sizeof 普通操作数不求值，变长数组类型的维度除外。
     if (tk.t === 'id' && tk.v === 'sizeof' && tokens[i + 1]?.v === '(') {
       const [args, next] = collectArgs(tokens, i + 1);
@@ -918,109 +1007,30 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
           continue;
         }
         if (inner.length >= 2 && inner[0].v === '*') {
-          const deref = inner.slice(1);
-          if (deref.length === 1 && deref[0].t === 'id' && !KEYWORDS.has(deref[0].v)) {
-            out.push({
-              callee: null,
-              receiver: deref[0].v,
-              member: null,
-              indices: [],
-              indexExprs: [],
-              kind: 'fnptr_ptr',
-              ...requiresType,
-              line: deref[0].line, col: deref[0].col,
-              cond: deref[0].cond,
-              via: `(*${deref[0].v})`,
-              macroChain: (deref[0].macroOrigins || macroChain).slice(),
-            });
+          const deref = stripOuterParens(inner.slice(1));
+          const ref = dispatchReference(deref, deref.length - 1, ctx.macros);
+          if (ref?.start === 0 && (ref.path.length || deref.length === 1)) {
+            // 下标和复杂接收表达式本身也可能包含调用。
+            scanCalls(deref, ctx, out, macroChain);
+            recordDispatch(ref, tk, requiresType);
             chainedArgs.set(close, null);
             i = close - 1;
             continue;
           }
-          if (deref[deref.length - 1]?.v === ']') {
-            const { recv, indices, indexExprs } = extractIndexedReceiver(deref, deref.length - 1, ctx.macros);
-            if (recv && indices.length) {
-              // 下标本身可能调用函数，跳过接收表达式前先扫描它。
-              scanCalls(deref, ctx, out, macroChain);
-              out.push({
-                callee: null,
-                receiver: recv,
-                member: null,
-                indices,
-                indexExprs,
-                kind: 'fnptr_indexed',
-                ...requiresType,
-                line: tk.line, col: tk.col,
-                cond: tk.cond,
-                via: formatIndexedVia(recv, indexExprs, null),
-                macroChain: (tk.macroOrigins || macroChain).slice(),
-              });
-              chainedArgs.set(close, null);
-              i = close - 1;
-              continue;
-            }
-          }
         }
       }
     }
 
-    // 下标间接调用：z[idx]() / e[r][c]()
-    if (tk.v === ']' && tokens[i + 1]?.v === '(') {
-      const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i, ctx.macros);
-      if (recv && indices.length) {
-        out.push({
-          callee: null,
-          receiver: recv,
-          member: null,
-          indices,
-          indexExprs,
-          kind: 'fnptr_indexed',
-          line: tk.line, col: tk.col,
-          cond: tk.cond,
-          via: formatIndexedVia(recv, indexExprs, null),
-          macroChain: (tk.macroOrigins || macroChain).slice(),
-        });
-        continue;
-      }
-    }
-
-    // 成员调用 a->b(...) / a.b(...) / z[idx].fn(...) / e[r][c].fn(...)
-    if (tk.v === '->' || tk.v === '.') {
-      const member = tokens[i + 1];
-      if (member && member.t === 'id' && tokens[i + 2] && tokens[i + 2].v === '(') {
-        const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i - 1, ctx.macros);
-        const table = recv ? ctx.fnptr?.get(recv) : null;
-        const tableMap = table?.map || table;
-        if (!indices.length && tableMap && Object.hasOwn(tableMap, member.v)) {
-          out.push({
-            callee: tableMap[member.v],
-            kind: 'fnptr',
-            line: member.line, col: member.col,
-            cond: member.cond,
-            via: `${recv}.${member.v}`,
-            macroChain: (member.macroOrigins || macroChain).slice(),
-          });
-        } else {
-          out.push({
-            callee: null,
-            receiver: recv,
-            member: member.v,
-            indices,
-            indexExprs,
-            kind: indices.length ? 'fnptr_indexed' : 'unknown',
-            line: member.line, col: member.col,
-            cond: member.cond,
-            via: indices.length ? formatIndexedVia(recv, indexExprs, member.v) : (recv ? `${recv}.${member.v}` : member.v),
-            macroChain: (member.macroOrigins || macroChain).slice(),
-          });
-        }
-        i += 2;
-        continue;
-      }
+    // 同一种路径表示覆盖 rows[i].sub.fn()、ops.slots[i]() 与纯数组调用。
+    if (tokens[i + 1]?.v === '(' &&
+        (tk.v === ']' || (tk.t === 'id' && ['.', '->'].includes(tokens[i - 1]?.v)))) {
+      const ref = dispatchReference(tokens, i, ctx.macros);
+      if (ref) recordDispatch(ref, tk);
+      continue;
     }
 
     if (tk.t !== 'id') continue;
-    if (KEYWORDS.has(tk.v)) continue;
+    if (KEYWORDS.has(tk.v) || tk.v === 'asm' || tk.v === '__asm' || tk.v === '__asm__') continue;
 
     // 宏调用：按当前行号查定义（修复同文件 #undef / 重定义宏错连）
     const m = ctx.macros.get(tk.v, tk.line);

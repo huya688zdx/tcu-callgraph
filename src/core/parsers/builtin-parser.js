@@ -260,6 +260,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const fnptrTablesList = [];
   const pendingFieldInitializers = [];
   const dispatchDeclarations = new Map();
+  const aliasUsesByFile = new Map();
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
@@ -320,6 +321,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       typedefHeadersByName.get(name).push(rel);
     }
     const dispatchScopes = new Set();
+    const aliasUses = [];
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -327,7 +329,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       if (taskDefs.isrs.has(fn.name)) fn.isrDeclaration = true;
       else if (taskDefs.names.has(fn.name)) fn.taskDeclaration = true;
       for (let k = fn.bodyStart - 1; k >= 0 && ![';', '{', '}'].includes(tokens[k].v); k--) {
-        if (tokens[k].v === '__interrupt') fn.isrDeclaration = true;
+        if (tokens[k].v === '__interrupt' || tokens[k].v === '_interrupt') fn.isrDeclaration = true;
       }
       fn.id = `${fn.file}::${fn.name}`;
       // #if/#else 两个分支各定义一次同名函数时 id 相同：只保留首个，避免重复节点
@@ -338,7 +340,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       for (const table of localTables.values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
-      const writes = findDispatchWrites(body, fileMacros);
+      const writes = findDispatchWrites(body, fileMacros, aliasUses);
       if (localTables.size || writes.length || calls.some(call => call.receiver)) dispatchScopes.add(tokens[fn.bodyStart]);
       const record = { fn, calls, writes, mentions: variableMentions(body) };
       functionRecords.push(record);
@@ -353,8 +355,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     collectDispatchDeclarations(tokens, dispatchScopes, binding => {
       const { declaration } = binding;
       if (!dispatchDeclarations.has(declaration.v)) dispatchDeclarations.set(declaration.v, []);
-      dispatchDeclarations.get(declaration.v).push({ ...binding, file: rel, isHeader });
-    });
+      const declarations = dispatchDeclarations.get(declaration.v);
+      if (!pruneInactive && binding.alias && declaration.cond) {
+        const previous = declarations.findLast(d => d.scope === binding.scope);
+        if (previous?.alias) {
+          binding.uncertain = true;
+          binding.alternatives = [previous.alias, ...(previous.alternatives || [])];
+        }
+      }
+      declarations.push({ ...binding, file: rel, isHeader });
+    }, fileMacros);
+    if (aliasUses.length) aliasUsesByFile.set(rel, aliasUses);
     for (const v of findGlobalVars(tokens, rel)) {
       // static 变量按文件区分；普通全局变量跨文件同名即同一个
       v.id = v.isStatic ? `var::${rel}::${v.name}` : `var::${v.name}`;
@@ -390,8 +401,6 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       return { file: visible[0], shape };
     }
   };
-  for (const fill of pendingFieldInitializers) fill(lookupInitializerType);
-  pendingFieldInitializers.length = 0;
   const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
   const isTypedefAt = (file, name, location) =>
     typedefsByFile.get(file)?.get(name)?.some(({ declaration, scope }) =>
@@ -483,22 +492,38 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const globalTablesByName = new Map();
   const localTablesByFunction = new Map();
   const tablesWithFilteredTargets = new Set();
+  const parsedSlots = new WeakMap();
   const declarationAt = (name, file, location) => dispatchDeclarations.get(name)?.findLast(p =>
     p.file === file && compareLocation(location, p.declaration) > 0 && (!p.scope.end || compareLocation(location, p.scope.end) < 0) &&
     (!p.typeToCheck || isTypedefAt(file, p.typeToCheck.v, p.typeToCheck)));
+  const targetKind = (name, file, location, functionId) => {
+    const local = declarationAt(name, file, location);
+    if (local && !local.isFunction) return 'object';
+    if ((!local || local.fileScope) && byId.get(functionId)?.params.includes(name)) return 'object';
+    if (local || (byName.has(name) && !resolveCallee(name, file).startsWith('ext::'))) return 'function';
+    const declared = dispatchDeclarations.get(name)?.some(p => p.isFunction && p.isHeader && p.fileScope &&
+      p.file !== file && includesHeader(file, p.file));
+    return declared ? 'function' : 'unknown';
+  };
+  for (const fill of pendingFieldInitializers) {
+    fill(lookupInitializerType, (token, file, functionId) => targetKind(token.v, file, token, functionId) === 'function');
+  }
+  pendingFieldInitializers.length = 0;
+  for (const [file, uses] of aliasUsesByFile) {
+    for (const use of uses) {
+      const binding = declarationAt(use.name, file, { line: use.line, col: use.col + 1 });
+      if (!binding?.alias || compareLocation(use, binding.declaration) === 0) continue;
+      binding.uncertain = true;
+      if (use.alternative) (binding.alternatives ??= []).push(use.alternative);
+    }
+  }
   for (const raw of fnptrTablesList) {
     const filteredMap = {};
     const location = raw.declaration ?? { line: raw.line, col: Infinity };
-    const params = byId.get(raw.functionId)?.params;
     for (const [slot, target] of Object.entries(raw.map)) {
-      const declarations = dispatchDeclarations.get(target);
-      const local = declarationAt(target, raw.file, location);
-      if (local && !local.isFunction) continue;
-      if ((!local || local.fileScope) && params?.includes(target)) continue;
-      const isStructField = !slot.startsWith('[');
-      const defined = byName.has(target) && !resolveCallee(target, raw.file).startsWith('ext::');
-      const declared = local || declarations?.some(p => p.file !== raw.file && p.isHeader && p.fileScope && includesHeader(raw.file, p.file));
-      if (defined || declared || isStructField) {
+      const kind = targetKind(target, raw.file, location, raw.functionId);
+      const isStructField = !slot.startsWith('[') && raw.slots.get(slot)?.designated;
+      if (kind === 'function' || (kind === 'unknown' && isStructField)) {
         filteredMap[slot] = target;
       }
     }
@@ -516,6 +541,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       ...(raw.unresolvedSlots && { unresolvedSlots: raw.unresolvedSlots }),
       ...(raw.functionId && { functionId: raw.functionId }),
     };
+    const slots = [...Object.entries(filteredMap), ...(raw.unresolvedSlots || []).map(slot => [slot, null])];
+    parsedSlots.set(entry, slots.map(([slot, target]) => ({ slot, target, ...raw.slots.get(slot) })));
     if (matchedSlots < Object.keys(raw.map).length) tablesWithFilteredTargets.add(entry);
     if (matchedSlots) cleanedTables.push(entry);
     if (entry.functionId) {
@@ -567,50 +594,35 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       writtenSlots.get(table).push({ ...write, file: fn.file });
     }
   }
-  const possiblyWritten = (writes, indices, member) => writes?.some(write => {
-    if (write.escape) return true;
-    if (write.member && member && write.member !== member) return false;
-    return write.indices.every((index, d) => index == null || indices[d] == null || index === indices[d]);
-  });
-  const matchTableSlots = (table, indices = [], member = null, writes) => {
+  // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
+  const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
+    part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
+  const possiblyWritten = (writes, path) => writes?.some(w => w.escape || compatiblePaths(w.path, path));
+  const matchTableSlots = (table, path, writes) => {
     const matched = [];
-    const slots = Object.entries(table.map);
-    for (const slot of table.unresolvedSlots || []) slots.push([slot, null]);
-    for (const [slot, target] of slots) {
-      if (!indices.length) {
-        if (member && slot === member) matched.push({ slot, target: possiblyWritten(writes, [], member) ? null : target });
-        continue;
+    for (const { slot, target, parts, unknownPosition } of parsedSlots.get(table)) {
+      // 整个聚合值未知时，其后续成员也未知。省略括号且维度未知时可能跨行。
+      const prefix = parts.length < path.length && (target === null || unknownPosition);
+      if ((parts.length === path.length || prefix) && compatiblePaths(parts, path)) {
+        matched.push({ slot, target: possiblyWritten(writes, parts) ? null : target });
       }
-      if (slot.includes('[?')) {
-        if (slot.endsWith(member ? '.' + member : ']') || (target === null && slot.endsWith(']'))) {
-          matched.push({ slot, target: possiblyWritten(writes, indices, member) ? null : target });
-        }
-        continue;
-      }
-      // 解析槽位路径，例如 "[1][0]" / "[0].fn" / "[1][2].handler"
-      const m = /^((?:\[\d+\])+)(?:\.([A-Za-z_]\w*))?$/.exec(slot);
-      if (!m) continue;
-      const slotIndices = [...m[1].matchAll(/\[(\d+)\]/g)].map((x) => Number.parseInt(x[1], 10));
-      const slotField = m[2] || null;
-      if (member) {
-        // 未解析的整个结构体元素也可能提供被调用的成员。
-        if (slotField !== member && !(target === null && !slotField)) continue;
-      } else if (slotField) {
-        // 结构体数组元素中无成员名调用时（例如 e[r][c]() 对应的非结构体表）不匹配带字段名的槽；
-        // 但若是一维位置初始化结构体数组（无指定字段名），slotField 本身为 null。
-        continue;
-      }
-      if (slotIndices.length < indices.length && target !== null) continue;
-      let ok = true;
-      for (let d = 0; d < Math.min(indices.length, slotIndices.length); d++) {
-        if (indices[d] !== null && slotIndices[d] !== indices[d]) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) matched.push({ slot, target: possiblyWritten(writes, slotIndices, slotField) ? null : target });
     }
     return matched;
+  };
+
+  const dispatchSources = (fn, call, binding) => {
+    if (!binding?.alias) return [{ table: lookupTable(fn, call), path: call.path, indexExprs: call.indexExprs }];
+    const sources = [];
+    for (const ref of [binding.alias, ...(binding.alternatives || [])]) {
+      // 捕获声明位置可见的表，调用位置可能已被另一个同名局部表遮蔽。
+      const table = lookupTable(fn, ref);
+      if (!table || (!ref.address && !table.dims)) continue;
+      let prefix = ref.address ? ref.path : [0];
+      if (binding.uncertain) prefix = prefix.map(part => typeof part === 'string' ? part : null);
+      sources.push({ table, path: [...prefix, ...call.path],
+        indexExprs: [...(ref.address ? ref.indexExprs : ['0']), ...call.indexExprs] });
+    }
+    return sources;
   };
 
   const indirectCalls = [];
@@ -632,16 +644,26 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         });
         continue;
       }
-      const table = lookupTable(fn, call);
-      let writes = writtenSlots.get(table);
-      if (writes && table.isStatic && HDR_EXT.test(table.file) && !HDR_EXT.test(fn.file)) {
-        // 头文件里的 static 对象在每个翻译单元有独立实例。
-        writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
+      const binding = call.firstOp === '->' ? declarationAt(call.receiver, fn.file, call) : null;
+      const sources = dispatchSources(fn, call, binding);
+      const tables = new Set(sources.map(source => source.table));
+      const table = tables.size === 1 ? sources[0].table : null;
+      const matched = [];
+      let uncertain = binding?.uncertain || (binding?.alias && !pruneInactive &&
+        binding.declaration.cond && binding.declaration.cond !== call.cond);
+      for (const source of sources) {
+        if (!source.table) continue;
+        let writes = writtenSlots.get(source.table);
+        if (writes && source.table.isStatic && HDR_EXT.test(source.table.file) && !HDR_EXT.test(fn.file)) {
+          // 头文件里的 static 对象在每个翻译单元有独立实例。
+          writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
+        }
+        if (possiblyWritten(writes, source.path) || (binding?.alias && source.path.includes(null))) uncertain = true;
+        for (const slot of matchTableSlots(source.table, source.path, writes)) matched.push({ ...slot, file: source.table.file });
       }
-      const matched = table ? matchTableSlots(table, call.indices || [], call.member || null, writes) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
-      const allConstIndices = (call.indices || []).every((idx) => idx !== null);
-      if (!table?.incomplete && !possiblyWritten(writes, call.indices || [], call.member) &&
+      const allConstIndices = sources.every(source => !source.path.includes(null));
+      if (table && !table.incomplete && !uncertain &&
           uniqueTargets.length === 1 && uniqueTargets[0] !== null &&
           (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
         const callee = uniqueTargets[0];
@@ -660,6 +682,12 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       } else {
         // 多候选动态分派表（如 z[idx]()、e[r][c]()）或未解析函数指针：
         // 不盲目画死所有候选，而是保留调用点与候选槽位供 LLM 结合源码精准判断后补边。
+        const candidates = new Map();
+        for (const { slot, target, file } of matched) {
+          if (target === null) continue;
+          const id = resolveCallee(target, file);
+          candidates.set(id + '\0' + slot, { slot, name: target, id });
+        }
         indirectCalls.push({
           caller: fn.id,
           callerName: fn.name,
@@ -668,13 +696,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
           expr: call.via || '',
           receiver: call.receiver || null,
           member: call.member || null,
-          indices: call.indexExprs || [],
+          indices: sources.length === 1 ? sources[0].indexExprs : call.indexExprs,
           table: table ? { name: table.name, file: table.file, line: table.line, isStatic: table.isStatic } : null,
-          candidates: matched.filter(s => s.target !== null).map((s) => ({
-            slot: s.slot,
-            name: s.target,
-            id: resolveCallee(s.target, table?.file || fn.file),
-          })),
+          candidates: [...candidates.values()],
         });
       }
     }
