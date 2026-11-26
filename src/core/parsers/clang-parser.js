@@ -273,11 +273,12 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     if (!database && options.strictCompileCommands) {
       throw new Error('严格编译数据库模式需要有效的 compile_commands.json');
     }
+    const responseFiles = new Map();
     const units = database
       ? (options.strictCompileCommands
-        ? readCompileCommands(root, database, { files: found, remap, includeTemplates: false })
+        ? readCompileCommands(root, database, { files: found, remap, responseFiles, includeTemplates: false })
         : completeCompileUnits(
-          readCompileCommands(root, database, { files: found, remap, includeTemplates: true }), found, includeArgs))
+          readCompileCommands(root, database, { files: found, remap, responseFiles, includeTemplates: true }), found, includeArgs))
       : found.filter((f) => !f.isHeader).map((f) => ({ rel: f.rel, file: f.abs, cwd: workRoot, args: includeArgs }));
     const selected = new Set(units.map((unit) => unit.rel));
     if (!units.length) throw new Error('Clang AST 未找到当前工程的编译单元');
@@ -310,7 +311,8 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     }
     if (!parsed.length) throw new Error(warnings.map((w) => `${w.file}：${w.error}`).join('；'));
     const files = found.filter((f) => f.isHeader || selected.has(f.rel)).map(({ abs, ...f }) => f);
-    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))), elapsedMs: Date.now() - started };
+    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))),
+      ...(responseFiles.size && { responseFiles: [...responseFiles] }), elapsedMs: Date.now() - started };
   } finally {
     if (dependenciesDir) fs.rmSync(dependenciesDir, { recursive: true, force: true });
     if (workRoot !== root) fs.rmSync(workRoot, { recursive: true, force: true });

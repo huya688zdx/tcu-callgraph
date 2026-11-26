@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { decodeSource, SRC_EXT } from '../source-files.js';
 
@@ -37,7 +38,7 @@ export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
   return JSON.stringify([
-    'clang-ast', 'v6', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
+    'clang-ast', 'v7', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
     Boolean(options.strictCompileCommands), options.buildProfileId || null,
   ]);
 }
@@ -83,7 +84,11 @@ const pathFlags = new Set(['-I', '-isystem', '-iquote', '-idirafter', '-include'
 const valueFlags = new Set(['-D', '-U', '-std', '-x', '-target', '--target']);
 const flags = [...pathFlags, ...valueFlags].sort((a, b) => b.length - a.length);
 
-function expandResponseTokens(args, directory, seen = new Set(), depth = 0) {
+function responseDigest(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function expandResponseTokens(args, directory, responseFiles, seen = new Set(), depth = 0) {
   if (depth > 6) return args;
   const out = [];
   for (let i = 0; i < args.length; i++) {
@@ -96,11 +101,16 @@ function expandResponseTokens(args, directory, seen = new Set(), depth = 0) {
       const rawPath = arg.startsWith('-@') ? arg.slice(2) : arg.slice(1);
       const target = path.resolve(directory, rawPath);
       const key = fileKey(target);
-      if (!seen.has(key) && fs.statSync(target, { throwIfNoEntry: false })?.isFile()) {
+      const exists = fs.statSync(target, { throwIfNoEntry: false })?.isFile();
+      if (!exists) responseFiles?.set(target, null);
+      if (!seen.has(key) && exists) {
         seen.add(key);
-        const text = decodeSource(fs.readFileSync(target)).replace(/^\uFEFF/, '');
+        const bytes = fs.readFileSync(target);
+        responseFiles?.set(target, responseDigest(bytes));
+        const text = decodeSource(bytes).replace(/^\uFEFF/, '');
         const nested = splitCommand(text.replace(/\r?\n/g, ' '));
-        out.push(...expandResponseTokens(nested, path.dirname(target), seen, depth + 1));
+        out.push(...expandResponseTokens(nested, path.dirname(target), responseFiles, seen, depth + 1));
+        seen.delete(key);
         continue;
       }
     }
@@ -109,8 +119,8 @@ function expandResponseTokens(args, directory, seen = new Set(), depth = 0) {
   return out;
 }
 
-function clangArguments(rawArgs, directory, remap) {
-  const args = expandResponseTokens(rawArgs, directory);
+function clangArguments(rawArgs, directory, remap, responseFiles) {
+  const args = expandResponseTokens(rawArgs, directory, responseFiles);
   const result = [];
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
@@ -137,7 +147,7 @@ function clangArguments(rawArgs, directory, remap) {
   return result;
 }
 
-export function readCompileCommands(root, file, { files, remap = (p) => p, includeTemplates = false } = {}) {
+export function readCompileCommands(root, file, { files, remap = (p) => p, includeTemplates = false, responseFiles } = {}) {
   const stat = fs.statSync(file);
   if (!stat.isFile() || stat.size > 64 * 1024 * 1024) {
     throw new Error(`compile_commands.json 必须是 64 MiB 以内的普通文件：${file}`);
@@ -161,7 +171,7 @@ export function readCompileCommands(root, file, { files, remap = (p) => p, inclu
     if (!args.length || args.some((arg) => typeof arg !== 'string')) {
       throw new Error(`compile_commands.json 条目缺少有效编译参数：${rel}`);
     }
-    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap), ...(includeTemplates && { templateOnly: !allowed?.has(id) }) });
+    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap, responseFiles), ...(includeTemplates && { templateOnly: !allowed?.has(id) }) });
   }
   return [...units.values()];
 }
@@ -200,6 +210,13 @@ export function dependencyStamp(file) {
 }
 
 export function externalDependenciesCurrent(model) {
+  for (const [file, digest] of model.responseFiles || []) {
+    try {
+      const current = fs.statSync(file, { throwIfNoEntry: false })?.isFile()
+        ? responseDigest(fs.readFileSync(file)) : null;
+      if (current !== digest) return false;
+    } catch { return false; }
+  }
   return (model.externalDeps || []).every(dep => {
     const current = dependencyStamp(dep.file);
     return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs;

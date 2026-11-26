@@ -10,6 +10,7 @@ import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceF
 import { loadModel, scanSources } from '../src/core/index.js';
 import { builtinParser } from '../src/core/parsers/builtin-parser.js';
 import { readCompileCommands } from '../src/core/parsers/clang-parser.js';
+import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
 
 const cores = ['core0', 'core1'];
 const vehicles = ['z111', 'z115'];
@@ -254,6 +255,28 @@ test('编译数据库拒绝 -I @bad，包括同名响应文件存在的情况', 
   assert.throws(read, /-I/);
   write(root, 'build/bad', '../inc\n');
   assert.throws(read, /-I/, '选项的操作数不能当作独立的响应文件展开');
+});
+
+test('Clang 模型缓存检查嵌套响应文件内容、删除和新增的响应文件', async t => {
+  const root = temporaryProject(t);
+  write(root, 'main.c', 'void main_fn(void) {}');
+  write(root, 'args.rsp', '@flags.rsp @optional.rsp');
+  const flags = write(root, 'flags.rsp', '-DMODE=1');
+  const database = write(root, 'compile_commands.json', JSON.stringify([{
+    directory: root, file: 'main.c', arguments: ['clang', '@args.rsp', 'main.c'],
+  }]));
+  const model = await loadModel(root, { parserId: 'clang-ast', parserOptions: {
+    compileCommandsPath: database, execClang: () => ({ kind: 'TranslationUnitDecl', inner: [] }),
+  } });
+  assert.equal(externalDependenciesCurrent(model), true);
+  fs.writeFileSync(flags, '-DMODE=0');
+  assert.equal(externalDependenciesCurrent(model), false);
+  fs.unlinkSync(flags);
+  assert.equal(externalDependenciesCurrent(model), false);
+  fs.writeFileSync(flags, '-DMODE=1');
+  assert.equal(externalDependenciesCurrent(model), true);
+  write(root, 'optional.rsp', '-DNEW');
+  assert.equal(externalDependenciesCurrent(model), false);
 });
 
 test('builtin 按构建配置过滤车型函数，并遵守空的编译单元清单', t => {
