@@ -15,6 +15,7 @@ import { scanBuildConfig } from './build-inspect.js';
 const MAX_INCLUDE_DEPTH = 12;
 const MAX_RSP_DEPTH = 6;
 const MAX_CONFIG_FILE_BYTES = 8 * 1024 * 1024;
+export const COMPILER_DEFINE = /^([A-Za-z_]\w*)(?:\([\w.,\s]*\))?(?:=.*)?$/;
 
 const toPosix = (p) => String(p || '').replace(/\\/g, '/');
 const fileKey = (rel) => (process.platform === 'win32' ? rel.toLowerCase() : rel);
@@ -213,9 +214,10 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       let val = '';
       if (/^-[Dd]=?$/.test(tok)) val = stripQuotes(rawTokens[++i] || '');
       else val = stripQuotes(tok.replace(/^-[Dd]=?/, ''));
-      if (val && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(val)) {
+      const name = COMPILER_DEFINE.exec(val)?.[1];
+      if (name) {
         (out.macroArgs ||= []).push('-D', val);
-        for (const old of out.defines) if (old.split('=')[0] === val.split('=')[0]) out.defines.delete(old);
+        for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
         out.defines.add(val);
       }
       continue;
@@ -225,7 +227,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       const name = tok === '-U' ? stripQuotes(rawTokens[++i] || '') : tok.slice(2);
       if (/^[A-Za-z_]\w*$/.test(name)) {
         (out.macroArgs ||= []).push('-U', name);
-        for (const old of out.defines) if (old.split('=')[0] === name) out.defines.delete(old);
+        for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
       }
       continue;
     }
@@ -284,18 +286,19 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const rules = new Map();
   const targetVariables = new Map();
   let defaultGoal;
-  const collected = { ...compilerConfig(), includedFiles: [] };
-  const visited = new Set();
+  const collected = compilerConfig();
+  const includedFiles = new Set();
+  const includeStack = new Set();
 
   const processFile = (absPath, depth) => {
     if (depth > MAX_INCLUDE_DEPTH) return;
     const key = fileKey(absPath);
-    if (visited.has(key)) return;
-    visited.add(key);
+    if (includeStack.has(key)) return;
     const text = safeReadText(absPath);
     if (!text) return;
+    includeStack.add(key);
     const dir = path.dirname(absPath);
-    collected.includedFiles.push(toPosix(path.relative(rootDir, absPath)));
+    includedFiles.add(toPosix(path.relative(rootDir, absPath)));
 
     // 合并反斜杠续行
     const rawLines = text.split(/\r\n|\r|\n/);
@@ -420,6 +423,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
         recipes.push({ command: line, prerequisites, targets });
       }
     }
+    includeStack.delete(key);
   };
 
   processFile(entryAbs, 0);
@@ -475,7 +479,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     ...meta,
     ...extractedOptions(collected),
     sourceFiles: [...collected.sourceFiles],
-    includedFiles: collected.includedFiles,
+    includedFiles: [...includedFiles],
     compilationUnits,
   };
 }
@@ -547,7 +551,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
         for (const raw of values) {
           const clean = stripQuotes(raw).replace(/^-D/, '');
-          if (clean && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(clean)) config.defines.add(clean);
+          if (COMPILER_DEFINE.test(clean)) config.defines.add(clean);
         }
       } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
         for (const raw of values) {

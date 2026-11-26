@@ -41,13 +41,16 @@ function flowchartHeaders(model, fn) {
           suffixes.set(suffix, suffixes.has(suffix) ? null : rel);
         }
       }
-      for (const { file, target } of includes) {
-        const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
-        const relative = path.posix.join(path.posix.dirname(file), normalized);
-        // Clang 已给出项目相对路径。内置解析器保留 include 指令中的原始路径。
-        const resolved = model.parserId === 'clang-ast' && paths.has(normalized) ? normalized
-          : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
-        if (!resolved) continue;
+      for (const { file, target, resolved: actual } of includes) {
+        let resolved = actual;
+        if (resolved === undefined) {
+          const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
+          const relative = path.posix.join(path.posix.dirname(file), normalized);
+          // Clang 已给出项目相对路径。无构建配置时，内置解析器仅保留 include 原始路径。
+          resolved = model.parserId === 'clang-ast' && paths.has(normalized) ? normalized
+            : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+        }
+        if (!paths.has(resolved)) continue;
         if (!direct.has(file)) direct.set(file, []);
         direct.get(file).push(resolved);
       }
@@ -91,10 +94,11 @@ function sourceReader(model, sourceRoot, fileStats) {
     const override = model._sourceFiles?.get(file);
     let location = cached?.location;
     if (!location || location.root !== model.root || location.override !== override) {
-      const filename = override ?? path.join(model.root, file);
+      const filename = override ?? path.resolve(model.root, file);
       location = { root: model.root, override, filename, directory: path.dirname(filename) };
     }
     const { filename, directory } = location;
+    const external = model.externalHeaders?.get(file);
     const invalidPath = '源码文件必须位于当前工程或对照目录内';
     let stat = fileStats?.get(filename);
     if (!stat) {
@@ -104,17 +108,19 @@ function sourceReader(model, sourceRoot, fileStats) {
     let realFile;
     if (stat.isSymbolicLink()) {
       realFile = fs.realpathSync(filename);
-      if (!withinRoots(realFile)) throw new Error(invalidPath);
+      if (!withinRoots(realFile) && external !== realFile) throw new Error(invalidPath);
       stat = fs.statSync(realFile, { bigint: true });
     } else {
       // 同一次查找按目录检查真实路径，常规文件只需要一次元数据查询。
-      let realDirectory = directories.get(directory);
-      if (!realDirectory) {
-        realDirectory = fs.realpathSync(directory);
-        if (!withinRoots(realDirectory)) throw new Error(invalidPath);
-        directories.set(directory, realDirectory);
+      let resolved = directories.get(directory);
+      if (!resolved) {
+        const realDirectory = fs.realpathSync(directory);
+        resolved = { realDirectory, withinRoots: withinRoots(realDirectory) };
+        directories.set(directory, resolved);
       }
+      const { realDirectory } = resolved;
       realFile = directory === realDirectory ? filename : path.join(realDirectory, path.basename(filename));
+      if (!resolved.withinRoots && external !== realFile) throw new Error(invalidPath);
     }
     if (!stat.isFile()) throw new Error(invalidPath);
 

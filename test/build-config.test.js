@@ -593,3 +593,54 @@ test('构建配置保留每个编译单元的头文件搜索顺序和 C 标准',
     assert.deepEqual(sorted(clang.functions.map(f => f.name)), expected);
   }
 });
+
+test('Make 在每个 include 位置重新计算变量并按名称处理函数式宏的重定义', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'MODE = 1', 'include flags.mk', 'MODE = 2', 'include flags.mk',
+    'all:', "\tcc $(CFLAGS) '-DREMOVED(x)=x' -UREMOVED '-DENABLED(x)=0' -UENABLED '-DENABLED(x)=x' -c main.c",
+  ].join('\n'));
+  write(root, 'flags.mk', 'CFLAGS := -DMODE=$(MODE)\n');
+  write(root, 'main.c', [
+    '#if MODE == 2 && !defined(REMOVED) && ENABLED(1)',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles.find(p => p.configFile === 'Makefile');
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['MODE=2', 'ENABLED(x)=x']);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [{ args }] = readCompileCommands(root, compileCommandsPath);
+  assert.deepEqual(args.slice(args.indexOf('-D')), [
+    '-D', 'MODE=2', '-D', 'REMOVED(x)=x', '-U', 'REMOVED', '-D', 'ENABLED(x)=0', '-U', 'ENABLED', '-D', 'ENABLED(x)=x',
+  ]);
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(clang.functions.map(fn => fn.name), ['correct']);
+  }
+});
+
+test('流程图接口读取构建配置选中的外部 SDK 头与嵌套头', async t => {
+  const root = temporaryProject(t);
+  const sdk = path.join(path.dirname(root), 'sdk');
+  write(sdk, 'config.h', '#include "nested.h"\n');
+  write(sdk, 'nested.h', '#define RUN() selected()\n');
+  write(root, 'config.h', '#define RUN() wrong()\n');
+  write(root, 'Makefile', 'all:\n\tcc -I../sdk -c main.c\n');
+  write(root, 'main.c', [
+    '#include <config.h>', 'static void selected(void) {}', 'void run(void) { RUN(); }',
+  ].join('\n'));
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId: 'make::Makefile' });
+  for (const expandMacros of [0, 1]) {
+    const query = new URLSearchParams({ id: 'main.c::run', expandMacros });
+    const result = await request('/api/flowchart?' + query);
+    assert.ok(result.ok);
+    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === '../sdk/nested.h'));
+    assert.ok(result.nodes.some(node => node.callees?.some(callee => callee.name === 'selected')));
+  }
+});

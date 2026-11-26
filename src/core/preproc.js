@@ -73,6 +73,18 @@ function parseDefineParams(text) {
   return { params, variadic, variadicName, rest: text.slice(i + 1) };
 }
 
+export function parseMacroDefinition(text, file, line, cond) {
+  const name = /^([A-Za-z_]\w*)/.exec(text)?.[1];
+  if (!name) return null;
+  const after = text.slice(name.length);
+  const { params = null, variadic, variadicName, rest } = after.startsWith('(')
+    ? parseDefineParams(after) : { rest: after };
+  return {
+    name, params, ...(variadic ? { variadic: true, variadicName } : {}),
+    body: lex(rest, file), file, line, cond, raw: rest.trim(),
+  };
+}
+
 /** 仅用于构建配置裁剪模式的轻量 C 预处理器常量表达式求值（支持 defined、!、&&、||、==、!=、<、<=、>、>=、位/算术运算）。 */
 function evalPreprocExpr(exprText, macros, line) {
   const tokens = lex(exprText);
@@ -220,32 +232,8 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
     if ((dir === 'define' || dir === 'undef') && isInactive()) continue;
 
     if (dir === 'define') {
-      const nm = /^([A-Za-z_]\w*)/.exec(rest);
-      if (!nm) continue;
-      const name = nm[1];
-      const after = rest.slice(name.length);
-      let params = null;
-      let variadic = false;
-      let variadicName = '__VA_ARGS__';
-      let bodyText = after;
-      if (after.startsWith('(')) {
-        const p = parseDefineParams(after);
-        params = p.params;
-        variadic = p.variadic;
-        variadicName = p.variadicName;
-        bodyText = p.rest;
-      }
-      const body = lex(bodyText, file);
-      macros.set(name, {
-        name,
-        params,
-        ...(variadic ? { variadic: true, variadicName } : {}),
-        body,
-        file,
-        line: tk.line,
-        cond: currentCond(),
-        raw: bodyText.trim(),
-      });
+      const def = parseMacroDefinition(rest, file, tk.line, currentCond());
+      if (def) macros.set(def.name, def);
       continue;
     }
 

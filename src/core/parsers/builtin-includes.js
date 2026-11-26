@@ -1,8 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { profileIncludeOptions } from '../build-config.js';
-import { lex } from '../lexer.js';
-import { fileMacroScope, preprocess } from '../preproc.js';
+import { COMPILER_DEFINE, profileIncludeOptions } from '../build-config.js';
+import { fileMacroScope, parseMacroDefinition, preprocess } from '../preproc.js';
 
 const cStandardVersions = new Map([
   ['iso9899:199409', '199409L'],
@@ -17,11 +16,12 @@ const cStandardVersions = new Map([
 export function buildMacros(defines = []) {
   const macros = new Map();
   for (const raw of defines) {
-    const [name, ...rest] = String(raw).split('=');
-    if (!/^[A-Za-z_]\w*$/.test(name.trim())) continue;
+    const option = String(raw).trim();
+    if (!COMPILER_DEFINE.test(option)) continue;
+    const [declaration, ...rest] = option.split('=');
     const value = rest.length ? rest.join('=').trim() : '1';
-    macros.set(name.trim(), { name: name.trim(), params: null, body: lex(value, '<build-config>'),
-      file: '<build-config>', line: 0, raw: value });
+    const def = parseMacroDefinition(declaration.trim() + ' ' + value, '<build-config>', 0);
+    if (def) macros.set(def.name, def);
   }
   return macros;
 }

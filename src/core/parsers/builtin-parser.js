@@ -243,6 +243,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
   const externalDeps = new Map();
+  const externalHeaders = new Map();
   const missingIncludes = new Set();
   const macros = new Map();
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
@@ -278,8 +279,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
   };
 
-  const loadInput = ({ rel, abs, bytes }) => {
+  const loadInput = ({ rel, abs, bytes, isHeader }) => {
     let buf;
+    let externalHeader;
     try {
       const size = bytes ?? fs.statSync(abs).size;
       if (size > MAX_FILE_BYTES) {
@@ -287,7 +289,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         return;
       }
       const stamp = dependencyStamp(abs);
-      buf = fs.readFileSync(abs);
+      if (isHeader && (rel.startsWith('../') || path.isAbsolute(rel))) externalHeader = fs.realpathSync(abs);
+      buf = fs.readFileSync(externalHeader || abs);
       if (stamp) externalDeps.set(abs, stamp);
       if (buf.length > MAX_FILE_BYTES) {
         warnings.push({ file: rel, error: `文件过大（${(buf.length / 1048576).toFixed(1)} MB），已跳过` });
@@ -306,6 +309,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       warnings.push({ file: rel, error: '疑似二进制文件（含 \\0），已跳过' });
       return;
     }
+    if (externalHeader) externalHeaders.set(rel, externalHeader);
     const src = decodeSource(buf);
     const original = lex(src, rel);
     const taskDefs = taskDeclarations(src, original);
@@ -800,6 +804,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     includes,
     warnings,
     externalDeps: [...externalDeps.values()],
+    ...(externalHeaders.size ? { externalHeaders } : {}),
     missingIncludes: [...missingIncludes],
     compilationUnits: parserOptions?.compilationUnits || {},
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
@@ -822,7 +827,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:5';
     return JSON.stringify([
-      'builtin:11',
+      'builtin:12',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
