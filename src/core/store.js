@@ -310,6 +310,12 @@ function briefOf(e) {
   return brief;
 }
 
+function clearArrangedPositions(nodes, groupMode) {
+  for (const [id, position] of Object.entries(nodes)) {
+    if (position?.arrangedFor === groupMode) delete nodes[id];
+  }
+}
+
 /** 把一条事件应用到 overlay 上（时间轴回放的唯一入口，必须和写接口一一对应） */
 function applyEvent(ov, e) {
   const after = e.after || {};
@@ -374,11 +380,12 @@ function applyEvent(ov, e) {
       for (const key of after.clearedLegacyManual || []) {
         if (ov.layout[key]) ov.layout[key].manual = [];
       }
-      if (e.op === 'layout.clear') {
+      if (e.op === 'layout.clear' && !after.resetPositions) {
         delete ov.layout[e.target];
         return;
       }
       const slot = ov.layout[e.target] || { nodes: {}, edges: {}, manual: [] };
+      if (after.resetPositions) clearArrangedPositions(slot.nodes, after.resetPositions);
       if (after.nodes) Object.assign(slot.nodes, after.nodes);
       if (after.edges) Object.assign(slot.edges, after.edges);
       if (after.manual) slot.manual = after.manual;
@@ -802,7 +809,7 @@ export function openStore({ dbPath, userData } = {}) {
     },
 
     /**
-     * 写布局槽位。clear=true 清空该槽位；否则按字段 merge，
+     * 写布局槽位。clear=true 清空该槽位，resetPositions 只清指定分组模式的 AI 坐标；其余按字段合并。
      * manual 是整体替换（它表示「当前视图里所有手工边」的完整集合）。
      */
     saveLayout(projectId, viewKey, mode, patch = {}) {
@@ -812,6 +819,7 @@ export function openStore({ dbPath, userData } = {}) {
           q.layoutDel.run(projectId, viewKey, mode);
           return { nodes: {}, edges: {}, manual: [] };
         }
+        if (patch.resetPositions) clearArrangedPositions(slot.nodes, patch.resetPositions);
         if (patch.nodes) Object.assign(slot.nodes, patch.nodes);
         if (patch.edges) Object.assign(slot.edges, patch.edges);
         if (patch.manual) slot.manual = patch.manual;

@@ -1770,9 +1770,48 @@ function clearCanvasAxis(rects, obstacles, axis, direction = 1) {
   return direction * offset;
 }
 
+function arrangedTargets(nodes, positions, groupMode) {
+  return nodes.flatMap(node => {
+    const position = positions?.[node.id];
+    return position?.arrangedFor === groupMode && [position.x, position.y].every(Number.isFinite)
+      ? [{ node, x: position.x, y: position.y }] : [];
+  });
+}
+
+function expandedArrangementBoxes(view, targets) {
+  const boxes = [
+    ...view.groups.map(box => ({ box, bounds: canvasRect(box), directory: false })),
+    ...view.containers.filter(box => !box.root).map(box => ({ box, bounds: canvasRect(box), directory: true })),
+  ];
+  const parentOf = (a, b) => a.directory && b.box.id.startsWith(a.box.id + '/');
+  const overlapArea = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) *
+    Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const expanded = new Set();
+  for (const { node, x, y } of targets) {
+    for (const entry of boxes) {
+      const { box, bounds } = entry;
+      if (!node.group || (node.group !== box.id && !node.group.startsWith(box.id + '/'))) continue;
+      const right = Math.max(bounds.x + bounds.w, x + node.w + 12);
+      const bottom = Math.max(bounds.y + bounds.h, y + node.h + 12);
+      bounds.x = Math.min(bounds.x, Math.max(0, x - 12));
+      bounds.y = Math.min(bounds.y, Math.max(0, y - 12));
+      bounds.w = right - bounds.x;
+      bounds.h = bottom - bounds.y;
+      expanded.add(entry);
+    }
+  }
+  for (const a of expanded) for (const b of boxes) {
+    if (a !== b && !parentOf(a, b) && !parentOf(b, a) &&
+        overlapArea(a.bounds, b.bounds) > overlapArea(a.box, b.box) + 0.01) return null;
+  }
+  return expanded;
+}
+
 function applyArrangedPositions(view, positions, groupMode) {
-  const arranged = view.nodes.filter(n => positions?.[n.id]?.arrangedFor === groupMode);
+  const arranged = arrangedTargets(view.nodes, positions, groupMode);
   if (!arranged.length) return;
+  const boxes = expandedArrangementBoxes(view, arranged);
+  if (!boxes) return;
   // 增量刷新会把 layoutSlots 传回服务端。重置时据此丢弃已调整的旧几何。
   const slots = view.layoutSlots || {
     nodes: view.nodes.map(n => ({ ...canvasRect(n), file: n.file, group: n.group })),
@@ -1782,23 +1821,12 @@ function applyArrangedPositions(view, positions, groupMode) {
     width: view.width, height: view.height, layoutDirection: view.layoutDirection,
   };
   view.layoutSlots = { ...slots, aiArranged: true };
-  let changed = false;
-  for (const node of arranged) {
-    const { x, y } = positions[node.id];
-    if (![x, y].every(Number.isFinite) || (node.x === x && node.y === y)) continue;
-    changed = true;
-    Object.assign(node, { x, y });
-    for (const box of [...view.groups, ...view.containers]) {
-      if (box.root || !node.group || (node.group !== box.id && !node.group.startsWith(box.id + '/'))) continue;
-      const right = Math.max(box.x + box.w, x + node.w + 12);
-      const bottom = Math.max(box.y + box.h, y + node.h + 12);
-      box.x = Math.min(box.x, Math.max(0, x - 12));
-      box.y = Math.min(box.y, Math.max(0, y - 12));
-      box.w = right - box.x;
-      box.h = bottom - box.y;
-    }
-  }
+  const changed = arranged.some(({ node, x, y }) => node.x !== x || node.y !== y);
   if (!changed) return;
+  for (const { node, x, y } of arranged) {
+    Object.assign(node, { x, y });
+  }
+  for (const { box, bounds } of boxes) Object.assign(box, bounds);
   routeEdges(view.nodes, view.edges, { layoutDirection: view.layoutDirection });
   for (const rect of [...view.nodes, ...view.groups, ...view.containers]) {
     if (rect.root) continue;
@@ -3079,14 +3107,20 @@ export const server = http.createServer(async (req, res) => {
         const op = clear ? 'layout.clear' : 'layout.save';
         const positions = [...updated.values()].map(({ id, x, y }) => ({ id, x, y }));
         const patch = Object.fromEntries(positions.map(({ id, x, y }) => [id, { x, y, arrangedFor: groupMode }]));
+        if (positions.length) {
+          const geometry = view.layoutSlots?.aiArranged ? view.layoutSlots : view;
+          const targets = arrangedTargets(view.nodes, { ...beforeSlot?.nodes, ...patch }, groupMode);
+          if (!expandedArrangementBoxes(geometry, targets)) return fail('调整后文件框或目录容器会重叠，请改用其他位置');
+        }
         const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
         const slot = store.transaction(() => {
           const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
-          const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, clear });
+          const resetPositions = clear ? groupMode : undefined;
+          const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, resetPositions });
           store.appendEvent(PROJECT.id, {
             op, target: key, actor: 'ai',
             before: clear ? before : { nodes: pickKeys(before.nodes, [...updated.keys()]) },
-            after: { nodes: patch, reason, view: activeView },
+            after: { nodes: patch, resetPositions, reason, view: activeView },
           });
           return savedSlot;
         });
@@ -5271,6 +5305,7 @@ export const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
         .then((patch) => {
+          if (!currentSession(req)) return sessionConflict(res);
           if (patch.nodes !== undefined && !isPlainObject(patch.nodes)) return bad(res, 'nodes 必须是对象');
           if (patch.edges !== undefined && !isPlainObject(patch.edges)) return bad(res, 'edges 必须是对象');
           if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
@@ -5279,7 +5314,15 @@ export const server = http.createServer(async (req, res) => {
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = remapLayoutRoot(String(patch.root || ''), MODEL);
           const key = layoutKey(rootId, mode);
+          const resetPositions = patch.resetPositions;
+          if (resetPositions !== undefined && (!['file', 'period', 'flat'].includes(resetPositions) ||
+              (resetPositions === 'flat') !== (mode === 'flat') || patch.clear)) return bad(res, '无效的坐标重置模式');
+          const op = patch.clear || resetPositions ? 'layout.clear' : 'layout.save';
           const hasManualOp = patch.manual !== undefined || patch.addManual !== undefined || patch.removeManual !== undefined;
+          if (resetPositions && !hasManualOp && !patch.nodes && !patch.edges &&
+              !Object.values(overlay.layout[key]?.nodes || {}).some(position => position?.arrangedFor === resetPositions)) {
+            return json(res, { ok: true });
+          }
           const migrated = patch.clear || hasManualOp
             ? legacyManualKeys(overlay.layout || {}, rootId, mode, MODEL) : [];
           const slot = store.transaction(() => {
@@ -5304,6 +5347,7 @@ export const server = http.createServer(async (req, res) => {
               edges: patch.edges,
               manual: nextManual,
               clear: !!patch.clear,
+              resetPositions,
             });
             // 手工线是整组替换，清空旧别名的连线以免之后又被回退读取。
             for (const legacyKey of migrated) {
@@ -5311,14 +5355,14 @@ export const server = http.createServer(async (req, res) => {
             }
             // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
             store.appendEvent(PROJECT.id, {
-              op: patch.clear ? 'layout.clear' : 'layout.save',
+              op,
               target: key,
               before: {
-                nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
+                nodes: resetPositions ? before.nodes : pickKeys(before.nodes, Object.keys(patch.nodes || {})),
                 edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
                 manual: nextManual ? before.manual : undefined,
               },
-              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: nextManual,
+              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: nextManual, resetPositions,
                 clearedLegacyManual: migrated.length ? migrated : undefined, view: currentViewSnapshot() },
               actor: patch.actor === 'ai' ? 'ai' : 'user',
             });
@@ -5327,7 +5371,7 @@ export const server = http.createServer(async (req, res) => {
           overlay.layout = overlay.layout || {};
           overlay.layout[key] = slot;
           for (const legacyKey of migrated) overlay.layout[legacyKey].manual = [];
-          broadcastChange(patch.clear ? 'layout.clear' : 'layout.save', patch.actor === 'ai' ? 'ai' : 'user');
+          broadcastChange(op, patch.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true });
         })
         .catch((err) => {

@@ -1206,8 +1206,10 @@ export async function runAiAgent({
   const requiredTool = removal ? 'remove_from_canvas'
     : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
   const hasEditIntent = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u.test(userText);
-  const readOnlyQuestion = !requiredTool && !hasEditIntent &&
-    /(?:为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|为何没有|为什么没有|为什么会|怎么没有|[？?]\s*$)/u.test(userText);
+  const readOnlyQuestion = !requiredTool && !hasEditIntent && (
+    /(?:为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|为何没有|为什么没有|为什么会|怎么没有)/u.test(userText) ||
+    /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText)
+  );
   const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
   const unanchoredDeictic = !requiredTool && !hasSelectionContext &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&

@@ -65,13 +65,15 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   });
   const jsonPost = (route, body) => post(route, body).then(res => res.json());
   const root = 'main.c::main';
-  const page = { roots: [root, 'can.c::Can_Init'], up: 0, down: 1 };
+  const page = { roots: [root, 'can.c::Can_Init'], up: 0, down: 1, groupMode: 'flat' };
   const layoutRoot = page.roots.join('+');
-  const query = '/api/view?up=0&down=1';
+  const query = '/api/view?up=0&down=1&groupMode=flat';
   const viewUrl = query + '&roots=' + encodeURIComponent(page.roots.join(','));
+  const manual = { from: 'main.c::Task_10ms', to: 'main.c::Task_100ms' };
+  assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', addManual: [manual] })).ok, true);
   const view = await get(viewUrl);
   assert.equal((await jsonPost('/api/page', page)).ok, true);
-  assert.ok(view.groups.length && view.containers.length && view.edges.length);
+  assert.ok(view.edges.length);
   const other = view.nodes.find(node => node.name === 'Task_10ms');
   const anchor = view.nodes.find(node => node.name === 'Can_Init');
   const liveNodes = view.nodes.map((node, i) => ({
@@ -81,7 +83,7 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   const anchorRect = liveNodes.find(node => node.id === anchor.id);
   const liveGroups = view.groups.map(({ id, x, y, w, h }) => ({ id, x: x + 500, y, w, h }));
   const liveContainers = view.containers.map(({ id, x, y, w, h }) => ({ id, x: x + 600, y, w, h }));
-  const canvasLayout = { root, mode: 'group', width: 6000, height: 5000,
+  const canvasLayout = { root, mode: 'flat', width: 6000, height: 5000,
     nodes: liveNodes, groups: liveGroups, containers: liveContainers };
 
   const requests = [];
@@ -151,6 +153,16 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   const initial = await reader.read();
   assert.match(decoder.decode(initial.value), /retry:/);
 
+  assert.equal((await jsonPost('/api/page', { ...page, groupMode: 'file' })).ok, true);
+  const grouped = await get(viewUrl.replace('groupMode=flat', 'groupMode=file'));
+  const foreign = grouped.nodes.find(node => node.name === 'Can_Init');
+  const below = Math.max(...grouped.groups.map(box => box.y + box.h)) + 50;
+  steps.push({ action: 'move', moves: [{ id: root, x: foreign.x, y: below }] });
+  await chat();
+  assert.match(outputs.pop().error, /容器会重叠/);
+  assert.equal((await get('/api/session/export')).overlay.layout[layoutRoot + '::group'], undefined);
+  assert.equal((await jsonPost('/api/page', page)).ok, true);
+
   steps.push(
     { action: 'inspect' },
     { action: 'move', reason: '移到右边', moves: [
@@ -159,7 +171,7 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     ] },
     { action: 'align', nodes: ['main', other.name], axis: 'x', distribute: true, gap: 35 },
     { action: 'inspect' },
-    { action: 'move', moves: [{ id: other.id, dx: other.w + 35 }] },
+    { action: 'move', moves: [{ id: other.id, dx: other.w + 35, dy: 12 }] },
   );
   const events = await chat({ canvasLayout });
   const [inspect, move, align, aligned, displaced] = outputs;
@@ -178,14 +190,14 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     const actual = aligned.nodes.find(node => node.id === id);
     assert.deepEqual({ x: actual.x, y: actual.y }, { x, y });
   }
-  assert.deepEqual(displaced.positions, [{ id: other.id, x: second.x + view.nodes.find(n => n.id === root).w, y: second.y }],
+  assert.deepEqual(displaced.positions, [{ id: other.id, x: second.x + view.nodes.find(n => n.id === root).w, y: second.y + 12 }],
     '偏移后的目标遇到同一行的节点时沿移动轴避让');
   assert.ok(events.some(event => event.type === 'tool_end' && /action=align/.test(event.digest)));
 
-  const slot = layoutRoot + '::group';
+  const slot = layoutRoot + '::flat';
   const arranged = await get(viewUrl);
   const saved = await get('/api/session/export');
-  const writes = saved.events.filter(event => event.op === 'layout.save');
+  const writes = saved.events.filter(event => event.op === 'layout.save' && event.actor === 'ai');
   assert.equal(writes.length, 3);
   assert.ok(writes.every(event => event.actor === 'ai' && event.target === slot));
   for (const { id, x, y } of [second, displaced.positions[0]]) {
@@ -205,14 +217,20 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   assert.equal(reset.root, layoutRoot);
   assert.equal(resetInspect.canvas.width, view.width);
   const cleared = await get('/api/session/export');
-  assert.equal(cleared.overlay.layout[slot], undefined);
-  assert.ok(cleared.events.some(event => event.op === 'layout.clear' && event.actor === 'ai' &&
-    event.target === slot && event.after.reason === '恢复自动布局'));
+  assert.deepEqual(cleared.overlay.layout[slot].nodes, {});
+  assert.deepEqual(cleared.overlay.layout[slot].manual, [manual]);
+  const resetEvent = cleared.events.find(event => event.op === 'layout.clear' && event.actor === 'ai' && event.target === slot);
+  assert.equal(resetEvent?.after.resetPositions, 'flat');
+  assert.equal(resetEvent?.after.reason, '恢复自动布局');
   const refreshed = await jsonPost(query, { roots: page.roots, previous: arranged, projectId: view.projectId });
+  assert.ok(refreshed.nodes, refreshed.error);
   assert.deepEqual(refreshed.nodes.map(({ id, x, y }) => ({ id, x, y })), view.nodes.map(({ id, x, y }) => ({ id, x, y })));
   const movedEvent = writes.find(event => event.after.nodes[other.id]?.x === displaced.positions[0].x);
   const replayed = await get(`/api/view?at=${movedEvent.id}&useSnapshot=1`);
   assert.equal(replayed.nodes.find(node => node.id === other.id).x, displaced.positions[0].x);
+  const manualVisible = canvas => canvas.edges.some(edge => edge.manual && edge.from === manual.from && edge.to === manual.to);
+  assert.ok(manualVisible(refreshed));
+  assert.ok(manualVisible(await get(`/api/view?at=${resetEvent.id}&useSnapshot=1`)));
 
   let broadcast = '';
   while ((broadcast.match(/\n\n/g) || []).length < 4) {
@@ -224,6 +242,41 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   const layouts = changes.filter(change => change.op.startsWith('layout.'));
   assert.deepEqual(layouts.map(change => change.op), ['layout.save', 'layout.save', 'layout.save', 'layout.clear']);
   assert.ok(layouts.every(change => change.actor === 'ai' && change.projectId === view.projectId));
+
+  await t.test('工具栏重新排版会持久清除 AI 坐标并保留手工连线', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/page', page)).ok, true);
+    const { x, y } = view.nodes.find(node => node.id === root);
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat',
+      nodes: { [root]: { x: x + 500, y, arrangedFor: 'flat' } },
+    })).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const rootX = `window.__cg?.view?.nodes.find(node => node.id === ${JSON.stringify(root)})?.x`;
+    await browser.waitFor(`${rootX} === ${x + 500}`);
+    await browser.evaluate("document.getElementById('resetLayout').click()");
+    await browser.waitFor(`${rootX} === ${x}`);
+    const afterToolbar = await get(viewUrl);
+    assert.equal(afterToolbar.nodes.find(node => node.id === root).x, x);
+    assert.ok(manualVisible(afterToolbar));
+  });
+});
+
+test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {
+  for (const [prompt, allowed] of [['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false]]) {
+    const executed = [];
+    let step = 0;
+    const result = await runAiAgent({
+      config: { baseUrl: 'http://127.0.0.1:8000/v1', model: 'mock', toolMode: 'tools' },
+      prompt,
+      executeTool: async name => { executed.push(name); return { ok: true }; },
+      fetchImpl: async () => Response.json({ choices: [{ message: step++ === 0 ? { tool_calls: [{
+        id: 'add', type: 'function', function: { name: 'add_to_canvas', arguments: '{"functions":["Task_10ms"]}' },
+      }] } : { content: '已处理。' } }] }),
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(executed, allowed ? ['add_to_canvas'] : []);
+  }
 });
 
 test('normalizeBaseUrl 兼容根地址、/v1 与完整 /chat/completions，并拒绝非法协议', () => {
