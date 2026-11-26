@@ -830,9 +830,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:7';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:8';
     return JSON.stringify([
-      'builtin:16',
+      'builtin:17',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

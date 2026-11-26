@@ -41,6 +41,15 @@ export function profilePredefinedMacros(file, config) {
 /** 按编译单元顺序执行 include。头文件自己的行号与它在调用方引入宏的位置分别记录。 */
 export function preprocessProfile(root, files, options, load, visit, expand = false) {
   const key = s => process.platform === 'win32' ? s.toLowerCase() : s;
+  const uniqueDirs = dirs => {
+    const seen = new Set();
+    return dirs.filter(dir => {
+      const normalized = key(dir);
+      if (seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+  };
   const byPath = new Map((options.availableFiles || files).map(f => [key(path.resolve(root, f.rel)), f]));
   const inputs = new Map();
   const headers = new Map();
@@ -72,9 +81,9 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const system = dirsFor('-isystem');
     const after = dirsFor('-idirafter');
     const systemKeys = new Set([...system, ...after].map(key));
-    const search = [...dirsFor('-I').filter(dir => !systemKeys.has(key(dir))), ...system, ...after];
+    const search = uniqueDirs([...dirsFor('-I').filter(dir => !systemKeys.has(key(dir))), ...system, ...after]);
     if (!includeOptions.length) search.push(path.resolve(root));
-    const quotedSearch = [...dirsFor('-iquote'), ...search];
+    const quotedSearch = uniqueDirs([...dirsFor('-iquote'), ...search]);
     const forced = [...(config.macroIncludes || []).map(target => [target, true]),
       ...(config.forcedIncludes || []).map(target => [target, false])];
     const predefined = profilePredefinedMacros(source.rel, config);
@@ -91,7 +100,9 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       function include({ target, line }, quoted, next, fromDir = path.dirname(path.resolve(root, file.rel)), macrosOnly = macroOnly) {
         const resume = next && origin;
         const dirs = resume ? origin.dirs : quoted ? [fromDir, ...quotedSearch] : search;
+        const supplyingDir = resume ? key(origin.dirs[origin.index]) : null;
         for (let index = resume ? origin.index + 1 : 0; index < dirs.length; index++) {
+          if (supplyingDir !== null && key(dirs[index]) === supplyingDir) continue;
           const abs = path.resolve(dirs[index], target.replaceAll('\\', '/'));
           const absKey = key(abs);
           const relative = path.relative(root, abs);

@@ -735,3 +735,28 @@ test('构建配置从找到包装头的目录之后解析 include_next', async t
     assert.deepEqual(clang.functions.map(fn => fn.name), ['wrapped']);
   }
 });
+
+test('include_next 跳过与本地包装头目录重复的 -I 路径', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -I. -Isdk -c main.c');
+  write(root, 'config.h', '#pragma once\n#include_next <config.h>\n');
+  write(root, 'sdk/config.h', '#define FEATURE 1\n');
+  write(root, 'main.c', [
+    '#include "config.h"', '#if FEATURE',
+    'void wrapped(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, scanSources(root), profile);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.functions.map(fn => fn.name), ['wrapped']);
+});
+
+test('Make 引号条件保留空操作数并选择正确的编译参数', t => {
+  const root = temporaryProject(t);
+  const file = write(root, 'Makefile', [
+    'MODE =', 'ifeq "$(MODE)" ""', 'CFLAGS = -DEMPTY', 'else', 'CFLAGS = -DWRONG', 'endif',
+    "ifneq 'on' ''", 'CFLAGS += -DENABLED', 'endif', 'all:', '\tcc $(CFLAGS) -c main.c',
+  ].join('\n'));
+  write(root, 'main.c', 'int value;');
+  assert.deepEqual(parseMakefileTree(file, root).compilationUnits['main.c'].defines, ['EMPTY', 'ENABLED']);
+});

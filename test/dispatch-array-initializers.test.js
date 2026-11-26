@@ -204,3 +204,24 @@ test('切换联合体成员会作废重叠的回调槽，保留同一成员的�
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'foo', 'bar']);
 });
+
+test('匿名聚合的初始化保持不确定，不将回调错分给后续字段', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-anonymous-member-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { Fn first; Fn alternate; }; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops implicit = { foo };',
+    'static const Ops explicit = { .alternate = foo, .next = bar };',
+    'void call(void) { if (implicit.next) implicit.next(); explicit.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = name => model.fnptrTables.find(entry => entry.name === name);
+  assert.equal(table('implicit').incomplete, true);
+  assert.equal(table('implicit').map.next, undefined);
+  assert.equal(table('explicit').map.next, 'bar');
+  assert.ok(!model.edges.some(edge => edge.from === 'ops.c::call' && edge.to === 'ops.c::foo'));
+  const explicitCall = model.indirectCalls.find(call => call.receiver === 'explicit');
+  assert.deepEqual(explicitCall.candidates.map(candidate => candidate.name), ['bar']);
+});

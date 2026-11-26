@@ -408,6 +408,10 @@ function initializerDeclarations(statement, macros) {
 function initializerMembers(body, macros) {
   const fields = new Map();
   for (const part of splitAtTopLevel(body, ';')) {
+    if (['struct', 'union'].includes(part[0]?.v) && part[1]?.v === '{' && matchBrace(part, 1) === part.length - 1) {
+      fields.set('@anonymous:' + part[0].s, { anonymous: true });
+      continue;
+    }
     for (const [name, shape] of initializerDeclarations(part, macros)) fields.set(name, shape);
   }
   return fields;
@@ -471,11 +475,14 @@ function formatInitIndex(index) {
   return `[?${index.expr}${index.offset ? '+' + index.offset : ''}]`;
 }
 
+const anonymousInitLayout = { anonymous: true };
+
 /** 延迟展开成员类型，遇到指针就停止，递归结构体不会无限展开。 */
 function initializerLayout(root, file, lookup) {
   const cache = new Map();
   const resolve = (declaration, source) => {
     if (!declaration) return null;
+    if (declaration.anonymous) return anonymousInitLayout;
     if (cache.has(declaration)) return cache.get(declaration);
     const extents = [];
     const seen = new Set();
@@ -496,7 +503,7 @@ function initializerLayout(root, file, lookup) {
     }
     const fields = shape?.pointer ? null : shape?.fields;
     let layout = fields ? {
-      names: [...fields.keys()], union: !!shape.union,
+      names: [...fields.keys()], union: !!shape.union, hasAnonymous: [...fields.values()].some(field => field.anonymous),
       field: name => resolve(fields.get(name), source),
     } : { pointer: !!shape?.pointer };
     for (let i = extents.length - 1; i >= 0; i--) layout = { element: layout, length: extents[i] };
@@ -507,7 +514,9 @@ function initializerLayout(root, file, lookup) {
 }
 
 function initChild(layout, part) {
-  return typeof part === 'string' ? layout?.field?.(part) : layout?.element;
+  if (layout?.anonymous) return layout;
+  if (typeof part !== 'string') return layout?.element;
+  return layout?.field?.(part) ?? (layout?.hasAnonymous ? anonymousInitLayout : undefined);
 }
 
 /** 消耗一个子对象，将游标进位到下一个成员或数组元素。 */
@@ -577,7 +586,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     if (!val.length) continue;
     const braced = val[0].v === '{' && val.at(-1).v === '}';
     const path = designated ? designators : cursor?.slice();
-    const unknownPosition = !path;
+    let unknownPosition = !path;
     const parts = path ?? [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
     if (parts.some(p => typeof p === 'object')) status.incomplete = true;
     const operand = braced ? null : simpleInitializerOperand(val);
@@ -601,6 +610,13 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         parts.push(first);
         child = child.field(first);
       } else break;
+    }
+    if (child?.anonymous) {
+      // 匿名聚合会提升字段名，无法确定布局时不将值误分配给后续字段。
+      status.incomplete = true;
+      unknownPosition = true;
+      parts.splice(0, parts.length, { expr: '@' + item[0].line + ':' + item[0].col, offset: 0 });
+      child = null;
     }
     const slotPath = [...prefix, ...parts];
     let slot = '';

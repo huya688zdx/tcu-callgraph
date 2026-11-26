@@ -116,24 +116,28 @@ function tokenizeArgs(line) {
   const out = [];
   let cur = '';
   let quote = '';
+  let started = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '\\' && quote !== "'" && line[i + 1] === '"') {
       cur += '"';
+      started = true;
       i++;
       continue;
     }
     if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
       quote = quote ? '' : ch;
+      started = true;
       continue;
     }
     if (!quote && /\s/.test(ch)) {
-      if (cur) { out.push(cur); cur = ''; }
+      if (started) { out.push(cur); cur = ''; started = false; }
       continue;
     }
     cur += ch;
+    started = true;
   }
-  if (cur) out.push(cur);
+  if (started) out.push(cur);
   return out;
 }
 
