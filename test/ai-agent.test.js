@@ -16,6 +16,97 @@ import {
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
+test('runAiAgent：当前附件超过输入预算时提示缩小行范围，并在发送前停止', async () => {
+  const content = 'int work(void);\n'.repeat(1600).slice(0, 24_000);
+  const attachments = Array.from({ length: 4 }, (_, i) => ({ name: i + '.c', content }));
+  let sent = 0;
+  await assert.rejects(runAiAgent({
+    config: { baseUrl: 'http://localhost', model: 'mock' },
+    prompt: '分析代码', attachments,
+    fetchImpl: () => { sent++; throw new Error('超限请求不应发送'); },
+  }), /预计需要.*24576.*附件/);
+  assert.equal(sent, 0);
+});
+
+test('runAiAgent：附件全文优先于旧历史，每次请求都给输出和工具结果留出空间', async () => {
+  const config = { baseUrl: 'http://localhost', model: 'mock', toolMode: 'tools', maxTokens: 8192 };
+  const content = 'int sensor(void);\n'.repeat(100);
+  const turn = { config, prompt: '查看相关函数', attachments: [{ name: 'sensor.c', content }] };
+  const done = () => Response.json({ choices: [{ message: { content: '已查看。' } }] });
+  const baseline = await runAiAgent({ ...turn, fetchImpl: done });
+  config.contextWindow = baseline.metrics.contextEstTokens + config.maxTokens + 1450;
+  const requests = [];
+  const result = await runAiAgent({
+    ...turn,
+    history: [
+      { role: 'user', text: '旧的问题：' + '温'.repeat(3500) },
+      { role: 'assistant', text: '旧的回答' },
+      { role: 'user', text: '最近的问题' },
+      { role: 'assistant', text: '最近的说明：' + '温'.repeat(550) },
+    ],
+    executeTool: async () => ({ ok: true, name: 'sensor', file: 'sensor.c', startLine: 1, endLine: 1, source: '温'.repeat(950) }),
+    fetchImpl: async (_url, { body }) => {
+      const req = JSON.parse(body);
+      requests.push(req);
+      assert.ok(estimateMessagesTokens(req.messages, !!req.tools) + req.max_tokens <= config.contextWindow);
+      if (requests.length > 1) return done();
+      return Response.json({ choices: [{ message: { tool_calls: [{
+        id: 'read', type: 'function', function: { name: 'read_function', arguments: '{"name":"sensor"}' },
+      }] } }] });
+    },
+  });
+  assert.equal(result.answer, '已查看。');
+  assert.equal(requests.length, 2);
+  assert.ok(requests[0].messages.some(m => m.content?.includes('最近的说明')));
+  assert.ok(!requests[0].messages.some(m => m.content?.includes('旧的问题')));
+  assert.ok(!requests[0].messages.some(m => m.content?.includes('旧的回答')));
+  assert.equal(requests[0].messages[1].role, 'user');
+  assert.ok(!requests[1].messages.some(m => m.content?.includes('最近的说明')));
+  assert.deepEqual(requests[1].messages.slice(-2).map(m => m.role), ['assistant', 'tool']);
+  for (const req of requests) assert.ok(req.messages.some(m => m.role === 'user' && m.content.includes(content)));
+});
+
+test('runAiAgent：按历史 token 或条数限制裁剪时，完整保留最近的问答', async () => {
+  for (const byCount of [false, true]) {
+    const history = Array.from({ length: byCount ? 21 : 6 }, (_, i) => ({
+      role: i % 2 ? 'assistant' : 'user',
+      text: '历史' + i + (byCount || i === 5 ? '' : '温'.repeat(3900)),
+    }));
+    await runAiAgent({
+      config: { baseUrl: 'http://localhost', model: 'mock', maxTokens: 1024, contextWindow: 32768 },
+      prompt: '继续核对', history,
+      fetchImpl: async (_url, { body }) => {
+        const { messages } = JSON.parse(body);
+        assert.equal(messages[1].role, 'user');
+        assert.ok(messages[1].content.startsWith('历史2'));
+        return Response.json({ choices: [{ message: { content: '已核对。' } }] });
+      },
+    });
+  }
+});
+
+test('runAiAgent：工具结果撑满窗口后保留操作记录，后续请求和步数上限总结都遵守预算', async () => {
+  const config = { baseUrl: 'http://localhost', model: 'mock', toolMode: 'prompt', maxTokens: 4096 };
+  const turn = { config, prompt: '查看函数', attachments: [{ name: 'entry.c', content: 'int sensor(void);' }] };
+  const initial = await runAiAgent({ ...turn, fetchImpl: async () => Response.json({ choices: [{ message: { content: '好' } }] }) });
+  config.contextWindow = initial.metrics.contextEstTokens + config.maxTokens + 40;
+  for (const maxSteps of [1, 2]) {
+    let sent = 0;
+    const result = await runAiAgent({
+      ...turn, maxSteps,
+      executeTool: async () => ({ ok: true, name: 'sensor', file: 'entry.c', startLine: 1, endLine: 1, source: '字'.repeat(1000) }),
+      fetchImpl: async () => {
+        sent++;
+        return Response.json({ choices: [{ message: { content: '<tool_call>{"name":"read_function","arguments":{"name":"sensor"}}</tool_call>' } }] });
+      },
+    });
+    assert.equal(sent, 1);
+    assert.equal(result.toolLog.length, 1);
+    assert.equal(result.toolLog[0].name, 'read_function');
+    assert.ok(result.answer.includes(result.toolLog[0].summary));
+  }
+});
+
 test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 时降级', async () => {
   const prompt = '查看画布截图';
   const small = 'data:image/png;base64,AAAA';

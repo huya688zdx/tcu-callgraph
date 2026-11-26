@@ -428,6 +428,19 @@ export function estimateMessagesTokens(messages, includeTools = false) {
   }, includeTools ? TOOL_SCHEMA_TOKENS : 0);
 }
 
+/** 仅裁剪 [start, end) 中的旧对话；移除提问时也移除它后面的回答。 */
+function trimOldTurns(messages, start, end, excessTokens, excessCount = 0) {
+  let freed = 0, count = 0;
+  while (start + count < end) {
+    const message = messages[start + count];
+    if (freed >= excessTokens && count >= excessCount && !(count && message.role === 'assistant')) break;
+    freed += estimateMessagesTokens([message]);
+    count++;
+  }
+  if (count) messages.splice(start, count);
+  return freed;
+}
+
 function openAiToolsPayload() {
   return AGENT_TOOLS.map(tool => ({
     type: 'function',
@@ -994,9 +1007,8 @@ async function readChatStream(body, signal, onDelta, onChunk, onProgress) {
   return { choices: [{ message: msg, finish_reason: finishReason }], usage };
 }
 
-function createMetrics(config, request, onEvent, onReport = null) {
+function createMetrics(config, contextEstTokens, onEvent, onReport = null) {
   const startedAt = Date.now();
-  const contextEstTokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
   let firstTokenAt = null;
   let lastReport = null;
   let completionEstimate = 0;
@@ -1303,9 +1315,8 @@ export async function runAiAgent({
   const cleanHistory = (Array.isArray(history) ? history : [])
     .filter(m => m && ['user', 'assistant'].includes(m.role))
     .map(m => ({ role: m.role, content: historyContent(m, 4000, historyAttachmentChars) }))
-    .filter(m => m.content)
-    .slice(-20);
-  while (estimateMessagesTokens(cleanHistory) > historyBudget) cleanHistory.shift();
+    .filter(m => m.content);
+  trimOldTurns(cleanHistory, 0, cleanHistory.length, estimateMessagesTokens(cleanHistory) - historyBudget, cleanHistory.length - 20);
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
   const removal = /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
   const pendingVehicle = /车型|目录|全部保留|\bz\d+\b/u.test(lastReply) &&
@@ -1364,6 +1375,14 @@ export async function runAiAgent({
   const recordMetrics = (m) => { lastMetrics = m; };
   const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
   const maxTokens = config.maxTokens ?? DEFAULT_AI_CONFIG.maxTokens;
+  // 输出上限为 0 时由模型决定输出长度，至少留出一个生成 token。
+  const inputBudget = config.contextWindow - Math.max(1, maxTokens);
+  const fitRequestHistory = (request) => {
+    const tokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
+    const turnStart = request.messages.indexOf(userMessage);
+    // 只移除本轮之前的消息，保留附件全文和已执行工具的调用/返回配对。
+    return tokens - trimOldTurns(request.messages, 1, turnStart, tokens - inputBudget);
+  };
   const requestDefaults = {
     model: config.model,
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
@@ -1397,7 +1416,13 @@ export async function runAiAgent({
       ...(streamMode === 'stream_usage' ? { stream_options: { include_usage: true } } : {}),
     };
 
-    const metrics = createMetrics(config, reqBody, onEvent, recordMetrics);
+    const inputTokens = fitRequestHistory(reqBody);
+    if (inputTokens > inputBudget) {
+      const reason = `本轮输入预计需要 ${inputTokens} 个 token，预留输出后可用 ${Math.max(0, inputBudget)} 个。请缩小${attachments.length ? '附件的选取范围' : '本轮输入'}，或调整上下文窗口和输出上限。`;
+      if (!toolLog.length) throw new Error(reason);
+      return finish(`${reason}\n工具执行记录：${toolLog.map(tool => tool.summary).join('；')}。`);
+    }
+    const metrics = createMetrics(config, inputTokens, onEvent, recordMetrics);
     const res = await fetchJson(chatUrl, {
       method: 'POST',
       headers: authHeaders(config.apiKey),
@@ -1649,14 +1674,16 @@ export async function runAiAgent({
       };
       let metrics, res;
       do {
-        metrics = createMetrics(config, request, onEvent, recordMetrics);
+        const inputTokens = fitRequestHistory(request);
+        if (inputTokens > inputBudget) break;
+        metrics = createMetrics(config, inputTokens, onEvent, recordMetrics);
         res = await fetchJson(chatUrl, {
           method: 'POST',
           headers: authHeaders(config.apiKey),
           body: JSON.stringify(request),
         }, fetchImpl, 15_000, signal);
       } while (!res.ok && degradeImages(res));
-      if (res.ok) {
+      if (res?.ok) {
         summaryMessage = res.json?.choices?.[0]?.message;
         metrics.finish(res.json);
       }
