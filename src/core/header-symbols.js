@@ -7,7 +7,7 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
   for (const p of parsed) {
     if (!p.isHeader) continue;
     const definitions = new Map([...p.macroChanges].filter(([, def]) => def));
-    const context = fileMacroScope(headerMacros, definitions);
+    const context = fileMacroScope(p.profileScope || headerMacros, definitions);
     for (const m of definitions.values()) {
       const id = `header::${p.rel}::${m.name}`;
       const calls = invocations.get(id) || [];

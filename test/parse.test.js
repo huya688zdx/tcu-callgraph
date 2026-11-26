@@ -737,3 +737,142 @@ void dispatch(Ops *p, Ops s) {
   ]);
   assert.ok(sites.every(call => !call.table && !call.candidates.length));
 });
+
+test('C89 位置初始化按可见字段顺序分派，括号解引用和嵌套下标匹配同一槽位', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-positional-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), `
+typedef void (*Fn)(void);
+typedef struct { int id; Fn handler; } Tbl;
+typedef struct { Fn first, run; } Ops;
+struct Sub { Fn fn; Fn more[2]; };
+typedef struct { struct Sub sub; } Nested;
+typedef struct Later Later;
+struct Later { Nested entry; };
+`);
+  fs.writeFileSync(path.join(dir, 'wrapper.h'), '#include "types.h"\n');
+  fs.writeFileSync(path.join(dir, 'elsewhere.h'), 'typedef struct { void (*wrong)(void); } Tbl;\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "wrapper.h"
+static void FnA(void) {} static void FnB(void) {}
+static const Tbl rows[] = {{1, FnA}, {2, FnB}};
+static const Ops s_ops = {FnA, FnB};
+static const Nested nested[] = {{{FnA, {FnA, FnB}}}, {{FnB, {FnB, FnA}}}};
+static const Nested single = {{FnB, {FnA, FnA}}};
+static const struct Sub grid[1][2] = {{{FnA}, {FnB}}};
+static const Tbl flat[] = {1, FnA, 2, FnB};
+static const Later later = {FnB, FnA, FnB};
+static int index_of(void) { return 1; }
+void constant(void) {
+  rows[0].handler(); (*rows[1].handler)(); s_ops.run(); (*s_ops.first)();
+  nested[0].sub.fn(); single.sub.fn(); grid[0][1].fn(); nested[0].sub.more[1]();
+  flat[1].handler(); later.entry.sub.fn(); later.entry.sub.more[1]();
+}
+void dynamic(int i) {
+  rows[i].handler(); (*rows[index_of()].handler)(); (*nested[i].sub.fn)(); nested[0].sub.more[i]();
+}
+void local(int i) {
+  typedef struct { Fn handler; int id; } Tbl;
+  static const Tbl rows[] = {{FnB, 1}, {FnA, 2}};
+  rows[0].handler(); rows[i].handler();
+}
+`);
+  const model = loadModel(dir);
+  const edges = name => model.edges.filter(edge => edge.from === 'app.c::' + name && edge.kind !== 'var')
+    .map(edge => [edge.kind, edge.callee]);
+  const sites = name => model.indirectCalls.filter(site => site.caller === 'app.c::' + name);
+  assert.deepEqual(model.fnptrTables.find(table => table.name === 'rows' && !table.functionId).map,
+    { '[0].handler': 'FnA', '[1].handler': 'FnB' });
+  assert.deepEqual(edges('constant'), [
+    'FnA', 'FnB', 'FnB', 'FnA', 'FnA', 'FnB', 'FnB', 'FnB', 'FnB', 'FnB', 'FnB',
+  ].map(fn => ['fnptr', fn]));
+  assert.deepEqual(edges('local'), [['fnptr', 'FnB']]);
+  assert.deepEqual(edges('dynamic'), [['direct', 'index_of']]);
+  assert.deepEqual(sites('dynamic').map(site => [site.table.name, site.candidates.map(c => c.slot)]), [
+    ['rows', ['[0].handler', '[1].handler']], ['rows', ['[0].handler', '[1].handler']],
+    ['nested', ['[0].sub.fn', '[1].sub.fn']], ['nested', ['[0].sub.more[0]', '[0].sub.more[1]']],
+  ]);
+  assert.deepEqual(sites('local')[0].candidates.map(c => c.name), ['FnB', 'FnA']);
+});
+
+test('局部指针在初始化处绑定分派表，重赋值、增量与逃逸保留为间接候选', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-table-alias-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef struct { void (*run)(void); } Ops;
+typedef struct { int id; void (*handler)(void); } Tbl;
+static void FnA(void) {} static void FnB(void) {}
+static const Ops s_ops = {FnA};
+static const Ops other = {FnB};
+static const Tbl rows[] = {{0, FnA}, {1, FnB}};
+static const Tbl one[] = {{0, FnA}};
+void take(const Ops **out);
+#define ESCAPE(x) take(&(x))
+void constant(void) {
+  const Ops *p = &s_ops; p->run(); (*p->run)();
+  const Tbl *q = &rows[0]; q->handler();
+  { const Ops s_ops = {FnB}; p->run(); }
+  { const Ops *p = &other; p->run(); }
+  p->run();
+}
+void dynamic(int i) {
+  const Tbl *r = &rows[i]; r->handler();
+  const Tbl *s = &one[i]; (*s->handler)();
+}
+void reassign(int cond) { const Ops *p = &s_ops; if (cond) p = &other; p->run(); }
+void move(void) { const Tbl *p = &rows[0]; ++p; p->handler(); }
+void escape(void) { const Ops *p = &s_ops; ESCAPE(p); (*p->run)(); }
+void shadow(void) { const Ops *p = &s_ops; { const Ops *p = &other; ESCAPE(p); p->run(); } p->run(); }
+void conditional(void) {
+#ifdef VARIANT
+  const Ops *p = &other;
+#else
+  const Ops *p = &s_ops;
+#endif
+  p->run();
+}
+`);
+  const model = loadModel(dir);
+  const edges = name => model.edges.filter(edge => edge.from === 'app.c::' + name && edge.kind === 'fnptr')
+    .map(edge => edge.callee);
+  const sites = name => model.indirectCalls.filter(site => site.caller === 'app.c::' + name);
+  assert.deepEqual(edges('constant'), ['FnA', 'FnA', 'FnA', 'FnA', 'FnB', 'FnA']);
+  assert.deepEqual(sites('constant'), []);
+  for (const name of ['dynamic', 'reassign', 'move', 'escape', 'conditional']) assert.deepEqual(edges(name), [], name);
+  assert.deepEqual(sites('dynamic').map(site => [site.receiver, site.table.name, site.indices, site.candidates.map(c => c.slot)]), [
+    ['r', 'rows', ['i'], ['[0].handler', '[1].handler']], ['s', 'one', ['i'], ['[0].handler']],
+  ]);
+  assert.deepEqual(sites('reassign')[0].candidates.map(c => c.name), ['FnA', 'FnB']);
+  assert.deepEqual(sites('move')[0].candidates.map(c => c.name), ['FnA', 'FnB']);
+  assert.deepEqual(sites('escape')[0].candidates.map(c => c.name), ['FnA']);
+  assert.deepEqual(edges('shadow'), ['FnA']);
+  assert.deepEqual(sites('shadow')[0].candidates.map(c => c.name), ['FnB']);
+  assert.deepEqual(sites('conditional')[0].candidates.map(c => c.name).sort(), ['FnA', 'FnB']);
+});
+
+test('带尾置嵌入式属性的分派表保留变量名，并在初始化行展开处理函数宏', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-table-attribute-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef struct { void (*run)(void); } Ops;
+static void RealFn(void) {} static void Later(void) {}
+#define ALIAS_MACRO HANDLER
+#define HANDLER RealFn
+static const Ops sectioned[] __attribute__((section(".rodata"))) = {{.run = ALIAS_MACRO}};
+static const Ops unused _attribute((unused)) = {.run = &ALIAS_MACRO};
+#undef HANDLER
+#define HANDLER Later
+static const Ops aligned __declspec(align(4)) _attribute((unused)) = {ALIAS_MACRO};
+static void (*const raw[])(void) __attribute__((used)) = {ALIAS_MACRO};
+void call(void) { sectioned[0].run(); unused.run(); aligned.run(); raw[0](); }
+void local(void) { static const Ops block _attribute((unused)) = {ALIAS_MACRO}; block.run(); }
+`);
+  const model = loadModel(dir);
+  assert.deepEqual(model.fnptrTables.filter(table => !table.functionId).map(table => [table.name, table.map]), [
+    ['sectioned', { '[0].run': 'RealFn' }], ['unused', { run: 'RealFn' }],
+    ['aligned', { run: 'Later' }], ['raw', { '[0]': 'Later' }],
+  ]);
+  assert.deepEqual(model.edges.filter(edge => edge.from === 'app.c::call' && edge.kind === 'fnptr').map(edge => edge.callee),
+    ['RealFn', 'RealFn', 'Later', 'Later']);
+  assert.deepEqual(model.edges.filter(edge => edge.from === 'app.c::local' && edge.kind !== 'var').map(edge => edge.callee), ['Later']);
+});

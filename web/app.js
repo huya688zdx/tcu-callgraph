@@ -30,6 +30,7 @@ import { acceptRestoredRevision, restorePage, savePage } from './lib/live.js';
 import { syncComparison } from './lib/compare.js';
 import { clearPairFlow } from './lib/pair-flow.js';
 import { syncFlowchart, wireFlowchart } from './lib/flowchart.js';
+import { openModal, closeModal } from './lib/modal.js';
 
 wireFlowchart();
 
@@ -349,6 +350,7 @@ hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
   // 并行恢复统计、文件树与画布，解析器探测异步执行不阻塞首帧；并通知 AI 助手按新工程隔离切换对话。
   if (!preserveAiChat) document.dispatchEvent(new CustomEvent('cg:project-changed'));
   void loadParsers();
+  void loadBuildConfigs();
   const [result] = await Promise.all([
     restorePage({ isCurrent: (started) => epoch === reloadEpoch && seq + Number(started) === viewSeq }),
     loadTree(),
@@ -385,6 +387,7 @@ function syncCanvasControls() {
   els.groupMode.disabled = !!state.at;
   els.layoutGroupSelect.disabled = !!state.at;
   els.parserSelect.disabled = parserBusy || !!state.at || !!state.view?.comparison || els.parserSelect.options.length < 2;
+  if (buildConfigBtn) buildConfigBtn.disabled = parserBusy || !!state.at || !!state.view?.comparison;
   els.resetLayout.disabled = !!state.at;
   emptyGuide.hidden = !!state.view?.nodes.length || !!state.view?.comparison;
   emptyGuideCompare.disabled = !!state.at;
@@ -646,6 +649,217 @@ els.groupMode.addEventListener('change', () => {
 let parserBusy = false;
 let activeParser = '';
 let parserList = [];
+let buildConfigState = null;
+const buildConfigBtn = document.getElementById('buildConfigBtn');
+const buildProfileSelect = document.getElementById('buildProfileSelect');
+const buildProfileInfo = document.getElementById('buildProfileInfo');
+const buildMultiCoreHint = document.getElementById('buildMultiCoreHint');
+const buildParserSelect = document.getElementById('buildParserSelect');
+const buildStrictCheck = document.getElementById('buildStrictCheck');
+const buildClangBin = document.getElementById('buildClangBin');
+const buildClangStatus = document.getElementById('buildClangStatus');
+const buildConfigMessage = document.getElementById('buildConfigMessage');
+const buildConfigCancel = document.getElementById('buildConfigCancel');
+const buildExportDb = document.getElementById('buildExportDb');
+const buildConfigApply = document.getElementById('buildConfigApply');
+let buildModalSeq = 0;
+let buildStrictTouched = false;
+
+function setBuildMessage(text, isError = false) {
+  if (!buildConfigMessage) return;
+  buildConfigMessage.textContent = text || '';
+  buildConfigMessage.className = isError ? 'err' : 'ok';
+  buildConfigMessage.hidden = !text;
+}
+
+function updateBuildConfigBtn() {
+  if (!buildConfigBtn) return;
+  if (!buildConfigState || buildConfigState.unsupported) {
+    buildConfigBtn.hidden = true;
+    return;
+  }
+  buildConfigBtn.hidden = false;
+  const active = (buildConfigState.profiles || []).find((p) => p.id === buildConfigState.activeProfileId);
+  if (active) {
+    buildConfigBtn.textContent = `⚙ ${active.label}`;
+    buildConfigBtn.classList.add('active');
+    buildConfigBtn.title = `当前构建配置：${active.label}（${active.compiler} · ${active.activeFileCount} 个 .c）`;
+  } else {
+    const count = (buildConfigState.profiles || []).length;
+    buildConfigBtn.textContent = count ? `⚙ 构建配置 (${count})` : '⚙ 构建配置';
+    buildConfigBtn.classList.remove('active');
+    buildConfigBtn.title = '选择机种构建配置（.cproject / .mak / QAC）、设置便携版 Clang 路径或导出 compile_commands.json';
+  }
+}
+
+function renderBuildProfileSummary() {
+  if (!buildProfileInfo || !buildConfigState) return;
+  const id = buildProfileSelect?.value || '';
+  const p = (buildConfigState.profiles || []).find((item) => item.id === id);
+  buildProfileInfo.replaceChildren();
+  if (!p) {
+    const line = document.createElement('div');
+    line.textContent = `全部源码（未按机种过滤）：共 ${buildConfigState.totalSourceFiles || 0} 个 .c 文件。` +
+      ((buildConfigState.profiles || []).length
+        ? `已检测到 ${buildConfigState.profiles.length} 个构建配置，切换后将按所选机种过滤参与编译的源码并注入宏定义。`
+        : '当前目录未发现 .cproject / .mak / QAC 配置，可直接使用全部源码或配置 Clang 路径。');
+    buildProfileInfo.append(line);
+    return;
+  }
+  const head = document.createElement('div');
+  head.textContent = `来源：${p.configFile} · 编译器/架构：${p.compiler} (${p.arch}) · 参与编译：${p.activeFileCount} / ${buildConfigState.totalSourceFiles || 0} 个 .c`;
+  buildProfileInfo.append(head);
+  const tags = document.createElement('div');
+  tags.className = 'build-tags';
+  const items = [
+    `-I 目录 ${p.includeCount}`,
+    `-D 宏定义 ${p.defineCount}`,
+    ...(p.exclusionCount ? [`排除规则 ${p.exclusionCount}`] : []),
+    ...(p.sampleDefines || []).slice(0, 6).map((d) => `-D${d}`),
+  ];
+  for (const label of items) {
+    const span = document.createElement('span');
+    span.className = 'build-tag';
+    span.textContent = label;
+    tags.append(span);
+  }
+  buildProfileInfo.append(tags);
+}
+
+function renderBuildConfigModal() {
+  if (!buildConfigState || !buildProfileSelect) return;
+  const profiles = buildConfigState.profiles || [];
+  buildProfileSelect.replaceChildren(
+    new Option(`全部源码（默认 · ${buildConfigState.totalSourceFiles || 0} 个 .c）`, ''),
+    ...profiles.map((p) => new Option(`${p.label} [${p.source} · ${p.activeFileCount} .c]`, p.id)),
+  );
+  buildProfileSelect.value = buildConfigState.activeProfileId || '';
+  if (buildMultiCoreHint) {
+    buildMultiCoreHint.hidden = !buildConfigState.multiCoreHint;
+    buildMultiCoreHint.textContent = buildConfigState.multiCoreHint
+      ? `检测到 ${buildConfigState.cprojectCount} 个 .cproject（多核或多工程结构），已按目录前缀拆分为独立配置供单独选择。`
+      : '';
+  }
+  if (buildParserSelect) {
+    buildParserSelect.value = buildConfigState.activeParser || activeParser || 'builtin';
+  }
+  if (buildStrictCheck) {
+    buildStrictCheck.checked = buildConfigState.strictCompileCommands !== false;
+  }
+  if (buildClangBin) {
+    buildClangBin.value = buildConfigState.clangBin || '';
+  }
+  if (buildClangStatus) {
+    const st = buildConfigState.clangStatus;
+    if (st?.ok) {
+      buildClangStatus.className = 'build-status ok';
+      buildClangStatus.textContent = `✓ 已就绪：${st.version}（${st.bin}）`;
+    } else {
+      buildClangStatus.className = 'build-status warn';
+      buildClangStatus.textContent = `⚠ 未检测到 Clang（${st?.reason || '未安装'}）。仍可使用「内置快速解析」按所选机种过滤源码与宏定义；后续拷贝便携版 clang.exe 后在此填入路径即可启用 Clang AST。`;
+    }
+  }
+  renderBuildProfileSummary();
+}
+
+async function loadBuildConfigs() {
+  const epoch = reloadEpoch;
+  const data = await api.buildConfigs();
+  if (epoch !== reloadEpoch) return;
+  buildConfigState = data;
+  updateBuildConfigBtn();
+  if (document.getElementById('buildConfigModal')?.classList.contains('show')) {
+    renderBuildConfigModal();
+  }
+}
+
+buildStrictCheck?.addEventListener('change', () => {
+  buildStrictTouched = true;
+});
+
+buildProfileSelect?.addEventListener('change', () => {
+  if (buildProfileSelect.value && buildStrictCheck && !buildStrictTouched) {
+    buildStrictCheck.checked = true;
+  }
+  renderBuildProfileSummary();
+  setBuildMessage('');
+});
+
+buildConfigCancel?.addEventListener('click', () => closeModal());
+
+buildConfigBtn?.addEventListener('click', async () => {
+  if (parserBusy || state.at || state.view?.comparison) return;
+  const seq = ++buildModalSeq;
+  const epoch = reloadEpoch;
+  buildStrictTouched = false;
+  setBuildMessage('正在刷新工程构建配置…');
+  if (buildConfigApply) buildConfigApply.disabled = true;
+  if (buildExportDb) buildExportDb.disabled = true;
+  openModal('buildConfigModal');
+  const data = await api.buildConfigs();
+  if (seq !== buildModalSeq || epoch !== reloadEpoch) return;
+  if (!data) {
+    setBuildMessage('获取构建配置失败，请关闭重试', true);
+    return;
+  }
+  buildConfigState = data;
+  updateBuildConfigBtn();
+  renderBuildConfigModal();
+  setBuildMessage('');
+  if (buildConfigApply) buildConfigApply.disabled = false;
+  if (buildExportDb) buildExportDb.disabled = false;
+});
+
+buildExportDb?.addEventListener('click', async () => {
+  if (parserBusy) return;
+  buildExportDb.disabled = true;
+  setBuildMessage('正在生成 compile_commands.json…');
+  try {
+    const result = await api.saveBuildConfig({
+      profileId: buildProfileSelect?.value || null,
+      exportCompileCommands: true,
+    });
+    if (!result?.ok) throw new Error(result?.error || '导出失败');
+    setBuildMessage(`已导出 ${result.exportedPath}（共 ${result.unitCount} 个编译单元，${result.includeCount} 个 -I，${result.defineCount} 个 -D${result.shimPath ? '，含 GHS 兼容垫片' : ''}）`);
+  } catch (error) {
+    setBuildMessage(error.message || '导出失败', true);
+  } finally {
+    buildExportDb.disabled = false;
+  }
+});
+
+buildConfigApply?.addEventListener('click', async () => {
+  if (parserBusy) return;
+  parserBusy = true;
+  buildConfigApply.disabled = true;
+  buildExportDb.disabled = true;
+  syncCanvasControls();
+  setBuildMessage('正在应用构建配置并重新解析工程…');
+  try {
+    const result = await api.saveBuildConfig({
+      profileId: buildProfileSelect?.value || null,
+      parserId: buildParserSelect?.value || 'builtin',
+      clangBin: buildClangBin?.value ?? '',
+      strictCompileCommands: Boolean(buildStrictCheck?.checked),
+    });
+    if (!result?.ok) {
+      if (result?.clangStatus && buildClangStatus) {
+        buildClangStatus.className = 'build-status warn';
+        buildClangStatus.textContent = `⚠ ${result.clangStatus.reason || 'Clang 不可用'}`;
+      }
+      throw new Error(result?.error || '应用构建配置失败');
+    }
+    closeModal();
+    await hooks.reloadAll();
+  } catch (error) {
+    setBuildMessage(error.message || '应用构建配置失败', true);
+  } finally {
+    parserBusy = false;
+    buildConfigApply.disabled = false;
+    buildExportDb.disabled = false;
+    syncCanvasControls();
+  }
+});
 function renderParserSelect() {
   const select = els.parserSelect;
   select.replaceChildren(...parserList.map(({ id, name, available }) => {
@@ -783,6 +997,7 @@ resize();
   const myEpoch = reloadEpoch;
   const seq = viewSeq;
   void loadParsers();
+  void loadBuildConfigs();
   try {
     const p = await api.uiPrefs();
     if (myEpoch !== reloadEpoch) return;

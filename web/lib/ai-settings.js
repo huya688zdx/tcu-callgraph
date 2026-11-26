@@ -17,6 +17,7 @@ import { edgeKey, els, state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
 const drawer = document.getElementById('aiDrawer');
+const resizeHandle = document.getElementById('aiResizeHandle');
 const closeBtn = document.getElementById('aiDrawerClose');
 const tabs = [...document.querySelectorAll('[data-ai-tab]')];
 const panes = {
@@ -639,6 +640,35 @@ function locateSymbolFromChat(rawSym) {
   }
 }
 
+function splitTableCells(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\' && s[i + 1] === '|') { cur += '|'; i++; continue; }
+    if (s[i] === '|') { cells.push(cur.trim()); cur = ''; continue; }
+    cur += s[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+function parseTableAlignRow(line) {
+  if (!line || !line.includes('|')) return null;
+  const cells = splitTableCells(line);
+  if (cells.length < 2) return null;
+  const aligns = [];
+  for (const cell of cells) {
+    if (!/^:?-{2,}:?$/.test(cell)) return null;
+    if (cell.startsWith(':') && cell.endsWith(':')) aligns.push('center');
+    else if (cell.endsWith(':')) aligns.push('right');
+    else aligns.push('left');
+  }
+  return aligns;
+}
+
 function formatAssistantText(text) {
   const inline = (line) => line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, index) => {
     if (index % 2 === 0) return esc(part);
@@ -656,11 +686,78 @@ function formatAssistantText(text) {
     .replace(/^\s*\n+/, '').replace(/\n+\s*$/, '').replace(/\n{3,}/g, '\n\n').split('\n');
   let block = '';
   let html = '';
-  for (const line of lines) {
+  const closeBlock = () => {
+    if (block) {
+      html += `</${block}>`;
+      block = '';
+    }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 围栏代码块 ```
+    if (/^\s*```/.test(line)) {
+      closeBlock();
+      const codeLines = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) codeLines.push(lines[i]);
+      html += `<pre class="ai-md-pre"><code>${esc(codeLines.join('\n'))}</code></pre>`;
+      continue;
+    }
+
+    // GFM 表格（表头行 + 对齐分隔行 + 数据行）
+    const aligns = line.includes('|') && i + 1 < lines.length ? parseTableAlignRow(lines[i + 1]) : null;
+    if (aligns) {
+      const headers = splitTableCells(line);
+      if (headers.length >= 2) {
+        closeBlock();
+        const colCount = Math.max(headers.length, aligns.length);
+        const alignAttr = (c) => (aligns[c] && aligns[c] !== 'left' ? ` style="text-align:${aligns[c]}"` : '');
+        html += '<div class="ai-table-wrap"><table class="ai-md-table"><thead><tr>';
+        for (let c = 0; c < colCount; c++) {
+          html += `<th${alignAttr(c)}>${inline(headers[c] || '')}</th>`;
+        }
+        html += '</tr></thead><tbody>';
+        i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+          const cells = splitTableCells(lines[i]);
+          html += '<tr>';
+          for (let c = 0; c < colCount; c++) {
+            html += `<td${alignAttr(c)}>${inline(cells[c] || '')}</td>`;
+          }
+          html += '</tr>';
+          i++;
+        }
+        i--;
+        html += '</tbody></table></div>';
+        continue;
+      }
+    }
+
+    // 标题 #..####
+    const heading = line.match(/^\s*#{1,4}\s+(\S.*)$/);
+    if (heading) {
+      closeBlock();
+      html += `<h4 class="ai-md-h">${inline(heading[1])}</h4>`;
+      continue;
+    }
+
+    // 引用 >
+    const quote = line.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      closeBlock();
+      const qLines = [quote[1]];
+      while (i + 1 < lines.length && /^\s*>\s?/.test(lines[i + 1])) {
+        i++;
+        qLines.push(lines[i].replace(/^\s*>\s?/, ''));
+      }
+      html += `<blockquote class="ai-md-quote">${qLines.map(inline).join('<br>')}</blockquote>`;
+      continue;
+    }
+
     const item = line.match(/^\s*([-*+]|\d+\.)\s+(\S.*)$/);
     const tag = item ? (/^\d/.test(item[1]) ? 'ol' : 'ul') : line.trim() ? 'p' : '';
     if (block !== tag) {
-      if (block) html += `</${block}>`;
+      closeBlock();
       if (tag) html += `<${tag}>`;
       block = tag;
     } else if (tag === 'p') {
@@ -669,7 +766,7 @@ function formatAssistantText(text) {
     if (item) html += `<li>${inline(item[2])}</li>`;
     else if (tag) html += inline(line);
   }
-  if (block) html += `</${block}>`;
+  closeBlock();
   return html;
 }
 
@@ -1874,9 +1971,10 @@ function addStep(stepsEl, label) {
 }
 
 function finishStep(row, tool) {
-  row.classList.add(tool.ok !== false ? 'ok' : 'err');
+  const cls = tool.ok !== false ? 'ok' : (tool.blocked ? 'blocked' : 'err');
+  row.classList.add(cls);
   const head = row.querySelector('.ai-step-head');
-  head.textContent = head.title = tool.name;
+  head.textContent = head.title = tool.blocked ? `${tool.name}（待确认）` : tool.name;
   if (tool.summary) {
     const result = document.createElement('div');
     result.className = 'ai-step-result';
@@ -2235,7 +2333,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       dirtyScroll = true;
       scheduleStreamPaint();
     } else if (ev.type === 'tool_end') {
-      const tool = { name: ev.name, ok: ev.ok !== false, summary: ev.summary || '', digest: ev.digest || '' };
+      const tool = { name: ev.name, ok: ev.ok !== false, ...(ev.blocked ? { blocked: true } : {}), summary: ev.summary || '', digest: ev.digest || '' };
       collectedTools.push(tool);
       const index = pendingSteps.findIndex((step) => step.name === tool.name);
       const row = index >= 0 ? pendingSteps.splice(index, 1)[0].row : addStep(ui.steps, tool.name);
@@ -2257,7 +2355,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       stopThinking();
       const entry = {};
       if (Array.isArray(ev.toolLog) && ev.toolLog.length) {
-        entry.tools = ev.toolLog.map(({ name, ok, summary, digest }) => ({ name, ok, summary, digest }));
+        entry.tools = ev.toolLog.map(({ name, ok, blocked, summary, digest }) => ({ name, ok, ...(blocked ? { blocked: true } : {}), summary, digest }));
       }
       if (ev.type === 'question' || ev.awaitingUser) {
         entry.text = ev.question || '请确认以下选项：';
@@ -2749,3 +2847,67 @@ if (saveBtn)
       lockedEl.textContent = r?.error || t('ai.locked');
     }
   });
+
+// AI 抽屉左侧拖拽调宽（记住宽度并在窄窗自动收拢，双击恢复默认 460px）
+const AI_DRAWER_WIDTH_KEY = 'cg.aiDrawerWidth';
+const AI_DRAWER_DEFAULT_WIDTH = 460;
+const AI_DRAWER_MIN_WIDTH = 340;
+const AI_DRAWER_MAX_WIDTH = 960;
+
+function applyAiDrawerWidth(px, { persist = false } = {}) {
+  if (!drawer) return;
+  if (window.innerWidth <= 480) {
+    drawer.style.width = '';
+    return;
+  }
+  const maxW = Math.max(AI_DRAWER_MIN_WIDTH, Math.min(AI_DRAWER_MAX_WIDTH, window.innerWidth - 24));
+  const clamped = Math.round(Math.max(AI_DRAWER_MIN_WIDTH, Math.min(maxW, px)));
+  drawer.style.width = `${clamped}px`;
+  if (persist) {
+    try { localStorage.setItem(AI_DRAWER_WIDTH_KEY, String(clamped)); } catch { /* ignore */ }
+  }
+}
+
+try {
+  const saved = Number(localStorage.getItem(AI_DRAWER_WIDTH_KEY));
+  if (Number.isFinite(saved) && saved >= AI_DRAWER_MIN_WIDTH) applyAiDrawerWidth(saved);
+} catch { /* ignore */ }
+
+window.addEventListener('resize', () => {
+  if (!drawer) return;
+  if (window.innerWidth <= 480) {
+    drawer.style.width = '';
+    return;
+  }
+  const cur = Number.parseFloat(drawer.style.width);
+  if (Number.isFinite(cur) && cur > 0) applyAiDrawerWidth(cur);
+});
+
+if (resizeHandle && drawer) {
+  let resizing = false;
+  resizeHandle.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || window.innerWidth <= 480) return;
+    resizing = true;
+    drawer.classList.add('resizing');
+    resizeHandle.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  });
+  resizeHandle.addEventListener('pointermove', (e) => {
+    if (!resizing) return;
+    const desired = window.innerWidth - 12 - e.clientX;
+    applyAiDrawerWidth(desired);
+  });
+  const endResize = (e) => {
+    if (!resizing) return;
+    resizing = false;
+    drawer.classList.remove('resizing');
+    if (e?.pointerId != null) resizeHandle.releasePointerCapture?.(e.pointerId);
+    const cur = Number.parseFloat(drawer.style.width);
+    if (Number.isFinite(cur) && cur > 0) applyAiDrawerWidth(cur, { persist: true });
+  };
+  resizeHandle.addEventListener('pointerup', endResize);
+  resizeHandle.addEventListener('pointercancel', endResize);
+  resizeHandle.addEventListener('dblclick', () => {
+    applyAiDrawerWidth(AI_DRAWER_DEFAULT_WIDTH, { persist: true });
+  });
+}

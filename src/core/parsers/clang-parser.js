@@ -270,11 +270,24 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     const names = new Map(found.map((f) => [fileKey(f.rel), f.rel]));
     const headers = found.filter((f) => f.isHeader);
     const includeArgs = [...new Set([workRoot, ...headers.map((f) => path.dirname(f.abs))])].flatMap((dir) => ['-I', dir]);
-    const units = database ? completeCompileUnits(
-      readCompileCommands(root, database, { files: found, remap, includeTemplates: true }), found, includeArgs)
+    if (!database && options.strictCompileCommands) {
+      throw new Error('严格编译数据库模式需要有效的 compile_commands.json');
+    }
+    const responseFiles = new Map();
+    const units = database
+      ? (options.strictCompileCommands
+        ? readCompileCommands(root, database, { files: found, remap, responseFiles, includeTemplates: false })
+        : completeCompileUnits(
+          readCompileCommands(root, database, { files: found, remap, responseFiles, includeTemplates: true }), found, includeArgs))
       : found.filter((f) => !f.isHeader).map((f) => ({ rel: f.rel, file: f.abs, cwd: workRoot, args: includeArgs }));
     const selected = new Set(units.map((unit) => unit.rel));
-    if (!units.length) throw new Error('Clang AST 未找到当前工程的编译单元');
+    if (!units.length) {
+      // 选中配置的全部编译单元可能在本次变更中新增或删除；比较的这一侧即为空图。
+      if (sourceFiles && options.buildProfileId && options.strictCompileCommands) {
+        return { ...assemble(root, [], [], warnings, 0, new Map()), elapsedMs: Date.now() - started };
+      }
+      throw new Error('Clang AST 未找到当前工程的编译单元');
+    }
     const parsed = [];
     if (!execClang) dependenciesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-deps-'));
     const dependencyFile = dependenciesDir && path.join(dependenciesDir, 'headers.d');
@@ -304,7 +317,8 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     }
     if (!parsed.length) throw new Error(warnings.map((w) => `${w.file}：${w.error}`).join('；'));
     const files = found.filter((f) => f.isHeader || selected.has(f.rel)).map(({ abs, ...f }) => f);
-    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))), elapsedMs: Date.now() - started };
+    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))),
+      ...(responseFiles.size && { responseFiles: [...responseFiles] }), elapsedMs: Date.now() - started };
   } finally {
     if (dependenciesDir) fs.rmSync(dependenciesDir, { recursive: true, force: true });
     if (workRoot !== root) fs.rmSync(workRoot, { recursive: true, force: true });

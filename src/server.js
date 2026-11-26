@@ -42,6 +42,8 @@ import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
 import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
 import { readBuildConfigFile, resolveBuildFile, scanBuildConfig, summarizeCproject, summarizeDotProject } from './core/build-inspect.js';
+import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from './core/build-config.js';
+import { resolveBuildProfileOptions } from './core/build-profile-options.js';
 import { scheduleConfig } from './core/tcu-schedule.js';
 import { applyDataflow, diffParserModels } from './core/parsers/ir.js';
 import {
@@ -124,8 +126,26 @@ const analysisPending = new WeakMap();
 const configuredParser = () => store.getSetting('parser.active', 'builtin');
 const scanRootFor = target => fs.statSync(target, { throwIfNoEntry: false })?.isFile() ? path.dirname(target) : target;
 const compileCommandsKey = scanRoot => 'parser.compileCommandsPath.' + fileKey(path.resolve(scanRoot));
-const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => id === 'clang-ast'
-  ? { compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)) } : {};
+const clangBinKey = 'parser.clangBin';
+const buildProfileKey = scanRoot => 'parser.buildProfile.' + fileKey(path.resolve(scanRoot));
+const strictCompileCommandsKey = scanRoot => 'parser.strictCompileCommands.' + fileKey(path.resolve(scanRoot));
+const configuredClangBin = () => String(store.getSetting(clangBinKey) || '').trim();
+const configuredBuildProfile = scanRoot => store.getSetting(buildProfileKey(scanRoot)) || null;
+const configuredStrictCompile = scanRoot => store.getSetting(strictCompileCommandsKey(scanRoot));
+const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => {
+  const buildProfileId = configuredBuildProfile(scanRoot) || undefined;
+  if (id === 'clang-ast') {
+    const clangBin = configuredClangBin() || undefined;
+    const strictSaved = configuredStrictCompile(scanRoot);
+    return {
+      compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)),
+      ...(clangBin ? { clangBin } : {}),
+      ...(buildProfileId ? { buildProfileId } : {}),
+      ...(strictSaved !== undefined && strictSaved !== null ? { strictCompileCommands: Boolean(strictSaved) } : {}),
+    };
+  }
+  return buildProfileId ? { buildProfileId } : {};
+};
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
 async function compareProjects(...args) {
@@ -306,7 +326,8 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
   const scanRoot = isFile ? path.dirname(abs) : abs;
   const focus = isFile ? path.relative(path.dirname(abs), abs).replace(/\\/g, '/') : '';
   const scan = isDot ? null : await analysisJob('scan', () => scanRoot);
-  const parserKey = parser.cacheKey?.(scanRoot, parserOptions, status) ?? parser.id + ':2';
+  const resolvedOptions = isDot ? (parserOptions || {}) : resolveBuildProfileOptions(scanRoot, parser.id, parserOptions, scan?.files || []);
+  const parserKey = parser.cacheKey?.(scanRoot, resolvedOptions, status) ?? parser.id + ':2';
   const key = scan && !scan.warnings.length ? cacheKey(scan.files, focus, parserKey) : '';
   const scanMs = performance.now() - t0;
 
@@ -322,9 +343,9 @@ async function loadTargetModel(abs, isFile, parserId, parserOptions) {
     if (focus) model.focusFile = focus;
     rebuildIndex(model);
   } else if (parser.id === 'builtin' || parser.id === 'clang-ast') {
-    model = rebuildIndex(await scanInProcess(abs, scan, { parserId: parser.id, parserOptions }));
+    model = rebuildIndex(await scanInProcess(abs, scan, { parserId: parser.id, parserOptions: resolvedOptions }));
   } else {
-    model = await loadModel(abs, scan, { parserId: parser.id, parserOptions });
+    model = await loadModel(abs, scan, { parserId: parser.id, parserOptions: resolvedOptions });
   }
   const analyzeMs = performance.now() - parseAt;
 
@@ -596,8 +617,12 @@ async function getOrBuildFlowchart(projectId, model, fn, opts = {}) {
     const models = [model, otherFn ? otherModel : null].map((item, i) => {
       if (!item) return null;
       if (previous[i]?.deref() === item._index) return undefined;
-      const { root, parserId, files, includes, functions, externals, edges, headerSymbols, _sourceFiles, _sourceBuffers } = item;
-      return analysisModel({ root, parserId, files, includes, functions, externals, edges, headerSymbols, _sourceFiles, _sourceBuffers });
+      const { root, parserId, files, includes, functions, externals, edges, headerSymbols,
+        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, includeDirs,
+        includeOptions, forcedIncludes, macroIncludes, languageStandard, workingDirectory, _sourceFiles, _sourceBuffers } = item;
+      return analysisModel({ root, parserId, files, includes, functions, externals, edges, headerSymbols,
+        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, includeDirs,
+        includeOptions, forcedIncludes, macroIncludes, languageStandard, workingDirectory, _sourceFiles, _sourceBuffers });
     });
     state.indexes = [model, otherFn ? otherModel : null].map(item => item && new WeakRef(item._index));
     hit = cache.get(entryKey);
@@ -759,7 +784,7 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
     if (selection || parserId === 'builtin' || (isFile && /\.(dot|gv)$/i.test(abs))) throw error;
     fallback = `${parserId} 加载失败，已回退到内置快速解析：${error.message}`;
     console.warn(`[解析器] ${fallback}`);
-    loaded = await loadTargetModel(abs, isFile, 'builtin', {});
+    loaded = await loadTargetModel(abs, isFile, 'builtin', parserOptionsFor('builtin', isFile ? path.dirname(abs) : abs));
   }
   const { model, fromCache, loadMs } = loaded;
   // 同工程刷新期间照常接受写入。先在局部构建模型，发布前再检查会话并读最新存档。
@@ -803,7 +828,15 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
 
   if (selection) store.transaction(() => {
     store.setSetting('parser.active', selection.parserId);
-    if (selection.parserId === 'clang-ast') store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
+    if (selection.saveBuildConfig) {
+      const cfg = selection.saveBuildConfig;
+      if (cfg.clangBin !== undefined) store.setSetting(clangBinKey, cfg.clangBin || '');
+      if (cfg.buildProfileId !== undefined) store.setSetting(buildProfileKey(model.root), cfg.buildProfileId || null);
+      if (cfg.strictCompileCommands !== undefined) store.setSetting(strictCompileCommandsKey(model.root), Boolean(cfg.strictCompileCommands));
+      if (cfg.compileCommandsPath !== undefined) store.setSetting(compileCommandsKey(model.root), cfg.compileCommandsPath || null);
+    } else if (selection.parserId === 'clang-ast') {
+      store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
+    }
   });
   if (!refreshCurrent) sessionRevision++;
   root = abs;
@@ -2140,7 +2173,7 @@ async function buildView(
   const recommendations = (nodes, edges) => g.root ? {
     recommendations: previewRecommendations(g.root, model, COMPARISON, viewOverlay.deleted.nodes, nodes, edges),
   } : {};
-  // 局部范围补当前已显示节点之间的关系，不带入邻接函数。
+  // 局部范围补当前已显示节点之间的关系，不带入邻接函数；同时补齐当前可见节点之间经 AI 核实的推断调用边。
   const allowedIds = new Set(nodeMap.keys());
   for (const scope of cleanExpansions) {
     const part = subgraph(model, scope.root, { up: 1, down: 1, maxNodes: 600, includeVariables: !!COMPARISON, allowedIds });
@@ -2148,6 +2181,11 @@ async function buildView(
       const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
       if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
     }
+  }
+  for (const e of model.edges) {
+    if (!e.inferred || !allowedIds.has(e.from) || !allowedIds.has(e.to)) continue;
+    const k = `${e.from}|${e.to}|${e.line}|${e.kind}`;
+    if (!seenEdge.has(k)) { seenEdge.add(k); edgeList.push(e); }
   }
   truncated ||= g.nodes.length > 600;
   if (g.nodes.length > 600) {
@@ -2417,7 +2455,7 @@ export const server = http.createServer(async (req, res) => {
   try {
     u = new URL(req.url, `http://127.0.0.1:${PORT}`);
     req.switchRequest = ['/api/switch', '/api/compare', '/api/compare/apply', '/api/compare/exit',
-      '/api/parsers', '/api/parsers/diff'].includes(u.pathname);
+      '/api/parsers', '/api/parsers/diff', '/api/build-configs'].includes(u.pathname);
   } catch {
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
     return res.end('bad request');
@@ -4084,6 +4122,7 @@ export const server = http.createServer(async (req, res) => {
           if (!rawEdges.length) return { ok: false, error: 'edges 不能为空' };
           const removing = args.remove === true;
           const addToCanvas = args.addToCanvas !== false;
+          const includeTasks = args.includeTasks !== false;
           const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
           const resolvedEdges = [];
           const ambiguous = [];
@@ -4120,58 +4159,81 @@ export const server = http.createServer(async (req, res) => {
           }
           const currentList = loadInferredEdges(PROJECT.id);
           let nextList;
+          let newlyAddedCount = 0;
+          let alreadyExistedCount = 0;
           if (removing) {
             const rmSet = new Set(resolvedEdges.map(e => `${e.from}|${e.to}`));
             nextList = currentList.filter(e => !rmSet.has(`${e.from}|${e.to}`));
           } else {
             const byPair = new Map(currentList.map(e => [`${e.from}|${e.to}|${e.line}`, e]));
-            for (const e of resolvedEdges) byPair.set(`${e.from}|${e.to}|${e.line}`, e);
+            for (const e of resolvedEdges) {
+              const key = `${e.from}|${e.to}|${e.line}`;
+              if (byPair.has(key)) alreadyExistedCount++;
+              else newlyAddedCount++;
+              byPair.set(key, e);
+            }
             nextList = [...byPair.values()];
           }
           saveInferredEdges(PROJECT.id, nextList);
           applyInferredEdges(MODEL, PROJECT.id, nextList);
           S = stats(MODEL);
 
-          const review = reviewWriteResult();
+          let review = reviewWriteResult();
+          let canvasNodeCount = 0;
+          let upstreamCount = 0;
           if (!removing && addToCanvas) {
-            const page = latestPage() || {
-              projectId: PROJECT.id, comparisonId: null, roots: [], expansions: [], vars: [], hiddenVars: [],
-              up: 0, down: 0, group: true, groupMode: 'file', empty: true,
+            const fromIds = [...new Set(resolvedEdges.map((e) => e.from))];
+            const toIds = [...new Set(resolvedEdges.map((e) => e.to))];
+            const isAliveFn = (id) => {
+              const n = MODEL._index.byId.get(id);
+              return Boolean(n && n.kind !== 'var' && !n.external && !overlay.deleted.nodes[id]);
             };
-            const existingRoots = Array.isArray(page.roots) ? [...page.roots] : [];
-            const rootSet = new Set(existingRoots);
-            let addedNodes = false;
-            for (const e of resolvedEdges) {
-              for (const id of [e.from, e.to]) {
-                if (!rootSet.has(id)) {
-                  rootSet.add(id);
-                  existingRoots.push(id);
-                  addedNodes = true;
+            const aliveFrom = fromIds.filter(isAliveFn);
+            const aliveTo = toIds.filter(isAliveFn);
+            const endpointIds = [...new Set([...aliveFrom, ...aliveTo])];
+            if (endpointIds.length) {
+              // 复用 composeMcpView(mode:'add')，自动补齐调用方（from）的上游 TASK/上级调用链，并保留被调方（to）与连线
+              let composed = null;
+              if (includeTasks && aliveFrom.length) {
+                try {
+                  composed = composeMcpView({
+                    mode: 'add',
+                    changedFunctionIds: aliveFrom,
+                    functionIds: aliveTo.filter((id) => !aliveFrom.includes(id)),
+                    fallbackCallers: true,
+                    up: 0,
+                    down: 0,
+                    reason: reason || '补全间接调用链及上游调用者',
+                  });
+                } catch {
+                  composed = null;
                 }
               }
-            }
-            if (addedNodes) {
-              const key = 'ui.last-view.' + PROJECT.id;
-              const nextPage = {
-                ...page,
-                projectId: PROJECT.id,
-                comparisonId: null,
-                roots: existingRoots,
-                empty: false,
-                ts: Date.now(),
-              };
-              store.transaction(() => {
-                nextPage.revision = store.appendEvent(PROJECT.id, {
-                  op: 'view.compose',
-                  actor: 'ai',
-                  target: resolvedEdges[0].from,
-                  before: page,
-                  after: { ...nextPage, count: existingRoots.length, rootCount: existingRoots.length, reason: reason || '补全间接调用链', view: viewSnapshot(nextPage) },
-                });
-                store.setSetting(key, nextPage);
-              });
-              if (!review.updatedWhileReviewing) pageState = nextPage;
-              broadcastChange('view.compose', 'ai', { page: nextPage, reason: reason || '补全间接调用链' });
+              if (!composed) {
+                try {
+                  composed = composeMcpView({
+                    mode: 'add',
+                    changedFunctionIds: [],
+                    functionIds: endpointIds,
+                    up: 0,
+                    down: 0,
+                    reason: reason || '补全间接调用链',
+                  });
+                } catch {
+                  composed = null;
+                }
+              }
+              if (composed?.page) {
+                const visibleSet = new Set([
+                  ...(composed.page.roots || []),
+                  ...(composed.page.expansions || []).map((s) => s.root),
+                ]);
+                canvasNodeCount = visibleSet.size;
+                upstreamCount = Math.max(0, (composed.taskRoots?.length || 0) + (composed.upstreamFunctions?.length || 0));
+                if (composed.updatedWhileReviewing) review = { updatedWhileReviewing: true, reviewNote: composed.reviewNote };
+              } else {
+                broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
+              }
             } else {
               broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
             }
@@ -4183,6 +4245,10 @@ export const server = http.createServer(async (req, res) => {
             ok: true,
             removed: removing,
             addedCount: resolvedEdges.length,
+            newlyAddedCount,
+            alreadyExistedCount,
+            canvasNodeCount,
+            upstreamCount,
             edges: resolvedEdges,
             notFound,
             ...review,
@@ -4927,6 +4993,193 @@ export const server = http.createServer(async (req, res) => {
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
         });
+      return;
+    }
+
+    if (u.pathname === '/api/build-configs' && req.method === 'GET') {
+      const scanRoot = scanRootFor(root);
+      const isDot = fs.statSync(root, { throwIfNoEntry: false })?.isFile() && /\.(dot|gv)$/i.test(root);
+      if (isDot) {
+        return json(res, { ok: true, unsupported: true, activeParser: MODEL.parserId, profiles: [] });
+      }
+      const scan = await analysisJob('scan', () => scanRoot);
+      const discovered = discoverBuildProfiles(scanRoot);
+      const activeProfileId = configuredBuildProfile(scanRoot);
+      const clangBin = configuredClangBin();
+      const clangStatus = detectClang(clangBin || undefined, { refresh: true });
+      const strictSaved = configuredStrictCompile(scanRoot);
+      const strictCompileCommands = strictSaved === undefined || strictSaved === null
+        ? Boolean(activeProfileId) : Boolean(strictSaved);
+      const customCompileCommandsPath = store.getSetting(compileCommandsKey(scanRoot)) || '';
+      const detectedCompileCommands = findCompileCommands(scanRoot, customCompileCommandsPath || undefined);
+      const profiles = discovered.profiles.map((p) => {
+        const activeFiles = selectProfileSourceFiles(p, scan.files);
+        return {
+          id: p.id,
+          label: p.label,
+          source: p.source,
+          configFile: p.configFile,
+          dir: p.dir,
+          arch: p.arch,
+          compiler: p.compiler,
+          includeCount: (p.includeDirs || []).length,
+          defineCount: (p.defines || []).length,
+          exclusionCount: (p.exclusions || []).length,
+          activeFileCount: activeFiles.length,
+          sampleDefines: (p.defines || []).slice(0, 8),
+          sampleIncludes: (p.includeDirs || []).slice(0, 4).map((d) => {
+            const rel = path.relative(scanRoot, d).replace(/\\/g, '/');
+            return rel && !rel.startsWith('..') ? rel : d;
+          }),
+        };
+      });
+      return json(res, {
+        ok: true,
+        activeParser: MODEL.parserId,
+        configuredParser: configuredParser(),
+        clangBin,
+        clangStatus,
+        activeProfileId,
+        strictCompileCommands,
+        compileCommandsPath: customCompileCommandsPath,
+        detectedCompileCommands,
+        totalSourceFiles: scan.files.filter((f) => !f.isHeader).length,
+        multiCoreHint: discovered.multiCoreHint,
+        cprojectCount: discovered.cprojectCount,
+        profiles,
+      });
+    }
+
+    if (u.pathname === '/api/build-configs' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      switching = true;
+      try {
+        const body = await readJson(req, res);
+        const scanRoot = scanRootFor(root);
+        const isDot = fs.statSync(root).isFile() && /\.(dot|gv)$/i.test(root);
+        if (isDot) return bad(res, 'DOT 文件不支持构建配置');
+
+        const {
+          profileId,
+          parserId,
+          clangBin,
+          strictCompileCommands,
+          compileCommandsPath,
+          exportCompileCommands,
+          exportPath,
+        } = body || {};
+
+        if (clangBin !== undefined && (typeof clangBin !== 'string' || clangBin.includes('\0'))) {
+          return bad(res, 'clangBin 必须是有效的可执行文件路径');
+        }
+        if (profileId !== undefined && profileId !== null && (typeof profileId !== 'string' || profileId.includes('\0'))) {
+          return bad(res, 'profileId 无效');
+        }
+        if (compileCommandsPath !== undefined && compileCommandsPath !== null &&
+            (typeof compileCommandsPath !== 'string' || compileCommandsPath.includes('\0'))) {
+          return bad(res, 'compileCommandsPath 无效');
+        }
+
+        const discovered = discoverBuildProfiles(scanRoot);
+
+        if (exportCompileCommands) {
+          const targetId = profileId !== undefined ? (profileId || null) : configuredBuildProfile(scanRoot);
+          let profile = targetId ? discovered.profiles.find((p) => p.id === targetId) : null;
+          if (targetId && !profile) return bad(res, `未找到构建配置：${targetId}`);
+          if (!profile) {
+            profile = {
+              id: 'default:all',
+              label: '全部源码',
+              dir: '.',
+              arch: 'generic',
+              compiler: 'C',
+              includeDirs: [],
+              defines: [],
+              forcedIncludes: [],
+              exclusions: [],
+              sourceRoots: [],
+              explicitSources: [],
+            };
+          }
+          const relExport = String(exportPath || 'compile_commands.json').trim();
+          const absExport = path.resolve(scanRoot, relExport);
+          const relCheck = path.relative(scanRoot, absExport).replace(/\\/g, '/');
+          if (!relCheck || relCheck.startsWith('..') || path.isAbsolute(relCheck) || !/\.json$/i.test(relCheck)) {
+            return bad(res, '导出路径必须位于工程目录内且以 .json 结尾');
+          }
+          const scan = await analysisJob('scan', () => scanRoot);
+          const mat = materializeCompileCommands(scanRoot, profile, { files: scan.files, exportPath: relCheck });
+          return json(res, {
+            ok: true,
+            exportedPath: mat.compileCommandsPath,
+            shimPath: mat.shimPath,
+            unitCount: mat.unitCount,
+            includeCount: mat.includeCount,
+            defineCount: mat.defineCount,
+          });
+        }
+
+        const nextParserId = parserId ?? MODEL.parserId ?? configuredParser();
+        if (typeof nextParserId !== 'string' || !getParser(nextParserId) || nextParserId === 'dot') {
+          return bad(res, '未知源码解析器');
+        }
+        const nextClangBin = clangBin !== undefined ? clangBin.trim() : configuredClangBin();
+        const nextProfileId = profileId !== undefined
+          ? (typeof profileId === 'string' && profileId.trim() ? profileId.trim() : null)
+          : configuredBuildProfile(scanRoot);
+        if (nextProfileId && !discovered.profiles.some((p) => p.id === nextProfileId)) {
+          return bad(res, `未找到构建配置：${nextProfileId}`);
+        }
+        const nextStrict = strictCompileCommands !== undefined
+          ? Boolean(strictCompileCommands)
+          : (nextProfileId ? true : Boolean(configuredStrictCompile(scanRoot)));
+        const nextDbPath = compileCommandsPath !== undefined
+          ? (compileCommandsPath && compileCommandsPath.trim() ? path.resolve(scanRoot, compileCommandsPath.trim()) : null)
+          : (store.getSetting(compileCommandsKey(scanRoot)) || null);
+
+        const clangStatus = detectClang(nextClangBin || undefined, { refresh: true });
+        if (nextParserId === 'clang-ast' && !clangStatus.ok) {
+          return json(res, { ok: false, error: clangStatus.reason || 'Clang 不可用', clangStatus }, 400);
+        }
+
+        const nextParserOptions = nextParserId === 'clang-ast'
+          ? {
+              compileCommandsPath: nextDbPath,
+              strictCompileCommands: nextStrict,
+              ...(nextClangBin ? { clangBin: nextClangBin } : {}),
+              ...(nextProfileId ? { buildProfileId: nextProfileId } : {}),
+            }
+          : { ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
+
+        const { stats: st } = await openTarget(root, {
+          selection: {
+            parserId: nextParserId,
+            parserOptions: nextParserOptions,
+            saveBuildConfig: {
+              clangBin: nextClangBin,
+              buildProfileId: nextProfileId,
+              strictCompileCommands: nextStrict,
+              compileCommandsPath: nextDbPath,
+            },
+          },
+        });
+        comparisonPreview = null;
+        comparisonBase = null;
+        broadcastChange('project.switch', 'user', { project: ROOT_LABEL, projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
+        return json(res, {
+          ok: true,
+          activeParser: MODEL.parserId,
+          activeProfileId: nextProfileId,
+          strictCompileCommands: nextStrict,
+          clangBin: nextClangBin,
+          clangStatus,
+          parser: parserInfo(),
+          stats: st,
+          warnings: MODEL.warnings,
+        });
+      } catch (error) {
+        if (!res.headersSent) return json(res, { ok: false, error: error.message }, 400);
+      } finally { switching = false; }
       return;
     }
 

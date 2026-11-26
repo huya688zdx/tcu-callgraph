@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { preprocessProfile } from './builtin-includes.js';
 import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from '../cparse.js';
 import { decodeSource } from '../source-files.js';
 import { taskDeclarations } from '../task-declarations.js';
@@ -76,13 +77,13 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
       console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);
     }
   }
-  const headerMacros = new Map();
-  for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel);
-  for (const f of sources) {
+  const loadInput = f => {
     const original = lex(f.src, f.rel);
     const taskDefs = taskDeclarations(f.src, original);
-    f.src = taskDefs.source;
-    const { tokens } = preprocess(taskDefs.names.size ? lex(f.src, f.rel) : original, fileMacroScope(headerMacros), f.rel, { expand: true });
+    return { tokens: taskDefs.names.size ? lex(taskDefs.source, f.rel) : original, src: taskDefs.source };
+  };
+  const rawSources = new Map();
+  const renderTokens = tokens => {
     const parts = [];
     let line = 1;
     for (const tk of tokens) {
@@ -91,8 +92,30 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
       parts.push(tk.v, ' ');
       line += (tk.v.match(/\n/g) || []).length;
     }
-    f.expanded = parts.join('');
+    return parts.join('');
+  };
+  const saveExpanded = (f, input, { tokens }) => {
+    f.src = rawSources.get(f.rel) ?? input.src;
+    f.expanded = renderTokens(tokens);
     if (!keepOriginal) delete f.src;
+  };
+  if (model.pruneInactive) {
+    const profile = {
+      compilationUnits: model.compilationUnits, defines: model.buildDefines,
+      includeDirs: model.includeDirs, includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes,
+      macroArgs: model.macroArgs, macroIncludes: model.macroIncludes, languageStandard: model.languageStandard,
+      workingDirectory: model.workingDirectory,
+    };
+    if (keepOriginal) preprocessProfile(model.root, sources, profile, loadInput,
+      (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)));
+    preprocessProfile(model.root, sources, profile, loadInput, saveExpanded, true);
+  } else {
+    const macros = new Map();
+    for (const f of sources.filter(f => f.isHeader)) preprocess(lex(f.src, f.rel), macros, f.rel);
+    for (const f of sources) {
+      const input = loadInput(f);
+      saveExpanded(f, input, preprocess(input.tokens, fileMacroScope(macros), f.rel, { expand: true }));
+    }
   }
   return { sources, failedFiles };
 }

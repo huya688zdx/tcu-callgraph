@@ -5,6 +5,7 @@ import ELK from 'elkjs/lib/elk.bundled.js';
 import { collectFunctions, declaratorName, getParser } from './cparse.js';
 import { findFunctions } from './extract.js';
 import { collectArgs, lex } from './lexer.js';
+import { preprocessProfile, profilePredefinedMacros } from './parsers/builtin-includes.js';
 import { expandSeq, fileMacroScope, preprocess } from './preproc.js';
 import { decodeSource, HDR_EXT } from './source-files.js';
 import { fingerprint } from './source-fingerprint.js';
@@ -30,7 +31,9 @@ function flowchartHeaders(model, fn) {
   let index = headerIndexes.get(model);
   if (index?.files !== model.files || index.includes !== includes ||
       index.fileCount !== model.files.length || index.includeCount !== includeCount) {
-    const headers = model.files.filter(file => file.isHeader || HDR_EXT.test(file.rel)).map(file => file.rel);
+    const resolvedFiles = new Set((includes || []).map(include => include.resolved).filter(Boolean));
+    const headers = model.files.filter(file => file.isHeader || HDR_EXT.test(file.rel) || resolvedFiles.has(file.rel))
+      .map(file => file.rel);
     const direct = new Map();
     if (includeCount) {
       const paths = new Set(model.files.map(file => file.rel));
@@ -41,13 +44,16 @@ function flowchartHeaders(model, fn) {
           suffixes.set(suffix, suffixes.has(suffix) ? null : rel);
         }
       }
-      for (const { file, target } of includes) {
-        const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
-        const relative = path.posix.join(path.posix.dirname(file), normalized);
-        // Clang 已给出项目相对路径。内置解析器保留 include 指令中的原始路径。
-        const resolved = model.parserId === 'clang-ast' && paths.has(normalized) ? normalized
-          : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
-        if (!resolved) continue;
+      for (const { file, target, resolved: actual } of includes) {
+        let resolved = actual;
+        if (resolved === undefined) {
+          const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
+          const relative = path.posix.join(path.posix.dirname(file), normalized);
+          // Clang 已给出项目相对路径。无构建配置时，内置解析器仅保留 include 原始路径。
+          resolved = model.parserId === 'clang-ast' && paths.has(normalized) ? normalized
+            : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+        }
+        if (!paths.has(resolved)) continue;
         if (!direct.has(file)) direct.set(file, []);
         direct.get(file).push(resolved);
       }
@@ -91,10 +97,11 @@ function sourceReader(model, sourceRoot, fileStats) {
     const override = model._sourceFiles?.get(file);
     let location = cached?.location;
     if (!location || location.root !== model.root || location.override !== override) {
-      const filename = override ?? path.join(model.root, file);
+      const filename = override ?? path.resolve(model.root, file);
       location = { root: model.root, override, filename, directory: path.dirname(filename) };
     }
     const { filename, directory } = location;
+    const external = model.externalHeaders?.get(file);
     const invalidPath = '源码文件必须位于当前工程或对照目录内';
     let stat = fileStats?.get(filename);
     if (!stat) {
@@ -104,17 +111,19 @@ function sourceReader(model, sourceRoot, fileStats) {
     let realFile;
     if (stat.isSymbolicLink()) {
       realFile = fs.realpathSync(filename);
-      if (!withinRoots(realFile)) throw new Error(invalidPath);
+      if (!withinRoots(realFile) && external !== realFile) throw new Error(invalidPath);
       stat = fs.statSync(realFile, { bigint: true });
     } else {
       // 同一次查找按目录检查真实路径，常规文件只需要一次元数据查询。
-      let realDirectory = directories.get(directory);
-      if (!realDirectory) {
-        realDirectory = fs.realpathSync(directory);
-        if (!withinRoots(realDirectory)) throw new Error(invalidPath);
-        directories.set(directory, realDirectory);
+      let resolved = directories.get(directory);
+      if (!resolved) {
+        const realDirectory = fs.realpathSync(directory);
+        resolved = { realDirectory, withinRoots: withinRoots(realDirectory) };
+        directories.set(directory, resolved);
       }
+      const { realDirectory } = resolved;
       realFile = directory === realDirectory ? filename : path.join(realDirectory, path.basename(filename));
+      if (!resolved.withinRoots && external !== realFile) throw new Error(invalidPath);
     }
     if (!stat.isFile()) throw new Error(invalidPath);
 
@@ -878,6 +887,36 @@ function diffDisplayLines(beforeText, afterText) {
   return wrapDiffLines(segments);
 }
 
+function flowchartMacroConfig(model, fn) {
+  if (!model.pruneInactive) return null;
+  return model.compilationUnits?.[fn.file] || {
+    defines: model.buildDefines, macroArgs: model.macroArgs, includeDirs: model.includeDirs,
+    includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes, macroIncludes: model.macroIncludes,
+    languageStandard: model.languageStandard, workingDirectory: model.workingDirectory,
+  };
+}
+
+function flowchartProfileMacros(model, fn, tokens, read, config) {
+  const source = { rel: fn.file, isHeader: false };
+  const macros = profilePredefinedMacros(fn.file, config);
+  const load = file => {
+    if (file === source) return { tokens: tokens.filter(token => token.t === 'preproc' && token.line < fn.line) };
+    const entry = read(file.rel);
+    entry.macroTokens ??= lex(entry.source, file.rel).filter(token => token.t === 'preproc');
+    return { tokens: entry.macroTokens };
+  };
+  preprocessProfile(model.root, [source], {
+    workingDirectory: model.workingDirectory, ...config, availableFiles: model.files, allowUnlistedIncludes: false,
+  }, load, (file, input, result, scope) => {
+    if (file !== source) return;
+    for (const [name, def] of scope.changes) {
+      if (def) macros.set(name, def);
+      else macros.delete(name);
+    }
+  });
+  return macros;
+}
+
 function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   if (!isFlowchartFunction(fn) || !model.files.some(file => file.rel === fn.file)) {
     throw new Error('无法找到函数源码');
@@ -885,6 +924,11 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   const read = sourceReader(model, sourceRoot);
   const { source } = read(fn.file);
   const tokens = lex(source, fn.file);
+  const config = flowchartMacroConfig(model, fn);
+  if (config) {
+    const headers = flowchartProfileMacros(model, fn, tokens, read, config);
+    return { ...buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros, true), headers };
+  }
   const headers = new Map();
   for (const file of flowchartHeaders(model, fn)) {
     const entry = read(file);
@@ -901,9 +945,9 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   return { ...buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros), headers };
 }
 
-function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros) {
+function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros, macrosAtFunction = false) {
   const local = fileMacroScope(headers);
-  collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file);
+  if (!macrosAtFunction) collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file);
   const bounds = locateBody(parser, source, tokens, fn, local);
   if (!bounds) throw new Error(`无法定位函数定义：${fn.name}`);
   const bodyTokens = tokens.filter(token => token.s >= bounds.open && token.s <= bounds.close);
@@ -961,13 +1005,15 @@ function findSourceFunction(parser, source, tokens, fn, headers) {
   return { ...fn, line: definition.line, endLine: definition.endLine };
 }
 
-function extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) {
+function extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros, sourceRoot) {
   const source = otherSourceText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const tokens = lex(source, fn.file);
   const definition = findSourceFunction(parser, source, tokens, fn, headers);
   // 对照文件复用工程符号，调用位置以对照源码为准。
   const sourceModel = { _index: { ...model._index, outAdj: new Map() } };
-  return buildSourceGraph(parser, sourceModel, definition, source, tokens, headers, expandMacros);
+  const config = flowchartMacroConfig(model, fn);
+  const macros = config ? flowchartProfileMacros(model, definition, tokens, sourceReader(model, sourceRoot), config) : headers;
+  return buildSourceGraph(parser, sourceModel, definition, source, tokens, macros, expandMacros, !!config);
 }
 
 function addCallInputs(hash, index, fn) {
@@ -999,7 +1045,9 @@ export function flowchartCacheHash(model, fn, { version = 'after', expandMacros 
     }));
   }
   function addInputs(side, graphModel, graphFn, files) {
+    const config = flowchartMacroConfig(graphModel, graphFn);
     h.update(JSON.stringify([side, graphFn.id, graphFn.name, graphFn.file, graphFn.line, graphFn.endLine])).update(files);
+    if (config) h.update('\0profile2\0').update(JSON.stringify(config));
     addCallInputs(h, graphModel._index, graphFn);
   }
   const currentFiles = fileInputs(model, fn, sourceRoot);
@@ -1025,7 +1073,7 @@ export async function buildFlowchart(model, fn, { expandMacros = false, version 
       const counterpart = otherModel && isFlowchartFunction(otherFn)
         ? extractFlowchartGraph(parser, otherModel, otherFn, expandMacros, otherSourceRoot)
         : typeof otherSourceText === 'string'
-          ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) : null;
+          ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros, sourceRoot) : null;
       if (counterpart) changes = matchFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
     } catch { /* 对照版本无法解析时，仅保留函数级状态。 */ }
   }

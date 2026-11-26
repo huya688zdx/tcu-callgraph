@@ -1,15 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { SRC_EXT } from '../source-files.js';
+import { decodeSource, SRC_EXT } from '../source-files.js';
 
 export const fileKey = (rel) => process.platform === 'win32' ? rel.toLowerCase() : rel;
 
 const clangDetectCache = new Map();
 
-export function detectClang(customBin) {
+export function detectClang(customBin, { refresh = false } = {}) {
   const bin = customBin || process.env.CALLGRAPH_CLANG || 'clang';
-  if (clangDetectCache.has(bin)) return clangDetectCache.get(bin);
+  if (!refresh && clangDetectCache.has(bin)) return clangDetectCache.get(bin);
   let result;
   try {
     const version = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true }).split(/\r?\n/)[0];
@@ -36,7 +37,10 @@ export function findCompileCommands(root, explicit) {
 export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
-  return JSON.stringify(['clang-ast', 'v5', root, status.bin, status.version, file, st?.mtimeMs, st?.size]);
+  return JSON.stringify([
+    'clang-ast', 'v7', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
+    Boolean(options.strictCompileCommands), options.buildProfileId || null,
+  ]);
 }
 
 /** 只拆分参数，不展开变量、重定向或执行编译数据库里的命令。 */
@@ -80,14 +84,53 @@ const pathFlags = new Set(['-I', '-isystem', '-iquote', '-idirafter', '-include'
 const valueFlags = new Set(['-D', '-U', '-std', '-x', '-target', '--target']);
 const flags = [...pathFlags, ...valueFlags].sort((a, b) => b.length - a.length);
 
-function clangArguments(args, directory, remap) {
+function responseDigest(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+function expandResponseTokens(args, directory, responseFiles, seen = new Set(), depth = 0) {
+  if (depth > 6) return args;
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const isCompilerSlot = depth === 0 && i === 0;
+    const prev = i > 0 ? args[i - 1] : null;
+    const isOptionOperand = typeof prev === 'string' && (pathFlags.has(prev) || valueFlags.has(prev));
+    if (!isCompilerSlot && !isOptionOperand && typeof arg === 'string' && arg.length > 1 &&
+        (arg.startsWith('@') || arg.startsWith('-@'))) {
+      const rawPath = arg.startsWith('-@') ? arg.slice(2) : arg.slice(1);
+      const target = path.resolve(directory, rawPath);
+      const key = fileKey(target);
+      const exists = fs.statSync(target, { throwIfNoEntry: false })?.isFile();
+      if (!exists) responseFiles?.set(target, null);
+      if (!seen.has(key) && exists) {
+        seen.add(key);
+        const bytes = fs.readFileSync(target);
+        responseFiles?.set(target, responseDigest(bytes));
+        const text = decodeSource(bytes).replace(/^\uFEFF/, '');
+        const nested = splitCommand(text.replace(/\r?\n/g, ' '));
+        out.push(...expandResponseTokens(nested, directory, responseFiles, seen, depth + 1));
+        seen.delete(key);
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+function clangArguments(rawArgs, directory, remap, responseFiles) {
+  const args = expandResponseTokens(rawArgs, directory, responseFiles);
   const result = [];
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     const flag = flags.find((f) => arg === f || arg.startsWith(f + '=')
       || (['-I', '-D', '-U', '-isystem', '-iquote', '-idirafter'].includes(f) && arg.startsWith(f)));
     if (!flag) {
-      if (/^-f(?:no-)?(?:ms-extensions|ms-compatibility|short-enums|short-wchar|signed-char|unsigned-char|freestanding|builtin)$/.test(arg)) result.push(arg);
+      if (/^-f(?:no-)?(?:ms-extensions|ms-compatibility|gnu-keywords|short-enums|short-wchar|signed-char|unsigned-char|freestanding|builtin)$/.test(arg) ||
+          /^-Wno-(?:unknown-pragmas|attributes|gnu|incompatible-pointer-types)$/.test(arg)) {
+        result.push(arg);
+      }
       continue;
     }
     const value = arg === flag ? args[++i] : arg.slice(flag.length).replace(/^=/, '');
@@ -104,7 +147,7 @@ function clangArguments(args, directory, remap) {
   return result;
 }
 
-export function readCompileCommands(root, file, { files, remap = (p) => p, includeTemplates = false } = {}) {
+export function readCompileCommands(root, file, { files, remap = (p) => p, includeTemplates = false, responseFiles } = {}) {
   const stat = fs.statSync(file);
   if (!stat.isFile() || stat.size > 64 * 1024 * 1024) {
     throw new Error(`compile_commands.json 必须是 64 MiB 以内的普通文件：${file}`);
@@ -128,7 +171,7 @@ export function readCompileCommands(root, file, { files, remap = (p) => p, inclu
     if (!args.length || args.some((arg) => typeof arg !== 'string')) {
       throw new Error(`compile_commands.json 条目缺少有效编译参数：${rel}`);
     }
-    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap), ...(includeTemplates && { templateOnly: !allowed?.has(id) }) });
+    units.set(id, { rel: allowed?.get(id) || rel, file: remap(abs), cwd: remap(directory), args: clangArguments(args, directory, remap, responseFiles), ...(includeTemplates && { templateOnly: !allowed?.has(id) }) });
   }
   return [...units.values()];
 }
@@ -160,15 +203,27 @@ export function completeCompileUnits(entries, files, fallbackArgs) {
 export function dependencyStamp(file) {
   try {
     const stat = fs.statSync(file);
-    return stat.isFile() ? { file, size: stat.size, mtimeMs: stat.mtimeMs } : null;
+    return stat.isFile() ? { file, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } : null;
   } catch {
     return null;
   }
 }
 
 export function externalDependenciesCurrent(model) {
+  for (const file of model.missingIncludes || []) {
+    try { if (fs.statSync(file, { throwIfNoEntry: false })?.isFile()) return false; }
+    catch { return false; }
+  }
+  for (const [file, digest] of model.responseFiles || []) {
+    try {
+      const current = fs.statSync(file, { throwIfNoEntry: false })?.isFile()
+        ? responseDigest(fs.readFileSync(file)) : null;
+      if (current !== digest) return false;
+    } catch { return false; }
+  }
   return (model.externalDeps || []).every(dep => {
     const current = dependencyStamp(dep.file);
-    return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs;
+    return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs &&
+      (dep.ctimeMs === undefined || current.ctimeMs === dep.ctimeMs);
   });
 }

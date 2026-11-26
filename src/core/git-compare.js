@@ -6,7 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { compareProjects, fingerprint } from './compare.js';
+import { selectedBuildProfile } from './build-profile-options.js';
 import { decodeSource, listSourceFiles } from './index.js';
+import { externalDependenciesCurrent } from './parsers/clang-config.js';
 import { addScheduleBytes, isScheduleFile, listScheduleFiles } from './tcu-schedule.js';
 
 const run = promisify(execFile);
@@ -724,12 +726,27 @@ function retainSnapshot(model, buffers) {
   model.files = model.files.map(file => ({ ...file, abs: path.join(model.root, file.rel) }));
 }
 
+function comparisonIncludeDependencies(comparison) {
+  const externalDeps = [];
+  const missingIncludes = new Set();
+  for (const model of [comparison.beforeModel, comparison.afterModel]) {
+    const externalPaths = new Set([...(model.externalHeaders?.keys() || [])].map(file => path.resolve(model.root, file)));
+    if (externalPaths.size) {
+      for (const dep of model.externalDeps || []) if (externalPaths.has(dep.file)) externalDeps.push(dep);
+    }
+    for (const file of model.missingIncludes || []) missingIncludes.add(file);
+  }
+  return { externalDeps, missingIncludes };
+}
+
 export async function compareGitProject(projectPath, gitOptions = {}, compareOptions = {}) {
   const baseRef = validatedRef(gitOptions.baseRef, 'HEAD');
   const targetRef = validatedRef(gitOptions.targetRef, worktreeRef);
   const includeUntracked = gitOptions.includeUntracked !== false;
   const repo = await locateRepo(projectPath);
   if (!repo.isRepo) throw new Error(repo.reason === 'gitUnavailable' ? '未找到 Git 可执行程序' : '当前工程不在 Git 工作区中');
+  const buildProfile = selectedBuildProfile(repo.root, compareOptions.parserOptions);
+  compareOptions = { ...compareOptions, buildProfile };
   const base = await resolveCommit(repo, baseRef);
   const target = targetRef === worktreeRef || targetRef === indexRef ? null : await resolveCommit(repo, targetRef);
   const before = await commitFiles(repo, base.sha);
@@ -761,23 +778,20 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
       return analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
     }
     const key = JSON.stringify([repo.repoRoot, repo.projectPrefix, baseRef, base.sha, targetRef, target?.sha,
-      worktree?.fingerprint, includeUntracked, parserId, compareOptions.parserOptions || null]);
+      worktree?.fingerprint, includeUntracked, parserId, compareOptions.parserOptions || null, buildProfile]);
     // INDEX 没有提交 SHA，需核对暂存对象。重命名结果也可能随 Git 配置变化。
     const validation = JSON.stringify([targetRef === indexRef ? [...after].sort() : null, changes,
       metadata.baseLabel, metadata.targetLabel]);
     const entry = analyzedComparisons.get(key);
-    let cached;
-    if (entry?.validation === validation) {
-      cached = entry.result;
-    } else {
-      cached = await analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
-    }
+    const cached = entry?.validation === validation && externalDependenciesCurrent(entry.dependencies)
+      ? entry : null;
+    const result = cached?.result ?? await analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
     analyzedComparisons.delete(key);
-    analyzedComparisons.set(key, { validation, result: cached });
+    analyzedComparisons.set(key, cached ?? { validation, result, dependencies: comparisonIncludeDependencies(result) });
     if (analyzedComparisons.size > analyzedComparisonLimit) {
       analyzedComparisons.delete(analyzedComparisons.keys().next().value);
     }
-    return { ...cached, git: { ...cached.git } };
+    return { ...result, git: { ...result.git } };
   };
   if (!changes.length && !compareOptions.allowEmptyRefresh) {
     return { projectPath: repo.root, git: metadata, summary: emptySummary(), roots: [], candidates: [],

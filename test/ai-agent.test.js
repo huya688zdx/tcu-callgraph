@@ -661,8 +661,14 @@ test('e2e：移动嵌套目录时按外框定位，并保留参照目录下方�
   assert.deepEqual([beta.x, beta.y], [alpha.x, alpha.y + alpha.h + 36]);
 });
 
-test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {
-  for (const [prompt, allowed] of [['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false]]) {
+test('解释连接或未指定修复目标时阻止写工具，目标明确时允许执行', async () => {
+  for (const [prompt, allowed] of [
+    ['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false],
+    ['为什么 A 和 B 连接在一起？', false], ['请解释一下 A 和 B 的连接关系', false],
+    ['A 和 B 的连接关系是什么？', false], ['A 和 B 怎么没连上？', false],
+    ['请把 A 和 B 连接起来', true], ['为什么没有连接？然后把 A 和 B 连起来', true],
+    ['这个函数漏了上游，补齐一下', false], ['Task_10ms 漏了上游，补齐一下', true],
+  ]) {
     const executed = [];
     let step = 0;
     const result = await runAiAgent({
