@@ -253,8 +253,8 @@ function stripOuterParens(tokens) {
   return start ? tokens.slice(start, end + 1) : tokens;
 }
 
-/** 从简单的函数指针初始化值提取目标，保留取址、解引用与类型转换。 */
-function extractTargetIdent(tokens) {
+/** 剥除取址、解引用和类型转换，复杂表达式返回 null。 */
+function simpleInitializerOperand(tokens) {
   let value = stripOuterParens(tokens);
   while (value.length > 1) {
     if (value[0].v === '&' || value[0].v === '*') {
@@ -269,11 +269,7 @@ function extractTargetIdent(tokens) {
     if (value[next].v === '(' && !TYPE_WORDS.has(type[0].v) && !type.some(t => t.v === '*')) return null;
     value = stripOuterParens(value.slice(next));
   }
-  const target = value[0];
-  if (target?.t === 'id' && !TYPE_WORDS.has(target.v) && !KEYWORDS.has(target.v) && !NON_FN_IDENTS.has(target.v)) {
-    return { name: target.v, line: target.line };
-  }
-  return null;
+  return value[0] ?? null;
 }
 
 /** 切分顶层初始化项或成员声明，保留内部括号中的分隔符。 */
@@ -573,10 +569,19 @@ function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status
         : !remaining.length && (extents.length > 0 || scalarBrace);
       collectInitSlots(val.slice(1, -1), nextPrefix, remaining, map, slotLines, macros, status, atElement);
     } else {
-      const target = extractTargetIdent(val);
-      if (target) {
-        map[nextPrefix] = target.name;
-        slotLines[nextPrefix] = target.line;
+      const operand = simpleInitializerOperand(val);
+      // 重复指定一个槽位时，后面的初始化值覆盖先前的函数或未知值。
+      status.unresolvedSlots.delete(nextPrefix);
+      if (operand?.t === 'id' && !TYPE_WORDS.has(operand.v) && !KEYWORDS.has(operand.v) && !NON_FN_IDENTS.has(operand.v)) {
+        map[nextPrefix] = operand.v;
+        slotLines[nextPrefix] = operand.line;
+      } else {
+        delete map[nextPrefix];
+        delete slotLines[nextPrefix];
+        // 条件表达式和强转得到的非零地址可能指向别处；(Fn)0 等空值没有调用目标。
+        if (!operand || (operand.t === 'num' && val.length > 1 && parseConstIndex([operand]) !== 0)) {
+          status.unresolvedSlots.add(nextPrefix);
+        }
       }
     }
     if (!unknownPosition) cursor = nextInitIndices(indices.length ? indices : cursor ?? [0], extents);
@@ -678,16 +683,21 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
     };
     const fill = lookup => {
-      const status = { incomplete: false, isScalarField: slot => scalarInitializerField(slot, rootShape, file, lookup) };
+      const status = {
+        incomplete: false,
+        unresolvedSlots: new Set(),
+        isScalarField: slot => scalarInitializerField(slot, rootShape, file, lookup),
+      };
       collectInitSlots(inner, '', extents, table.map, table.slotLines, macros, status);
       if (status.incomplete) table.incomplete = true;
+      if (status.unresolvedSlots.size) table.unresolvedSlots = [...status.unresolvedSlots];
     };
     // 仅有指定项带花括号时才需要等待头文件关系，普通表仍当场完成。
     if (pendingFields && inner.some((t, j) => t.v === '=' && inner[j + 1]?.v === '{')) {
       pendingFields.push(fill);
     } else {
       fill(localLookup);
-      if (!Object.keys(table.map).length) { i = close; continue; }
+      if (!table.unresolvedSlots && !Object.keys(table.map).length) { i = close; continue; }
     }
     tables.set(functionId ? i : nameTok.v, table);
     i = close;

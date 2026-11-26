@@ -4003,6 +4003,7 @@ export const server = http.createServer(async (req, res) => {
             return true;
           }).slice(0, limit).map((tb) => {
             const entries = Object.entries(tb.map || {});
+            for (const slot of tb.unresolvedSlots || []) entries.push([slot, null]);
             return {
               name: tb.name,
               file: tb.file || '',

@@ -5,6 +5,36 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadModel } from '../src/core/index.js';
 
+test('下标可能命中未解析的初始化值时保留间接调用，已知位置仍能直连', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-unknown-target-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'dispatch.c'), `
+typedef void (*Fn)(void);
+static void a(void) {}
+static void b(void) {}
+static Fn const table[] = {a, 1 ? b : a};
+static Fn const rows[2][2] = {{a, (Fn)0}, {a, 1 ? b : a}};
+static Fn const overrides[] = {[0] = a, [0] = 1 ? b : a, [1] = 1 ? a : b, [1] = b};
+void known(int i) { table[0](); rows[0][i](); overrides[1](); }
+void uncertain(int i) { table[i](); table[1](); rows[1][i](); overrides[0](); }
+typedef struct { Fn run; } Ops;
+void members(int i, Ops left, Ops right) {
+  Ops entries[] = {{.run = a}, i ? left : right};
+  entries[i].run(); entries[0].run();
+}
+`);
+  const model = loadModel(dir);
+  const targets = name => (model._index.outAdj.get('dispatch.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.callee);
+  assert.deepEqual(targets('uncertain'), []);
+  assert.deepEqual(targets('known'), ['a', 'a', 'b']);
+  assert.deepEqual(targets('members'), ['a']);
+  assert.deepEqual(model.indirectCalls.find(site => site.receiver === 'entries').candidates.map(c => c.name), ['a']);
+  const sites = model.indirectCalls.filter(site => site.caller === 'dispatch.c::uncertain');
+  assert.deepEqual(sites.map(site => site.candidates.map(c => c.name)), [['a'], [], ['a'], []]);
+  assert.deepEqual(model.fnptrTables.find(t => t.name === 'overrides').map, { '[1]': 'b' });
+});
+
 test('用字段声明区分标量花括号和单元素数组，包括没有调用点的头文件类型', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-braced-fields-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

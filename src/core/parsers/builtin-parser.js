@@ -485,7 +485,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       }
     }
     const matchedSlots = Object.keys(filteredMap).length;
-    if (!matchedSlots && !raw.functionId) continue;
+    if (!matchedSlots && !raw.functionId && !raw.unresolvedSlots) continue;
     const entry = {
       name: raw.name,
       file: raw.file,
@@ -495,6 +495,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       dims: raw.dims,
       map: filteredMap,
       ...(raw.incomplete && { incomplete: true }),
+      ...(raw.unresolvedSlots && { unresolvedSlots: raw.unresolvedSlots }),
       ...(raw.functionId && { functionId: raw.functionId }),
     };
     if (matchedSlots < Object.keys(raw.map).length) tablesWithFilteredTargets.add(entry);
@@ -537,13 +538,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   };
   const matchTableSlots = (table, indices = [], member = null) => {
     const matched = [];
-    for (const [slot, target] of Object.entries(table.map)) {
+    const slots = Object.entries(table.map);
+    for (const slot of table.unresolvedSlots || []) slots.push([slot, null]);
+    for (const [slot, target] of slots) {
       if (!indices.length) {
         if (member && slot === member) matched.push({ slot, target });
         continue;
       }
       if (slot.includes('[?')) {
-        if (member ? slot.endsWith('.' + member) : slot.endsWith(']')) matched.push({ slot, target });
+        if (slot.endsWith(member ? '.' + member : ']') || (target === null && slot.endsWith(']'))) {
+          matched.push({ slot, target });
+        }
         continue;
       }
       // 解析槽位路径，例如 "[1][0]" / "[0].fn" / "[1][2].handler"
@@ -552,15 +557,16 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       const slotIndices = [...m[1].matchAll(/\[(\d+)\]/g)].map((x) => Number.parseInt(x[1], 10));
       const slotField = m[2] || null;
       if (member) {
-        if (slotField !== member) continue;
+        // 未解析的整个结构体元素也可能提供被调用的成员。
+        if (slotField !== member && !(target === null && !slotField)) continue;
       } else if (slotField) {
         // 结构体数组元素中无成员名调用时（例如 e[r][c]() 对应的非结构体表）不匹配带字段名的槽；
         // 但若是一维位置初始化结构体数组（无指定字段名），slotField 本身为 null。
         continue;
       }
-      if (slotIndices.length < indices.length) continue;
+      if (slotIndices.length < indices.length && target !== null) continue;
       let ok = true;
-      for (let d = 0; d < indices.length; d++) {
+      for (let d = 0; d < Math.min(indices.length, slotIndices.length); d++) {
         if (indices[d] !== null && slotIndices[d] !== indices[d]) {
           ok = false;
           break;
@@ -594,7 +600,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
       const allConstIndices = (call.indices || []).every((idx) => idx !== null);
-      if (!table?.incomplete && uniqueTargets.length === 1 && (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
+      if (!table?.incomplete && uniqueTargets.length === 1 && uniqueTargets[0] !== null &&
+          (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
         const callee = uniqueTargets[0];
         edges.push({
           from: fn.id,
@@ -621,7 +628,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
           member: call.member || null,
           indices: call.indexExprs || [],
           table: table ? { name: table.name, file: table.file, line: table.line, isStatic: table.isStatic } : null,
-          candidates: matched.map((s) => ({
+          candidates: matched.filter(s => s.target !== null).map((s) => ({
             slot: s.slot,
             name: s.target,
             id: resolveCallee(s.target, table?.file || fn.file),

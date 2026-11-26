@@ -1951,7 +1951,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     'void ghh(void) {}',
     'void jkk(void) {}',
     'void kkk(void) {}',
-    'const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, kkk } };',
+    'const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, 1 ? jkk : kkk } };',
     '/* 10ms周期 */',
     'void dispatch_x(int mode) {',
     '  int row = mode ? 1 : 0;',
@@ -2044,6 +2044,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
 
   const inspectRes = toolResults.find((r) => r.name === 'inspect_indirect_calls')?.data;
   assert.ok(inspectRes?.tables?.some((tb) => tb.name === 'e' && tb.slots.some((s) => s.slot === '[1][0]' && s.target === 'ghh')));
+  assert.ok(inspectRes.tables.find(tb => tb.name === 'e').slots.some(s => s.slot === '[1][2]' && s.target === null));
   const srcRes = toolResults.find((r) => r.name === 'read_source')?.data;
   assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
   const searches = toolResults.filter(r => r.name === 'read_source').slice(1).map(r => r.data);
