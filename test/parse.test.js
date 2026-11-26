@@ -670,3 +670,38 @@ static const Ops ops = {.run = target};
   assert.deepEqual(targets('three.c'), []);
   assert.deepEqual(model.indirectCalls.find(call => call.caller === 'three.c::run').candidates, []);
 });
+
+test('成员数组调用保留所属表达式，同名全局分派表只绑定裸表调用', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-receiver-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef void (*Fn)(void);
+typedef struct { Fn table[1]; } Ops;
+typedef struct { Fn run; } Entry;
+static void a(void) {}
+static void b(void) {}
+static Fn const table[] = { a };
+static const Entry entries[] = {{ .run = b }};
+static int index_of(void) { return 0; }
+static Ops *choose(Ops *p) { return p; }
+void dispatch(Ops *p, Ops s) {
+  p->table[0]();
+  s.table[0]();
+  (*p->table[index_of()])();
+  choose(p)->table[0]();
+  (p->table)[0]();
+  table[0]();
+  entries[0].run();
+}
+`);
+  const model = loadModel(dir);
+  const calls = model._index.outAdj.get('app.c::dispatch').filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls.map(edge => [edge.kind, edge.callee]), [
+    ['direct', 'index_of'], ['direct', 'choose'], ['fnptr', 'a'], ['fnptr', 'b'],
+  ]);
+  const sites = model.indirectCalls.filter(call => call.caller === 'app.c::dispatch');
+  assert.deepEqual(sites.map(call => call.expr), [
+    'p->table[0]', 's.table[0]', 'p->table[index_of()]', 'choose(p)->table[0]', '(p->table)[0]',
+  ]);
+  assert.ok(sites.every(call => !call.table && !call.candidates.length));
+});

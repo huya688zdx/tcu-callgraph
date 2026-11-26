@@ -55,12 +55,14 @@ export function statementEnd(tokens, i, end = tokens.length) {
   return Math.min(i + 1, end);
 }
 
-/** 从 closeIdx 处的 ')' 反向找到匹配的 '(' */
-function matchParenBack(tokens, closeIdx) {
+/** 从右圆括号或右方括号反向找到成对的左括号。 */
+function matchOpenBack(tokens, closeIdx) {
+  const close = tokens[closeIdx].v;
+  const open = close === ']' ? '[' : '(';
   let depth = 0;
   for (let i = closeIdx; i >= 0; i--) {
-    if (tokens[i].v === ')') depth++;
-    else if (tokens[i].v === '(') {
+    if (tokens[i].v === close) depth++;
+    else if (tokens[i].v === open) {
       depth--;
       if (depth === 0) return i;
     }
@@ -76,7 +78,7 @@ const ANNOTATIONS = new Set([
 /** 若 idx 处的 ')' 是 __attribute__((..)) / __declspec(..) 这类注解块的右括号，返回注解关键字下标 */
 function annotationStartAt(tokens, idx) {
   if (idx < 0 || tokens[idx].v !== ')') return -1;
-  const open = matchParenBack(tokens, idx);
+  const open = matchOpenBack(tokens, idx);
   if (open < 1) return -1;
   const kw = tokens[open - 1];
   if (!kw || kw.t !== 'id' || !ANNOTATIONS.has(kw.v)) return -1;
@@ -95,7 +97,7 @@ function paramListEnd(tokens, idx) {
     end = kw - 1;
     if (end < 0 || tokens[end].v !== ')') return null;
   }
-  const open = matchParenBack(tokens, end);
+  const open = matchOpenBack(tokens, end);
   if (open < 1) return null;
   return { open, close: end };
 }
@@ -244,7 +246,7 @@ const NON_FN_IDENTS = new Set(['NULL', 'nullptr', 'true', 'false', 'TRUE', 'FALS
 /** 仅移除包住整个表达式的括号，保留强制转换、实参列表等内部结构。 */
 function stripOuterParens(tokens) {
   let start = 0, end = tokens.length - 1;
-  while (tokens[start]?.v === '(' && tokens[end]?.v === ')' && matchParenBack(tokens, end) === start) {
+  while (tokens[start]?.v === '(' && tokens[end]?.v === ')' && matchOpenBack(tokens, end) === start) {
     start++;
     end--;
   }
@@ -693,27 +695,48 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
   return tables;
 }
 
-/** 从下标或成员左侧回溯提取真实表名及各维下标，避免把 z[idx].fn() 误认成 idx.fn() */
+/** 提取去掉末尾下标的接收表达式，例如 p->table 或 rows[i].table。 */
+function receiverBefore(tokens, end) {
+  let start = end + 1;
+  for (let i = end; i >= 0;) {
+    const t = tokens[i];
+    if (t.v === ')' || t.v === ']') {
+      const open = matchOpenBack(tokens, i);
+      if (open < 0 || (t.v === ')' && conditionKeywords.has(tokens[open - 1]?.v))) break;
+      start = open;
+      i = open - 1;
+    } else if (t.t === 'id' && !KEYWORDS.has(t.v)) {
+      start = i;
+      if (!['.', '->'].includes(tokens[i - 1]?.v)) break;
+      start = i - 1;
+      i -= 2;
+    } else break;
+  }
+  if (start > end) return null;
+  const expr = tokens.slice(start, end + 1);
+  let inner = stripOuterParens(expr);
+  // 宏常把对象地址写成 (&ops)->run；它与 ops.run 绑定同一张表。
+  const memberOp = tokens[end + 1]?.v;
+  if ((memberOp === '->' && inner[0]?.v === '&') || (memberOp === '.' && inner[0]?.v === '*')) {
+    inner = stripOuterParens(inner.slice(1));
+  }
+  return inner.length === 1 && inner[0].t === 'id' ? inner[0].v : expr.map(t => t.v).join('');
+}
+
+/** 从下标或成员左侧回溯提取接收表达式及各维下标。 */
 function extractIndexedReceiver(tokens, endIdx, macros) {
   let j = endIdx;
   const indices = [];
   const indexExprs = [];
   while (j >= 0 && tokens[j].v === ']') {
-    let depth = 1;
-    let k = j - 1;
-    for (; k >= 0 && depth > 0; k--) {
-      if (tokens[k].v === ']') depth++;
-      else if (tokens[k].v === '[') depth--;
-    }
-    if (depth !== 0) break;
-    const exprToks = tokens.slice(k + 2, j);
+    const open = matchOpenBack(tokens, j);
+    if (open < 0) break;
+    const exprToks = tokens.slice(open + 1, j);
     indices.unshift(parseConstIndex(exprToks, macros));
     indexExprs.unshift(exprToks.map((t) => t.v).join(''));
-    j = k;
+    j = open - 1;
   }
-  while (j >= 0 && (tokens[j].v === ')' || tokens[j].v === '*')) j--;
-  const recv = j >= 0 && tokens[j].t === 'id' && !KEYWORDS.has(tokens[j].v) ? tokens[j].v : null;
-  return { recv, indices, indexExprs };
+  return { recv: receiverBefore(tokens, j), indices, indexExprs };
 }
 
 function formatIndexedVia(recv, indexExprs, member) {
