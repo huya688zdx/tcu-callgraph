@@ -1347,7 +1347,7 @@ export async function runAiAgent({
     .filter(m => m.content);
   trimOldTurns(cleanHistory, 0, cleanHistory.length, estimateMessagesTokens(cleanHistory) - historyBudget, cleanHistory.length - 20);
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
-  const asksForExplanation = /为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|怎么没有|如何连接/u;
+  const asksForExplanation = /为什么|为何|啥原因|什么原因|怎么(?:回事|没|不|会|连)|是不是|有没有|干嘛的|做什么|是什么|什么关系|含义|解释|说明一下|分析(?:一下|下)|看一下|帮我看|查一下|如何连接/u;
   const explaining = asksForExplanation.test(userText) ||
     /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText);
   const editVerb = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u;

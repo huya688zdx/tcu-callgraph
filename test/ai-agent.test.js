@@ -665,6 +665,7 @@ test('解释已有连接时阻止写工具，明确要求改图时允许执行',
   for (const [prompt, allowed] of [
     ['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false],
     ['为什么 A 和 B 连接在一起？', false], ['请解释一下 A 和 B 的连接关系', false],
+    ['A 和 B 的连接关系是什么？', false], ['A 和 B 怎么没连上？', false],
     ['请把 A 和 B 连接起来', true], ['为什么没有连接？然后把 A 和 B 连起来', true],
   ]) {
     const executed = [];
