@@ -14,11 +14,27 @@ const allBoxes = (view) => [
   ...(view?.containers || []).map((box) => ({ kind: 'dir', box })),
 ];
 
+const ancestorBoxes = (boxes, target) => boxes.filter((b) => inside(b, target))
+  .sort((a, b) => Number(!!a.box.root) - Number(!!b.box.root) || b.box.id.length - a.box.id.length);
+const overlapKey = (a, b) => `${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`;
+const unrelated = (a, b) => a.box !== b.box && !inside(a, b) && !inside(b, a);
+
+function captureInitialOverlap(watched, boxes) {
+  const initial = new Map();
+  for (const a of watched) for (const b of boxes) {
+    if (!unrelated(a, b)) continue;
+    const area = gapOverlapArea(a.box, b.box);
+    if (area > 0) initial.set(overlapKey(a, b), area);
+  }
+  return initial;
+}
+
+const snapshotRect = (item) => ({ item, x: item.x, y: item.y, w: item.w, h: item.h });
+
 export function beginHierarchyMove(view, selection) {
   const boxes = allBoxes(view);
   const moving = boxes.filter((b) => b.box === selection.box || inside(selection, b));
-  const ancestors = boxes.filter((b) => b.box !== selection.box && inside(b, selection))
-    .sort((a, b) => b.box.depth - a.box.depth);
+  const ancestors = ancestorBoxes(boxes, selection);
   const files = new Set(moving.filter((b) => b.kind === 'file').map((b) => b.box.id));
   const nodes = view.nodes.filter((n) => files.has(n.group));
   const ids = new Set(nodes.map((n) => n.id));
@@ -28,14 +44,7 @@ export function beginHierarchyMove(view, selection) {
     (from && to ? internal : from || to ? crossing : stationary).push(edge);
   }
   const watched = [...moving, ...ancestors];
-  const initialOverlap = new Map();
-  for (const a of watched) {
-    for (const b of boxes) {
-      if (a.box === b.box || inside(a, b) || inside(b, a)) continue;
-      const area = gapOverlapArea(a.box, b.box);
-      if (area > 0) initialOverlap.set(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`, area);
-    }
-  }
+  const initialOverlap = captureInitialOverlap(watched, boxes);
   const parentId = (id) => id.split('/').slice(0, -1).join('/');
   const peers = boxes.filter((b) => b.box !== selection.box && !b.box.root &&
     !inside(selection, b) && !inside(b, selection) && parentId(b.box.id) === parentId(selection.box.id));
@@ -43,7 +52,7 @@ export function beginHierarchyMove(view, selection) {
     ancestor,
     children: boxes.filter((c) => inside(ancestor, c)).map((c) => c.box),
   }));
-  const rects = watched.map(({ box }) => ({ item: box, x: box.x, y: box.y, w: box.w, h: box.h }));
+  const rects = watched.map(({ box }) => snapshotRect(box));
   const positions = nodes.map((n) => ({ item: n, x: n.x, y: n.y }));
   const restoreList = [...rects, ...positions];
   const origin = rects.find((r) => r.item === selection.box);
@@ -170,7 +179,7 @@ export function moveHierarchy(drag, dx, dy, tolerance = 0) {
         if (!overlap(a.box, b.box)) continue;
         if (!initialOverlap) return false;
         const area = gapOverlapArea(a.box, b.box);
-        const initial = initialOverlap.get(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`) || 0;
+        const initial = initialOverlap.get(overlapKey(a, b)) || 0;
         if (!(initial > 0 && area <= initial + 0.01)) return false;
       }
     }
@@ -225,28 +234,27 @@ export function moveHierarchy(drag, dx, dy, tolerance = 0) {
   return changed;
 }
 
-/** 计算框内子元素的最小包围边界（含标准边距），确保手动缩小时不会裁掉内部节点或子框。 */
-function minContentRect(view, target, boxes, { filePad = 8, fileTop = 32 } = {}) {
-  if (target.kind === 'file') {
-    const nodes = (view.nodes || []).filter((n) => n.group === target.box.id);
-    if (!nodes.length) return null;
-    return {
-      minX: Math.min(...nodes.map((n) => n.x)) - filePad,
-      minY: Math.min(...nodes.map((n) => n.y)) - fileTop,
-      maxX: Math.max(...nodes.map((n) => n.x + n.w)) + filePad,
-      maxY: Math.max(...nodes.map((n) => n.y + n.h)) + filePad,
-    };
+const contentItems = (view, target, boxes) => target.kind === 'file'
+  ? (view.nodes || []).filter((n) => n.group === target.box.id)
+  : boxes.filter((c) => inside(target, c)).map((c) => c.box);
+
+const contentPadding = (target) => ({
+  pad: target.kind === 'file' ? 8 : target.box.root ? 24 : 10,
+  top: target.box.root ? 24 : 32,
+});
+
+/** 计算框内节点或子框的包围边界，并留出标题区与内边距。 */
+function minContentRect(target, items) {
+  if (!items.length) return null;
+  const { pad, top } = contentPadding(target);
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const item of items) {
+    minX = Math.min(minX, item.x);
+    minY = Math.min(minY, item.y);
+    maxX = Math.max(maxX, item.x + item.w);
+    maxY = Math.max(maxY, item.y + item.h);
   }
-  const children = boxes.filter((c) => inside(target, c)).map((c) => c.box);
-  if (!children.length) return null;
-  const pad = target.box.root ? 24 : 10;
-  const topPad = target.box.root ? 24 : 32;
-  return {
-    minX: Math.min(...children.map((c) => c.x)) - pad,
-    minY: Math.min(...children.map((c) => c.y)) - topPad,
-    maxX: Math.max(...children.map((c) => c.x + c.w)) + pad,
-    maxY: Math.max(...children.map((c) => c.y + c.h)) + pad,
-  };
+  return { minX: minX - pad, minY: minY - top, maxX: maxX + pad, maxY: maxY + pad };
 }
 
 function syncViewBounds(view, boxes, { allowShrink = false, baseWidth = 480, baseHeight = 260 } = {}) {
@@ -266,26 +274,110 @@ function syncViewBounds(view, boxes, { allowShrink = false, baseWidth = 480, bas
       maxY = Math.max(maxY, p[1] + 24);
     }
   }
-  view.width = Math.round(maxX);
-  view.height = Math.round(maxY);
+  view.width = Math.ceil(maxX);
+  view.height = Math.ceil(maxY);
+}
+
+export function beginNodeMove(view, node) {
+  const boxes = allBoxes(view);
+  const file = boxes.find((b) => b.kind === 'file' && b.box.id === node.group);
+  const watched = file ? [file, ...ancestorBoxes(boxes, file)] : [];
+  const initialOverlap = captureInitialOverlap(watched, boxes);
+  const chain = watched.map((target) => ({
+    ...target,
+    items: contentItems(view, target, boxes),
+    peers: boxes.filter((b) => unrelated(target, b)).map((b) => ({
+      box: b.box,
+      area: initialOverlap.get(overlapKey(target, b)) || 0,
+    })),
+  }));
+  let minX = 0, minY = 0;
+  for (const target of chain) {
+    const { pad, top } = contentPadding(target);
+    minX += pad;
+    minY += top;
+  }
+  return {
+    view, node, chain, boxes, initialOverlap,
+    // 兼容标题区或内边距较窄的旧布局，拖拽不会进一步压缩这两处边距。
+    minX: Math.max(0, Math.min(minX, node.x)),
+    minY: Math.max(0, Math.min(minY, node.y)),
+    rects: [...chain.map(({ box }) => snapshotRect(box)), snapshotRect(node)],
+    width: view.width, height: view.height,
+  };
+}
+
+export function cancelNodeMove(drag) {
+  restoreRects(drag);
+  drag.view.width = drag.width;
+  drag.view.height = drag.height;
+}
+
+/** 先检查向外扩展的包络，落位后再收紧被节点腾出的边。 */
+export function placeNodeInHierarchy(drag, x, y) {
+  const { node, chain } = drag;
+  if (x === node.x && y === node.y) return true;
+  const before = chain.map(({ box }) => snapshotRect(box));
+  const oldX = node.x, oldY = node.y;
+  const oldContents = chain.map((target) => minContentRect(target, target.items));
+  node.x = x;
+  node.y = y;
+  for (const target of chain) {
+    const b = target.box;
+    const content = minContentRect(target, target.items);
+    const left = Math.max(0, Math.min(b.x, content.minX));
+    const top = Math.max(0, Math.min(b.y, content.minY));
+    const right = Math.max(b.x + b.w, content.maxX);
+    const bottom = Math.max(b.y + b.h, content.maxY);
+    Object.assign(b, { x: left, y: top, w: right - left, h: bottom - top });
+    if (target.peers.some(({ box, area }) => {
+      const next = gapOverlapArea(b, box);
+      return next > 0 && (area === 0 || next > area + 0.01);
+    })) {
+      restoreRects({ rects: before });
+      node.x = oldX;
+      node.y = oldY;
+      return false;
+    }
+  }
+  chain.forEach((target, i) => {
+    const content = minContentRect(target, target.items);
+    const previous = oldContents[i];
+    shrinkToContent(target, content, {
+      left: content.minX > previous.minX, top: content.minY > previous.minY,
+      right: content.maxX < previous.maxX, bottom: content.maxY < previous.maxY,
+    });
+  });
+  return true;
+}
+
+export function syncNodeMoveBounds(drag) {
+  syncViewBounds(drag.view, drag.boxes, {
+    allowShrink: drag.chain.length > 0, baseWidth: drag.width, baseHeight: drag.height,
+  });
+}
+
+/** 松手后从移动的文件框或目录逐层向外收紧。 */
+export function autoShrinkContainerChain(view, boxId) {
+  const boxes = allBoxes(view);
+  const target = boxes.find((b) => b.box.id === boxId);
+  let changed = false;
+  if (target) {
+    for (const entry of [target, ...ancestorBoxes(boxes, target)]) {
+      changed = shrinkToContent(entry, minContentRect(entry, contentItems(view, entry, boxes))) || changed;
+    }
+  }
+  syncViewBounds(view, boxes, { allowShrink: true });
+  return changed;
 }
 
 /** 开始拖拽文件框 / 目录容器的边或角来手动调整大小。 */
 export function beginBoxResize(view, selection, edge) {
   const boxes = allBoxes(view);
-  const ancestors = boxes.filter((b) => b.box !== selection.box && inside(b, selection))
-    .sort((a, b) => b.box.depth - a.box.depth);
-  const content = minContentRect(view, selection, boxes);
+  const ancestors = ancestorBoxes(boxes, selection);
+  const content = minContentRect(selection, contentItems(view, selection, boxes));
   const watched = [selection, ...ancestors];
-  // 记录拖拽前已存在重叠的面积：允许重叠减小或保持，绝不允许把重叠拉得更大。
-  const initialOverlap = new Map();
-  for (const a of watched) {
-    for (const b of boxes) {
-      if (a.box === b.box || inside(a, b) || inside(b, a)) continue;
-      const area = gapOverlapArea(a.box, b.box);
-      if (area > 0) initialOverlap.set(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`, area);
-    }
-  }
+  const initialOverlap = captureInitialOverlap(watched, boxes);
   return {
     ...selection,
     edge,
@@ -294,7 +386,7 @@ export function beginBoxResize(view, selection, edge) {
     ancestors,
     content,
     initialOverlap,
-    rects: watched.map(({ box }) => ({ item: box, x: box.x, y: box.y, w: box.w, h: box.h })),
+    rects: watched.map(({ box }) => snapshotRect(box)),
     lastRect: { x: selection.box.x, y: selection.box.y, w: selection.box.w, h: selection.box.h },
     width: view.width,
     height: view.height,
@@ -373,7 +465,7 @@ export function resizeBox(drag, dx, dy) {
         if (a.box === b.box || inside(a, b) || inside(b, a)) return true;
         const area = gapOverlapArea(a.box, b.box);
         if (area <= 0) return true;
-        const initial = drag.initialOverlap.get(`${a.kind}:${a.box.id}|${b.kind}:${b.box.id}`) || 0;
+        const initial = drag.initialOverlap.get(overlapKey(a, b)) || 0;
         return initial > 0 && area <= initial + 0.01;
       });
     });
@@ -401,6 +493,20 @@ export function resizeBox(drag, dx, dy) {
   return movedNow;
 }
 
+function shrinkToContent({ kind, box: b }, content, { left = true, top = true, right = true, bottom = true } = {}) {
+  if (!content) return false;
+  const minW = kind === 'dir' ? 160 : 120;
+  const minH = kind === 'dir' ? 90 : 70;
+  const curRight = b.x + b.w, curBottom = b.y + b.h;
+  const x = left ? Math.max(b.x, Math.min(curRight - minW, content.minX)) : b.x;
+  const y = top ? Math.max(b.y, Math.min(curBottom - minH, content.minY)) : b.y;
+  const nextRight = right ? Math.min(curRight, Math.max(x + minW, content.maxX)) : curRight;
+  const nextBottom = bottom ? Math.min(curBottom, Math.max(y + minH, content.maxY)) : curBottom;
+  if (x === b.x && y === b.y && nextRight === curRight && nextBottom === curBottom) return false;
+  Object.assign(b, { x, y, w: nextRight - x, h: nextBottom - y });
+  return true;
+}
+
 /** 一键将文件框或目录容器收缩贴合内部内容，只收缩多余空白、绝不反向撑大。 */
 export function shrinkBoxToFit(view, selection, { recursive = true } = {}) {
   const boxes = allBoxes(view);
@@ -415,26 +521,7 @@ export function shrinkBoxToFit(view, selection, { recursive = true } = {}) {
   }
   let changed = false;
   for (const target of targets) {
-    const content = minContentRect(view, target, boxes, { filePad: 8, fileTop: 32 });
-    if (!content) continue;
-    const minW = target.kind === 'dir' ? 160 : 120;
-    const minH = target.kind === 'dir' ? 90 : 70;
-    const b = target.box;
-    const curRight = b.x + b.w;
-    const curBottom = b.y + b.h;
-    const nx = Math.max(b.x, Math.min(curRight - minW, Math.round(content.minX * 10) / 10));
-    const ny = Math.max(b.y, Math.min(curBottom - minH, Math.round(content.minY * 10) / 10));
-    const nRight = Math.min(curRight, Math.max(nx + minW, Math.round(content.maxX * 10) / 10));
-    const nBottom = Math.min(curBottom, Math.max(ny + minH, Math.round(content.maxY * 10) / 10));
-    const nw = Math.round((nRight - nx) * 10) / 10;
-    const nh = Math.round((nBottom - ny) * 10) / 10;
-    if (b.x !== nx || b.y !== ny || b.w !== nw || b.h !== nh) {
-      b.x = nx;
-      b.y = ny;
-      b.w = nw;
-      b.h = nh;
-      changed = true;
-    }
+    changed = shrinkToContent(target, minContentRect(target, contentItems(view, target, boxes))) || changed;
   }
   if (changed) {
     syncViewBounds(view, boxes, { allowShrink: !!selection.box.root, baseWidth: view.width, baseHeight: view.height });
