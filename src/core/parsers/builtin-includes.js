@@ -13,8 +13,7 @@ const cStandardVersions = new Map([
   ['c23', '202311L'], ['gnu23', '202311L'],
 ]);
 
-export function buildMacros(defines = []) {
-  const macros = new Map();
+export function buildMacros(defines = [], macros = new Map()) {
   for (const raw of defines) {
     const option = String(raw).trim();
     if (!COMPILER_DEFINE.test(option)) continue;
@@ -65,12 +64,15 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const quotedSearch = [...dirsFor('-iquote'), ...search];
     const forced = config.forcedIncludes || [];
     const stdVersion = cStandardVersions.get(unit?.languageStandard);
-    const undefinesStdVersion = (config.macroArgs || []).some((arg, i, args) =>
-      i % 2 === 0 && arg === '-U' && args[i + 1] === '__STDC_VERSION__');
     const predefined = buildMacros([
-      ...(stdVersion && !undefinesStdVersion ? ['__STDC_VERSION__=' + stdVersion] : []),
-      ...(config.defines || []),
+      ...(path.extname(source.rel) === '.c' ? ['__STDC__=1'] : []),
+      ...(stdVersion ? ['__STDC_VERSION__=' + stdVersion] : []),
     ]);
+    const macroArgs = config.macroArgs || [];
+    for (let i = 0; i < macroArgs.length; i += 2) {
+      if (macroArgs[i] === '-U') predefined.delete(macroArgs[i + 1]);
+    }
+    buildMacros(config.defines, predefined);
 
     const stack = new Set(), once = new Set();
     function processFile(file, base) {

@@ -167,3 +167,21 @@ test('结构体成员数组在声明位置展开头文件宏，省略花括号�
     assert.deepEqual(edges.map(edge => edge.callee), ['first', 'second', 'next']);
   }
 });
+
+test('覆盖整个结构体成员的初始化会清除被省略的旧回调', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-override-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { Fn a; Fn b; } Inner;',
+    'typedef struct { Inner inner; Inner other; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void baz(void) {}',
+    'static const Ops ops = { .inner = { .a = foo, .b = bar }, .other = { .b = bar }, .inner = { .a = baz } };',
+    'void call(void) { ops.inner.a(); ops.inner.b(); ops.other.b(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = model.fnptrTables.find(entry => entry.name === 'ops');
+  assert.deepEqual(table.map, { 'other.b': 'bar', 'inner.a': 'baz' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'bar']);
+});

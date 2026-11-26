@@ -564,7 +564,7 @@ test('构建配置保留每个编译单元的头文件搜索顺序和 C 标准',
   ]) {
     write(root, name + '.c', [
       '#include ' + include,
-      '#if FEATURE == ' + feature + ' && __STDC_VERSION__ == ' + standard,
+      '#if FEATURE == ' + feature + ' && __STDC__ == 1 && __STDC_VERSION__ == ' + standard,
       'void ' + name + '_correct(void) {}',
       '#else',
       'void ' + name + '_wrong(void) {}',
@@ -598,11 +598,11 @@ test('Make 在每个 include 位置重新计算变量并按名称处理函数式
   const root = temporaryProject(t);
   write(root, 'Makefile', [
     'MODE = 1', 'include flags.mk', 'MODE = 2', 'include flags.mk',
-    'all:', "\tcc $(CFLAGS) '-DREMOVED(x)=x' -UREMOVED '-DENABLED(x)=0' -UENABLED '-DENABLED(x)=x' -c main.c",
+    'all:', "\tcc $(CFLAGS) '-DREMOVED(x)=x' -UREMOVED '-DENABLED(x)=0' -UENABLED '-DENABLED(x)=x' -U__STDC__ -c main.c",
   ].join('\n'));
   write(root, 'flags.mk', 'CFLAGS := -DMODE=$(MODE)\n');
   write(root, 'main.c', [
-    '#if MODE == 2 && !defined(REMOVED) && ENABLED(1)',
+    '#if MODE == 2 && !defined(__STDC__) && !defined(REMOVED) && ENABLED(1)',
     'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
   ].join('\n'));
   const profile = discoverBuildProfiles(root).profiles.find(p => p.configFile === 'Makefile');
@@ -615,6 +615,7 @@ test('Make 在每个 include 位置重新计算变量并按名称处理函数式
   const [{ args }] = readCompileCommands(root, compileCommandsPath);
   assert.deepEqual(args.slice(args.indexOf('-D')), [
     '-D', 'MODE=2', '-D', 'REMOVED(x)=x', '-U', 'REMOVED', '-D', 'ENABLED(x)=0', '-U', 'ENABLED', '-D', 'ENABLED(x)=x',
+    '-U', '__STDC__',
   ]);
   if (detectClang().ok) {
     const clang = await loadModel(root, { parserId: 'clang-ast',

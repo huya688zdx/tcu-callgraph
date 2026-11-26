@@ -531,6 +531,20 @@ function nextInitPath(path, root) {
   return null;
 }
 
+function clearAggregateSlots(slot, table, status) {
+  const remove = key => {
+    delete table.map[key];
+    delete table.slotLines[key];
+    table.slots.delete(key);
+    status.unresolvedSlots.delete(key);
+  };
+  remove(slot);
+  if (!status.initializedAggregates.delete(slot)) return;
+  for (const key of table.slots.keys()) {
+    if (key.startsWith(slot + '.') || key.startsWith(slot + '[')) remove(key);
+  }
+}
+
 /** 每一对花括号都有独立的游标。数组按维度进位，结构体按字段声明顺序进位。 */
 function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false) {
   const items = splitAtTopLevel(inner);
@@ -584,13 +598,19 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
       } else break;
     }
     const slotPath = [...prefix, ...parts];
+    let slot = '';
+    for (let i = 0; i < slotPath.length; i++) {
+      const part = slotPath[i];
+      slot += typeof part === 'string' ? (slot ? '.' : '') + part : formatInitIndex(part);
+      if (i < slotPath.length - 1) status.initializedAggregates.add(slot);
+    }
+    // 新的聚合初始化覆盖整个子对象，包括没有显式列出的成员。
+    if (braced || child?.names) clearAggregateSlots(slot, table, status);
     if (braced) {
       const scalar = !child?.element && !child?.names &&
         (child?.pointer || (typeof parts.at(-1) !== 'string' && (!!layout?.element || scalarBrace)));
       collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated);
     } else {
-      let slot = '';
-      for (const p of slotPath) slot += typeof p === 'string' ? (slot ? '.' : '') + p : formatInitIndex(p);
       // 同一槽位的后一个初始化覆盖前一个。未知的整个结构体可能提供任一成员。
       status.unresolvedSlots.delete(slot);
       if (!child?.names && operand?.t === 'id' && !KEYWORDS.has(operand.v) && !NON_FN_IDENTS.has(operand.v)) {
@@ -609,7 +629,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
           unknownPosition: slotPath.some(p => typeof p === 'object' && p.expr.startsWith('@')),
           designated: designatedParent || designated,
         });
-      }
+      } else table.slots.delete(slot);
     }
     // 无法判定是聚合复制还是标量时，后续位置保持不确定，避免生成错误确定边。
     cursor = unknownPosition || (!braced && child?.names) ? null : nextInitPath(parts, layout);
@@ -731,6 +751,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         incomplete: false,
         enumNames,
         unresolvedSlots: new Set(),
+        initializedAggregates: new Set(),
         isFunction: token => isFunction(token, file, functionId),
       };
       const layout = initializerLayout(rootShape, file, lookup);

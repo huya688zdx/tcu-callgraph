@@ -147,6 +147,14 @@ function addInclude(out, flag, dir) {
   out.includeOptions.set(fileKey(flag + '\0' + dir), [flag, dir]);
 }
 
+function addDefine(out, value) {
+  const name = COMPILER_DEFINE.exec(value)?.[1];
+  if (!name) return;
+  (out.macroArgs ||= []).push('-D', value);
+  for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
+  out.defines.add(value);
+}
+
 function extractedOptions(config) {
   return {
     includeDirs: [...config.includeDirs],
@@ -214,12 +222,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       let val = '';
       if (/^-[Dd]=?$/.test(tok)) val = stripQuotes(rawTokens[++i] || '');
       else val = stripQuotes(tok.replace(/^-[Dd]=?/, ''));
-      const name = COMPILER_DEFINE.exec(val)?.[1];
-      if (name) {
-        (out.macroArgs ||= []).push('-D', val);
-        for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
-        out.defines.add(val);
-      }
+      addDefine(out, val);
       continue;
     }
 
@@ -551,7 +554,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
         for (const raw of values) {
           const clean = stripQuotes(raw).replace(/^-D/, '');
-          if (COMPILER_DEFINE.test(clean)) config.defines.add(clean);
+          addDefine(config, clean);
         }
       } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
         for (const raw of values) {
@@ -566,7 +569,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       const attrs = m[1];
       const val = stripQuotes(m[2]);
       const sc = extractXmlAttr(attrs, 'superClass');
-      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[ID]|-i(?:system|quote|dirafter)|@|-f\s)/.test(val)) {
+      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter)|@|-f\s)/.test(val)) {
         extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
       }
     }
@@ -597,7 +600,6 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       arch,
       compiler,
       ...extractedOptions(config),
-      macroArgs: [],
       sourceRoots,
       sourceEntries,
       exclusions,
