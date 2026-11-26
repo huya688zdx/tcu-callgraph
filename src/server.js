@@ -35,6 +35,7 @@ import {
 } from './core/ai-agent.js';
 import { normalizeExpansions } from './core/expansion.js';
 import { routeEdges } from './core/routing.js';
+import { contentPadding, inside } from '../web/lib/hierarchy.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
@@ -1802,30 +1803,45 @@ function discardCollidingArrangements(nodes, targets) {
 }
 
 function expandedArrangementBoxes(view, targets) {
-  const boxes = [
-    ...view.groups.map(box => ({ box, bounds: canvasRect(box), directory: false })),
-    ...view.containers.filter(box => !box.root).map(box => ({ box, bounds: canvasRect(box), directory: true })),
-  ];
-  const parentOf = (a, b) => a.directory && b.box.id.startsWith(a.box.id + '/');
+  const files = new Map(view.groups.map(box => [box.id, { box, bounds: canvasRect(box), kind: 'file' }]));
+  const directories = view.containers.map(box => ({ box, bounds: canvasRect(box), kind: 'dir' }));
+  directories.sort((a, b) => Number(!!a.box.root) - Number(!!b.box.root) || b.box.id.length - a.box.id.length);
+  const boxes = [...files.values(), ...directories];
   const expanded = new Set();
+  const expand = (entry, content) => {
+    const { bounds } = entry;
+    const { pad, top } = contentPadding(entry);
+    const left = Math.min(bounds.x, Math.max(0, content.x - pad));
+    const upper = Math.min(bounds.y, content.y - top);
+    const right = Math.max(bounds.x + bounds.w, content.x + content.w + pad);
+    const bottom = Math.max(bounds.y + bounds.h, content.y + content.h + pad);
+    Object.assign(bounds, { x: left, y: upper, w: right - left, h: bottom - upper });
+    expanded.add(entry);
+  };
   for (const { node, x, y } of targets) {
-    for (const entry of boxes) {
-      const { box, bounds } = entry;
-      if (!node.group || (node.group !== box.id && !node.group.startsWith(box.id + '/'))) continue;
-      const right = Math.max(bounds.x + bounds.w, x + node.w + 12);
-      const bottom = Math.max(bounds.y + bounds.h, y + node.h + 12);
-      bounds.x = Math.min(bounds.x, Math.max(0, x - 12));
-      bounds.y = Math.min(bounds.y, Math.max(0, y - 12));
-      bounds.w = right - bounds.x;
-      bounds.h = bottom - bounds.y;
-      expanded.add(entry);
+    const file = files.get(node.group);
+    if (file) expand(file, { x, y, w: node.w, h: node.h });
+  }
+  // 先扩展内层框，再用子框的新边界扩展父框，为每层标题留出空间。
+  for (const entry of boxes) {
+    if (!expanded.has(entry)) continue;
+    const parent = directories.find(candidate => inside(candidate, entry));
+    if (parent && !parent.box.root) {
+      expand(parent, entry.bounds);
+      continue;
+    }
+    const minY = parent ? parent.bounds.y + contentPadding(parent).top : 0;
+    if (entry.bounds.y < minY) {
+      return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
     }
   }
   for (const a of expanded) for (const b of boxes) {
-    if (a !== b && !parentOf(a, b) && !parentOf(b, a) &&
-        rectangleOverlapArea(a.bounds, b.bounds) > rectangleOverlapArea(a.box, b.box) + 0.01) return null;
+    if (a !== b && !inside(a, b) && !inside(b, a) &&
+        rectangleOverlapArea(a.bounds, b.bounds) > rectangleOverlapArea(a.box, b.box) + 0.01) {
+      return { error: '调整后文件框或目录容器会重叠，请改用其他位置' };
+    }
   }
-  return expanded;
+  return { boxes: expanded };
 }
 
 function applyArrangedPositions(view, positions, groupMode, previous) {
@@ -1843,7 +1859,7 @@ function applyArrangedPositions(view, positions, groupMode, previous) {
     (alreadyApplied ? retained : pending).push(target);
   }
   const candidates = discardCollidingArrangements(view.nodes, pending);
-  const boxes = expandedArrangementBoxes(view, candidates);
+  const { boxes } = expandedArrangementBoxes(view, candidates);
   const applicable = boxes ? candidates : [];
   if (!retained.length && !applicable.length) return;
   // 增量刷新会把 layoutSlots 传回服务端。重置时据此丢弃已调整的旧几何。
@@ -3145,7 +3161,8 @@ export const server = http.createServer(async (req, res) => {
         if (positions.length) {
           const geometry = view.layoutSlots?.aiArranged ? view.layoutSlots : view;
           const targets = arrangedTargets(view.nodes, { ...beforeSlot?.nodes, ...patch }, groupMode);
-          if (!expandedArrangementBoxes(geometry, targets)) return fail('调整后文件框或目录容器会重叠，请改用其他位置');
+          const { error } = expandedArrangementBoxes(geometry, targets);
+          if (error) return fail(error);
         }
         const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
         const slot = store.transaction(() => {

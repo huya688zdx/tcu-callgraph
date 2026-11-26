@@ -1857,6 +1857,10 @@ function showDrawer(showSetup = false) {
 }
 
 document.addEventListener('cg:selection-changed', (event) => setCanvasSelection(event.detail));
+document.addEventListener('cg:pair-flow-cleared', ({ detail: ids }) => {
+  const selection = ids.length === 1 ? { kind: 'node', id: ids[0] } : { kind: 'pair', ids };
+  if (selectionKey(canvasSelection) === selectionKey(selection)) setCanvasSelection(null);
+});
 document.addEventListener('cg:ask-ai', async (event) => {
   const { prompt, ...selection } = event.detail || {};
   setCanvasSelection(selection, true);

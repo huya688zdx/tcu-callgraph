@@ -308,6 +308,55 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     assert.deepEqual([updated.x, updated.y], [1800, 700]);
   });
 
+  await t.test('退出两点链路会清除当前上下文并保留暂存对象', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    await browser.waitFor('Boolean(window.__cg?.view?.nodes.length)');
+    await browser.evaluate("document.getElementById('aiBtn').click()");
+    await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+    const countBefore = requests.length;
+    await browser.evaluate(`(async () => {
+      const { pickPairFlow } = await import('/lib/pair-flow.js');
+      const main = ${JSON.stringify(root)};
+      const task = ${JSON.stringify(other.id)};
+      const selectFile = path => document.dispatchEvent(new CustomEvent('cg:selection-changed', {
+        detail: { kind: 'file', path },
+      }));
+      document.querySelector('[data-ai-tab="chat"]').click();
+      selectFile('can.c');
+      document.getElementById('aiPinSelection').click();
+      pickPairFlow(main);
+      pickPairFlow(task);
+      const row = document.getElementById('aiSelectionRow');
+      if (row.hidden || document.getElementById('pairFlowFloat').hidden) {
+        throw new Error('两点链路未设置当前上下文');
+      }
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      if (!row.hidden) throw new Error('Escape 未清除两点链路上下文');
+      pickPairFlow(main);
+      pickPairFlow(task);
+      selectFile('adc.c');
+      document.querySelector('#pairFlowFloat [data-pair-clear]').click();
+      if (row.hidden || !document.getElementById('aiSelectionText').textContent.includes('adc.c')) {
+        throw new Error('关闭两点链路时清除了后续选中的文件');
+      }
+      pickPairFlow(main);
+      pickPairFlow(task);
+      document.querySelector('#pairFlowFloat [data-pair-clear]').click();
+      if (!row.hidden) throw new Error('取消按钮未清除两点链路上下文');
+      document.getElementById('aiPromptInput').value = '请解释暂存的文件';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    assert.equal(requests.length, countBefore + 1);
+    const prompt = requests.at(-1).messages.at(-1).content;
+    const text = typeof prompt === 'string' ? prompt : prompt[0].text;
+    assert.match(text, /文件 can\.c/);
+    assert.doesNotMatch(text, /节点 |连线 |文件 adc\.c/);
+  });
+
   await t.test('暂存满 16 项也优先向模型发送当前选区', async browserTest => {
     try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
     assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
@@ -322,6 +371,7 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
         detail: { kind: 'node', id, file },
       }));
       document.querySelector('[data-ai-tab="chat"]').click();
+      document.getElementById('aiNewChat').click();
       for (let i = 0; i < 16; i++) {
         pick('pinned.c::f' + i, 'pinned.c');
         document.getElementById('aiPinSelection').click();
@@ -338,6 +388,44 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     assert.match(text, /1\. 节点 main\.c::main/);
     assert.doesNotMatch(text, /pinned\.c::f15\b/);
   });
+});
+
+test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async t => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-layout-'));
+  t.after(() => fs.rmSync(target, { recursive: true, force: true, maxRetries: 3 }));
+  const directory = path.join(target, 'src', 'deep');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'unit.c'), 'int entry(void) { return 1; }\n');
+  const srv = await launchServer({ target });
+  t.after(srv.close);
+  const root = 'src/deep/unit.c::entry';
+  const viewUrl = srv.baseUrl + '/api/view?groupMode=file&up=0&down=0&roots=' + encodeURIComponent(root);
+  const getView = () => fetch(viewUrl).then(response => response.json());
+  const initial = await getView();
+  const node = initial.nodes.find(node => node.id === root);
+  const targetY = node.y - 6;
+  const savePosition = async y => {
+    const response = await fetch(srv.baseUrl + '/api/layout', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root, mode: 'group', nodes: { [root]: { x: node.x, y, arrangedFor: 'file' } } }),
+    });
+    assert.equal((await response.json()).ok, true);
+  };
+  await savePosition(targetY);
+  const arranged = await getView();
+  const placed = arranged.nodes.find(node => node.id === root);
+  assert.equal(placed.y, targetY);
+  const childToParents = [placed, arranged.groups.find(box => box.id === placed.group),
+    ...['src/deep', 'src'].map(id => arranged.containers.find(box => box.id === id))];
+  for (let i = 1; i < childToParents.length; i++) {
+    const child = childToParents[i - 1];
+    const parent = childToParents[i];
+    assert.ok(child.y - parent.y >= 32, `${parent.id} 标题与子项重叠`);
+    assert.ok(parent.y < [...initial.groups, ...initial.containers].find(box => box.id === parent.id).y);
+  }
+  await savePosition(0);
+  const invalid = await getView();
+  assert.equal(invalid.nodes.find(node => node.id === root).y, node.y);
 });
 
 test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {

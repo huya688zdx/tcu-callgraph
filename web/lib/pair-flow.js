@@ -163,10 +163,12 @@ function renderPanel() {
 document.addEventListener('callgraph:langchange', renderPanel);
 
 export function clearPairFlow({ paint = true } = {}) {
+  const pair = state.pairFlow;
   state.pairFlow = null;
   state.hoverRelation = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
   renderFloatBar(null, []);
+  if (pair) document.dispatchEvent(new CustomEvent('cg:pair-flow-cleared', { detail: pair.ids }));
   if (paint) draw();
 }
 
@@ -185,7 +187,8 @@ export function pickPairFlow(id) {
   let signature;
   pair.refresh = current => {
     if (current !== view || !ids.every(id => current.nodes.some(n => n.id === id))) {
-      state.pairFlow = null; renderPanel(); return;
+      clearPairFlow({ paint: false });
+      return;
     }
     if (ids.length !== 2) return;
     const next = visibleGraphKey(current);

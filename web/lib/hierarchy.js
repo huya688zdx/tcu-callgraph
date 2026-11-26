@@ -1,5 +1,5 @@
 /** 层级框整体移动与手动调整大小：保留归属关系，扩展祖先容器，避免同级区域重叠。 */
-const inside = (parent, child) => parent.box !== child.box && parent.kind === 'dir' &&
+export const inside = (parent, child) => parent.box !== child.box && parent.kind === 'dir' &&
   (parent.box.root || child.box.id.startsWith(parent.box.id + '/'));
 const overlap = (a, b) => a.x < b.x + b.w + 12 && b.x < a.x + a.w + 12 &&
   a.y < b.y + b.h + 12 && b.y < a.y + a.h + 12;
@@ -238,7 +238,7 @@ const contentItems = (view, target, boxes) => target.kind === 'file'
   ? (view.nodes || []).filter((n) => n.group === target.box.id)
   : boxes.filter((c) => inside(target, c)).map((c) => c.box);
 
-const contentPadding = (target) => ({
+export const contentPadding = (target) => ({
   pad: target.kind === 'file' ? 8 : target.box.root ? 24 : 10,
   top: target.box.root ? 24 : 32,
 });
