@@ -141,6 +141,32 @@ function tokenizeArgs(line) {
   return out;
 }
 
+function splitRecipeCommands(line) {
+  const commands = [];
+  let start = 0;
+  let quote = '';
+  let ambiguous = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '\\' && quote !== "'" && /[\\'"&|;]/.test(line[i + 1] || '')) {
+      i++;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
+      quote = quote ? '' : ch;
+      continue;
+    }
+    if (quote || !';&|'.includes(ch)) continue;
+    commands.push(line.slice(start, i).trim());
+    const andThen = ch === '&' && line[i + 1] === '&';
+    if (ch !== ';' && !andThen) ambiguous = true;
+    if (ch !== ';' && line[i + 1] === ch) i++;
+    start = i + 1;
+  }
+  commands.push(line.slice(start).trim());
+  return { commands, ambiguous };
+}
+
 function compilerConfig() {
   return { includeDirs: new Set(), includeOptions: new Map(), defines: new Set(),
     forcedIncludes: new Set(), macroIncludes: [], sourceFiles: new Set() };
@@ -472,21 +498,28 @@ export function parseMakefileTree(entryAbs, rootDir) {
         const paths = ref === '$<' ? deps.slice(0, 1) : ref === '$^' ? [...new Set(deps)] : deps;
         return paths.map(dep => /\s/.test(dep) ? '"' + dep.replaceAll('"', '\\"') + '"' : dep).join(' ');
       });
-    const args = tokenizeArgs(expanded);
-    const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
-    const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');
-    // 兼容工程自定义的 CC 名称，同时避免将 echo、清理等命令的参数计入配置。
+    const { commands, ambiguous } = splitRecipeCommands(expanded);
+    const original = commands.length === 1 ? [command] : splitRecipeCommands(command).commands;
     const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER)\)|\$\{(?:CC|CXX|C_COMPILER)\})(?:\s|$)/i;
-    if (!compilerVar.test(command) &&
-        !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
-    if (args.length) compilers.add(compiler);
-    const unit = compilerConfig();
-    extractCompilerFlags(args, entryDir, rootDir, unit);
-    for (const rel of unit.sourceFiles) compilationUnits[rel] = {
-      ...extractedOptions(unit),
-      ...(unit.languageStandard ? { languageStandard: unit.languageStandard } : {}),
-    };
-    extractCompilerFlags(args, entryDir, rootDir, collected);
+    let changedDirectory = false;
+    for (const [index, invocation] of commands.entries()) {
+      const args = tokenizeArgs(invocation);
+      const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
+      const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');
+      if (/^(?:cd|pushd|popd)$/i.test(compiler)) changedDirectory = true;
+      // 兼容工程自定义的 CC 名称，同时避免将 echo、清理等命令的参数计入配置。
+      if (!(original.length === commands.length && compilerVar.test(original[index])) &&
+          !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
+      if (ambiguous || changedDirectory) throw new Error('暂不支持含管道、替代分支或切换目录的 Make 编译命令');
+      if (args.length) compilers.add(compiler);
+      const unit = compilerConfig();
+      extractCompilerFlags(args, entryDir, rootDir, unit);
+      for (const rel of unit.sourceFiles) compilationUnits[rel] = {
+        ...extractedOptions(unit),
+        ...(unit.languageStandard ? { languageStandard: unit.languageStandard } : {}),
+      };
+      extractCompilerFlags(args, entryDir, rootDir, collected);
+    }
   }
   if (!recipes.length) {
     // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。

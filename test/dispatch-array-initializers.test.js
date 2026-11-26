@@ -225,3 +225,19 @@ test('匿名聚合的初始化保持不确定，不将回调错分给后续字�
   const explicitCall = model.indirectCalls.find(call => call.receiver === 'explicit');
   assert.deepEqual(explicitCall.candidates.map(candidate => candidate.name), ['bar']);
 });
+
+test('运行时写入联合体其他成员会作废重叠槽，独立实例和字段不受影响', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-overlapping-write-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { Fn a; Fn b; } u; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void keep(void) {}',
+    'static Ops rows[2] = { { .u = { .a = foo }, .next = keep }, { .u = { .a = foo } } };',
+    'void call(void) { rows[0].u.b = bar; rows[0].u.a(); rows[1].u.a(); rows[0].next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'keep']);
+  assert.equal(model.indirectCalls.filter(call => call.caller === 'ops.c::call').length, 1);
+});

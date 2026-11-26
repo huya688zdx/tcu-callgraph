@@ -613,14 +613,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
   const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
     part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
-  const possiblyWritten = (writes, path) => writes?.some(w => w.escape || compatiblePaths(w.path, path));
+  const possiblyWritten = (writes, path, unions = []) => writes?.some(w =>
+    w.escape || compatiblePaths(w.path, path) || unions.some(depth =>
+      typeof w.path[depth] === 'string' && w.path[depth] !== path[depth] &&
+      compatiblePaths(w.path.slice(0, depth), path.slice(0, depth))));
   const matchTableSlots = (table, path, writes) => {
     const matched = [];
-    for (const { slot, target, parts, unknownPosition } of parsedSlots.get(table)) {
+    for (const { slot, target, parts, unknownPosition, unions } of parsedSlots.get(table)) {
       // 整个聚合值未知时，其后续成员也未知。省略括号且维度未知时可能跨行。
       const prefix = parts.length < path.length && (target === null || unknownPosition);
       if ((parts.length === path.length || prefix) && compatiblePaths(parts, path)) {
-        matched.push({ slot, target: possiblyWritten(writes, parts) ? null : target });
+        matched.push({ slot, target: possiblyWritten(writes, parts, unions) ? null : target });
       }
     }
     return matched;
@@ -830,9 +833,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:8';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:9';
     return JSON.stringify([
-      'builtin:17',
+      'builtin:18',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

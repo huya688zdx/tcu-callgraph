@@ -618,9 +618,11 @@ async function getOrBuildFlowchart(projectId, model, fn, opts = {}) {
       if (!item) return null;
       if (previous[i]?.deref() === item._index) return undefined;
       const { root, parserId, files, includes, functions, externals, edges, headerSymbols,
-        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, _sourceFiles, _sourceBuffers } = item;
+        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, includeDirs,
+        includeOptions, forcedIncludes, macroIncludes, _sourceFiles, _sourceBuffers } = item;
       return analysisModel({ root, parserId, files, includes, functions, externals, edges, headerSymbols,
-        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, _sourceFiles, _sourceBuffers });
+        externalHeaders, buildDefines, macroArgs, compilationUnits, pruneInactive, includeDirs,
+        includeOptions, forcedIncludes, macroIncludes, _sourceFiles, _sourceBuffers });
     });
     state.indexes = [model, otherFn ? otherModel : null].map(item => item && new WeakRef(item._index));
     hit = cache.get(entryKey);

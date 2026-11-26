@@ -5,7 +5,7 @@ import ELK from 'elkjs/lib/elk.bundled.js';
 import { collectFunctions, declaratorName, getParser } from './cparse.js';
 import { findFunctions } from './extract.js';
 import { collectArgs, lex } from './lexer.js';
-import { profilePredefinedMacros } from './parsers/builtin-includes.js';
+import { preprocessProfile, profilePredefinedMacros } from './parsers/builtin-includes.js';
 import { expandSeq, fileMacroScope, preprocess } from './preproc.js';
 import { decodeSource, HDR_EXT } from './source-files.js';
 import { fingerprint } from './source-fingerprint.js';
@@ -31,7 +31,9 @@ function flowchartHeaders(model, fn) {
   let index = headerIndexes.get(model);
   if (index?.files !== model.files || index.includes !== includes ||
       index.fileCount !== model.files.length || index.includeCount !== includeCount) {
-    const headers = model.files.filter(file => file.isHeader || HDR_EXT.test(file.rel)).map(file => file.rel);
+    const resolvedFiles = new Set((includes || []).map(include => include.resolved).filter(Boolean));
+    const headers = model.files.filter(file => file.isHeader || HDR_EXT.test(file.rel) || resolvedFiles.has(file.rel))
+      .map(file => file.rel);
     const direct = new Map();
     if (includeCount) {
       const paths = new Set(model.files.map(file => file.rel));
@@ -151,11 +153,7 @@ function literalTruth(expression) {
   return undefined;
 }
 
-function collectMacros(tokens, scope, file, pruneInactive = false) {
-  if (pruneInactive) {
-    preprocess(tokens, scope, file, { pruneInactive: true });
-    return;
-  }
+function collectMacros(tokens, scope, file) {
   preprocess(tokens.map(token => {
     if (token.t !== 'preproc') return token;
     const [, name, expr] = directive(token) || [];
@@ -891,10 +889,31 @@ function diffDisplayLines(beforeText, afterText) {
 
 function flowchartMacroConfig(model, fn) {
   if (!model.pruneInactive) return null;
-  const unit = model.compilationUnits?.[fn.file];
-  return unit
-    ? { defines: unit.defines, macroArgs: unit.macroArgs, languageStandard: unit.languageStandard }
-    : { defines: model.buildDefines, macroArgs: model.macroArgs };
+  return model.compilationUnits?.[fn.file] || {
+    defines: model.buildDefines, macroArgs: model.macroArgs, includeDirs: model.includeDirs,
+    includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes, macroIncludes: model.macroIncludes,
+  };
+}
+
+function flowchartProfileMacros(model, fn, tokens, read, config) {
+  const source = { rel: fn.file, isHeader: false };
+  const macros = profilePredefinedMacros(fn.file, config);
+  const load = file => {
+    if (file === source) return { tokens: tokens.filter(token => token.t === 'preproc' && token.line < fn.line) };
+    const entry = read(file.rel);
+    entry.macroTokens ??= lex(entry.source, file.rel).filter(token => token.t === 'preproc');
+    return { tokens: entry.macroTokens };
+  };
+  preprocessProfile(model.root, [source], {
+    ...config, availableFiles: model.files, allowUnlistedIncludes: false,
+  }, load, (file, input, result, scope) => {
+    if (file !== source) return;
+    for (const [name, def] of scope.changes) {
+      if (def) macros.set(name, def);
+      else macros.delete(name);
+    }
+  });
+  return macros;
 }
 
 function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
@@ -905,19 +924,19 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   const { source } = read(fn.file);
   const tokens = lex(source, fn.file);
   const config = flowchartMacroConfig(model, fn);
-  const headers = config ? profilePredefinedMacros(fn.file, config) : new Map();
+  if (config) {
+    const headers = flowchartProfileMacros(model, fn, tokens, read, config);
+    return { ...buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros, true), headers };
+  }
+  const headers = new Map();
   for (const file of flowchartHeaders(model, fn)) {
     const entry = read(file);
-    let macros = config ? null : entry.macros;
-    if (!macros) {
-      const tokens = entry.macroTokens ?? lex(entry.source, file).filter(token => token.t === 'preproc');
+    if (!entry.macros) {
       const scope = fileMacroScope(headers);
-      collectMacros(tokens, scope, file, !!config);
-      macros = scope.changes;
-      if (config) entry.macroTokens = tokens;
-      else entry.macros = macros;
+      collectMacros(lex(entry.source, file).filter(token => token.t === 'preproc'), scope, file);
+      entry.macros = scope.changes;
     }
-    for (const [name, def] of macros) {
+    for (const [name, def] of entry.macros) {
       if (def) headers.set(name, def);
       else headers.delete(name);
     }
@@ -925,9 +944,9 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   return { ...buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros), headers };
 }
 
-function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros) {
+function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros, macrosAtFunction = false) {
   const local = fileMacroScope(headers);
-  collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file, model.pruneInactive);
+  if (!macrosAtFunction) collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file);
   const bounds = locateBody(parser, source, tokens, fn, local);
   if (!bounds) throw new Error(`无法定位函数定义：${fn.name}`);
   const bodyTokens = tokens.filter(token => token.s >= bounds.open && token.s <= bounds.close);
@@ -985,13 +1004,15 @@ function findSourceFunction(parser, source, tokens, fn, headers) {
   return { ...fn, line: definition.line, endLine: definition.endLine };
 }
 
-function extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) {
+function extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros, sourceRoot) {
   const source = otherSourceText.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const tokens = lex(source, fn.file);
   const definition = findSourceFunction(parser, source, tokens, fn, headers);
   // 对照文件复用工程符号，调用位置以对照源码为准。
   const sourceModel = { _index: { ...model._index, outAdj: new Map() } };
-  return buildSourceGraph(parser, sourceModel, definition, source, tokens, headers, expandMacros);
+  const config = flowchartMacroConfig(model, fn);
+  const macros = config ? flowchartProfileMacros(model, definition, tokens, sourceReader(model, sourceRoot), config) : headers;
+  return buildSourceGraph(parser, sourceModel, definition, source, tokens, macros, expandMacros, !!config);
 }
 
 function addCallInputs(hash, index, fn) {
@@ -1025,7 +1046,7 @@ export function flowchartCacheHash(model, fn, { version = 'after', expandMacros 
   function addInputs(side, graphModel, graphFn, files) {
     const config = flowchartMacroConfig(graphModel, graphFn);
     h.update(JSON.stringify([side, graphFn.id, graphFn.name, graphFn.file, graphFn.line, graphFn.endLine])).update(files);
-    if (config) h.update('\0profile\0').update(JSON.stringify(config));
+    if (config) h.update('\0profile2\0').update(JSON.stringify(config));
     addCallInputs(h, graphModel._index, graphFn);
   }
   const currentFiles = fileInputs(model, fn, sourceRoot);
@@ -1051,7 +1072,7 @@ export async function buildFlowchart(model, fn, { expandMacros = false, version 
       const counterpart = otherModel && isFlowchartFunction(otherFn)
         ? extractFlowchartGraph(parser, otherModel, otherFn, expandMacros, otherSourceRoot)
         : typeof otherSourceText === 'string'
-          ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros) : null;
+          ? extractSourceComparison(parser, model, fn, otherSourceText, headers, expandMacros, sourceRoot) : null;
       if (counterpart) changes = matchFlowchartNodes(graph.nodes, counterpart.graph.nodes, version);
     } catch { /* 对照版本无法解析时，仅保留函数级状态。 */ }
   }

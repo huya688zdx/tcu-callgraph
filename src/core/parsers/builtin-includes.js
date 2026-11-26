@@ -111,7 +111,8 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
           if (header && !header.isHeader) {
             header = { ...header, isHeader: true };
             byPath.set(absKey, header);
-          } else if (!header && (external || options.allowLocalIncludes) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
+          } else if (!header && options.allowUnlistedIncludes !== false &&
+              (external || options.allowLocalIncludes) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
             header = { abs, rel: path.relative(root, abs).replaceAll('\\', '/'), isHeader: true };
             byPath.set(absKey, header);
           }

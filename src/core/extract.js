@@ -560,7 +560,7 @@ function clearAggregateSlots(slot, table, status) {
 }
 
 /** 每一对花括号都有独立的游标。数组按维度进位，结构体按字段声明顺序进位。 */
-function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false) {
+function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false, parentUnions = []) {
   const items = splitAtTopLevel(inner);
   let cursor = layout?.names?.length ? [layout.names[0]] : scalarBrace && items.length === 1 ? [] : [0];
   for (const item of items) {
@@ -621,10 +621,12 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     const slotPath = [...prefix, ...parts];
     let slot = '';
     let parent = layout;
+    let unions = parentUnions;
     for (let i = 0; i < slotPath.length; i++) {
       const part = slotPath[i];
       if (i >= prefix.length) {
         if (parent?.union && typeof part === 'string') {
+          unions = [...unions, i];
           // union 成员重叠。切换成员后，前一个成员的值不再能确定调用目标。
           clearInitSlot(slot, table, status);
           const previous = status.activeUnionMembers.get(slot);
@@ -643,7 +645,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     if (braced) {
       const scalar = !child?.element && !child?.names &&
         (child?.pointer || (typeof parts.at(-1) !== 'string' && (!!layout?.element || scalarBrace)));
-      collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated);
+      collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated, unions);
     } else {
       // 同一槽位的后一个初始化覆盖前一个。未知的整个结构体可能提供任一成员。
       status.unresolvedSlots.delete(slot);
@@ -662,6 +664,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
           parts: slotPath.map(p => typeof p === 'object' ? null : p),
           unknownPosition: slotPath.some(p => typeof p === 'object' && p.expr.startsWith('@')),
           designated: designatedParent || designated,
+          ...(unions.length ? { unions } : {}),
         });
       } else table.slots.delete(slot);
     }

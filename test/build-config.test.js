@@ -692,24 +692,24 @@ test('Make 自动变量合并同一目标的多个规则，保持配方依赖优
 test('流程图按编译单元展开构建宏，并绑定 .inc 中可见的静态函数', async t => {
   const root = temporaryProject(t);
   write(root, 'Makefile', [
-    'all:', '\tcc -DRUN=helper -c a.c', '\tcc -DRUN=other -c b.c',
+    'all:', '\tcc -DSELECTED=helper -c a.c', '\tcc -DRUN=other -c b.c',
   ].join('\n'));
-  write(root, 'helper.inc', 'static inline void helper(void) {}\n');
-  write(root, 'a.c', '#include "helper.inc"\nvoid runA(void) { RUN(); }\n');
+  write(root, 'helper.inc', '#if MODE\n#define RUN SELECTED\n#endif\nstatic inline void helper(void) {}\n');
+  write(root, 'a.c', '#define MODE 1\n#include "helper.inc"\n#undef MODE\nvoid runA(void) { RUN(); }\n');
   write(root, 'b.c', 'static void other(void) {}\nvoid runB(void) { RUN(); }\n');
   const { request, close } = await startServer(root);
   t.after(close);
   await request('/api/build-configs', { profileId: 'make::Makefile' });
-  for (const [id, calleeId, name] of [
-    ['a.c::runA', 'helper.inc::helper', 'helper'],
-    ['b.c::runB', 'b.c::other', 'other'],
+  for (const [id, calleeId, name, macroFile] of [
+    ['a.c::runA', 'helper.inc::helper', 'helper', 'helper.inc'],
+    ['b.c::runB', 'b.c::other', 'other', '<build-config>'],
   ]) {
     const query = new URLSearchParams({ id, expandMacros: 1 });
     const result = await request('/api/flowchart?' + query);
     const invocation = result.nodes.find(node => node.kind === 'call');
     assert.match(invocation.text, new RegExp(name + '\\(\\)'));
     assert.ok(invocation.callees.some(callee => callee.id === calleeId));
-    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === '<build-config>'));
+    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === macroFile));
   }
 });
 
@@ -759,4 +759,22 @@ test('Make 引号条件保留空操作数并选择正确的编译参数', t => {
   ].join('\n'));
   write(root, 'main.c', 'int value;');
   assert.deepEqual(parseMakefileTree(file, root).compilationUnits['main.c'].defines, ['EMPTY', 'ENABLED']);
+});
+
+test('Make 复合配方的每个编译调用独立收集参数，引号中的分号保持为数据', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'CC = vendor-cc-custom', 'all:',
+    '\t$(CC) -DFEATURE=1 -DMESSAGE="a;b" -c first.c; $(CC) -DFEATURE=0 -c second.c && echo -DIGNORED',
+  ].join('\n'));
+  for (const [rel, mode] of [['first', 1], ['second', 0]]) {
+    write(root, rel + '.c', '#if FEATURE == ' + mode + '\nvoid ' + rel + '_correct(void) {}\n#endif');
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.compilationUnits['first.c'].defines, ['FEATURE=1', 'MESSAGE=a;b']);
+  assert.deepEqual(profile.compilationUnits['second.c'].defines, ['FEATURE=0']);
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
+    ['first_correct', 'second_correct']);
 });
