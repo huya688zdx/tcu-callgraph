@@ -10,7 +10,7 @@ export function textWidth(s) {
   return w;
 }
 
-function measureLines(edges, geometryOnly = false) {
+function measureLines(edges, geometryOnly = false, crossed = null) {
   const horizontal = [];
   const vertical = [];
   const pathKeys = new Set();
@@ -79,7 +79,11 @@ function measureLines(edges, geometryOnly = false) {
       const v = vertical[i];
       if (h.y <= v.y1 + 0.5 || h.y >= v.y2 - 0.5) continue;
       const related = h.edge.from === v.edge.from || h.edge.from === v.edge.to || h.edge.to === v.edge.from || h.edge.to === v.edge.to;
-      if (!related) intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
+      if (!related) {
+        intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
+        crossed?.add(h.edge);
+        crossed?.add(v.edge);
+      }
     }
   }
   return { length, rawLength, crossings: intersections.size, bends };
@@ -129,8 +133,14 @@ export function directoryWhitespace({ groups, containers }) {
 }
 
 /** 保留同线型的公共干线，处理不同线型相互遮盖及跨区绕行，只改动 subset。 */
-export function improveEdgeRoutes(view, subset, simplify = () => true) {
+export function improveEdgeRoutes(view, subset, simplify = () => true, crossingPass = false) {
   if (!subset.length) return;
+  if (crossingPass) {
+    const crossed = new Set();
+    measureLines(view.edges, false, crossed);
+    subset = subset.filter(e => crossed.has(e));
+    if (!subset.length) return;
+  }
   const detour = (e) => {
     const p = e.points;
     let length = 0;
@@ -140,16 +150,17 @@ export function improveEdgeRoutes(view, subset, simplify = () => true) {
   const { byEdge } = routeOverlapConflicts(view.edges, { differentStylesOnly: true });
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   const callNodes = callEndpoints(view.edges);
+  const groupDirections = new Map(view.groups?.map(g => [g.id, g.layoutDirection]));
   const facePenalty = (e) => {
     const a = byId.get(e.from), b = byId.get(e.to);
-    const roles = semanticFaces(e, a, b, view.layoutDirection, callNodes);
+    const roles = semanticFaces(e, a, b, view.layoutDirection, callNodes, groupDirections);
     const side = (node, [x, y]) => nearestSide(node, { x, y });
     return roles ? 24 * (Number(side(a, e.points[0]) !== roles[0]) +
       Number(side(b, e.points.at(-1)) !== roles[1])) : 0;
   };
   const ranked = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2)
     .map((edge) => ({ edge, overlap: byEdge.get(edge) || 0, detour: detour(edge) }))
-    .filter(({ edge, overlap, detour }) => overlap || facePenalty(edge) || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))
+    .filter(({ edge, overlap, detour }) => crossingPass || overlap || facePenalty(edge) || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))
     .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour).slice(0, 12);
   if (!ranked.length) return;
   const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
@@ -160,11 +171,18 @@ export function improveEdgeRoutes(view, subset, simplify = () => true) {
     const vertical = [below ? 'bottom' : 'top', below ? 'top' : 'bottom'];
     const others = view.edges.filter((e) => e !== edge);
     const existing = collectSegments(others);
+    const barriers = crossingPass ? [...(view.groups || []), ...(view.containers || [])].filter(box =>
+      !box.root && ![a.group,b.group].some(id => id === box.id || id?.startsWith(box.id + '/'))) : [];
     const candidates = [];
-    for (const [fromSide, toSide] of [[vertical[0], horizontal[1]], [horizontal[0], vertical[1]], vertical, horizontal]) {
+    const faces = crossingPass
+      ? [...horizontal, ...vertical].flatMap(from => [...horizontal, ...vertical].map(to => [from, to]))
+      : [[vertical[0], horizontal[1]], [horizontal[0], vertical[1]], vertical, horizontal];
+    for (const [fromSide, toSide] of faces) {
       const candidate = { ...edge, fromSide, toSide };
-      routeEdges(view.nodes, [candidate], { existing, layoutDirection: view.layoutDirection, callNodes });
-      if (candidate.blocked || candidate.points.some(([x, y]) => (view.width != null && (x < 0 || x > view.width)) ||
+      routeEdges(view.nodes, [candidate], { existing, layoutDirection: view.layoutDirection, callNodes, groupDirections });
+      const diagonal = candidate.points.some(([x, y], i) => i && Math.abs(x-candidate.points[i-1][0]) > 1e-6 &&
+        Math.abs(y-candidate.points[i-1][1]) > 1e-6);
+      if (candidate.blocked || diagonal || barriers.some(box => pathCrossesBody(candidate.points, box)) || candidate.points.some(([x, y]) => (view.width != null && (x < 0 || x > view.width)) ||
         (view.height != null && (y < 0 || y > view.height)))) continue;
       candidates.push(candidate);
     }
@@ -177,6 +195,7 @@ export function improveEdgeRoutes(view, subset, simplify = () => true) {
     for (const candidate of candidates) {
       const next = layoutMetrics([...nearby, candidate]);
       // 只为解开重线允许一个新的交点，避免从拥挤的公共通道中逐条抽线穿过整图。
+      if (crossingPass && next.crossings >= current.crossings) continue;
       const fewerConflicts = next.styleOverlapLength < current.styleOverlapLength - 0.5;
       if (next.styleOverlapLength > bestStyleOverlap + 0.5 || next.crossings > current.crossings + Number(fewerConflicts)) continue;
       const score = scoreMetrics(next) + facePenalty(candidate);
@@ -212,12 +231,34 @@ export function mergeSharedRoutes(view, subset = view.edges) {
   if (!affected.size) return;
   const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
   const cost = (edges) => { const m = routeLengthAndCrossings(edges, true); return m.length + STUB * m.bends; };
-  const replacementCost = (edge, points) => cost(view.edges.map((e) => e === edge ? { ...e, points } : e));
+  // 只替换一条线。异色线和两条路径包络之外的线，对同色线段并集的增量贡献为零。
+  const byStyle = new Map();
+  for (const e of view.edges) {
+    const key = edgeStyleKey(e);
+    if (!byStyle.has(key)) byStyle.set(key, []);
+    byStyle.get(key).push(e);
+  }
+  const replacementDelta = (edge, points) => {
+    const before = bounds.get(edge), after = routeBounds(points);
+    const nearby = byStyle.get(edgeStyleKey(edge)).filter(e => e !== edge &&
+      (boundsMeet(bounds.get(e), before, 4) || boundsMeet(bounds.get(e), after, 4)));
+    return cost([...nearby, { ...edge, points }]) - cost([...nearby, edge]);
+  };
   const automatic = view.edges.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2);
   const callNodes = callEndpoints(view.edges);
-  let viewCost;
+  const groupDirections = new Map(view.groups?.map(g => [g.id, g.layoutDirection]));
   const length = (pts) => pts.slice(1).reduce((sum, p, i) => sum + Math.abs(p[0] - pts[i][0]) + Math.abs(p[1] - pts[i][1]), 0);
-  const clearsNodes = (edge, points) => !pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) &&
+  const barriers = new Map();
+  const boxes = [...(view.groups || []), ...(view.containers || [])];
+  const clearsBoxes = (edge, points) => {
+    if (!barriers.has(edge)) {
+      const owners = [nodes.get(edge.from)?.group, nodes.get(edge.to)?.group];
+      barriers.set(edge, boxes.filter(b => !b.root && !owners.some(id => id === b.id || id?.startsWith(b.id + '/')) &&
+        !pathCrossesBody(edge.points, b)));
+    }
+    return !barriers.get(edge).some(b => pathCrossesBody(points, b));
+  };
+  const clearsNodes = (edge, points) => clearsBoxes(edge, points) && !pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) &&
     !pathCrossesBody(points, nodes.get(edge.from)) && !pathCrossesBody(points, nodes.get(edge.to));
   const addsConflict = (edge) => {
     // 每条原线路的冲突只计算一次，其他边在其候选比较期间保持不变。
@@ -266,7 +307,6 @@ export function mergeSharedRoutes(view, subset = view.edges) {
             if (length(cand) > origLen + 0.5 || !clearsNodes(edge, cand) || conflicts(cand)) continue;
             edge.points = cand;
             bounds.set(edge, routeBounds(cand));
-            viewCost = undefined;
             changed = true;
             break;
           }
@@ -290,7 +330,7 @@ export function mergeSharedRoutes(view, subset = view.edges) {
       let groupCost = cost(edges);
       for (const edge of edges.filter((e) => affected.has(e)).sort((a, b) => b.points.length - a.points.length)) {
         const q = role === 'from' ? edge.points : edge.points.slice().reverse();
-        const roles = semanticFaces(edge, nodes.get(edge.from), nodes.get(edge.to), view.layoutDirection, callNodes);
+        const roles = semanticFaces(edge, nodes.get(edge.from), nodes.get(edge.to), view.layoutDirection, callNodes, groupDirections);
         const keepPort = roles && nearestSide(nodes.get(edge[role]), { x: q[0][0], y: q[0][1] }) === roles[role === 'from' ? 0 : 1];
         let best = null, gain = 0;
         const originalLength = length(edge.points);
@@ -322,10 +362,8 @@ export function mergeSharedRoutes(view, subset = view.edges) {
         const next = cost(edges.map((e) => e === edge ? { ...e, points: best } : e));
         // 同目标汇流也不能拆散其他同源组已有的干线。
         if (next >= groupCost - 0.5) continue;
-        viewCost ??= cost(view.edges);
-        const total = replacementCost(edge, best);
-        if (total < viewCost - 0.5) {
-          edge.points = best; groupCost = next; viewCost = total;
+        if (replacementDelta(edge, best) < -0.5) {
+          edge.points = best; groupCost = next;
           bounds.set(edge, routeBounds(best));
         }
       }
@@ -377,18 +415,16 @@ export function mergeSharedRoutes(view, subset = view.edges) {
             if (points.length < 2 || !samePoint(points[0], q[0]) || !samePoint(points.at(-1), q.at(-1)) ||
                 points.some((pt, idx) => idx > 0 && segmentAxis(points[idx - 1], pt) < 0) ||
                 !clearsNodes(edge, points) || conflicts(points)) continue;
-            viewCost ??= cost(view.edges);
-            const total = replacementCost(edge, points);
-            if (total < viewCost - 0.5 && total < bestCost) {
+            const delta = replacementDelta(edge, points);
+            if (delta < -0.5 && delta < bestCost) {
               best = points;
-              bestCost = total;
+              bestCost = delta;
             }
           }
         }
         if (best) {
           const prevLen = edge.points.length;
           edge.points = best;
-          viewCost = bestCost;
           bounds.set(edge, routeBounds(best));
           changed = true;
           if (edge.points.length < prevLen) j = Math.max(0, j - 1);

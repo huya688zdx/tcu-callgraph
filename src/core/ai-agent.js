@@ -105,6 +105,20 @@ function scrubSecret(text, apiKey) {
 function clipToolOutput(output, maxChars = 12000) {
   let text = JSON.stringify(output);
   if (text.length <= maxChars) return text;
+  if (output?.action === 'inspect' && Array.isArray(output.nodes)) {
+    const { nodes, groups, containers, edges, ...summary } = output;
+    const clipped = { ...summary, truncated: true, nodes: [], groups: [], containers: [], edges: [] };
+    let remaining = maxChars - JSON.stringify(clipped).length;
+    for (const [key, items] of Object.entries({ nodes, groups, containers, edges })) {
+      for (const item of items || []) {
+        const size = JSON.stringify(item).length + (clipped[key].length ? 1 : 0);
+        if (size > remaining) break;
+        clipped[key].push(item);
+        remaining -= size;
+      }
+    }
+    return JSON.stringify(clipped);
+  }
   // 裁剪工具结果时保留车型选择所需的目录前缀。
   const vehicleChoice = {
     ...(output?.needsVehicleChoice === true ? { needsVehicleChoice: true } : {}),
@@ -268,6 +282,40 @@ export const AGENT_TOOLS = [
     },
   },
   {
+    name: 'arrange_canvas',
+    description: '查看当前画布坐标，移动、对齐或重置画布节点。x 向右增加，y 向下增加。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'move', 'align', 'reset'] },
+        moves: {
+          type: 'array',
+          maxItems: 200,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: '画布节点完整 ID 或唯一短名称' },
+              x: { type: 'number' },
+              y: { type: 'number' },
+              dx: { type: 'number' },
+              dy: { type: 'number' },
+              relativeTo: { type: 'string', description: '参照节点完整 ID 或唯一短名称' },
+              placement: { type: 'string', enum: ['right', 'left', 'below', 'above'] },
+              gap: { type: 'number', minimum: 0 },
+            },
+            required: ['id'],
+          },
+        },
+        nodes: { type: 'array', maxItems: 200, items: { type: 'string' } },
+        axis: { type: 'string', enum: ['x', 'y'], description: 'x 为水平一排（同 Y），y 为垂直一列（同 X）' },
+        distribute: { type: 'boolean' },
+        gap: { type: 'number', minimum: 0, description: '均匀分布时节点边缘之间的间距' },
+        reason: { type: 'string', maxLength: 240 },
+      },
+      required: ['action'],
+    },
+  },
+  {
     name: 'remove_from_canvas',
     description: '按函数或车型目录前缀移除当前画布中的节点，保留其他节点。',
     parameters: {
@@ -298,7 +346,16 @@ export function estimateTokens(text) {
 const TOOL_SCHEMA_TOKENS = estimateTokens(JSON.stringify(openAiToolsPayload()));
 
 export function estimateMessagesTokens(messages, includeTools = false) {
-  return messages.reduce((total, message) => total + 4 + estimateTokens(JSON.stringify(message)), includeTools ? TOOL_SCHEMA_TOKENS : 0);
+  return messages.reduce((total, message) => {
+    if (!Array.isArray(message.content)) return total + 4 + estimateTokens(JSON.stringify(message));
+    let imageTokens = 0;
+    const content = message.content.map(part => {
+      if (part?.type !== 'image_url') return part;
+      imageTokens += 600;
+      return { type: 'image_url' };
+    });
+    return total + 4 + estimateTokens(JSON.stringify({ ...message, content })) + imageTokens;
+  }, includeTools ? TOOL_SCHEMA_TOKENS : 0);
 }
 
 function openAiToolsPayload() {
@@ -318,6 +375,68 @@ function authHeaders(apiKey) {
   return headers;
 }
 
+function formatUiContextSelections(ui) {
+  if (!ui || typeof ui !== 'object') return { multi: false, selections: [] };
+  const selectedNode = ui.selectedNode ?? (ui.kind === 'node' ? ui : null);
+  const selectedEdge = ui.selectedEdge ?? (ui.kind === 'edge' ? ui : null);
+  const selectedFile = ui.selectedFile ?? (ui.kind === 'file' ? ui : null);
+  const location = (file, line) => {
+    if (!line) return file;
+    return file ? `${file}:${line}` : `第 ${line} 行`;
+  };
+  const formatSelection = (kind, item) => {
+    if (!item) return '';
+    if (kind === 'node') {
+      const id = typeof item === 'string' ? item : item.id || item.name;
+      const source = location(item.file ?? item.path, item.line ?? item.startLine);
+      return `节点 ${[id, source].filter(Boolean).join('，')}`;
+    }
+    if (kind === 'edge') {
+      const { from, to, id, edgeKey, file, line, labels, label } = item;
+      const endpoints = typeof item === 'string' ? item : from && to ? `${from} → ${to}` : '';
+      const texts = (Array.isArray(labels) ? labels : [labels ?? label])
+        .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
+      const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
+      return `连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`;
+    }
+    if (kind !== 'file') return '';
+    const file = typeof item === 'string' ? item : item.path || item.file;
+    return file ? `文件 ${file}` : '';
+  };
+  if (ui.items?.length) {
+    return {
+      multi: true,
+      selections: ui.items.map(item => formatSelection(item?.kind, item)).filter(Boolean),
+    };
+  }
+  return {
+    multi: false,
+    selections: [
+      formatSelection('node', selectedNode),
+      formatSelection('edge', selectedEdge),
+      formatSelection('file', selectedFile),
+    ].filter(Boolean),
+  };
+}
+
+function buildTurnUserText(userText, uiContext) {
+  const { selections } = formatUiContextSelections(uiContext);
+  if (!selections.length) return userText;
+  const multi = selections.length > 1;
+  const header = multi
+    ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
+    : '[本轮画布当前选中对象（指代最高优先级）]';
+  const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
+  return [
+    header,
+    body,
+    '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
+    '',
+    '用户本轮提问：',
+    userText,
+  ].join('\n');
+}
+
 function buildSystemPrompt(context, promptToolMode) {
   const ctxLines = [
     `当前工程：${context.projectName || '未命名'}（函数 ${context.fnCount ?? 0} / 变量 ${context.varCount ?? 0}）`,
@@ -332,35 +451,17 @@ function buildSystemPrompt(context, promptToolMode) {
     ctxLines.push(`已识别任务入口：${context.tasks.slice(0, 10).join(', ')}`);
   }
   if (context.uiContext) {
-    const ui = context.uiContext;
-    const selectedNode = ui.selectedNode ?? (ui.kind === 'node' ? ui : null);
-    const selectedEdge = ui.selectedEdge ?? (ui.kind === 'edge' ? ui : null);
-    const selectedFile = ui.selectedFile ?? (ui.kind === 'file' ? ui : null);
-    const selections = [];
-    const location = (file, line) => {
-      if (!line) return file;
-      return file ? `${file}:${line}` : `第 ${line} 行`;
-    };
-    if (selectedNode) {
-      const id = typeof selectedNode === 'string' ? selectedNode : selectedNode.id ?? selectedNode.name;
-      const source = location(selectedNode.file ?? selectedNode.path, selectedNode.line ?? selectedNode.startLine);
-      selections.push(`节点 ${[id, source].filter(Boolean).join('，')}`);
+    const { multi, selections } = formatUiContextSelections(context.uiContext);
+    if (multi) {
+      ctxLines.push(`用户当前在画布上选中/暂存的对象（共 ${selections.length} 项）：`,
+        ...selections.map((text, index) => `${index + 1}. ${text}`));
+    } else {
+      ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
     }
-    if (selectedEdge) {
-      const { from, to, id, edgeKey, file, line, labels, label } = selectedEdge;
-      const endpoints = typeof selectedEdge === 'string' ? selectedEdge : from && to ? `${from} → ${to}` : '';
-      const texts = (Array.isArray(labels) ? labels : [labels ?? label])
-        .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
-      const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
-      selections.push(`连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`);
-    }
-    const file = typeof selectedFile === 'string' ? selectedFile : selectedFile?.path ?? selectedFile?.file;
-    if (file) selections.push(`文件 ${file}`);
-    ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
   }
 
   const base = [
-    '你是 TCU C 调用图画布助手。目标是尽快调用工具把用户需要的函数和变量加入可编辑画布，再给出简明中文说明。',
+    '你是 TCU C 调用图画布助手。回答解释或排查类问题时先调只读工具查证事实；用户要求构图、标注或调整画布时，再尽快调用对应工具修改画布并给出简明中文说明。',
     '核心原则：',
     '1. 不要长篇空想，立刻动手调工具。',
     '2. 用户要求将 Git 改动加入画布时，先调用 get_git_changes 检查目录分支，再按第 8、9 条确定范围。调用 add_to_canvas 时传 fromGit: true 和已取得的 snapshotId，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块默认拆分为独立书签，若需要用户决定则用 ask_user 确认拆分或合并。用户要求合并时传 splitByGroup: false。',
@@ -369,12 +470,14 @@ function buildSystemPrompt(context, promptToolMode) {
     '普通最终回复末尾用 <next_steps>[{"label":"简短按钮文案","prompt":"点击后执行的具体指令"}]</next_steps> 给出 2–3 个结合本轮具体函数、变量或发现的后续操作。label 最多 28 字。书签建议可用 draft 字段填写 "/bookmark 名称"。调用 ask_user 时省略建议。',
     '4. 补齐 TASK 周期或调用顺序时，先调用 find_symbols({}) 查看 canvasEdges 和 suggestedLabels（含从函数头注释提取的周期），再调用 apply_labels 传入 items 或 { autoDetect: true } 写入画布。手动标周期用 preset:"task"（如 text:"TASK:10ms"），标调用顺序用 preset:"call"（コール順N），且 call 标签禁止填写 note。',
     '5. 源码若为日文 CP932，调 read_function 可传 encoding:"cp932"，严禁将乱码写入标签注释或回复。',
-    '6. 只使用已确认存在的函数名。遇到重名时，根据上下文选择完整「文件::函数名」；如果目标仍不明确，在修改画布前用 ask_user 提供候选项。仅在重大画布修改前确有歧义时提问，用户意图明确或已回答时直接执行。',
+    '6. 只使用已确认存在的函数名。遇到重名或同一函数/文件存在于多个车型目录（如 z144/a.c::foo 与 z145/a.c::foo）时，只要用户未指定车型目录且未在画布选中具体实例，严禁自行猜选其中一个或全部加入画布，必须在修改画布前调用 ask_user 提供候选项；用户意图明确或已回答时直接执行。',
     '7. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
-    '8. 准备写入画布且需要确认上游车型时，先用 trace_upstream 读取上游链。get_git_changes、trace_upstream 或 add_to_canvas 返回至少两个 pathBranches 分支或 needsVehicleChoice: true，且用户尚未明确范围时，下一步必须单独调用 ask_user。用每个分支的 prefix 作为一个选项，再加一个「全部保留」选项。等用户选择后再调用 add_to_canvas。',
+    '8. 准备写入画布且需要确认上游车型或同名多车型路径时，先用 trace_upstream 读取上游链。get_git_changes、trace_upstream 或 add_to_canvas 返回至少两个 pathBranches 分支、ambiguous 或 needsVehicleChoice: true，且用户尚未明确范围时，下一步必须单独调用 ask_user。用每个分支的 prefix 作为一个选项，再加一个「全部保留」选项。等用户选择后再调用 add_to_canvas。',
     '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
     '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
-    '10. 用户提到当前选中的函数、连线或文件时，使用当前画布选中对象中的完整 ID、端点及文件路径定位。回答解释类问题时只读分析。',
+    '10. 指代锚定规则（最高优先级）：当本轮消息附带「本轮画布当前选中对象」时，任何指代词（“这个函数”、“它”、“这个变量”、“这条线”、“当前对象”）或未显式点名其他符号的提问，必须严格锚定到本轮画布选中对象的完整 ID、端点及文件路径；严禁因上一轮回复刚提过其他函数/连线（近因偏差）而把目标换成上轮对象。仅当用户本轮明确点名其他符号时，才以用户点名为准。',
+    '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径（如上轮提过的某条调用链或其他相关函数）当成本轮隐含需求去追查或写入画布。回答“为什么没有上游调用链/为什么未连线/这个函数做什么”等解释排查类问题时，只使用只读工具（read_function、trace_upstream、find_symbols），不得擅自修改画布。',
+    '12. 使用 arrange_canvas({ action: "inspect" }) 查看画布坐标，再按用户要求使用 move、align 或 reset。附有画布截图时，结合图像和 inspect 返回的节点坐标确定目标后再移动。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -518,7 +621,7 @@ function convertMessagesToPromptMode(messages, context) {
       }
       out.push({ role: 'assistant', content: textParts.join('\n') || '…' });
     } else {
-      out.push({ role: m.role, content: String(m.content || '') });
+      out.push(m);
     }
   }
   flushTools();
@@ -915,14 +1018,28 @@ function summarizeToolResult(name, result) {
   }
   if (name === 'read_function') return `已读 ${result.name || result.id} (${result.file}:${result.startLine}-${result.endLine})`;
   if (name === 'add_to_canvas') {
-    const parts = [`已加入画布（${result.addedCount ?? result.roots?.length ?? 0} 项）`];
+    const names = Array.isArray(result.addedNames) ? result.addedNames.filter(Boolean) : [];
+    const preview = names.length
+      ? `：${names.slice(0, 6).join('、')}${names.length > 6 ? ` 等 ${names.length} 项` : ''}`
+      : '';
+    const parts = [`已加入画布（${result.addedCount ?? result.roots?.length ?? 0} 项${preview}）`];
     if (result.bookmarks?.length) parts.push(`已创建 ${result.bookmarks.length} 个书签`);
     if (result.ambiguous?.length) parts.push(`${result.ambiguous.length} 个重名待确认`);
     if (result.notFound?.length) parts.push(`${result.notFound.length} 个未找到`);
     return parts.join('，');
   }
   if (name === 'apply_labels') return `已写入 ${result.applied || 0} 条标签`;
-  if (name === 'remove_from_canvas') return '已从画布移除 ' + (Array.isArray(result.removed) ? result.removed.length : result.removed ?? 0) + ' 项';
+  if (name === 'arrange_canvas') {
+    if (result.action === 'inspect') return `已查看 ${result.nodes?.length ?? 0} 个画布节点的位置`;
+    if (result.action === 'reset') return '已恢复自动布局';
+    return `已调整 ${result.updatedCount} 个画布节点的位置`;
+  }
+  if (name === 'remove_from_canvas') {
+    const list = Array.isArray(result.removed) ? result.removed : [];
+    const shortNames = list.map(id => String(id).split('::').pop()).filter(Boolean);
+    const preview = shortNames.length ? `（${shortNames.slice(0, 5).join('、')}${shortNames.length > 5 ? '…' : ''}）` : '';
+    return `已从画布移除 ${list.length || (Number(result.removed) || 0)} 项${preview}`;
+  }
   if (name === 'trace_upstream') return '已追踪 ' + Object.keys(result.pathBranches ?? {}).length + ' 个上游分支';
   return '完成';
 }
@@ -931,6 +1048,7 @@ const DIGEST_FIELDS = [
   'snapshotId', 'includePaths', 'excludePaths', 'includeAllBranches', 'functions', 'vars', 'fromGit', 'splitByGroup',
   'id', 'file', 'pathBranches', 'needsVehicleChoice', 'isolatedGroups', 'changedFunctions', 'changedFiles', 'changedVars',
   'roots', 'matches', 'upstreamChains', 'applied', 'removed', 'bookmarks', 'edgeKeys', 'error',
+  'action', 'axis', 'updatedCount', 'positions',
 ];
 
 export function summarizeToolDigest(name, args, result) {
@@ -971,7 +1089,13 @@ export function summarizeToolDigest(name, args, result) {
 }
 
 function historyContent(message, maxLength = Infinity) {
-  const text = String(message.text ?? message.content ?? '').trim();
+  const rawText = String(message.text ?? message.content ?? '').trim();
+  const selectionPrefix = message.role === 'user' && message.selectionSummary
+    ? `[当时画布选中：${String(message.selectionSummary).trim()}]`
+    : '';
+  const text = selectionPrefix && !rawText.startsWith('[当时画布选中：')
+    ? [selectionPrefix, rawText].filter(Boolean).join('\n')
+    : rawText;
   const details = [];
   if (Array.isArray(message.tools)) {
     for (const tool of message.tools) {
@@ -1044,6 +1168,7 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
 export async function runAiAgent({
   config,
   prompt,
+  images = [],
   history = [],
   context = {},
   executeTool,
@@ -1080,11 +1205,44 @@ export async function runAiAgent({
     /待确认选项|已提供选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
   const requiredTool = removal ? 'remove_from_canvas'
     : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
+  const hasEditIntent = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u.test(userText);
+  const readOnlyQuestion = !requiredTool && !hasEditIntent && (
+    /(?:为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|为何没有|为什么没有|为什么会|怎么没有)/u.test(userText) ||
+    /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText)
+  );
+  const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
+  const unanchoredDeictic = !requiredTool && !hasSelectionContext &&
+    /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
+    !/[A-Za-z_][A-Za-z0-9_]{2,}/u.test(userText);
+  const isCanvasWriteTool = (call) =>
+    ['add_to_canvas', 'remove_from_canvas', 'apply_labels'].includes(call.name) ||
+    (call.name === 'arrange_canvas' && call.arguments?.action !== 'inspect');
 
+  let imagesDegraded = false;
+  const turnUserText = buildTurnUserText(userText, context.uiContext);
+  const userMessage = {
+    role: 'user',
+    content: images.length > 0 && !imagesDegraded
+      ? [{ type: 'text', text: turnUserText }, ...images.map(img => ({
+        type: 'image_url', image_url: { url: typeof img === 'string' ? img : img.dataUrl },
+      }))]
+      : turnUserText,
+  };
+  const degradeImages = (res) => {
+    if (!images.length || imagesDegraded || ![400, 422].includes(res.status)) return false;
+    const error = res.json?.error;
+    const detail = [error?.param, error?.message, typeof error === 'string' ? error : null,
+      res.json?.message, res.json?.detail].filter(Boolean);
+    if (!/image|vision|multimodal|content.*string|expected.*string|unsupported/i.test(detail.length ? JSON.stringify(detail) : res.text)) return false;
+    imagesDegraded = true;
+    userMessage.content = turnUserText;
+    onEvent({ type: 'fallback', text: '当前模型接口不支持图片输入，已自动降级为纯文本继续' });
+    return true;
+  };
   let messages = [
     { role: 'system', content: buildSystemPrompt(context, activeMode === 'prompt') },
     ...cleanHistory,
-    { role: 'user', content: userText },
+    userMessage,
   ];
   const allThoughts = [];
   const toolLog = [];
@@ -1150,6 +1308,10 @@ export async function runAiAgent({
         const detail = error?.param || error?.message || res.text;
         if (streamMode === 'stream_usage' && /stream_options|include_usage/i.test(detail)) {
           streamMode = 'stream';
+          step--;
+          continue;
+        }
+        if (degradeImages(res)) {
           step--;
           continue;
         }
@@ -1317,8 +1479,23 @@ export async function runAiAgent({
       signal?.throwIfAborted();
       let output;
       try {
-        if (!TOOL_NAME_SET.has(call.name)) output = { ok: false, error: `未知工具：${call.name}` };
-        else output = await executeTool(call.name, call.arguments || {});
+        if (!TOOL_NAME_SET.has(call.name)) {
+          output = { ok: false, error: `未知工具：${call.name}` };
+        } else if (readOnlyQuestion && isCanvasWriteTool(call)) {
+          output = {
+            ok: false,
+            blocked: true,
+            error: '用户本轮只是排查/解释类提问，并未要求修改画布。禁止擅自调用写工具修改画布；请只使用 read_function / trace_upstream / find_symbols 只读查证后回答，若确实需要修改画布请先调用 ask_user 征询用户确认。',
+          };
+        } else if (unanchoredDeictic && isCanvasWriteTool(call)) {
+          output = {
+            ok: false,
+            blocked: true,
+            error: '当前画布未选中任何对象，且用户提问仅使用指代词而未明确指名具体函数/变量，指代不明。禁止直接修改画布，请先调用 ask_user 向用户确认目标对象。',
+          };
+        } else {
+          output = await executeTool(call.name, call.arguments || {});
+        }
       } catch (err) {
         output = { ok: false, error: String(err?.message || err) };
       }
@@ -1328,7 +1505,8 @@ export async function runAiAgent({
       toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, summary, digest });
       onEvent({ type: 'tool_end', name: call.name, ok: output?.ok !== false, summary, digest });
 
-      const clipped = clipToolOutput(output, 12000);
+      const layoutBudget = Math.max(12000, Math.min(72000, config.contextWindow * 2));
+      const clipped = clipToolOutput(output, call.name === 'arrange_canvas' ? layoutBudget : 12000);
       if (callStyle === 'tool_calls' && activeMode === 'tools') {
         messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: clipped });
       } else if (callStyle === 'function_call' && activeMode === 'tools') {
@@ -1360,12 +1538,15 @@ export async function runAiAgent({
         ...(reasoningDegraded ? {} : reasoningPayload),
         messages: [...messages, { role: 'user', content: '请用 2-4 句简明中文总结以上已完成的操作结果，不要再调用工具。' }],
       };
-      const metrics = createMetrics(config, request, onEvent, recordMetrics);
-      const res = await fetchJson(chatUrl, {
-        method: 'POST',
-        headers: authHeaders(config.apiKey),
-        body: JSON.stringify(request),
-      }, fetchImpl, 15_000, signal);
+      let metrics, res;
+      do {
+        metrics = createMetrics(config, request, onEvent, recordMetrics);
+        res = await fetchJson(chatUrl, {
+          method: 'POST',
+          headers: authHeaders(config.apiKey),
+          body: JSON.stringify(request),
+        }, fetchImpl, 15_000, signal);
+      } while (!res.ok && degradeImages(res));
       if (res.ok) {
         summaryMessage = res.json?.choices?.[0]?.message;
         metrics.finish(res.json);

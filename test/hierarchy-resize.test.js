@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from '../web/lib/hierarchy.js';
+import { beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit, beginNodeMove,
+  placeNodeInHierarchy, syncNodeMoveBounds, beginHierarchyMove, moveHierarchy,
+  autoShrinkContainerChain } from '../web/lib/hierarchy.js';
 
 function makeSampleView() {
   return {
@@ -113,4 +115,55 @@ test('多层嵌套向左上拉伸保留各层目录标题边距，且已有重�
   const dragE = beginBoxResize(view, { kind: 'file', box: fileF }, 'e');
   resizeBox(dragE, 120, 0);
   assert.equal(fileF.w, origW, '已有重叠绝不能被进一步拉大');
+});
+
+const rect = ({ x, y, w, h }) => [x, y, w, h];
+
+test('节点向内拖回时，文件框与目录实时收回腾出的空间，松手后四周贴合', () => {
+  const view = makeSampleView();
+  const [file] = view.groups, [dir, root] = view.containers;
+  const drag = beginNodeMove(view, view.nodes[0]);
+
+  assert.equal(placeNodeInHierarchy(drag, 60, 650), true);
+  assert.equal(file.y + file.h, 698);
+  assert.equal(dir.y + dir.h, 708);
+  assert.equal(root.y + root.h, 732);
+  assert.equal(placeNodeInHierarchy(drag, 60, 110), true);
+  syncNodeMoveBounds(drag);
+  assert.equal(file.y + file.h, 158);
+  assert.equal(dir.y + dir.h, 190);
+  assert.equal(root.y + root.h, 214);
+  assert.equal(view.height, 260);
+
+  assert.equal(autoShrinkContainerChain(view, file.id), true);
+  assert.deepEqual(rect(file), [52, 78, 136, 80]);
+  assert.deepEqual(rect(dir), [42, 28, 528, 162]);
+  assert.deepEqual(rect(root), [18, 4, 576, 210]);
+  assert.equal(view.width, 594);
+  assert.equal(autoShrinkContainerChain(view, file.id), false);
+});
+
+test('自动收缩遵守文件框和目录的最小宽高', () => {
+  const view = makeSampleView();
+  view.nodes.splice(1);
+  view.groups.splice(1);
+  Object.assign(view.nodes[0], { w: 40, h: 20 });
+  assert.equal(autoShrinkContainerChain(view, view.groups[0].id), true);
+  assert.deepEqual(rect(view.groups[0]), [52, 68, 120, 70]);
+  assert.deepEqual(rect(view.containers[0]), [42, 36, 160, 112]);
+});
+
+test('层级移动收尾收缩受影响的链，保留同级文件框和画布内的折线', () => {
+  const view = makeSampleView();
+  const [file, sibling] = view.groups, [dir, root] = view.containers;
+  const siblingBefore = rect(sibling);
+  view.edges.push({ from: 'other', to: 'another', points: [[645, 510], [800, 510]] });
+  const drag = beginHierarchyMove(view, { kind: 'file', box: file });
+  assert.equal(moveHierarchy(drag, 0, 160), true);
+  assert.equal(autoShrinkContainerChain(view, file.id), true);
+  assert.deepEqual(rect(file), [52, 228, 136, 80]);
+  assert.deepEqual(rect(sibling), siblingBefore);
+  assert.deepEqual(rect(dir), [42, 28, 528, 290]);
+  assert.deepEqual(rect(root), [18, 4, 576, 338]);
+  assert.deepEqual([view.width, view.height], [824, 534]);
 });

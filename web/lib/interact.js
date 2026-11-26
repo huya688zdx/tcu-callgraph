@@ -7,16 +7,16 @@ import { t } from '../i18n.js';
 import { nodePeriodBadge } from './period-text.js';
 import { els, state, cam, FONT, esc, edgeKey, THEME } from './state.js';
 import {
-  collidesWith,
   moveNodeNoOverlap,
+  moveEdgeSegment,
   rerouteScope,
   fullReroute,
   edgePoints,
   distToSegment,
 } from './geometry.js';
-import { draw, panCanvas, finishPan } from './render.js';
+import { draw, panCanvas, finishPan, viewport, boxVisible } from './render.js';
 import { contentBounds, stopCamAnim, panCam, zoomCam } from './camera.js';
-import { pathBlockedByNodes, routeEdges, collectSegments } from '/core/routing.js';
+import { nearestSide, routeEdges, collectSegments, collapse } from '/core/routing.js';
 import {
   selectNode,
   showNodeMenu,
@@ -32,8 +32,11 @@ import { askAi, fileAiDetail, nodeAiDetail, publishAiSelection, renderDetail, re
 import { hitLabel, dragLabelTo, labelAnchor, saveLabels, edgeLabels } from './edge-labels.js';
 import { edgeAiDetail, renderLabelPanel } from './label-panel.js';
 import { statusLabel } from './change-status.js';
-import { nearestSide } from '/core/routing.js';
-import { beginHierarchyMove, moveHierarchy, cancelHierarchyMove, updateCrossingEdgePreview, beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit } from './hierarchy.js';
+import {
+  beginHierarchyMove, moveHierarchy, cancelHierarchyMove, updateCrossingEdgePreview,
+  beginBoxResize, resizeBox, cancelBoxResize, shrinkBoxToFit,
+  beginNodeMove, cancelNodeMove, syncNodeMoveBounds, autoShrinkContainerChain,
+} from './hierarchy.js';
 import { openManualNodeDialog, removeManualNodePermanently } from './manual-node.js';
 import { pickPairFlow, clearPairFlow } from './pair-flow.js';
 import { hooks } from './hooks.js';
@@ -237,36 +240,10 @@ function hitEnd(e) {
   return null;
 }
 
-function moveSeg(seg, x, y) {
-  const pts = seg.edge.points;
-  if (!seg.prepared) {
-    seg.prepared = true;
-    if (seg.index === 0 || seg.index === pts.length - 2) {
-      // 首尾线段保留引出方向，给直线和单拐角线补出可移动的中段。
-      const a = pts[seg.index], b = pts[seg.index + 1];
-      const p = [a[0] + (b[0] - a[0]) / 4, a[1] + (b[1] - a[1]) / 4];
-      const q = [a[0] + (b[0] - a[0]) * 3 / 4, a[1] + (b[1] - a[1]) * 3 / 4];
-      pts.splice(seg.index + 1, 0, [...p], p, q, [...q]);
-      seg.index += 2;
-    }
-  }
-  const i = seg.index;
-  const axis = seg.orient === 'h' ? 1 : 0;
-  const oldA = pts[i][axis];
-  const oldB = pts[i + 1][axis];
-  if (seg.orient === 'h') {
-    pts[i][1] = y;
-    pts[i + 1][1] = y;
-  } else {
-    pts[i][0] = x;
-    pts[i + 1][0] = x;
-  }
-  if (pathBlockedByNodes(pts, state.view.nodes, new Set([seg.edge.from, seg.edge.to]))) {
-    pts[i][axis] = oldA;
-    pts[i + 1][axis] = oldB;
-    return false;
-  }
-  return pts[i][axis] !== oldA || pts[i + 1][axis] !== oldB;
+const snapTolerance = (event) => event.shiftKey ? 0 : Math.max(6, 8 / cam.k);
+
+function moveSeg(seg, x, y, tolerance = 0) {
+  return moveEdgeSegment(state.view, seg, x, y, tolerance);
 }
 
 /**
@@ -283,7 +260,7 @@ let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
-function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false } = {}) {
+function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false, directPair = false } = {}) {
   if (state.pairFlow) clearPairFlow({ paint: false });
   state.moveTarget = null;
   state.hoverRelation = null;
@@ -293,6 +270,7 @@ function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null,
   state.trunkHits = trunkHits;
   state.prevTrunkHits = trunkHits;
   state.trunkFocusNode = focusNode;
+  state.directPairEdge = Boolean(directPair);
   state.multiSelection = trunkGroup?.length > 1 ? {
     kind: 'edge',
     anchor: edge,
@@ -317,9 +295,11 @@ function clearTrunk() {
   state.trunkHits = null;
   state.prevTrunkHits = null;
   state.trunkFocusNode = null;
+  state.directPairEdge = false;
 }
 
 function pickTrunkEndpoint(id) {
+  if (state.directPairEdge) return false;
   const trunkHits = activeTrunk();
   if (!trunkHits) return false;
   const outgoing = trunkHits.filter((edge) => edge.from === id);
@@ -346,6 +326,7 @@ function resetDragState() {
   moveFrame = 0;
   pendingMove = null;
   state.dragNode = null;
+  state.dragNodeGuides = [];
   state.dragBox = null;
   state.resizeBox = null;
   state.dragEnd = null;
@@ -373,9 +354,8 @@ function cancelDrag() {
     state.dragSeg.edge.points = state.dragSeg.original;
     state.dragSeg.edge.custom = state.dragSeg.custom;
   }
-  if (state.dragNode && state.dragStart) {
-    state.dragNode.x = state.dragStart.nx;
-    state.dragNode.y = state.dragStart.ny;
+  if (state.dragNode) {
+    cancelNodeMove(state.dragNode);
     dragCache?.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => [...p]); });
   }
   resetDragState();
@@ -655,8 +635,9 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   const seg = hitSegment(e);
   if (seg && editable) {
-    state.dragSeg = { ...seg, original: seg.edge.points.map((p) => [...p]), custom: seg.edge.custom,
-      start: worldPos(e), origin: [...seg.edge.points[seg.index]] };
+    pushHistory();
+    state.dragSeg = { ...seg, view: state.view, original: seg.edge.points.map((p) => [...p]), custom: seg.edge.custom,
+      start: worldPos(e), origin: [...seg.edge.points[seg.index]], guides: [] };
     state.dragStart = { x: e.clientX, y: e.clientY };
     els.cv.style.cursor = seg.orient === 'h' ? 'row-resize' : 'col-resize';
     els.cv.setPointerCapture(e.pointerId);
@@ -704,14 +685,32 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   if (n) {
     clearTrunk();
-    if (!editable || !moveReady('node', n)) { selectNode(n.id); return; }
-    state.dragNode = n;
+    if (!editable || !moveReady('node', n)) {
+      const prev = state.selected;
+      if (prev && prev !== n.id && !state.selectedEdge) {
+        const direct = (state.view?.edges || []).filter((ed) =>
+          (ed.from === prev && ed.to === n.id) || (ed.from === n.id && ed.to === prev));
+        if (direct.length) {
+          selectEdge(direct[0], {
+            trunkHits: direct.length > 1 ? direct : null,
+            trunkGroup: direct.length > 1 ? direct : null,
+            directPair: true,
+          });
+          return;
+        }
+      }
+      selectNode(n.id);
+      return;
+    }
+    pushHistory();
+    state.dragNode = beginNodeMove(state.view, n);
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };
     state.dragMoved = false;
     // 拖拽期间每帧都要重布这些边：相关边与其他边线段只在这里算一次
     const related = state.view.edges.filter((ed) => ed.from === n.id || ed.to === n.id);
     const others = state.view.edges.filter((ed) => ed.from !== n.id && ed.to !== n.id);
-    dragCache = { related, segments: collectSegments(others), paths: related.map((ed) => ed.points.map((p) => p.slice())) };
+    const connected = new Set(related.map((ed) => ed.from === n.id ? ed.to : ed.from));
+    dragCache = { related, connected, segments: collectSegments(others), paths: related.map((ed) => ed.points.map((p) => p.slice())) };
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
@@ -815,31 +814,38 @@ function handlePointerMove(e) {
   }
 
   if (state.dragSeg) {
-    if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) <= 3 && !state.dragMoved) return;
-    const p = worldPos(e);
     const seg = state.dragSeg;
-    if (moveSeg(seg, seg.origin[0] + p.x - seg.start.x, seg.origin[1] + p.y - seg.start.y)) {
+    if (seg.view !== state.view) { cancelDrag(); return; }
+    if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) <= 3 &&
+        !state.dragMoved && !seg.guides.length) return;
+    const p = worldPos(e);
+    if (moveSeg(seg, seg.origin[0] + p.x - seg.start.x, seg.origin[1] + p.y - seg.start.y, snapTolerance(e))) {
       state.dragMoved = true;
       state.dragSeg.edge.custom = true;
     }
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
   if (state.dragNode) {
+    const drag = state.dragNode;
+    if (drag.view !== state.view) { cancelDrag(); return; }
     const dx = dragDelta(e.clientX - state.dragStart.x);
     const dy = dragDelta(e.clientY - state.dragStart.y);
     if (Math.abs(e.clientX - state.dragStart.x) + Math.abs(e.clientY - state.dragStart.y) > 3) state.dragMoved = true;
     if (!state.dragMoved) return;
-    const { x, y } = state.dragNode;
-    moveNodeNoOverlap(state.dragNode, state.dragStart.nx + dx, state.dragStart.ny + dy);
-    if (x === state.dragNode.x && y === state.dragNode.y) return;
-    // 从本次按下时的 ELK 路径调整端部，避免逐帧重新选面和改走廊。
-    if (dragCache) {
+    const area = viewport(els.cv.clientWidth, els.cv.clientHeight);
+    const changed = moveNodeNoOverlap(drag, state.dragStart.nx + dx, state.dragStart.ny + dy, {
+      tolerance: snapTolerance(e), connected: dragCache.connected, visible: (n) => boxVisible(n, area),
+    });
+    state.dragNodeGuides = drag.guides;
+    if (changed) {
+      // 从按下时的折线调整端部，避免逐帧重新选面和改走廊。
       dragCache.related.forEach((ed, i) => { ed.points = dragCache.paths[i].map((p) => p.slice()); });
       routeEdges(state.view.nodes, dragCache.related, { existing: dragCache.segments, preservePaths: true });
+      syncNodeMoveBounds(drag);
     }
-    draw();
+    draw({ geometryUnchanged: true });
     return;
   }
 
@@ -997,12 +1003,13 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (dragBox) {
-    if (dragBox.dx || dragBox.dy) {
+    if (dragBox.view === state.view && (dragBox.dx || dragBox.dy)) {
       // 松手时依据起始折线和最终位置布线，预览经过多少帧都得到同一结果。
       for (const { edge, points } of dragBox.paths) {
         if (dragBox.ids.has(edge.from) !== dragBox.ids.has(edge.to)) edge.points = points;
       }
       fullReroute(dragBox.ids);
+      autoShrinkContainerChain(dragBox.view, dragBox.box.id);
       pushHistory();
     } else if (moved) cancelHierarchyMove(dragBox);
     draw();
@@ -1053,20 +1060,27 @@ els.cv.addEventListener('pointerup', (e) => {
   }
 
   if (dragSeg) {
-    if (moved) pushHistory();
-    else { dragSeg.edge.points = dragSeg.original; dragSeg.edge.custom = dragSeg.custom; }
+    const { edge, original, custom, view } = dragSeg;
+    const points = moved && view === state.view ? collapse(edge.points) : original;
+    const changed = points.length !== original.length ||
+      points.some(([x, y], i) => x !== original[i][0] || y !== original[i][1]);
+    edge.points = changed ? points : original;
+    edge.custom = changed ? true : custom;
+    if (changed) pushHistory();
     draw();
     return;
   }
 
   if (dragNode) {
+    const { node, view, chain } = dragNode;
     if (moved && originalNodeRoutes) {
       originalNodeRoutes.related.forEach((edge, i) => { edge.points = originalNodeRoutes.paths[i]; });
     }
-    if (moved && (dragNode.x !== dragStart.nx || dragNode.y !== dragStart.ny)) {
-      fullReroute(new Set([dragNode.id])); // 只处理相连或被新位置挡住的线
+    if (view === state.view && moved && (node.x !== dragStart.nx || node.y !== dragStart.ny)) {
+      fullReroute(new Set([node.id])); // 只处理相连或被新位置挡住的线
+      if (chain.length) autoShrinkContainerChain(view, node.group);
       pushHistory();
-    }
+    } else if (moved) cancelNodeMove(dragNode);
     draw();
     return;
   }
@@ -1167,7 +1181,7 @@ document.addEventListener('keydown', (e) => {
     }
     return;
   }
-  if (e.key === 'Escape' && (state.dragBox || state.resizeBox || state.dragNode || state.linkFrom || state.moveTarget) && !document.querySelector('.modal.show')) {
+  if (e.key === 'Escape' && (state.dragBox || state.resizeBox || state.dragNode || state.dragSeg || state.linkFrom || state.moveTarget) && !document.querySelector('.modal.show')) {
     e.preventDefault();
     e.stopImmediatePropagation();
     state.moveTarget = null;

@@ -683,8 +683,18 @@ els.parserSelect.addEventListener('change', async () => {
     syncCanvasControls();
   }
 });
-els.resetLayout.addEventListener('click', () => {
-  loadView(state.roots.length ? state.roots : state.root, { expansions: state.expansions });
+els.resetLayout.addEventListener('click', async () => {
+  const { view, roots, root, expansions, groupMode } = state;
+  try {
+    if (view && !view.comparison) {
+      const result = await api.layout({
+        root: roots.join('+') || root || '',
+        mode: groupMode === 'flat' ? 'flat' : 'group', resetPositions: groupMode,
+      });
+      if (!result?.ok) throw new Error(result?.error || t('app.viewFailed'));
+    }
+    if (state.view === view && !state.at) await loadView(roots.length ? roots : root, { expansions });
+  } catch (error) { reportCanvasError(error); }
 });
 clearButton.addEventListener('click', () => clearCanvas().catch(reportCanvasError));
 document.getElementById('multiSelectRemove').addEventListener('click', () => deleteSelection().catch(reportCanvasError));

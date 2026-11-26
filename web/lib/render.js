@@ -67,6 +67,30 @@ function boxVisible(box, area, width = box.w) {
     box.y <= area.bottom && box.y + box.h >= area.top;
 }
 
+function drawAlignmentGuides(ctx, guides, dpr) {
+  if (!guides?.length) return;
+  const pixels = Math.max(1, Math.round(dpr));
+  const extension = 12 / cam.k;
+  ctx.save();
+  ctx.strokeStyle = '#2563EB';
+  ctx.lineWidth = pixels / (cam.k * dpr);
+  ctx.setLineDash([4 / cam.k, 4 / cam.k]);
+  for (const { axis, at, from, to } of guides) {
+    const screen = (at * cam.k + cam[axis]) * dpr;
+    const aligned = ((Math.round(screen - pixels / 2) + pixels / 2) / dpr - cam[axis]) / cam.k;
+    ctx.beginPath();
+    if (axis === 'x') {
+      ctx.moveTo(aligned, from - extension);
+      ctx.lineTo(aligned, to + extension);
+    } else {
+      ctx.moveTo(from - extension, aligned);
+      ctx.lineTo(to + extension, aligned);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 const groupPaintWidth = (box) => Math.max(box.w, 26 * String(box.label).length + 30);
 
 function panCanvas(dx, dy, contentBounds) {
@@ -114,20 +138,20 @@ function screenRect(box, padding, camera = cam, dpr = window.devicePixelRatio ||
   return right > x && bottom > y ? { x, y, right, bottom } : null;
 }
 
-export function pulseAdded(nodes, edges) {
+export function pulseAdded(nodes, edges, { highlightMs = RECENT_HIGHLIGHT_MS, rippleMs = RECENT_RIPPLE_MS } = {}) {
   clearTimeout(recentTimer);
   const count = nodes.length + edges.length;
   const now = performance.now();
   const recent = count ? {
     nodes: new Set(nodes.map((n) => n.id)), edges: new Set(edges.map(edgeKey)),
-    started: now, until: now + RECENT_HIGHLIGHT_MS, rippleUntil: now + RECENT_RIPPLE_MS,
+    started: now, until: now + highlightMs, rippleUntil: now + rippleMs, rippleDur: rippleMs,
   } : null;
   state.recent = recent;
   if (recent) recentTimer = setTimeout(() => {
     if (state.recent !== recent) return;
     state.recent = null;
     if (!document.hidden) draw({ geometryUnchanged: true });
-  }, RECENT_HIGHLIGHT_MS);
+  }, highlightMs);
   draw();
 }
 function scheduleDraw() {
@@ -637,21 +661,15 @@ function draw({ geometryUnchanged = false } = {}) {
     ctx.lineWidth = 2 / cam.k;
     roundRect(ctx, box.x - 2, box.y - 2, box.w + 4, box.h + 4, 14);
     ctx.stroke();
-    ctx.lineWidth = 1 / cam.k;
-    ctx.setLineDash([4 / cam.k, 4 / cam.k]);
-    for (const g of guides) {
-      ctx.beginPath();
-      if (g.axis === 'x') {
-        ctx.moveTo(g.at, Math.min(box.y, g.peer.y) - 12);
-        ctx.lineTo(g.at, Math.max(box.y + box.h, g.peer.y + g.peer.h) + 12);
-      } else {
-        ctx.moveTo(Math.min(box.x, g.peer.x) - 12, g.at);
-        ctx.lineTo(Math.max(box.x + box.w, g.peer.x + g.peer.w) + 12, g.at);
-      }
-      ctx.stroke();
-    }
     ctx.restore();
+    drawAlignmentGuides(ctx, guides.map(({ axis, at, peer }) => {
+      const coord = axis === 'x' ? 'y' : 'x', size = axis === 'x' ? 'h' : 'w';
+      return { axis, at, from: Math.min(box[coord], peer[coord]),
+        to: Math.max(box[coord] + box[size], peer[coord] + peer[size]) };
+    }), dpr);
   }
+  if (state.dragNode) drawAlignmentGuides(ctx, state.dragNodeGuides, dpr);
+  if (state.dragSeg) drawAlignmentGuides(ctx, state.dragSeg.guides, dpr);
 
   ctx.restore();
 
@@ -1066,7 +1084,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
       ctx.fillText('NEW', bx + bw / 2, by + bh / 2);
     }
     if (collectingEffects && performance.now() < state.recent.rippleUntil) {
-      effects.push({ kind: 'ripple', box: n, started: state.recent.started, dur: RECENT_RIPPLE_MS, color: RECENT_COLOR });
+      effects.push({ kind: 'ripple', box: n, started: state.recent.started, dur: state.recent.rippleDur || RECENT_RIPPLE_MS, color: RECENT_COLOR });
     }
   }
   ctx.restore();
@@ -1085,6 +1103,8 @@ export {
   roundRect,
   updateGroups,
   draw,
+  viewport,
+  boxVisible,
   compositeEffects,
   panCanvas,
   finishPan,

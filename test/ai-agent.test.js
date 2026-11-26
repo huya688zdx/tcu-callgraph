@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  estimateMessagesTokens,
   extractThinkingAndText,
   normalizeAiConfig,
   normalizeBaseUrl,
@@ -14,6 +15,435 @@ import {
 } from '../src/core/ai-agent.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
+
+test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 时降级', async () => {
+  const prompt = '查看画布截图';
+  const small = 'data:image/png;base64,AAAA';
+  const large = 'data:image/webp;base64,' + 'A'.repeat(2_400_000);
+  const content = [
+    { type: 'text', text: prompt },
+    { type: 'image_url', image_url: { url: small } },
+    { type: 'image_url', image_url: { url: large } },
+  ];
+  const tokens = estimateMessagesTokens([{ role: 'user', content }]);
+  assert.ok(tokens >= 1200 && tokens < 1300);
+  assert.equal(tokens, estimateMessagesTokens([{
+    role: 'user', content: content.map(part => part.image_url ? { ...part, image_url: { url: small } } : part),
+  }]));
+
+  for (const rejectsImages of [false, true]) {
+    const requests = [], events = [];
+    const result = await runAiAgent({
+      config: { baseUrl: 'http://127.0.0.1:8000/v1', model: 'mock-vision', toolMode: 'tools' },
+      prompt, images: [{ dataUrl: small, label: '画布' }, { dataUrl: large }], maxSteps: 1,
+      onEvent: event => events.push(event),
+      fetchImpl: async (_url, { body }) => {
+        requests.push(JSON.parse(body).messages.at(-1).content);
+        if (requests.length === 1 && rejectsImages) {
+          return Response.json({ error: { param: 'messages', message: 'Expected message content to be a string' } }, { status: 400 });
+        }
+        return Response.json({ choices: [{ message: { content: '已查看。' } }] });
+      },
+    });
+    assert.deepEqual(requests, rejectsImages ? [content, prompt] : [content]);
+    assert.equal(result.ok, true);
+    assert.equal(result.answer, '已查看。');
+    assert.ok(result.metrics.contextEstTokens < 10_000);
+    assert.deepEqual(events.filter(event => event.type === 'fallback'), rejectsImages ? [{
+      type: 'fallback', text: '当前模型接口不支持图片输入，已自动降级为纯文本继续',
+    }] : []);
+  }
+});
+
+test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重置画布布局', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const get = route => fetch(srv.baseUrl + route, { signal: AbortSignal.timeout(15_000) }).then(res => res.json());
+  const post = (route, body) => fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const jsonPost = (route, body) => post(route, body).then(res => res.json());
+  const root = 'main.c::main';
+  const page = { roots: [root, 'can.c::Can_Init'], up: 0, down: 1, groupMode: 'flat' };
+  const layoutRoot = page.roots.join('+');
+  const query = '/api/view?up=0&down=1&groupMode=flat';
+  const viewUrl = query + '&roots=' + encodeURIComponent(page.roots.join(','));
+  const manual = { from: 'main.c::Task_10ms', to: 'main.c::Task_100ms' };
+  assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', addManual: [manual] })).ok, true);
+  const view = await get(viewUrl);
+  assert.equal((await jsonPost('/api/page', page)).ok, true);
+  assert.ok(view.edges.length);
+  const other = view.nodes.find(node => node.name === 'Task_10ms');
+  const anchor = view.nodes.find(node => node.name === 'Can_Init');
+  const liveNodes = view.nodes.map((node, i) => ({
+    id: node.id, name: node.name, kind: node.kind, file: node.file,
+    x: 1000 + i * 250, y: 1000 + i * 150, w: node.w, h: node.h,
+  }));
+  const anchorRect = liveNodes.find(node => node.id === anchor.id);
+  const liveGroups = view.groups.map(({ id, x, y, w, h }) => ({ id, x: x + 500, y, w, h }));
+  const liveContainers = view.containers.map(({ id, x, y, w, h }) => ({ id, x: x + 600, y, w, h }));
+  const canvasLayout = { root, mode: 'flat', width: 6000, height: 5000,
+    nodes: liveNodes, groups: liveGroups, containers: liveContainers };
+
+  const requests = [];
+  const steps = [];
+  const outputs = [];
+  const llm = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/models') {
+      res.end(JSON.stringify({ data: [{ id: 'mock-layout' }] }));
+      return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const request = JSON.parse(Buffer.concat(chunks));
+    requests.push(request);
+    const last = request.messages.at(-1);
+    if (last.role === 'tool') outputs.push(JSON.parse(last.content));
+    const args = steps.shift();
+    const message = args ? { tool_calls: [{
+      id: 'arrange-' + requests.length, type: 'function', function: { name: 'arrange_canvas', arguments: JSON.stringify(args) },
+    }] } : { content: '已完成。' };
+    res.end(JSON.stringify({ choices: [{ message }] }));
+  });
+  await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => llm.close(resolve)));
+  const config = { baseUrl: `http://127.0.0.1:${llm.address().port}/v1`, model: 'mock-layout', toolMode: 'tools' };
+  const chat = async (payload = {}) => {
+    const response = await post('/api/ai/chat', { prompt: '查看并调整画布', config, ...payload });
+    const body = await response.text();
+    assert.equal(response.status, 200, body.slice(0, 300));
+    const events = body.trim().split('\n').map(JSON.parse);
+    assert.ok(events.some(event => event.type === 'done'), body.slice(-500));
+    return events;
+  };
+
+  const png = 'data:image/png;base64,' + 'A'.repeat(2_150_000);
+  const jpeg = 'data:image/jpeg;base64,' + 'A'.repeat(2_150_000);
+  await chat({
+    images: ['data:image/gif;base64,AAAA', 'data:image/webp;base64,' + 'A'.repeat(3_000_000),
+      png, { dataUrl: jpeg, label: '画布' }, 'data:image/webp;base64,AAAA'],
+    uiContext: {
+      kind: 'file', path: 'legacy.c',
+      items: [
+        { kind: 'node', id: root, file: 'main.c', line: 42 },
+        { kind: 'node', id: root, name: '重复节点' },
+        { kind: 'node', id: other.id, file: other.file },
+        { kind: 'edge', from: root, to: other.id, labels: [{ text: 'TASK:10ms' }] },
+        { kind: 'file', path: anchor.file },
+        { kind: 'invalid', id: 'ignored' },
+      ],
+    },
+  });
+  const chatMessages = requests[0].messages;
+  assert.deepEqual(chatMessages.at(-1).content.map(part => part.image_url?.url), [undefined, png, jpeg]);
+  const system = chatMessages[0].content;
+  assert.ok(system.includes([
+    '用户当前在画布上选中/暂存的对象（共 4 项）：',
+    `1. 节点 ${root}，main.c:42`,
+    `2. 节点 ${other.id}，${other.file}`,
+    `3. 连线 ${root} → ${other.id}，标签 TASK:10ms`,
+    `4. 文件 ${anchor.file}`,
+  ].join('\n')), system);
+  assert.doesNotMatch(system, /重复节点|legacy\.c|ignored/);
+  assert.ok(requests[0].tools.some(tool => tool.function.name === 'arrange_canvas'));
+
+  const streamSignal = AbortSignal.timeout(30_000);
+  const stream = await fetch(srv.baseUrl + '/api/stream', { signal: streamSignal });
+  const reader = stream.body.getReader();
+  t.after(() => reader.cancel().catch(() => {}));
+  const decoder = new TextDecoder();
+  const initial = await reader.read();
+  assert.match(decoder.decode(initial.value), /retry:/);
+
+  assert.equal((await jsonPost('/api/page', { ...page, groupMode: 'file' })).ok, true);
+  const grouped = await get(viewUrl.replace('groupMode=flat', 'groupMode=file'));
+  const foreign = grouped.nodes.find(node => node.name === 'Can_Init');
+  const below = Math.max(...grouped.groups.map(box => box.y + box.h)) + 50;
+  steps.push({ action: 'move', moves: [{ id: root, x: foreign.x, y: below }] });
+  await chat();
+  assert.match(outputs.pop().error, /容器会重叠/);
+  assert.equal((await get('/api/session/export')).overlay.layout[layoutRoot + '::group'], undefined);
+  assert.equal((await jsonPost('/api/page', page)).ok, true);
+
+  steps.push(
+    { action: 'inspect' },
+    { action: 'move', reason: '移到右边', moves: [
+      { id: 'main', x: 3400, y: 3200 },
+      { id: other.id, relativeTo: anchor.name, placement: 'right', gap: 31 },
+    ] },
+    { action: 'align', nodes: ['main', other.name], axis: 'x', distribute: true, gap: 35 },
+    { action: 'inspect' },
+    { action: 'move', moves: [{ id: other.id, dx: other.w + 35, dy: 12 }] },
+  );
+  const events = await chat({ canvasLayout });
+  const [inspect, move, align, aligned, displaced] = outputs;
+  assert.deepEqual(inspect.nodes.find(node => node.id === anchor.id), anchorRect);
+  assert.deepEqual(inspect.groups, liveGroups);
+  assert.deepEqual(inspect.containers, liveContainers);
+  assert.deepEqual(inspect.canvas, { width: 6000, height: 5000 });
+  assert.deepEqual(inspect.edges, view.edges.map(({ from, to, kind }) => ({ from, to, kind })));
+  assert.deepEqual(move.positions, [{ id: root, x: 3400, y: 3200 },
+    { id: other.id, x: anchorRect.x + anchorRect.w + 31, y: anchorRect.y }]);
+  const [first, second] = align.positions;
+  assert.equal(first.y, 3200);
+  assert.equal(second.y, first.y);
+  assert.equal(second.x - first.x, other.w + 35);
+  for (const { id, x, y } of align.positions) {
+    const actual = aligned.nodes.find(node => node.id === id);
+    assert.deepEqual({ x: actual.x, y: actual.y }, { x, y });
+  }
+  assert.deepEqual(displaced.positions, [{ id: other.id, x: second.x + view.nodes.find(n => n.id === root).w, y: second.y + 12 }],
+    '偏移后的目标遇到同一行的节点时沿移动轴避让');
+  assert.ok(events.some(event => event.type === 'tool_end' && /action=align/.test(event.digest)));
+
+  const slot = layoutRoot + '::flat';
+  const arranged = await get(viewUrl);
+  const saved = await get('/api/session/export');
+  const writes = saved.events.filter(event => event.op === 'layout.save' && event.actor === 'ai');
+  assert.equal(writes.length, 3);
+  assert.ok(writes.every(event => event.actor === 'ai' && event.target === slot));
+  for (const { id, x, y } of [second, displaced.positions[0]]) {
+    const stored = saved.overlay.layout[slot].nodes[id];
+    const rendered = arranged.nodes.find(node => node.id === id);
+    assert.deepEqual([stored.x, stored.y], [x, y]);
+    assert.deepEqual([rendered.x, rendered.y], [x, y]);
+  }
+
+  const history = { roots: [anchor.id], up: 0, down: 0 };
+  const { eventId: at } = await jsonPost('/api/view-event', { op: 'view.snapshot', view: history });
+  assert.equal((await jsonPost('/api/page', { ...history, at })).ok, true);
+  steps.push({ action: 'reset', reason: '恢复自动布局' }, { action: 'inspect' });
+  await chat({ canvasLayout: { ...canvasLayout, width: 1 } });
+  const [reset, resetInspect] = outputs.slice(5);
+  assert.equal(reset.updatedWhileReviewing, true);
+  assert.equal(reset.root, layoutRoot);
+  assert.equal(resetInspect.canvas.width, view.width);
+  const cleared = await get('/api/session/export');
+  assert.deepEqual(cleared.overlay.layout[slot].nodes, {});
+  assert.deepEqual(cleared.overlay.layout[slot].manual, [manual]);
+  const resetEvent = cleared.events.find(event => event.op === 'layout.clear' && event.actor === 'ai' && event.target === slot);
+  assert.equal(resetEvent?.after.resetPositions, 'flat');
+  assert.equal(resetEvent?.after.reason, '恢复自动布局');
+  const refreshed = await jsonPost(query, { roots: page.roots, previous: arranged, projectId: view.projectId });
+  assert.ok(refreshed.nodes, refreshed.error);
+  assert.deepEqual(refreshed.nodes.map(({ id, x, y }) => ({ id, x, y })), view.nodes.map(({ id, x, y }) => ({ id, x, y })));
+  const movedEvent = writes.find(event => event.after.nodes[other.id]?.x === displaced.positions[0].x);
+  const replayed = await get(`/api/view?at=${movedEvent.id}&useSnapshot=1`);
+  assert.equal(replayed.nodes.find(node => node.id === other.id).x, displaced.positions[0].x);
+  const manualVisible = canvas => canvas.edges.some(edge => edge.manual && edge.from === manual.from && edge.to === manual.to);
+  assert.ok(manualVisible(refreshed));
+  assert.ok(manualVisible(await get(`/api/view?at=${resetEvent.id}&useSnapshot=1`)));
+
+  let broadcast = '';
+  while ((broadcast.match(/\n\n/g) || []).length < 4) {
+    const { value, done } = await reader.read();
+    assert.equal(done, false);
+    broadcast += decoder.decode(value, { stream: true });
+  }
+  const changes = [...broadcast.matchAll(/^data: (.*)$/gm)].map(([, data]) => JSON.parse(data));
+  const layouts = changes.filter(change => change.op.startsWith('layout.'));
+  assert.deepEqual(layouts.map(change => change.op), ['layout.save', 'layout.save', 'layout.save', 'layout.clear']);
+  assert.ok(layouts.every(change => change.actor === 'ai' && change.projectId === view.projectId));
+
+  await t.test('工具栏重新排版会持久清除 AI 坐标并保留手工连线', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/page', page)).ok, true);
+    const { x, y } = view.nodes.find(node => node.id === root);
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat',
+      nodes: { [root]: { x: x + 500, y, arrangedFor: 'flat' } },
+    })).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const rootX = `window.__cg?.view?.nodes.find(node => node.id === ${JSON.stringify(root)})?.x`;
+    await browser.waitFor(`${rootX} === ${x + 500}`);
+    await browser.evaluate("document.getElementById('resetLayout').click()");
+    await browser.waitFor(`${rootX} === ${x}`);
+    const afterToolbar = await get(viewUrl);
+    assert.equal(afterToolbar.nodes.find(node => node.id === root).x, x);
+    assert.ok(manualVisible(afterToolbar));
+  });
+
+  await t.test('自动布局扩展后跳过冲突坐标，并保留其他安全的 AI 坐标', async () => {
+    const shallowUrl = viewUrl.replace('down=1', 'down=0');
+    const shallow = await get(shallowUrl);
+    const wide = await get(viewUrl);
+    const newcomer = wide.nodes.find(node => !shallow.nodes.some(old => old.id === node.id));
+    assert.ok(newcomer);
+    const secondRoot = page.roots[1];
+    const safe = { x: 5000, y: 5000, arrangedFor: 'flat' };
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', nodes: {
+      [root]: { x: newcomer.x, y: newcomer.y, arrangedFor: 'flat' }, [secondRoot]: safe,
+    } })).ok, true);
+    const xy = (canvas, id) => {
+      const { x, y } = canvas.nodes.find(node => node.id === id);
+      return [x, y];
+    };
+    assert.deepEqual(xy(await get(shallowUrl), root), [newcomer.x, newcomer.y]);
+    const expanded = await get(viewUrl);
+    assert.deepEqual(xy(expanded, root), xy(wide, root));
+    assert.deepEqual(xy(expanded, newcomer.id), [newcomer.x, newcomer.y]);
+    assert.deepEqual(xy(expanded, secondRoot), [safe.x, safe.y]);
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', resetPositions: 'flat' })).ok, true);
+  });
+
+  await t.test('增量刷新保留手动位置，后续 AI 坐标仍可生效', async () => {
+    const savePosition = async (x, y) => assert.equal((await jsonPost('/api/layout', {
+      root: layoutRoot, mode: 'flat', nodes: { [root]: { x, y, arrangedFor: 'flat' } },
+    })).ok, true);
+    await savePosition(1400, 900);
+    const previous = await get(viewUrl);
+    const moved = previous.nodes.find(node => node.id === root);
+    assert.deepEqual([moved.x, moved.y], [1400, 900]);
+    Object.assign(moved, { x: 1700, y: 800 });
+    const refresh = () => jsonPost(query.replace('down=1', 'down=0'), { roots: page.roots, previous, projectId: view.projectId });
+    const preserved = await refresh();
+    assert.ok(preserved.nodes, preserved.error);
+    assert.equal(preserved.nodes.length, 2, '增量刷新已移除外围节点');
+    const retained = preserved.nodes.find(node => node.id === root);
+    assert.deepEqual([retained.x, retained.y], [1700, 800]);
+    await savePosition(1800, 700);
+    const updated = (await refresh()).nodes.find(node => node.id === root);
+    assert.deepEqual([updated.x, updated.y], [1800, 700]);
+  });
+
+  await t.test('退出两点链路会清除当前上下文并保留暂存对象', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    await browser.waitFor('Boolean(window.__cg?.view?.nodes.length)');
+    await browser.evaluate("document.getElementById('aiBtn').click()");
+    await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+    const countBefore = requests.length;
+    await browser.evaluate(`(async () => {
+      const { pickPairFlow } = await import('/lib/pair-flow.js');
+      const main = ${JSON.stringify(root)};
+      const task = ${JSON.stringify(other.id)};
+      const selectFile = path => document.dispatchEvent(new CustomEvent('cg:selection-changed', {
+        detail: { kind: 'file', path },
+      }));
+      document.querySelector('[data-ai-tab="chat"]').click();
+      selectFile('can.c');
+      document.getElementById('aiPinSelection').click();
+      pickPairFlow(main);
+      pickPairFlow(task);
+      const row = document.getElementById('aiSelectionRow');
+      if (row.hidden || document.getElementById('pairFlowFloat').hidden) {
+        throw new Error('两点链路未设置当前上下文');
+      }
+      document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      if (!row.hidden) throw new Error('Escape 未清除两点链路上下文');
+      pickPairFlow(main);
+      pickPairFlow(task);
+      selectFile('adc.c');
+      document.querySelector('#pairFlowFloat [data-pair-clear]').click();
+      if (row.hidden || !document.getElementById('aiSelectionText').textContent.includes('adc.c')) {
+        throw new Error('关闭两点链路时清除了后续选中的文件');
+      }
+      pickPairFlow(main);
+      pickPairFlow(task);
+      document.querySelector('#pairFlowFloat [data-pair-clear]').click();
+      if (!row.hidden) throw new Error('取消按钮未清除两点链路上下文');
+      document.getElementById('aiPromptInput').value = '请解释暂存的文件';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    assert.equal(requests.length, countBefore + 1);
+    const prompt = requests.at(-1).messages.at(-1).content;
+    const text = typeof prompt === 'string' ? prompt : prompt[0].text;
+    assert.match(text, /文件 can\.c/);
+    assert.doesNotMatch(text, /节点 |连线 |文件 adc\.c/);
+  });
+
+  await t.test('暂存满 16 项也优先向模型发送当前选区', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    await browser.waitFor('Boolean(window.__cg?.view)');
+    await browser.evaluate("document.getElementById('aiBtn').click()");
+    await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+    const countBefore = requests.length;
+    await browser.evaluate(`(() => {
+      const pick = (id, file) => document.dispatchEvent(new CustomEvent('cg:selection-changed', {
+        detail: { kind: 'node', id, file },
+      }));
+      document.querySelector('[data-ai-tab="chat"]').click();
+      document.getElementById('aiNewChat').click();
+      for (let i = 0; i < 16; i++) {
+        pick('pinned.c::f' + i, 'pinned.c');
+        document.getElementById('aiPinSelection').click();
+      }
+      pick(${JSON.stringify(root)}, 'main.c');
+      document.getElementById('aiPromptInput').value = '请解释这个函数';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    assert.equal(requests.length, countBefore + 1);
+    const prompt = requests.at(-1).messages.at(-1).content;
+    const text = typeof prompt === 'string' ? prompt : prompt[0].text;
+    assert.match(text, /共 16 项/);
+    assert.match(text, /1\. 节点 main\.c::main/);
+    assert.doesNotMatch(text, /pinned\.c::f15\b/);
+  });
+});
+
+test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async t => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-layout-'));
+  t.after(() => fs.rmSync(target, { recursive: true, force: true, maxRetries: 3 }));
+  const directory = path.join(target, 'src', 'deep');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'unit.c'), 'int entry(void) { return 1; }\n');
+  const srv = await launchServer({ target });
+  t.after(srv.close);
+  const root = 'src/deep/unit.c::entry';
+  const viewUrl = srv.baseUrl + '/api/view?groupMode=file&up=0&down=0&roots=' + encodeURIComponent(root);
+  const getView = () => fetch(viewUrl).then(response => response.json());
+  const initial = await getView();
+  const node = initial.nodes.find(node => node.id === root);
+  const targetY = node.y - 6;
+  const savePosition = async y => {
+    const response = await fetch(srv.baseUrl + '/api/layout', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root, mode: 'group', nodes: { [root]: { x: node.x, y, arrangedFor: 'file' } } }),
+    });
+    assert.equal((await response.json()).ok, true);
+  };
+  await savePosition(targetY);
+  const arranged = await getView();
+  const placed = arranged.nodes.find(node => node.id === root);
+  assert.equal(placed.y, targetY);
+  const childToParents = [placed, arranged.groups.find(box => box.id === placed.group),
+    ...['src/deep', 'src'].map(id => arranged.containers.find(box => box.id === id))];
+  for (let i = 1; i < childToParents.length; i++) {
+    const child = childToParents[i - 1];
+    const parent = childToParents[i];
+    assert.ok(child.y - parent.y >= 32, `${parent.id} 标题与子项重叠`);
+    assert.ok(parent.y < [...initial.groups, ...initial.containers].find(box => box.id === parent.id).y);
+  }
+  await savePosition(0);
+  const invalid = await getView();
+  assert.equal(invalid.nodes.find(node => node.id === root).y, node.y);
+});
+
+test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {
+  for (const [prompt, allowed] of [['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false]]) {
+    const executed = [];
+    let step = 0;
+    const result = await runAiAgent({
+      config: { baseUrl: 'http://127.0.0.1:8000/v1', model: 'mock', toolMode: 'tools' },
+      prompt,
+      executeTool: async name => { executed.push(name); return { ok: true }; },
+      fetchImpl: async () => Response.json({ choices: [{ message: step++ === 0 ? { tool_calls: [{
+        id: 'add', type: 'function', function: { name: 'add_to_canvas', arguments: '{"functions":["Task_10ms"]}' },
+      }] } : { content: '已处理。' } }] }),
+    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(executed, allowed ? ['add_to_canvas'] : []);
+  }
+});
 
 test('normalizeBaseUrl 兼容根地址、/v1 与完整 /chat/completions，并拒绝非法协议', () => {
   assert.deepEqual(normalizeBaseUrl('http://127.0.0.1:11434'), {
@@ -1139,4 +1569,141 @@ test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者�
   assert.ok(shown.includes('src/z145/flow.c::z145_entry'), '非 TASK 命名的上级调用者 z145_entry 也应自动加入画布');
   assert.ok(shown.includes('src/common/step.c::common_step'), '被修改的共通函数应保留在画布');
   assert.ok(!shown.some((id) => id.includes('src/z144/')), '被排除的 src/z144 不应加入画布');
+});
+
+test('指代锚定防近因偏差、解释类提问禁止擅自改画布、多车型同名文件/函数强制询问', async (t) => {
+  // 1. 单元测试：turnUserText 紧贴当前提问锚定选中函数 a，历史轮次保留上轮选中 b，且解释提问拦截写工具
+  const seenRequests = [];
+  let executedWrite = false;
+  let step = 0;
+  const mockFetch = async (_url, init) => {
+    const body = JSON.parse(init.body);
+    seenRequests.push(body);
+    step++;
+    if (step === 1) {
+      // 模型企图在用户问“为什么没有上游调用链”时擅自调用 add_to_canvas
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            tool_calls: [{ id: 'tc_write', type: 'function', function: { name: 'add_to_canvas', arguments: '{"functions":["func_b"]}' } }],
+          },
+        }],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: '已核查 `a.c::func_a`，它没有直接调用者。' } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  const agentRes = await runAiAgent({
+    config: { baseUrl: 'http://127.0.0.1:1/v1', model: 'mock-local', toolMode: 'tools', maxTokens: 1024 },
+    prompt: '这个函数为什么没有上游的调用链条',
+    history: [
+      { role: 'user', text: '看一下这个函数', selectionSummary: '节点 b.c::func_b' },
+      { role: 'assistant', text: 'func_b 由 task_10ms 调用，另外还存在 extra_x -> extra_y 的链路。' },
+    ],
+    context: {
+      projectName: 'demo',
+      uiContext: { kind: 'node', id: 'a.c::func_a', name: 'func_a', file: 'a.c', line: 12 },
+    },
+    executeTool: async (name) => {
+      if (name === 'add_to_canvas') executedWrite = true;
+      return { ok: true };
+    },
+    fetchImpl: mockFetch,
+  });
+  assert.equal(executedWrite, false, '用户仅问“为什么没有上游调用链”时，运行时必须拦截写工具 add_to_canvas');
+  assert.equal(agentRes.toolLog[0].ok, false);
+  assert.match(agentRes.toolLog[0].summary, /排查\/解释类提问/);
+  const firstReqMsgs = seenRequests[0].messages;
+  assert.match(firstReqMsgs[1].content, /\[当时画布选中：节点 b\.c::func_b\]/, '历史用户轮次应保留当时的选中锚点');
+  assert.match(firstReqMsgs.at(-1).content, /\[本轮画布当前选中对象（指代最高优先级）\]/, '本轮用户消息必须紧贴注入当前选中对象');
+  assert.match(firstReqMsgs.at(-1).content, /节点 a\.c::func_a，a\.c:12/);
+  assert.match(firstReqMsgs.at(-1).content, /这个函数为什么没有上游的调用链条/);
+  assert.match(firstReqMsgs[0].content, /指代锚定规则|严格作用域边界/);
+
+  // 2. 端到端：多车型不同路径同名文件同名函数（z144/ctrl.c::calc_gear 与 z145/ctrl.c::calc_gear），模型无论猜选单个还是全选都必须拦截要求询问
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-dup-vehicle-'));
+  fs.mkdirSync(path.join(dir, 'z144'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'z145'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'z144', 'ctrl.c'), 'void calc_gear(void) {}\nvoid z144_run(void) { calc_gear(); }\n');
+  fs.writeFileSync(path.join(dir, 'z145', 'ctrl.c'), 'void calc_gear(void) {}\nvoid z145_run(void) { calc_gear(); }\n');
+
+  const capturedToolOutputs = [];
+  let llmTurn = 0;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      const lastTool = body.messages.findLast((m) => m.role === 'tool');
+      if (lastTool) capturedToolOutputs.push(JSON.parse(lastTool.content));
+      llmTurn++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (llmTurn === 1) {
+        // 情况 A：模型直接同时传入两个车型的同名函数且设 includeTasks: false
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'c1', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ functions: ['z144/ctrl.c::calc_gear', 'z145/ctrl.c::calc_gear'], includeTasks: false }) } }],
+            },
+          }],
+        }));
+      } else if (llmTurn === 2) {
+        // 情况 B：模型不问用户，私自猜选 z144/ctrl.c::calc_gear 单个加入
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{ id: 'c2', type: 'function', function: { name: 'add_to_canvas', arguments: JSON.stringify({ functions: ['z144/ctrl.c::calc_gear'], includeTasks: false }) } }],
+            },
+          }],
+        }));
+      } else {
+        res.end(JSON.stringify({
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [{
+                id: 'c3',
+                type: 'function',
+                function: {
+                  name: 'ask_user',
+                  arguments: JSON.stringify({ question: 'calc_gear 存在多个车型版本，需要加入哪一个？', options: [{ label: 'z144' }, { label: 'z145' }, { label: '全部保留' }] }),
+                },
+              }],
+            },
+          }],
+        }));
+      }
+    });
+  });
+  await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+  const srv = await launchServer({ target: dir });
+  t.after(async () => {
+    await new Promise((r) => mockLlm.close(r));
+    await srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-dup', toolMode: 'tools', maxTokens: 4096 });
+  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: '把 calc_gear 加入画布' }),
+  });
+  assert.equal(chatRes.status, 200);
+  const events = (await chatRes.text()).trim().split('\n').map(JSON.parse);
+  assert.ok(events.some((e) => e.type === 'question'), '多车型同名函数拦截后应转向 ask_user 询问');
+  assert.equal(capturedToolOutputs.length, 2);
+  assert.equal(capturedToolOutputs[0].needsVehicleChoice, true, '同时传入多车型同名函数必须拦截并要求询问');
+  assert.equal(capturedToolOutputs[1].needsVehicleChoice, true, '用户未指定车型时私自猜选单个车型版本也必须拦截');
+  assert.deepEqual(capturedToolOutputs[1].pathBranches.map((b) => b.prefix).sort(), ['z144', 'z145']);
 });

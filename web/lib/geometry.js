@@ -3,34 +3,19 @@
  * 不涉及 DOM 绘制，方便单独测试
  */
 import { state } from './state.js';
-import { routeEdges, collectSegments, pathBlockedByNodes } from '/core/routing.js';
+import { routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from '/core/routing.js';
 import { improveEdgeRoutes, mergeSharedRoutes } from '/core/layout-metrics.js';
-/** 节点只能在所属文件框内移动，避免跑出框外导致结构散架 */
-function clampToGroup(n) {
-  const v = state.view;
-  if (!v || !v.groups || !n.group) return;
-  const g = v.groups.find((x) => x.id === n.group);
-  if (!g) return;
-  const pad = 8;
-  const left = g.x + pad;
-  const right = g.x + g.w - n.w - pad;
-  const top = g.y + 32;
-  const bottom = g.y + g.h - n.h - pad;
-  if (right >= left) n.x = Math.max(left, Math.min(right, n.x));
-  if (bottom >= top) n.y = Math.max(top, Math.min(bottom, n.y));
-}
+import { placeNodeInHierarchy } from './hierarchy.js';
 
 /** 节点是否与其它节点相撞（留一点视觉间隙，避免边框贴死） */
-function collidesWith(n, pad = 6) {
-  const v = state.view;
-  if (!v) return false;
-  for (const o of v.nodes) {
+function collidesWith(nodes, n, x, y, pad = 6) {
+  for (const o of nodes) {
     if (o.id === n.id) continue;
     if (
-      n.x < o.x + o.w + pad &&
-      n.x + n.w + pad > o.x &&
-      n.y < o.y + o.h + pad &&
-      n.y + n.h + pad > o.y
+      x < o.x + o.w + pad &&
+      x + n.w + pad > o.x &&
+      y < o.y + o.h + pad &&
+      y + n.h + pad > o.y
     ) {
       return true;
     }
@@ -38,50 +23,137 @@ function collidesWith(n, pad = 6) {
   return false;
 }
 
-/**
- * 拖动落位：整体移动被挡住时退化为单轴滑动（贴着别的节点滑过去），
- * 两个方向都过不去就停在原位 —— 保证拖动过程中节点之间永不重叠
- */
-function moveNodeNoOverlap(n, tx, ty) {
-  const ox = n.x;
-  const oy = n.y;
-
-  n.x = tx;
-  n.y = ty;
-  // 相连函数的中心相差很小时吸附对齐，消掉手拖产生的几像素台阶；不跨过碰撞约束。
-  const related = new Set();
-  for (const e of state.view?.edges || []) {
-    if (e.from === n.id) related.add(e.to);
-    if (e.to === n.id) related.add(e.from);
-  }
-  for (const [axis, size] of [['x', 'w'], ['y', 'h']]) {
-    let offset = 0;
-    let distance = 8;
-    for (const other of state.view?.nodes || []) {
-      if (!related.has(other.id)) continue;
-      const delta = other[axis] + other[size] / 2 - n[axis] - n[size] / 2;
-      if (Math.abs(delta) < distance) {
-        distance = Math.abs(delta);
-        offset = delta;
+function nodeSnapTargets(nodes, node, x, y, tolerance, connected, visible) {
+  const targets = {};
+  if (tolerance <= 0) return targets;
+  const axes = [['x', 'w', x], ['y', 'h', y]];
+  for (const other of nodes) {
+    if (other.id === node.id) continue;
+    const priority = connected.has(other.id) ? 0 : node.group && node.group === other.group ? 1 : 2;
+    if (priority === 2 && !visible(other)) continue;
+    for (const [axis, size, pointer] of axes) {
+      for (const ratio of [0, 0.5, 1]) {
+        const at = other[axis] + other[size] * ratio;
+        const position = at - node[size] * ratio;
+        const distance = Math.abs(position - pointer);
+        const best = targets[axis];
+        if (distance <= tolerance && (!best || distance < best.distance ||
+          (distance === best.distance && priority < best.priority))) {
+          targets[axis] = { at, position, distance, priority, other };
+        }
       }
     }
-    n[axis] += offset;
   }
-  clampToGroup(n);
-  if (!collidesWith(n)) return;
+  return targets;
+}
 
-  n.x = tx;
-  n.y = oy;
-  clampToGroup(n);
-  if (!collidesWith(n)) return;
+/** 优先尝试吸附；被节点或容器挡住时沿两个轴分别贴边移动。 */
+function moveNodeNoOverlap(drag, tx, ty, { tolerance = 0, connected = new Set(), visible = () => true } = {}) {
+  const { node, view, minX, minY } = drag;
+  const { x: oldX, y: oldY } = node;
+  const x = Math.max(minX, tx), y = Math.max(minY, ty);
+  const targets = nodeSnapTargets(view.nodes, node, x, y, tolerance, connected, visible);
+  const sx = Math.max(minX, targets.x?.position ?? x);
+  const sy = Math.max(minY, targets.y?.position ?? y);
+  const place = (nx, ny) => (nx === node.x && ny === node.y) ||
+    (!collidesWith(view.nodes, node, nx, ny) && placeNodeInHierarchy(drag, nx, ny));
+  const attempts = [[sx, sy], [sx, y], [x, sy], [x, y]];
+  if (!attempts.some(([nx, ny], i) => (i === 0 || nx !== oldX || ny !== oldY) && place(nx, ny))) {
+    const slide = (axis, target) => {
+      const start = node[axis];
+      if (start === target) return;
+      const tryAt = (at) => axis === 'x' ? place(at, node.y) : place(node.x, at);
+      if (tryAt(target)) return;
+      let lo = 0, hi = 1;
+      for (let i = 0; i < 16 && Math.abs(target - start) * (hi - lo) > 0.02; i++) {
+        const mid = (lo + hi) / 2;
+        if (tryAt(start + (target - start) * mid)) lo = mid;
+        else hi = mid;
+      }
+    };
+    slide('x', x);
+    slide('y', y);
+    slide('x', x);
+  }
+  drag.guides = [];
+  for (const [axis, across, size] of [['x', 'y', 'h'], ['y', 'x', 'w']]) {
+    const match = targets[axis];
+    if (match && node[axis] === match.position) {
+      drag.guides.push({
+        axis, at: match.at,
+        from: Math.min(node[across], match.other[across]),
+        to: Math.max(node[across] + node[size], match.other[across] + match.other[size]),
+      });
+    }
+  }
+  return node.x !== oldX || node.y !== oldY;
+}
 
-  n.x = ox;
-  n.y = ty;
-  clampToGroup(n);
-  if (!collidesWith(n)) return;
+function segmentSnapTargets(view, edge, axis, across, endpoints) {
+  const horizontal = axis === 1;
+  const key = horizontal ? 'y' : 'x';
+  const direction = horizontal ? 'x' : 'y';
+  const size = horizontal ? 'h' : 'w';
+  const span = horizontal ? 'w' : 'h';
+  const targets = endpoints.map((n) => ({
+    at: n[key] + n[size] / 2, from: n[direction], to: n[direction] + n[span], priority: 0,
+  }));
+  const corridors = collectSegments(view.edges.filter((other) => other !== edge));
+  for (const s of horizontal ? corridors.h : corridors.v) {
+    targets.push({ at: s[key], from: s[direction + '1'], to: s[direction + '2'], priority: 1 });
+  }
+  const start = edge.points[0], end = edge.points.at(-1);
+  targets.push({
+    at: (start[axis] + end[axis]) / 2,
+    from: Math.min(start[across], end[across]), to: Math.max(start[across], end[across]),
+    priority: 2,
+  });
+  return targets;
+}
 
-  n.x = ox;
-  n.y = oy;
+/** 移动正交线段，先试安全的吸附位置，再试原始指针位置。 */
+function moveEdgeSegment(view, seg, x, y, tolerance = 0) {
+  const axis = seg.orient === 'h' ? 1 : 0, across = 1 - axis;
+  const desired = axis === 1 ? y : x;
+  const { edge } = seg;
+  const points = edge.points;
+  const work = points.map((p) => [...p]);
+  let i = seg.index;
+  if (!seg.prepared && (i === 0 || i === work.length - 2)) {
+    // 首尾线段保留引出方向，只移动补出的中段。
+    const a = work[i], b = work[i + 1];
+    const p = a.map((v, j) => v + (b[j] - v) / 4);
+    const q = a.map((v, j) => v + (b[j] - v) * 3 / 4);
+    work.splice(i + 1, 0, [...p], p, q, [...q]);
+    i += 2;
+  }
+  const oldA = work[i][axis], oldB = work[i + 1][axis];
+  const skip = new Set([edge.from, edge.to]);
+  const endpoints = seg.endpoints ??= view.nodes.filter((n) => skip.has(n.id));
+  const targets = tolerance > 0 ? (seg.snapTargets ??= segmentSnapTargets(view, edge, axis, across, endpoints))
+    .filter(({ at }) => Math.abs(at - desired) <= tolerance)
+    .sort((a, b) => Math.abs(a.at - desired) - Math.abs(b.at - desired) || a.priority - b.priority) : [];
+  const checked = new Set();
+  seg.guides = [];
+  for (const match of [...targets, { at: desired }]) {
+    if (checked.has(match.at)) continue;
+    checked.add(match.at);
+    work[i][axis] = work[i + 1][axis] = match.at;
+    if (pathBlockedByNodes(work, view.nodes, skip) || endpoints.some((n) => pathCrossesBody(work, n))) continue;
+    if (match.priority !== undefined) {
+      seg.guides.push({
+        axis: axis === 1 ? 'y' : 'x', at: match.at,
+        from: Math.min(match.from, work[i][across], work[i + 1][across]),
+        to: Math.max(match.to, work[i][across], work[i + 1][across]),
+      });
+    }
+    if (oldA === match.at && oldB === match.at) return false;
+    seg.prepared = true;
+    seg.index = i;
+    edge.points = work;
+    return true;
+  }
+  return false;
 }
 
 /** 边的折线由共享路由器维护（严格正交）；此处只做读取 */
@@ -151,9 +223,8 @@ function distToSegment(p, a, b) {
   return Math.hypot(p.x - (a[0] + t * dx), p.y - (a[1] + t * dy));
 }
 export {
-  clampToGroup,
-  collidesWith,
   moveNodeNoOverlap,
+  moveEdgeSegment,
   edgePoints,
   rerouteScope,
   liveReroute,

@@ -63,6 +63,7 @@ const state = {
   dragSeg: null,
   dragEnd: null,
   dragNode: null,
+  dragNodeGuides: [],
   dragBox: null,
   resizeBox: null,
   dragLabel: null,

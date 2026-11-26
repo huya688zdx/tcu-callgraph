@@ -378,13 +378,18 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const sel = selectedId(edge);
   let selLabel = labels.find((l) => l.id === sel) || null;
   if (!selLabel) state.selectedLabel = null;
-  document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: edgeAiDetail(edge) }));
-  if (connPick !== edge || connMode !== 'fixed' || selLabel) connPick = null;
-  if (detectResult && (detectResult.edge !== edge || detectResult.labelId !== selLabel?.id)) detectResult = null;
-
   const trunkHits = state.trunkHits?.length > 1 && state.trunkHits.includes(edge) ? state.trunkHits : null;
   const activeBranches = new Set(state.multiSelection?.trunk ? state.multiSelection.hits : [edge]);
   const allTrunk = Boolean(trunkHits && trunkHits.every((item) => activeBranches.has(item)));
+  const aiDetail = edgeAiDetail(edge);
+  if (trunkHits?.length > 1) {
+    aiDetail.trunkBranches = trunkHits.map((item) => edgeAiDetail(item));
+    aiDetail.trunkActiveIndex = trunkHits.indexOf(edge);
+    aiDetail.trunkAll = allTrunk;
+  }
+  document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: aiDetail }));
+  if (connPick !== edge || connMode !== 'fixed' || selLabel) connPick = null;
+  if (detectResult && (detectResult.edge !== edge || detectResult.labelId !== selLabel?.id)) detectResult = null;
   const focusName = trunkHits && state.trunkFocusNode ? nodeName(state.trunkFocusNode) : null;
   const caption = focusName && activeBranches.size > 1 ? `${focusName} · ${t('trunk.highlighted', { n: activeBranches.size })}`
     : allTrunk ? t('trunk.highlightedAll', { n: trunkHits.length })

@@ -34,6 +34,8 @@ import {
   testConnection as testAiConnection,
 } from './core/ai-agent.js';
 import { normalizeExpansions } from './core/expansion.js';
+import { routeEdges } from './core/routing.js';
+import { contentPadding, inside } from '../web/lib/hierarchy.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
@@ -1723,6 +1725,172 @@ function sendFile(res, file, headers) {
  */
 const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
 
+const CANVAS_SNAPSHOT_LIMIT = 200;
+const canvasNumber = (value) => Number.isFinite(value) && Math.abs(value) <= 1_000_000;
+const canvasRect = ({ id, x, y, w, h }) => ({ id, x, y, w, h });
+const canvasNode = (node) => ({ ...canvasRect(node), name: node.name, kind: node.kind, file: node.file });
+
+function sanitizeCanvasLayout(raw) {
+  if (!isPlainObject(raw) || typeof raw.root !== 'string' || raw.root.length > 32_000 ||
+      !['flat', 'group', 'file', 'period'].includes(raw.mode) || !Array.isArray(raw.nodes)) return null;
+  const rects = (items, nodes = false) => {
+    if (!Array.isArray(items)) return null;
+    const byId = new Map();
+    for (const item of items.slice(0, CANVAS_SNAPSHOT_LIMIT)) {
+      if (!isPlainObject(item) || typeof item.id !== 'string' || item.id.length > 1024 ||
+          (nodes && !item.id) || byId.has(item.id) ||
+          ![item.x, item.y, item.w, item.h].every(canvasNumber) || item.w <= 0 || item.h <= 0) continue;
+      byId.set(item.id, canvasRect(item));
+    }
+    return byId;
+  };
+  const dimension = (n) => canvasNumber(n) && n >= 0 ? n : undefined;
+  return {
+    root: remapLayoutRoot(raw.root, MODEL), mode: raw.mode,
+    width: dimension(raw.width), height: dimension(raw.height),
+    nodes: rects(raw.nodes, true), groups: rects(raw.groups), containers: rects(raw.containers),
+  };
+}
+
+// 找出移动轴上第一个无冲突的位置。均匀分布时整排节点使用同一偏移。
+function clearCanvasAxis(rects, obstacles, axis, direction = 1) {
+  const [across, length, breadth] = axis === 'x' ? ['y', 'w', 'h'] : ['x', 'h', 'w'];
+  const blocked = [];
+  for (const rect of rects) for (const other of obstacles) {
+    if (rect[across] >= other[across] + other[breadth] || other[across] >= rect[across] + rect[breadth]) continue;
+    const low = other[axis] - rect[axis] - rect[length];
+    const high = other[axis] + other[length] - rect[axis];
+    blocked.push(direction > 0 ? [low, high] : [-high, -low]);
+  }
+  let offset = 0;
+  for (const [low, high] of blocked.sort((a, b) => a[0] - b[0])) {
+    if (low >= offset) break;
+    offset = Math.max(offset, high);
+  }
+  if (direction < 0 && rects.some(rect => rect[axis] < offset)) return clearCanvasAxis(rects, obstacles, axis);
+  return direction * offset;
+}
+
+function arrangedTargets(nodes, positions, groupMode) {
+  return nodes.flatMap(node => {
+    const position = positions?.[node.id];
+    return position?.arrangedFor === groupMode && [position.x, position.y].every(Number.isFinite)
+      ? [{ node, x: position.x, y: position.y }] : [];
+  });
+}
+
+const rectangleOverlapArea = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) *
+  Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+
+function discardCollidingArrangements(nodes, targets) {
+  const moves = new Map(targets.filter(({ node, x, y }) => node.x !== x || node.y !== y)
+    .map(({ node, x, y }) => [node, { x, y, w: node.w, h: node.h }]));
+  while (moves.size) {
+    const blocked = new Set();
+    for (const [node, target] of moves) {
+      for (const other of nodes) {
+        if (node === other || rectangleOverlapArea(target, moves.get(other) || other) <=
+            rectangleOverlapArea(node, other) + 0.01) continue;
+        blocked.add(node);
+        if (moves.has(other)) blocked.add(other);
+      }
+    }
+    if (!blocked.size) break;
+    // 某个节点退回自动位置后，可能挡到另一条覆盖坐标，因此重新检查剩余移动。
+    for (const node of blocked) moves.delete(node);
+  }
+  return targets.filter(({ node, x, y }) => moves.has(node) || (node.x === x && node.y === y));
+}
+
+function expandedArrangementBoxes(view, targets) {
+  const files = new Map(view.groups.map(box => [box.id, { box, bounds: canvasRect(box), kind: 'file' }]));
+  const directories = view.containers.map(box => ({ box, bounds: canvasRect(box), kind: 'dir' }));
+  directories.sort((a, b) => Number(!!a.box.root) - Number(!!b.box.root) || b.box.id.length - a.box.id.length);
+  const boxes = [...files.values(), ...directories];
+  const expanded = new Set();
+  const expand = (entry, content) => {
+    const { bounds } = entry;
+    const { pad, top } = contentPadding(entry);
+    const left = Math.min(bounds.x, Math.max(0, content.x - pad));
+    const upper = Math.min(bounds.y, content.y - top);
+    const right = Math.max(bounds.x + bounds.w, content.x + content.w + pad);
+    const bottom = Math.max(bounds.y + bounds.h, content.y + content.h + pad);
+    Object.assign(bounds, { x: left, y: upper, w: right - left, h: bottom - upper });
+    expanded.add(entry);
+  };
+  for (const { node, x, y } of targets) {
+    const file = files.get(node.group);
+    if (file) expand(file, { x, y, w: node.w, h: node.h });
+  }
+  // 先扩展内层框，再用子框的新边界扩展父框，为每层标题留出空间。
+  for (const entry of boxes) {
+    if (!expanded.has(entry)) continue;
+    const parent = directories.find(candidate => inside(candidate, entry));
+    if (parent && !parent.box.root) {
+      expand(parent, entry.bounds);
+      continue;
+    }
+    const minY = parent ? parent.bounds.y + contentPadding(parent).top : 0;
+    if (entry.bounds.y < minY) {
+      return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
+    }
+  }
+  for (const a of expanded) for (const b of boxes) {
+    if (a !== b && !inside(a, b) && !inside(b, a) &&
+        rectangleOverlapArea(a.bounds, b.bounds) > rectangleOverlapArea(a.box, b.box) + 0.01) {
+      return { error: '调整后文件框或目录容器会重叠，请改用其他位置' };
+    }
+  }
+  return { boxes: expanded };
+}
+
+function applyArrangedPositions(view, positions, groupMode, previous) {
+  const arranged = arrangedTargets(view.nodes, positions, groupMode);
+  if (!arranged.length) return;
+  const lastApplied = previous?.layoutSlots?.aiPositions;
+  const previousNodes = new Map((previous?.nodes || []).map(node => [node.id, node]));
+  const retained = [], pending = [];
+  for (const target of arranged) {
+    const { node, x, y } = target;
+    const prior = previousNodes.get(node.id);
+    const applied = lastApplied?.[node.id];
+    // 增量布局沿用了浏览器位置时，只应用浏览器尚未收到的新 AI 坐标。
+    const alreadyApplied = applied?.x === x && applied?.y === y && prior?.x === node.x && prior?.y === node.y;
+    (alreadyApplied ? retained : pending).push(target);
+  }
+  const candidates = discardCollidingArrangements(view.nodes, pending);
+  const { boxes } = expandedArrangementBoxes(view, candidates);
+  const applicable = boxes ? candidates : [];
+  if (!retained.length && !applicable.length) return;
+  // 增量刷新会把 layoutSlots 传回服务端。重置时据此丢弃已调整的旧几何。
+  const slots = view.layoutSlots || {
+    nodes: view.nodes.map(n => ({ ...canvasRect(n), file: n.file, group: n.group })),
+    edges: view.edges.map(e => ({ ...e })),
+    groups: view.groups.map(box => ({ ...box })),
+    containers: view.containers.map(box => ({ ...box })),
+    width: view.width, height: view.height, layoutDirection: view.layoutDirection,
+  };
+  const aiPositions = Object.fromEntries([...retained, ...applicable].map(({ node, x, y }) => [node.id, { x, y }]));
+  view.layoutSlots = { ...slots, aiArranged: true, aiPositions };
+  const changed = applicable.some(({ node, x, y }) => node.x !== x || node.y !== y);
+  if (!changed) return;
+  for (const { node, x, y } of applicable) {
+    Object.assign(node, { x, y });
+  }
+  for (const { box, bounds } of boxes) Object.assign(box, bounds);
+  routeEdges(view.nodes, view.edges, { layoutDirection: view.layoutDirection });
+  for (const rect of [...view.nodes, ...view.groups, ...view.containers]) {
+    if (rect.root) continue;
+    view.width = Math.max(view.width, rect.x + rect.w + 24);
+    view.height = Math.max(view.height, rect.y + rect.h + 24);
+  }
+  for (const edge of view.edges) for (const [x, y] of edge.points || []) {
+    view.width = Math.max(view.width, x + 24);
+    view.height = Math.max(view.height, y + 24);
+  }
+  for (const box of view.containers) if (box.root) Object.assign(box, { w: view.width, h: view.height });
+}
+
 // 旧存档的外部占位节点若已有真实定义，优先绑定到生产源码。
 function remapLegacyExt(id, model) {
   if (typeof id !== 'string' || !id.startsWith('ext::')) return id;
@@ -2006,11 +2174,12 @@ async function buildView(
     }
   }
 
-  // 只恢复手工关系，旧固定坐标和折线不再参与排版。
+  // 恢复手工关系和当前布局模式下的 AI 坐标，旧固定坐标和折线仍保持原有兼容行为。
   const mode = group ? 'group' : 'flat';
   const layout = viewOverlay.layout || {};
   const layoutRoot = roots.join('+');
-  const manual = layout[layoutKey(layoutRoot, mode)]?.manual;
+  const slot = layout[layoutKey(layoutRoot, mode)];
+  const manual = slot?.manual;
   const byId = new Map(clean.map((n) => [n.id, n]));
   // 比较模式的 roots 是「保留+选中」的合集，和存手工关系时的原视图槽位键对不上；
   // 改为从全部槽位按「两端都在当前图上」找回，按端点对去重，保证手工关系仍可见。
@@ -2056,8 +2225,11 @@ async function buildView(
     if (numbers) e.callNumbers = numbers;
   }
   const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
+  const positions = COMPARISON ? null : slot?.nodes;
+  if (previous?.layoutSlots?.aiArranged && !clean.some(n => positions?.[n.id]?.arrangedFor === groupMode)) previous = null;
   const laid = await layoutElk(clean, viewEdges, { group, groupMode, rootLabel: ROOT_LABEL, previous });
   assertCurrent();
+  applyArrangedPositions(laid, positions, groupMode, previous);
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -2269,6 +2441,8 @@ export const server = http.createServer(async (req, res) => {
             .map((m) => ({
               role: m.role,
               text: String(m.text || '').slice(0, 8000),
+              ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
+                ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
               ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
               ...(Array.isArray(m.tools) && m.tools.length ? {
@@ -2346,13 +2520,30 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/ai/chat' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       let p;
-      try { p = await readJson(req, res); } catch { return; }
+      try { p = await readJson(req, res, 8 * 1024 * 1024); } catch { return; }
       if (!currentSession(req)) return sessionConflict(res);
       const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
       let cfg;
       try { cfg = normalizeAiConfig(p.config || {}, saved); } catch (err) { return bad(res, err.message); }
       const prompt = String(p.prompt || '').trim();
       if (!prompt) return bad(res, '请输入要执行的任务');
+      const images = [];
+      for (const item of Array.isArray(p.images) ? p.images : []) {
+        const dataUrl = typeof item === 'string' ? item : item?.dataUrl;
+        if (typeof dataUrl !== 'string' || dataUrl.length > 3_000_000 ||
+            !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) continue;
+        images.push({ dataUrl, ...(typeof item?.label === 'string' ? { label: item.label.slice(0, 120) } : {}) });
+        if (images.length === 2) break;
+      }
+      const canvasLayoutRoots = (ids) => ids.map(id => remapLegacyExt(id, MODEL)).filter(Boolean);
+      let canvasSnapshot = reviewingPage(pageState) ? null : sanitizeCanvasLayout(p.canvasLayout);
+      const snapshotPage = canvasSnapshot && latestPage();
+      const snapshotView = snapshotPage ? viewSnapshot(snapshotPage) : null;
+      const snapshotRoots = canvasLayoutRoots(snapshotView?.roots || []);
+      const snapshotRoot = snapshotRoots.join('+');
+      if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
+      const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
+      let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -2632,69 +2823,145 @@ export const server = http.createServer(async (req, res) => {
         });
       };
 
-      // 检测改动/目标函数的上游调用链是否横跨多个车型/目录前缀（兼容任意嵌套深度，如 z145/ 或 src/z145/ 与 src/z144/），便于 AI 提前询问筛选。
-      const summarizeVehicleBranches = (model, fnIds) => {
-        const targetSet = new Set(fnIds);
-        const dirSegsOf = (file) => {
-          const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
-          return parts.length > 1 ? parts.slice(0, -1) : [];
-        };
-        const collectedNodes = []; // { id, file, segs, isTask }
-        const seenNode = new Set();
-        for (const id of targetSet) {
-          if (!model._index?.byId?.has(id)) continue;
-          try {
-            const trace = traceToTasks(model, id, { limit: 60 });
-            for (const chain of trace.upstreamChains || []) {
-              for (const nodeId of chain.path || []) {
-                if (targetSet.has(nodeId) || seenNode.has(nodeId)) continue;
-                seenNode.add(nodeId);
-                const file = fileOfNodeId(model, nodeId);
-                collectedNodes.push({ id: nodeId, file, segs: dirSegsOf(file), isTask: nodeId === chain.taskId });
-              }
-            }
-          } catch { /* ignore */ }
-          // 同时向上回溯最多 6 层直接调用者，确保非标准命名（无正式 TASK）的多车型上游分支也能被发现
-          const queue = [{ node: id, depth: 0 }];
-          const visited = new Set([id]);
-          for (let qi = 0; qi < queue.length; qi++) {
-            const { node, depth } = queue[qi];
-            if (depth >= 6) continue;
-            for (const e of model._index.inAdj.get(node) || []) {
-              if (e.kind === 'var' || visited.has(e.from)) continue;
-              visited.add(e.from);
-              if (!targetSet.has(e.from) && !seenNode.has(e.from)) {
-                seenNode.add(e.from);
-                const file = fileOfNodeId(model, e.from);
-                collectedNodes.push({ id: e.from, file, segs: dirSegsOf(file), isTask: false });
-              }
-              queue.push({ node: e.from, depth: depth + 1 });
-            }
-          }
-        }
-        const dirLists = [
-          ...[...targetSet].map((id) => dirSegsOf(fileOfNodeId(model, id))),
-          ...collectedNodes.map((n) => n.segs),
-        ].filter((segs) => segs.length > 0);
-        if (!dirLists.length) return [];
-        // 计算所有涉及文件的最长公共目录前缀（例如 src/ 或 app/ecu/），取其后的首级分叉目录作为车型/分支前缀
+      // 检测改动/目标函数自身同名多车型副本或上游调用链是否横跨多个车型/目录前缀（兼容任意嵌套深度，如 z145/ 或 src/z145/ 与 src/z144/），便于 AI 提前询问筛选。
+      const dirSegsOfFile = (file) => {
+        const parts = String(file || '').replace(/\\/g, '/').split('/').filter(Boolean);
+        return parts.length > 1 ? parts.slice(0, -1) : [];
+      };
+      const commonDirLenOf = (dirLists) => {
+        if (!dirLists.length) return 0;
         let commonLen = dirLists[0].length;
         for (let i = 1; i < dirLists.length; i++) {
           let k = 0;
           while (k < commonLen && k < dirLists[i].length && dirLists[i][k].toLowerCase() === dirLists[0][k].toLowerCase()) k++;
           commonLen = k;
         }
+        return commonLen;
+      };
+      const branchesFromIds = (model, ids) => {
+        const items = ids.map((id) => ({ id, file: fileOfNodeId(model, id) }))
+          .map((item) => ({ ...item, segs: dirSegsOfFile(item.file) }))
+          .filter((item) => item.segs.length > 0);
+        if (items.length < 2) return [];
+        const commonLen = commonDirLenOf(items.map((item) => item.segs));
+        const byPrefix = new Map();
+        for (const item of items) {
+          if (item.segs.length <= commonLen) continue;
+          const pref = item.segs.slice(0, commonLen + 1).join('/');
+          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          const entry = byPrefix.get(pref);
+          entry.sampleFunctions.add(item.id);
+          entry.chainCount++;
+        }
+        const out = [...byPrefix.values()]
+          .map((b) => ({ prefix: b.prefix, taskIds: [], sampleFunctions: [...b.sampleFunctions].slice(0, 8), chainCount: b.chainCount }))
+          .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
+        return out.length > 1 ? out : [];
+      };
+      const summarizeVehicleBranches = (model, fnIds, { includeUpstream = true } = {}) => {
+        const targetSet = new Set(fnIds);
+        const collectedNodes = []; // { id, file, segs, isTask }
+        const seenNode = new Set();
+        if (includeUpstream) {
+          for (const id of targetSet) {
+            if (!model._index?.byId?.has(id)) continue;
+            try {
+              const trace = traceToTasks(model, id, { limit: 60 });
+              for (const chain of trace.upstreamChains || []) {
+                for (const nodeId of chain.path || []) {
+                  if (targetSet.has(nodeId) || seenNode.has(nodeId)) continue;
+                  seenNode.add(nodeId);
+                  const file = fileOfNodeId(model, nodeId);
+                  collectedNodes.push({ id: nodeId, file, segs: dirSegsOfFile(file), isTask: nodeId === chain.taskId });
+                }
+              }
+            } catch { /* ignore */ }
+            // 同时向上回溯最多 6 层直接调用者，确保非标准命名（无正式 TASK）的多车型上游分支也能被发现
+            const queue = [{ node: id, depth: 0 }];
+            const visited = new Set([id]);
+            for (let qi = 0; qi < queue.length; qi++) {
+              const { node, depth } = queue[qi];
+              if (depth >= 6) continue;
+              for (const e of model._index.inAdj.get(node) || []) {
+                if (e.kind === 'var' || visited.has(e.from)) continue;
+                visited.add(e.from);
+                if (!targetSet.has(e.from) && !seenNode.has(e.from)) {
+                  seenNode.add(e.from);
+                  const file = fileOfNodeId(model, e.from);
+                  collectedNodes.push({ id: e.from, file, segs: dirSegsOfFile(file), isTask: false });
+                }
+                queue.push({ node: e.from, depth: depth + 1 });
+              }
+            }
+          }
+        }
+        const targetEntries = [...targetSet]
+          .filter((id) => model._index?.byId?.has(id))
+          .map((id) => {
+            const fn = model._index.byId.get(id);
+            const file = fileOfNodeId(model, id);
+            const norm = file.replace(/\\/g, '/');
+            return {
+              id,
+              name: fn?.name || id.split('::').pop() || '',
+              base: norm.split('/').pop() || '',
+              file,
+              segs: dirSegsOfFile(file),
+            };
+          });
+        const dirLists = [
+          ...targetEntries.map((item) => item.segs),
+          ...collectedNodes.map((n) => n.segs),
+        ].filter((segs) => segs.length > 0);
+        if (!dirLists.length) return [];
+        const commonLen = commonDirLenOf(dirLists);
         const branchKeyOf = (segs) => {
           if (segs.length <= commonLen) return '';
           return segs.slice(0, commonLen + 1).join('/');
         };
-        const targetKeys = new Set([...targetSet].map((id) => branchKeyOf(dirSegsOf(fileOfNodeId(model, id)))).filter(Boolean));
+        // 若目标集合本身就包含不同路径下的同名函数或同名文件，直接识别为多车型分支。
+        const dupTargetIds = new Set();
+        const byFnName = new Map();
+        const byBase = new Map();
+        for (const item of targetEntries) {
+          const pref = branchKeyOf(item.segs);
+          if (!pref) continue;
+          if (item.name) {
+            if (!byFnName.has(item.name)) byFnName.set(item.name, new Map());
+            byFnName.get(item.name).set(pref, [...(byFnName.get(item.name).get(pref) || []), item.id]);
+          }
+          if (item.base) {
+            if (!byBase.has(item.base)) byBase.set(item.base, new Map());
+            byBase.get(item.base).set(pref, [...(byBase.get(item.base).get(pref) || []), item.id]);
+          }
+        }
+        for (const groups of [byFnName, byBase]) {
+          for (const prefMap of groups.values()) {
+            if (prefMap.size > 1) {
+              for (const ids of prefMap.values()) for (const id of ids) dupTargetIds.add(id);
+            }
+          }
+        }
         const byPrefix = new Map();
+        const ensurePrefix = (pref) => {
+          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
+          return byPrefix.get(pref);
+        };
+        if (dupTargetIds.size) {
+          for (const item of targetEntries) {
+            if (!dupTargetIds.has(item.id)) continue;
+            const pref = branchKeyOf(item.segs);
+            if (!pref) continue;
+            const entry = ensurePrefix(pref);
+            entry.sampleFunctions.add(item.id);
+            entry.chainCount++;
+          }
+        }
+        const targetKeys = new Set(targetEntries.map((item) => branchKeyOf(item.segs)).filter(Boolean));
         for (const item of collectedNodes) {
           const pref = branchKeyOf(item.segs);
-          if (!pref || targetKeys.has(pref)) continue;
-          if (!byPrefix.has(pref)) byPrefix.set(pref, { prefix: pref, taskIds: new Set(), sampleFunctions: new Set(), chainCount: 0 });
-          const entry = byPrefix.get(pref);
+          if (!pref || (!dupTargetIds.size && targetKeys.has(pref))) continue;
+          const entry = ensurePrefix(pref);
           if (item.isTask) entry.taskIds.add(item.id);
           else entry.sampleFunctions.add(item.id);
           entry.chainCount++;
@@ -2709,9 +2976,223 @@ export const server = http.createServer(async (req, res) => {
           .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
         return branches.length > 1 ? branches : [];
       };
+      const findCrossVehicleDuplicateBranches = (model, fnIds, { selectedIds, promptText }) => {
+        const lowerPrompt = String(promptText || '').toLowerCase();
+        const mentionsBranch = (file, prefix) => {
+          const normFile = String(file || '').replace(/\\/g, '/').toLowerCase();
+          const normPref = String(prefix || '').toLowerCase();
+          const leaf = normPref.split('/').pop() || '';
+          if (normFile && lowerPrompt.includes(normFile)) return true;
+          if (normPref && lowerPrompt.includes(normPref)) return true;
+          if (leaf && leaf.length >= 2) {
+            const escaped = leaf.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(lowerPrompt)) return true;
+          }
+          return false;
+        };
+        const byPrefix = new Map();
+        for (const id of fnIds) {
+          if (selectedIds.has(id)) continue;
+          const fn = model._index?.byId?.get(id);
+          if (!fn?.name) continue;
+          const siblings = (model._index.byName.get(fn.name) || [])
+            .filter((n) => !n.external && !overlay.deleted.nodes[n.id]);
+          if (siblings.length < 2) continue;
+          const siblingBranches = branchesFromIds(model, siblings.map((n) => n.id));
+          if (siblingBranches.length < 2) continue;
+          const chosenFile = fileOfNodeId(model, id);
+          const chosenBranch = siblingBranches.find((b) => b.sampleFunctions.includes(id));
+          if (chosenBranch && mentionsBranch(chosenFile, chosenBranch.prefix)) continue;
+          for (const b of siblingBranches) {
+            if (!byPrefix.has(b.prefix)) byPrefix.set(b.prefix, { prefix: b.prefix, taskIds: [], sampleFunctions: new Set(), chainCount: 0 });
+            const entry = byPrefix.get(b.prefix);
+            for (const sid of b.sampleFunctions) entry.sampleFunctions.add(sid);
+            entry.chainCount += b.chainCount;
+          }
+        }
+        const out = [...byPrefix.values()]
+          .map((b) => ({ prefix: b.prefix, taskIds: [], sampleFunctions: [...b.sampleFunctions].slice(0, 8), chainCount: b.chainCount }))
+          .sort((a, b) => b.chainCount - a.chainCount || a.prefix.localeCompare(b.prefix));
+        return out.length > 1 ? out : [];
+      };
+      let uiSelectedIds = new Set();
+      const recentUserPromptText = [
+        ...(Array.isArray(p.history) ? p.history.filter((m) => m?.role === 'user').slice(-3).map((m) => String(m.content || m.text || '')) : []),
+        prompt,
+      ].join('\n');
+
+      const arrangeCanvas = async (args) => {
+        const fail = error => ({ ok: false, error });
+        if (COMPARISON) return fail('比较模式不支持调整画布布局');
+        const page = latestPage();
+        if (!page || (!page.roots?.length && !page.expansions?.length && !page.vars?.length)) return fail('当前画布为空');
+        const { action } = args;
+        if (!['inspect', 'move', 'align', 'reset'].includes(action)) return fail('未知的画布布局操作');
+        const activeView = viewSnapshot(page);
+        const { roots, up, down, group, groupMode, vars, hiddenVars, expansions } = activeView;
+        const layoutRoot = canvasLayoutRoots(roots).join('+');
+        const layoutMode = group ? 'group' : 'flat';
+        const key = layoutKey(layoutRoot, layoutMode);
+        const beforeSlot = overlay.layout[key];
+        const view = await buildView(roots, up, down, group, null, {
+          want: vars, skip: hiddenVars, expansions, groupMode, signal: abort.signal,
+        });
+        assertActive();
+        const current = latestPage();
+        if (!current || !isDeepStrictEqual(activeView, viewSnapshot(current)) || overlay.layout[key] !== beforeSlot) {
+          return fail('画布布局已变化，请重新查看当前布局');
+        }
+        if (!view.nodes.length) return fail('当前画布为空');
+        const snapshot = canvasSnapshot && snapshotKey === key && snapshotSlot === beforeSlot &&
+          (canvasSnapshot.mode === groupMode || canvasSnapshot.mode === layoutMode) &&
+          isDeepStrictEqual(snapshotView, activeView) ? canvasSnapshot : null;
+        const live = snapshot && view.nodes.some(n => snapshot.nodes.has(n.id)) ? snapshot : null;
+        const nodes = view.nodes.map(n => canvasNode({ ...n, ...live?.nodes.get(n.id) }));
+        if (action === 'inspect') {
+          return {
+            ok: true, action, root: layoutRoot, mode: layoutMode, nodes,
+            groups: view.groups.map(box => live?.groups?.get(box.id) ?? canvasRect(box)),
+            containers: view.containers.map(box => live?.containers?.get(box.id) ?? canvasRect(box)),
+            canvas: { width: live?.width ?? view.width, height: live?.height ?? view.height },
+            edges: view.edges.map(({ from, to, kind }) => ({ from, to, kind })),
+            ...(view.truncated ? { truncated: true } : {}),
+          };
+        }
+
+        const byId = new Map(nodes.map(n => [n.id, n]));
+        const resolveNode = (query) => {
+          if (typeof query !== 'string' || !query.trim()) throw new Error('请提供画布节点的名称或 ID');
+          query = query.trim();
+          if (byId.has(query)) return byId.get(query);
+          const onCanvas = n => byId.has(n.id);
+          const matches = ['fn', 'var'].flatMap(kind => {
+            const { resolved, ambiguous } = resolveSymbols(MODEL, [query], kind, onCanvas);
+            return [...resolved, ...ambiguous.flatMap(item => item.candidates)].filter(id => byId.has(id));
+          });
+          // 画布也可能包含外部占位节点或具有显示别名的节点。
+          const shortName = query.replace(/\(\s*\)$/, '').toLowerCase();
+          for (const n of nodes) if (n.name?.toLowerCase() === shortName) matches.push(n.id);
+          const unique = [...new Set(matches)];
+          if (unique.length > 1) throw new Error(`画布节点「${query}」重名，请使用完整 ID：${unique.slice(0, 8).join('、')}`);
+          if (!unique.length) throw new Error(`当前画布没有节点「${query}」`);
+          return byId.get(unique[0]);
+        };
+        const gapOf = (value) => {
+          if (value == null) return 24;
+          if (!canvasNumber(value) || value < 0) throw new Error('gap 必须为非负数');
+          return value;
+        };
+        const updated = new Map();
+        if (action === 'move') {
+          if (!Array.isArray(args.moves) || !args.moves.length || args.moves.length > CANVAS_SNAPSHOT_LIMIT) {
+            return fail('moves 必须包含 1 至 200 项');
+          }
+          for (const move of args.moves) {
+            if (!isPlainObject(move) || ['x', 'y', 'dx', 'dy'].some(k => move[k] !== undefined && !canvasNumber(move[k]))) {
+              return fail('移动坐标和偏移必须是有效数字');
+            }
+            const node = resolveNode(move.id);
+            const target = { ...node };
+            let axis, direction, relativeLimit;
+            if (move.relativeTo !== undefined || move.placement !== undefined) {
+              const anchor = resolveNode(move.relativeTo);
+              const placement = move.placement;
+              if (anchor === node || !['left', 'right', 'above', 'below'].includes(placement)) {
+                return fail('相对移动需要另一个参照节点和有效的 placement');
+              }
+              const gap = gapOf(move.gap);
+              axis = ['left', 'right'].includes(placement) ? 'x' : 'y';
+              direction = ['left', 'above'].includes(placement) ? -1 : 1;
+              target.x = anchor.x;
+              target.y = anchor.y;
+              const size = axis === 'x' ? 'w' : 'h';
+              target[axis] += direction * ((direction > 0 ? anchor[size] : node[size]) + gap);
+              relativeLimit = target[axis];
+            } else if (['x', 'y', 'dx', 'dy'].every(k => move[k] === undefined)) {
+              return fail('请提供目标坐标、移动偏移或相对位置');
+            }
+            target.x = Math.max(0, (move.x ?? target.x) + (move.dx ?? 0));
+            target.y = Math.max(0, (move.y ?? target.y) + (move.dy ?? 0));
+            if (relativeLimit !== undefined) {
+              if (direction < 0 && relativeLimit < 0) return fail('参照节点在该方向没有足够空间');
+              target[axis] = direction > 0 ? Math.max(target[axis], relativeLimit) : Math.min(target[axis], relativeLimit);
+            }
+            const dx = target.x - node.x, dy = target.y - node.y;
+            axis ??= Math.abs(dx) >= Math.abs(dy) ? 'x' : 'y';
+            direction ??= (axis === 'x' ? dx : dy) < 0 ? -1 : 1;
+            target[axis] += clearCanvasAxis([target], nodes.filter(n => n !== node), axis, direction);
+            if (relativeLimit !== undefined && direction < 0 && target[axis] > relativeLimit) {
+              return fail('参照节点在该方向没有足够的无重叠空间');
+            }
+            Object.assign(node, { x: target.x, y: target.y });
+            updated.set(node.id, node);
+          }
+        } else if (action === 'align') {
+          const { axis } = args;
+          if (!['x', 'y'].includes(axis)) return fail('axis 必须为 x（同行）或 y（同列）');
+          if (!Array.isArray(args.nodes) || args.nodes.length < 2 || args.nodes.length > CANVAS_SNAPSHOT_LIMIT) {
+            return fail('请选择 2 至 200 个要对齐的节点');
+          }
+          const selected = [...new Set(args.nodes.map(resolveNode))];
+          if (selected.length < 2) return fail('请选择至少两个不同的画布节点');
+          const obstacles = nodes.filter(n => !selected.includes(n));
+          const [across, length] = axis === 'x' ? ['y', 'w'] : ['x', 'h'];
+          const line = Math.max(0, selected[0][across]);
+          selected.sort((a, b) => a[axis] - b[axis]);
+          const targets = selected.map(n => ({ ...n, [across]: line, [axis]: Math.max(0, n[axis]) }));
+          if (args.distribute === true) {
+            const gap = gapOf(args.gap);
+            for (let i = 1; i < targets.length; i++) targets[i][axis] = targets[i - 1][axis] + targets[i - 1][length] + gap;
+            const offset = clearCanvasAxis(targets, obstacles, axis);
+            for (const target of targets) target[axis] += offset;
+          } else {
+            for (const target of targets) {
+              target[axis] += clearCanvasAxis([target], obstacles, axis);
+              obstacles.push(target);
+            }
+          }
+          for (const target of targets) updated.set(target.id, target);
+        }
+
+        const clear = action === 'reset';
+        const op = clear ? 'layout.clear' : 'layout.save';
+        const positions = [...updated.values()].map(({ id, x, y }) => ({ id, x, y }));
+        const patch = Object.fromEntries(positions.map(({ id, x, y }) => [id, { x, y, arrangedFor: groupMode }]));
+        if (positions.length) {
+          const geometry = view.layoutSlots?.aiArranged ? view.layoutSlots : view;
+          const targets = arrangedTargets(view.nodes, { ...beforeSlot?.nodes, ...patch }, groupMode);
+          const { error } = expandedArrangementBoxes(geometry, targets);
+          if (error) return fail(error);
+        }
+        const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
+        const slot = store.transaction(() => {
+          const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
+          const resetPositions = clear ? groupMode : undefined;
+          const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, resetPositions });
+          store.appendEvent(PROJECT.id, {
+            op, target: key, actor: 'ai',
+            before: clear ? before : { nodes: pickKeys(before.nodes, [...updated.keys()]) },
+            after: { nodes: patch, resetPositions, reason, view: activeView },
+          });
+          return savedSlot;
+        });
+        overlay.layout[key] = slot;
+        if (live && !clear) {
+          snapshotSlot = slot;
+          for (const node of updated.values()) live.nodes.set(node.id, canvasRect(node));
+          // 写入后文件框和画布范围由服务端重新计算。
+          live.groups = live.containers = null;
+          live.width = live.height = undefined;
+        } else if (key === snapshotKey) {
+          canvasSnapshot = null;
+        }
+        broadcastChange(op, 'ai', { projectId: PROJECT.id });
+        return { ok: true, action, root: layoutRoot, mode: layoutMode, updatedCount: positions.length, positions, ...reviewWriteResult() };
+      };
 
       const executeAiTool = async (name, args) => {
         assertActive();
+        if (name === 'arrange_canvas') return arrangeCanvas(args);
         if (name === 'get_git_changes') {
           const q = new URLSearchParams({ limit: '80' });
           if (args.baseRef) q.set('baseRef', String(args.baseRef));
@@ -3083,31 +3564,52 @@ export const server = http.createServer(async (req, res) => {
           const varRes = hasExplicitVars ? resolveGroupSymbols(args.vars, 'var') : { resolved: filterByPath(defaultVarIds), ambiguous: [], notFound: [] };
           let actualFnIds = custom ? [...new Set(explicitGroups.flatMap(g => g.fnIds))] : fnRes.resolved.slice(0, 80);
           const varIds = custom ? [...new Set(explicitGroups.flatMap(g => g.varIds))] : varRes.resolved.slice(0, 40);
+          // 重名函数/变量（如不同车型目录下同名文件/同名函数）绝不静默跳过或私自猜选：先拦截要求询问。
+          const allAmbiguous = [...fnRes.ambiguous, ...varRes.ambiguous];
+          if (allAmbiguous.length) {
+            const candidateIds = allAmbiguous.flatMap((entry) => entry.candidates || []);
+            const ambBranches = branchesFromIds(targetModel, candidateIds);
+            return {
+              ok: false,
+              needsVehicleChoice: true,
+              ...(ambBranches.length > 1 ? { pathBranches: ambBranches } : {}),
+              ambiguous: allAmbiguous,
+              notFound: [...fnRes.notFound, ...varRes.notFound],
+              error: ambBranches.length > 1
+                ? `检测到重名函数/变量横跨多个车型或目录分支（${ambBranches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入完整「文件::函数名」、includePaths 或 includeAllBranches:true。`
+                : '检测到重名函数/变量，请先用 ask_user 向用户确认具体候选「文件::函数名」，再重试。',
+            };
+          }
           // 支持仅追加全局变量到已有画布
           const currentPage = latestPage();
           const pureVars = !actualFnIds.length && varIds.length > 0 && !args.fromGit && (currentPage?.roots?.length > 0);
           if (!actualFnIds.length && !pureVars) {
             return {
               ok: false,
-              error: fnRes.ambiguous.length ? '函数名重名，请改用完整「文件::函数名」或传入 includePaths 指定车型目录'
-                : varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
+              error: varIds.length ? '当前画布为空，添加变量时请同时指定至少一个相关函数'
                 : '未匹配到可加入画布的函数',
-              ambiguous: [...fnRes.ambiguous, ...varRes.ambiguous],
+              ambiguous: [],
               notFound: [...fnRes.notFound, ...varRes.notFound],
             };
           }
           const mode = custom ? 'replace' : args.mode === 'replace' || args.mode === 'add'
             ? args.mode
             : (args.fromGit || (typeof args.bookmarkName === 'string' && args.bookmarkName.trim()) ? 'replace' : 'add');
-          // 安全拦截：检测到共通/修改函数的上游横跨多个车型或目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
-          if (!COMPARISON && includeTasks && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
-            const branches = summarizeVehicleBranches(groupModel, actualFnIds);
+          // 安全拦截：检测到多车型同名文件/函数或上游调用链横跨多个车型目录分支（如 z145 与 z144）且未指定筛选时，先让 AI 询问用户再入图。
+          if (!COMPARISON && !pureVars && !includePaths.length && !excludePaths.length && !args.includeAllBranches) {
+            let branches = summarizeVehicleBranches(groupModel, actualFnIds, { includeUpstream: includeTasks });
+            if (!branches.length && !args.fromGit && hasExplicitFns) {
+              branches = findCrossVehicleDuplicateBranches(groupModel, actualFnIds, {
+                selectedIds: uiSelectedIds,
+                promptText: recentUserPromptText,
+              });
+            }
             if (branches.length > 1) {
               return {
                 ok: false,
                 needsVehicleChoice: true,
                 pathBranches: branches,
-                error: `检测到上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
+                error: `检测到目标函数或上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
               };
             }
           }
@@ -3284,10 +3786,16 @@ export const server = http.createServer(async (req, res) => {
               prewarmChangedFlowcharts(PROJECT.id, MODEL, changedEntries, gitComparison.beforeModel, gitComparison.beforePath);
             }
           }
+          const addedIds = [...new Set([...actualFnIds, ...scopes.flatMap(g => [...g.varIds, ...g.sourceWriterIds])])];
+          const addedNames = addedIds.map((id) => {
+            const node = targetModel._index?.byId?.get(id);
+            return node?.name || String(id).replace(/^var::/, '').split('::').pop();
+          }).filter(Boolean);
           return {
             ok: true,
             editable: !COMPARISON,
-            addedCount: new Set([...actualFnIds, ...scopes.flatMap(g => [...g.varIds, ...g.sourceWriterIds])]).size,
+            addedCount: addedIds.length,
+            addedNames: [...new Set(addedNames)].slice(0, 30),
             autoTaskLabels,
             ...(createdBookmarks.length ? { bookmarks: createdBookmarks, activeBookmark: createdBookmarks[0].name } : {}),
             roots: composed.page.roots.slice(0, 30),
@@ -3383,25 +3891,47 @@ export const server = http.createServer(async (req, res) => {
             containerKind: f.containerKind === 'dir' ? 'dir' : 'file',
             label: String(f.label || '').slice(0, 120),
           });
-          if (raw.kind === 'node') {
-            const node = sanitizeNode(raw);
-            return node ? { ...node, selectedNode: node } : null;
-          }
-          if (raw.kind === 'edge') {
-            const edge = sanitizeEdge(raw);
-            return edge ? { ...edge, selectedEdge: edge } : null;
-          }
-          if (raw.kind === 'file') {
-            const file = sanitizeFile(raw);
-            return file ? { ...file, selectedFile: file } : null;
-          }
           const out = {};
-          if (raw.selectedNode) out.selectedNode = sanitizeNode(raw.selectedNode);
-          if (raw.selectedEdge) out.selectedEdge = sanitizeEdge(raw.selectedEdge);
-          if (raw.selectedFile) out.selectedFile = sanitizeFile(raw.selectedFile);
+          const types = [['node', 'selectedNode', sanitizeNode], ['edge', 'selectedEdge', sanitizeEdge],
+            ['file', 'selectedFile', sanitizeFile]];
+          const flat = types.find(([kind]) => raw.kind === kind);
+          for (const [, key, sanitize] of flat ? [flat] : types) {
+            if (flat) {
+              const item = sanitize(raw);
+              Object.assign(out, item, { [key]: item });
+            } else if (raw[key]) out[key] = sanitize(raw[key]);
+          }
+          if (Array.isArray(raw.items)) {
+            const items = new Map();
+            for (const entry of raw.items.slice(0, 16)) {
+              let item, id;
+              if (entry?.kind === 'node') {
+                item = sanitizeNode(entry);
+                id = item?.id || (item?.name && JSON.stringify([item.name, item.file, item.line]));
+              } else if (entry?.kind === 'edge') {
+                item = sanitizeEdge(entry);
+                id = item?.edgeKey || (item?.from && item?.to && `${item.from}->${item.to}:${item.line}`);
+              } else if (entry?.kind === 'file') {
+                item = sanitizeFile(entry);
+                id = item?.path;
+              }
+              if (!id) continue;
+              const key = JSON.stringify([item.kind, id]);
+              if (!items.has(key)) items.set(key, item);
+            }
+            if (items.size) out.items = [...items.values()];
+          }
           return Object.keys(out).length ? out : null;
         };
         const uiContext = sanitizeUiContext(p.uiContext);
+        uiSelectedIds = new Set([
+          ...(uiContext?.selectedNode?.id ? [uiContext.selectedNode.id] : []),
+          ...(uiContext?.selectedEdge?.from ? [uiContext.selectedEdge.from] : []),
+          ...(uiContext?.selectedEdge?.to ? [uiContext.selectedEdge.to] : []),
+          ...((uiContext?.items || []).flatMap((item) => item?.kind === 'node' && item.id
+            ? [item.id]
+            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean) : [])),
+        ]);
         const context = {
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
@@ -3415,6 +3945,7 @@ export const server = http.createServer(async (req, res) => {
         await runAiAgent({
           config: cfg,
           prompt,
+          images,
           history: p.history || [],
           context,
           executeTool: executeAiTool,
@@ -4826,6 +5357,7 @@ export const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       readJson(req, res)
         .then((patch) => {
+          if (!currentSession(req)) return sessionConflict(res);
           if (patch.nodes !== undefined && !isPlainObject(patch.nodes)) return bad(res, 'nodes 必须是对象');
           if (patch.edges !== undefined && !isPlainObject(patch.edges)) return bad(res, 'edges 必须是对象');
           if (patch.manual !== undefined && !Array.isArray(patch.manual)) return bad(res, 'manual 必须是数组');
@@ -4834,7 +5366,15 @@ export const server = http.createServer(async (req, res) => {
           const mode = patch.mode === 'group' ? 'group' : 'flat';
           const rootId = remapLayoutRoot(String(patch.root || ''), MODEL);
           const key = layoutKey(rootId, mode);
+          const resetPositions = patch.resetPositions;
+          if (resetPositions !== undefined && (!['file', 'period', 'flat'].includes(resetPositions) ||
+              (resetPositions === 'flat') !== (mode === 'flat') || patch.clear)) return bad(res, '无效的坐标重置模式');
+          const op = patch.clear || resetPositions ? 'layout.clear' : 'layout.save';
           const hasManualOp = patch.manual !== undefined || patch.addManual !== undefined || patch.removeManual !== undefined;
+          if (resetPositions && !hasManualOp && !patch.nodes && !patch.edges &&
+              !Object.values(overlay.layout[key]?.nodes || {}).some(position => position?.arrangedFor === resetPositions)) {
+            return json(res, { ok: true });
+          }
           const migrated = patch.clear || hasManualOp
             ? legacyManualKeys(overlay.layout || {}, rootId, mode, MODEL) : [];
           const slot = store.transaction(() => {
@@ -4859,6 +5399,7 @@ export const server = http.createServer(async (req, res) => {
               edges: patch.edges,
               manual: nextManual,
               clear: !!patch.clear,
+              resetPositions,
             });
             // 手工线是整组替换，清空旧别名的连线以免之后又被回退读取。
             for (const legacyKey of migrated) {
@@ -4866,14 +5407,14 @@ export const server = http.createServer(async (req, res) => {
             }
             // 事件只存增量：nodeIds 是被写过的键，before 是它们原来的值
             store.appendEvent(PROJECT.id, {
-              op: patch.clear ? 'layout.clear' : 'layout.save',
+              op,
               target: key,
               before: {
-                nodes: pickKeys(before.nodes, Object.keys(patch.nodes || {})),
+                nodes: resetPositions ? before.nodes : pickKeys(before.nodes, Object.keys(patch.nodes || {})),
                 edges: pickKeys(before.edges, Object.keys(patch.edges || {})),
                 manual: nextManual ? before.manual : undefined,
               },
-              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: nextManual,
+              after: { nodes: patch.nodes || {}, edges: patch.edges || {}, manual: nextManual, resetPositions,
                 clearedLegacyManual: migrated.length ? migrated : undefined, view: currentViewSnapshot() },
               actor: patch.actor === 'ai' ? 'ai' : 'user',
             });
@@ -4882,7 +5423,7 @@ export const server = http.createServer(async (req, res) => {
           overlay.layout = overlay.layout || {};
           overlay.layout[key] = slot;
           for (const legacyKey of migrated) overlay.layout[legacyKey].manual = [];
-          broadcastChange(patch.clear ? 'layout.clear' : 'layout.save', patch.actor === 'ai' ? 'ai' : 'user');
+          broadcastChange(op, patch.actor === 'ai' ? 'ai' : 'user');
           json(res, { ok: true });
         })
         .catch((err) => {

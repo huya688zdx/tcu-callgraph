@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { layoutElk } from '../src/core/layout-elk.js';
-import { routeEdges, pathCrossesBody } from '../src/core/routing.js';
-import { mergeSharedRoutes } from '../src/core/layout-metrics.js';
+import { layoutElk, validLayout } from '../src/core/layout-elk.js';
+import { routeEdges, pathCrossesBody, routeOverlapConflicts } from '../src/core/routing.js';
+import { mergeSharedRoutes, routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { beginHierarchyMove } from '../web/lib/hierarchy.js';
 
 function geometry(view) {
+  if (view.groups) assert.ok(validLayout(view));
   const byId = new Map(view.nodes.map(n => [n.id, n]));
   for (let i = 0; i < view.nodes.length; i++) {
     const a = view.nodes[i];
@@ -116,4 +117,102 @@ test('独立调用保留距离 60px 的平行走廊', () => {
   const original = structuredClone(edges);
   mergeSharedRoutes({ nodes, edges });
   assert.deepEqual(edges, original);
+});
+
+test('纵向控制链连接横向分支文件，跨框调用不穿第三方框', async () => {
+  const nodes = [], edges = [];
+  const add = (id, file) => nodes.push({ id, file: 'fw/' + file + '.c' });
+  const call = (from, to) => edges.push({ from, to, kind: 'direct' });
+  for (let i = 0; i < 8; i++) {
+    add('a' + i, 'loop');
+    if (i) call('a' + (i-1), 'a' + i);
+  }
+  for (let i = 0; i < 4; i++) {
+    add('b' + i, 'io');
+    if (i) call('b0', 'b' + i);
+  }
+  add('z', 'boot');
+  call('z', 'a0');
+  call('a7', 'b0');
+  const view = await layoutElk(nodes, edges, { rootLabel: 'TCU' });
+  const byId = geometry(view);
+  for (let i = 1; i < 8; i++) {
+    assert.equal(byId.get('a' + i).x, byId.get('a0').x);
+    assert.ok(byId.get('a' + i).y > byId.get('a' + (i-1)).y);
+  }
+  for (let i = 1; i < 4; i++) assert.ok(byId.get('b' + i).x >= byId.get('b0').x + byId.get('b0').w);
+  for (const e of view.edges) for (const g of view.groups) {
+    if (![byId.get(e.from).group, byId.get(e.to).group].includes(g.id)) assert.ok(!pathCrossesBody(e.points, g));
+  }
+  const metrics = routeLengthAndCrossings(view.edges);
+  assert.equal(metrics.crossings, 0);
+  assert.ok(metrics.length < 560, `统一方向基线线长为 604，当前为 ${metrics.length}`);
+  // 浏览器的增量请求仅在文件框中保留局部方向。
+  const previous = { ...view, nodes: view.nodes.map(({ layoutDirection, ...n }) => n) };
+  const restored = await layoutElk(nodes, edges, { previous });
+  const geometryOf = v => v.nodes.map(n => [n.id, n.x, n.y, n.layoutDirection]).sort();
+  assert.deepEqual(geometryOf(restored), geometryOf(view));
+  assert.deepEqual(restored.edges.map(e => e.points), view.edges.map(e => e.points));
+});
+
+test('单文件宽扇出保留入口层，目标在两个维度折行', async () => {
+  const nodes = Array.from({ length: 25 }, (_, i) => ({ id: 'f' + i, file: 'main.c' }));
+  const edges = nodes.slice(1).map(n => ({ from: 'f0', to: n.id, kind: 'direct' }));
+  const view = await layoutElk(nodes, edges);
+  const byId = geometry(view);
+  const hub = byId.get('f0'), targets = edges.map(e => byId.get(e.to));
+  const horizontal = view.layoutDirection === 'RIGHT';
+  assert.ok(targets.every(n => horizontal ? n.x >= hub.x + hub.w : n.y >= hub.y + hub.h));
+  assert.ok(new Set(targets.map(n => n.x)).size > 1 && new Set(targets.map(n => n.y)).size > 1);
+  assert.ok(Math.max(view.width/view.height, view.height/view.width) < 2);
+});
+
+test('变量侧翼和纯变量文件按跨文件访问函数的空间顺序摆放', async () => {
+  const nodes = [], edges = [];
+  for (let file = 0; file < 3; file++) {
+    for (let i = 0; i < 5; i++) {
+      const id = `f${file}${i}`;
+      nodes.push({ id, file: `src/${file}.c` });
+      if (i) edges.push({ from: `f${file}${i-1}`, to: id, kind: 'direct' });
+    }
+    if (file) edges.push({ from: `f${file-1}4`, to: `f${file}0`, kind: 'direct' });
+  }
+  for (let i = 4; i >= 0; i--) {
+    const id = 'v' + i;
+    nodes.push({ id, kind: 'var', file: i < 3 ? 'src/1.c' : 'data/vars.h' });
+    for (let file = 0; file < 3; file++) edges.push({ from: `f${file}${i}`, to: id, kind: 'var', via: file ? '读' : '写' });
+  }
+  const view = await layoutElk(nodes, edges);
+  const byId = geometry(view);
+  for (let i = 0; i < 3; i++) {
+    const user = byId.get('f1' + i), state = byId.get('v' + i);
+    assert.equal(user.y, state.y);
+    assert.ok(user.x + user.w <= state.x || state.x + state.w <= user.x);
+  }
+  assert.ok(byId.get('v3').y < byId.get('v4').y);
+  const metrics = routeLengthAndCrossings(view.edges);
+  assert.ok(metrics.length < 4000 && metrics.bends < 46);
+});
+
+test('混合方向跨文件边使用一个直角，亚像素错位的端口保留正交短段', () => {
+  const nodes = [
+    { id: 'a', group: 'ctl', x: 0, y: 0, w: 120.4, h: 44 },
+    { id: 'b', group: 'io', x: 240, y: 160, w: 120, h: 44 },
+    { id: 'c', group: 'ctl', x: 0, y: 80, w: 120, h: 44 },
+  ];
+  const opts = { layoutDirection: 'RIGHT', groupDirections: new Map([['ctl','DOWN'], ['io','RIGHT']]) };
+  const mixed = [{ from: 'a', to: 'b', kind: 'direct' }];
+  routeEdges(nodes.slice(0, 2), mixed, opts);
+  assert.deepEqual(mixed[0].points, [[60.2,44], [60.2,182], [240,182]]);
+  const straight = [{ from: 'a', to: 'c', kind: 'direct' }];
+  routeEdges(nodes, straight, opts);
+  geometry({ nodes, edges: straight });
+});
+
+test('不同自定义颜色的平行调用和自递归各自避让', () => {
+  const nodes = [{ id: 's', x: 0, y: 0, w: 100, h: 44 }, { id: 't', x: 240, y: 0, w: 100, h: 44 }];
+  const edges = ['#aa0000', '#0000aa'].flatMap(color => ['s','t'].map(to => ({ from:'s', to, kind:'direct', color })));
+  routeEdges(nodes, edges, { layoutDirection: 'RIGHT', searchGaps: true });
+  geometry({ nodes, edges });
+  assert.equal(routeOverlapConflicts(edges, { differentStylesOnly: true }).length, 0);
 });
