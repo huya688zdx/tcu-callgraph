@@ -119,8 +119,8 @@ function tokenizeArgs(line) {
   let started = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && quote !== "'" && line[i + 1] === '"') {
-      cur += '"';
+    if (ch === '\\' && ((quote !== "'" && line[i + 1] === '"') || (!quote && line[i + 1] === '#'))) {
+      cur += line[i + 1];
       started = true;
       i++;
       continue;
@@ -145,23 +145,35 @@ function splitRecipeCommands(line) {
   const commands = [];
   let start = 0;
   let quote = '';
+  let inWord = false;
   let ambiguous = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && quote !== "'" && /[\\'"&|;]/.test(line[i + 1] || '')) {
+    if (ch === '\\' && quote !== "'" && /[\\'"&|;#\s]/.test(line[i + 1] || '')) {
+      inWord = true;
       i++;
       continue;
     }
     if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
       quote = quote ? '' : ch;
+      inWord = true;
       continue;
     }
-    if (quote || !';&|'.includes(ch)) continue;
+    if (quote) continue;
+    if (ch === '#' && !inWord) {
+      commands.push(line.slice(start, i).trim());
+      return { commands, ambiguous };
+    }
+    if (!';&|'.includes(ch)) {
+      inWord = !/\s/.test(ch);
+      continue;
+    }
     commands.push(line.slice(start, i).trim());
     const andThen = ch === '&' && line[i + 1] === '&';
     if (ch !== ';' && !andThen) ambiguous = true;
     if (ch !== ';' && line[i + 1] === ch) i++;
     start = i + 1;
+    inWord = false;
   }
   commands.push(line.slice(start).trim());
   return { commands, ambiguous };
@@ -480,9 +492,18 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const compilers = new Set();
   const compilationUnits = {};
   const reachable = new Map();
-  const explicitRecipes = new Set(recipes.flatMap(recipe => recipe.targets));
+  const lastRecipeRule = new Map();
+  for (const { targets, ruleDeps } of recipes) {
+    if (!ruleDeps?.separate) for (const target of targets) lastRecipeRule.set(target, ruleDeps);
+  }
+  const activeRecipes = recipes.flatMap(recipe => {
+    if (recipe.ruleDeps?.separate || !recipe.targets.length) return [recipe];
+    const targets = recipe.targets.filter(target => lastRecipeRule.get(target) === recipe.ruleDeps);
+    return targets.length ? [{ ...recipe, targets }] : [];
+  });
+  const explicitRecipes = new Set(activeRecipes.flatMap(recipe => recipe.targets));
   const suffixRecipes = new Map();
-  for (const recipe of recipes) {
+  for (const recipe of activeRecipes) {
     const name = recipe.targets[0];
     if (recipe.targets.length !== 1 || !recipe.ruleDeps || recipe.ruleDeps.separate ||
         recipe.ruleDeps.normal.length || recipe.ruleDeps.orderOnly.length) continue;
@@ -530,9 +551,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
-  for (const { command, ruleDeps, targets, stem } of [...recipes, ...instantiated]) {
-    const target = targets.find(name => reachable.has(name));
-    if (goal && !target) continue;
+  const collectRecipe = ({ command, ruleDeps, stem }, target) => {
     // GNU Make 将有命令的规则的依赖放在同一目标的其他依赖之前。
     const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
       ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
@@ -566,6 +585,11 @@ export function parseMakefileTree(entryAbs, rootDir) {
       };
       extractCompilerFlags(args, entryDir, rootDir, collected);
     }
+  };
+  for (const recipe of [...activeRecipes, ...instantiated]) {
+    const targets = goal ? recipe.targets.filter(target => reachable.has(target)) : recipe.targets;
+    for (const target of targets) collectRecipe(recipe, target);
+    if (!goal && !recipe.targets.length) collectRecipe(recipe);
   }
   if (!recipes.length) {
     // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。

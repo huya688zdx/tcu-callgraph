@@ -845,3 +845,40 @@ test('CDT 的 fileInfo 编译选项只作用于对应源码', async t => {
     assert.deepEqual(sorted(model.functions.map(fn => fn.name)), ['a_off', 'b_on']);
   }
 });
+
+test('Make 配方忽略词边界的 shell 注释并保留字面井号', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all:',
+    "\tcc -DFEATURE=1 -DMID=a#b '-DQUOTED=#quoted' -DESCAPED=\\#escaped -c main.c # -DFEATURE=0; cc old.c",
+  ].join('\n'));
+  write(root, 'main.c', 'int value;');
+  write(root, 'old.c', 'int unused;');
+  const parsed = parseMakefileTree(makefile, root);
+  assert.deepEqual(parsed.sourceFiles, ['main.c']);
+  assert.deepEqual(parsed.compilationUnits['main.c'].defines, [
+    'FEATURE=1', 'MID=a#b', 'QUOTED=#quoted', 'ESCAPED=#escaped',
+  ]);
+});
+
+test('Make 单冒号目标只采用最后一个配方，双冒号规则独立收集', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o multiple',
+    'main.o: shared.h',
+    'main.o: old.c',
+    '\tcc -DOLD -c old.c',
+    'include late.mk',
+    'multiple:: a.c',
+    '\tcc -DA -c $<',
+    'multiple:: b.c',
+    '\tcc -DB -c $<',
+  ].join('\n'));
+  write(root, 'late.mk', 'main.o: main.c\n\tcc -DNEW -DDEPS="$^" -c $<');
+  for (const file of ['main.c', 'a.c', 'b.c', 'old.c', 'shared.h']) write(root, file, 'int value;');
+  const parsed = parseMakefileTree(makefile, root);
+  assert.deepEqual(sorted(parsed.sourceFiles), ['a.c', 'b.c', 'main.c']);
+  assert.deepEqual(parsed.compilationUnits['main.c'].defines, ['NEW', 'DEPS=main.c shared.h old.c']);
+  assert.deepEqual(parsed.compilationUnits['a.c'].defines, ['A']);
+  assert.deepEqual(parsed.compilationUnits['b.c'].defines, ['B']);
+});
