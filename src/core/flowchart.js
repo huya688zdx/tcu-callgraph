@@ -5,6 +5,7 @@ import ELK from 'elkjs/lib/elk.bundled.js';
 import { collectFunctions, declaratorName, getParser } from './cparse.js';
 import { findFunctions } from './extract.js';
 import { collectArgs, lex } from './lexer.js';
+import { profilePredefinedMacros } from './parsers/builtin-includes.js';
 import { expandSeq, fileMacroScope, preprocess } from './preproc.js';
 import { decodeSource, HDR_EXT } from './source-files.js';
 import { fingerprint } from './source-fingerprint.js';
@@ -150,7 +151,11 @@ function literalTruth(expression) {
   return undefined;
 }
 
-function collectMacros(tokens, scope, file) {
+function collectMacros(tokens, scope, file, pruneInactive = false) {
+  if (pruneInactive) {
+    preprocess(tokens, scope, file, { pruneInactive: true });
+    return;
+  }
   preprocess(tokens.map(token => {
     if (token.t !== 'preproc') return token;
     const [, name, expr] = directive(token) || [];
@@ -884,6 +889,14 @@ function diffDisplayLines(beforeText, afterText) {
   return wrapDiffLines(segments);
 }
 
+function flowchartMacroConfig(model, fn) {
+  if (!model.pruneInactive) return null;
+  const unit = model.compilationUnits?.[fn.file];
+  return unit
+    ? { defines: unit.defines, macroArgs: unit.macroArgs, languageStandard: unit.languageStandard }
+    : { defines: model.buildDefines, macroArgs: model.macroArgs };
+}
+
 function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   if (!isFlowchartFunction(fn) || !model.files.some(file => file.rel === fn.file)) {
     throw new Error('无法找到函数源码');
@@ -891,15 +904,20 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
   const read = sourceReader(model, sourceRoot);
   const { source } = read(fn.file);
   const tokens = lex(source, fn.file);
-  const headers = new Map();
+  const config = flowchartMacroConfig(model, fn);
+  const headers = config ? profilePredefinedMacros(fn.file, config) : new Map();
   for (const file of flowchartHeaders(model, fn)) {
     const entry = read(file);
-    if (!entry.macros) {
+    let macros = config ? null : entry.macros;
+    if (!macros) {
+      const tokens = entry.macroTokens ?? lex(entry.source, file).filter(token => token.t === 'preproc');
       const scope = fileMacroScope(headers);
-      collectMacros(lex(entry.source, file).filter(token => token.t === 'preproc'), scope, file);
-      entry.macros = scope.changes;
+      collectMacros(tokens, scope, file, !!config);
+      macros = scope.changes;
+      if (config) entry.macroTokens = tokens;
+      else entry.macros = macros;
     }
-    for (const [name, def] of entry.macros) {
+    for (const [name, def] of macros) {
       if (def) headers.set(name, def);
       else headers.delete(name);
     }
@@ -909,7 +927,7 @@ function extractFlowchartGraph(parser, model, fn, expandMacros, sourceRoot) {
 
 function buildSourceGraph(parser, model, fn, source, tokens, headers, expandMacros) {
   const local = fileMacroScope(headers);
-  collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file);
+  collectMacros(tokens.filter(token => token.t === 'preproc' && token.line < fn.line), local, fn.file, model.pruneInactive);
   const bounds = locateBody(parser, source, tokens, fn, local);
   if (!bounds) throw new Error(`无法定位函数定义：${fn.name}`);
   const bodyTokens = tokens.filter(token => token.s >= bounds.open && token.s <= bounds.close);
@@ -1005,7 +1023,9 @@ export function flowchartCacheHash(model, fn, { version = 'after', expandMacros 
     }));
   }
   function addInputs(side, graphModel, graphFn, files) {
+    const config = flowchartMacroConfig(graphModel, graphFn);
     h.update(JSON.stringify([side, graphFn.id, graphFn.name, graphFn.file, graphFn.line, graphFn.endLine])).update(files);
+    if (config) h.update('\0profile\0').update(JSON.stringify(config));
     addCallInputs(h, graphModel._index, graphFn);
   }
   const currentFiles = fileInputs(model, fn, sourceRoot);

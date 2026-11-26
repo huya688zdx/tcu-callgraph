@@ -25,6 +25,19 @@ export function buildMacros(defines = [], macros = new Map()) {
   return macros;
 }
 
+export function profilePredefinedMacros(file, config) {
+  const stdVersion = cStandardVersions.get(config.languageStandard);
+  const macros = buildMacros([
+    ...(path.extname(file) === '.c' ? ['__STDC__=1'] : []),
+    ...(stdVersion ? ['__STDC_VERSION__=' + stdVersion] : []),
+  ]);
+  const macroArgs = config.macroArgs || [];
+  for (let i = 0; i < macroArgs.length; i += 2) {
+    if (macroArgs[i] === '-U') macros.delete(macroArgs[i + 1]);
+  }
+  return buildMacros(config.defines, macros);
+}
+
 /** 按编译单元顺序执行 include。头文件自己的行号与它在调用方引入宏的位置分别记录。 */
 export function preprocessProfile(root, files, options, load, visit, expand = false) {
   const key = s => process.platform === 'win32' ? s.toLowerCase() : s;
@@ -52,8 +65,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
 
   for (const source of files) {
     if (source.isHeader) continue;
-    const unit = options.compilationUnits?.[source.rel];
-    const config = unit || options;
+    const config = options.compilationUnits?.[source.rel] || options;
     const includeOptions = profileIncludeOptions(config);
     const dirsFor = flag => includeOptions.filter(([kind]) => kind === flag).map(([, dir]) => path.resolve(root, dir));
     const system = dirsFor('-isystem');
@@ -64,16 +76,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
     const quotedSearch = [...dirsFor('-iquote'), ...search];
     const forced = [...(config.macroIncludes || []).map(target => [target, true]),
       ...(config.forcedIncludes || []).map(target => [target, false])];
-    const stdVersion = cStandardVersions.get(unit?.languageStandard);
-    const predefined = buildMacros([
-      ...(path.extname(source.rel) === '.c' ? ['__STDC__=1'] : []),
-      ...(stdVersion ? ['__STDC_VERSION__=' + stdVersion] : []),
-    ]);
-    const macroArgs = config.macroArgs || [];
-    for (let i = 0; i < macroArgs.length; i += 2) {
-      if (macroArgs[i] === '-U') predefined.delete(macroArgs[i + 1]);
-    }
-    buildMacros(config.defines, predefined);
+    const predefined = profilePredefinedMacros(source.rel, config);
 
     const stack = new Set(), once = new Set();
     function processFile(file, base, macroOnly = false) {

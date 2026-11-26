@@ -26,8 +26,7 @@ function sharedDirectoryDepth(directory, file) {
   return depth;
 }
 
-function includedHeaders(headers, includes) {
-  const paths = new Set(headers.map(({ rel }) => rel));
+function includedHeaders(paths, includes) {
   const suffixes = new Map();
   for (const rel of paths) {
     for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
@@ -403,7 +402,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       recordFile(file, input, preprocess(input.tokens, scope, file.rel), scope);
     }
   }
-  const includesHeader = includedHeaders(headers, includes);
+  const headerPaths = new Set(parsed.filter(file => file.isHeader).map(file => file.rel));
+  const includesHeader = includedHeaders(headerPaths, includes);
   const lookupInitializerType = (file, name, at) => {
     const local = typedefsByFile.get(file)?.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     if (local) return { file, shape: local.shape };
@@ -450,7 +450,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     if (!all) return `ext::${name}`;
     const local = all.find((f) => f.file === fromFile);
     if (local) return local.id;
-    const visibleStatic = f => f.isStatic && HDR_EXT.test(f.file) && includesHeader(fromFile, f.file);
+    const visibleStatic = f => f.isStatic && headerPaths.has(f.file) && includesHeader(fromFile, f.file);
     if (all.length === 1) return !all[0].isStatic || visibleStatic(all[0]) ? all[0].id : `ext::${name}`;
     const visibleStatics = all.filter(visibleStatic);
     let candidates = visibleStatics.length ? visibleStatics : all.filter(f => !f.isStatic);
@@ -567,7 +567,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     } else if (entry.isStatic) {
       if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
       staticTablesByFile.get(entry.file).set(entry.name, entry);
-      if (HDR_EXT.test(entry.file)) {
+      if (headerPaths.has(entry.file)) {
         if (!headerTablesByName.has(entry.name)) headerTablesByName.set(entry.name, []);
         headerTablesByName.get(entry.name).push(entry);
       }
@@ -666,7 +666,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       for (const source of sources) {
         if (!source.table) continue;
         let writes = writtenSlots.get(source.table);
-        if (writes && source.table.isStatic && HDR_EXT.test(source.table.file) && !HDR_EXT.test(fn.file)) {
+        if (writes && source.table.isStatic && headerPaths.has(source.table.file) && !headerPaths.has(fn.file)) {
           // 头文件里的 static 对象在每个翻译单元有独立实例。
           writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
         }
@@ -828,7 +828,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:7';
     return JSON.stringify([
-      'builtin:14',
+      'builtin:15',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

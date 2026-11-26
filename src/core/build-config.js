@@ -338,7 +338,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (pair.length !== 2) throw new Error(`不支持的 Make 条件: ${kind} ${operand}`);
       return kind === 'ifeq' ? pair[0] === pair[1] : pair[0] !== pair[1];
     };
-    let prerequisites = '';
+    let ruleDeps;
     let targets = [];
     for (const rawLine of lines) {
       const line = rawLine.replace(/^\s*#.*$/, '').trim();
@@ -366,7 +366,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       }
       if (!active()) continue;
       if (rawLine.startsWith('\t')) {
-        recipes.push({ command: line, prerequisites, targets });
+        recipes.push({ command: line, ruleDeps, targets });
         continue;
       }
 
@@ -416,17 +416,20 @@ export function parseMakefileTree(entryAbs, rootDir) {
         // 尚未实例化模式规则的目标，拒绝该候选，避免发布含 %.c 的空配置。
         if (line.slice(0, line.indexOf(':')).includes('%')) throw new Error('暂不支持 Make 模式规则');
         // 普通规则的依赖在读入时展开；命令（包括分号后的内联命令）等所有定义收齐。
-        prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
-        targets = tokenizeArgs(expandMakeVars(line.slice(0, line.indexOf(':')), vars));
+        const colon = line.indexOf(':');
+        const prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
+        const [normal, orderOnly = []] = prerequisites.split('|', 2).map(tokenizeArgs);
+        ruleDeps = { normal, orderOnly, separate: line[colon + 1] === ':' };
+        targets = tokenizeArgs(expandMakeVars(line.slice(0, colon), vars));
         for (const target of targets) {
           if (!target.startsWith('.')) defaultGoal ??= target;
           if (!rules.has(target)) rules.set(target, []);
-          rules.get(target).push(...tokenizeArgs(prerequisites.replace('|', ' ')));
+          rules.get(target).push(ruleDeps);
         }
-        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites, targets });
+        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), ruleDeps, targets });
       } else if (/^ +\S/.test(rawLine)) {
         // 一些 NMAKE 工程以空格缩进命令。
-        recipes.push({ command: line, prerequisites, targets });
+        recipes.push({ command: line, ruleDeps, targets });
       }
     }
     includeStack.delete(key);
@@ -448,15 +451,23 @@ export function parseMakefileTree(entryAbs, rootDir) {
       environment.set(name, { value, simple });
     }
     reachable.set(target, environment);
-    for (const dependency of rules.get(target) || []) visitTarget(dependency, environment);
+    for (const { normal, orderOnly } of rules.get(target) || []) {
+      for (const dependency of [...normal, ...orderOnly]) visitTarget(dependency, environment);
+    }
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
-  for (const { command, prerequisites, targets } of recipes) {
-    if (goal && !targets.some(target => reachable.has(target))) continue;
-    const deps = prerequisites.split('|')[0];
-    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(targets.find(target => reachable.has(target))) || vars)
-      .replace(/\$[<^+]/g, ref => ref === '$<' ? `"${tokenizeArgs(deps)[0] || ''}"` : deps);
+  for (const { command, ruleDeps, targets } of recipes) {
+    const target = targets.find(name => reachable.has(name));
+    if (goal && !target) continue;
+    // GNU Make 将有命令的规则的依赖放在同一目标的其他依赖之前。
+    const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
+      ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
+    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(target) || vars)
+      .replace(/\$[<^+]/g, ref => {
+        const paths = ref === '$<' ? deps.slice(0, 1) : ref === '$^' ? [...new Set(deps)] : deps;
+        return paths.map(dep => /\s/.test(dep) ? '"' + dep.replaceAll('"', '\\"') + '"' : dep).join(' ');
+      });
     const args = tokenizeArgs(expanded);
     const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
     const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');

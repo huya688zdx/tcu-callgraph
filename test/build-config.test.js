@@ -667,3 +667,48 @@ test('构建配置在强制包含前处理 -imacros，且丢弃宏文件子树�
     assert.deepEqual(sorted(clang.functions.map(fn => fn.name)), ['correct', 'startup']);
   }
 });
+
+test('Make 自动变量合并同一目标的多个规则，保持配方依赖优先并排除顺序依赖', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o other.o',
+    'main.o: main.c | order.c',
+    'main.o:',
+    '\tcc -DMAIN -c $<',
+    'other.o: before.c shared.c',
+    'other.o: other.c shared.c',
+    '\tcc -DFIRST=$< -DUNIQUE="$^" -DALL="$+" -c $<',
+    'other.o: last.c',
+  ].join('\n'));
+  for (const file of ['main', 'order', 'before', 'shared', 'other', 'last']) write(root, file + '.c', 'int value;');
+  const profile = parseMakefileTree(makefile, root);
+  assert.deepEqual(profile.sourceFiles, ['main.c', 'other.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['MAIN']);
+  assert.deepEqual(profile.compilationUnits['other.c'].defines, [
+    'FIRST=other.c', 'UNIQUE=other.c shared.c before.c last.c', 'ALL=other.c shared.c before.c shared.c last.c',
+  ]);
+});
+
+test('流程图按编译单元展开构建宏，并绑定 .inc 中可见的静态函数', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all:', '\tcc -DRUN=helper -c a.c', '\tcc -DRUN=other -c b.c',
+  ].join('\n'));
+  write(root, 'helper.inc', 'static inline void helper(void) {}\n');
+  write(root, 'a.c', '#include "helper.inc"\nvoid runA(void) { RUN(); }\n');
+  write(root, 'b.c', 'static void other(void) {}\nvoid runB(void) { RUN(); }\n');
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId: 'make::Makefile' });
+  for (const [id, calleeId, name] of [
+    ['a.c::runA', 'helper.inc::helper', 'helper'],
+    ['b.c::runB', 'b.c::other', 'other'],
+  ]) {
+    const query = new URLSearchParams({ id, expandMacros: 1 });
+    const result = await request('/api/flowchart?' + query);
+    const invocation = result.nodes.find(node => node.kind === 'call');
+    assert.match(invocation.text, new RegExp(name + '\\(\\)'));
+    assert.ok(invocation.callees.some(callee => callee.id === calleeId));
+    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === '<build-config>'));
+  }
+});
