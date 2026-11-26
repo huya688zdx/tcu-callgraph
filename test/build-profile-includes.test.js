@@ -1,3 +1,5 @@
+import { analysisSources } from '../src/core/parsers/builtin-dataflow.js';
+import { readCompileCommands } from '../src/core/parsers/clang-config.js';
 import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
 import { discoverBuildProfiles, materializeCompileCommands } from '../src/core/build-config.js';
 import { resolveBuildProfileOptions } from '../src/core/build-profile-options.js';
@@ -212,4 +214,49 @@ test('模式规则候选被隔离，转义引号保留在宏值中', t => {
   assert.ok(model.functions.some(f => f.name === 'yes'));
   const exported = materializeCompileCommands(root, profiles[0], { files, exportPath: 'compile_commands.json' });
   assert.ok(JSON.parse(fs.readFileSync(exported.compileCommandsPath, 'utf8'))[0].arguments.includes('CONFIG_HEADER="config.h"'));
+});
+
+test('普通加载读取本地 inc，快照仍不补回缺失文件', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-inc-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'config.inc'), '#define FEATURE 1');
+  fs.writeFileSync(path.join(root, 'main.c'), '#include "config.inc"\n#if FEATURE\nvoid yes(void) {}\n#else\nvoid no(void) {}\n#endif');
+  const options = { parserId: 'builtin', parserOptions: { buildProfileId: 'inc' } };
+  assert.ok(loadModel(root, options).functions.some(f => f.name === 'yes'));
+  const snapshot = buildIndex(root, new Map([['main.c', path.join(root, 'main.c')]]), null, options);
+  assert.deepEqual(snapshot.functions.map(f => f.name), ['no']);
+});
+
+test('嵌套响应文件始终相对编译目录解析', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-nested-cwd-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, 'build'));
+  fs.writeFileSync(path.join(root, 'main.c'), 'int main;');
+  fs.writeFileSync(path.join(root, 'build/flags.rsp'), '@nested.rsp');
+  fs.writeFileSync(path.join(root, 'nested.rsp'), '-DFEATURE=1');
+  const database = path.join(root, 'compile_commands.json');
+  fs.writeFileSync(database, JSON.stringify([{ directory: root, file: 'main.c', arguments: ['gcc', '@build/flags.rsp', '-c', 'main.c'] }]));
+  const units = readCompileCommands(root, database);
+  assert.deepEqual(units[0].args, ['-D', 'FEATURE=1']);
+});
+
+test('Make 默认目标仅包含可达的生产编译单元', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-goal-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all: active.o\nactive.o: active.c\n\tcc -DPROD active.c\ndebug: debug.c\n\tcc -DDEBUG debug.c');
+  for (const file of ['active.c', 'debug.c']) fs.writeFileSync(path.join(root, file), 'int value;');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.sourceFiles, ['active.c']);
+  assert.deepEqual(profile.defines, ['PROD']);
+});
+
+test('原始比较定义只包含活动分支并保留宏调用', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-raw-prune-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), '#define VALUE 42\n#if FEATURE\nint run(void) { return 999; }\n#else\nint run(void) { return VALUE; }\n#endif');
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'raw', defines: ['FEATURE=0'] } });
+  const file = analysisSources(model).sources.find(f => f.rel === 'main.c');
+  assert.ok(!file.src.includes('999'));
+  assert.ok(file.src.includes('VALUE'));
+  assert.ok(file.expanded.includes('42'));
 });

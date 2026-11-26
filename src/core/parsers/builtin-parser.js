@@ -390,7 +390,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
 
   // 构建配置按翻译单元处理 include，普通扫描沿用先头文件后源文件的顺序。
   if (pruneInactive) {
-    preprocessProfile(root, files, { ...parserOptions, onMissingInclude: file => missingIncludes.add(file) }, loadInput, recordFile);
+    preprocessProfile(root, files, { ...parserOptions, allowLocalIncludes: !sourceFiles, onMissingInclude: file => missingIncludes.add(file) }, loadInput, recordFile);
   } else {
     for (const file of [...headers, ...sources]) {
       const input = loadInput(file);
@@ -819,7 +819,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
     return JSON.stringify([
-      'builtin:8',
+      'builtin:9',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

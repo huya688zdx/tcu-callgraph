@@ -62,11 +62,11 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
           const relative = path.relative(root, abs);
           const external = relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
           let header = byPath.get(key(abs));
-          if (!header && external && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
+          if (!header && (external || options.allowLocalIncludes) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
             header = { abs, rel: path.relative(root, abs).replaceAll('\\', '/'), isHeader: true };
             byPath.set(key(abs), header);
           }
-          if (!header) { if (external) options.onMissingInclude?.(abs); continue; }
+          if (!header) { if (external || options.allowLocalIncludes) options.onMissingInclude?.(abs); continue; }
           const changed = processFile(header, { get: name => scope.get(name, line) });
           if (changed) for (const [name, def] of changed) {
             if (def) scope.set(name, def, line);

@@ -82,8 +82,8 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
     const taskDefs = taskDeclarations(f.src, original);
     return { tokens: taskDefs.names.size ? lex(taskDefs.source, f.rel) : original, src: taskDefs.source };
   };
-  const saveExpanded = (f, input, { tokens }) => {
-    f.src = input.src;
+  const rawSources = new Map();
+  const renderTokens = tokens => {
     const parts = [];
     let line = 1;
     for (const tk of tokens) {
@@ -92,10 +92,18 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
       parts.push(tk.v, ' ');
       line += (tk.v.match(/\n/g) || []).length;
     }
-    f.expanded = parts.join('');
+    return parts.join('');
+  };
+  const saveExpanded = (f, input, { tokens }) => {
+    f.src = rawSources.get(f.rel) ?? input.src;
+    f.expanded = renderTokens(tokens);
     if (!keepOriginal) delete f.src;
   };
   if (model.pruneInactive) {
+    if (keepOriginal) preprocessProfile(model.root, sources, {
+      compilationUnits: model.compilationUnits, defines: model.buildDefines,
+      includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
+    }, loadInput, (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)), false);
     preprocessProfile(model.root, sources, {
       compilationUnits: model.compilationUnits, defines: model.buildDefines, includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
     }, loadInput, saveExpanded, true);

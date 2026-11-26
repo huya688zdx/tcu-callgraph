@@ -109,7 +109,7 @@ function expandResponseTokens(args, directory, responseFiles, seen = new Set(), 
         responseFiles?.set(target, responseDigest(bytes));
         const text = decodeSource(bytes).replace(/^\uFEFF/, '');
         const nested = splitCommand(text.replace(/\r?\n/g, ' '));
-        out.push(...expandResponseTokens(nested, path.dirname(target), responseFiles, seen, depth + 1));
+        out.push(...expandResponseTokens(nested, directory, responseFiles, seen, depth + 1));
         seen.delete(key);
         continue;
       }

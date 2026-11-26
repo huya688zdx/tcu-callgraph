@@ -250,6 +250,8 @@ export function parseMakefileTree(entryAbs, rootDir) {
   };
   const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
   const recipes = [];
+  const rules = new Map();
+  let defaultGoal;
   const collected = {
     includeDirs: new Set(),
     defines: new Set(),
@@ -302,6 +304,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       return kind === 'ifeq' ? pair[0] === pair[1] : pair[0] !== pair[1];
     };
     let prerequisites = '';
+    let targets = [];
     for (const rawLine of lines) {
       const line = rawLine.replace(/^\s*#.*$/, '').trim();
       if (!line) continue;
@@ -328,7 +331,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       }
       if (!active()) continue;
       if (rawLine.startsWith('\t')) {
-        recipes.push({ command: line, prerequisites });
+        recipes.push({ command: line, prerequisites, targets });
         continue;
       }
 
@@ -366,10 +369,16 @@ export function parseMakefileTree(entryAbs, rootDir) {
         if (line.slice(0, line.indexOf(':')).includes('%')) throw new Error('暂不支持 Make 模式规则');
         // 普通规则的依赖在读入时展开；命令（包括分号后的内联命令）等所有定义收齐。
         prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
-        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites });
+        targets = tokenizeArgs(expandMakeVars(line.slice(0, line.indexOf(':')), vars));
+        for (const target of targets) {
+          if (!target.startsWith('.')) defaultGoal ??= target;
+          if (!rules.has(target)) rules.set(target, []);
+          rules.get(target).push(...tokenizeArgs(prerequisites.replace('|', ' ')));
+        }
+        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites, targets });
       } else if (/^ +\S/.test(rawLine)) {
         // 一些 NMAKE 工程以空格缩进命令。
-        recipes.push({ command: line, prerequisites });
+        recipes.push({ command: line, prerequisites, targets });
       }
     }
   };
@@ -377,7 +386,16 @@ export function parseMakefileTree(entryAbs, rootDir) {
   processFile(entryAbs, 0);
   const compilers = new Set();
   const compilationUnits = {};
-  for (const { command, prerequisites } of recipes) {
+  const reachable = new Set();
+  const visitTarget = target => {
+    if (reachable.has(target)) return;
+    reachable.add(target);
+    for (const dependency of rules.get(target) || []) visitTarget(dependency);
+  };
+  const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
+  if (goal) visitTarget(goal);
+  for (const { command, prerequisites, targets } of recipes) {
+    if (goal && !targets.some(target => reachable.has(target))) continue;
     const deps = prerequisites.split('|')[0];
     const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), vars)
       .replace(/\$[<^+]/g, ref => ref === '$<' ? `"${tokenizeArgs(deps)[0] || ''}"` : deps);
