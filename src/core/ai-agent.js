@@ -1347,22 +1347,25 @@ export async function runAiAgent({
     .filter(m => m.content);
   trimOldTurns(cleanHistory, 0, cleanHistory.length, estimateMessagesTokens(cleanHistory) - historyBudget, cleanHistory.length - 20);
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
-  const removal = /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
+  const asksForExplanation = /为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|怎么没有|如何连接/u;
+  const explaining = asksForExplanation.test(userText) ||
+    /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText);
+  const editVerb = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u;
+  // 一句解释中也可能出现“连接、删除”等动词。混合请求只接受另一条明确的操作指令。
+  const hasEditIntent = explaining
+    ? userText.split(/[，,。！？!?；;\n]|(?:然后|顺便|顺手|并且|并(?=把|将|请|帮我))/u).some(clause =>
+      !asksForExplanation.test(clause) && /^(?:请|帮我|给我|直接|把|将|补齐|补全|补上|修复|删除|添加到)/u.test(clause.trim()) &&
+      editVerb.test(clause) && !/不要|别|无需|不用/u.test(clause))
+    : editVerb.test(userText);
+  const removal = hasEditIntent && /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
   const pendingVehicle = /车型|目录|全部保留|\bz\d+\b/u.test(lastReply) &&
     /[？?]|待确认选项|已提供选项|请(?:选择|确认)/u.test(lastReply);
   const selectedOption = !/^(?:继续|确认)[。！!]*$/u.test(userText) &&
     /待确认选项|已提供选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
   const requiredTool = removal ? 'remove_from_canvas'
     : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
-  const pureWhyWithoutAction = /(?:为什么(?:没有|没|不)|为何(?:没有|没|不)|怎么(?:没有|没|不))/u.test(userText) &&
-    !/(?:请|帮我|给我|把.+?(?:加|连|补|改|修|移|删|排|调)|直接|顺便|顺手|同时|并且|并把)/u.test(userText);
-  const hasEditIntent = !pureWhyWithoutAction && /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u.test(userText);
   const hasProblemReport = /(?:有点问题|有问题|不对|错了|漏了|少了|缺了|没连上|没加上|乱了|重了|重叠|挤在一起)/u.test(userText);
-  const readOnlyQuestion = !requiredTool && !hasEditIntent && (
-    pureWhyWithoutAction ||
-    /(?:为什么|为何|啥原因|什么原因|怎么回事|是不是|有没有|干嘛的|做什么|作用是什么|含义|解释|分析一下|看一下|帮我看|查一下|为何没有|为什么没有|为什么会|怎么没有)/u.test(userText) ||
-    /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText)
-  );
+  const readOnlyQuestion = !requiredTool && explaining && !hasEditIntent;
   const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
   const unanchoredDeictic = !requiredTool && !hasSelectionContext && !hasProblemReport &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
