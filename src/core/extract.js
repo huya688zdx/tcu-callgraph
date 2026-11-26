@@ -257,15 +257,15 @@ function extractTargetIdent(tokens) {
   return null;
 }
 
-/** 切分顶层逗号分隔项 */
-function splitTopCommas(tokens) {
+/** 切分顶层初始化项或成员声明，保留内部括号中的分隔符。 */
+function splitAtTopLevel(tokens, separator = ',') {
   const items = [];
   let cur = [];
   let depth = 0;
   for (const tk of tokens) {
     if (tk.v === '(' || tk.v === '{' || tk.v === '[') depth++;
     else if (tk.v === ')' || tk.v === '}' || tk.v === ']') depth--;
-    if (tk.v === ',' && depth === 0) {
+    if (tk.v === separator && depth === 0) {
       if (cur.length) items.push(cur);
       cur = [];
       continue;
@@ -285,14 +285,113 @@ function isStandardTypeName(name) {
   return standardTypeNames.has(name) || /^u?int(?:_least|_fast)?(?:8|16|32|64)_t$/.test(name);
 }
 
-/** 从 typedef 声明收集别名及其作用域，供括号中的单个标识符消歧。 */
+/** 记录函数原型；仅在有局部分派表的函数内保留可能遮蔽目标的对象声明。 */
+export function collectDispatchDeclarations(tokens, localTableScopes, record) {
+  const scopes = [{ end: null, trackObjects: false }];
+  let start = 0, hasParen = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.v === '(') hasParen = true;
+    if (![';', '{', '}'].includes(token.v)) continue;
+    const scope = scopes.at(-1);
+    const fileScope = scopes.length === 1;
+    // 左花括号也可能开始初始化，此时声明名已经可见。
+    if ((token.v === ';' || (token.v === '{' && tokens[i - 1]?.v === '=')) && (hasParen || scope.trackObjects)) {
+      const first = tokens[start], second = tokens[start + 1];
+      const typePrefix = first?.t === 'id' && (TYPE_WORDS.has(first.v) || (!KEYWORDS.has(first.v) &&
+        (second?.t === 'id' || (fileScope && second?.v === '*'))));
+      if (typePrefix) for (const part of splitAtTopLevel(tokens.slice(start, i))) {
+        const eq = part.findIndex(t => t.v === '=');
+        const declarator = eq < 0 ? part : part.slice(0, eq);
+        const name = declarationName(declarator);
+        if (!name || name === first) continue;
+        const isFunction = declarator[declarator.indexOf(name) + 1]?.v === '(';
+        if (isFunction || scope.trackObjects) record(name, scope, fileScope, isFunction);
+      }
+    }
+    if (token.v === '{') scopes.push({ end: null, trackObjects: scope.trackObjects || localTableScopes.has(token) });
+    if (token.v === '}' && !fileScope) scopes.pop().end = token;
+    start = i + 1;
+    hasParen = false;
+  }
+}
+
+function declarationName(part) {
+  let name = null, depth = 0;
+  for (let j = 0; j < part.length; j++) {
+    const t = part[j];
+    if (!depth && t.t === 'id' && !KEYWORDS.has(t.v) && !ANNOTATIONS.has(t.v)) name = t;
+    if (!depth && t.v === '(' && part[j + 1]?.v === '*') {
+      let k = j + 2;
+      while (part[k]?.v === '*' || TYPE_WORDS.has(part[k]?.v)) k++;
+      if (part[k]?.t === 'id') name = part[k];
+    }
+    if (['(', '[', '{'].includes(t.v)) depth++;
+    if ([')', ']', '}'].includes(t.v)) depth--;
+  }
+  return name;
+}
+
+function declarationType(tokens) {
+  const tag = tokens.findIndex(t => t.v === 'struct' || t.v === 'union');
+  if (tag >= 0) return tokens[tag + 1]?.t === 'id' ? tokens[tag].v + ' ' + tokens[tag + 1].v : null;
+  return tokens.find(t => t.t === 'id' && !KEYWORDS.has(t.v))?.v ?? null;
+}
+
+/** 只保留辨别标量括号所需的信息：指针、数组层数和记录成员。 */
+function initializerDeclarations(statement) {
+  const parts = splitAtTopLevel(statement);
+  const first = parts[0] || [];
+  const base = declarationType(first);
+  const open = first.findIndex(t => t.v === '{');
+  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open))) : null;
+  const shapes = new Map();
+  for (const part of parts) {
+    const token = declarationName(part);
+    if (!token) continue;
+    const name = part.indexOf(token);
+    let j = name + 1, rank = 0;
+    while (part[j]?.v === '[') {
+      let depth = 1;
+      for (j++; j < part.length && depth; j++) {
+        if (part[j].v === '[') depth++;
+        if (part[j].v === ']') depth--;
+      }
+      rank++;
+    }
+    let before = name - 1;
+    while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
+    shapes.set(token.v, { token, type: base, rank, pointer: part[before]?.v === '*', fields });
+  }
+  return shapes;
+}
+
+function initializerMembers(body) {
+  const fields = new Map();
+  for (const part of splitAtTopLevel(body, ';')) {
+    for (const [name, shape] of initializerDeclarations(part)) fields.set(name, shape);
+  }
+  return fields;
+}
+
+/** 收集类型声明及作用域；成员声明帮助区分标量与只初始化了一项的数组。 */
 export function findTypedefs(tokens) {
   const aliases = new Map();
   const scopes = [{ end: null }];
+  const record = (name, declaration, shape) => {
+    if (!aliases.has(name)) aliases.set(name, []);
+    aliases.get(name).push({ declaration, shape, scope: scopes.at(-1), fileScope: scopes.length === 1 });
+  };
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     if (token.v === '{') { scopes.push({ end: null }); continue; }
     if (token.v === '}' && scopes.length > 1) { scopes.pop().end = token; continue; }
+    if ((token.v === 'struct' || token.v === 'union') && tokens[i + 1]?.t === 'id' && tokens[i + 2]?.v === '{') {
+      const close = matchBrace(tokens, i + 2);
+      record(token.v + ' ' + tokens[i + 1].v, token, { fields: initializerMembers(tokens.slice(i + 3, close)) });
+      i = close;
+      continue;
+    }
     if (token.v !== 'typedef') continue;
     let end = i + 1, depth = 0;
     for (; end < tokens.length; end++) {
@@ -302,22 +401,11 @@ export function findTypedefs(tokens) {
       if ([')', ']', '}'].includes(value)) depth--;
     }
     if (tokens[end]?.v !== ';') continue;
-    for (const part of splitTopCommas(tokens.slice(i + 1, end))) {
-      let name = null, depth = 0;
-      for (let j = 0; j < part.length; j++) {
-        const t = part[j];
-        if (!depth && t.t === 'id' && !KEYWORDS.has(t.v) && !ANNOTATIONS.has(t.v)) name = t;
-        if (!depth && t.v === '(' && part[j + 1]?.v === '*') {
-          let k = j + 2;
-          while (part[k]?.v === '*' || TYPE_WORDS.has(part[k]?.v)) k++;
-          if (part[k]?.t === 'id') name = part[k];
-        }
-        if (['(', '[', '{'].includes(t.v)) depth++;
-        if ([')', ']', '}'].includes(t.v)) depth--;
+    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end))) {
+      record(name, shape.token, shape);
+      if (shape.fields && shape.type && !aliases.get(shape.type)?.some(entry => entry.declaration === token)) {
+        record(shape.type, token, { fields: shape.fields });
       }
-      if (!name) continue;
-      if (!aliases.has(name.v)) aliases.set(name.v, []);
-      aliases.get(name.v).push({ declaration: name, scope: scopes.at(-1), fileScope: scopes.length === 1 });
     }
     i = end;
   }
@@ -342,6 +430,31 @@ function formatInitIndex(index) {
   return `[?${index.expr}${index.offset ? '+' + index.offset : ''}]`;
 }
 
+function scalarInitializerField(slot, shape, file, lookup) {
+  let rank = 0;
+  // 每个字段都先还原 typedef，保留别名自身声明的数组层数。
+  const resolve = () => {
+    const seen = new Set();
+    while (shape && !seen.has(shape)) {
+      seen.add(shape);
+      rank += shape.rank || 0;
+      if (shape.fields || shape.pointer) break;
+      const found = shape.type && lookup(file, shape.type, shape.token);
+      file = found?.file;
+      shape = found?.shape;
+    }
+  };
+  resolve();
+  for (const [, name, indices] of slot.matchAll(/(?:^|\.)([A-Za-z_]\w*)((?:\[[^\]]*\])*)/g)) {
+    shape = shape?.fields?.get(name);
+    if (!shape) return false;
+    rank = 0;
+    resolve();
+    if (rank !== (indices.match(/\[/g)?.length || 0)) return false;
+  }
+  return !!shape?.pointer;
+}
+
 /** 消耗一个标量或整个子数组后，进位到同一对花括号里的下一个子对象。 */
 function nextInitIndices(indices, extents) {
   const next = indices.slice();
@@ -360,7 +473,7 @@ function nextInitIndices(indices, extents) {
 
 /** 递归提取结构体和数组中的函数指针槽位，省略花括号时按声明维度逐项填充。 */
 function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status, scalarBrace = false) {
-  const items = splitTopCommas(inner);
+  const items = splitAtTopLevel(inner);
   let cursor = [0];
   for (const item of items) {
     if (!item.length) continue;
@@ -419,7 +532,8 @@ function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status
     }
     if (braced) {
       const remaining = fields.length || unknownPosition ? [] : extents.slice(indices.length);
-      const atElement = !fields.length && !remaining.length && (extents.length > 0 || scalarBrace);
+      const atElement = fields.length ? status.isScalarField(nextPrefix)
+        : !remaining.length && (extents.length > 0 || scalarBrace);
       collectInitSlots(val.slice(1, -1), nextPrefix, remaining, map, slotLines, macros, status, atElement);
     } else {
       const target = extractTargetIdent(val);
@@ -440,9 +554,15 @@ function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status
  *   const fn_t e[2][3] = { {vvv, ggg, jjj}, {ghh, jkk, kkk} };
  *   const Entry tbl[] = { { .enter = Enter_A, .run = Run_A }, ... };
  */
-export function findFnPtrTables(tokens, file = '', { functionId = null, macros } = {}) {
+export function findFnPtrTables(tokens, file = '', { functionId = null, macros, pendingFields } = {}) {
   const tables = new Map();
   const scopes = [{ end: null }];
+  let localTypes;
+  const localLookup = (_, name, at) => {
+    localTypes ??= findTypedefs(tokens);
+    const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
+    return entry && { file, shape: entry.shape };
+  };
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
     if (tk.v === '{') { scopes.push({ end: null }); continue; }
@@ -484,31 +604,55 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros }
     // 检查声明语句里的 static / const 修饰符
     let isStatic = false;
     let isConst = false;
-    for (let s = p; s >= 0 && ![';', '{', '}'].includes(tokens[s].v); s--) {
-      if (tokens[s].v === 'static' || tokens[s].v === 'STATIC') isStatic = true;
-      if (tokens[s].v === 'const' || tokens[s].v === 'CONST') isConst = true;
+    let beforeDeclaration = p - 1;
+    for (; beforeDeclaration >= 0 && ![';', '{', '}'].includes(tokens[beforeDeclaration].v); beforeDeclaration--) {
+      const word = tokens[beforeDeclaration].v;
+      if (word === 'static' || word === 'STATIC') isStatic = true;
+      if (word === 'const' || word === 'CONST') isConst = true;
     }
 
     const close = matchBrace(tokens, i + 1);
     const inner = tokens.slice(i + 2, close);
-    const map = {};
-    const slotLines = {};
-    const status = { incomplete: false };
-    collectInitSlots(inner, '', extents, map, slotLines, macros, status);
-    if (Object.keys(map).length) {
-      tables.set(functionId ? i : nameTok.v, {
-        name: nameTok.v,
-        file,
-        line: nameTok.line,
-        isStatic,
-        isConst,
-        dims: extents.length,
-        map,
-        slotLines,
-        ...(status.incomplete && { incomplete: true }),
-        ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
-      });
+    const rootShape = { type: declarationType(tokens.slice(beforeDeclaration + 1, p)), token: nameTok };
+    if (!rootShape.type && tokens[beforeDeclaration]?.v === '}') {
+      // struct { ... } ops = { ... } 将类型定义与变量声明写在同一处。
+      let open = beforeDeclaration - 1, depth = 1;
+      for (; open >= 0 && depth; open--) {
+        if (tokens[open].v === '}') depth++;
+        if (tokens[open].v === '{') depth--;
+      }
+      if (['struct', 'union'].includes(tokens[open]?.v) || ['struct', 'union'].includes(tokens[open - 1]?.v)) {
+        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration));
+        for (let j = open; j >= 0 && ![';', '{', '}'].includes(tokens[j].v); j--) {
+          if (['static', 'STATIC'].includes(tokens[j].v)) isStatic = true;
+          if (['const', 'CONST'].includes(tokens[j].v)) isConst = true;
+        }
+      }
     }
+    const table = {
+      name: nameTok.v,
+      file,
+      line: nameTok.line,
+      isStatic,
+      isConst,
+      dims: extents.length,
+      map: {},
+      slotLines: {},
+      ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
+    };
+    const fill = lookup => {
+      const status = { incomplete: false, isScalarField: slot => scalarInitializerField(slot, rootShape, file, lookup) };
+      collectInitSlots(inner, '', extents, table.map, table.slotLines, macros, status);
+      if (status.incomplete) table.incomplete = true;
+    };
+    // 仅有指定项带花括号时才需要等待头文件关系，普通表仍当场完成。
+    if (pendingFields && inner.some((t, j) => t.v === '=' && inner[j + 1]?.v === '{')) {
+      pendingFields.push(fill);
+    } else {
+      fill(localLookup);
+      if (!Object.keys(table.map).length) { i = close; continue; }
+    }
+    tables.set(functionId ? i : nameTok.v, table);
     i = close;
   }
   return tables;

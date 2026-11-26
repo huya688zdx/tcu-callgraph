@@ -5,6 +5,37 @@ import os from 'node:os';
 import path from 'node:path';
 import { loadModel } from '../src/core/index.js';
 
+test('用字段声明区分标量花括号和单元素数组，包括没有调用点的头文件类型', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-braced-fields-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), `
+typedef void (*Fn)(void);
+typedef Fn Single[1];
+typedef struct { Fn run, unused; Fn slots[1]; Single extra; void (*raw)(void); } Ops;
+`);
+  fs.writeFileSync(path.join(dir, 'table.c'), `
+#include "types.h"
+static void target(void) {}
+static const Ops ops = {
+  .run = {target}, .unused = {target}, .slots = {target}, .extra = {target}, .raw = {target}
+};
+static const Ops rows[] = {{ .run = {target} }};
+struct Tagged { Ops inner; };
+static const struct Tagged nested = { .inner = { .raw = {target} } };
+static const struct { Fn run; Fn slots[1]; } inlined = { .run = {target}, .slots = {target} };
+void call(void) { ops.run(); rows[0].run(); }
+`);
+  const model = loadModel(dir);
+  assert.deepEqual(model.fnptrTables.find(t => t.name === 'ops').map, {
+    run: 'target', unused: 'target', 'slots[0]': 'target', 'extra[0]': 'target', raw: 'target',
+  });
+  assert.deepEqual(model.fnptrTables.find(t => t.name === 'rows').map, { '[0].run': 'target' });
+  assert.deepEqual(model.fnptrTables.find(t => t.name === 'nested').map, { 'inner.raw': 'target' });
+  assert.deepEqual(model.fnptrTables.find(t => t.name === 'inlined').map, { run: 'target', 'slots[0]': 'target' });
+  const calls = model._index.outAdj.get('table.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(calls.map(edge => edge.to), ['table.c::target', 'table.c::target']);
+});
+
 test('按声明的数组形状填充省略花括号的初始值和指定槽位', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-array-shape-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

@@ -6,7 +6,7 @@ import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
-import { findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
+import { collectDispatchDeclarations, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
 
@@ -241,6 +241,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   const typedefsByFile = new Map();
   const typedefHeadersByName = new Map();
   const fnptrTablesList = [];
+  const pendingFieldInitializers = [];
+  const dispatchDeclarations = new Map();
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
@@ -300,6 +302,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (!typedefHeadersByName.has(name)) typedefHeadersByName.set(name, []);
       typedefHeadersByName.get(name).push(rel);
     }
+    const localTableScopes = new Set();
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -314,7 +317,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
       const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
-      for (const table of findFnPtrTables(body, rel, { functionId: fn.id, macros: fileMacros }).values()) fnptrTablesList.push(table);
+      const localTables = findFnPtrTables(body, rel, { functionId: fn.id, macros: fileMacros, pendingFields: pendingFieldInitializers });
+      if (localTables.size) localTableScopes.add(tokens[fn.bodyStart]);
+      for (const table of localTables.values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
       const record = { fn, calls, mentions: variableMentions(body) };
@@ -324,9 +329,13 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       else recordFunctionCalls(record, body, fileMacros);
       functions.push(fn);
     }
-    for (const table of findFnPtrTables(tokens, rel, { macros: fileMacros }).values()) {
+    for (const table of findFnPtrTables(tokens, rel, { macros: fileMacros, pendingFields: pendingFieldInitializers }).values()) {
       fnptrTablesList.push(table);
     }
+    collectDispatchDeclarations(tokens, localTableScopes, (declaration, scope, fileScope, isFunction) => {
+      if (!dispatchDeclarations.has(declaration.v)) dispatchDeclarations.set(declaration.v, []);
+      dispatchDeclarations.get(declaration.v).push({ file: rel, declaration, scope, fileScope, isFunction, isHeader });
+    });
     for (const v of findGlobalVars(tokens, rel)) {
       // static 变量按文件区分；普通全局变量跨文件同名即同一个
       v.id = v.isStatic ? `var::${rel}::${v.name}` : `var::${v.name}`;
@@ -353,6 +362,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   for (const file of headers) parseFile(file);
   for (const file of sources) parseFile(file);
   const includesHeader = includedHeaders(headers, includes);
+  const lookupInitializerType = (file, name, at) => {
+    const local = typedefsByFile.get(file)?.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
+    if (local) return { file, shape: local.shape };
+    const visible = typedefHeadersByName.get(name)?.filter(header => header !== file && includesHeader(file, header));
+    if (visible?.length === 1) {
+      const shape = typedefsByFile.get(visible[0]).get(name).findLast(e => e.fileScope).shape;
+      return { file: visible[0], shape };
+    }
+  };
+  for (const fill of pendingFieldInitializers) fill(lookupInitializerType);
+  pendingFieldInitializers.length = 0;
   const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
   const isTypedefAt = (file, name, location) =>
     typedefsByFile.get(file)?.get(name)?.some(({ declaration, scope }) =>
@@ -436,21 +456,32 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   // 过滤并按文件/作用域索引函数指针分派表：
   // - 单结构体 `.field = fn` 保持原有兼容；
-  // - 数组/嵌套表只保留指向真实已定义函数的槽位，避免把普通常量数据表误认成函数指针表；
+  // - 数组/嵌套表只保留可见的函数定义或原型，避免把普通常量数据表误认成函数指针表；
   // - 同名 static 表严格按文件隔离，杜绝跨文件污染。
   const cleanedTables = [];
   const staticTablesByFile = new Map();
   const globalTablesByName = new Map();
   const localTablesByFunction = new Map();
+  const tablesWithFilteredTargets = new Set();
   for (const raw of fnptrTablesList) {
     const filteredMap = {};
+    const location = raw.declaration ?? { line: raw.line, col: Infinity };
+    const params = byId.get(raw.functionId)?.params;
     for (const [slot, target] of Object.entries(raw.map)) {
+      const declarations = dispatchDeclarations.get(target);
+      const local = declarations?.findLast(p => p.file === raw.file && compareLocation(location, p.declaration) > 0 &&
+        (!p.scope.end || compareLocation(location, p.scope.end) < 0));
+      if (local && !local.isFunction) continue;
+      if ((!local || local.fileScope) && params?.includes(target)) continue;
       const isStructField = !slot.startsWith('[');
-      if (byName.has(target) || isStructField) {
+      const defined = byName.has(target) && !resolveCallee(target, raw.file).startsWith('ext::');
+      const declared = local || declarations?.some(p => p.file !== raw.file && p.isHeader && p.fileScope && includesHeader(raw.file, p.file));
+      if (defined || declared || isStructField) {
         filteredMap[slot] = target;
       }
     }
-    if (!Object.keys(filteredMap).length) continue;
+    const matchedSlots = Object.keys(filteredMap).length;
+    if (!matchedSlots && !raw.functionId) continue;
     const entry = {
       name: raw.name,
       file: raw.file,
@@ -462,12 +493,14 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       ...(raw.incomplete && { incomplete: true }),
       ...(raw.functionId && { functionId: raw.functionId }),
     };
-    cleanedTables.push(entry);
+    if (matchedSlots < Object.keys(raw.map).length) tablesWithFilteredTargets.add(entry);
+    if (matchedSlots) cleanedTables.push(entry);
     if (entry.functionId) {
       if (!localTablesByFunction.has(entry.functionId)) localTablesByFunction.set(entry.functionId, new Map());
       const byName = localTablesByFunction.get(entry.functionId);
       if (!byName.has(entry.name)) byName.set(entry.name, []);
-      byName.get(entry.name).push({ entry, declaration: raw.declaration, end: raw.scope.end });
+      // 同名局部数组即便全由运行时回调初始化，也会遮蔽外层表。
+      byName.get(entry.name).push({ entry: matchedSlots ? entry : null, declaration: raw.declaration, end: raw.scope.end });
     } else if (entry.isStatic) {
       if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
       staticTablesByFile.get(entry.file).set(entry.name, entry);
@@ -480,7 +513,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (!name) return null;
     const local = localTablesByFunction.get(fn.id)?.get(name)?.findLast(table =>
       compareLocation(call, table.declaration) >= 0 && (!table.end || compareLocation(call, table.end) < 0));
-    return local?.entry || staticTablesByFile.get(fn.file)?.get(name) || globalTablesByName.get(name) || null;
+    return local ? local.entry : staticTablesByFile.get(fn.file)?.get(name) || globalTablesByName.get(name) || null;
   };
   const matchTableSlots = (table, indices = [], member = null) => {
     const matched = [];
@@ -541,7 +574,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
       const allConstIndices = (call.indices || []).every((idx) => idx !== null);
-      if (!table?.incomplete && uniqueTargets.length === 1 && (allConstIndices || !call.indices?.length || matched.length === 1)) {
+      if (!table?.incomplete && uniqueTargets.length === 1 && (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
         const callee = uniqueTargets[0];
         edges.push({
           from: fn.id,
@@ -616,22 +649,13 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   // 外部符号虚拟节点
   const externals = new Map();
-  for (const e of edges) {
-    if (e.to.startsWith('ext::')) {
-      const name = e.to.slice(5);
-      if (!externals.has(e.to)) {
-        externals.set(e.to, {
-          id: e.to,
-          name,
-          file: '<external>',
-          line: 0,
-          isStatic: false,
-          external: true,
-          params: [],
-        });
-      }
+  const noteExternal = id => {
+    if (id.startsWith('ext::') && !externals.has(id)) {
+      externals.set(id, { id, name: id.slice(5), file: '<external>', line: 0, isStatic: false, external: true, params: [] });
     }
-  }
+  };
+  for (const edge of edges) noteExternal(edge.to);
+  for (const call of indirectCalls) for (const candidate of call.candidates) noteExternal(candidate.id);
 
   // 邻接表
   const allNodes = new Map([...byId, ...externals]);

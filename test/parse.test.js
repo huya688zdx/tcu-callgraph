@@ -557,3 +557,49 @@ int after(int n) { return ((FN))((actual)(n)) + (CAST)(FN)(n); }
     ['app.c::second', 'macro', 'FN > ENTRY'],
   ]);
 });
+
+test('分派表保留可见的外部函数候选，并区分函数指针变量和无关声明', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-external-targets-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'lib.h'), 'void api(void), api_only(void);\n');
+  fs.writeFileSync(path.join(dir, 'entry.h'), '#include "lib.h"\n');
+  fs.writeFileSync(path.join(dir, 'unrelated.h'), 'void numeric(void);\n');
+  fs.writeFileSync(path.join(dir, 'other.c'), 'static void external(void) {}\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "entry.h"
+typedef void (*Fn)(void);
+extern void external(void);
+static void local(void) {}
+static const Fn dispatch[] = { local, external, api };
+static const Fn library[] = { api, api_only };
+enum { numeric = 2 };
+static const int data[] = { numeric };
+void constant(void) { dispatch[0](); dispatch[1](); dispatch[2](); }
+void dynamic(unsigned i) { dispatch[i](); library[i](); }
+void partial(unsigned i, Fn api) {
+  extern void inside(void);
+  const Fn mixed[] = {local, api, inside};
+  const Fn single[] = {local, api};
+  mixed[0](); mixed[2](); mixed[i](); single[i]();
+}
+void different(void) { enum { inside = 1 }; const int values[] = { inside }; }
+void shadow(Fn runtime) {
+  { Fn external = runtime; const Fn dispatch[] = {external}; dispatch[0](); }
+  const Fn restored[] = {external}; restored[0]();
+}
+`);
+  const model = loadModel(dir);
+  const targets = name => (model._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.to);
+  assert.deepEqual(targets('constant'), ['app.c::local', 'ext::external', 'ext::api']);
+  assert.deepEqual(targets('dynamic'), []);
+  assert.deepEqual(targets('partial'), ['app.c::local', 'ext::inside']);
+  assert.deepEqual(targets('shadow'), ['ext::external']);
+  const candidates = table => model.indirectCalls.find(call => call.receiver === table)?.candidates.map(c => c.id);
+  assert.deepEqual(candidates('dispatch'), ['app.c::local', 'ext::external', 'ext::api']);
+  assert.deepEqual(candidates('library'), ['ext::api', 'ext::api_only']);
+  assert.deepEqual(candidates('mixed'), ['app.c::local', 'ext::inside']);
+  assert.deepEqual(candidates('single'), ['app.c::local']);
+  assert.ok(model.externals.some(node => node.id === 'ext::api_only'));
+  assert.ok(!model.fnptrTables.some(table => ['data', 'values'].includes(table.name)));
+});
