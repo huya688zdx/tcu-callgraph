@@ -7,10 +7,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseMakefileTree, discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from '../src/core/build-config.js';
+import { resolveBuildProfileOptions } from '../src/core/build-profile-options.js';
 import { loadModel, scanSources } from '../src/core/index.js';
 import { builtinParser } from '../src/core/parsers/builtin-parser.js';
 import { readCompileCommands } from '../src/core/parsers/clang-parser.js';
-import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
+import { detectClang, externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
 
 const cores = ['core0', 'core1'];
 const vehicles = ['z111', 'z115'];
@@ -544,4 +545,51 @@ test('GNU Make 嵌套 include 使用构建目录', t => {
   const result = parseMakefileTree(path.join(root, 'Makefile'), root);
   assert.deepEqual(result.defines, ['FEATURE=1']);
   assert.deepEqual(result.includedFiles, ['Makefile', 'build/flags.mk', 'common.mk']);
+});
+
+test('构建配置保留每个编译单元的头文件搜索顺序和 C 标准', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all:',
+    '\tcc -std=c11 @angle.rsp -c angle.c',
+    '\tcc -std=gnu11 -iquote private -Ipublic -c quote.c',
+  ].join('\n'));
+  write(root, 'angle.rsp', '-idirafter after -isystemsystem -iquote "private" -Ipublic -std=c99');
+  for (const [dir, feature] of [['private', 1], ['public', 2], ['system', 3], ['after', 4]]) {
+    write(root, dir + '/config.h', '#define FEATURE ' + feature);
+  }
+  for (const [name, include, feature, standard] of [
+    ['angle', '<config.h>', 2, '199901L'],
+    ['quote', '"config.h"', 1, '201112L'],
+  ]) {
+    write(root, name + '.c', [
+      '#include ' + include,
+      '#if FEATURE == ' + feature + ' && __STDC_VERSION__ == ' + standard,
+      'void ' + name + '_correct(void) {}',
+      '#else',
+      'void ' + name + '_wrong(void) {}',
+      '#endif',
+    ].join('\n'));
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  const builtin = loadModel(root, { parserId: 'builtin',
+    parserOptions: resolveBuildProfileOptions(root, 'builtin', options, files, profile) });
+  const expected = ['angle_correct', 'quote_correct'];
+  assert.deepEqual(sorted(builtin.functions.map(f => f.name)), expected);
+
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const units = new Map(readCompileCommands(root, compileCommandsPath).map(unit => [unit.rel, unit.args]));
+  for (const [flag, dir] of [['-idirafter', 'after'], ['-isystem', 'system'], ['-iquote', 'private'], ['-I', 'public']]) {
+    const args = units.get('angle.c');
+    assert.equal(args[args.indexOf(flag) + 1], path.join(root, dir));
+  }
+  assert.ok(units.get('angle.c').includes('-std=c99'));
+  assert.ok(units.get('quote.c').includes('-std=gnu11'));
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(sorted(clang.functions.map(f => f.name)), expected);
+  }
 });

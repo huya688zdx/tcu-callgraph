@@ -136,7 +136,31 @@ function tokenizeArgs(line) {
   return out;
 }
 
-/** 从一段编译参数（含 @rsp / -f 响应文件）提取 -I、-D、-U、-include 与 .c 源路径。 */
+function compilerConfig() {
+  return { includeDirs: new Set(), includeOptions: new Map(), defines: new Set(),
+    forcedIncludes: new Set(), sourceFiles: new Set() };
+}
+
+function addInclude(out, flag, dir) {
+  out.includeDirs.add(dir);
+  out.includeOptions.set(fileKey(flag + '\0' + dir), [flag, dir]);
+}
+
+function extractedOptions(config) {
+  return {
+    includeDirs: [...config.includeDirs],
+    includeOptions: [...config.includeOptions.values()],
+    defines: [...config.defines],
+    macroArgs: config.macroArgs || [],
+    forcedIncludes: [...config.forcedIncludes],
+  };
+}
+
+export function profileIncludeOptions(config) {
+  return config.includeOptions ?? (config.includeDirs || []).map(dir => ['-I', dir]);
+}
+
+/** 从编译参数及响应文件读取预处理选项、语言标准和源路径。 */
 function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Set(), depth = 0) {
   if (depth > MAX_RSP_DEPTH) return;
   for (let i = 0; i < rawTokens.length; i++) {
@@ -162,17 +186,24 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       continue;
     }
 
-    // -I / -I= / -isystem / -i (部分 GHS / QAC 风格)
-    if (/^(?:-I|-isystem|-iquote|-i)(?:=|$)/.test(tok) || (/^-[Ii]/.test(tok) && tok.length > 2 && !/^-(?:include|imacros|isystem|iquote|idirafter|inline|ir|iso)/.test(tok))) {
-      let val = '';
-      if (/^(?:-I|-isystem|-iquote|-i)=?$/.test(tok)) {
-        val = stripQuotes(rawTokens[++i] || '');
-      } else {
-        val = stripQuotes(tok.replace(/^(?:-I|-isystem|-iquote|-i)=?/, ''));
-      }
+    // -i 是部分 GHS / QAC 工具链中表示普通包含目录的选项。
+    const includeFlag = /^(?:-isystem|-iquote|-idirafter|-I|-i(?!nclude|macros|nline|r|so|sysroot))/.exec(tok)?.[0];
+    if (includeFlag) {
+      const joined = tok.slice(includeFlag.length).replace(/^=/, '');
+      const val = stripQuotes(joined || rawTokens[i + 1]);
+      if (!joined && val && !val.startsWith('-')) i++;
       if (val && !val.startsWith('-') && !/\$\(/.test(val)) {
         const abs = path.isAbsolute(val) ? path.normalize(val) : path.resolve(baseDir, val);
-        out.includeDirs.add(abs);
+        addInclude(out, includeFlag === '-i' ? '-I' : includeFlag, abs);
+      }
+      continue;
+    }
+
+    if (tok === '-std' || tok.startsWith('-std=')) {
+      const standard = tok === '-std' ? stripQuotes(rawTokens[i + 1]) : tok.slice(5);
+      if (/^[A-Za-z0-9][\w.+:-]*$/.test(standard)) {
+        out.languageStandard = standard;
+        if (tok === '-std') i++;
       }
       continue;
     }
@@ -253,13 +284,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const rules = new Map();
   const targetVariables = new Map();
   let defaultGoal;
-  const collected = {
-    includeDirs: new Set(),
-    defines: new Set(),
-    forcedIncludes: new Set(),
-    sourceFiles: new Set(),
-    includedFiles: [],
-  };
+  const collected = { ...compilerConfig(), includedFiles: [] };
   const visited = new Set();
 
   const processFile = (absPath, depth) => {
@@ -430,11 +455,11 @@ export function parseMakefileTree(entryAbs, rootDir) {
     if (!compilerVar.test(command) &&
         !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
     if (args.length) compilers.add(compiler);
-    const unit = { includeDirs: new Set(), defines: new Set(), forcedIncludes: new Set(), sourceFiles: new Set() };
+    const unit = compilerConfig();
     extractCompilerFlags(args, entryDir, rootDir, unit);
     for (const rel of unit.sourceFiles) compilationUnits[rel] = {
-      includeDirs: [...unit.includeDirs], defines: [...unit.defines],
-      forcedIncludes: [...unit.forcedIncludes], macroArgs: unit.macroArgs || [],
+      ...extractedOptions(unit),
+      ...(unit.languageStandard ? { languageStandard: unit.languageStandard } : {}),
     };
     extractCompilerFlags(args, entryDir, rootDir, collected);
   }
@@ -448,10 +473,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
   const meta = detectArchAndCompiler([...compilers].join('\n'));
   return {
     ...meta,
-    includeDirs: [...collected.includeDirs],
-    defines: [...collected.defines],
-    macroArgs: collected.macroArgs || [],
-    forcedIncludes: [...collected.forcedIncludes],
+    ...extractedOptions(collected),
     sourceFiles: [...collected.sourceFiles],
     includedFiles: collected.includedFiles,
     compilationUnits,
@@ -505,9 +527,7 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
     if (!cfgName || seenNames.has(cfgName)) continue;
     seenNames.add(cfgName);
 
-    const includeDirs = new Set();
-    const defines = new Set();
-    const forcedIncludes = new Set();
+    const config = compilerConfig();
     const exclusions = [];
     const sourceRoots = [];
     const sourceEntries = [];
@@ -522,17 +542,17 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       if (/includePath/i.test(vt) || /include\.?paths?/i.test(sc)) {
         for (const raw of values) {
           const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) includeDirs.add(abs);
+          if (abs) addInclude(config, '-I', abs);
         }
       } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
         for (const raw of values) {
           const clean = stripQuotes(raw).replace(/^-D/, '');
-          if (clean && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(clean)) defines.add(clean);
+          if (clean && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(clean)) config.defines.add(clean);
         }
       } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
         for (const raw of values) {
           const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) forcedIncludes.add(abs);
+          if (abs) config.forcedIncludes.add(abs);
         }
       }
     }
@@ -542,9 +562,8 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       const attrs = m[1];
       const val = stripQuotes(m[2]);
       const sc = extractXmlAttr(attrs, 'superClass');
-      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[ID]|@|-f\s)/.test(val)) {
-        const tmp = { includeDirs, defines, forcedIncludes, sourceFiles: new Set() };
-        extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, tmp);
+      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[ID]|-i(?:system|quote|dirafter)|@|-f\s)/.test(val)) {
+        extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
       }
     }
 
@@ -573,9 +592,8 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       dir: projectRelDir,
       arch,
       compiler,
-      includeDirs: [...includeDirs],
-      defines: [...defines],
-      forcedIncludes: [...forcedIncludes],
+      ...extractedOptions(config),
+      macroArgs: [],
       sourceRoots,
       sourceEntries,
       exclusions,
@@ -590,7 +608,7 @@ function parseQacProfile(rootDir, rel, abs) {
   const text = safeReadText(abs);
   if (!text) return null;
   const dir = path.dirname(abs);
-  const collected = { includeDirs: new Set(), defines: new Set(), forcedIncludes: new Set(), sourceFiles: new Set() };
+  const collected = compilerConfig();
   for (const rawLine of text.split(/\r\n|\r|\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#') || line.startsWith(';')) continue;
@@ -605,10 +623,7 @@ function parseQacProfile(rootDir, rel, abs) {
     configFile: rel,
     dir: toPosix(path.relative(rootDir, dir)) || '.',
     ...meta,
-    includeDirs: [...collected.includeDirs],
-    defines: [...collected.defines],
-    macroArgs: collected.macroArgs || [],
-    forcedIncludes: [...collected.forcedIncludes],
+    ...extractedOptions(collected),
     sourceRoots: [],
     exclusions: [],
     sourceFiles: [...collected.sourceFiles],
@@ -650,6 +665,7 @@ export function discoverBuildProfiles(rootDir) {
       arch: item.parsed.arch,
       compiler: item.parsed.compiler,
       includeDirs: item.parsed.includeDirs,
+      includeOptions: item.parsed.includeOptions,
       defines: item.parsed.defines,
       macroArgs: item.parsed.macroArgs,
       compilationUnits: item.parsed.compilationUnits,
@@ -844,24 +860,23 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
       .filter((f) => f.isHeader && (!scopeDir || fileKey(f.rel).startsWith(fileKey(scopeDir) + '/')))
       .map((f) => path.dirname(f.abs)),
   )];
-  const allIncludeDirs = [];
-  const seenInc = new Set();
-  const fallbackDirs = (profile.includeDirs || []).length ? scopedHeaderDirs : [absRoot, ...scopedHeaderDirs];
-  for (const dir of [...(profile.includeDirs || []), ...fallbackDirs]) {
-    if (!dir) continue;
-    const norm = path.normalize(dir);
-    const k = fileKey(norm);
-    if (seenInc.has(k)) continue;
-    if (fs.statSync(norm, { throwIfNoEntry: false })?.isDirectory()) {
-      seenInc.add(k);
-      allIncludeDirs.push(norm);
-    }
+  const includeOptions = profileIncludeOptions(profile);
+  const seenInc = new Set(includeOptions.map(([, dir]) => fileKey(path.normalize(dir))));
+  const fallbackDirs = includeOptions.length ? scopedHeaderDirs : [absRoot, ...scopedHeaderDirs];
+  const fallbackOptions = [];
+  const fallbackFlag = includeOptions.some(([flag]) => flag !== '-I') ? '-idirafter' : '-I';
+  for (const dir of fallbackDirs) {
+    const key = fileKey(dir);
+    if (seenInc.has(key) || !fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) continue;
+    seenInc.add(key);
+    fallbackOptions.push([fallbackFlag, dir]);
   }
 
   const baseArgs = ['clang', '-fsyntax-only', '-fms-extensions', '-fgnu-keywords', '-Wno-unknown-pragmas', '-Wno-attributes'];
   const argsFor = config => {
     const args = [...baseArgs];
-    for (const dir of config === profile ? allIncludeDirs : config.includeDirs || []) args.push('-I', dir);
+    for (const entry of config === profile ? [...includeOptions, ...fallbackOptions] : profileIncludeOptions(config)) args.push(...entry);
+    if (config.languageStandard) args.push('-std=' + config.languageStandard);
     if (config.macroArgs?.length) args.push(...config.macroArgs);
     else for (const def of config.defines || []) args.push('-D', def);
     if (shimPath) args.push('-include', shimPath);
@@ -886,7 +901,7 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     compileCommandsPath,
     shimPath,
     unitCount: entries.length,
-    includeCount: allIncludeDirs.length,
+    includeCount: seenInc.size,
     defineCount: (profile.defines || []).length,
     activeFiles: activeRels,
   };

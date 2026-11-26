@@ -19,6 +19,7 @@ export function resolveBuildProfileOptions(root, parserId, options = {}, files =
     resolved.defines = profile.defines || [];
     resolved.compilationUnits = profile.compilationUnits || {};
     resolved.includeDirs = profile.includeDirs || [];
+    resolved.includeOptions = profile.includeOptions;
     resolved.forcedIncludes = profile.forcedIncludes || [];
   }
   return resolved;

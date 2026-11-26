@@ -803,7 +803,10 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     missingIncludes: [...missingIncludes],
     compilationUnits: parserOptions?.compilationUnits || {},
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
-    ...(pruneInactive ? { pruneInactive: true, includeDirs: parserOptions.includeDirs || [], forcedIncludes: parserOptions.forcedIncludes || [] } : {}),
+    ...(pruneInactive ? {
+      pruneInactive: true, includeDirs: parserOptions.includeDirs || [], includeOptions: parserOptions.includeOptions,
+      forcedIncludes: parserOptions.forcedIncludes || [],
+    } : {}),
   };
 
   return model;
@@ -819,10 +822,11 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
     return JSON.stringify([
-      'builtin:9',
+      'builtin:10',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
+      options.includeOptions,
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),

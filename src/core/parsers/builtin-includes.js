@@ -1,7 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { profileIncludeOptions } from '../build-config.js';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
+
+const cStandardVersions = new Map([
+  ['iso9899:199409', '199409L'],
+  ['c99', '199901L'], ['gnu99', '199901L'], ['c9x', '199901L'], ['gnu9x', '199901L'],
+  ['iso9899:1999', '199901L'], ['iso9899:199x', '199901L'],
+  ['c11', '201112L'], ['gnu11', '201112L'], ['c1x', '201112L'], ['gnu1x', '201112L'],
+  ['c17', '201710L'], ['gnu17', '201710L'], ['c18', '201710L'], ['gnu18', '201710L'],
+  ['iso9899:2011', '201112L'], ['iso9899:2017', '201710L'], ['iso9899:2018', '201710L'],
+  ['c23', '202311L'], ['gnu23', '202311L'],
+]);
 
 export function buildMacros(defines = []) {
   const macros = new Map();
@@ -42,11 +53,24 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
 
   for (const source of files) {
     if (source.isHeader) continue;
-    const config = options.compilationUnits?.[source.rel] || options;
-    const search = (config.includeDirs || []).map(dir => path.resolve(root, dir));
-    if (!search.length) search.push(path.resolve(root));
+    const unit = options.compilationUnits?.[source.rel];
+    const config = unit || options;
+    const includeOptions = profileIncludeOptions(config);
+    const dirsFor = flag => includeOptions.filter(([kind]) => kind === flag).map(([, dir]) => path.resolve(root, dir));
+    const system = dirsFor('-isystem');
+    const after = dirsFor('-idirafter');
+    const systemKeys = new Set([...system, ...after].map(key));
+    const search = [...dirsFor('-I').filter(dir => !systemKeys.has(key(dir))), ...system, ...after];
+    if (!includeOptions.length) search.push(path.resolve(root));
+    const quotedSearch = [...dirsFor('-iquote'), ...search];
     const forced = config.forcedIncludes || [];
-    const predefined = buildMacros(config.defines);
+    const stdVersion = cStandardVersions.get(unit?.languageStandard);
+    const undefinesStdVersion = (config.macroArgs || []).some((arg, i, args) =>
+      i % 2 === 0 && arg === '-U' && args[i + 1] === '__STDC_VERSION__');
+    const predefined = buildMacros([
+      ...(stdVersion && !undefinesStdVersion ? ['__STDC_VERSION__=' + stdVersion] : []),
+      ...(config.defines || []),
+    ]);
 
     const stack = new Set(), once = new Set();
     function processFile(file, base) {
@@ -57,7 +81,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       stack.add(file);
       const scope = fileMacroScope(base, new Map(), { trackPositions: true });
       function include({ target, line }, quoted, fromDir = path.dirname(path.resolve(root, file.rel))) {
-        for (const dir of quoted ? [fromDir, ...search] : search) {
+        for (const dir of quoted ? [fromDir, ...quotedSearch] : search) {
           const abs = path.resolve(dir, target.replaceAll('\\', '/'));
           const relative = path.relative(root, abs);
           const external = relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
