@@ -5,6 +5,8 @@
  * - 自动兼容旧版 OpenAI 接口：支持标准 tool_calls、旧版 function_call，以及不传 tools / role:"tool" 的纯对话工具调用回退。
  */
 
+import { MAX_CODE_ATTACHMENT_CHARS, sanitizeCodeAttachments } from '../../web/lib/ai-code-attachments.js';
+
 const VALID_TOOL_MODES = new Set(['auto', 'tools', 'prompt']);
 const VALID_REASONING_EFFORTS = new Set(['default', 'off', 'low', 'medium', 'high']);
 const MAX_AGENT_STEPS = 24;
@@ -196,7 +198,7 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'read_function',
-    description: '读取某个函数的 C 源码、直接调用关系、变量读写和上游 TASK/ISR 入口。可直接传短函数名或完整 文件::函数名。',
+    description: '读取某个函数的 C 源码、直接调用关系、间接调用点、变量读写和上游 TASK/ISR 入口。可直接传短函数名或完整 文件::函数名。',
     parameters: {
       type: 'object',
       properties: {
@@ -204,6 +206,64 @@ export const AGENT_TOOLS = [
         encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], description: '源码编码，日文工程可传 cp932，默认 auto' },
       },
       required: ['name'],
+    },
+  },
+  {
+    name: 'read_source',
+    description: '只读查看工程内任意 C/H 文件的指定行范围，或按关键词在源码中全文检索（适用于查找常量结构体、一维/二维函数指针数组、宏定义、回调注册、状态机分派表等）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: '工程内相对路径，如 "src/app/dispatch.c"。与 startLine/endLine 配合按行读取' },
+        startLine: { type: 'integer', description: '起始行号（从 1 开始），默认 1' },
+        endLine: { type: 'integer', description: '结束行号，单次最多读取 200 行' },
+        query: { type: 'string', description: '全文搜索关键词（不传 file 时在工程所有 C/H 文件中搜索；传 file 时仅在该文件搜索）' },
+        paths: { type: 'array', items: { type: 'string' }, description: '可选：限定搜索的目录前缀列表' },
+        encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], description: '源码编码，默认 auto' },
+        limit: { type: 'integer', description: '搜索模式最多返回匹配条数，默认 25' },
+      },
+    },
+  },
+  {
+    name: 'inspect_indirect_calls',
+    description: '只读检查函数指针、一维/二维常量结构体或分派表引起的间接调用点与候选槽位。可传 function 查某函数的间接出边与引用该函数的分派表，或传 table 查看整张表的槽位矩阵。',
+    parameters: {
+      type: 'object',
+      properties: {
+        function: { type: 'string', description: '可选：函数名或完整 ID，同时查该函数的间接调用点以及把它放进分派表的引用处' },
+        table: { type: 'string', description: '可选：分派表/常量数组名，查看完整 1D/2D 槽位映射与所有调用点' },
+        limit: { type: 'integer', description: '最多返回条数，默认 30' },
+      },
+    },
+  },
+  {
+    name: 'add_call_edge',
+    description: '将经源码核实的间接调用边（函数指针、1D/2D 常量分派表、回调注册、复杂宏、状态机派发等）持久化写入工程调用图并显示在画布上，使上游 TASK 追踪和画布连线立即可见。仅在确认具体目标后调用，切勿把无关分派表项全量写入。',
+    parameters: {
+      type: 'object',
+      properties: {
+        edges: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 40,
+          description: '经源码核实的调用边列表',
+          items: {
+            type: 'object',
+            properties: {
+              from: { type: 'string', description: '调用方函数名或完整 ID' },
+              to: { type: 'string', description: '被调方函数名或完整 ID' },
+              line: { type: 'integer', description: '可选：源码中触发该调用的行号' },
+              via: { type: 'string', description: '简短途径说明，如 "e[1][0] / 状态机表"、"z[idx].fn"' },
+              reason: { type: 'string', description: '源码判断依据（简短中文）' },
+            },
+            required: ['from', 'to'],
+          },
+        },
+        addToCanvas: { type: 'boolean', description: '是否同时将端点函数加入当前画布（默认 true）' },
+        remove: { type: 'boolean', description: '为 true 时移除已添加的推断调用边' },
+        reason: { type: 'string', description: '画布提示栏显示的简短理由' },
+      },
+      required: ['edges'],
     },
   },
   {
@@ -298,23 +358,33 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'arrange_canvas',
-    description: '查看当前画布坐标，移动、对齐或重置画布节点。x 向右增加，y 向下增加。',
+    description: '整理、查看、移动或对齐当前画布布局。一键整理优先用 action:"tidy"；整体移动文件框/目录容器用 move_group / align_groups；微调单个节点用 move / align；恢复自动布局用 reset。x 向右增加，y 向下增加。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['inspect', 'move', 'align', 'reset'] },
+        action: { type: 'string', enum: ['inspect', 'tidy', 'move_group', 'align_groups', 'move', 'align', 'reset'] },
+        direction: { type: 'string', enum: ['LR', 'TB'], description: 'action=tidy 时的主排布方向：LR（从左到右调用流，默认）或 TB（从上到下）' },
+        group: { type: 'string', description: 'action=move_group 时的目标文件框或目录容器 ID/名称' },
+        groups: { type: 'array', maxItems: 100, items: { type: 'string' }, description: 'action=align_groups 时要对齐的文件框或目录容器列表（省略则对齐全部文件框）' },
+        groupGap: { type: 'number', minimum: 0, description: 'action=tidy 时文件框/目录之间的间距，默认 44' },
+        x: { type: 'number' },
+        y: { type: 'number' },
+        dx: { type: 'number' },
+        dy: { type: 'number' },
+        relativeTo: { type: 'string', description: 'action=move_group 时的参照容器 ID/名称' },
+        placement: { type: 'string', enum: ['right', 'left', 'below', 'above'] },
         moves: {
           type: 'array',
           maxItems: 200,
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', description: '画布节点完整 ID 或唯一短名称' },
+              id: { type: 'string', description: '画布节点（move）或文件框/目录容器（move_group）完整 ID 或唯一短名称' },
               x: { type: 'number' },
               y: { type: 'number' },
               dx: { type: 'number' },
               dy: { type: 'number' },
-              relativeTo: { type: 'string', description: '参照节点完整 ID 或唯一短名称' },
+              relativeTo: { type: 'string', description: '参照节点或容器完整 ID 或唯一短名称' },
               placement: { type: 'string', enum: ['right', 'left', 'below', 'above'] },
               gap: { type: 'number', minimum: 0 },
             },
@@ -324,7 +394,7 @@ export const AGENT_TOOLS = [
         nodes: { type: 'array', maxItems: 200, items: { type: 'string' } },
         axis: { type: 'string', enum: ['x', 'y'], description: 'x 为水平一排（同 Y），y 为垂直一列（同 X）' },
         distribute: { type: 'boolean' },
-        gap: { type: 'number', minimum: 0, description: '均匀分布时节点边缘之间的间距' },
+        gap: { type: 'number', minimum: 0, description: '节点或容器边缘之间的间距' },
         reason: { type: 'string', maxLength: 240 },
       },
       required: ['action'],
@@ -371,6 +441,19 @@ export function estimateMessagesTokens(messages, includeTools = false) {
     });
     return total + 4 + estimateTokens(JSON.stringify({ ...message, content })) + imageTokens;
   }, includeTools ? TOOL_SCHEMA_TOKENS : 0);
+}
+
+/** 仅裁剪 [start, end) 中的旧对话；移除提问时也移除它后面的回答。 */
+function trimOldTurns(messages, start, end, excessTokens, excessCount = 0) {
+  let freed = 0, count = 0;
+  while (start + count < end) {
+    const message = messages[start + count];
+    if (freed >= excessTokens && count >= excessCount && !(count && message.role === 'assistant')) break;
+    freed += estimateMessagesTokens([message]);
+    count++;
+  }
+  if (count) messages.splice(start, count);
+  return freed;
 }
 
 function openAiToolsPayload() {
@@ -434,22 +517,38 @@ function formatUiContextSelections(ui) {
   };
 }
 
-function buildTurnUserText(userText, uiContext) {
+function formatCodeAttachments(files, maxChars = MAX_CODE_ATTACHMENT_CHARS * files.length) {
+  if (!files.length) return [];
+  const lines = ['[用户附带的外部文件/代码片段]'];
+  const perFile = Math.floor(maxChars / files.length);
+  for (const file of files) {
+    const range = file.endLine ? ` (L${file.startLine || 1}-L${file.endLine}${file.totalLines ? ` / 共 ${file.totalLines} 行` : ''})` : '';
+    lines.push(`--- 文件：${file.name}${range} ---`, file.content.slice(0, perFile));
+    if (file.truncated || file.content.length > perFile) lines.push('（片段已截断）');
+    lines.push('--- 结束 ---');
+  }
+  return lines;
+}
+
+function buildTurnUserText(userText, uiContext, attachments = []) {
+  const sections = [];
   const { selections } = formatUiContextSelections(uiContext);
-  if (!selections.length) return userText;
-  const multi = selections.length > 1;
-  const header = multi
-    ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
-    : '[本轮画布当前选中对象（指代最高优先级）]';
-  const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
-  return [
-    header,
-    body,
-    '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
-    '',
-    '用户本轮提问：',
-    userText,
-  ].join('\n');
+  if (selections.length) {
+    const multi = selections.length > 1;
+    const header = multi
+      ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
+      : '[本轮画布当前选中对象（指代最高优先级）]';
+    const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
+    sections.push(
+      header,
+      body,
+      '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
+    );
+  }
+  sections.push(...formatCodeAttachments(attachments));
+  if (!sections.length) return userText;
+  sections.push('', '用户本轮提问：', userText);
+  return sections.join('\n');
 }
 
 function buildSystemPrompt(context, promptToolMode) {
@@ -492,8 +591,10 @@ function buildSystemPrompt(context, promptToolMode) {
     '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
     '10. 指代锚定规则（最高优先级）：当本轮消息附带「本轮画布当前选中对象」时，任何指代词（“这个函数”、“它”、“这个变量”、“这条线”、“当前对象”）或未显式点名其他符号的提问，必须严格锚定到本轮画布选中对象的完整 ID、端点及文件路径；严禁因上一轮回复刚提过其他函数/连线（近因偏差）而把目标换成上轮对象。仅当用户本轮明确点名其他符号时，才以用户点名为准。',
     '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径（如上轮提过的某条调用链或其他相关函数）当成本轮隐含需求去追查或写入画布。回答“为什么没有上游调用链/为什么未连线/这个函数做什么”等解释排查类问题时，只使用只读工具（read_function、trace_upstream、find_symbols），不得擅自修改画布。',
-    '12. 使用 arrange_canvas({ action: "inspect" }) 查看画布坐标，再按用户要求使用 move、align 或 reset。附有画布截图时，结合图像和 inspect 返回的节点坐标确定目标后再移动。',
-    '13. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
+    '12. 整理画布布局时：用户要求“整理画布/排版/排整齐/减少交叉”时优先调用 arrange_canvas({ action: "tidy", direction: "LR" })（或 "TB"）；移动/对齐整个文件框或目录容器用 move_group / align_groups；精调单个节点时先 inspect 再 move/align。附有画布截图时结合图像与坐标操作。',
+    '13. 间接调用链（函数指针、1D/2D 常量结构体数组如 z[idx]() / e[r][c]()、回调注册、状态机/中断派发、复杂宏）：当静态图缺少调用链或用户问“为什么找不到上游/调用关系”时，先用 inspect_indirect_calls 和 read_source 核查实际源码与分派表初始化代码，按代码逻辑精准判断真正会调用哪些目标。纯排查提问时只解释查证结果；用户要求补齐/加入调用链（或确认后），调用 add_call_edge 只加入经源码确认的具体边（切勿把无关的表项全量写入）。',
+    '14. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
+    '15. 除调用 ask_user 外，每次普通最终回复的末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（给出 2–3 个结合本轮函数/变量/发现的后续建议）。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -731,8 +832,10 @@ function normalizeLineBreaks(text) {
 export function sanitizeSuggestions(items) {
   const result = [];
   for (const item of Array.isArray(items) ? items : []) {
-    const label = typeof item?.label === 'string' ? [...item.label.trim()].slice(0, 28).join('') : '';
-    const prompt = typeof item?.prompt === 'string' ? item.prompt.trim().slice(0, 2000) : '';
+    const rawLabel = item?.label ?? item?.title ?? item?.text;
+    const rawPrompt = item?.prompt ?? item?.query ?? item?.message ?? item?.question;
+    const label = typeof rawLabel === 'string' ? [...rawLabel.trim()].slice(0, 28).join('') : '';
+    const prompt = typeof rawPrompt === 'string' ? rawPrompt.trim().slice(0, 2000) : '';
     const draft = typeof item?.draft === 'string' ? item.draft.trim().slice(0, 2000) : '';
     if (label && (prompt || draft)) result.push({ label, ...(prompt ? { prompt } : { draft }) });
     if (result.length === 3) break;
@@ -783,7 +886,8 @@ function readAnswer(raw) {
   let text = '';
   createContentReader((channel, delta) => { if (channel === 'text') text += delta; })(raw, true);
   const block = /<next_steps\s*>([\s\S]*?)<\/next_steps\s*>/i.exec(raw);
-  const suggestions = sanitizeSuggestions(block && safeJsonParse(block[1]));
+  const blockInner = block ? block[1].trim().replace(/^```(?:json)?\s*\r?\n?/i, '').replace(/\r?\n?```\s*$/, '').trim() : '';
+  const suggestions = sanitizeSuggestions(blockInner && safeJsonParse(blockInner));
   // 提示词工具模式只解析建议块之外的工具指令。
   const toolText = raw.replace(/<next_steps\b[\s\S]*?(?:<\/next_steps\s*>|$)/gi, '');
   return { text: text.trim(), suggestions, toolText };
@@ -919,9 +1023,8 @@ async function readChatStream(body, signal, onDelta, onChunk, onProgress) {
   return { choices: [{ message: msg, finish_reason: finishReason }], usage };
 }
 
-function createMetrics(config, request, onEvent, onReport = null) {
+function createMetrics(config, contextEstTokens, onEvent, onReport = null) {
   const startedAt = Date.now();
-  const contextEstTokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
   let firstTokenAt = null;
   let lastReport = null;
   let completionEstimate = 0;
@@ -1045,6 +1148,19 @@ function summarizeToolResult(name, result) {
     return Array.isArray(result.suggestedLabels) ? `${summary}，${result.suggestedLabels.length} 条建议标签` : summary;
   }
   if (name === 'read_function') return `已读 ${result.name || result.id} (${result.file}:${result.startLine}-${result.endLine})`;
+  if (name === 'read_source') {
+    if (result.file) return `已读 ${result.file}:${result.startLine}-${result.endLine}`;
+    return `源码检索找到 ${result.matches?.length || 0} 处匹配`;
+  }
+  if (name === 'inspect_indirect_calls') {
+    return `查到 ${result.indirectCalls?.length || 0} 处间接调用、${result.tables?.length || 0} 张分派表`;
+  }
+  if (name === 'add_call_edge') {
+    const verb = result.removed ? '移除' : '写入';
+    const list = Array.isArray(result.edges) ? result.edges : [];
+    const preview = list.slice(0, 3).map(e => `${String(e.from).split('::').pop()}→${String(e.to).split('::').pop()}`).join('、');
+    return `已${verb} ${list.length || result.addedCount || 0} 条推断调用边${preview ? `（${preview}${list.length > 3 ? '…' : ''}）` : ''}`;
+  }
   if (name === 'add_to_canvas') {
     const names = Array.isArray(result.addedNames) ? result.addedNames.filter(Boolean) : [];
     const preview = names.length
@@ -1060,6 +1176,8 @@ function summarizeToolResult(name, result) {
   if (name === 'arrange_canvas') {
     if (result.action === 'inspect') return `已查看 ${result.nodes?.length ?? 0} 个画布节点的位置`;
     if (result.action === 'reset') return '已恢复自动布局';
+    if (result.action === 'tidy') return `已一键整理 ${result.updatedCount} 个画布节点`;
+    if (result.action === 'move_group' || result.action === 'align_groups') return `已调整容器及内部 ${result.updatedCount} 个节点`;
     return `已调整 ${result.updatedCount} 个画布节点的位置`;
   }
   if (name === 'remove_from_canvas') {
@@ -1116,7 +1234,7 @@ export function summarizeToolDigest(name, args, result) {
   return [header, ...values].join(' ');
 }
 
-function historyContent(message, maxLength = Infinity) {
+function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_000) {
   const rawText = String(message.text ?? message.content ?? '').trim();
   const selectionPrefix = message.role === 'user' && message.selectionSummary
     ? `[当时画布选中：${String(message.selectionSummary).trim()}]`
@@ -1137,7 +1255,8 @@ function historyContent(message, maxLength = Infinity) {
   }
   const metadata = details.join('\n').slice(0, maxLength);
   const textBudget = metadata ? Math.max(0, maxLength - metadata.length - 1) : maxLength;
-  return [text.slice(0, textBudget), metadata].filter(Boolean).join('\n');
+  const files = message.role === 'user' ? sanitizeCodeAttachments(message.attachedFiles) : [];
+  return [text.slice(0, textBudget), metadata, ...formatCodeAttachments(files, maxAttachmentChars)].filter(Boolean).join('\n');
 }
 
 export async function compactConversation({ config, messages, fetchImpl = fetch, signal = null }) {
@@ -1159,7 +1278,7 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
       const references = text.match(/[\p{L}\d_.:/\\-]+\.(?:c|h|cc|cpp|hpp|arxml|oil|json)(?:::[\w$]+)?|\b(?:z\d+|[\w.-]+(?:[/\\][\w.-]+)+)\b/giu);
       if (references?.length) facts.push('文件或路径：' + [...new Set(references)].join('、'));
     }
-    const structured = historyContent({ ...message, text: '' });
+    const structured = historyContent({ ...message, text: '' }, Infinity, 0);
     if (structured) facts.push(structured);
   }
 
@@ -1197,6 +1316,7 @@ export async function runAiAgent({
   config,
   prompt,
   images = [],
+  attachments = [],
   history = [],
   context = {},
   executeTool,
@@ -1218,13 +1338,13 @@ export async function runAiAgent({
     contextWindow: validContextWindow(config.contextWindow) ? config.contextWindow : DEFAULT_AI_CONFIG.contextWindow,
   };
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
+  const historyBudget = Math.floor(config.contextWindow * 0.65);
+  const historyAttachmentChars = Math.min(MAX_CODE_ATTACHMENT_CHARS, Math.floor(historyBudget / 3));
   const cleanHistory = (Array.isArray(history) ? history : [])
     .filter(m => m && ['user', 'assistant'].includes(m.role))
-    .map(m => ({ role: m.role, content: historyContent(m, 4000) }))
-    .filter(m => m.content)
-    .slice(-20);
-  const historyBudget = Math.floor(config.contextWindow * 0.65);
-  while (estimateMessagesTokens(cleanHistory) > historyBudget) cleanHistory.shift();
+    .map(m => ({ role: m.role, content: historyContent(m, 4000, historyAttachmentChars) }))
+    .filter(m => m.content);
+  trimOldTurns(cleanHistory, 0, cleanHistory.length, estimateMessagesTokens(cleanHistory) - historyBudget, cleanHistory.length - 20);
   const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
   const removal = /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
   const pendingVehicle = /车型|目录|全部保留|\bz\d+\b/u.test(lastReply) &&
@@ -1243,11 +1363,11 @@ export async function runAiAgent({
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
     !/[A-Za-z_][A-Za-z0-9_]{2,}/u.test(userText);
   const isCanvasWriteTool = (call) =>
-    ['add_to_canvas', 'remove_from_canvas', 'apply_labels'].includes(call.name) ||
+    ['add_to_canvas', 'remove_from_canvas', 'apply_labels', 'add_call_edge'].includes(call.name) ||
     (call.name === 'arrange_canvas' && call.arguments?.action !== 'inspect');
 
   let imagesDegraded = false;
-  const turnUserText = buildTurnUserText(userText, context.uiContext);
+  const turnUserText = buildTurnUserText(userText, context.uiContext, attachments);
   const userMessage = {
     role: 'user',
     content: images.length > 0 && !imagesDegraded
@@ -1283,6 +1403,14 @@ export async function runAiAgent({
   const recordMetrics = (m) => { lastMetrics = m; };
   const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
   const maxTokens = config.maxTokens ?? DEFAULT_AI_CONFIG.maxTokens;
+  // 输出上限为 0 时由模型决定输出长度，至少留出一个生成 token。
+  const inputBudget = config.contextWindow - Math.max(1, maxTokens);
+  const fitRequestHistory = (request) => {
+    const tokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
+    const turnStart = request.messages.indexOf(userMessage);
+    // 只移除本轮之前的消息，保留附件全文和已执行工具的调用/返回配对。
+    return tokens - trimOldTurns(request.messages, 1, turnStart, tokens - inputBudget);
+  };
   const requestDefaults = {
     model: config.model,
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
@@ -1316,7 +1444,13 @@ export async function runAiAgent({
       ...(streamMode === 'stream_usage' ? { stream_options: { include_usage: true } } : {}),
     };
 
-    const metrics = createMetrics(config, reqBody, onEvent, recordMetrics);
+    const inputTokens = fitRequestHistory(reqBody);
+    if (inputTokens > inputBudget) {
+      const reason = `本轮输入预计需要 ${inputTokens} 个 token，预留输出后可用 ${Math.max(0, inputBudget)} 个。请缩小${attachments.length ? '附件的选取范围' : '本轮输入'}，或调整上下文窗口和输出上限。`;
+      if (!toolLog.length) throw new Error(reason);
+      return finish(`${reason}\n工具执行记录：${toolLog.map(tool => tool.summary).join('；')}。`);
+    }
+    const metrics = createMetrics(config, inputTokens, onEvent, recordMetrics);
     const res = await fetchJson(chatUrl, {
       method: 'POST',
       headers: authHeaders(config.apiKey),
@@ -1568,14 +1702,16 @@ export async function runAiAgent({
       };
       let metrics, res;
       do {
-        metrics = createMetrics(config, request, onEvent, recordMetrics);
+        const inputTokens = fitRequestHistory(request);
+        if (inputTokens > inputBudget) break;
+        metrics = createMetrics(config, inputTokens, onEvent, recordMetrics);
         res = await fetchJson(chatUrl, {
           method: 'POST',
           headers: authHeaders(config.apiKey),
           body: JSON.stringify(request),
         }, fetchImpl, 15_000, signal);
       } while (!res.ok && degradeImages(res));
-      if (res.ok) {
+      if (res?.ok) {
         summaryMessage = res.json?.choices?.[0]?.message;
         metrics.finish(res.json);
       }

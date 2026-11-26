@@ -36,6 +36,7 @@ import {
 import { normalizeExpansions } from './core/expansion.js';
 import { routeEdges } from './core/routing.js';
 import { contentPadding, inside } from '../web/lib/hierarchy.js';
+import { boundSavedCodeAttachments, sanitizeCodeAttachments } from '../web/lib/ai-code-attachments.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
@@ -465,6 +466,66 @@ function applyManualNodes(model, projectId, list = loadManualNodes(projectId)) {
   if (injected) rebuildIndex(model);
 }
 
+const inferredEdgesKey = (projectId) => `inferred.edges.${projectId}`;
+
+function loadInferredEdges(projectId) {
+  const raw = store.getSetting(inferredEdgesKey(projectId), []);
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const from = typeof item.from === 'string' ? item.from.trim() : '';
+    const to = typeof item.to === 'string' ? item.to.trim() : '';
+    if (!from || !to || from === to) continue;
+    const line = Number.isInteger(item.line) && item.line >= 0 ? item.line : 0;
+    const via = typeof item.via === 'string' ? item.via.trim().slice(0, 120) : '';
+    const reason = typeof item.reason === 'string' ? item.reason.trim().slice(0, 240) : '';
+    const k = `${from}|${to}|${line}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({ from, to, line, via, reason });
+  }
+  return out;
+}
+
+function saveInferredEdges(projectId, list) {
+  store.setSetting(inferredEdgesKey(projectId), list);
+}
+
+function applyInferredEdges(model, projectId, list = loadInferredEdges(projectId)) {
+  if (!model) return;
+  const hadInferred = model.edges.some(e => e.inferred);
+  if (!list.length && !hadInferred) return;
+  let edges = hadInferred ? model.edges.filter(e => !e.inferred) : model.edges;
+  const byId = model._index?.byId;
+  const existingKeys = new Set(edges.map(e => `${e.from}|${e.to}|${e.line || 0}`));
+  for (const item of list) {
+    const fromNode = byId?.get(item.from);
+    const toNode = byId?.get(item.to);
+    if (!fromNode || !toNode) continue;
+    const key = `${item.from}|${item.to}|${item.line || 0}`;
+    if (existingKeys.has(key)) continue;
+    existingKeys.add(key);
+    // 源码连线索引以边数组为键，补边时换用新数组。
+    if (edges === model.edges) edges = [...edges];
+    edges.push({
+      from: item.from,
+      to: item.to,
+      callee: toNode.name || item.to.split('::').pop(),
+      kind: 'fnptr',
+      line: item.line || 0,
+      via: item.via || 'AI 核实间接调用',
+      ...(item.reason ? { reason: item.reason } : {}),
+      inferred: true,
+    });
+  }
+  if (edges !== model.edges) {
+    model.edges = edges;
+    rebuildIndex(model);
+  }
+}
+
 // ---- 流程图持久化缓存 + 有变更函数默认预加载保存 ----
 const FLOWCHART_CACHE_MAX = 40;
 const flowchartMemCache = new Map(); // projectId -> Map<entryKey, { hash, savedAt, data }>
@@ -732,6 +793,7 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
     return result;
   });
   applyManualNodes(model, project.id, reconciled.list);
+  applyInferredEdges(model, project.id);
   const st = stats(model);
 
   const ov = store.loadOverlay(project.id);
@@ -1090,6 +1152,22 @@ function traceContext(id, version = null) {
   return { model: COMPARISON[traceVersion + 'Model'], traceVersion };
 }
 
+async function readIndexedSourceBytes(model, file, comparison) {
+  const source = await model._sourceBuffers?.getAsync(file);
+  if (source) return source;
+  const realRoot = await fs.promises.realpath(model.root);
+  const realFile = await fs.promises.realpath(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
+  const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
+  const withinRoots = roots.some(root => {
+    const rel = path.relative(root, realFile);
+    return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
+  });
+  if (!withinRoots || !(await fs.promises.stat(realFile)).isFile()) {
+    throw new Error('源码文件必须位于当前工程或对照目录内');
+  }
+  return fs.promises.readFile(realFile);
+}
+
 async function readMcpSource(q) {
   const id = q.get('id');
   if (q.has('id') === ['file', 'startLine', 'endLine'].some((key) => q.has(key))) {
@@ -1112,20 +1190,7 @@ async function readMcpSource(q) {
   if (!model.files?.some((entry) => entry.rel === file)) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
-  let source = await model._sourceBuffers?.getAsync(file);
-  if (!source) {
-    const realRoot = await fs.promises.realpath(model.root);
-    const realFile = await fs.promises.realpath(model._sourceFiles?.get(file) ?? path.join(realRoot, file));
-    const roots = [realRoot, comparison?.beforePath, comparison?.afterPath].filter(Boolean);
-    const withinRoots = roots.some(root => {
-      const rel = path.relative(root, realFile);
-      return rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel);
-    });
-    if (!withinRoots || !(await fs.promises.stat(realFile)).isFile()) {
-      throw new Error('源码文件必须位于当前工程或对照目录内');
-    }
-    source = await fs.promises.readFile(realFile);
-  }
+  const source = await readIndexedSourceBytes(model, file, comparison);
   const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
   let decoded;
   try { decoded = decoder.decode(source.subarray(decoder.bomLength)); }
@@ -1150,13 +1215,17 @@ async function readMcpSource(q) {
   };
 }
 
+function normalizeFilterPath(value) {
+  return value.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
 function normalizePathPrefixes(raw) {
   const arr = Array.isArray(raw) ? raw : typeof raw === 'string' && raw.trim() ? [raw] : [];
-  return [...new Set(arr.map((s) => String(s || '').trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase()).filter(Boolean))];
+  return [...new Set(arr.map(s => normalizeFilterPath(String(s || '').trim())).filter(Boolean))];
 }
 
 function fileMatchesPathPrefix(filePath, prefix) {
-  const norm = String(filePath || '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+  const norm = normalizeFilterPath(String(filePath || ''));
   if (!norm || !prefix) return false;
   return norm === prefix || norm.startsWith(prefix + '/') || norm.includes('/' + prefix + '/');
 }
@@ -1803,35 +1872,76 @@ function discardCollidingArrangements(nodes, targets) {
   return targets.filter(({ node, x, y }) => moves.has(node) || (node.x === x && node.y === y));
 }
 
-function expandedArrangementBoxes(view, targets) {
+function arrangementBoxGeometry(view, targets) {
+  const targetByNode = new Map(targets.map(({ node, x, y }) => [node.id, { x, y, w: node.w, h: node.h }]));
   const files = new Map(view.groups.map(box => [box.id, { box, bounds: canvasRect(box), kind: 'file' }]));
   const directories = view.containers.map(box => ({ box, bounds: canvasRect(box), kind: 'dir' }));
   directories.sort((a, b) => Number(!!a.box.root) - Number(!!b.box.root) || b.box.id.length - a.box.id.length);
   const boxes = [...files.values(), ...directories];
+  const touchedFiles = new Set();
+  for (const { node } of targets) {
+    if (files.has(node.group)) touchedFiles.add(node.group);
+  }
   const expanded = new Set();
-  const expand = (entry, content) => {
-    const { bounds } = entry;
+  const fitBounds = (entry, rects) => {
+    if (!rects.length) return;
     const { pad, top } = contentPadding(entry);
-    const left = Math.min(bounds.x, Math.max(0, content.x - pad));
-    const upper = Math.min(bounds.y, content.y - top);
-    const right = Math.max(bounds.x + bounds.w, content.x + content.w + pad);
-    const bottom = Math.max(bounds.y + bounds.h, content.y + content.h + pad);
-    Object.assign(bounds, { x: left, y: upper, w: right - left, h: bottom - upper });
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const r of rects) {
+      if (r.x < minX) minX = r.x;
+      if (r.y < minY) minY = r.y;
+      if (r.x + r.w > maxX) maxX = r.x + r.w;
+      if (r.y + r.h > maxY) maxY = r.y + r.h;
+    }
+    const left = Math.max(0, minX - pad);
+    const upper = minY - top;
+    const right = maxX + pad;
+    const bottom = maxY + pad;
+    Object.assign(entry.bounds, { x: left, y: upper, w: Math.max(1, right - left), h: Math.max(1, bottom - upper) });
     expanded.add(entry);
   };
-  for (const { node, x, y } of targets) {
-    const file = files.get(node.group);
-    if (file) expand(file, { x, y, w: node.w, h: node.h });
+  const nodesByGroup = new Map();
+  for (const n of view.nodes || []) {
+    if (!n.group || !touchedFiles.has(n.group)) continue;
+    if (!nodesByGroup.has(n.group)) nodesByGroup.set(n.group, []);
+    nodesByGroup.get(n.group).push(targetByNode.get(n.id) || { x: n.x, y: n.y, w: n.w, h: n.h });
   }
-  // 先扩展内层框，再用子框的新边界扩展父框，为每层标题留出空间。
-  for (const entry of boxes) {
-    if (!expanded.has(entry)) continue;
-    const parent = directories.find(candidate => inside(candidate, entry));
-    if (parent && !parent.box.root) {
-      expand(parent, entry.bounds);
+  for (const groupId of touchedFiles) {
+    fitBounds(files.get(groupId), nodesByGroup.get(groupId) || []);
+  }
+  // 从最深目录逐层向上重算祖先容器边界：节点整组移走后文件框同步收紧，不再残留旧占位导致误判碰撞。
+  for (const dir of directories) {
+    const children = boxes.filter(candidate => inside(dir, candidate));
+    if (!children.some(child => expanded.has(child))) continue;
+    if (dir.box.root) {
+      const { pad } = contentPadding(dir);
+      let maxX = dir.bounds.x + dir.bounds.w;
+      let maxY = dir.bounds.y + dir.bounds.h;
+      for (const child of children) {
+        maxX = Math.max(maxX, child.bounds.x + child.bounds.w + pad);
+        maxY = Math.max(maxY, child.bounds.y + child.bounds.h + pad);
+      }
+      Object.assign(dir.bounds, { w: maxX - dir.bounds.x, h: maxY - dir.bounds.y });
+      expanded.add(dir);
       continue;
     }
-    const minY = parent ? parent.bounds.y + contentPadding(parent).top : 0;
+    fitBounds(dir, children.map(child => child.bounds));
+  }
+  return { expanded, boxes, directories };
+}
+
+function expandedArrangementBoxes(view, targets) {
+  const { expanded, boxes, directories } = arrangementBoxGeometry(view, targets);
+  for (const entry of expanded) {
+    if (entry.box.root) {
+      const minY = entry.bounds.y + contentPadding(entry).top;
+      if (boxes.some(child => inside(entry, child) && child.bounds.y < minY)) {
+        return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
+      }
+      continue;
+    }
+    const parent = directories.find(candidate => inside(candidate, entry));
+    const minY = parent?.box.root ? parent.bounds.y + contentPadding(parent).top : 0;
     if (entry.bounds.y < minY) {
       return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
     }
@@ -2444,7 +2554,9 @@ export const server = http.createServer(async (req, res) => {
               text: String(m.text || '').slice(0, 8000),
               ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                 ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
+              ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
               ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
+              ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
               ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
               ...(Array.isArray(m.tools) && m.tools.length ? {
                 tools: m.tools.slice(0, 20).map((tl) => ({
@@ -2481,6 +2593,7 @@ export const server = http.createServer(async (req, res) => {
         }
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
+        boundSavedCodeAttachments(threads, activeId);
         return { activeId, threads };
       };
       if (req.method === 'POST') {
@@ -2536,6 +2649,7 @@ export const server = http.createServer(async (req, res) => {
         images.push({ dataUrl, ...(typeof item?.label === 'string' ? { label: item.label.slice(0, 120) } : {}) });
         if (images.length === 2) break;
       }
+      const attachments = sanitizeCodeAttachments(p.attachments);
       const canvasLayoutRoots = (ids) => ids.map(id => remapLegacyExt(id, MODEL)).filter(Boolean);
       let canvasSnapshot = reviewingPage(pageState) ? null : sanitizeCanvasLayout(p.canvasLayout);
       const snapshotPage = canvasSnapshot && latestPage();
@@ -3028,7 +3142,9 @@ export const server = http.createServer(async (req, res) => {
         const page = latestPage();
         if (!page || (!page.roots?.length && !page.expansions?.length && !page.vars?.length)) return fail('当前画布为空');
         const { action } = args;
-        if (!['inspect', 'move', 'align', 'reset'].includes(action)) return fail('未知的画布布局操作');
+        if (!['inspect', 'move', 'align', 'move_group', 'align_groups', 'tidy', 'reset'].includes(action)) {
+          return fail('未知的画布布局操作');
+        }
         const activeView = viewSnapshot(page);
         const { roots, up, down, group, groupMode, vars, hiddenVars, expansions } = activeView;
         const layoutRoot = canvasLayoutRoots(roots).join('+');
@@ -3061,6 +3177,7 @@ export const server = http.createServer(async (req, res) => {
         }
 
         const byId = new Map(nodes.map(n => [n.id, n]));
+        const nodeGroup = new Map(view.nodes.map(n => [n.id, n.group || '']));
         const resolveNode = (query) => {
           if (typeof query !== 'string' || !query.trim()) throw new Error('请提供画布节点的名称或 ID');
           query = query.trim();
@@ -3153,6 +3270,333 @@ export const server = http.createServer(async (req, res) => {
             }
           }
           for (const target of targets) updated.set(target.id, target);
+        } else if (action === 'move_group' || action === 'align_groups') {
+          const geometry = {
+            nodes: nodes.map(n => ({ ...n, group: nodeGroup.get(n.id) })),
+            groups: view.groups.map(box => ({ ...box, ...live?.groups?.get(box.id) })),
+            containers: view.containers.map(box => ({ ...box, ...live?.containers?.get(box.id) })),
+          };
+          const allBoxes = [
+            ...geometry.groups.map(box => ({ kind: 'file', box })),
+            ...geometry.containers.filter(c => !c.root).map(box => ({ kind: 'dir', box })),
+          ];
+          const resolveBox = (query) => {
+            if (typeof query !== 'string' || !query.trim()) throw new Error('请提供文件框或目录容器的 ID 或名称');
+            const q = query.trim();
+            const exact = allBoxes.find(b => b.box.id === q);
+            if (exact) return exact;
+            const lower = q.toLowerCase();
+            const matches = allBoxes.filter(b =>
+              b.box.id.toLowerCase() === lower ||
+              String(b.box.label || '').toLowerCase() === lower ||
+              b.box.id.toLowerCase().endsWith('/' + lower)
+            );
+            if (matches.length === 1) return matches[0];
+            if (matches.length > 1) throw new Error(`容器「${q}」重名，请使用完整路径：${matches.slice(0, 6).map(m => m.box.id).join('、')}`);
+            throw new Error(`当前画布没有文件框或目录容器「${q}」`);
+          };
+          const boxMembers = (entry) => entry.kind === 'file'
+            ? nodes.filter(n => nodeGroup.get(n.id) === entry.box.id)
+            : nodes.filter(n => {
+              const g = nodeGroup.get(n.id);
+              return g && (g === entry.box.id || g.startsWith(entry.box.id + '/'));
+            });
+          const boundsForMove = entries => {
+            // 本批已移动和即将移动的节点都按保存时的规则包框；未改动的参照框沿用当前尺寸。
+            const moved = new Set([...updated.values(), ...entries.flatMap(boxMembers)]);
+            const targets = [...moved].map(n => ({ node: { ...n, group: nodeGroup.get(n.id) }, x: n.x, y: n.y }));
+            const { boxes } = arrangementBoxGeometry(geometry, targets);
+            return new Map(boxes.map(({ box, bounds }) => [box, bounds]));
+          };
+          const shiftEntry = (entry, dx, dy) => {
+            const members = boxMembers(entry);
+            for (const n of members) {
+              n.x = Math.max(24, Math.round(n.x + dx));
+              n.y = Math.max(48, Math.round(n.y + dy));
+              updated.set(n.id, n);
+            }
+          };
+
+          if (action === 'move_group') {
+            const list = Array.isArray(args.moves) && args.moves.length ? args.moves
+              : args.group ? [{ id: args.group, x: args.x, y: args.y, dx: args.dx, dy: args.dy, relativeTo: args.relativeTo, placement: args.placement, gap: args.gap }] : [];
+            if (!list.length) return fail('move_group 需要提供 group 或 moves');
+            for (const move of list) {
+              const entry = resolveBox(move.id ?? move.group);
+              const bounds = boundsForMove([entry]);
+              const cur = bounds.get(entry.box);
+              let targetX = cur.x;
+              let targetY = cur.y;
+              let axis = 'x';
+              let direction = 1;
+              if (move.relativeTo !== undefined || move.placement !== undefined) {
+                const anchorEntry = resolveBox(move.relativeTo);
+                if (anchorEntry.box.id === entry.box.id || !['left', 'right', 'above', 'below'].includes(move.placement)) {
+                  return fail('相对移动容器需要另一个参照容器和有效的 placement');
+                }
+                const anchor = bounds.get(anchorEntry.box);
+                const gap = gapOf(move.gap ?? 36);
+                axis = ['left', 'right'].includes(move.placement) ? 'x' : 'y';
+                direction = ['left', 'above'].includes(move.placement) ? -1 : 1;
+                targetX = anchor.x;
+                targetY = anchor.y;
+                if (move.placement === 'right') targetX = anchor.x + anchor.w + gap;
+                else if (move.placement === 'left') targetX = Math.max(24, anchor.x - cur.w - gap);
+                else if (move.placement === 'below') targetY = anchor.y + anchor.h + gap;
+                else if (move.placement === 'above') targetY = Math.max(48, anchor.y - cur.h - gap);
+              } else {
+                if (canvasNumber(move.x)) targetX = Math.max(24, move.x);
+                if (canvasNumber(move.y)) targetY = Math.max(48, move.y);
+                if (canvasNumber(move.dx)) targetX = Math.max(24, targetX + move.dx);
+                if (canvasNumber(move.dy)) targetY = Math.max(48, targetY + move.dy);
+                axis = Math.abs(targetX - cur.x) >= Math.abs(targetY - cur.y) ? 'x' : 'y';
+                direction = (axis === 'x' ? targetX - cur.x : targetY - cur.y) < 0 ? -1 : 1;
+              }
+              const targetRect = { x: targetX, y: targetY, w: cur.w, h: cur.h };
+              const memberIds = new Set(boxMembers(entry).map(n => n.id));
+              const obstacleRects = allBoxes
+                .filter(b => b.kind === 'file' && !boxMembers(b).some(n => memberIds.has(n.id)))
+                .map(b => {
+                  const r = bounds.get(b.box);
+                  return { x: r.x - 16, y: r.y - 16, w: r.w + 32, h: r.h + 32 };
+                });
+              targetRect[axis] += clearCanvasAxis([targetRect], obstacleRects, axis, direction);
+              shiftEntry(entry, targetRect.x - cur.x, targetRect.y - cur.y);
+            }
+          } else {
+            const axis = args.axis || 'x';
+            if (!['x', 'y'].includes(axis)) return fail('axis 必须为 x（同行）或 y（同列）');
+            const queries = Array.isArray(args.groups) && args.groups.length >= 2 ? args.groups
+              : Array.isArray(args.nodes) && args.nodes.length >= 2 ? args.nodes
+              : view.groups.map(g => g.id);
+            const entries = [...new Map(queries.map(q => { const b = resolveBox(q); return [b.box.id, b]; })).values()];
+            if (entries.length < 2) return fail('至少需要 2 个文件框或目录容器才能对齐');
+            const gap = gapOf(args.gap ?? 36);
+            const bounds = boundsForMove(entries);
+            const items = entries.map(entry => ({ entry, rect: bounds.get(entry.box) }));
+            items.sort((a, b) => a.rect[axis] - b.rect[axis]);
+            const across = axis === 'x' ? 'y' : 'x';
+            const length = axis === 'x' ? 'w' : 'h';
+            const line = Math.max(across === 'y' ? 48 : 24, items[0].rect[across]);
+            let cursor = Math.max(axis === 'x' ? 24 : 48, items[0].rect[axis]);
+            for (const item of items) {
+              const next = { ...item.rect, [across]: line, [axis]: cursor };
+              shiftEntry(item.entry, next.x - item.rect.x, next.y - item.rect.y);
+              cursor = next[axis] + item.rect[length] + gap;
+            }
+          }
+        } else if (action === 'tidy') {
+          // 按调用拓扑深度一键整理画布：支持 LR（从左到右）与 TB（从上到下），自动按文件/目录干净紧凑排布且零重叠。
+          const direction = args.direction === 'TB' ? 'TB' : 'LR';
+          const nodeGapX = gapOf(args.gap ?? 28);
+          const nodeGapY = gapOf(args.gap ?? 22);
+          const groupGap = gapOf(args.groupGap ?? 44);
+
+          // 1. 计算每个节点的调用层级（rank）
+          const fnIds = new Set(nodes.filter(n => n.kind !== 'var').map(n => n.id));
+          const outAdj = new Map(nodes.map(n => [n.id, []]));
+          const inDeg = new Map(nodes.map(n => [n.id, 0]));
+          for (const e of view.edges || []) {
+            if (!fnIds.has(e.from) || !fnIds.has(e.to) || e.from === e.to) continue;
+            outAdj.get(e.from).push(e.to);
+            inDeg.set(e.to, (inDeg.get(e.to) || 0) + 1);
+          }
+          const rank = new Map();
+          const queue = [...fnIds].filter(id => (inDeg.get(id) || 0) === 0);
+          if (!queue.length && fnIds.size) queue.push([...fnIds][0]);
+          const visited = new Set();
+          for (const id of queue) rank.set(id, 0);
+          while (queue.length) {
+            const u = queue.shift();
+            visited.add(u);
+            const ru = rank.get(u) || 0;
+            for (const v of outAdj.get(u) || []) {
+              const nextR = ru + 1;
+              if ((rank.get(v) ?? -1) < nextR && nextR <= nodes.length) {
+                rank.set(v, nextR);
+              }
+              const deg = (inDeg.get(v) || 1) - 1;
+              inDeg.set(v, deg);
+              if (deg === 0 && !visited.has(v)) queue.push(v);
+            }
+          }
+          for (const n of nodes) {
+            if (n.kind === 'var') {
+              const peers = (view.edges || [])
+                .filter(e => e.from === n.id || e.to === n.id)
+                .map(e => rank.get(e.from === n.id ? e.to : e.from))
+                .filter(Number.isFinite);
+              rank.set(n.id, peers.length ? Math.round(peers.reduce((s, r) => s + r, 0) / peers.length) : 0);
+            } else if (!rank.has(n.id)) {
+              rank.set(n.id, 0);
+            }
+          }
+
+          const layoutNodeCluster = (cluster, startX, startY) => {
+            const buckets = new Map();
+            for (const n of cluster) {
+              const r = rank.get(n.id) ?? 0;
+              if (!buckets.has(r)) buckets.set(r, []);
+              buckets.get(r).push(n);
+            }
+            const layers = [...buckets.keys()].sort((a, b) => a - b).map(r => buckets.get(r));
+            for (const layer of layers) {
+              layer.sort((a, b) => (a.kind === 'var') - (b.kind === 'var') || String(a.name || a.id).localeCompare(String(b.name || b.id)));
+            }
+            let maxX = startX, maxY = startY;
+            if (direction === 'LR') {
+              let cx = startX;
+              for (const layer of layers) {
+                let cy = startY;
+                let colW = 0;
+                for (const n of layer) {
+                  n.x = Math.round(cx);
+                  n.y = Math.round(cy);
+                  updated.set(n.id, n);
+                  colW = Math.max(colW, n.w);
+                  cy += n.h + nodeGapY;
+                }
+                maxY = Math.max(maxY, cy - nodeGapY);
+                cx += colW + nodeGapX;
+              }
+              maxX = Math.max(maxX, cx - nodeGapX);
+            } else {
+              let cy = startY;
+              for (const layer of layers) {
+                let cx = startX;
+                let rowH = 0;
+                for (const n of layer) {
+                  n.x = Math.round(cx);
+                  n.y = Math.round(cy);
+                  updated.set(n.id, n);
+                  rowH = Math.max(rowH, n.h);
+                  cx += n.w + nodeGapX;
+                }
+                maxX = Math.max(maxX, cx - nodeGapX);
+                cy += rowH + nodeGapY;
+              }
+              maxY = Math.max(maxY, cy - nodeGapY);
+            }
+            return { w: Math.max(1, maxX - startX), h: Math.max(1, maxY - startY) };
+          };
+
+          if (layoutMode === 'flat' || !view.groups?.length) {
+            layoutNodeCluster(nodes, 48, 48);
+          } else {
+            // 按目录树自底向上排列文件框，确保所有目录容器互不重叠且按拓扑层级从左到右（或从上到下）排列。
+            const groupNodes = new Map();
+            for (const n of nodes) {
+              const gid = nodeGroup.get(n.id) || '__ungrouped__';
+              if (!groupNodes.has(gid)) groupNodes.set(gid, []);
+              groupNodes.get(gid).push(n);
+            }
+            const dirIds = new Set((view.containers || []).filter(c => !c.root).map(c => c.id));
+            const parentOf = (id) => {
+              const parts = String(id).split('/');
+              for (let i = parts.length - 1; i >= 1; i--) {
+                const cand = parts.slice(0, i).join('/');
+                if (dirIds.has(cand)) return cand;
+              }
+              return '__root__';
+            };
+            const childrenOf = new Map();
+            const addChild = (parent, item) => {
+              if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+              childrenOf.get(parent).push(item);
+            };
+            const groupMetrics = new Map();
+            for (const g of view.groups) {
+              const members = groupNodes.get(g.id) || [];
+              if (!members.length) continue;
+              const { w, h } = layoutNodeCluster(members, 0, 0);
+              const avgRank = members.reduce((s, n) => s + (rank.get(n.id) || 0), 0) / members.length;
+              const entry = { kind: 'file', id: g.id, members, pad: 8, top: 32, w: w + 16, h: h + 40, rank: avgRank, relX: 0, relY: 0 };
+              groupMetrics.set(g.id, entry);
+              addChild(parentOf(g.id), entry);
+            }
+            const dirMetrics = new Map();
+            const sortedDirs = [...dirIds].sort((a, b) => b.length - a.length);
+            for (const dirId of sortedDirs) {
+              const entry = { kind: 'dir', id: dirId, pad: 10, top: 32, children: [], w: 0, h: 0, rank: 0, relX: 0, relY: 0 };
+              dirMetrics.set(dirId, entry);
+              addChild(parentOf(dirId), entry);
+            }
+            const packChildren = (items, gap) => {
+              if (!items.length) return { w: 0, h: 0 };
+              items.sort((a, b) => a.rank - b.rank || String(a.id).localeCompare(String(b.id)));
+              // 按 rank 分栏/分行，使同一层级的模块竖排（LR 模式）或横排（TB 模式），避免拉成超长一字长蛇。
+              const bands = new Map();
+              for (const item of items) {
+                const band = Math.round(item.rank);
+                if (!bands.has(band)) bands.set(band, []);
+                bands.get(band).push(item);
+              }
+              const orderedBands = [...bands.keys()].sort((a, b) => a - b).map(k => bands.get(k));
+              let maxX = 0, maxY = 0;
+              if (direction === 'LR') {
+                let cx = 0;
+                for (const band of orderedBands) {
+                  let cy = 0, colW = 0;
+                  for (const item of band) {
+                    item.relX = cx;
+                    item.relY = cy;
+                    colW = Math.max(colW, item.w);
+                    cy += item.h + gap;
+                  }
+                  maxY = Math.max(maxY, cy - gap);
+                  cx += colW + gap;
+                }
+                maxX = Math.max(0, cx - gap);
+              } else {
+                let cy = 0;
+                for (const band of orderedBands) {
+                  let cx = 0, rowH = 0;
+                  for (const item of band) {
+                    item.relX = cx;
+                    item.relY = cy;
+                    rowH = Math.max(rowH, item.h);
+                    cx += item.w + gap;
+                  }
+                  maxX = Math.max(maxX, cx - gap);
+                  cy += rowH + gap;
+                }
+                maxY = Math.max(0, cy - gap);
+              }
+              return { w: maxX, h: maxY };
+            };
+            for (const dirId of sortedDirs) {
+              const dir = dirMetrics.get(dirId);
+              dir.children = childrenOf.get(dirId) || [];
+              if (!dir.children.length) continue;
+              const inner = packChildren(dir.children, Math.max(24, Math.round(groupGap * 0.75)));
+              dir.w = inner.w + dir.pad * 2;
+              dir.h = inner.h + dir.top + dir.pad;
+              dir.rank = dir.children.reduce((s, c) => s + c.rank, 0) / dir.children.length;
+            }
+            const topItems = (childrenOf.get('__root__') || []).filter(item => item.w > 0 && item.h > 0);
+            packChildren(topItems, groupGap);
+            const placeTree = (item, baseX, baseY) => {
+              const x = baseX + item.relX;
+              const y = baseY + item.relY;
+              if (item.kind === 'file') {
+                for (const n of item.members) {
+                  n.x = Math.round(x + item.pad + n.x);
+                  n.y = Math.round(y + item.top + n.y);
+                  updated.set(n.id, n);
+                }
+              } else {
+                for (const child of item.children) {
+                  placeTree(child, x + item.pad, y + item.top);
+                }
+              }
+            };
+            for (const item of topItems) placeTree(item, 48, 56);
+            const ungrouped = groupNodes.get('__ungrouped__') || [];
+            if (ungrouped.length) {
+              const bottomY = Math.max(56, ...[...updated.values()].map(n => n.y + n.h)) + groupGap;
+              layoutNodeCluster(ungrouped, 48, bottomY);
+            }
+          }
         }
 
         const clear = action === 'reset';
@@ -3268,10 +3712,15 @@ export const server = http.createServer(async (req, res) => {
           const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
           const traces = resolved.slice(0, 15).map((id) => {
             const tr = traceToTasks(MODEL, id, { limit });
+            const directCallers = (MODEL._index?.inAdj?.get(id) || [])
+              .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
+              .slice(0, 20)
+              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
             return {
               id,
               upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
               chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
+              directCallers,
               totalTasks: tr.totalTasks || 0,
             };
           });
@@ -3503,7 +3952,240 @@ export const server = http.createServer(async (req, res) => {
             taskPeriods: src.taskPeriods,
             upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
             calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
+            indirectCalls: (MODEL.indirectCalls || []).filter(ic => ic.caller === src.id).slice(0, 15),
             varAccess: (src.varAccess || []).slice(0, 25),
+          };
+        }
+        if (name === 'read_source') {
+          const encoding = ['auto', 'cp932', 'utf-8'].includes(args.encoding) ? args.encoding : 'auto';
+          const fileArg = typeof args.file === 'string' ? args.file.replace(/\\/g, '/').trim() : '';
+          const query = typeof args.query === 'string' ? args.query.trim() : '';
+          if (fileArg && !query) {
+            const start = Math.max(1, Math.trunc(Number(args.startLine) || 1));
+            const end = Math.max(start, Math.min(start + 199, Math.trunc(Number(args.endLine) || (start + 119))));
+            const q = new URLSearchParams({ file: fileArg, startLine: String(start), endLine: String(end), encoding });
+            const src = await readMcpSource(q);
+            assertActive();
+            return {
+              ok: true,
+              file: src.file,
+              startLine: src.startLine,
+              endLine: src.endLine,
+              totalLines: src.totalLines,
+              truncated: Boolean(src.truncated),
+              sourceEncoding: src.sourceEncoding,
+              source: src.source,
+            };
+          }
+          if (!query) return { ok: false, error: 'read_source 需要提供 file（按行读取）或 query（全文检索）' };
+          const limit = Math.max(1, Math.min(50, Math.trunc(Number(args.limit) || 25)));
+          const pathPrefixes = normalizePathPrefixes(args.paths);
+          const comparison = COMPARISON;
+          const { model } = traceContext(null);
+          const candidateFiles = (model.files || [])
+            .filter(f => !f.manual && f.rel)
+            .filter(f => !fileArg || f.rel === fileArg || f.rel.endsWith('/' + fileArg))
+            .filter(f => {
+              if (!pathPrefixes.length) return true;
+              const rel = normalizeFilterPath(f.rel);
+              return pathPrefixes.some(p => rel === p || rel.startsWith(p + '/'));
+            });
+          const needle = query.toLowerCase();
+          const matches = [];
+          for (const f of candidateFiles) {
+            if (matches.length >= limit) break;
+            assertActive();
+            let raw;
+            try { raw = await readIndexedSourceBytes(model, f.rel, comparison); } catch { continue; }
+            assertActive();
+            const decoder = sourceDecoder(raw, encoding);
+            const text = decoder.decode(raw.subarray(decoder.bomLength));
+            const lines = text.split(/\r\n|\r|\n/);
+            for (let idx = 0; idx < lines.length; idx++) {
+              if (!lines[idx].toLowerCase().includes(needle)) continue;
+              const startCtx = Math.max(0, idx - 1);
+              const endCtx = Math.min(lines.length, idx + 2);
+              matches.push({
+                file: f.rel,
+                line: idx + 1,
+                text: lines[idx].trim().slice(0, 220),
+                context: lines.slice(startCtx, endCtx).map((l, k) => `${startCtx + k + 1}: ${l.slice(0, 180)}`).join('\n'),
+              });
+              if (matches.length >= limit) break;
+            }
+          }
+          return { ok: true, query, matches, total: matches.length, scannedFiles: candidateFiles.length };
+        }
+        if (name === 'inspect_indirect_calls') {
+          const fnQuery = typeof args.function === 'string' ? args.function.trim() : '';
+          const tableQuery = typeof args.table === 'string' ? args.table.trim() : '';
+          const limit = Math.max(1, Math.min(60, Math.trunc(Number(args.limit) || 30)));
+          const allIndirect = Array.isArray(MODEL.indirectCalls) ? MODEL.indirectCalls : [];
+          const allTables = Array.isArray(MODEL.fnptrTables) ? MODEL.fnptrTables : [];
+
+          let targetFnIds = new Set();
+          let targetFnNames = new Set();
+          if (fnQuery) {
+            const { resolved, ambiguous } = resolveSymbols(MODEL, [fnQuery], 'fn');
+            for (const id of [...resolved, ...ambiguous.flatMap(a => a.candidates)]) {
+              targetFnIds.add(id);
+              const node = MODEL._index?.byId?.get(id);
+              if (node?.name) targetFnNames.add(node.name);
+            }
+            const short = fnQuery.split('::').pop().replace(/\(\s*\)$/, '');
+            if (short) targetFnNames.add(short);
+          }
+
+          const matchedTables = allTables.filter((tb) => {
+            if (tableQuery && !tb.name.toLowerCase().includes(tableQuery.toLowerCase())) return false;
+            if (fnQuery && !tableQuery) {
+              const vals = Object.values(tb.map || {});
+              const holdsTarget = vals.some((v) => targetFnNames.has(v));
+              const usedByCaller = allIndirect.some((ic) => targetFnIds.has(ic.caller) && ic.table?.name === tb.name);
+              return holdsTarget || usedByCaller;
+            }
+            return true;
+          }).slice(0, limit).map((tb) => {
+            const entries = Object.entries(tb.map || {});
+            for (const slot of tb.unresolvedSlots || []) entries.push([slot, null]);
+            return {
+              name: tb.name,
+              file: tb.file || '',
+              line: tb.line || 0,
+              isStatic: Boolean(tb.isStatic),
+              slotCount: entries.length,
+              slots: entries.slice(0, 60).map(([slot, fnName]) => ({ slot, target: fnName })),
+              ...(entries.length > 60 ? { truncated: true } : {}),
+            };
+          });
+
+          const matchedTableNames = new Set(matchedTables.map(t => t.name));
+          const matchedCalls = allIndirect.filter((ic) => {
+            if (tableQuery && ic.table?.name !== tableQuery && ic.receiver !== tableQuery) return false;
+            if (fnQuery) {
+              if (targetFnIds.has(ic.caller)) return true;
+              if (ic.candidates?.some((c) => targetFnIds.has(c.id) || targetFnNames.has(c.name))) return true;
+              if (ic.table && matchedTableNames.has(ic.table.name)) return true;
+              return false;
+            }
+            return true;
+          }).slice(0, limit);
+
+          return {
+            ok: true,
+            indirectCalls: matchedCalls,
+            tables: matchedTables,
+            inferredEdges: loadInferredEdges(PROJECT.id).slice(0, 40),
+          };
+        }
+        if (name === 'add_call_edge') {
+          if (COMPARISON) return { ok: false, error: '比较模式不支持添加推断调用边' };
+          const rawEdges = Array.isArray(args.edges) ? args.edges : [];
+          if (!rawEdges.length) return { ok: false, error: 'edges 不能为空' };
+          const removing = args.remove === true;
+          const addToCanvas = args.addToCanvas !== false;
+          const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
+          const resolvedEdges = [];
+          const ambiguous = [];
+          const notFound = [];
+          for (const item of rawEdges.slice(0, 40)) {
+            if (!item || typeof item !== 'object') continue;
+            const fromRes = resolveSymbols(MODEL, [item.from], 'fn');
+            const toRes = resolveSymbols(MODEL, [item.to], 'fn');
+            if (fromRes.ambiguous.length) { ambiguous.push(...fromRes.ambiguous); continue; }
+            if (toRes.ambiguous.length) { ambiguous.push(...toRes.ambiguous); continue; }
+            if (!fromRes.resolved.length) { notFound.push(String(item.from || '')); continue; }
+            if (!toRes.resolved.length) { notFound.push(String(item.to || '')); continue; }
+            const fromId = fromRes.resolved[0];
+            const toId = toRes.resolved[0];
+            if (fromId === toId) continue;
+            resolvedEdges.push({
+              from: fromId,
+              to: toId,
+              line: Number.isInteger(item.line) && item.line >= 0 ? item.line : 0,
+              via: typeof item.via === 'string' && item.via.trim() ? item.via.trim().slice(0, 120) : 'AI 核实间接调用',
+              reason: typeof item.reason === 'string' ? item.reason.trim().slice(0, 240) : reason,
+            });
+          }
+          if (ambiguous.length) {
+            return {
+              ok: false,
+              needsVehicleChoice: true,
+              error: '部分函数名存在重名，请先调用 ask_user 确认目标文件/车型或传入完整「文件::函数名」',
+              ambiguous,
+            };
+          }
+          if (!resolvedEdges.length) {
+            return { ok: false, error: '未解析到有效的调用边端点', notFound };
+          }
+          const currentList = loadInferredEdges(PROJECT.id);
+          let nextList;
+          if (removing) {
+            const rmSet = new Set(resolvedEdges.map(e => `${e.from}|${e.to}`));
+            nextList = currentList.filter(e => !rmSet.has(`${e.from}|${e.to}`));
+          } else {
+            const byPair = new Map(currentList.map(e => [`${e.from}|${e.to}|${e.line}`, e]));
+            for (const e of resolvedEdges) byPair.set(`${e.from}|${e.to}|${e.line}`, e);
+            nextList = [...byPair.values()];
+          }
+          saveInferredEdges(PROJECT.id, nextList);
+          applyInferredEdges(MODEL, PROJECT.id, nextList);
+          S = stats(MODEL);
+
+          const review = reviewWriteResult();
+          if (!removing && addToCanvas) {
+            const page = latestPage() || {
+              projectId: PROJECT.id, comparisonId: null, roots: [], expansions: [], vars: [], hiddenVars: [],
+              up: 0, down: 0, group: true, groupMode: 'file', empty: true,
+            };
+            const existingRoots = Array.isArray(page.roots) ? [...page.roots] : [];
+            const rootSet = new Set(existingRoots);
+            let addedNodes = false;
+            for (const e of resolvedEdges) {
+              for (const id of [e.from, e.to]) {
+                if (!rootSet.has(id)) {
+                  rootSet.add(id);
+                  existingRoots.push(id);
+                  addedNodes = true;
+                }
+              }
+            }
+            if (addedNodes) {
+              const key = 'ui.last-view.' + PROJECT.id;
+              const nextPage = {
+                ...page,
+                projectId: PROJECT.id,
+                comparisonId: null,
+                roots: existingRoots,
+                empty: false,
+                ts: Date.now(),
+              };
+              store.transaction(() => {
+                nextPage.revision = store.appendEvent(PROJECT.id, {
+                  op: 'view.compose',
+                  actor: 'ai',
+                  target: resolvedEdges[0].from,
+                  before: page,
+                  after: { ...nextPage, count: existingRoots.length, rootCount: existingRoots.length, reason: reason || '补全间接调用链', view: viewSnapshot(nextPage) },
+                });
+                store.setSetting(key, nextPage);
+              });
+              if (!review.updatedWhileReviewing) pageState = nextPage;
+              broadcastChange('view.compose', 'ai', { page: nextPage, reason: reason || '补全间接调用链' });
+            } else {
+              broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
+            }
+          } else {
+            broadcastChange('edge.annotate', 'ai', { projectId: PROJECT.id });
+          }
+
+          return {
+            ok: true,
+            removed: removing,
+            addedCount: resolvedEdges.length,
+            edges: resolvedEdges,
+            notFound,
+            ...review,
           };
         }
         if (name === 'add_to_canvas') {
@@ -3990,6 +4672,7 @@ export const server = http.createServer(async (req, res) => {
           config: cfg,
           prompt,
           images,
+          attachments,
           history: p.history || [],
           context,
           executeTool: executeAiTool,

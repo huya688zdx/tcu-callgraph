@@ -1,5 +1,5 @@
 import { collectArgs } from './lexer.js';
-import { matchBrace } from './extract.js';
+import { matchBrace, statementEnd } from './extract.js';
 import { numericConstant, scheduleConfig, unwrap } from './tcu-schedule.js';
 
 // 任务名给出标称周期。沿整个工程的调用图传播，条件调用只表示可能运行于该任务。
@@ -113,26 +113,6 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
       lines.set(t.line, (lines.get(t.line) ?? true) && locks.size > 0);
     }
   };
-  function statementEnd(i, end) {
-    const op = value(i);
-    if (op === '{') {
-      const close = matchBrace(tokens, i);
-      return close < 0 ? end : close + 1;
-    }
-    if (['if', 'for', 'while', 'switch'].includes(op) && value(i + 1) === '(') {
-      const start = collectArgs(tokens, i + 1)[1];
-      const next = statementEnd(start, end);
-      return op === 'if' && value(next) === 'else' ? statementEnd(next + 1, end) : next;
-    }
-    if (op === 'do') {
-      const next = statementEnd(i + 1, end);
-      if (value(next) !== 'while' || value(next + 1) !== '(') return next;
-      return Math.min(end, collectArgs(tokens, next + 1)[1] + 1);
-    }
-    while (i < end && value(i) !== ';') i++;
-    return Math.min(i + 1, end);
-  }
-
   function statement(i, end, depth, guards, locks, jumps) {
     const op = value(i);
     if (op === '{') {
@@ -167,7 +147,7 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
       const nested = gate ? [...guards, gate] : guards;
       const yes = new Map(locks), no = new Map(locks);
       const branchJumps = op === 'if' ? jumps : { break: [], continue: op === 'switch' ? jumps?.continue : [] };
-      if (op === 'while' || op === 'for') discardLoopLocks(start, statementEnd(start, end), yes);
+      if (op === 'while' || op === 'for') discardLoopLocks(start, statementEnd(tokens, start, end), yes);
       const next = statement(start, end, depth + 1, nested, yes, branchJumps);
       const after = op === 'if' && value(next) === 'else'
         ? statement(next + 1, end, depth + 1, guards, no, jumps) : next;
@@ -181,7 +161,7 @@ function schedulingEvidence(fn, tokens, fileMacros, calls) {
     if (op === 'do') {
       const start = i + 1;
       // do-while(0) 执行一次，其余循环可能以不同中断状态重入。
-      const tail = statementEnd(start, end);
+      const tail = statementEnd(tokens, start, end);
       const condition = value(tail) === 'while' && value(tail + 1) === '('
         ? collectArgs(tokens, tail + 1)[0][0] : null;
       if (!condition || numberAt(condition.map(t => t.v), i) !== 0) discardLoopLocks(start, tail, locks);
@@ -443,7 +423,7 @@ export function needsCounterAnalysis(model) {
 
 export function taskPeriods(model) {
   const cached = cache.get(model);
-  if (cached && cached.df === model._df) return cached.contexts;
+  if (cached && cached.df === model._df && cached.index === model._index) return cached.contexts;
   const collected = new Map();
   const tasks = projectTasks(model);
   const byEntry = new Map();
@@ -567,7 +547,7 @@ export function taskPeriods(model) {
     }
     return [id, [...unique.values()].sort(contextOrder)];
   }));
-  cache.set(model, { df, contexts });
+  cache.set(model, { df, index: model._index, contexts });
   return contexts;
 }
 

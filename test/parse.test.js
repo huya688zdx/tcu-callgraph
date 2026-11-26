@@ -284,3 +284,456 @@ const Ops ops = { .tick = tick };
   assert.deepEqual(entry.varAccess.map(({ id, read, write }) => [id, read, write]),
     [['var::later', true, true], ['var::caller.c::local_count', true, true]]);
 });
+
+test('宏复合表达式 #define x (a()+b())、同文件重定义、变参宏、外层括号调用与假边过滤', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-macro-edge-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'macro.c'), `
+int a(void) { return 1; }
+int b(void) { return 2; }
+void one(void) {}
+void two(void) {}
+int never_called(void) { return 0; }
+#define X (a() + b())
+#define WRAP(...) (__VA_ARGS__)
+#define ID(fn) fn
+#define M one
+int use_x(void) {
+  void local_proto(void);
+  int sz = (int)sizeof(never_called());
+  M();
+  WRAP(two());
+  ID(one)();
+  (a)();
+  return X + sz;
+}
+#undef M
+#define M two
+void use_m_after(void) {
+  M();
+}
+`);
+  const model = loadModel(dir);
+  const out = (name) => (model._index.outAdj.get(`macro.c::${name}`) || []).filter((e) => e.kind !== 'var');
+  const useX = out('use_x');
+  assert.ok(useX.some((e) => e.to === 'macro.c::a' && e.kind === 'macro'), '#define X (a()+b()) 应提取到 a()');
+  assert.ok(useX.some((e) => e.to === 'macro.c::b' && e.kind === 'macro'), '#define X (a()+b()) 应提取到 b()');
+  assert.ok(useX.some((e) => e.to === 'macro.c::one' && e.kind === 'macro'), 'M() 在重定义前应指向 one');
+  assert.ok(useX.some((e) => e.to === 'macro.c::two' && e.kind === 'macro'), '变参宏 WRAP(two()) 应提取到 two');
+  assert.ok(useX.some((e) => e.to === 'macro.c::a' && e.kind === 'direct'), '(a)() 应识别为直接调用');
+  assert.ok(!useX.some((e) => e.to === 'macro.c::never_called'), 'sizeof(never_called()) 不求值不应建边');
+  assert.ok(!useX.some((e) => e.callee === 'local_proto'), '块内局部函数原型不应被当成调用');
+  const after = out('use_m_after');
+  assert.deepEqual(after.map((e) => e.to), ['macro.c::two'], '#undef 重定义后应指向 two');
+});
+
+test('1D/2D 常量函数指针数组与结构体表：常量下标直连、动态下标保留候选且 static 表按文件隔离', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-fnptr-2d-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t step; } Ops;
+void fnA(void) {}
+void vvv(void) {}
+void ggg(void) {}
+void jjj(void) {}
+void ghh(void) {}
+void jkk(void) {}
+void kkk(void) {}
+static const Ops ops = { .step = fnA };
+static const Ops wrapped = { .step = ((fnA)) };
+static const fn_t addresses[] = { &(vvv), ((void (*)(void))(&ghh)), (fn_t)jjj };
+void call_wrapped(void) { wrapped.step(); addresses[0](); addresses[1](); addresses[2](); }
+const fn_t z[] = { vvv, ghh };
+const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, kkk } };
+const Ops tbl[] = { { .step = vvv }, { .step = ghh } };
+void call_const(void) {
+  ops.step();
+  z[1]();
+  e[1][0]();
+  tbl[0].step();
+}
+void call_dyn(int r, int c) {
+  z[r]();
+  e[r][c]();
+  tbl[r].step();
+}
+`);
+  fs.writeFileSync(path.join(dir, 'b.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t step; } Ops;
+void fnB(void) {}
+static const Ops ops = { .step = fnB };
+void call_b(void) {
+  ops.step();
+}
+`);
+  const model = loadModel(dir);
+  const out = (id) => (model._index.outAdj.get(id) || []).filter((e) => e.kind !== 'var');
+  const constTargets = out('a.c::call_const').map((e) => e.to);
+  assert.ok(constTargets.includes('a.c::fnA'), 'a.c static ops.step() 不应被 b.c 同名 static 表污染');
+  assert.ok(constTargets.includes('a.c::ghh'), '常量下标 z[1]() 与 e[1][0]() 应直接连到 ghh');
+  assert.ok(constTargets.includes('a.c::vvv'), '结构体数组常量下标 tbl[0].step() 应直接连到 vvv');
+  assert.deepEqual(out('b.c::call_b').map((e) => e.to), ['b.c::fnB'], 'b.c static ops 应独立指向 fnB');
+  assert.deepEqual(model.fnptrTables.find(table => table.name === 'wrapped').map, { step: 'fnA' });
+  assert.deepEqual(out('a.c::call_wrapped').map(e => [e.kind, e.to]), [
+    ['fnptr', 'a.c::fnA'], ['fnptr', 'a.c::vvv'], ['fnptr', 'a.c::ghh'], ['fnptr', 'a.c::jjj'],
+  ]);
+
+  // 动态下标不盲目画死所有候选，而是在 indirectCalls 保留完整候选供 LLM 判断
+  assert.equal(out('a.c::call_dyn').length, 0);
+  const dynSites = (model.indirectCalls || []).filter((ic) => ic.caller === 'a.c::call_dyn');
+  assert.equal(dynSites.length, 3);
+  const site2d = dynSites.find((ic) => ic.table?.name === 'e');
+  assert.ok(site2d);
+  assert.deepEqual(site2d.candidates.map((c) => c.name).sort(), ['ggg', 'ghh', 'jjj', 'jkk', 'kkk', 'vvv']);
+  assert.ok(site2d.candidates.some((c) => c.slot === '[1][0]' && c.name === 'ghh'));
+});
+
+test('保留初始化式调用，解析函数内分派表作用域和八进制下标', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-local-tables-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef void (*fn_t)(void);
+typedef struct { fn_t run; } Ops;
+void global_target(void) {}
+void first_local(void) {}
+void second_local(void) {}
+void inner_local(void) {}
+int number(void) { return 1; }
+int *pointer(void) { return 0; }
+static const Ops ops = { .run = global_target };
+static const fn_t table[11] = { [010u] = first_local, [10] = second_local };
+void first(void) {
+  ops.run();
+  static const Ops ops = { .run = first_local };
+  ops.run();
+  { static const Ops ops = { .run = inner_local }; ops.run(); }
+  ops.run();
+}
+void second(void) { static const Ops ops = { .run = second_local }; ops.run(); }
+void global_only(void) { ops.run(); }
+void octal(void) { table[010](); table[8](); table[10](); }
+int initialize(void) {
+  typedef int Value;
+  extern int *prototype(void);
+  extern Value *typedef_prototype(void);
+  int x = 2 * number();
+  int y = *pointer();
+  return x + y;
+}
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('first'), ['global_target', 'first_local', 'inner_local', 'first_local']);
+  assert.deepEqual(calls('second'), ['second_local']);
+  assert.deepEqual(calls('global_only'), ['global_target']);
+  assert.deepEqual(calls('octal'), ['first_local', 'first_local', 'second_local']);
+  assert.deepEqual(calls('initialize'), ['number', 'pointer']);
+});
+
+test('区分 typedef 转换和括号调用，并保留解引用分派表下标里的调用', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-casts-and-indices-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef unsigned short Reading, *ReadingPtr;\n');
+  fs.writeFileSync(path.join(dir, 'api.h'), '#include "types.h"\n#define READ_CAST() (Reading)(read_value())\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "api.h"
+#include <stdint.h>
+typedef void (*Handler)(void);
+static unsigned short read_value(void) { return 5; }
+static void first(void) {}
+static void second(void) {}
+static int next(void) { return 0; }
+static int column(void) { return 1; }
+static int handler_t(void) { return 0; }
+static const Handler arr[2][2] = { { first, second }, { second, first } };
+unsigned int cast_values(void) {
+  typedef unsigned int LocalCount;
+  return (uint16_t)(read_value()) + (LocalCount)(read_value()) + READ_CAST() + (handler_t)();
+}
+Handler cast_handler(void) { return (Handler)(0); }
+void dispatch(void) { (*arr[next()][column()])(); }
+`);
+  fs.writeFileSync(path.join(dir, 'other.c'), 'int Reading(void) { return 3; }\nint use(void) { return (Reading)(); }\n');
+  const model = loadModel(dir);
+  const calls = id => (model._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('app.c::cast_values'), ['read_value', 'read_value', 'read_value', 'handler_t']);
+  assert.deepEqual(calls('app.c::cast_handler'), []);
+  assert.deepEqual(calls('other.c::use'), ['Reading']);
+  assert.deepEqual(calls('app.c::dispatch'), ['next', 'column']);
+  const sites = model.indirectCalls.filter(call => call.caller === 'app.c::dispatch');
+  assert.equal(sites.length, 1);
+  assert.deepEqual(sites[0].indices, ['next()', 'column()']);
+  assert.deepEqual(new Set(sites[0].candidates.map(candidate => candidate.name)), new Set(['first', 'second']));
+  assert.ok(!(model.headerEdges || []).some(edge => edge.to === 'ext::Reading'));
+});
+
+test('分派表保留未知指定槽位，已知槽位按初始化文件绑定', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-designators-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), `
+typedef void (*Fn)(void);
+static void target(void) {}
+static void other(void) {}
+#define SLOT (2)
+const Fn table[4] = { [SLOT] = target, other };
+enum { ENUM_SLOT = 2 };
+static const Fn uncertain[4] = { [ENUM_SLOT] = target, other };
+void unknown(void) { uncertain[0](); }
+`);
+  fs.writeFileSync(path.join(dir, 'b.c'), `
+typedef void (*Fn)(void);
+extern const Fn table[4];
+static void target(void) {}
+#define INDEX 2
+void call_sites(void) { table[INDEX](); table[3](); target(); }
+`);
+  const model = loadModel(dir);
+  const calls = id => (model._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls('b.c::call_sites').map(edge => edge.to), ['a.c::target', 'a.c::other', 'b.c::target']);
+  assert.deepEqual(calls('a.c::unknown'), []);
+  const table = model.fnptrTables.find(table => table.name === 'uncertain');
+  assert.equal(table.incomplete, true);
+  assert.deepEqual(table.map, { '[?ENUM_SLOT]': 'target', '[?ENUM_SLOT+1]': 'other' });
+  const site = model.indirectCalls.find(call => call.caller === 'a.c::unknown');
+  assert.deepEqual(site.candidates.map(candidate => candidate.id), ['a.c::target', 'a.c::other']);
+});
+
+test('sizeof 只保留变长数组边界调用，连续调用的实参不生成假边', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-vla-chained-calls-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef unsigned short Count;\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+typedef int (*Fn)(int);
+static int next(void) { return 2; }
+static int second(void) { return 3; }
+static int run(int n) { return n; }
+static Fn factory(int index) { return run; }
+int sizes(const int *values) {
+  return sizeof(int[next()]) + sizeof(Count[second()]) + sizeof(values[next()])
+    + sizeof(next()) + sizeof(int (*)[next()]);
+}
+int chain(int index) { return factory(index)(42) + (factory)(index)(42); }
+int cast_chain(int index) { typedef int Result; return (Result)(run)(index); }
+int conditional(int index) { if (index) (run)(42); return 0; }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('sizes'), ['next', 'second']);
+  assert.deepEqual(calls('chain'), ['factory', 'factory']);
+  assert.deepEqual(calls('cast_chain'), ['run']);
+  assert.deepEqual(calls('conditional'), ['run']);
+});
+
+test('sizeof 在调用处展开宏，只记录变长数组类型中求值的维度', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-sizeof-macro-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), '#define TYPE int[next()]\n#define ALIAS TYPE\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+static int next(void) { return 2; }
+static int second(void) { return 3; }
+#define MATRIX(n) int[n][second()]
+int first(void) { return sizeof(ALIAS); }
+int matrix(void) { return sizeof(MATRIX(next())); }
+#undef TYPE
+#define TYPE values[next()]
+int expr(int *values) { return sizeof(ALIAS); }
+#undef TYPE
+#define TYPE int (*)[next()]
+int ptr(void) { return sizeof(ALIAS); }
+#define MAKE_MATRIX MATRIX
+int matrix_alias(void) { return sizeof(MAKE_MATRIX(next())); }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls('first').map(edge => [edge.callee, edge.line, edge.via]), [
+    ['next', 6, 'ALIAS > TYPE'],
+  ]);
+  assert.deepEqual(calls('matrix').map(edge => edge.callee), ['next', 'second']);
+  assert.deepEqual(calls('matrix_alias').map(edge => edge.callee), ['next', 'second']);
+  assert.deepEqual(calls('expr'), []);
+  assert.deepEqual(calls('ptr'), []);
+});
+
+test('括号内的函数名按调用处展开对象宏，保留函数式宏的同名函数', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-parenthesized-alias-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'api.h'), '#define FN ENTRY\n#define ENTRY first\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "api.h"
+typedef int Result;
+static int first(int n) { return n; }
+static int second(int n) { return n; }
+static int actual(int n) { return n; }
+#define actual(n) second(n)
+#define CAST Result
+int before(int n) { return (FN)(n) + (actual)(n); }
+#undef ENTRY
+#define ENTRY ((second))
+int after(int n) { return ((FN))((actual)(n)) + (CAST)(FN)(n); }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => [edge.to, edge.kind, edge.via]);
+  assert.deepEqual(calls('before'), [
+    ['app.c::first', 'macro', 'FN > ENTRY'], ['app.c::actual', 'direct', undefined],
+  ]);
+  assert.deepEqual(calls('after'), [
+    ['app.c::second', 'macro', 'FN > ENTRY'], ['app.c::actual', 'direct', undefined],
+    ['app.c::second', 'macro', 'FN > ENTRY'],
+  ]);
+});
+
+test('分派表保留可见的外部函数候选，并区分函数指针变量和无关声明', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-external-targets-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'lib.h'), 'void api(void), api_only(void);\n');
+  fs.writeFileSync(path.join(dir, 'entry.h'), '#include "lib.h"\n');
+  fs.writeFileSync(path.join(dir, 'unrelated.h'), 'void numeric(void);\n');
+  fs.writeFileSync(path.join(dir, 'other.c'), 'static void external(void) {}\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "entry.h"
+typedef void (*Fn)(void);
+extern void external(void);
+static void local(void) {}
+static const Fn dispatch[] = { local, external, api };
+static const Fn library[] = { api, api_only };
+enum { numeric = 2 };
+static const int data[] = { numeric };
+void constant(void) { dispatch[0](); dispatch[1](); dispatch[2](); }
+void dynamic(unsigned i) { dispatch[i](); library[i](); }
+void partial(unsigned i, Fn api) {
+  extern void inside(void);
+  const Fn mixed[] = {local, api, inside};
+  const Fn single[] = {local, api};
+  mixed[0](); mixed[2](); mixed[i](); single[i]();
+}
+void different(void) { enum { inside = 1 }; const int values[] = { inside }; }
+void shadow(Fn runtime) {
+  { Fn external = runtime; const Fn dispatch[] = {external}; dispatch[0](); }
+  const Fn restored[] = {external}; restored[0]();
+}
+`);
+  const model = loadModel(dir);
+  const targets = name => (model._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.to);
+  assert.deepEqual(targets('constant'), ['app.c::local', 'ext::external', 'ext::api']);
+  assert.deepEqual(targets('dynamic'), []);
+  assert.deepEqual(targets('partial'), ['app.c::local', 'ext::inside']);
+  assert.deepEqual(targets('shadow'), ['ext::external']);
+  const candidates = table => model.indirectCalls.find(call => call.receiver === table)?.candidates.map(c => c.id);
+  assert.deepEqual(candidates('dispatch'), ['app.c::local', 'ext::external', 'ext::api']);
+  assert.deepEqual(candidates('library'), ['ext::api', 'ext::api_only']);
+  assert.deepEqual(candidates('mixed'), ['app.c::local', 'ext::inside']);
+  assert.deepEqual(candidates('single'), ['app.c::local']);
+  assert.ok(model.externals.some(node => node.id === 'ext::api_only'));
+  assert.ok(!model.fnptrTables.some(table => ['data', 'values'].includes(table.name)));
+});
+
+test('形参和块内指针按声明位置遮蔽分派表，离开块后恢复外层绑定', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-shadow-table-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef void (*Fn)(void);\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+static void file_fn(void) {}
+static void local_fn(void) {}
+static const Fn table[] = {file_fn};
+void param(const Fn *table) { table[0](); }
+void array_param(unsigned n, Fn table[n]) { table[0](); }
+void pointer(const Fn *other) { const Fn *table = other; table[0](); }
+void block(Fn *other) {
+  table[0]();
+  { Fn *table = other; table[0](); }
+  table[0]();
+}
+void nested(Fn *table) {
+  table[0]();
+  { const Fn table[] = {local_fn};
+    table[0](); { Fn *table = 0; table[0](); } table[0]();
+  }
+  table[0]();
+}
+void loop(Fn *other) {
+  for (Fn *table = other; table; table = 0) { table[0](); }
+  table[0]();
+  for (Fn *table = other; table; table = 0) if (other) table[0](); else table[0]();
+  for (Fn table[] = {local_fn}; other; other = 0) table[0]();
+  table[0]();
+}
+`);
+  const model = loadModel(dir);
+  const resolved = name => (model._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.callee);
+  for (const name of ['param', 'array_param', 'pointer']) assert.deepEqual(resolved(name), [], name);
+  assert.deepEqual(resolved('block'), ['file_fn', 'file_fn']);
+  assert.deepEqual(resolved('nested'), ['local_fn', 'local_fn']);
+  assert.deepEqual(resolved('loop'), ['file_fn', 'local_fn', 'file_fn']);
+  const unresolved = model.indirectCalls.filter(call => call.receiver === 'table');
+  assert.equal(unresolved.length, 10);
+  assert.ok(unresolved.every(call => !call.table && !call.candidates.length));
+});
+
+test('静态分派表仅在直接或间接包含其头文件的调用点可见', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-header-table-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const name of ['first', 'second']) {
+    fs.writeFileSync(path.join(dir, name + '.h'), `
+typedef struct { void (*run)(void); } Ops;
+static void target(void) {}
+static const Ops ops = {.run = target};
+`);
+  }
+  fs.writeFileSync(path.join(dir, 'wrapper.h'), '#include "second.h"\n');
+  fs.writeFileSync(path.join(dir, 'one.c'), '#include "first.h"\nvoid run(void) { ops.run(); }\n');
+  fs.writeFileSync(path.join(dir, 'two.c'), '#include "wrapper.h"\nvoid run(void) { ops.run(); }\n');
+  fs.writeFileSync(path.join(dir, 'three.c'), 'typedef struct { void (*run)(void); } Ops;\nextern Ops ops;\nvoid run(void) { ops.run(); }\n');
+  const model = loadModel(dir);
+  const targets = file => (model._index.outAdj.get(file + '::run') || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.to);
+  assert.deepEqual(targets('one.c'), ['first.h::target']);
+  assert.deepEqual(targets('two.c'), ['second.h::target']);
+  assert.deepEqual(targets('three.c'), []);
+  assert.deepEqual(model.indirectCalls.find(call => call.caller === 'three.c::run').candidates, []);
+});
+
+test('成员数组调用保留所属表达式，同名全局分派表只绑定裸表调用', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-receiver-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+typedef void (*Fn)(void);
+typedef struct { Fn table[1]; } Ops;
+typedef struct { Fn run; } Entry;
+static void a(void) {}
+static void b(void) {}
+static Fn const table[] = { a };
+static const Entry entries[] = {{ .run = b }};
+static int index_of(void) { return 0; }
+static Ops *choose(Ops *p) { return p; }
+void dispatch(Ops *p, Ops s) {
+  p->table[0]();
+  s.table[0]();
+  (*p->table[index_of()])();
+  choose(p)->table[0]();
+  (p->table)[0]();
+  table[0]();
+  entries[0].run();
+}
+`);
+  const model = loadModel(dir);
+  const calls = model._index.outAdj.get('app.c::dispatch').filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls.map(edge => [edge.kind, edge.callee]), [
+    ['direct', 'index_of'], ['direct', 'choose'], ['fnptr', 'a'], ['fnptr', 'b'],
+  ]);
+  const sites = model.indirectCalls.filter(call => call.caller === 'app.c::dispatch');
+  assert.deepEqual(sites.map(call => call.expr), [
+    'p->table[0]', 's.table[0]', 'p->table[index_of()]', 'choose(p)->table[0]', '(p->table)[0]',
+  ]);
+  assert.ok(sites.every(call => !call.table && !call.candidates.length));
+});

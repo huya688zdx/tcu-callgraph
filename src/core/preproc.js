@@ -32,11 +32,26 @@ export function fileMacroScope(base, changes = new Map(), { trackPositions = fal
 }
 
 function parseDefineParams(text) {
-  // text 形如 "(a, b) body..."
+  // text 形如 "(a, b) body..." 或 "(fmt, ...) body..." 或 "(args...) body..."
   const params = [];
+  let variadic = false;
+  let variadicName = '__VA_ARGS__';
   let depth = 0;
   let i = 0;
   let cur = '';
+  const pushParam = (raw) => {
+    const p = raw.trim();
+    if (!p) return;
+    if (p === '...') {
+      variadic = true;
+      variadicName = '__VA_ARGS__';
+    } else if (p.endsWith('...')) {
+      variadic = true;
+      variadicName = p.slice(0, -3).trim() || '__VA_ARGS__';
+    } else {
+      params.push(p);
+    }
+  };
   for (; i < text.length; i++) {
     const c = text[i];
     if (c === '(') {
@@ -48,14 +63,14 @@ function parseDefineParams(text) {
       if (depth === 0) break;
     }
     if (c === ',' && depth === 1) {
-      params.push(cur.trim());
+      pushParam(cur);
       cur = '';
       continue;
     }
     cur += c;
   }
-  if (cur.trim()) params.push(cur.trim());
-  return { params, rest: text.slice(i + 1) };
+  pushParam(cur);
+  return { params, variadic, variadicName, rest: text.slice(i + 1) };
 }
 
 /**
@@ -116,16 +131,21 @@ export function preprocess(tokens, macros, file, { expand = false } = {}) {
       const name = nm[1];
       const after = rest.slice(name.length);
       let params = null;
+      let variadic = false;
+      let variadicName = '__VA_ARGS__';
       let bodyText = after;
       if (after.startsWith('(')) {
         const p = parseDefineParams(after);
         params = p.params;
+        variadic = p.variadic;
+        variadicName = p.variadicName;
         bodyText = p.rest;
       }
       const body = lex(bodyText, file);
       macros.set(name, {
         name,
         params,
+        ...(variadic ? { variadic: true, variadicName } : {}),
         body,
         file,
         line: tk.line,
@@ -202,14 +222,57 @@ function substitute(m, args, siteTok) {
   const out = [];
   const body = m.body;
   const macroOrigins = [...(siteTok.macroOrigins || []), m.name];
+  const vaTokens = () => {
+    const rest = args.slice(m.params ? m.params.length : 0);
+    const joined = [];
+    for (let r = 0; r < rest.length; r++) {
+      if (r > 0) joined.push({ t: 'op', v: ',', line: siteTok.line, col: siteTok.col, cond: siteTok.cond });
+      for (const tok of rest[r]) joined.push(tok);
+    }
+    return joined;
+  };
+  const isVa = (name) => Boolean(m.variadic && name === (m.variadicName || '__VA_ARGS__'));
+  let operandStart = 0;
   for (let i = 0; i < body.length; i++) {
     const tk = body[i];
 
-    if (tk.v === '#' && body[i + 1] && m.params.includes(body[i + 1].v)) {
-      const ai = m.params.indexOf(body[i + 1].v);
+    if (tk.v === '##' && body[i + 1]) {
+      const right = body[i + 1];
+      const variadic = isVa(right.v);
+      const param = m.params.indexOf(right.v);
+      let rightTokens = [right];
+      if (variadic) rightTokens = vaTokens();
+      else if (param >= 0) rightTokens = args[param] || [];
+      let tail = 0;
+      if (variadic && body[i - 1]?.v === ',') {
+        // GNU 扩展仅对宏体中的字面逗号生效，显式传入空实参时保留逗号。
+        if (args.length <= m.params.length) out.pop();
+      } else if (rightTokens.length) {
+        // 空左实参不产生 token，不能取走宏体中更早的标点。
+        const left = out.length > operandStart ? out.pop() : null;
+        const first = rightTokens[0];
+        const value = (left?.v || '') + first.v;
+        out.push({
+          t: left ? (lex(value)[0]?.t || left.t) : first.t,
+          v: value, line: siteTok.line, col: siteTok.col, cond: siteTok.cond, macroOrigins,
+        });
+        tail = 1;
+      }
+      for (let j = tail; j < rightTokens.length; j++) {
+        const t = rightTokens[j];
+        out.push({ ...t, line: siteTok.line, col: siteTok.col,
+          cond: siteTok.cond ?? t.cond, macroOrigins: t.macroOrigins || [] });
+      }
+      i++;
+      continue;
+    }
+    operandStart = out.length;
+    if (tk.v === '#' && body[i + 1] && (m.params.includes(body[i + 1].v) || isVa(body[i + 1].v))) {
+      const targetName = body[i + 1].v;
+      const argToks = isVa(targetName) ? vaTokens() : (args[m.params.indexOf(targetName)] || []);
       out.push({
         t: 'str',
-        v: `"${stringifyTokens(args[ai] || [])}"`,
+        v: `"${stringifyTokens(argToks)}"`,
         line: siteTok.line,
         col: siteTok.col,
         cond: siteTok.cond,
@@ -219,21 +282,16 @@ function substitute(m, args, siteTok) {
       continue;
     }
 
-    if (tk.v === '##' && out.length && body[i + 1]) {
-      const right = body[i + 1];
-      const left = out.pop();
-      const rv = m.params.includes(right.v)
-        ? (args[m.params.indexOf(right.v)] || []).map((t) => t.v).join('')
-        : right.v;
-      out.push({
-        t: 'id',
-        v: left.v + rv,
-        line: siteTok.line,
-        col: siteTok.col,
-        cond: siteTok.cond,
-        macroOrigins,
-      });
-      i++;
+    if (isVa(tk.v)) {
+      for (const t of vaTokens()) {
+        out.push({
+          ...t,
+          line: siteTok.line,
+          col: siteTok.col,
+          cond: siteTok.cond ?? t.cond,
+          macroOrigins: [...macroOrigins, ...(t.macroOrigins || [])],
+        });
+      }
       continue;
     }
 
@@ -263,37 +321,39 @@ export function expandSeq(tokens, macros, depth = 0, seen = new Set(), onExpand)
   const out = [];
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
-    const m = tk.t === 'id' ? macros.get(tk.v) : undefined;
-    if (m && !seen.has(tk.v)) {
-      if (m.params === null) {
-        onExpand?.(m, tk, tk);
-        const body = m.body.map((b) => ({
-          ...b,
-          line: tk.line,
-          col: tk.col,
-          cond: tk.cond ?? b.cond,
-          macroOrigins: [...(tk.macroOrigins || []), m.name],
-        }));
-        const nextSeen = new Set(seen);
-        nextSeen.add(tk.v);
-        out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
-        continue;
-      }
-
-      if (tokens[i + 1] && tokens[i + 1].v === '(') {
-        const [args, next] = collectArgs(tokens, i + 1);
-        if (args) {
-          onExpand?.(m, tk, tokens[next - 1]);
-          const body = substitute(m, args, tk);
-          const nextSeen = new Set(seen);
-          nextSeen.add(tk.v);
-          out.push(...expandSeq(body, macros, depth + 1, nextSeen, onExpand));
-          i = next - 1;
-          continue;
-        }
-      }
+    const m = tk.t === 'id' ? macros.get(tk.v, tk.line) : undefined;
+    if (!m || seen.has(tk.v) || (m.params !== null && tokens[i + 1]?.v !== '(')) {
+      out.push(tk);
+      continue;
     }
-    out.push(tk);
+    let body;
+    if (m.params === null) {
+      onExpand?.(m, tk, tk);
+      body = m.body.map(b => ({
+        ...b, line: tk.line, col: tk.col, cond: tk.cond ?? b.cond,
+        macroOrigins: [...(tk.macroOrigins || []), m.name],
+      }));
+    } else {
+      const [args, next] = collectArgs(tokens, i + 1);
+      onExpand?.(m, tk, tokens[next - 1]);
+      body = substitute(m, args, tk);
+      i = next - 1;
+    }
+    const nextSeen = new Set(seen).add(tk.v);
+    let expanded = expandSeq(body, macros, depth + 1, nextSeen, onExpand);
+    // 替换结果末尾的函数式宏可以使用原序列中紧跟的实参，例如 MAKE -> MATRIX。
+    while (tokens[i + 1]?.v === '(') {
+      const tail = expanded.at(-1);
+      const fn = tail?.t === 'id' && macros.get(tail.v, tail.line);
+      if (!fn?.params || nextSeen.has(tail.v) || tail.macroOrigins?.includes(tail.v)) break;
+      const [args, next] = collectArgs(tokens, i + 1);
+      onExpand?.(fn, tail, tokens[next - 1]);
+      out.push(...expanded.slice(0, -1));
+      nextSeen.add(tail.v);
+      expanded = expandSeq(substitute(fn, args, tail), macros, depth + 1, nextSeen, onExpand);
+      i = next - 1;
+    }
+    out.push(...expanded);
   }
   return out;
 }

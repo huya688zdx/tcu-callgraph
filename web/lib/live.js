@@ -41,6 +41,7 @@ let failures = 0; // 连续刷新失败次数：服务重启期间有限重试�
 let pendingCompose = null;
 let applyingCompose = false;
 let pageRevision = 0;
+let lastAiOp = '';
 
 /** 用户是否正在拖节点 / 拖连线 / 平移——此刻刷新会打断操作，稍后再试 */
 function isInteracting() {
@@ -132,7 +133,7 @@ async function flushReload() {
       });
     } else {
       await hooks.reloadKeepCam();
-      toast(n > 1 ? t('live.edits', { n }) : t('live.updated'));
+      toast(n > 1 ? t('live.edits', { n }) : lastAiOp === 'layout.save' ? 'AI 已整理并更新画布布局' : lastAiOp === 'layout.clear' ? 'AI 已恢复自动布局' : t('live.updated'));
     }
     failures = 0;
     void loadStats().catch(() => {});
@@ -212,6 +213,7 @@ if (es) {
       if (m.page.revision <= Math.max(pageRevision, pendingCompose?.page.revision ?? 0)) return;
       pendingCompose = m;
     }
+    lastAiOp = m.op || '';
     if (state.at || reviewTransition()) markReviewUpdated();
     scheduleReload();
   });

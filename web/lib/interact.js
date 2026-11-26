@@ -156,6 +156,19 @@ function hitTitle(e) {
   return null;
 }
 
+function edgeHitDistance(edge, p, limit = Infinity) {
+  const pts = edgePoints(edge);
+  let distance = Infinity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    if (p.x < Math.min(a[0], b[0]) - limit || p.x > Math.max(a[0], b[0]) + limit ||
+        p.y < Math.min(a[1], b[1]) - limit || p.y > Math.max(a[1], b[1]) + limit) continue;
+    distance = Math.min(distance, distToSegment(p, a, b));
+    if (!distance) break;
+  }
+  return distance;
+}
+
 function hitEdges(e) {
   if (!state.view) return [];
   const p = worldPos(e);
@@ -163,16 +176,8 @@ function hitEdges(e) {
   let nearest = radius;
   const hits = [];
   for (const edge of state.view.edges) {
-    const pts = edgePoints(edge);
-    let distance = Infinity;
     const limit = Math.min(radius, nearest + tie);
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i], b = pts[i + 1];
-      if (p.x < Math.min(a[0], b[0]) - limit || p.x > Math.max(a[0], b[0]) + limit ||
-          p.y < Math.min(a[1], b[1]) - limit || p.y > Math.max(a[1], b[1]) + limit) continue;
-      distance = Math.min(distance, distToSegment(p, a, b));
-      if (!distance) break;
-    }
+    const distance = edgeHitDistance(edge, p, limit);
     if (distance > limit) continue;
     hits.push({ edge, distance });
     nearest = Math.min(nearest, distance);
@@ -180,15 +185,54 @@ function hitEdges(e) {
   return hits.filter((hit) => hit.distance <= nearest + tie).map((hit) => hit.edge);
 }
 
+function selectedEdgeHit(e) {
+  const edge = state.selectedEdge;
+  if (!edge || !state.view?.edges?.includes(edge)) return false;
+  const radius = 9 / cam.k;
+  return edgeHitDistance(edge, worldPos(e), radius) <= radius;
+}
+
 function hitEdge(e) {
+  if (state.selectedEdge && !state.multiSelection?.trunk && selectedEdgeHit(e)) return state.selectedEdge;
   const hits = hitEdges(e);
   return hits.includes(state.selectedEdge) ? state.selectedEdge : hits[0] || null;
 }
 
+let preTrunkCycle = null;
+
 function pickEdgeAt(e, onPick, useSelection = false) {
+  // 已明确锁定两点直连关系时，点中这条高亮边不应跳到背景中被淡化的其他共线分支。
+  if (state.selectedEdge && state.directPairEdge && selectedEdgeHit(e)) {
+    const pairHits = state.trunkHits?.length > 1 && state.trunkHits.includes(state.selectedEdge)
+      ? state.trunkHits : null;
+    if (useSelection || !pairHits) {
+      onPick(state.selectedEdge, { trunkHits: pairHits, directPair: true });
+      return true;
+    }
+    const group = state.multiSelection?.trunk ? state.multiSelection.hits : null;
+    const prevSelected = !group ? state.selectedEdge : null;
+    const next = group ? pairHits[0] : pairHits[pairHits.indexOf(state.selectedEdge) + 1];
+    if (prevSelected) {
+      preTrunkCycle = {
+        view: state.view, edge: prevSelected, trunkHits: pairHits, directPair: true,
+        clientX: e.clientX, clientY: e.clientY, at: performance.now(),
+      };
+    }
+    onPick(next || pairHits[0], { trunkHits: pairHits, trunkGroup: next ? null : pairHits, directPair: true, scrollToTrunkBranch: Boolean(next) });
+    return true;
+  }
+  if (useSelection && state.selectedEdge && !state.multiSelection?.trunk && selectedEdgeHit(e)) {
+    const hits = hitEdges(e);
+    const trunkHits = state.trunkHits?.length > 1 && state.trunkHits.includes(state.selectedEdge)
+      ? state.trunkHits
+      : hits.length > 1 && hits.includes(state.selectedEdge) ? hits : null;
+    onPick(state.selectedEdge, { trunkHits, directPair: state.directPairEdge });
+    return true;
+  }
   const hits = hitEdges(e);
   if (!hits.length) return false;
   if (hits.length === 1) {
+    preTrunkCycle = null;
     onPick(hits[0]);
     return true;
   }
@@ -204,6 +248,20 @@ function pickEdgeAt(e, onPick, useSelection = false) {
   const continuing = hits.includes(state.selectedEdge) && sameTrunk(state.prevTrunkHits);
   const trunkHits = continuing ? state.prevTrunkHits : hits;
   const group = state.multiSelection?.trunk ? state.multiSelection.hits : null;
+  if (state.selectedEdge && !group && hits.includes(state.selectedEdge)) {
+    // 记下本次单击前的已选连线：若紧接着触发双击，则还原到原连线进入编辑而不是切到下一条。
+    preTrunkCycle = {
+      view: state.view,
+      edge: state.selectedEdge,
+      trunkHits: continuing ? trunkHits : state.trunkHits,
+      directPair: state.directPairEdge,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      at: performance.now(),
+    };
+  } else {
+    preTrunkCycle = null;
+  }
   const next = !continuing ? null : group
     ? (sameTrunk(group) ? trunkHits[0] : null) : trunkHits[trunkHits.indexOf(state.selectedEdge) + 1];
   onPick(next || trunkHits[0], { trunkHits, trunkGroup: next ? null : trunkHits, scrollToTrunkBranch: Boolean(next) });
@@ -212,7 +270,7 @@ function pickEdgeAt(e, onPick, useSelection = false) {
 
 /** 双击解锁后，整段连线都可拖动，不局限于控制点附近。 */
 function hitSegment(e) {
-  if (!state.selectedEdge || !moveReady('edge', state.selectedEdge) || state.view?.comparison || hitEdge(e) !== state.selectedEdge) return null;
+  if (!state.selectedEdge || !moveReady('edge', state.selectedEdge) || state.view?.comparison) return null;
   const p = worldPos(e);
   const pts = edgePoints(state.selectedEdge);
   let distance = 8 / cam.k, best = null;
@@ -296,6 +354,7 @@ function clearTrunk() {
   state.prevTrunkHits = null;
   state.trunkFocusNode = null;
   state.directPairEdge = false;
+  preTrunkCycle = null;
 }
 
 function pickTrunkEndpoint(id) {
@@ -597,8 +656,12 @@ els.cv.addEventListener('pointerdown', (e) => {
     els.cv.setPointerCapture(e.pointerId);
     return;
   }
-  const lb = hitLabel(worldPos(e));
-  if (lb) {
+  const rawLb = hitLabel(worldPos(e));
+  // 当前已聚焦单条连线且光标正落在这条线上时，不被背景中其他淡化边的标签抢走单击/双击编辑。
+  const lb = rawLb && state.selectedEdge && !state.multiSelection?.trunk && rawLb.edge !== state.selectedEdge && selectedEdgeHit(e)
+    ? null
+    : rawLb;
+  if (lb && !(e.detail >= 2 && state.selectedEdge && lb.edge !== state.selectedEdge)) {
     if (!editable) {
       selectEdge(lb.edge, { labelId: lb.label.id });
       return;
@@ -715,7 +778,17 @@ els.cv.addEventListener('pointerdown', (e) => {
     return;
   }
 
-  if (pickEdgeAt(e, selectEdge)) return;
+  if (e.detail >= 2 && preTrunkCycle && preTrunkCycle.view === state.view &&
+      performance.now() - preTrunkCycle.at <= 700 &&
+      Math.hypot(e.clientX - preTrunkCycle.clientX, e.clientY - preTrunkCycle.clientY) <= 12 &&
+      state.view?.edges?.includes(preTrunkCycle.edge)) {
+    selectEdge(preTrunkCycle.edge, {
+      trunkHits: preTrunkCycle.trunkHits,
+      directPair: preTrunkCycle.directPair,
+    });
+    return;
+  }
+  if (pickEdgeAt(e, selectEdge, e.detail >= 2)) return;
   // 双击解锁文件框/目录容器后，拖拽框内空白区域也能直接移动，不必瞄准左上角标题胶囊。
   if (editable && state.moveTarget?.view === state.view && (state.moveTarget.kind === 'file' || state.moveTarget.kind === 'dir')) {
     const p = worldPos(e);
@@ -1223,6 +1296,18 @@ els.cv.addEventListener('dblclick', (e) => {
     return;
   }
   hideMenu();
+  if (preTrunkCycle && preTrunkCycle.view === state.view &&
+      performance.now() - preTrunkCycle.at <= 700 &&
+      Math.hypot(e.clientX - preTrunkCycle.clientX, e.clientY - preTrunkCycle.clientY) <= 12 &&
+      state.view?.edges?.includes(preTrunkCycle.edge)) {
+    const saved = preTrunkCycle;
+    preTrunkCycle = null;
+    selectEdge(saved.edge, { trunkHits: saved.trunkHits, directPair: saved.directPair });
+    if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: saved.edge, view: state.view };
+    draw();
+    return;
+  }
+  preTrunkCycle = null;
   if (pickEdgeAt(e, (edge, selection) => {
     selectEdge(edge, selection);
     if (!state.view?.comparison) state.moveTarget = { kind: 'edge', item: edge, view: state.view };

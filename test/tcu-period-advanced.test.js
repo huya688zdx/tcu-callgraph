@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadModel } from '../src/core/index.js';
+import { loadModel, rebuildIndex } from '../src/core/index.js';
 import { buildDataflowIndex } from '../src/core/dataflow.js';
 import { projectTasks, taskPeriods, withTaskPeriods } from '../src/core/task-periods.js';
 import { exportSvg } from '../src/core/export-svg.js';
@@ -28,6 +28,22 @@ const periodsFor = (model, name) => {
   assert.ok(fn, name);
   return taskPeriods(model).get(fn.id) || [];
 };
+
+test('删除推断调用边后重新传播任务周期，并保留其他调用路径', t => {
+  const model = loadModel(project(t, { 'tasks.c': `
+void leaf(void) {}
+void target(void) { leaf(); }
+void Task20ms(void) { target(); }
+void Task10ms(void) {}
+` }));
+  const originalEdges = model.edges;
+  model.edges = [...originalEdges, { from: 'tasks.c::Task10ms', to: 'tasks.c::target', kind: 'fnptr', inferred: true }];
+  rebuildIndex(model);
+  assert.deepEqual(periodsFor(model, 'leaf').map(c => c.us), [10000, 20000]);
+  model.edges = originalEdges;
+  rebuildIndex(model);
+  for (const fn of ['target', 'leaf']) assert.deepEqual(periodsFor(model, fn).map(c => c.us), [20000]);
+});
 
 test('取模、有效位掩码和阈值清零按调用位置推导，普通调用保持原周期', t => {
   const root = project(t, { 'rates.c': `

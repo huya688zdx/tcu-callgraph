@@ -50,6 +50,7 @@ export function normalizeGraphIR(rawModel, meta = {}) {
   requireIR(object(rawModel), 'model');
   const model = { ...rawModel, ...meta };
   for (const field of collections) model[field] ??= [];
+  model.indirectCalls ??= [];
   model.generatedAt ??= new Date().toISOString();
   model.elapsedMs ??= 0;
   return validateGraphIR(model);

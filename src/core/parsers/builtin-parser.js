@@ -6,7 +6,7 @@ import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
-import { findFunctions, findFnPtrTables, scanCalls } from '../extract.js';
+import { collectDispatchDeclarations, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
 
@@ -237,11 +237,31 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   const functions = [];
   const functionRecords = [];
-  const fnptrTables = new Map();
+  const deferredTypedefCalls = [];
+  const typedefsByFile = new Map();
+  const typedefHeadersByName = new Map();
+  const fnptrTablesList = [];
+  const pendingFieldInitializers = [];
+  const dispatchDeclarations = new Map();
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
   const varById = new Map();
+
+  const recordFunctionCalls = (record, body, fileMacros) => {
+    const { fn, calls } = record;
+    for (const call of calls) {
+      call.macroDefinitions = (call.macroChain || []).map((name) => {
+        const def = fileMacros.get(name, call.line);
+        return def ? `header::${def.file}::${name}` : null;
+      }).filter(Boolean);
+    }
+    const deferred = calls.length > 1 && calls.some((c) => ['unknown', 'fnptr_indexed', 'fnptr_ptr'].includes(c.kind));
+    if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
+    record.nesting = deferred ? callNestingTokens(body) : null;
+    assignCallGroups(body, calls);
+    record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
+  };
 
   const parseFile = ({ rel, abs, isHeader, bytes }) => {
     let buf;
@@ -275,6 +295,14 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
     const fileMacros = fileMacroScope(macros, new Map(), { trackPositions: true });
     const { tokens, includes: inc } = preprocess(input, fileMacros, rel);
+    const typedefs = findTypedefs(tokens);
+    if (typedefs.size) typedefsByFile.set(rel, typedefs);
+    if (isHeader) for (const [name, entries] of typedefs) {
+      if (!entries.some(entry => entry.fileScope)) continue;
+      if (!typedefHeadersByName.has(name)) typedefHeadersByName.set(name, []);
+      typedefHeadersByName.get(name).push(rel);
+    }
+    const dispatchScopes = new Set();
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
     for (const def of fileMacros.changes.values()) if (def) macroDefs.set(def.name, def);
     includes.push(...inc);
@@ -289,25 +317,27 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
       const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+      const localTables = findFnPtrTables(body, rel, { functionId: fn.id, macros: fileMacros, pendingFields: pendingFieldInitializers });
+      for (const table of localTables.values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
-      for (const call of calls) {
-        call.macroDefinitions = (call.macroChain || []).map((name) => {
-          const def = fileMacros.get(name);
-          return def ? `header::${def.file}::${name}` : null;
-        }).filter(Boolean);
-      }
-      const deferred = calls.length > 1 && calls.some((c) => c.kind === 'unknown');
-      if (!deferred && calls.length > 1 && hasNestedCall(body, calls)) fn.hasNestedCalls = true;
-      const nesting = deferred ? callNestingTokens(body) : null;
-      assignCallGroups(body, calls);
-      functionRecords.push({ fn, calls, nesting, mentions: variableMentions(body),
-        taskEvidence: collectTaskEvidence(fn, body, fileMacros, calls) });
+      const writes = findDispatchWrites(body, fileMacros);
+      if (localTables.size || writes.length || calls.some(call => call.receiver)) dispatchScopes.add(tokens[fn.bodyStart]);
+      const record = { fn, calls, writes, mentions: variableMentions(body) };
+      functionRecords.push(record);
+      // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
+      if (calls.some(call => call.parenthesized || call.requiresTypes)) deferredTypedefCalls.push({ record, body, fileMacros });
+      else recordFunctionCalls(record, body, fileMacros);
       functions.push(fn);
     }
-    for (const [name, map] of findFnPtrTables(tokens)) {
-      fnptrTables.set(name, { ...map });
+    for (const table of findFnPtrTables(tokens, rel, { macros: fileMacros, pendingFields: pendingFieldInitializers }).values()) {
+      fnptrTablesList.push(table);
     }
+    collectDispatchDeclarations(tokens, dispatchScopes, binding => {
+      const { declaration } = binding;
+      if (!dispatchDeclarations.has(declaration.v)) dispatchDeclarations.set(declaration.v, []);
+      dispatchDeclarations.get(declaration.v).push({ ...binding, file: rel, isHeader });
+    });
     for (const v of findGlobalVars(tokens, rel)) {
       // static 变量按文件区分；普通全局变量跨文件同名即同一个
       v.id = v.isStatic ? `var::${rel}::${v.name}` : `var::${v.name}`;
@@ -334,6 +364,32 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   for (const file of headers) parseFile(file);
   for (const file of sources) parseFile(file);
   const includesHeader = includedHeaders(headers, includes);
+  const lookupInitializerType = (file, name, at) => {
+    const local = typedefsByFile.get(file)?.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
+    if (local) return { file, shape: local.shape };
+    const visible = typedefHeadersByName.get(name)?.filter(header => header !== file && includesHeader(file, header));
+    if (visible?.length === 1) {
+      const shape = typedefsByFile.get(visible[0]).get(name).findLast(e => e.fileScope).shape;
+      return { file: visible[0], shape };
+    }
+  };
+  for (const fill of pendingFieldInitializers) fill(lookupInitializerType);
+  pendingFieldInitializers.length = 0;
+  const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
+  const isTypedefAt = (file, name, location) =>
+    typedefsByFile.get(file)?.get(name)?.some(({ declaration, scope }) =>
+      compareLocation(location, declaration) > 0 && (!scope.end || compareLocation(location, scope.end) < 0)) ||
+    typedefHeadersByName.get(name)?.some(header => header !== file && includesHeader(file, header));
+  const skipTypeDependentCall = (file, call, params = []) => {
+    if (call.parenthesized && !params.includes(call.callee) && isTypedefAt(file, call.callee, call)) return true;
+    return call.requiresTypes?.some(type => params.includes(type.v) || !isTypedefAt(file, type.v, type));
+  };
+  for (const { record, body, fileMacros } of deferredTypedefCalls) {
+    const { fn } = record;
+    record.calls = record.calls.filter(call => !skipTypeDependentCall(fn.file, call, fn.params));
+    recordFunctionCalls(record, body, fileMacros);
+  }
+  deferredTypedefCalls.length = 0;
 
   const byId = new Map();
   const byName = new Map();
@@ -400,24 +456,210 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     return (glob || list[0]).id;
   };
 
+  // 过滤并按文件/作用域索引函数指针分派表：
+  // - 单结构体 `.field = fn` 保持原有兼容；
+  // - 数组/嵌套表只保留可见的函数定义或原型，避免把普通常量数据表误认成函数指针表；
+  // - static 表只在本文件和包含其定义的翻译单元可见。
+  const cleanedTables = [];
+  const staticTablesByFile = new Map();
+  const headerTablesByName = new Map();
+  const globalTablesByName = new Map();
+  const localTablesByFunction = new Map();
+  const tablesWithFilteredTargets = new Set();
+  const declarationAt = (name, file, location) => dispatchDeclarations.get(name)?.findLast(p =>
+    p.file === file && compareLocation(location, p.declaration) > 0 && (!p.scope.end || compareLocation(location, p.scope.end) < 0) &&
+    (!p.typeToCheck || isTypedefAt(file, p.typeToCheck.v, p.typeToCheck)));
+  for (const raw of fnptrTablesList) {
+    const filteredMap = {};
+    const location = raw.declaration ?? { line: raw.line, col: Infinity };
+    const params = byId.get(raw.functionId)?.params;
+    for (const [slot, target] of Object.entries(raw.map)) {
+      const declarations = dispatchDeclarations.get(target);
+      const local = declarationAt(target, raw.file, location);
+      if (local && !local.isFunction) continue;
+      if ((!local || local.fileScope) && params?.includes(target)) continue;
+      const isStructField = !slot.startsWith('[');
+      const defined = byName.has(target) && !resolveCallee(target, raw.file).startsWith('ext::');
+      const declared = local || declarations?.some(p => p.file !== raw.file && p.isHeader && p.fileScope && includesHeader(raw.file, p.file));
+      if (defined || declared || isStructField) {
+        filteredMap[slot] = target;
+      }
+    }
+    const matchedSlots = Object.keys(filteredMap).length;
+    if (!matchedSlots && !raw.functionId && !raw.unresolvedSlots) continue;
+    const entry = {
+      name: raw.name,
+      file: raw.file,
+      line: raw.line,
+      isStatic: raw.isStatic,
+      isConst: raw.isConst,
+      dims: raw.dims,
+      map: filteredMap,
+      ...(raw.incomplete && { incomplete: true }),
+      ...(raw.unresolvedSlots && { unresolvedSlots: raw.unresolvedSlots }),
+      ...(raw.functionId && { functionId: raw.functionId }),
+    };
+    if (matchedSlots < Object.keys(raw.map).length) tablesWithFilteredTargets.add(entry);
+    if (matchedSlots) cleanedTables.push(entry);
+    if (entry.functionId) {
+      if (!localTablesByFunction.has(entry.functionId)) localTablesByFunction.set(entry.functionId, new Map());
+      const byName = localTablesByFunction.get(entry.functionId);
+      if (!byName.has(entry.name)) byName.set(entry.name, []);
+      // 同名局部数组即便全由运行时回调初始化，也会遮蔽外层表。
+      const binding = dispatchDeclarations.get(entry.name)?.find(p => p.declaration === raw.declaration);
+      byName.get(entry.name).push({ entry: matchedSlots ? entry : null, declaration: raw.declaration, end: (binding?.scope || raw.scope).end });
+    } else if (entry.isStatic) {
+      if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
+      staticTablesByFile.get(entry.file).set(entry.name, entry);
+      if (HDR_EXT.test(entry.file)) {
+        if (!headerTablesByName.has(entry.name)) headerTablesByName.set(entry.name, []);
+        headerTablesByName.get(entry.name).push(entry);
+      }
+    } else {
+      globalTablesByName.set(entry.name, entry);
+    }
+  }
+  const lookupTable = (fn, call) => {
+    const name = call.receiver;
+    if (!name) return null;
+    const local = localTablesByFunction.get(fn.id)?.get(name)?.findLast(table =>
+      compareLocation(call, table.declaration) >= 0 && (!table.end || compareLocation(call, table.end) < 0));
+    const binding = declarationAt(name, fn.file, call);
+    if (binding && !binding.fileScope && (!local || compareLocation(binding.declaration, local.declaration) > 0)) {
+      if (!binding.isExtern) return null;
+    } else {
+      if (local) return local.entry;
+      if (fn.params.includes(name)) return null;
+    }
+    const own = staticTablesByFile.get(fn.file)?.get(name);
+    if (own) return own;
+    const visible = headerTablesByName.get(name)?.filter(table => includesHeader(fn.file, table.file));
+    if (visible?.length) return visible.length === 1 ? visible[0] : null;
+    return globalTablesByName.get(name) || null;
+  };
+  const writtenSlots = new Map();
+  const tableNames = new Set(cleanedTables.map(table => table.name));
+  for (const { fn, writes } of functionRecords) {
+    for (const write of writes) {
+      if (!tableNames.has(write.receiver)) continue;
+      // 声明名本身已进入其局部作用域，不能把局部指针的初始化算到外层同名表。
+      const table = lookupTable(fn, { ...write, col: write.col + 1 });
+      if (!table || (write.escape && table.isConst)) continue;
+      if (write.escape === 'array' && (write.member || write.indices.length >= table.dims)) continue;
+      if (!writtenSlots.has(table)) writtenSlots.set(table, []);
+      writtenSlots.get(table).push({ ...write, file: fn.file });
+    }
+  }
+  const possiblyWritten = (writes, indices, member) => writes?.some(write => {
+    if (write.escape) return true;
+    if (write.member && member && write.member !== member) return false;
+    return write.indices.every((index, d) => index == null || indices[d] == null || index === indices[d]);
+  });
+  const matchTableSlots = (table, indices = [], member = null, writes) => {
+    const matched = [];
+    const slots = Object.entries(table.map);
+    for (const slot of table.unresolvedSlots || []) slots.push([slot, null]);
+    for (const [slot, target] of slots) {
+      if (!indices.length) {
+        if (member && slot === member) matched.push({ slot, target: possiblyWritten(writes, [], member) ? null : target });
+        continue;
+      }
+      if (slot.includes('[?')) {
+        if (slot.endsWith(member ? '.' + member : ']') || (target === null && slot.endsWith(']'))) {
+          matched.push({ slot, target: possiblyWritten(writes, indices, member) ? null : target });
+        }
+        continue;
+      }
+      // 解析槽位路径，例如 "[1][0]" / "[0].fn" / "[1][2].handler"
+      const m = /^((?:\[\d+\])+)(?:\.([A-Za-z_]\w*))?$/.exec(slot);
+      if (!m) continue;
+      const slotIndices = [...m[1].matchAll(/\[(\d+)\]/g)].map((x) => Number.parseInt(x[1], 10));
+      const slotField = m[2] || null;
+      if (member) {
+        // 未解析的整个结构体元素也可能提供被调用的成员。
+        if (slotField !== member && !(target === null && !slotField)) continue;
+      } else if (slotField) {
+        // 结构体数组元素中无成员名调用时（例如 e[r][c]() 对应的非结构体表）不匹配带字段名的槽；
+        // 但若是一维位置初始化结构体数组（无指定字段名），slotField 本身为 null。
+        continue;
+      }
+      if (slotIndices.length < indices.length && target !== null) continue;
+      let ok = true;
+      for (let d = 0; d < Math.min(indices.length, slotIndices.length); d++) {
+        if (indices[d] !== null && slotIndices[d] !== indices[d]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) matched.push({ slot, target: possiblyWritten(writes, slotIndices, slotField) ? null : target });
+    }
+    return matched;
+  };
+
+  const indirectCalls = [];
   for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
     const edgeStart = edges.length;
     for (const call of calls) {
-      const table = call.receiver ? fnptrTables.get(call.receiver) : null;
-      const callee = call.callee || (table && Object.hasOwn(table, call.member) ? table[call.member] : null);
-      if (!callee) continue;
-      edges.push({
-        from: fn.id,
-        to: resolveCallee(callee, fn.file),
-        callee,
-        kind: call.kind === 'unknown' ? 'fnptr' : call.kind,
-        line: call.line, col: call.col, orderGroup: call.orderGroup,
-        ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
-        cond: call.cond,
-        via: call.via,
-        macroChain: call.macroChain,
-        macroDefinitions: call.macroDefinitions,
-      });
+      if (call.callee) {
+        edges.push({
+          from: fn.id,
+          to: resolveCallee(call.callee, fn.file),
+          callee: call.callee,
+          kind: call.kind,
+          line: call.line, col: call.col, orderGroup: call.orderGroup,
+          ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
+          cond: call.cond,
+          via: call.via,
+          macroChain: call.macroChain,
+          macroDefinitions: call.macroDefinitions,
+        });
+        continue;
+      }
+      const table = lookupTable(fn, call);
+      let writes = writtenSlots.get(table);
+      if (writes && table.isStatic && HDR_EXT.test(table.file) && !HDR_EXT.test(fn.file)) {
+        // 头文件里的 static 对象在每个翻译单元有独立实例。
+        writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
+      }
+      const matched = table ? matchTableSlots(table, call.indices || [], call.member || null, writes) : [];
+      const uniqueTargets = [...new Set(matched.map((s) => s.target))];
+      const allConstIndices = (call.indices || []).every((idx) => idx !== null);
+      if (!table?.incomplete && !possiblyWritten(writes, call.indices || [], call.member) &&
+          uniqueTargets.length === 1 && uniqueTargets[0] !== null &&
+          (allConstIndices || (matched.length === 1 && !tablesWithFilteredTargets.has(table)))) {
+        const callee = uniqueTargets[0];
+        edges.push({
+          from: fn.id,
+          to: resolveCallee(callee, table.file),
+          callee,
+          kind: 'fnptr',
+          line: call.line, col: call.col, orderGroup: call.orderGroup,
+          ...(call.onceWhenGatesMatch && { onceWhenGatesMatch: true }),
+          cond: call.cond,
+          via: call.via,
+          macroChain: call.macroChain,
+          macroDefinitions: call.macroDefinitions,
+        });
+      } else {
+        // 多候选动态分派表（如 z[idx]()、e[r][c]()）或未解析函数指针：
+        // 不盲目画死所有候选，而是保留调用点与候选槽位供 LLM 结合源码精准判断后补边。
+        indirectCalls.push({
+          caller: fn.id,
+          callerName: fn.name,
+          file: fn.file,
+          line: call.line,
+          expr: call.via || '',
+          receiver: call.receiver || null,
+          member: call.member || null,
+          indices: call.indexExprs || [],
+          table: table ? { name: table.name, file: table.file, line: table.line, isStatic: table.isStatic } : null,
+          candidates: matched.filter(s => s.target !== null).map((s) => ({
+            slot: s.slot,
+            name: s.target,
+            id: resolveCallee(s.target, table?.file || fn.file),
+          })),
+        });
+      }
     }
     const resolvedCalls = edges.slice(edgeStart);
     if (nesting && resolvedCalls.length > 1 && hasNestedCall(nesting, resolvedCalls)) fn.hasNestedCalls = true;
@@ -459,22 +701,13 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
 
   // 外部符号虚拟节点
   const externals = new Map();
-  for (const e of edges) {
-    if (e.to.startsWith('ext::')) {
-      const name = e.to.slice(5);
-      if (!externals.has(e.to)) {
-        externals.set(e.to, {
-          id: e.to,
-          name,
-          file: '<external>',
-          line: 0,
-          isStatic: false,
-          external: true,
-          params: [],
-        });
-      }
+  const noteExternal = id => {
+    if (id.startsWith('ext::') && !externals.has(id)) {
+      externals.set(id, { id, name: id.slice(5), file: '<external>', line: 0, isStatic: false, external: true, params: [] });
     }
-  }
+  };
+  for (const edge of edges) noteExternal(edge.to);
+  for (const call of indirectCalls) for (const candidate of call.candidates) noteExternal(candidate.id);
 
   // 邻接表
   const allNodes = new Map([...byId, ...externals]);
@@ -483,7 +716,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     if (!callsByMacro.has(id)) callsByMacro.set(id, []);
     callsByMacro.get(id).push(e);
   }
-  const symbols = headerSymbols(parsed, resolveCallee, new Set([...byName.keys(), ...edges.filter((e) => e.kind !== 'var').map((e) => e.callee)]), macros, callsByMacro);
+  const symbols = headerSymbols(parsed, resolveCallee,
+    new Set([...byName.keys(), ...edges.filter(e => e.kind !== 'var').map(e => e.callee)]), macros, callsByMacro, skipTypeDependentCall);
   for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
     const id = symbol.targetIds[i];
     if (!allNodes.has(id) && id.startsWith('ext::')) {
@@ -512,7 +746,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     externals: [...externals.values()],
     edges,
     macros: [...macroDefs.values()],
-    fnptrTables: [...fnptrTables.entries()].map(([name, map]) => ({ name, map })),
+    fnptrTables: cleanedTables,
+    indirectCalls,
     includes,
     warnings,
   };

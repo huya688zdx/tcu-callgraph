@@ -16,6 +16,97 @@ import {
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
+test('runAiAgent：当前附件超过输入预算时提示缩小行范围，并在发送前停止', async () => {
+  const content = 'int work(void);\n'.repeat(1600).slice(0, 24_000);
+  const attachments = Array.from({ length: 4 }, (_, i) => ({ name: i + '.c', content }));
+  let sent = 0;
+  await assert.rejects(runAiAgent({
+    config: { baseUrl: 'http://localhost', model: 'mock' },
+    prompt: '分析代码', attachments,
+    fetchImpl: () => { sent++; throw new Error('超限请求不应发送'); },
+  }), /预计需要.*24576.*附件/);
+  assert.equal(sent, 0);
+});
+
+test('runAiAgent：附件全文优先于旧历史，每次请求都给输出和工具结果留出空间', async () => {
+  const config = { baseUrl: 'http://localhost', model: 'mock', toolMode: 'tools', maxTokens: 8192 };
+  const content = 'int sensor(void);\n'.repeat(100);
+  const turn = { config, prompt: '查看相关函数', attachments: [{ name: 'sensor.c', content }] };
+  const done = () => Response.json({ choices: [{ message: { content: '已查看。' } }] });
+  const baseline = await runAiAgent({ ...turn, fetchImpl: done });
+  config.contextWindow = baseline.metrics.contextEstTokens + config.maxTokens + 1450;
+  const requests = [];
+  const result = await runAiAgent({
+    ...turn,
+    history: [
+      { role: 'user', text: '旧的问题：' + '温'.repeat(3500) },
+      { role: 'assistant', text: '旧的回答' },
+      { role: 'user', text: '最近的问题' },
+      { role: 'assistant', text: '最近的说明：' + '温'.repeat(550) },
+    ],
+    executeTool: async () => ({ ok: true, name: 'sensor', file: 'sensor.c', startLine: 1, endLine: 1, source: '温'.repeat(950) }),
+    fetchImpl: async (_url, { body }) => {
+      const req = JSON.parse(body);
+      requests.push(req);
+      assert.ok(estimateMessagesTokens(req.messages, !!req.tools) + req.max_tokens <= config.contextWindow);
+      if (requests.length > 1) return done();
+      return Response.json({ choices: [{ message: { tool_calls: [{
+        id: 'read', type: 'function', function: { name: 'read_function', arguments: '{"name":"sensor"}' },
+      }] } }] });
+    },
+  });
+  assert.equal(result.answer, '已查看。');
+  assert.equal(requests.length, 2);
+  assert.ok(requests[0].messages.some(m => m.content?.includes('最近的说明')));
+  assert.ok(!requests[0].messages.some(m => m.content?.includes('旧的问题')));
+  assert.ok(!requests[0].messages.some(m => m.content?.includes('旧的回答')));
+  assert.equal(requests[0].messages[1].role, 'user');
+  assert.ok(!requests[1].messages.some(m => m.content?.includes('最近的说明')));
+  assert.deepEqual(requests[1].messages.slice(-2).map(m => m.role), ['assistant', 'tool']);
+  for (const req of requests) assert.ok(req.messages.some(m => m.role === 'user' && m.content.includes(content)));
+});
+
+test('runAiAgent：按历史 token 或条数限制裁剪时，完整保留最近的问答', async () => {
+  for (const byCount of [false, true]) {
+    const history = Array.from({ length: byCount ? 21 : 6 }, (_, i) => ({
+      role: i % 2 ? 'assistant' : 'user',
+      text: '历史' + i + (byCount || i === 5 ? '' : '温'.repeat(3900)),
+    }));
+    await runAiAgent({
+      config: { baseUrl: 'http://localhost', model: 'mock', maxTokens: 1024, contextWindow: 32768 },
+      prompt: '继续核对', history,
+      fetchImpl: async (_url, { body }) => {
+        const { messages } = JSON.parse(body);
+        assert.equal(messages[1].role, 'user');
+        assert.ok(messages[1].content.startsWith('历史2'));
+        return Response.json({ choices: [{ message: { content: '已核对。' } }] });
+      },
+    });
+  }
+});
+
+test('runAiAgent：工具结果撑满窗口后保留操作记录，后续请求和步数上限总结都遵守预算', async () => {
+  const config = { baseUrl: 'http://localhost', model: 'mock', toolMode: 'prompt', maxTokens: 4096 };
+  const turn = { config, prompt: '查看函数', attachments: [{ name: 'entry.c', content: 'int sensor(void);' }] };
+  const initial = await runAiAgent({ ...turn, fetchImpl: async () => Response.json({ choices: [{ message: { content: '好' } }] }) });
+  config.contextWindow = initial.metrics.contextEstTokens + config.maxTokens + 40;
+  for (const maxSteps of [1, 2]) {
+    let sent = 0;
+    const result = await runAiAgent({
+      ...turn, maxSteps,
+      executeTool: async () => ({ ok: true, name: 'sensor', file: 'entry.c', startLine: 1, endLine: 1, source: '字'.repeat(1000) }),
+      fetchImpl: async () => {
+        sent++;
+        return Response.json({ choices: [{ message: { content: '<tool_call>{"name":"read_function","arguments":{"name":"sensor"}}</tool_call>' } }] });
+      },
+    });
+    assert.equal(sent, 1);
+    assert.equal(result.toolLog.length, 1);
+    assert.equal(result.toolLog[0].name, 'read_function');
+    assert.ok(result.answer.includes(result.toolLog[0].summary));
+  }
+});
+
 test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 时降级', async () => {
   const prompt = '查看画布截图';
   const small = 'data:image/png;base64,AAAA';
@@ -53,6 +144,55 @@ test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 �
       type: 'fallback', text: '当前模型接口不支持图片输入，已自动降级为纯文本继续',
     }] : []);
   }
+});
+
+test('e2e：窄窗口下 AI 助手的停止和引导按钮完整可点击', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+  await browser.waitFor('Boolean(window.__cg?.view)');
+  await browser.evaluate(`(async () => {
+    document.getElementById('aiBtn').click();
+    document.querySelector('[data-ai-tab="chat"]').click();
+    await document.fonts.ready;
+  })()`);
+
+  const cases = [];
+  for (const [width, height, streaming] of [[1024, 700, true], [420, 600, false], [360, 600, true], [320, 360, true]]) {
+    await browser.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    const clipped = await browser.evaluate(`(() => {
+      const model = document.getElementById('aiQuickModel');
+      model.replaceChildren(new Option('organization/very-long-model-name-for-code-analysis', 'test-model'));
+      model.value = 'test-model';
+      const stop = document.getElementById('aiStopChat');
+      const send = document.getElementById('aiSendChat');
+      stop.hidden = ${!streaming};
+      send.textContent = ${JSON.stringify(streaming ? '引导' : '发送')};
+      if (${height} === 360) {
+        for (let i = 0; i < 16; i++) {
+          const path = 'src/a-long-folder-name/model-context-' + i + '.c';
+          document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: { kind: 'file', path } }));
+          document.getElementById('aiPinSelection').click();
+        }
+      }
+      const drawer = document.getElementById('aiDrawer').getBoundingClientRect();
+      const ids = ['aiQuickModel', 'aiQuickReasoning', 'aiAttachShot', 'aiSendChat'];
+      if (!stop.hidden) ids.push('aiStopChat');
+      return ids.flatMap(id => {
+        const control = document.getElementById(id);
+        const element = control.closest('.fsel')?.querySelector('.fsel-btn') ?? control;
+        const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(left + width / 2, top + height / 2);
+        return left >= drawer.left && top >= drawer.top && right <= drawer.right && bottom <= drawer.bottom &&
+          element.contains(hit) ? [] : [{ id, top, bottom, left, right, hit: hit?.id }];
+      });
+    })()`);
+    cases.push({ width, height, streaming, clipped });
+  }
+  assert.ok(cases.every(({ clipped }) => clipped.length === 0), JSON.stringify(cases));
 });
 
 test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重置画布布局', async t => {
@@ -388,6 +528,53 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     assert.match(text, /1\. 节点 main\.c::main/);
     assert.doesNotMatch(text, /pinned\.c::f15\b/);
   });
+
+  await t.test('外部代码选段在重载对话后仍可用于追问', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    const openChat = async () => {
+      await browser.waitFor("Boolean(window.__cg?.view) && !document.getElementById('aiDrawer').classList.contains('show')");
+      await browser.evaluate("document.getElementById('aiBtn').click()");
+      await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+      await browser.evaluate(`document.querySelector('[data-ai-tab="chat"]').click()`);
+    };
+    const countBefore = requests.length;
+    await openChat();
+    await browser.evaluate(`(() => {
+      document.getElementById('aiNewChat').click();
+      const input = document.getElementById('aiTextFileInput');
+      const files = new DataTransfer();
+      files.items.add(new File(['outside_first\\nint saved_excerpt(void) { return 37; }\\noutside_last'], 'external.c'));
+      input.files = files.files;
+      input.dispatchEvent(new Event('change'));
+    })()`);
+    await browser.waitFor("document.querySelectorAll('.ai-att-range input').length === 2");
+    await browser.evaluate(`(() => {
+      const [start, end] = document.querySelectorAll('.ai-att-range input');
+      start.value = end.value = '2';
+      start.dispatchEvent(new Event('change'));
+      document.getElementById('aiPromptInput').value = '请读一下这段代码';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    const saved = await get('/api/ai/chats');
+    const thread = saved.threads.find(item => item.id === saved.activeId);
+    assert.deepEqual(thread.messages[0].attachedFiles, [{ name: 'external.c', startLine: 2, endLine: 2, totalLines: 3,
+      content: 'int saved_excerpt(void) { return 37; }' }]);
+    await browser.send('Page.reload');
+    await openChat();
+    await browser.waitFor("document.querySelector('.ai-msg-att-file')?.textContent.includes('external.c')");
+    await browser.evaluate(`(() => {
+      document.getElementById('aiPromptInput').value = '上面附件中的函数返回什么？';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.querySelectorAll('#aiMessages .ai-msg.assistant .ai-msg-text').length >= 2 && document.getElementById('aiStopChat').hidden");
+    assert.equal(requests.length, countBefore + 2);
+    const priorTurn = requests.at(-1).messages.find(m => m.role === 'user' && m.content.includes('请读一下这段代码'));
+    assert.match(priorTurn?.content || '', /external\.c \(L2-L2.*\)[\s\S]*saved_excerpt\(void\) \{ return 37; \}/);
+    assert.doesNotMatch(priorTurn.content, /outside_first|outside_last/);
+  });
 });
 
 test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async t => {
@@ -426,6 +613,52 @@ test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async
   await savePosition(0);
   const invalid = await getView();
   assert.equal(invalid.nodes.find(node => node.id === root).y, node.y);
+});
+
+test('e2e：移动嵌套目录时按外框定位，并保留参照目录下方的间隔', async t => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-move-directories-'));
+  t.after(() => fs.rmSync(target, { recursive: true, force: true, maxRetries: 3 }));
+  const roots = [];
+  for (const [directory, name] of [['alpha/deep', 'entry'], ['beta', 'worker']]) {
+    fs.mkdirSync(path.join(target, directory), { recursive: true });
+    fs.writeFileSync(path.join(target, directory, 'unit.c'), `void ${name}(void) {}\n`);
+    roots.push(`${directory}/unit.c::${name}`);
+  }
+  const moves = [
+    { id: 'alpha', x: 720, y: 640 },
+    { id: 'beta', relativeTo: 'alpha', placement: 'below', gap: 36 },
+  ];
+  let result;
+  const llm = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const last = JSON.parse(Buffer.concat(chunks)).messages.at(-1);
+    if (last.role === 'tool') result = JSON.parse(last.content);
+    const message = result ? { content: '已移动。' } : { tool_calls: [{
+      id: 'move', type: 'function', function: { name: 'arrange_canvas', arguments: JSON.stringify({ action: 'move_group', moves }) },
+    }] };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ choices: [{ message }] }));
+  });
+  await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => llm.close(resolve)));
+  const srv = await launchServer({ target });
+  t.after(srv.close);
+  const post = (route, body) => fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post('/api/page', { roots, up: 0, down: 0, groupMode: 'file' });
+  const chat = await post('/api/ai/chat', { prompt: '移动这两个目录', config: {
+    model: 'mock-layout', baseUrl: `http://127.0.0.1:${llm.address().port}/v1`, toolMode: 'tools',
+  } });
+  assert.match(await chat.text(), /"type":"done"/);
+  assert.equal(result?.ok, true, JSON.stringify(result));
+  const view = await fetch(srv.baseUrl + '/api/view?groupMode=file&up=0&down=0&roots=' +
+    encodeURIComponent(roots.join(','))).then(res => res.json());
+  const alpha = view.containers.find(box => box.id === 'alpha');
+  const beta = view.containers.find(box => box.id === 'beta');
+  assert.deepEqual([alpha.x, alpha.y], [720, 640]);
+  assert.deepEqual([beta.x, beta.y], [alpha.x, alpha.y + alpha.h + 36]);
 });
 
 test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {
@@ -1706,4 +1939,225 @@ test('指代锚定防近因偏差、解释类提问禁止擅自改画布、多�
   assert.equal(capturedToolOutputs[0].needsVehicleChoice, true, '同时传入多车型同名函数必须拦截并要求询问');
   assert.equal(capturedToolOutputs[1].needsVehicleChoice, true, '用户未指定车型时私自猜选单个车型版本也必须拦截');
   assert.deepEqual(capturedToolOutputs[1].pathBranches.map((b) => b.prefix).sort(), ['z144', 'z145']);
+});
+
+test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，以及 tidy/move_group 整理分组画布', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-indirect-tidy-'));
+  fs.writeFileSync(path.join(dir, 'dispatch.c'), [
+    'typedef void (*fn_t)(void);',
+    'void vvv(void) {}',
+    'void ggg(void) {}',
+    'void jjj(void) {}',
+    'void ghh(void) {}',
+    'void jkk(void) {}',
+    'void kkk(void) {}',
+    'const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, 1 ? jkk : kkk } };',
+    '/* 10ms周期 */',
+    'void dispatch_x(int mode) {',
+    '  int row = mode ? 1 : 0;',
+    '  e[row][0]();',
+    '}',
+    'void Task10ms(void) { dispatch_x(1); }',
+  ].join('\n'));
+  const cp932Text = new TextDecoder('shift_jis').decode(Uint8Array.of(0xc2, 0xa9));
+  fs.writeFileSync(path.join(dir, 'worker.c'), Buffer.concat([Buffer.from([
+    'void ghh(void);',
+    'void worker_step(void) { ghh(); }',
+    '/* ',
+  ].join('\n')), Buffer.from([0xc2, 0xa9]), Buffer.from(' */\n')]));
+  for (const folder of ['Src/Dispatch', 'Src/DispatchExtra', 'Backup/Src/Dispatch']) {
+    fs.mkdirSync(path.join(dir, folder), { recursive: true });
+    fs.writeFileSync(path.join(dir, folder, 'bom.h'), '\uFEFF/* 周期 */\n');
+  }
+
+  const toolResults = [];
+  let turn = 0;
+  const mockLlm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      const last = body.messages?.at(-1);
+      if (last?.role === 'tool') toolResults.push({ name: last.name, data: JSON.parse(last.content) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      turn++;
+      const reply = (name, args) => res.end(JSON.stringify({
+        choices: [{ message: { content: '', tool_calls: [{ id: `t_${turn}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } }],
+      }));
+      if (turn === 1) return reply('inspect_indirect_calls', { function: 'ghh' });
+      if (turn === 2) return reply('read_source', { file: 'dispatch.c', startLine: 8, endLine: 13 });
+      if (turn === 3) return reply('read_source', { query: cp932Text, file: 'worker.c', encoding: 'cp932' });
+      if (turn === 4) return reply('read_source', { query: '周期', paths: ['sRC\\Dispatch/'], file: 'bom.h', encoding: 'cp932' });
+      if (turn === 5) return reply('apply_labels', {
+        items: [{ from: 'worker_step', to: 'ghh', line: 2, preset: 'task', text: 'TASK:10ms' }],
+      });
+      if (turn === 6) return reply('add_call_edge', {
+        edges: [{ from: 'dispatch_x', to: 'ghh', line: 12, via: 'e[1][0]', reason: 'mode!=0 时调用 e[1][0] 即 ghh' }],
+        addToCanvas: true,
+      });
+      if (turn === 7) return reply('apply_labels', {
+        items: [{ from: 'dispatch_x', to: 'ghh', line: 12, preset: 'task', text: 'TASK:10ms' }],
+      });
+      if (turn === 8) return reply('trace_upstream', { functions: ['ghh'] });
+      if (turn === 9) return reply('arrange_canvas', { action: 'tidy', direction: 'LR' });
+      res.end(JSON.stringify({
+        choices: [{
+          message: {
+            content: '已补全 dispatch_x → ghh 间接调用边并整理画布。\n<next_steps>\n```json\n[{"label":"检查另一分支","prompt":"查看 dispatch_x 的 vvv 分支"}]\n```\n</next_steps>',
+          },
+        }],
+      }));
+    });
+  });
+  await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+  const srv = await launchServer({ target: dir });
+  t.after(async () => {
+    await new Promise((r) => mockLlm.close(r));
+    await srv.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then((r) => r.json());
+  await post('/api/ai/config', { baseUrl: `http://127.0.0.1:${mockLlm.address().port}/v1`, model: 'mock-2d', toolMode: 'tools', maxTokens: 4096 });
+  await post('/api/page', { roots: ['dispatch.c::dispatch_x', 'worker.c::worker_step'], up: 0, down: 0, groupMode: 'file' });
+  const targetPeriods = async () => {
+    const response = await fetch(srv.baseUrl + '/api/source?id=dispatch.c::ghh');
+    assert.equal(response.status, 200);
+    return (await response.json()).taskPeriods.map(context => context.us);
+  };
+  assert.deepEqual(await targetPeriods(), []);
+
+  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: '请查明 dispatch_x 如何调用 ghh 并补全这条调用边，加上 TASK 标签，再整理画布',
+      attachments: [{ name: 'notes.txt', startLine: 1, endLine: 2, totalLines: 2, content: 'mode=1 -> row=1 -> ghh' }],
+    }),
+  });
+  assert.equal(chatRes.status, 200);
+  const events = (await chatRes.text()).trim().split('\n').map(JSON.parse);
+  const done = events.find((e) => e.type === 'done');
+  assert.ok(done, '应正常完成对话');
+  assert.equal(done.suggestions?.[0]?.label, '检查另一分支', '应兼容带 ```json 代码块的 <next_steps>');
+
+  const inspectRes = toolResults.find((r) => r.name === 'inspect_indirect_calls')?.data;
+  assert.ok(inspectRes?.tables?.some((tb) => tb.name === 'e' && tb.slots.some((s) => s.slot === '[1][0]' && s.target === 'ghh')));
+  assert.ok(inspectRes.tables.find(tb => tb.name === 'e').slots.some(s => s.slot === '[1][2]' && s.target === null));
+  const srcRes = toolResults.find((r) => r.name === 'read_source')?.data;
+  assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
+  const searches = toolResults.filter(r => r.name === 'read_source').slice(1).map(r => r.data);
+  assert.deepEqual(searches[0]?.matches?.map(({ line, text }) => [line, text]), [[3, `/* ${cp932Text} */`]], JSON.stringify(searches));
+  assert.deepEqual(searches[1]?.matches?.map(({ file, line, text }) => [file, line, text]),
+    [['Src/Dispatch/bom.h', 1, '/* 周期 */']], JSON.stringify(searches));
+  const addRes = toolResults.find((r) => r.name === 'add_call_edge')?.data;
+  assert.equal(addRes?.ok, true);
+  assert.equal(addRes?.addedCount, 1);
+  const labels = toolResults.filter(r => r.name === 'apply_labels').map(r => r.data);
+  assert.deepEqual(labels.map(r => r.edgeKeys), [
+    ['worker.c::worker_step->dispatch.c::ghh:2'], ['dispatch.c::dispatch_x->dispatch.c::ghh:12'],
+  ]);
+  const traceRes = toolResults.find((r) => r.name === 'trace_upstream')?.data;
+  assert.ok(JSON.stringify(traceRes).includes('dispatch_x'), '补边后 trace_upstream 应立刻追踪到 dispatch_x');
+  assert.ok(!JSON.stringify(traceRes).includes('vvv'), '无关槽位 vvv 不应被误连');
+  assert.deepEqual(await targetPeriods(), [10000], '补边后再次查看源码应显示新增的 10ms 上游任务');
+  const tidyRes = toolResults.find((r) => r.name === 'arrange_canvas')?.data;
+  assert.equal(tidyRes?.ok, true, JSON.stringify(tidyRes));
+  assert.ok(tidyRes?.updatedCount >= 2, '分组模式下 tidy 应成功重排全部节点而不报容器重叠');
+});
+
+test('e2e：双击已选两点连线不误切其他共线、输入框动态建议 Tab 补全与分层截图可见缩略图', async (t) => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  await fetch(srv.baseUrl + '/api/page', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ roots: ['main.c::main'], up: 0, down: 1, groupMode: 'file' }),
+  });
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
+  await browser.waitFor('Boolean(window.__cg?.view?.nodes?.length)');
+
+  // 1. 测试双击已选中的直连边不会切换到同一共线干线上的其他边
+  const dblResult = await browser.evaluate(`(async () => {
+    const { state, edgeKey } = await import('/lib/state.js');
+    const { hooks } = await import('/lib/hooks.js');
+    const edges = state.view.edges;
+    if (edges.length < 2) return { skipped: true };
+    const e0 = edges[0], e1 = edges[1];
+    // 构造两条共享同一水平干线的边，先通过 directPair 选中 e1
+    const sharedPts = [[120, 120], [320, 120]];
+    e0.points = sharedPts.map(p => [...p]);
+    e1.points = sharedPts.map(p => [...p]);
+    hooks.selectEdge(e1, { directPair: true });
+    const cv = document.getElementById('cv');
+    const rect = cv.parentElement.getBoundingClientRect();
+    const { x, y, k } = window.__cg.cam;
+    const cx = rect.left + x + 220 * k;
+    const cy = rect.top + y + 120 * k;
+    cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerup', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new PointerEvent('pointerup', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    cv.dispatchEvent(new MouseEvent('dblclick', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
+    return {
+      expected: edgeKey(e1),
+      selected: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
+      moveKind: state.moveTarget?.kind || null,
+      moveItem: state.moveTarget?.item ? edgeKey(state.moveTarget.item) : null,
+    };
+  })()`);
+  if (!dblResult.skipped) {
+    assert.equal(dblResult.selected, dblResult.expected, '双击已选连线不应切换到共线上的其他边');
+    assert.equal(dblResult.moveKind, 'edge');
+    assert.equal(dblResult.moveItem, dblResult.expected, '解锁编辑的目标必须是原选中连线');
+  }
+
+  // 2. 测试动态建议 placeholder + Tab 补全 + 分层/视图截图缩略图预览
+  const uiResult = await browser.evaluate(`(async () => {
+    document.getElementById('aiBtn').click();
+    document.querySelector('[data-ai-tab="chat"]').click();
+    const input = document.getElementById('aiPromptInput');
+    const tabHint = document.getElementById('aiGhostTabHint');
+    const placeholderBefore = input.placeholder;
+    const hintVisibleBefore = !tabHint.hidden;
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+    const filledAfterTab = input.value;
+    const hintHiddenAfter = tabHint.hidden;
+
+    // 打开截图/附件菜单，截取当前画布并验证缩略图真实可见且可点击放大
+    document.getElementById('aiAttachShot').click();
+    const menu = document.getElementById('aiAttachMenu');
+    const menuOpen = !menu.hidden;
+    const firstBtn = menu.querySelector('button:not(:disabled)');
+    firstBtn.click();
+    const tray = document.getElementById('aiAttachments');
+    const thumb = tray.querySelector('img.ai-att-thumb');
+    const thumbSrc = thumb?.getAttribute('src') || '';
+    thumb?.click();
+    const lightboxOpen = !document.getElementById('aiImageLightbox').hidden;
+    document.getElementById('aiLightboxClose').click();
+    return {
+      placeholderBefore,
+      hintVisibleBefore,
+      filledAfterTab,
+      hintHiddenAfter,
+      menuOpen,
+      trayVisible: !tray.hidden,
+      hasDataUrl: thumbSrc.startsWith('data:image/'),
+      lightboxOpen,
+    };
+  })()`);
+  assert.ok(uiResult.placeholderBefore.length > 0 && !uiResult.placeholderBefore.includes('油压控制'), '输入框应使用动态上下文建议而非固定示例文案');
+  assert.equal(uiResult.hintVisibleBefore, true);
+  assert.equal(uiResult.filledAfterTab, uiResult.placeholderBefore, '按 Tab 应补全当前建议提问');
+  assert.equal(uiResult.hintHiddenAfter, true);
+  assert.equal(uiResult.menuOpen, true);
+  assert.equal(uiResult.trayVisible, true, '截图后应显示可见附件预览区');
+  assert.equal(uiResult.hasDataUrl, true, '缩略图应包含真实图片 DataURL');
+  assert.equal(uiResult.lightboxOpen, true, '点击缩略图应弹出大图预览');
 });

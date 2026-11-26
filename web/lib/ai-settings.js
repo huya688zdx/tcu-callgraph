@@ -5,13 +5,14 @@
  * 3. 外部 MCP：保留原有三档权限控制、一键复制 CC 命令与精简指令。
  */
 import { t } from '../i18n.js';
+import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
 import { focusBox } from './camera.js';
 import { hooks } from './hooks.js';
 import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
 import { runSearch } from './panels.js';
-import { draw } from './render.js';
+import { captureBoxImage, compositeEffects, draw } from './render.js';
 import { edgeKey, els, state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
@@ -46,7 +47,17 @@ const selectionText = document.getElementById('aiSelectionText');
 const pinSelectionBtn = document.getElementById('aiPinSelection');
 const selectionQuestions = document.getElementById('aiSelectionQuestions');
 const clearSelectionBtn = document.getElementById('aiClearSelection');
+const inputShellEl = document.getElementById('aiInputShell');
+const attachmentsEl = document.getElementById('aiAttachments');
 const inputEl = document.getElementById('aiPromptInput');
+const ghostTabHintEl = document.getElementById('aiGhostTabHint');
+const attachMenuEl = document.getElementById('aiAttachMenu');
+const imageFileInputEl = document.getElementById('aiImageFileInput');
+const textFileInputEl = document.getElementById('aiTextFileInput');
+const lightboxEl = document.getElementById('aiImageLightbox');
+const lightboxImgEl = document.getElementById('aiLightboxImg');
+const lightboxCaptionEl = document.getElementById('aiLightboxCaption');
+const lightboxCloseEl = document.getElementById('aiLightboxClose');
 const sendBtn = document.getElementById('aiSendChat');
 const stopBtn = document.getElementById('aiStopChat');
 const quickModelEl = document.getElementById('aiQuickModel');
@@ -115,7 +126,7 @@ const LABELS_FOLLOWUP = { label: '🏷 补全当前图 TASK/顺序标签', promp
 const FOLLOWUPS = new Map([
   ['add_to_canvas', [
     LABELS_FOLLOWUP,
-    { label: '✂️ 去掉不需要的车型路径', draft: '请去掉路径包含 ' },
+    { label: '✨ 一键整理画布排版', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 一键整理当前画布布局。' },
     { label: '🔖 为当前视图保存书签', draft: BOOKMARK_COMMAND + ' ' },
   ]],
   ['get_git_changes', [
@@ -129,6 +140,35 @@ const FOLLOWUPS = new Map([
   ['remove_from_canvas', [
     LABELS_FOLLOWUP,
     { label: '🔖 保存当前筛选结果为书签', draft: BOOKMARK_COMMAND + ' ' },
+  ]],
+  ['read_function', [
+    { label: '🔍 查上游 TASK 调用链', prompt: '请调用 trace_upstream 只读追踪刚才分析函数的上游 TASK/ISR 调用链。' },
+    { label: '🧭 查间接/函数指针调用', prompt: '请调用 inspect_indirect_calls 和 read_source 检查刚才分析函数是否存在函数指针数组、常量结构体或回调间接调用。' },
+    { label: '➕ 将相关函数加入画布', prompt: '请将刚才分析的相关函数及上游入口加入当前画布。' },
+  ]],
+  ['read_source', [
+    { label: '🧭 核实并补入间接调用边', prompt: '请根据刚才查到的源码证据，调用 add_call_edge 只加入真正会触发的间接调用边到画布。' },
+    { label: '🔍 追踪上游调用链', prompt: '请追踪刚才源码涉及核心函数的上游 TASK/ISR 调用链。' },
+  ]],
+  ['inspect_indirect_calls', [
+    { label: '🔗 按源码核实并补边入图', prompt: '请结合实际代码逻辑，只选择真正会执行的间接调用目标，调用 add_call_edge 写入工程调用图并加入画布。' },
+    { label: '📄 读取分派表定义源码', prompt: '请调用 read_source 读取对应常量结构体/分派表的完整定义源码。' },
+  ]],
+  ['add_call_edge', [
+    { label: '🔍 重新追踪上游调用链', prompt: '请重新调用 trace_upstream 验证补边后的完整上游 TASK/ISR 调用链。' },
+    { label: '✨ 整理当前画布布局', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 整理当前画布。' },
+  ]],
+  ['trace_upstream', [
+    { label: '➕ 将上游调用链加入画布', prompt: '请将刚才查到的上游调用链加入当前画布。' },
+    { label: '🧭 排查缺失的间接调用', prompt: '请调用 inspect_indirect_calls 检查是否还有通过函数指针表或回调触发的上游调用。' },
+  ]],
+  ['find_symbols', [
+    { label: '➕ 将匹配结果加入画布', prompt: '请将刚才找到的主要相关函数加入当前画布。' },
+    { label: '📖 查看核心函数源码', prompt: '请调用 read_function 读取其中最核心函数的源码实现。' },
+  ]],
+  ['arrange_canvas', [
+    { label: '↕️ 改为自上而下排布', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "TB" }) 按从上到下方向重新整理画布。' },
+    { label: '↩️ 恢复自动布局', prompt: '请调用 arrange_canvas({ action: "reset" }) 恢复画布自动布局。' },
   ]],
 ]);
 
@@ -145,8 +185,12 @@ let mcpLevel = 'readonly';
 let envLocked = false;
 const REASONING_LABELS = new Map([['default', '默认'], ['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
 const QUICK_CONFIG_ACTION = '__ai_open_config__';
-const DEFAULT_PROMPT_PLACEHOLDER = inputEl?.placeholder || '例如：把 Git 未提交改动的函数加入画布；或：找出油压控制相关函数和共享变量加到图里…';
 const STEERING_PROMPT_PLACEHOLDER = '生成中可随时输入并按 Enter 中途引导或纠正…';
+const MAX_PENDING_IMAGES = 2;
+const MAX_PENDING_FILES = MAX_CODE_ATTACHMENTS;
+let currentGhostSuggestion = '';
+const pendingImages = []; // [{ id, dataUrl, label, width, height }]
+const pendingFiles = [];  // [{ id, name, lines, startLine, endLine }]
 let llmConfig = {
   baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
   toolMode: 'auto', reasoningEffort: 'default', contextWindow: DEFAULT_CONTEXT_WINDOW,
@@ -173,7 +217,6 @@ let canvasSelection = null;
 const pinnedSelections = [];
 const MAX_PINNED_SELECTIONS = 16;
 const dismissedSelectionKeys = new Set();
-let attachCanvasShot = false;
 let activeStreamFlush = null;
 
 function isCanvasDragging() {
@@ -261,7 +304,12 @@ function activeThread() {
 function persistChats(projectId = chatProjectId) {
   if (projectId == null) return;
   const mutation = ++chatMutation;
-  const payload = { projectId, activeId: activeChatId, threads: chatThreads.slice(0, 30) };
+  const threads = chatThreads.slice(0, 30).map((th) => ({
+    ...th,
+    messages: (th.messages || []).slice(-80).map(({ attachedImages, ...rest }) => rest),
+  }));
+  boundSavedCodeAttachments(threads, activeChatId);
+  const payload = { projectId, activeId: activeChatId, threads };
   void api.saveAiChats(payload).catch(error => {
     if (projectId === chatProjectId && mutation === chatMutation) {
       setChatStatus(`对话保存失败：${error.message}`, true);
@@ -323,8 +371,13 @@ function messageContext(message) {
 }
 
 function chatHistory(messages) {
-  return messages.filter((m) => !m.error).slice(-16)
-    .map((m) => ({ role: m.role, content: messageContext(m) })).filter((m) => m.content);
+  const history = messages.filter((m) => !m.error).slice(-16).map((m) => ({
+    role: m.role,
+    content: messageContext(m),
+    ...(m.attachedFiles?.length ? { attachedFiles: m.attachedFiles } : {}),
+  })).filter(m => m.content || m.attachedFiles?.length);
+  boundSavedCodeAttachments([{ messages: history }]);
+  return history;
 }
 
 function estimateTextTokens(text) {
@@ -336,7 +389,13 @@ function estimateTextTokens(text) {
 }
 
 function estimateContext(messages) {
-  return chatHistory(messages).reduce((total, { content }) => total + 4 + estimateTextTokens(content), 0);
+  return chatHistory(messages).reduce((total, { content, attachedFiles }) =>
+    total + estimateHistoryMessage(content, attachedFiles), 0);
+}
+
+function estimateHistoryMessage(content, files = []) {
+  return 4 + estimateTextTokens(content) + files.reduce((total, file) =>
+    total + estimateTextTokens(file.name) + estimateTextTokens(file.content), 0);
 }
 
 function formatTokens(value) {
@@ -381,7 +440,8 @@ function computeContextState(thread, liveMetrics) {
   const saved = resolveMetricsTokens(baseIdx >= 0 ? messages[baseIdx].metrics : thread?.metrics);
   if (saved) {
     const trailing = baseIdx >= 0 ? messages.slice(baseIdx + 1) : [];
-    const extra = trailing.reduce((sum, msg) => sum + (msg.error ? 0 : 4 + estimateTextTokens(messageContext(msg))), 0);
+    const extra = trailing.reduce((sum, msg) =>
+      sum + (msg.error ? 0 : estimateHistoryMessage(messageContext(msg), msg.attachedFiles)), 0);
     return {
       used: saved.total + extra,
       promptTokens: saved.promptTokens,
@@ -460,13 +520,59 @@ function setChatStatus(text = '', error = false) {
   chatStatusEl.classList.toggle('err', error);
 }
 
+function computeInputSuggestion() {
+  if (activeAbort) return '';
+  const thread = chatThreads.find((item) => item.id === activeChatId);
+  const latest = thread?.messages?.at(-1);
+  if (latest?.role === 'assistant' && !latest.error && !Array.isArray(latest.questionOptions)) {
+    const dynamic = sanitizeSuggestions(latest.suggestions);
+    const first = dynamic[0] || buildFallbackFollowups(latest)[0];
+    if (first?.prompt) return first.prompt;
+    if (first?.draft) return first.draft;
+  }
+  if (canvasSelection) {
+    const { questions } = describeSelection(canvasSelection);
+    if (questions?.[0]?.[1]) return questions[0][1];
+  }
+  const nodes = state.view?.nodes || [];
+  if (nodes.length) {
+    const root = nodes.find((n) => n.id === state.roots?.[0]) || nodes[0];
+    if (root?.name) return `分析「${root.name}」的上下游调用链及共享变量读写关系`;
+  }
+  return '查看当前 Git 未提交改动，汇总涉及的文件、函数和独立模块';
+}
+
+function syncInputSuggestion() {
+  if (!inputEl) return;
+  if (activeAbort) {
+    currentGhostSuggestion = '';
+    inputEl.placeholder = STEERING_PROMPT_PLACEHOLDER;
+    if (ghostTabHintEl) ghostTabHintEl.hidden = true;
+    return;
+  }
+  currentGhostSuggestion = computeInputSuggestion();
+  inputEl.placeholder = currentGhostSuggestion || '';
+  if (ghostTabHintEl) {
+    ghostTabHintEl.hidden = !currentGhostSuggestion || Boolean(inputEl.value);
+  }
+}
+
+function acceptGhostSuggestion() {
+  if (!inputEl || inputEl.value || !currentGhostSuggestion) return false;
+  inputEl.value = currentGhostSuggestion;
+  inputEl.focus();
+  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+  syncInputSuggestion();
+  return true;
+}
+
 function updateChatControls() {
   const streaming = Boolean(activeAbort);
   sendBtn.disabled = Boolean(compacting);
   sendBtn.textContent = streaming ? '引导' : '发送';
   sendBtn.title = streaming ? '立即中止当前步骤并带上新引导继续' : '';
   sendBtn.classList.toggle('steering', streaming);
-  if (inputEl) inputEl.placeholder = streaming ? STEERING_PROMPT_PLACEHOLDER : DEFAULT_PROMPT_PLACEHOLDER;
+  syncInputSuggestion();
   compactBtn.disabled = Boolean(streaming || compacting) || !activeThread().messages.length;
   stopBtn.hidden = !streaming;
   for (const chip of selectionQuestions.children) chip.disabled = Boolean(compacting);
@@ -647,6 +753,7 @@ function prefillPrompt(draft) {
   inputEl.value = draft;
   inputEl.focus();
   inputEl.setSelectionRange(draft.length, draft.length);
+  syncInputSuggestion();
 }
 
 function sanitizeSuggestions(raw) {
@@ -666,6 +773,35 @@ function sanitizeSuggestions(raw) {
   return out;
 }
 
+function buildFallbackFollowups(message) {
+  const tools = Array.isArray(message?.tools) ? message.tools : [];
+  const successfulTools = tools.filter(tool => tool.ok !== false);
+  const addedToCanvas = successfulTools.some(tool => tool.name === 'add_to_canvas');
+  const action = successfulTools.findLast(tool => FOLLOWUPS.has(tool.name) &&
+    (tool.name !== 'get_git_changes' || !addedToCanvas));
+  if (action) return FOLLOWUPS.get(action.name) || [];
+  if (canvasSelection) {
+    const { questions } = describeSelection(canvasSelection);
+    if (questions?.length) {
+      return [
+        ...questions.slice(0, 2).map(([label, prompt]) => ({ label: `🔍 ${label}`, prompt })),
+        { label: '🧭 查间接/函数指针调用', prompt: '请调用 inspect_indirect_calls 检查当前选中对象是否存在间接调用或分派表关系。' },
+      ];
+    }
+  }
+  if (state.view?.nodes?.length) {
+    return [
+      LABELS_FOLLOWUP,
+      { label: '✨ 一键整理画布排版', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 整理当前画布布局。' },
+      { label: '⚡ 检查 Git 未提交改动', prompt: '请调用 get_git_changes 只读检查当前 Git 未提交改动，汇总改动涉及的文件和函数。' },
+    ];
+  }
+  return [
+    { label: '⚡ 检查 Git 未提交改动', prompt: '请调用 get_git_changes 只读检查当前 Git 未提交改动，汇总改动涉及的文件、函数和独立模块。' },
+    { label: '🔍 按关键词查找函数', draft: '帮我找出和 ' },
+  ];
+}
+
 function renderFollowups(box, message, thread) {
   if (thread.messages.at(-1) !== message || message.error) return;
   const tools = message.tools || [];
@@ -674,12 +810,8 @@ function renderFollowups(box, message, thread) {
   let options = dynamicOptions;
   const isDynamic = dynamicOptions.length > 0;
   if (!isDynamic) {
-    if (!message.completed) return;
-    const successfulTools = tools.filter(tool => tool.ok !== false);
-    const addedToCanvas = successfulTools.some(tool => tool.name === 'add_to_canvas');
-    const action = successfulTools.findLast(tool => FOLLOWUPS.has(tool.name) &&
-      (tool.name !== 'get_git_changes' || !addedToCanvas));
-    options = FOLLOWUPS.get(action?.name) || [];
+    if (message.completed === false) return;
+    options = buildFallbackFollowups(message);
   }
   if (!options.length) return;
 
@@ -707,6 +839,7 @@ function renderFollowups(box, message, thread) {
     chips.appendChild(button);
   }
   box.appendChild(chips);
+  syncInputSuggestion();
 }
 
 function selectionKey(selection) {
@@ -911,6 +1044,7 @@ function setCanvasSelection(selection, explicit = false) {
   if (canvasSelection === next) return;
   canvasSelection = next;
   renderSelectionBar();
+  syncInputSuggestion();
 }
 
 function pinCurrentSelection() {
@@ -973,8 +1107,8 @@ function buildCanvasLayoutSnapshot() {
   const v = state.view;
   if (!v || !Array.isArray(v.nodes) || !v.nodes.length) return undefined;
   return {
-    root: state.roots?.[0] || v.root || '',
-    mode: state.groupMode === 'flat' ? 'flat' : 'group',
+    root: (Array.isArray(state.roots) && state.roots.length ? state.roots.join('+') : '') || v.root || '',
+    mode: state.groupMode || (state.group ? 'file' : 'flat'),
     width: Math.round(v.width || 0),
     height: Math.round(v.height || 0),
     nodes: v.nodes.slice(0, 200).map((n) => ({
@@ -995,10 +1129,145 @@ function buildCanvasLayoutSnapshot() {
       w: Math.round(g.w),
       h: Math.round(g.h),
     })),
+    containers: (v.containers || []).slice(0, 100).map((c) => ({
+      id: c.id,
+      x: Math.round(c.x),
+      y: Math.round(c.y),
+      w: Math.round(c.w),
+      h: Math.round(c.h),
+    })),
   };
 }
 
-function captureCanvasImage() {
+function openImageLightbox(dataUrl, caption = '') {
+  if (!lightboxEl || !lightboxImgEl) return;
+  lightboxImgEl.src = dataUrl;
+  if (lightboxCaptionEl) lightboxCaptionEl.textContent = caption || '画布/附件图片预览';
+  lightboxEl.hidden = false;
+}
+
+function closeImageLightbox() {
+  if (!lightboxEl) return;
+  lightboxEl.hidden = true;
+  if (lightboxImgEl) lightboxImgEl.removeAttribute('src');
+}
+
+function updateAttachButton() {
+  if (!attachShotBtn) return;
+  const total = pendingImages.length + pendingFiles.length;
+  attachShotBtn.setAttribute('aria-pressed', String(total > 0));
+  if (total > 0) {
+    const parts = [];
+    if (pendingImages.length) parts.push(`${pendingImages.length}图`);
+    if (pendingFiles.length) parts.push(`${pendingFiles.length}文件`);
+    attachShotBtn.textContent = `📎 已附 ${parts.join('+')}`;
+  } else {
+    attachShotBtn.textContent = '📎 截图/文件';
+  }
+}
+
+function renderAttachments() {
+  updateAttachButton();
+  if (!attachmentsEl) return;
+  const hasAny = pendingImages.length > 0 || pendingFiles.length > 0;
+  attachmentsEl.hidden = !hasAny;
+  attachmentsEl.replaceChildren();
+  if (!hasAny) return;
+
+  for (const img of pendingImages) {
+    const card = document.createElement('div');
+    card.className = 'ai-att-img';
+    const thumb = document.createElement('img');
+    thumb.className = 'ai-att-thumb';
+    thumb.src = img.dataUrl;
+    thumb.alt = img.label || '截图';
+    thumb.title = '点击查看大图预览';
+    thumb.addEventListener('click', () => openImageLightbox(img.dataUrl, `${img.label} (${img.width}×${img.height})`));
+    const meta = document.createElement('div');
+    meta.className = 'ai-att-meta';
+    const name = document.createElement('span');
+    name.className = 'ai-att-name';
+    name.textContent = name.title = img.label || '画布截图';
+    const sub = document.createElement('span');
+    sub.className = 'ai-att-sub';
+    sub.textContent = `${img.width}×${img.height} · 点击预览`;
+    meta.append(name, sub);
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'ai-att-rm';
+    rm.setAttribute('aria-label', `移除图片：${img.label}`);
+    rm.textContent = '×';
+    rm.addEventListener('click', () => {
+      const idx = pendingImages.findIndex((x) => x.id === img.id);
+      if (idx >= 0) pendingImages.splice(idx, 1);
+      renderAttachments();
+    });
+    card.append(thumb, meta, rm);
+    attachmentsEl.appendChild(card);
+  }
+
+  for (const file of pendingFiles) {
+    const chip = document.createElement('div');
+    chip.className = 'ai-att-file';
+    const title = document.createElement('span');
+    title.textContent = `📄 ${file.name}`;
+    title.title = `${file.name}（共 ${file.lines.length} 行）`;
+    const range = document.createElement('span');
+    range.className = 'ai-att-range';
+    const startInput = document.createElement('input');
+    startInput.type = 'number';
+    startInput.min = '1';
+    startInput.max = String(Math.max(1, file.lines.length));
+    startInput.value = String(file.startLine);
+    startInput.title = '导入起始行号';
+    const endInput = document.createElement('input');
+    endInput.type = 'number';
+    endInput.min = '1';
+    endInput.max = String(Math.max(1, file.lines.length));
+    endInput.value = String(file.endLine);
+    endInput.title = '导入结束行号（可只导入部分片段）';
+    const syncRange = () => {
+      const total = Math.max(1, file.lines.length);
+      file.startLine = Math.max(1, Math.min(total, Math.trunc(Number(startInput.value) || 1)));
+      file.endLine = Math.max(file.startLine, Math.min(total, Math.trunc(Number(endInput.value) || total)));
+      startInput.value = String(file.startLine);
+      endInput.value = String(file.endLine);
+    };
+    startInput.addEventListener('change', syncRange);
+    endInput.addEventListener('change', syncRange);
+    range.append('L', startInput, '-', endInput, ` / ${file.lines.length}行`);
+    const rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'ai-att-rm';
+    rm.setAttribute('aria-label', `移除文件：${file.name}`);
+    rm.textContent = '×';
+    rm.addEventListener('click', () => {
+      const idx = pendingFiles.findIndex((x) => x.id === file.id);
+      if (idx >= 0) pendingFiles.splice(idx, 1);
+      renderAttachments();
+    });
+    chip.append(title, range, rm);
+    attachmentsEl.appendChild(chip);
+  }
+}
+
+function addImageAttachment(img) {
+  if (!img?.dataUrl) return false;
+  if (pendingImages.length >= MAX_PENDING_IMAGES) {
+    pendingImages.shift();
+  }
+  pendingImages.push({
+    id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    dataUrl: img.dataUrl,
+    label: img.label || '图片',
+    width: img.width || 0,
+    height: img.height || 0,
+  });
+  renderAttachments();
+  return true;
+}
+
+function captureViewportImage() {
   const cv = els.cv;
   if (!cv || !cv.width || !cv.height) return null;
   try {
@@ -1014,18 +1283,210 @@ function captureCanvasImage() {
     ctx.fillStyle = '#F7F6F2';
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(cv, 0, 0, w, h);
-    const dataUrl = off.toDataURL('image/jpeg', 0.82);
-    return dataUrl.startsWith('data:image/') ? { dataUrl, label: '当前画布截图' } : null;
+    ctx.save();
+    ctx.scale(scale, scale);
+    compositeEffects(ctx);
+    ctx.restore();
+    const dataUrl = off.toDataURL('image/jpeg', 0.85);
+    return dataUrl.startsWith('data:image/') ? { dataUrl, width: w, height: h, label: '当前画布视图' } : null;
   } catch {
     return null;
   }
 }
 
-function setAttachShot(on) {
-  attachCanvasShot = Boolean(on);
-  if (!attachShotBtn) return;
-  attachShotBtn.setAttribute('aria-pressed', String(attachCanvasShot));
-  attachShotBtn.textContent = attachCanvasShot ? '📷 已附带图' : '📷 画布图';
+function resolveSelectedCanvasBox() {
+  const v = state.view;
+  if (!v) return null;
+  const findBox = (kind, id) => {
+    if (!id) return null;
+    if (kind === 'file') {
+      const g = (v.groups || []).find((x) => x.id === id);
+      return g ? { kind: 'file', box: g, label: `文件：${g.label || g.id}` } : null;
+    }
+    const c = (v.containers || []).find((x) => x.id === id && !x.root);
+    return c ? { kind: 'dir', box: c, label: `目录：${c.label || c.id}` } : null;
+  };
+  if (state.ctxBox?.id) {
+    const found = findBox(state.ctxBox.kind, state.ctxBox.id);
+    if (found) return found;
+  }
+  if (canvasSelection?.kind === 'file' && canvasSelection.path) {
+    const found = findBox(canvasSelection.containerKind === 'dir' ? 'dir' : 'file', canvasSelection.path);
+    if (found) return found;
+  }
+  if (state.selected) {
+    const node = (v.nodes || []).find((n) => n.id === state.selected);
+    if (node?.group) {
+      const found = findBox('file', node.group);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function captureScopedBoxAttachment(entry) {
+  if (!entry?.box) return false;
+  const shot = captureBoxImage(entry.box, { padding: 28, maxDim: 1280 });
+  if (!shot) {
+    setChatStatus('无法截取该层级/文件框，请确认画布已渲染', true);
+    return false;
+  }
+  addImageAttachment({ ...shot, label: entry.label || entry.box.label || entry.box.id });
+  setChatStatus(`已截取「${entry.label}」，点击缩略图可放大确认`);
+  return true;
+}
+
+function encodeImageBlob(blob, label = '外部截图') {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const maxDim = 1280;
+        const scale = Math.min(1, maxDim / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+        const w = Math.max(1, Math.round((img.naturalWidth || 1) * scale));
+        const h = Math.max(1, Math.round((img.naturalHeight || 1) * scale));
+        const off = document.createElement('canvas');
+        off.width = w;
+        off.height = h;
+        const ctx = off.getContext('2d');
+        if (!ctx) { resolve(null); return; }
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        const dataUrl = off.toDataURL('image/jpeg', 0.85);
+        resolve(dataUrl.startsWith('data:image/') ? { dataUrl, width: w, height: h, label } : null);
+      } catch {
+        resolve(null);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+async function addImageFromBlob(blob, label = '剪贴板截图') {
+  const encoded = await encodeImageBlob(blob, label);
+  if (!encoded) {
+    setChatStatus('图片解析失败，请确认图片格式（PNG/JPG/WebP）', true);
+    return false;
+  }
+  addImageAttachment(encoded);
+  setChatStatus(`已附带图片「${label}」（${encoded.width}×${encoded.height}），点击缩略图可放大预览`);
+  return true;
+}
+
+async function addExternalTextFile(file) {
+  if (!file) return false;
+  if (file.size > 1_500_000) {
+    setChatStatus(`文件「${file.name}」超过 1.5MB，请裁剪后再导入`, true);
+    return false;
+  }
+  const text = await file.text().catch(() => null);
+  if (typeof text !== 'string' || !text.trim()) {
+    setChatStatus(`文件「${file.name}」内容为空或无法按文本读取`, true);
+    return false;
+  }
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  if (pendingFiles.length >= MAX_PENDING_FILES) pendingFiles.shift();
+  const endLine = Math.min(lines.length, 200);
+  pendingFiles.push({
+    id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    name: file.name,
+    lines,
+    startLine: 1,
+    endLine,
+  });
+  renderAttachments();
+  setChatStatus(`已导入「${file.name}」（共 ${lines.length} 行，默认 L1-${endLine}，可在上方微调导入行范围）`);
+  return true;
+}
+
+function closeAttachMenu() {
+  if (!attachMenuEl) return;
+  attachMenuEl.hidden = true;
+  attachShotBtn?.setAttribute('aria-expanded', 'false');
+}
+
+function openAttachMenu() {
+  if (!attachMenuEl) return;
+  if (!attachMenuEl.hidden) { closeAttachMenu(); return; }
+  attachMenuEl.replaceChildren();
+  const addItem = (title, hint, onClick, disabled = false) => {
+    const btnEl = document.createElement('button');
+    btnEl.type = 'button';
+    btnEl.setAttribute('role', 'menuitem');
+    btnEl.disabled = disabled;
+    const span = document.createElement('span');
+    span.textContent = title;
+    btnEl.appendChild(span);
+    if (hint) {
+      const small = document.createElement('small');
+      small.textContent = hint;
+      btnEl.appendChild(small);
+    }
+    btnEl.addEventListener('click', () => {
+      closeAttachMenu();
+      onClick();
+    });
+    attachMenuEl.appendChild(btnEl);
+  };
+  const addSep = () => {
+    const sep = document.createElement('div');
+    sep.className = 'ai-attach-sep';
+    attachMenuEl.appendChild(sep);
+  };
+  const addTitle = (text) => {
+    const el = document.createElement('div');
+    el.className = 'ai-attach-menu-title';
+    el.textContent = text;
+    attachMenuEl.appendChild(el);
+  };
+
+  addTitle('画布截图（即时显示缩略图）');
+  const hasNodes = Boolean(state.view?.nodes?.length);
+  addItem('📷 截取当前画布视图', '当前视野', () => {
+    const shot = captureViewportImage();
+    if (shot) {
+      addImageAttachment(shot);
+      setChatStatus('已截取当前画布视图，点击缩略图可放大确认');
+    } else {
+      setChatStatus('当前画布暂无可截取内容', true);
+    }
+  }, !hasNodes);
+
+  const selectedBox = resolveSelectedCanvasBox();
+  addItem(
+    selectedBox ? `📦 截取选中区域` : '📦 截取选中层级 / 文件框',
+    selectedBox ? selectedBox.label : '先在画布点选文件或目录',
+    () => captureScopedBoxAttachment(selectedBox),
+    !selectedBox,
+  );
+
+  const v = state.view;
+  const pickableBoxes = [
+    ...(v?.containers || []).filter((c) => !c.root).map((c) => ({ kind: 'dir', box: c, label: `目录：${c.label || c.id}` })),
+    ...(v?.groups || []).map((g) => ({ kind: 'file', box: g, label: `文件：${g.label || g.id}` })),
+  ].slice(0, 8);
+  if (pickableBoxes.length) {
+    addSep();
+    addTitle('按画布层级 / 文件框单独截图');
+    for (const entry of pickableBoxes) {
+      addItem(entry.kind === 'dir' ? `📁 ${entry.box.label || entry.box.id}` : `📄 ${entry.box.label || entry.box.id}`, entry.box.id, () => {
+        captureScopedBoxAttachment(entry);
+      });
+    }
+  }
+
+  addSep();
+  addTitle('外部图片与文件导入（也支持 Ctrl+V 粘贴截图 / 拖入文件）');
+  addItem('🖼️ 导入外部图片', 'PNG / JPG / WebP', () => imageFileInputEl?.click());
+  addItem('📄 导入外部代码/文本文件', '支持选定起止行片段', () => textFileInputEl?.click());
+
+  attachMenuEl.hidden = false;
+  attachShotBtn?.setAttribute('aria-expanded', 'true');
 }
 
 const EMPTY_CHAT_HTML = `<div class="empty">
@@ -1051,7 +1512,7 @@ function renderThreadMessages() {
     if (m.role === 'user') {
       const div = document.createElement('div');
       div.className = 'ai-msg user';
-      div.textContent = m.text || '';
+      buildUserBubbleContent(div, m.text || '', m.attachedImages || [], m.attachedFiles || []);
       messagesEl.appendChild(div);
     } else {
       const box = document.createElement('div');
@@ -1352,11 +1813,38 @@ function renderMcp() {
   if (saveBtn) saveBtn.disabled = envLocked;
 }
 
-function appendUserMessage(text) {
+function buildUserBubbleContent(div, text, attachedImages = [], attachedFiles = []) {
+  div.replaceChildren();
+  if (attachedImages.length || attachedFiles.length) {
+    const atts = document.createElement('div');
+    atts.className = 'ai-msg-atts';
+    for (const img of attachedImages) {
+      const el = document.createElement('img');
+      el.className = 'ai-msg-att-img';
+      el.src = img.dataUrl;
+      el.alt = img.label || '已发送图片';
+      el.title = `${img.label || '图片'} · 点击放大`;
+      el.addEventListener('click', () => openImageLightbox(img.dataUrl, img.label));
+      atts.appendChild(el);
+    }
+    for (const f of attachedFiles) {
+      const badge = document.createElement('span');
+      badge.className = 'ai-msg-att-file';
+      badge.textContent = f.endLine ? `📄 ${f.name} (L${f.startLine}-${f.endLine})` : `📄 ${f.name}`;
+      atts.appendChild(badge);
+    }
+    div.appendChild(atts);
+  }
+  const body = document.createElement('div');
+  body.textContent = text || '';
+  div.appendChild(body);
+}
+
+function appendUserMessage(text, attachedImages = [], attachedFiles = []) {
   if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
   const div = document.createElement('div');
   div.className = 'ai-msg user';
-  div.textContent = text;
+  buildUserBubbleContent(div, text, attachedImages, attachedFiles);
   messagesEl.appendChild(div);
 }
 
@@ -1412,6 +1900,8 @@ async function compactChat() {
   const projectId = chatProjectId;
   const messages = thread.messages;
   if (!messages.length) return;
+  const compactMessages = messages.map(message => ({ ...message }));
+  boundSavedCodeAttachments([{ messages: compactMessages }]);
   const isCurrent = () => chatProjectId === projectId && chatThreads.includes(thread) && thread.messages === messages;
   const before = estimateContext(messages);
   const controller = new AbortController();
@@ -1419,7 +1909,7 @@ async function compactChat() {
   updateChatControls();
   setChatStatus('正在压缩上下文…');
   try {
-    const result = await api.compactChat({ projectId, threadId: thread.id, messages }, controller.signal);
+    const result = await api.compactChat({ projectId, threadId: thread.id, messages: compactMessages }, controller.signal);
     if (result?.ok === false) throw new Error(result.error);
     if (!Array.isArray(result?.messages)) throw new Error('压缩接口返回了无效的对话数据');
     if (!isCurrent()) return;
@@ -1555,15 +2045,34 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     for (const button of questionCard.querySelectorAll('.ai-q-opt')) button.disabled = true;
     questionCard.querySelector('.ai-q-hint')?.remove();
   }
+  const images = pendingImages.splice(0, MAX_PENDING_IMAGES).map(({ dataUrl, label }) => ({ dataUrl, label }));
+  const attachments = sanitizeCodeAttachments(pendingFiles.splice(0, MAX_PENDING_FILES).map((file) => {
+    const start = Math.max(1, file.startLine || 1);
+    const end = Math.max(start, Math.min(file.lines.length, file.endLine || file.lines.length));
+    return {
+      name: file.name,
+      startLine: start,
+      endLine: end,
+      totalLines: file.lines.length,
+      content: file.lines.slice(start - 1, end).join('\n'),
+    };
+  }));
+  renderAttachments();
   const selectionSummary = summarizeUiContext(uiContext);
-  thread.messages.push({ role: 'user', text, ...(selectionSummary ? { selectionSummary } : {}) });
+  thread.messages.push({
+    role: 'user',
+    text,
+    ...(selectionSummary ? { selectionSummary } : {}),
+    ...(images.length ? { attachedImages: images } : {}),
+    ...(attachments.length ? { attachedFiles: attachments } : {}),
+  });
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
 
   inputEl.value = '';
   stickToBottom = true;
-  appendUserMessage(text);
+  appendUserMessage(text, images, attachments);
   const ui = createAssistantBox();
   const controller = new AbortController();
   activeAbort = controller;
@@ -1775,12 +2284,6 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       if (isVisible()) followChatScroll();
     }
   };
-  const images = [];
-  if (attachCanvasShot) {
-    const shot = captureCanvasImage();
-    if (shot) images.push(shot);
-    setAttachShot(false);
-  }
   const canvasLayout = buildCanvasLayoutSnapshot();
   let streamTimer = setTimeout(() => controller.abort(new Error('连接 AI 服务超时')), 15_000);
   let reader;
@@ -1792,6 +2295,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       threadId,
       uiContext,
       ...(images.length ? { images } : {}),
+      ...(attachments.length ? { attachments } : {}),
       ...(canvasLayout ? { canvasLayout } : {}),
     }, controller.signal);
     if (!res.ok) {
@@ -1908,10 +2412,69 @@ clearSelectionBtn.addEventListener('click', () => {
   setCanvasSelection(null);
   inputEl.focus({ preventScroll: true });
 });
-if (attachShotBtn) attachShotBtn.addEventListener('click', () => {
-  setAttachShot(!attachCanvasShot);
-  if (attachCanvasShot) setChatStatus('下次发送将附带当前画布截图（支持视觉的模型可看图分析与排版）');
+if (attachShotBtn) attachShotBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  openAttachMenu();
 });
+document.addEventListener('click', (e) => {
+  if (attachMenuEl && !attachMenuEl.hidden && !attachMenuEl.contains(e.target) && e.target !== attachShotBtn) {
+    closeAttachMenu();
+  }
+});
+if (lightboxCloseEl) lightboxCloseEl.addEventListener('click', closeImageLightbox);
+if (lightboxEl) lightboxEl.addEventListener('click', (e) => {
+  if (e.target === lightboxEl) closeImageLightbox();
+});
+if (ghostTabHintEl) ghostTabHintEl.addEventListener('click', () => acceptGhostSuggestion());
+if (imageFileInputEl) imageFileInputEl.addEventListener('change', async () => {
+  const files = [...(imageFileInputEl.files || [])];
+  imageFileInputEl.value = '';
+  for (const f of files.slice(0, MAX_PENDING_IMAGES)) {
+    await addImageFromBlob(f, f.name || '外部图片');
+  }
+});
+if (textFileInputEl) textFileInputEl.addEventListener('change', async () => {
+  const files = [...(textFileInputEl.files || [])];
+  textFileInputEl.value = '';
+  for (const f of files.slice(0, MAX_PENDING_FILES)) {
+    if (f.type?.startsWith('image/')) await addImageFromBlob(f, f.name);
+    else await addExternalTextFile(f);
+  }
+});
+const handlePasteFiles = async (e) => {
+  const items = [...(e.clipboardData?.items || [])];
+  const imageItems = items.filter((item) => item.kind === 'file' && item.type.startsWith('image/'));
+  if (!imageItems.length) return;
+  e.preventDefault();
+  for (const item of imageItems.slice(0, MAX_PENDING_IMAGES)) {
+    const blob = item.getAsFile();
+    if (blob) await addImageFromBlob(blob, '粘贴的外部截图');
+  }
+};
+if (inputEl) inputEl.addEventListener('paste', handlePasteFiles);
+if (drawer) drawer.addEventListener('paste', (e) => {
+  if (e.target === inputEl) return;
+  void handlePasteFiles(e);
+});
+if (inputShellEl) {
+  inputShellEl.addEventListener('dragover', (e) => {
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+      inputShellEl.classList.add('drag-over');
+    }
+  });
+  inputShellEl.addEventListener('dragleave', () => inputShellEl.classList.remove('drag-over'));
+  inputShellEl.addEventListener('drop', async (e) => {
+    inputShellEl.classList.remove('drag-over');
+    const files = [...(e.dataTransfer?.files || [])];
+    if (!files.length) return;
+    e.preventDefault();
+    for (const f of files.slice(0, MAX_PENDING_FILES)) {
+      if (f.type?.startsWith('image/')) await addImageFromBlob(f, f.name);
+      else await addExternalTextFile(f);
+    }
+  });
+}
 messagesEl.addEventListener('click', (event) => {
   const symBtn = event.target?.closest?.('.ai-sym-link[data-ai-sym]');
   if (!symBtn) return;
@@ -1929,7 +2492,11 @@ document.addEventListener('cg:project-changed', () => {
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
   pinnedSelections.length = 0;
-  setAttachShot(false);
+  pendingImages.length = 0;
+  pendingFiles.length = 0;
+  closeAttachMenu();
+  closeImageLightbox();
+  renderAttachments();
   setCanvasSelection(null);
   renderSelectionBar();
   chatGeneration++;
@@ -2018,7 +2585,11 @@ if (closeBtn) closeBtn.addEventListener('click', () => drawer?.classList.remove(
 // 隔离抽屉内按键事件，防止 F / Delete / Esc 误触画布快捷键
 if (drawer) drawer.addEventListener('keydown', (e) => {
   e.stopPropagation();
-  if (e.key === 'Escape') drawer.classList.remove('show');
+  if (e.key === 'Escape') {
+    if (lightboxEl && !lightboxEl.hidden) { closeImageLightbox(); return; }
+    if (attachMenuEl && !attachMenuEl.hidden) { closeAttachMenu(); return; }
+    drawer.classList.remove('show');
+  }
 });
 for (const tab of tabs) tab.addEventListener('click', () => setTab(tab.dataset.aiTab));
 if (goConfigBtn) goConfigBtn.addEventListener('click', () => setTab('api'));
@@ -2061,12 +2632,20 @@ if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
   if (val === (llmConfig.reasoningEffort || 'default')) return;
   void saveQuickConfig({ reasoningEffort: val }, `已切换思考强度：${REASONING_LABELS.get(val) || val}`);
 });
-if (inputEl) inputEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-    e.preventDefault();
-    sendPrompt();
-  }
-});
+if (inputEl) {
+  inputEl.addEventListener('input', syncInputSuggestion);
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && !inputEl.value && currentGhostSuggestion) {
+      e.preventDefault();
+      acceptGhostSuggestion();
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendPrompt();
+    }
+  });
+}
 
 // API 配置事件
 modelEl.addEventListener('input', syncModelPicker);
