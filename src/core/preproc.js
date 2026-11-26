@@ -92,99 +92,61 @@ function evalPreprocExpr(exprText, macros, line) {
   }
   const toks = expandSeq(input, macros).map(token => token.v);
   if (!toks.length) return 0;
+  // C 预处理表达式按 intmax_t/uintmax_t 求值，避免 JS 的 32 位截断。
+  const integer = (v, unsigned = false) => ({ v: unsigned ? BigInt.asUintN(64, v) : BigInt.asIntN(64, v), unsigned });
+  const truth = x => x.v !== 0n;
+  const bool = x => integer(x ? 1n : 0n);
+  const precedence = { '||': 1, '&&': 2, '|': 3, '^': 4, '&': 5, '==': 6, '!=': 6,
+    '<': 7, '<=': 7, '>': 7, '>=': 7, '<<': 8, '>>': 8, '+': 9, '-': 9, '*': 10, '/': 10, '%': 10 };
   let pos = 0;
-  const peek = () => toks[pos];
-  const next = () => toks[pos++];
-  const parsePrimary = () => {
-    const tk = peek();
-    if (!tk) return 0;
-    if (tk === '(') {
-      next();
-      const v = parseTernary();
-      if (peek() === ')') next();
-      return v;
+  const primary = () => {
+    const tk = toks[pos++];
+    if (tk === '(') { const v = expression(); if (toks[pos++] !== ')') throw Error(); return v; }
+    if (['!', '~', '+', '-'].includes(tk)) {
+      const x = primary();
+      if (tk === '!') return bool(!truth(x));
+      return integer(tk === '~' ? ~x.v : tk === '-' ? -x.v : x.v, x.unsigned);
     }
-    if (tk === '!') { next(); return parseUnary() ? 0 : 1; }
-    if (tk === '~') { next(); return ~parseUnary(); }
-    if (tk === '+') { next(); return +parseUnary(); }
-    if (tk === '-') { next(); return -parseUnary(); }
-    next();
-    if (/^[A-Za-z_]/.test(tk)) return 0;
-    const cleaned = tk.replace(/[uUlL]+$/, '');
-    if (/^0[xX]/.test(cleaned)) return Number.parseInt(cleaned, 16) || 0;
-    if (/^0[0-7]+$/.test(cleaned)) return Number.parseInt(cleaned, 8) || 0;
-    return Number.parseInt(cleaned, 10) || 0;
+    if (/^[A-Za-z_]/.test(tk)) return integer(0n);
+    const raw = tk.replace(/[uUlL]+$/, '');
+    const value = BigInt(/^0[0-7]+$/.test(raw) ? '0o' + raw.slice(1) : raw);
+    return integer(value, /u/i.test(tk) || value > 0x7fffffffffffffffn);
   };
-  const parseUnary = () => parsePrimary();
-  const parseMul = () => {
-    let v = parseUnary();
-    while (peek() === '*' || peek() === '/' || peek() === '%') {
-      const op = next();
-      const r = parseUnary();
-      if (op === '*') v = Math.trunc(v * r);
-      else if (op === '/') v = r ? Math.trunc(v / r) : 0;
-      else v = r ? v % r : 0;
+  const binary = (op, left, right) => {
+    if (op === '&&') return bool(truth(left) && truth(right));
+    if (op === '||') return bool(truth(left) || truth(right));
+    if (op === '<<' || op === '>>') {
+      if (right.v < 0n || right.v >= 64n) return integer(0n);
+      return integer(op === '<<' ? left.v << right.v : left.v >> right.v, left.unsigned);
     }
-    return v;
-  };
-  const parseAdd = () => {
-    let v = parseMul();
-    while (peek() === '+' || peek() === '-') v = next() === '+' ? v + parseMul() : v - parseMul();
-    return v;
-  };
-  const parseShift = () => {
-    let v = parseAdd();
-    while (peek() === '<<' || peek() === '>>') v = next() === '<<' ? (v << parseAdd()) : (v >> parseAdd());
-    return v;
-  };
-  const parseRel = () => {
-    let v = parseShift();
-    while (['<', '<=', '>', '>='].includes(peek())) {
-      const op = next();
-      const r = parseShift();
-      if (op === '<') v = v < r ? 1 : 0;
-      else if (op === '<=') v = v <= r ? 1 : 0;
-      else if (op === '>') v = v > r ? 1 : 0;
-      else v = v >= r ? 1 : 0;
+    const unsigned = left.unsigned || right.unsigned;
+    const a = integer(left.v, unsigned).v, b = integer(right.v, unsigned).v;
+    switch (op) {
+      case '==': return bool(a === b); case '!=': return bool(a !== b);
+      case '<': return bool(a < b); case '<=': return bool(a <= b);
+      case '>': return bool(a > b); case '>=': return bool(a >= b);
+      case '+': return integer(a + b, unsigned); case '-': return integer(a - b, unsigned);
+      case '*': return integer(a * b, unsigned); case '/': return integer(b ? a / b : 0n, unsigned);
+      case '%': return integer(b ? a % b : 0n, unsigned); case '&': return integer(a & b, unsigned);
+      case '|': return integer(a | b, unsigned); case '^': return integer(a ^ b, unsigned);
     }
-    return v;
   };
-  const parseEq = () => {
-    let v = parseRel();
-    while (peek() === '==' || peek() === '!=') {
-      const op = next();
-      const r = parseRel();
-      v = (op === '==' ? v === r : v !== r) ? 1 : 0;
+  const expression = (minimum = 0) => {
+    let value = primary();
+    while ((precedence[toks[pos]] || 0) > minimum) {
+      const op = toks[pos++];
+      value = binary(op, value, expression(precedence[op]));
     }
-    return v;
+    if (minimum === 0 && toks[pos] === '?') {
+      pos++;
+      const yes = expression();
+      if (toks[pos++] !== ':') throw Error();
+      const no = expression();
+      value = integer((truth(value) ? yes : no).v, yes.unsigned || no.unsigned);
+    }
+    return value;
   };
-  const parseBitAnd = () => { let v = parseEq(); while (peek() === '&') { next(); v &= parseEq(); } return v; };
-  const parseBitXor = () => { let v = parseBitAnd(); while (peek() === '^') { next(); v ^= parseBitAnd(); } return v; };
-  const parseBitOr = () => { let v = parseBitXor(); while (peek() === '|') { next(); v |= parseBitXor(); } return v; };
-  const parseLogAnd = () => {
-    let v = parseBitOr();
-    while (peek() === '&&') { next(); const r = parseBitOr(); v = (v && r) ? 1 : 0; }
-    return v;
-  };
-  const parseLogOr = () => {
-    let v = parseLogAnd();
-    while (peek() === '||') { next(); const r = parseLogAnd(); v = (v || r) ? 1 : 0; }
-    return v;
-  };
-  const parseTernary = () => {
-    const c = parseLogOr();
-    if (peek() !== '?') return c;
-    next();
-    const t = parseTernary();
-    if (peek() === ':') next();
-    const f = parseTernary();
-    return c ? t : f;
-  };
-  try {
-    return parseTernary();
-  } catch {
-    return 0;
-  }
+  try { return truth(expression()) ? 1 : 0; } catch { return 0; }
 }
 
 /**

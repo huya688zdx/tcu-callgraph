@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from '../src/core/build-config.js';
+import { parseMakefileTree, discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from '../src/core/build-config.js';
 import { loadModel, scanSources } from '../src/core/index.js';
 import { builtinParser } from '../src/core/parsers/builtin-parser.js';
 import { readCompileCommands } from '../src/core/parsers/clang-parser.js';
@@ -467,4 +467,39 @@ test('构建配置 API 在同一服务中列举、切换并导出车型', async 
   } finally {
     await close();
   }
+});
+
+test('Make 只采集活动分支并保留宏参数顺序', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-conditions-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'active.c'), 'int active;');
+  fs.writeFileSync(path.join(root, 'unused.c'), 'int unused;');
+  fs.writeFileSync(path.join(root, 'bad.mk'), 'CFLAGS = -DBAD');
+  fs.writeFileSync(path.join(root, 'Makefile'), `MODE = release
+ifeq ($(MODE),debug)
+include bad.mk
+CFLAGS = -DDEBUG
+all: unused.c
+\tcc $(CFLAGS) unused.c
+else ifneq ($(MODE),release)
+CFLAGS = -DWRONG
+else
+ifdef MODE
+CFLAGS = -DFEATURE=1 -UFEATURE -DOTHER=1 -UOTHER -DOTHER=2
+endif
+all: active.c
+\tcc $(CFLAGS) active.c
+endif
+`);
+  const result = parseMakefileTree(path.join(root, 'Makefile'), root);
+  assert.deepEqual(result.sourceFiles, ['active.c']);
+  assert.deepEqual(result.defines, ['OTHER=2']);
+  assert.deepEqual(result.includedFiles, ['Makefile']);
+  const profile = discoverBuildProfiles(root).profiles.find(p => p.source === 'makefile');
+  assert.deepEqual(profile.defines, ['OTHER=2']);
+  const generated = materializeCompileCommands(root, profile, { files: scanSources(root), exportPath: 'compile_commands.json' });
+  const args = JSON.parse(fs.readFileSync(generated.compileCommandsPath, 'utf8'))[0].arguments;
+  assert.deepEqual(args.slice(args.indexOf('-D'), -1), result.macroArgs);
+
+  assert.deepEqual(result.macroArgs, ['-D', 'FEATURE=1', '-U', 'FEATURE', '-D', 'OTHER=1', '-U', 'OTHER', '-D', 'OTHER=2']);
 });

@@ -151,6 +151,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
             const cleaned = rspText.replace(/(?:^|\s)#[^\r\n]*/g, ' ');
             extractCompilerFlags(tokenizeArgs(cleaned), path.dirname(rspPath), rootDir, out, seenRsp, depth + 1);
           }
+          seenRsp.delete(fileKey(rspPath));
         }
       }
       continue;
@@ -177,7 +178,18 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       if (/^-[Dd]=?$/.test(tok)) val = stripQuotes(rawTokens[++i] || '');
       else val = stripQuotes(tok.replace(/^-[Dd]=?/, ''));
       if (val && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(val)) {
+        (out.macroArgs ||= []).push('-D', val);
+        for (const old of out.defines) if (old.split('=')[0] === val.split('=')[0]) out.defines.delete(old);
         out.defines.add(val);
+      }
+      continue;
+    }
+
+    if (tok === '-U' || tok.startsWith('-U')) {
+      const name = tok === '-U' ? stripQuotes(rawTokens[++i] || '') : tok.slice(2);
+      if (/^[A-Za-z_]\w*$/.test(name)) {
+        (out.macroArgs ||= []).push('-U', name);
+        for (const old of out.defines) if (old.split('=')[0] === name) out.defines.delete(old);
       }
       continue;
     }
@@ -270,10 +282,45 @@ export function parseMakefileTree(entryAbs, rootDir) {
     }
     if (buf) lines.push(buf);
 
+    const conditions = [];
+    const active = () => conditions.every(c => c.active);
+    const evaluate = (kind, operand) => {
+      if (kind === 'ifdef' || kind === 'ifndef') {
+        const value = vars.get(expandMakeVars(operand.trim(), vars))?.value || '';
+        return kind === 'ifdef' ? value !== '' : value === '';
+      }
+      const expanded = expandMakeVars(operand, vars).trim();
+      const pair = expanded.startsWith('(') && expanded.endsWith(')')
+        ? expanded.slice(1, -1).split(',').map(v => v.trim()) : tokenizeArgs(expanded);
+      if (pair.length !== 2) throw new Error(`不支持的 Make 条件: ${kind} ${operand}`);
+      return kind === 'ifeq' ? pair[0] === pair[1] : pair[0] !== pair[1];
+    };
     let prerequisites = '';
     for (const rawLine of lines) {
       const line = rawLine.replace(/^\s*#.*$/, '').trim();
       if (!line) continue;
+      if (!rawLine.startsWith('\t')) {
+        const conditional = /^(ifeq|ifneq|ifdef|ifndef)\s+(.+)$/.exec(line);
+        if (conditional) {
+          const parent = active();
+          const taken = parent && evaluate(conditional[1], conditional[2]);
+          conditions.push({ parent, active: taken, taken });
+          continue;
+        }
+        if (/^else(?:\s|$)/.test(line)) {
+          const frame = conditions.at(-1);
+          if (!frame) throw new Error('Make else 缺少条件');
+          const tail = line.slice(4).trim();
+          const chained = /^(ifeq|ifneq|ifdef|ifndef)\s+(.+)$/.exec(tail);
+          if (tail && !chained) throw new Error(`不支持的 Make 条件: ${line}`);
+          frame.active = frame.parent && !frame.taken && (!chained || evaluate(chained[1], chained[2]));
+          frame.taken ||= frame.active;
+          continue;
+        }
+        if (line === 'endif') { if (!conditions.pop()) throw new Error('Make endif 缺少条件'); continue; }
+        if (/^!\s*(?:if|else|endif)/i.test(line)) throw new Error(`不支持的 Make 条件: ${line}`);
+      }
+      if (!active()) continue;
       if (rawLine.startsWith('\t')) {
         recipes.push({ command: line, prerequisites });
         continue;
@@ -347,6 +394,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
     ...meta,
     includeDirs: [...collected.includeDirs],
     defines: [...collected.defines],
+    macroArgs: collected.macroArgs || [],
     forcedIncludes: [...collected.forcedIncludes],
     sourceFiles: [...collected.sourceFiles],
     includedFiles: collected.includedFiles,
@@ -502,6 +550,7 @@ function parseQacProfile(rootDir, rel, abs) {
     ...meta,
     includeDirs: [...collected.includeDirs],
     defines: [...collected.defines],
+    macroArgs: collected.macroArgs || [],
     forcedIncludes: [...collected.forcedIncludes],
     sourceRoots: [],
     exclusions: [],
@@ -543,6 +592,7 @@ export function discoverBuildProfiles(rootDir) {
       compiler: item.parsed.compiler,
       includeDirs: item.parsed.includeDirs,
       defines: item.parsed.defines,
+      macroArgs: item.parsed.macroArgs,
       forcedIncludes: item.parsed.forcedIncludes,
       sourceRoots: [],
       exclusions: [],
@@ -750,7 +800,8 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
 
   const baseArgs = ['clang', '-fsyntax-only', '-fms-extensions', '-fgnu-keywords', '-Wno-unknown-pragmas', '-Wno-attributes'];
   for (const dir of allIncludeDirs) baseArgs.push('-I', dir);
-  for (const def of profile.defines || []) baseArgs.push('-D', def);
+  if (profile.macroArgs?.length) baseArgs.push(...profile.macroArgs);
+  else for (const def of profile.defines || []) baseArgs.push('-D', def);
   if (shimPath) baseArgs.push('-include', shimPath);
   for (const inc of profile.forcedIncludes || []) baseArgs.push('-include', inc);
 

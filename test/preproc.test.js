@@ -47,3 +47,12 @@ test('GNU 逗号拼接只在变参省略时移除逗号', () => {
   assert.deepEqual(expand('LOG(tag,)'), ['notify', '(', 'tag', ',', ')']);
   assert.deepEqual(expand('LOG(tag, a(), b)'), ['notify', '(', 'tag', ',', 'a', '(', ')', ',', 'b', ')']);
 });
+
+test('预处理整数保留 64 位精度和无符号语义', () => {
+  for (const expr of ['(1ULL << 32) == 4294967296ULL', '(0xffffffffU >> 31) == 1',
+    '(~0ULL >> 63) == 1', '(1ULL << 63) > 0', '(-1 >> 1) == -1',
+    '18446744073709551615ULL + 1 == 0', '(1 ? -1 : 0U) > 0']) {
+    const result = preprocess(lex(`#if ${expr}\ncorrect\n#else\nwrong\n#endif`), new Map(), 'test.c', { pruneInactive: true });
+    assert.deepEqual(result.tokens.map(t => t.v), ['correct'], expr);
+  }
+});
