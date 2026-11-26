@@ -90,6 +90,11 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   const steps = [];
   const outputs = [];
   const llm = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/v1/models') {
+      res.end(JSON.stringify({ data: [{ id: 'mock-layout' }] }));
+      return;
+    }
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const request = JSON.parse(Buffer.concat(chunks));
@@ -100,7 +105,6 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     const message = args ? { tool_calls: [{
       id: 'arrange-' + requests.length, type: 'function', function: { name: 'arrange_canvas', arguments: JSON.stringify(args) },
     }] } : { content: '已完成。' };
-    res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify({ choices: [{ message }] }));
   });
   await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
@@ -259,6 +263,80 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     const afterToolbar = await get(viewUrl);
     assert.equal(afterToolbar.nodes.find(node => node.id === root).x, x);
     assert.ok(manualVisible(afterToolbar));
+  });
+
+  await t.test('自动布局扩展后跳过冲突坐标，并保留其他安全的 AI 坐标', async () => {
+    const shallowUrl = viewUrl.replace('down=1', 'down=0');
+    const shallow = await get(shallowUrl);
+    const wide = await get(viewUrl);
+    const newcomer = wide.nodes.find(node => !shallow.nodes.some(old => old.id === node.id));
+    assert.ok(newcomer);
+    const secondRoot = page.roots[1];
+    const safe = { x: 5000, y: 5000, arrangedFor: 'flat' };
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', nodes: {
+      [root]: { x: newcomer.x, y: newcomer.y, arrangedFor: 'flat' }, [secondRoot]: safe,
+    } })).ok, true);
+    const xy = (canvas, id) => {
+      const { x, y } = canvas.nodes.find(node => node.id === id);
+      return [x, y];
+    };
+    assert.deepEqual(xy(await get(shallowUrl), root), [newcomer.x, newcomer.y]);
+    const expanded = await get(viewUrl);
+    assert.deepEqual(xy(expanded, root), xy(wide, root));
+    assert.deepEqual(xy(expanded, newcomer.id), [newcomer.x, newcomer.y]);
+    assert.deepEqual(xy(expanded, secondRoot), [safe.x, safe.y]);
+    assert.equal((await jsonPost('/api/layout', { root: layoutRoot, mode: 'flat', resetPositions: 'flat' })).ok, true);
+  });
+
+  await t.test('增量刷新保留手动位置，后续 AI 坐标仍可生效', async () => {
+    const savePosition = async (x, y) => assert.equal((await jsonPost('/api/layout', {
+      root: layoutRoot, mode: 'flat', nodes: { [root]: { x, y, arrangedFor: 'flat' } },
+    })).ok, true);
+    await savePosition(1400, 900);
+    const previous = await get(viewUrl);
+    const moved = previous.nodes.find(node => node.id === root);
+    assert.deepEqual([moved.x, moved.y], [1400, 900]);
+    Object.assign(moved, { x: 1700, y: 800 });
+    const refresh = () => jsonPost(query.replace('down=1', 'down=0'), { roots: page.roots, previous, projectId: view.projectId });
+    const preserved = await refresh();
+    assert.ok(preserved.nodes, preserved.error);
+    assert.equal(preserved.nodes.length, 2, '增量刷新已移除外围节点');
+    const retained = preserved.nodes.find(node => node.id === root);
+    assert.deepEqual([retained.x, retained.y], [1700, 800]);
+    await savePosition(1800, 700);
+    const updated = (await refresh()).nodes.find(node => node.id === root);
+    assert.deepEqual([updated.x, updated.y], [1800, 700]);
+  });
+
+  await t.test('暂存满 16 项也优先向模型发送当前选区', async browserTest => {
+    try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
+    assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
+    const browser = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => browser.close());
+    await browser.waitFor('Boolean(window.__cg?.view)');
+    await browser.evaluate("document.getElementById('aiBtn').click()");
+    await browser.waitFor("document.getElementById('aiModel').value === 'mock-layout'");
+    const countBefore = requests.length;
+    await browser.evaluate(`(() => {
+      const pick = (id, file) => document.dispatchEvent(new CustomEvent('cg:selection-changed', {
+        detail: { kind: 'node', id, file },
+      }));
+      document.querySelector('[data-ai-tab="chat"]').click();
+      for (let i = 0; i < 16; i++) {
+        pick('pinned.c::f' + i, 'pinned.c');
+        document.getElementById('aiPinSelection').click();
+      }
+      pick(${JSON.stringify(root)}, 'main.c');
+      document.getElementById('aiPromptInput').value = '请解释这个函数';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
+    assert.equal(requests.length, countBefore + 1);
+    const prompt = requests.at(-1).messages.at(-1).content;
+    const text = typeof prompt === 'string' ? prompt : prompt[0].text;
+    assert.match(text, /共 16 项/);
+    assert.match(text, /1\. 节点 main\.c::main/);
+    assert.doesNotMatch(text, /pinned\.c::f15\b/);
   });
 });
 

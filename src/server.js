@@ -1778,14 +1778,35 @@ function arrangedTargets(nodes, positions, groupMode) {
   });
 }
 
+const rectangleOverlapArea = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) *
+  Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+
+function discardCollidingArrangements(nodes, targets) {
+  const moves = new Map(targets.filter(({ node, x, y }) => node.x !== x || node.y !== y)
+    .map(({ node, x, y }) => [node, { x, y, w: node.w, h: node.h }]));
+  while (moves.size) {
+    const blocked = new Set();
+    for (const [node, target] of moves) {
+      for (const other of nodes) {
+        if (node === other || rectangleOverlapArea(target, moves.get(other) || other) <=
+            rectangleOverlapArea(node, other) + 0.01) continue;
+        blocked.add(node);
+        if (moves.has(other)) blocked.add(other);
+      }
+    }
+    if (!blocked.size) break;
+    // 某个节点退回自动位置后，可能挡到另一条覆盖坐标，因此重新检查剩余移动。
+    for (const node of blocked) moves.delete(node);
+  }
+  return targets.filter(({ node, x, y }) => moves.has(node) || (node.x === x && node.y === y));
+}
+
 function expandedArrangementBoxes(view, targets) {
   const boxes = [
     ...view.groups.map(box => ({ box, bounds: canvasRect(box), directory: false })),
     ...view.containers.filter(box => !box.root).map(box => ({ box, bounds: canvasRect(box), directory: true })),
   ];
   const parentOf = (a, b) => a.directory && b.box.id.startsWith(a.box.id + '/');
-  const overlapArea = (a, b) => Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) *
-    Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
   const expanded = new Set();
   for (const { node, x, y } of targets) {
     for (const entry of boxes) {
@@ -1802,16 +1823,29 @@ function expandedArrangementBoxes(view, targets) {
   }
   for (const a of expanded) for (const b of boxes) {
     if (a !== b && !parentOf(a, b) && !parentOf(b, a) &&
-        overlapArea(a.bounds, b.bounds) > overlapArea(a.box, b.box) + 0.01) return null;
+        rectangleOverlapArea(a.bounds, b.bounds) > rectangleOverlapArea(a.box, b.box) + 0.01) return null;
   }
   return expanded;
 }
 
-function applyArrangedPositions(view, positions, groupMode) {
+function applyArrangedPositions(view, positions, groupMode, previous) {
   const arranged = arrangedTargets(view.nodes, positions, groupMode);
   if (!arranged.length) return;
-  const boxes = expandedArrangementBoxes(view, arranged);
-  if (!boxes) return;
+  const lastApplied = previous?.layoutSlots?.aiPositions;
+  const previousNodes = new Map((previous?.nodes || []).map(node => [node.id, node]));
+  const retained = [], pending = [];
+  for (const target of arranged) {
+    const { node, x, y } = target;
+    const prior = previousNodes.get(node.id);
+    const applied = lastApplied?.[node.id];
+    // 增量布局沿用了浏览器位置时，只应用浏览器尚未收到的新 AI 坐标。
+    const alreadyApplied = applied?.x === x && applied?.y === y && prior?.x === node.x && prior?.y === node.y;
+    (alreadyApplied ? retained : pending).push(target);
+  }
+  const candidates = discardCollidingArrangements(view.nodes, pending);
+  const boxes = expandedArrangementBoxes(view, candidates);
+  const applicable = boxes ? candidates : [];
+  if (!retained.length && !applicable.length) return;
   // 增量刷新会把 layoutSlots 传回服务端。重置时据此丢弃已调整的旧几何。
   const slots = view.layoutSlots || {
     nodes: view.nodes.map(n => ({ ...canvasRect(n), file: n.file, group: n.group })),
@@ -1820,10 +1854,11 @@ function applyArrangedPositions(view, positions, groupMode) {
     containers: view.containers.map(box => ({ ...box })),
     width: view.width, height: view.height, layoutDirection: view.layoutDirection,
   };
-  view.layoutSlots = { ...slots, aiArranged: true };
-  const changed = arranged.some(({ node, x, y }) => node.x !== x || node.y !== y);
+  const aiPositions = Object.fromEntries([...retained, ...applicable].map(({ node, x, y }) => [node.id, { x, y }]));
+  view.layoutSlots = { ...slots, aiArranged: true, aiPositions };
+  const changed = applicable.some(({ node, x, y }) => node.x !== x || node.y !== y);
   if (!changed) return;
-  for (const { node, x, y } of arranged) {
+  for (const { node, x, y } of applicable) {
     Object.assign(node, { x, y });
   }
   for (const { box, bounds } of boxes) Object.assign(box, bounds);
@@ -2178,7 +2213,7 @@ async function buildView(
   if (previous?.layoutSlots?.aiArranged && !clean.some(n => positions?.[n.id]?.arrangedFor === groupMode)) previous = null;
   const laid = await layoutElk(clean, viewEdges, { group, groupMode, rootLabel: ROOT_LABEL, previous });
   assertCurrent();
-  applyArrangedPositions(laid, positions, groupMode);
+  applyArrangedPositions(laid, positions, groupMode, previous);
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {

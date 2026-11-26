@@ -941,7 +941,7 @@ function summarizeUiContext(uiContext) {
 function currentUiContext() {
   const items = [];
   const seen = new Set();
-  const sources = [...pinnedSelections, ...(canvasSelection ? [canvasSelection] : [])];
+  const sources = [...(canvasSelection ? [canvasSelection] : []), ...pinnedSelections];
   for (const source of sources) {
     for (const item of expandSelectionItems(source)) {
       const key = selectionKey(item);
