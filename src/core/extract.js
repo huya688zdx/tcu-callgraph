@@ -224,18 +224,35 @@ export function findFunctions(tokens, file) {
 
 const NON_FN_IDENTS = new Set(['NULL', 'nullptr', 'true', 'false', 'TRUE', 'FALSE', 'STD_ON', 'STD_OFF', 'E_OK', 'E_NOT_OK']);
 
-/** 取一段简单初始化值里的目标函数标识符（跳过纯算术表达式与常见常量） */
-function extractTargetIdent(tokens) {
-  if (!tokens.length) return null;
-  for (const t of tokens) {
-    if (['+', '-', '*', '/', '%', '|', '^', '<<', '>>', '==', '!=', '<', '>', '<=', '>=', '&&', '||', '?'].includes(t.v)) {
-      // 允许类型强转里的 *，如 (void (*)(void))fn；跳过明显算术/逻辑运算
-      if (t.v !== '*') return null;
-    }
+/** 仅移除包住整个表达式的括号，保留强制转换、实参列表等内部结构。 */
+function stripOuterParens(tokens) {
+  let start = 0, end = tokens.length - 1;
+  while (tokens[start]?.v === '(' && tokens[end]?.v === ')' && matchParenBack(tokens, end) === start) {
+    start++;
+    end--;
   }
-  const last = tokens[tokens.length - 1];
-  if (last && last.t === 'id' && !TYPE_WORDS.has(last.v) && !KEYWORDS.has(last.v) && !NON_FN_IDENTS.has(last.v)) {
-    return { name: last.v, line: last.line };
+  return start ? tokens.slice(start, end + 1) : tokens;
+}
+
+/** 从简单的函数指针初始化值提取目标，保留取址、解引用与类型转换。 */
+function extractTargetIdent(tokens) {
+  let value = stripOuterParens(tokens);
+  while (value.length > 1) {
+    if (value[0].v === '&' || value[0].v === '*') {
+      value = stripOuterParens(value.slice(1));
+      continue;
+    }
+    if (value[0].v !== '(') return null;
+    const [args, next] = collectArgs(value, 0);
+    const type = args?.[0];
+    if (args?.length !== 1 || type[0]?.t !== 'id' || next >= value.length) return null;
+    // (factory)(arg) 也可能是实际调用；仅对能辨明的类型跳过这种前缀。
+    if (value[next].v === '(' && !TYPE_WORDS.has(type[0].v) && !type.some(t => t.v === '*')) return null;
+    value = stripOuterParens(value.slice(next));
+  }
+  const target = value[0];
+  if (target?.t === 'id' && !TYPE_WORDS.has(target.v) && !KEYWORDS.has(target.v) && !NON_FN_IDENTS.has(target.v)) {
+    return { name: target.v, line: target.line };
   }
   return null;
 }
@@ -310,11 +327,7 @@ export function findTypedefs(tokens) {
 /** 解析常量整数索引（如 0, 1, 0x02），非常量返回 null */
 function parseConstIndex(tokens, macros) {
   if (macros && tokens.some(t => t.t === 'id')) tokens = expandSeq(tokens, macros);
-  while (tokens[0]?.v === '(' && tokens.at(-1)?.v === ')') {
-    const [inner, next] = collectArgs(tokens, 0);
-    if (inner?.length !== 1 || next !== tokens.length) return null;
-    tokens = inner[0];
-  }
+  tokens = stripOuterParens(tokens);
   if (tokens.length !== 1 || tokens[0].t !== 'num') return null;
   const s = tokens[0].v.replace(/[uUlL]+$/, '');
   let value;
@@ -324,11 +337,31 @@ function parseConstIndex(tokens, macros) {
   return Number.isSafeInteger(value) ? value : null;
 }
 
-/** 递归提取结构体 / 1D / 2D 数组初始化列表里的函数指针槽位 */
-function collectInitSlots(inner, prefix, isRootStruct, map, slotLines, macros, status) {
+function formatInitIndex(index) {
+  if (typeof index === 'number') return `[${index}]`;
+  return `[?${index.expr}${index.offset ? '+' + index.offset : ''}]`;
+}
+
+/** 消耗一个标量或整个子数组后，进位到同一对花括号里的下一个子对象。 */
+function nextInitIndices(indices, extents) {
+  const next = indices.slice();
+  while (next.length) {
+    const depth = next.length - 1;
+    const index = next[depth];
+    if (depth && (typeof index !== 'number' || extents[depth] == null)) return null;
+    if (!depth || index + 1 < extents[depth]) {
+      next[depth] = typeof index === 'number' ? index + 1 : { ...index, offset: index.offset + 1 };
+      break;
+    }
+    next.pop();
+  }
+  return next;
+}
+
+/** 递归提取结构体和数组中的函数指针槽位，省略花括号时按声明维度逐项填充。 */
+function collectInitSlots(inner, prefix, extents, map, slotLines, macros, status, scalarBrace = false) {
   const items = splitTopCommas(inner);
-  let pos = 0;
-  let unknownBase = null;
+  let cursor = [0];
   for (const item of items) {
     if (!item.length) continue;
     // 检测 C99 指定初始化器：[idx] = val 或 .field = val 或 [idx].field = val
@@ -347,8 +380,7 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines, macros, s
         }
         const expr = item.slice(k + 1, m - 1);
         const idx = parseConstIndex(expr, macros);
-        const unknown = idx === null ? `?${expr.map(t => t.v).join('')}` : null;
-        designators.push({ kind: 'index', value: unknown ?? idx });
+        designators.push({ kind: 'index', value: idx ?? { expr: expr.map(t => t.v).join(''), offset: 0 } });
         k = m;
       } else {
         break;
@@ -357,29 +389,38 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines, macros, s
     if (designators.length && item[k]?.v === '=') {
       hasEq = true;
       k++;
-      if (designators.some(d => d.kind === 'index' && typeof d.value === 'string')) status.incomplete = true;
-      if (designators[0].kind === 'index') {
-        const index = designators[0].value;
-        unknownBase = typeof index === 'string' ? index : null;
-        pos = unknownBase ? 0 : index;
-      }
+      if (designators.some(d => d.kind === 'index' && typeof d.value !== 'number')) status.incomplete = true;
     }
     const val = hasEq ? item.slice(k) : item;
-    if (!val.length) { pos++; continue; }
-
-    let nextPrefix = prefix;
+    if (!val.length) continue;
+    const braced = val[0].v === '{' && val.at(-1).v === '}';
+    let indices = cursor?.slice();
+    let fields = [];
     if (hasEq) {
-      for (const d of designators) {
-        if (d.kind === 'index') nextPrefix += `[${d.value}]`;
-        else nextPrefix += (isRootStruct && !nextPrefix ? d.value : `.${d.value}`);
-      }
-    } else {
-      // 指定位置未知时，随后的相对槽位也未知，直到遇到新的指定位置。
-      nextPrefix += `[${unknownBase ? unknownBase + (pos ? `+${pos}` : '') : pos}]`;
+      const field = designators.findIndex(d => d.kind === 'field');
+      const count = field < 0 ? designators.length : field;
+      indices = designators.slice(0, count).map(d => d.value);
+      fields = designators.slice(count);
+    } else if (scalarBrace && items.length === 1) {
+      indices = [];
     }
-
-    if (val[0].v === '{' && val[val.length - 1].v === '}') {
-      collectInitSlots(val.slice(1, -1), nextPrefix, false, map, slotLines, macros, status);
+    // 内层宽度未知时，无法判断上一标量是否填满该行，保留候选直到下一个显式指定位置。
+    const unknownPosition = indices == null;
+    if (unknownPosition) {
+      status.incomplete = true;
+      indices = [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
+    } else if (!braced && !fields.length) {
+      while (indices.length < extents.length) indices.push(0);
+    }
+    let nextPrefix = prefix + indices.map(formatInitIndex).join('');
+    for (const d of fields) {
+      if (d.kind === 'index') nextPrefix += formatInitIndex(d.value);
+      else nextPrefix += (nextPrefix ? '.' : '') + d.value;
+    }
+    if (braced) {
+      const remaining = fields.length || unknownPosition ? [] : extents.slice(indices.length);
+      const atElement = !fields.length && !remaining.length && (extents.length > 0 || scalarBrace);
+      collectInitSlots(val.slice(1, -1), nextPrefix, remaining, map, slotLines, macros, status, atElement);
     } else {
       const target = extractTargetIdent(val);
       if (target) {
@@ -387,7 +428,7 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines, macros, s
         slotLines[nextPrefix] = target.line;
       }
     }
-    pos++;
+    if (!unknownPosition) cursor = nextInitIndices(indices.length ? indices : cursor ?? [0], extents);
   }
 }
 
@@ -414,8 +455,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros }
     //   name[N] = { ... } / name[R][C] = { ... }
     //   void (*const name[N])(void) = { ... }
     let p = i - 1;
-    let dims = 0;
-    let nameTok = null;
+    const extents = [];
     if (p >= 0 && tokens[p].v === ')') {
       // 函数指针数组声明器：跳过形参列表 (...) 再进左侧 (*name[...])
       let d = 1;
@@ -425,38 +465,21 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros }
         else if (tokens[p].v === '(') d--;
         p--;
       }
-      if (p >= 0 && tokens[p].v === ')') {
-        let end = p - 1;
-        while (end >= 0 && tokens[end].v === ']') {
-          let bd = 1;
-          end--;
-          while (end >= 0 && bd > 0) {
-            if (tokens[end].v === ']') bd++;
-            else if (tokens[end].v === '[') bd--;
-            end--;
-          }
-          dims++;
-        }
-        if (end >= 0 && tokens[end].t === 'id' && !TYPE_WORDS.has(tokens[end].v)) {
-          nameTok = tokens[end];
-        }
-      }
-    } else {
-      while (p >= 0 && tokens[p].v === ']') {
-        let bd = 1;
-        p--;
-        while (p >= 0 && bd > 0) {
-          if (tokens[p].v === ']') bd++;
-          else if (tokens[p].v === '[') bd--;
-          p--;
-        }
-        dims++;
-      }
-      if (p >= 0 && tokens[p].t === 'id' && !TYPE_WORDS.has(tokens[p].v)) {
-        nameTok = tokens[p];
-      }
+      if (tokens[p]?.v !== ')') continue;
+      p--;
     }
-    if (!nameTok) continue;
+    while (tokens[p]?.v === ']') {
+      const close = p--;
+      let depth = 1;
+      while (p >= 0 && depth > 0) {
+        if (tokens[p].v === ']') depth++;
+        else if (tokens[p].v === '[') depth--;
+        p--;
+      }
+      extents.unshift(parseConstIndex(tokens.slice(p + 2, close), macros));
+    }
+    const nameTok = tokens[p];
+    if (nameTok?.t !== 'id' || TYPE_WORDS.has(nameTok.v)) continue;
 
     // 检查声明语句里的 static / const 修饰符
     let isStatic = false;
@@ -471,7 +494,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros }
     const map = {};
     const slotLines = {};
     const status = { incomplete: false };
-    collectInitSlots(inner, '', dims === 0, map, slotLines, macros, status);
+    collectInitSlots(inner, '', extents, map, slotLines, macros, status);
     if (Object.keys(map).length) {
       tables.set(functionId ? i : nameTok.v, {
         name: nameTok.v,
@@ -479,7 +502,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros }
         line: nameTok.line,
         isStatic,
         isConst,
-        dims,
+        dims: extents.length,
         map,
         slotLines,
         ...(status.incomplete && { incomplete: true }),
@@ -613,7 +636,12 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
           continue;
         }
         const requiresType = castType ? { requiresTypes: [castType] } : {};
-        const inner = tokens.slice(i + 1, close - 1);
+        let inner = stripOuterParens(tokens.slice(i + 1, close - 1));
+        const name = inner.length === 1 ? inner[0] : null;
+        // (FN)() 中 FN 可为对象宏，多层别名按调用行展开；括号隔开了函数式宏与实参。
+        if (name?.t === 'id' && ctx.macros.get(name.v, name.line)?.params === null) {
+          inner = stripOuterParens(expandSeq(inner, ctx.macros));
+        }
         if (inner.length === 1 && inner[0].t === 'id' && !KEYWORDS.has(inner[0].v) && !isStandardTypeName(inner[0].v)) {
           const calleeTok = inner[0];
           const origins = calleeTok.macroOrigins || macroChain;

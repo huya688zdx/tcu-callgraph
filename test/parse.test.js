@@ -341,6 +341,9 @@ void ghh(void) {}
 void jkk(void) {}
 void kkk(void) {}
 static const Ops ops = { .step = fnA };
+static const Ops wrapped = { .step = ((fnA)) };
+static const fn_t addresses[] = { &(vvv), ((void (*)(void))(&ghh)), (fn_t)jjj };
+void call_wrapped(void) { wrapped.step(); addresses[0](); addresses[1](); addresses[2](); }
 const fn_t z[] = { vvv, ghh };
 const fn_t e[2][3] = { { vvv, ggg, jjj }, { ghh, jkk, kkk } };
 const Ops tbl[] = { { .step = vvv }, { .step = ghh } };
@@ -372,6 +375,10 @@ void call_b(void) {
   assert.ok(constTargets.includes('a.c::ghh'), '常量下标 z[1]() 与 e[1][0]() 应直接连到 ghh');
   assert.ok(constTargets.includes('a.c::vvv'), '结构体数组常量下标 tbl[0].step() 应直接连到 vvv');
   assert.deepEqual(out('b.c::call_b').map((e) => e.to), ['b.c::fnB'], 'b.c static ops 应独立指向 fnB');
+  assert.deepEqual(model.fnptrTables.find(table => table.name === 'wrapped').map, { step: 'fnA' });
+  assert.deepEqual(out('a.c::call_wrapped').map(e => [e.kind, e.to]), [
+    ['fnptr', 'a.c::fnA'], ['fnptr', 'a.c::vvv'], ['fnptr', 'a.c::ghh'], ['fnptr', 'a.c::jjj'],
+  ]);
 
   // 动态下标不盲目画死所有候选，而是在 indirectCalls 保留完整候选供 LLM 判断
   assert.equal(out('a.c::call_dyn').length, 0);
@@ -520,4 +527,33 @@ int conditional(int index) { if (index) (run)(42); return 0; }
   assert.deepEqual(calls('chain'), ['factory', 'factory']);
   assert.deepEqual(calls('cast_chain'), ['run']);
   assert.deepEqual(calls('conditional'), ['run']);
+});
+
+test('括号内的函数名按调用处展开对象宏，保留函数式宏的同名函数', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-parenthesized-alias-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'api.h'), '#define FN ENTRY\n#define ENTRY first\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "api.h"
+typedef int Result;
+static int first(int n) { return n; }
+static int second(int n) { return n; }
+static int actual(int n) { return n; }
+#define actual(n) second(n)
+#define CAST Result
+int before(int n) { return (FN)(n) + (actual)(n); }
+#undef ENTRY
+#define ENTRY ((second))
+int after(int n) { return ((FN))((actual)(n)) + (CAST)(FN)(n); }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => [edge.to, edge.kind, edge.via]);
+  assert.deepEqual(calls('before'), [
+    ['app.c::first', 'macro', 'FN > ENTRY'], ['app.c::actual', 'direct', undefined],
+  ]);
+  assert.deepEqual(calls('after'), [
+    ['app.c::second', 'macro', 'FN > ENTRY'], ['app.c::actual', 'direct', undefined],
+    ['app.c::second', 'macro', 'FN > ENTRY'],
+  ]);
 });
