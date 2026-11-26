@@ -462,3 +462,62 @@ void dispatch(void) { (*arr[next()][column()])(); }
   assert.deepEqual(new Set(sites[0].candidates.map(candidate => candidate.name)), new Set(['first', 'second']));
   assert.ok(!(model.headerEdges || []).some(edge => edge.to === 'ext::Reading'));
 });
+
+test('分派表保留未知指定槽位，已知槽位按初始化文件绑定', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-designators-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a.c'), `
+typedef void (*Fn)(void);
+static void target(void) {}
+static void other(void) {}
+#define SLOT (2)
+const Fn table[4] = { [SLOT] = target, other };
+enum { ENUM_SLOT = 2 };
+static const Fn uncertain[4] = { [ENUM_SLOT] = target, other };
+void unknown(void) { uncertain[0](); }
+`);
+  fs.writeFileSync(path.join(dir, 'b.c'), `
+typedef void (*Fn)(void);
+extern const Fn table[4];
+static void target(void) {}
+#define INDEX 2
+void call_sites(void) { table[INDEX](); table[3](); target(); }
+`);
+  const model = loadModel(dir);
+  const calls = id => (model._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var');
+  assert.deepEqual(calls('b.c::call_sites').map(edge => edge.to), ['a.c::target', 'a.c::other', 'b.c::target']);
+  assert.deepEqual(calls('a.c::unknown'), []);
+  const table = model.fnptrTables.find(table => table.name === 'uncertain');
+  assert.equal(table.incomplete, true);
+  assert.deepEqual(table.map, { '[?ENUM_SLOT]': 'target', '[?ENUM_SLOT+1]': 'other' });
+  const site = model.indirectCalls.find(call => call.caller === 'a.c::unknown');
+  assert.deepEqual(site.candidates.map(candidate => candidate.id), ['a.c::target', 'a.c::other']);
+});
+
+test('sizeof 只保留变长数组边界调用，连续调用的实参不生成假边', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-vla-chained-calls-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'types.h'), 'typedef unsigned short Count;\n');
+  fs.writeFileSync(path.join(dir, 'app.c'), `
+#include "types.h"
+typedef int (*Fn)(int);
+static int next(void) { return 2; }
+static int second(void) { return 3; }
+static int run(int n) { return n; }
+static Fn factory(int index) { return run; }
+int sizes(const int *values) {
+  return sizeof(int[next()]) + sizeof(Count[second()]) + sizeof(values[next()])
+    + sizeof(next()) + sizeof(int (*)[next()]);
+}
+int chain(int index) { return factory(index)(42) + (factory)(index)(42); }
+int cast_chain(int index) { typedef int Result; return (Result)(run)(index); }
+int conditional(int index) { if (index) (run)(42); return 0; }
+`);
+  const model = loadModel(dir);
+  const calls = name => (model._index.outAdj.get(`app.c::${name}`) || [])
+    .filter(edge => edge.kind !== 'var').map(edge => edge.callee);
+  assert.deepEqual(calls('sizes'), ['next', 'second']);
+  assert.deepEqual(calls('chain'), ['factory', 'factory']);
+  assert.deepEqual(calls('cast_chain'), ['run']);
+  assert.deepEqual(calls('conditional'), ['run']);
+});

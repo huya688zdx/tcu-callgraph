@@ -2,7 +2,7 @@ import { expandSeq, fileMacroScope } from './preproc.js';
 import { scanCalls } from './extract.js';
 
 /** 头文件中的可调用宏作为可选入口；常量/包含保护不生成函数节点。 */
-export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros = new Map(), invocations = new Map(), isTypedefCall = () => false) {
+export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros = new Map(), invocations = new Map(), skipCall = () => false) {
   const symbols = [];
   for (const p of parsed) {
     if (!p.isHeader) continue;
@@ -27,7 +27,7 @@ export function headerSymbols(parsed, resolveCallee, callableNames, headerMacros
       } else if (callable.params !== null) {
         const scanned = [];
         scanCalls(expanded, { macros: context, fnptr: new Map() }, scanned);
-        names = [...new Set(scanned.filter(call => !isTypedefCall(p.rel, call)).map(call => call.callee)
+        names = [...new Set(scanned.filter(call => !skipCall(p.rel, call, callable.params)).map(call => call.callee)
           .filter(name => name && !callable.params.includes(name)))];
       }
       if ((!names.length && !calls.length) || names.includes(m.name)) continue;

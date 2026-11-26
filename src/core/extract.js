@@ -308,7 +308,13 @@ export function findTypedefs(tokens) {
 }
 
 /** 解析常量整数索引（如 0, 1, 0x02），非常量返回 null */
-function parseConstIndex(tokens) {
+function parseConstIndex(tokens, macros) {
+  if (macros && tokens.some(t => t.t === 'id')) tokens = expandSeq(tokens, macros);
+  while (tokens[0]?.v === '(' && tokens.at(-1)?.v === ')') {
+    const [inner, next] = collectArgs(tokens, 0);
+    if (inner?.length !== 1 || next !== tokens.length) return null;
+    tokens = inner[0];
+  }
   if (tokens.length !== 1 || tokens[0].t !== 'num') return null;
   const s = tokens[0].v.replace(/[uUlL]+$/, '');
   let value;
@@ -319,9 +325,10 @@ function parseConstIndex(tokens) {
 }
 
 /** 递归提取结构体 / 1D / 2D 数组初始化列表里的函数指针槽位 */
-function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
+function collectInitSlots(inner, prefix, isRootStruct, map, slotLines, macros, status) {
   const items = splitTopCommas(inner);
   let pos = 0;
+  let unknownBase = null;
   for (const item of items) {
     if (!item.length) continue;
     // 检测 C99 指定初始化器：[idx] = val 或 .field = val 或 [idx].field = val
@@ -338,9 +345,10 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
           if (item[m].v === '[') depth++;
           else if (item[m].v === ']') depth--;
         }
-        const idx = parseConstIndex(item.slice(k + 1, m - 1));
-        designators.push({ kind: 'index', value: idx ?? pos });
-        if (idx !== null && designators.length === 1) pos = idx;
+        const expr = item.slice(k + 1, m - 1);
+        const idx = parseConstIndex(expr, macros);
+        const unknown = idx === null ? `?${expr.map(t => t.v).join('')}` : null;
+        designators.push({ kind: 'index', value: unknown ?? idx });
         k = m;
       } else {
         break;
@@ -349,6 +357,12 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
     if (designators.length && item[k]?.v === '=') {
       hasEq = true;
       k++;
+      if (designators.some(d => d.kind === 'index' && typeof d.value === 'string')) status.incomplete = true;
+      if (designators[0].kind === 'index') {
+        const index = designators[0].value;
+        unknownBase = typeof index === 'string' ? index : null;
+        pos = unknownBase ? 0 : index;
+      }
     }
     const val = hasEq ? item.slice(k) : item;
     if (!val.length) { pos++; continue; }
@@ -360,11 +374,12 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
         else nextPrefix += (isRootStruct && !nextPrefix ? d.value : `.${d.value}`);
       }
     } else {
-      nextPrefix += `[${pos}]`;
+      // 指定位置未知时，随后的相对槽位也未知，直到遇到新的指定位置。
+      nextPrefix += `[${unknownBase ? unknownBase + (pos ? `+${pos}` : '') : pos}]`;
     }
 
     if (val[0].v === '{' && val[val.length - 1].v === '}') {
-      collectInitSlots(val.slice(1, -1), nextPrefix, false, map, slotLines);
+      collectInitSlots(val.slice(1, -1), nextPrefix, false, map, slotLines, macros, status);
     } else {
       const target = extractTargetIdent(val);
       if (target) {
@@ -384,7 +399,7 @@ function collectInitSlots(inner, prefix, isRootStruct, map, slotLines) {
  *   const fn_t e[2][3] = { {vvv, ggg, jjj}, {ghh, jkk, kkk} };
  *   const Entry tbl[] = { { .enter = Enter_A, .run = Run_A }, ... };
  */
-export function findFnPtrTables(tokens, file = '', functionId = null) {
+export function findFnPtrTables(tokens, file = '', { functionId = null, macros } = {}) {
   const tables = new Map();
   const scopes = [{ end: null }];
   for (let i = 0; i < tokens.length; i++) {
@@ -455,7 +470,8 @@ export function findFnPtrTables(tokens, file = '', functionId = null) {
     const inner = tokens.slice(i + 2, close);
     const map = {};
     const slotLines = {};
-    collectInitSlots(inner, '', dims === 0, map, slotLines);
+    const status = { incomplete: false };
+    collectInitSlots(inner, '', dims === 0, map, slotLines, macros, status);
     if (Object.keys(map).length) {
       tables.set(functionId ? i : nameTok.v, {
         name: nameTok.v,
@@ -466,6 +482,7 @@ export function findFnPtrTables(tokens, file = '', functionId = null) {
         dims,
         map,
         slotLines,
+        ...(status.incomplete && { incomplete: true }),
         ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
       });
     }
@@ -475,7 +492,7 @@ export function findFnPtrTables(tokens, file = '', functionId = null) {
 }
 
 /** 从下标或成员左侧回溯提取真实表名及各维下标，避免把 z[idx].fn() 误认成 idx.fn() */
-function extractIndexedReceiver(tokens, endIdx) {
+function extractIndexedReceiver(tokens, endIdx, macros) {
   let j = endIdx;
   const indices = [];
   const indexExprs = [];
@@ -488,7 +505,7 @@ function extractIndexedReceiver(tokens, endIdx) {
     }
     if (depth !== 0) break;
     const exprToks = tokens.slice(k + 2, j);
-    indices.unshift(parseConstIndex(exprToks));
+    indices.unshift(parseConstIndex(exprToks, macros));
     indexExprs.unshift(exprToks.map((t) => t.v).join(''));
     j = k;
   }
@@ -519,6 +536,45 @@ function isLocalPrototype(tokens, idIdx) {
     args.every(arg => !arg.length || arg.some(t => TYPE_WORDS.has(t.v) || t.v === '*'));
 }
 
+const typeQualifiers = new Set(['const', 'volatile', 'restrict']);
+const taggedTypes = new Set(['struct', 'union', 'enum']);
+const conditionKeywords = new Set(['if', 'for', 'while', 'switch']);
+
+/** sizeof 的数组类型名可以求值维度，普通表达式和指向 VLA 的指针类型不求值。 */
+function scanSizeofBounds(operand, ctx, out, macroChain) {
+  let index = operand.findIndex(t => t.v === '[');
+  if (index < 1) return;
+  let type = null;
+  for (let i = 0; i < index; i++) {
+    const token = operand[i];
+    if (token.v === '*' || typeQualifiers.has(token.v)) continue;
+    if (taggedTypes.has(token.v) && operand[i + 1]?.t === 'id') {
+      type ??= token;
+      i++;
+    } else if (TYPE_WORDS.has(token.v) || (!type && token.t === 'id' && !KEYWORDS.has(token.v))) {
+      type ??= token;
+    } else return;
+  }
+  if (!type) return;
+  const bounds = [];
+  while (operand[index]?.v === '[') {
+    let depth = 1, end = index + 1;
+    for (; end < operand.length && depth; end++) {
+      if (operand[end].v === '[') depth++;
+      if (operand[end].v === ']') depth--;
+    }
+    if (depth) return;
+    bounds.push(operand.slice(index + 1, end - 1));
+    index = end;
+  }
+  if (index !== operand.length) return;
+  const start = out.length;
+  for (const bound of bounds) scanCalls(bound, ctx, out, macroChain);
+  if (!TYPE_WORDS.has(type.v) && !isStandardTypeName(type.v)) {
+    for (let i = start; i < out.length; i++) out[i].requiresTypes = [...(out[i].requiresTypes || []), type];
+  }
+}
+
 /**
  * 扫描一段 token 中的调用
  * @param {Array} tokens
@@ -527,13 +583,15 @@ function isLocalPrototype(tokens, idIdx) {
  * @param {Array<string>} macroChain 宏展开链
  */
 export function scanCalls(tokens, ctx, out, macroChain = []) {
+  const chainedArgs = new Map();
   for (let i = 0; i < tokens.length; i++) {
     const tk = tokens[i];
 
-    // 跳过不求值表达式 sizeof(...)，防止把 sizeof(v()) 误计为真实调用
+    // sizeof 普通操作数不求值，变长数组类型的维度除外。
     if (tk.t === 'id' && tk.v === 'sizeof' && tokens[i + 1]?.v === '(') {
-      const [, next] = collectArgs(tokens, i + 1);
+      const [args, next] = collectArgs(tokens, i + 1);
       if (next > i + 1) {
+        if (args?.length === 1) scanSizeofBounds(args[0], ctx, out, macroChain);
         i = next - 1;
         continue;
       }
@@ -547,6 +605,14 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
         else if (tokens[close].v === ')') depth--;
       }
       if (depth === 0 && tokens[close]?.v === '(') {
+        const prev = tokens[i - 1];
+        const castType = chainedArgs.get(i);
+        if (prev?.t === 'id' && conditionKeywords.has(prev.v)) continue;
+        if (castType === null || prev?.v === ']' || (prev?.t === 'id' && !KEYWORDS.has(prev.v))) {
+          chainedArgs.set(close, null);
+          continue;
+        }
+        const requiresType = castType ? { requiresTypes: [castType] } : {};
         const inner = tokens.slice(i + 1, close - 1);
         if (inner.length === 1 && inner[0].t === 'id' && !KEYWORDS.has(inner[0].v) && !isStandardTypeName(inner[0].v)) {
           const calleeTok = inner[0];
@@ -554,12 +620,14 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
           out.push({
             callee: calleeTok.v,
             parenthesized: true,
+            ...requiresType,
             kind: origins.length ? 'macro' : 'direct',
             line: calleeTok.line, col: calleeTok.col,
             cond: calleeTok.cond,
             via: origins.length ? origins.join(' > ') : undefined,
             macroChain: origins.slice(),
           });
+          chainedArgs.set(close, calleeTok);
           i = close - 1;
           continue;
         }
@@ -573,16 +641,18 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
               indices: [],
               indexExprs: [],
               kind: 'fnptr_ptr',
+              ...requiresType,
               line: deref[0].line, col: deref[0].col,
               cond: deref[0].cond,
               via: `(*${deref[0].v})`,
               macroChain: (deref[0].macroOrigins || macroChain).slice(),
             });
+            chainedArgs.set(close, null);
             i = close - 1;
             continue;
           }
           if (deref[deref.length - 1]?.v === ']') {
-            const { recv, indices, indexExprs } = extractIndexedReceiver(deref, deref.length - 1);
+            const { recv, indices, indexExprs } = extractIndexedReceiver(deref, deref.length - 1, ctx.macros);
             if (recv && indices.length) {
               // 下标本身可能调用函数，跳过接收表达式前先扫描它。
               scanCalls(deref, ctx, out, macroChain);
@@ -593,11 +663,13 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
                 indices,
                 indexExprs,
                 kind: 'fnptr_indexed',
+                ...requiresType,
                 line: tk.line, col: tk.col,
                 cond: tk.cond,
                 via: formatIndexedVia(recv, indexExprs, null),
                 macroChain: (tk.macroOrigins || macroChain).slice(),
               });
+              chainedArgs.set(close, null);
               i = close - 1;
               continue;
             }
@@ -608,7 +680,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
 
     // 下标间接调用：z[idx]() / e[r][c]()
     if (tk.v === ']' && tokens[i + 1]?.v === '(') {
-      const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i);
+      const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i, ctx.macros);
       if (recv && indices.length) {
         out.push({
           callee: null,
@@ -630,7 +702,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     if (tk.v === '->' || tk.v === '.') {
       const member = tokens[i + 1];
       if (member && member.t === 'id' && tokens[i + 2] && tokens[i + 2].v === '(') {
-        const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i - 1);
+        const { recv, indices, indexExprs } = extractIndexedReceiver(tokens, i - 1, ctx.macros);
         const table = recv ? ctx.fnptr?.get(recv) : null;
         const tableMap = table?.map || table;
         if (!indices.length && tableMap && Object.hasOwn(tableMap, member.v)) {

@@ -314,17 +314,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       if (seenFnId.has(fn.id)) continue;
       seenFnId.add(fn.id);
       const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
-      for (const table of findFnPtrTables(body, rel, fn.id).values()) fnptrTablesList.push(table);
+      for (const table of findFnPtrTables(body, rel, { functionId: fn.id, macros: fileMacros }).values()) fnptrTablesList.push(table);
       const calls = [];
       scanCalls(body, { macros: fileMacros }, calls);
       const record = { fn, calls, mentions: variableMentions(body) };
       functionRecords.push(record);
       // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
-      if (calls.some(call => call.parenthesized)) deferredTypedefCalls.push({ record, body, fileMacros });
+      if (calls.some(call => call.parenthesized || call.requiresTypes)) deferredTypedefCalls.push({ record, body, fileMacros });
       else recordFunctionCalls(record, body, fileMacros);
       functions.push(fn);
     }
-    for (const table of findFnPtrTables(tokens, rel).values()) {
+    for (const table of findFnPtrTables(tokens, rel, { macros: fileMacros }).values()) {
       fnptrTablesList.push(table);
     }
     for (const v of findGlobalVars(tokens, rel)) {
@@ -354,14 +354,17 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
   for (const file of sources) parseFile(file);
   const includesHeader = includedHeaders(headers, includes);
   const compareLocation = (a, b) => a.line - b.line || a.col - b.col;
-  const isTypedefCall = (file, call) => {
-    if (!call.parenthesized) return false;
-    return typedefsByFile.get(file)?.get(call.callee)?.some(({ declaration, scope }) =>
-      compareLocation(call, declaration) > 0 && (!scope.end || compareLocation(call, scope.end) < 0)) ||
-      typedefHeadersByName.get(call.callee)?.some(header => header !== file && includesHeader(file, header));
+  const isTypedefAt = (file, name, location) =>
+    typedefsByFile.get(file)?.get(name)?.some(({ declaration, scope }) =>
+      compareLocation(location, declaration) > 0 && (!scope.end || compareLocation(location, scope.end) < 0)) ||
+    typedefHeadersByName.get(name)?.some(header => header !== file && includesHeader(file, header));
+  const skipTypeDependentCall = (file, call, params = []) => {
+    if (call.parenthesized && !params.includes(call.callee) && isTypedefAt(file, call.callee, call)) return true;
+    return call.requiresTypes?.some(type => params.includes(type.v) || !isTypedefAt(file, type.v, type));
   };
   for (const { record, body, fileMacros } of deferredTypedefCalls) {
-    record.calls = record.calls.filter(call => record.fn.params.includes(call.callee) || !isTypedefCall(record.fn.file, call));
+    const { fn } = record;
+    record.calls = record.calls.filter(call => !skipTypeDependentCall(fn.file, call, fn.params));
     recordFunctionCalls(record, body, fileMacros);
   }
   deferredTypedefCalls.length = 0;
@@ -456,6 +459,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       isConst: raw.isConst,
       dims: raw.dims,
       map: filteredMap,
+      ...(raw.incomplete && { incomplete: true }),
       ...(raw.functionId && { functionId: raw.functionId }),
     };
     cleanedTables.push(entry);
@@ -483,6 +487,10 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     for (const [slot, target] of Object.entries(table.map)) {
       if (!indices.length) {
         if (member && slot === member) matched.push({ slot, target });
+        continue;
+      }
+      if (slot.includes('[?')) {
+        if (member ? slot.endsWith('.' + member) : slot.endsWith(']')) matched.push({ slot, target });
         continue;
       }
       // 解析槽位路径，例如 "[1][0]" / "[0].fn" / "[1][2].handler"
@@ -533,11 +541,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
       const matched = table ? matchTableSlots(table, call.indices || [], call.member || null) : [];
       const uniqueTargets = [...new Set(matched.map((s) => s.target))];
       const allConstIndices = (call.indices || []).every((idx) => idx !== null);
-      if (uniqueTargets.length === 1 && (allConstIndices || !call.indices?.length || matched.length === 1)) {
+      if (!table?.incomplete && uniqueTargets.length === 1 && (allConstIndices || !call.indices?.length || matched.length === 1)) {
         const callee = uniqueTargets[0];
         edges.push({
           from: fn.id,
-          to: resolveCallee(callee, fn.file),
+          to: resolveCallee(callee, table.file),
           callee,
           kind: 'fnptr',
           line: call.line, col: call.col, orderGroup: call.orderGroup,
@@ -633,7 +641,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null) {
     callsByMacro.get(id).push(e);
   }
   const symbols = headerSymbols(parsed, resolveCallee,
-    new Set([...byName.keys(), ...edges.filter(e => e.kind !== 'var').map(e => e.callee)]), macros, callsByMacro, isTypedefCall);
+    new Set([...byName.keys(), ...edges.filter(e => e.kind !== 'var').map(e => e.callee)]), macros, callsByMacro, skipTypeDependentCall);
   for (const symbol of symbols) for (let i = 0; i < symbol.targetIds.length; i++) {
     const id = symbol.targetIds[i];
     if (!allNodes.has(id) && id.startsWith('ext::')) {
