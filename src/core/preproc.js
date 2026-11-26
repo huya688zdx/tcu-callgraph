@@ -100,12 +100,28 @@ function evalPreprocExpr(exprText, macros, line) {
     '<': 7, '<=': 7, '>': 7, '>=': 7, '<<': 8, '>>': 8, '+': 9, '-': 9, '*': 10, '/': 10, '%': 10 };
   let pos = 0;
   const primary = () => {
-    const tk = toks[pos++];
+    let tk = toks[pos++];
+    if (/^(?:u8|[LuU])$/.test(tk) && toks[pos]?.startsWith("'")) tk += toks[pos++];
     if (tk === '(') { const v = expression(); if (toks[pos++] !== ')') throw Error(); return v; }
     if (['!', '~', '+', '-'].includes(tk)) {
       const x = primary();
       if (tk === '!') return bool(!truth(x));
       return integer(tk === '~' ? ~x.v : tk === '-' ? -x.v : x.v, x.unsigned);
+    }
+    if (/^(?:u8|[LuU])?'/.test(tk)) {
+      const body = tk.slice(tk.indexOf("'") + 1, -1);
+      const chars = body.match(/\\(?:x[0-9a-fA-F]+|[0-7]{1,3}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)|[^\\]/gu) || [];
+      let value = 0n;
+      const escapes = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11 };
+      for (const char of chars) {
+        const escaped = char.slice(1);
+        const code = !char.startsWith('\\') ? char.codePointAt(0)
+          : /^[xXuU]/.test(escaped) ? parseInt(escaped.slice(1), 16)
+          : /^[0-7]/.test(escaped) ? parseInt(escaped, 8)
+          : escapes[escaped] ?? escaped.codePointAt(0);
+        value = (value << 8n) | BigInt(code);
+      }
+      return integer(value);
     }
     if (/^[A-Za-z_]/.test(tk)) return integer(0n);
     const raw = tk.replace(/[uUlL]+$/, '');

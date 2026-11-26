@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { lex } from '../lexer.js';
 import { fileMacroScope, preprocess } from '../preproc.js';
@@ -55,7 +56,12 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       const scope = fileMacroScope(base, new Map(), { trackPositions: true });
       function include({ target, line }, quoted, fromDir = path.dirname(path.resolve(root, file.rel))) {
         for (const dir of quoted ? [fromDir, ...search] : search) {
-          const header = byPath.get(key(path.resolve(dir, target.replaceAll('\\', '/'))));
+          const abs = path.resolve(dir, target.replaceAll('\\', '/'));
+          let header = byPath.get(key(abs));
+          if (!header && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
+            header = { abs, rel: path.relative(root, abs).replaceAll('\\', '/'), isHeader: true };
+            byPath.set(key(abs), header);
+          }
           if (!header) continue;
           const changed = processFile(header, { get: name => scope.get(name, line) });
           if (changed) for (const [name, def] of changed) {

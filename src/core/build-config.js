@@ -209,9 +209,10 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
     // 源码文件引用
     if (SRC_EXT.test(tok) && !tok.startsWith('-') && !/[*?<>]/.test(tok) && !/\$\(/.test(tok)) {
       const candidates = [path.resolve(baseDir, tok), path.resolve(rootDir, tok)];
+      candidates.sort((a, b) => Number(!!fs.statSync(b, { throwIfNoEntry: false })?.isFile()) - Number(!!fs.statSync(a, { throwIfNoEntry: false })?.isFile()));
       for (const abs of candidates) {
         const rel = toPosix(path.relative(rootDir, abs));
-        if (rel && !rel.startsWith('../') && !path.isAbsolute(rel) && fs.statSync(abs, { throwIfNoEntry: false })?.isFile()) {
+        if (rel && !rel.startsWith('../') && !path.isAbsolute(rel)) {
           out.sourceFiles.add(rel);
           break;
         }
@@ -574,7 +575,9 @@ export function discoverBuildProfiles(rootDir) {
   const parsedMaks = [];
   for (const mk of makEntries) {
     const abs = path.resolve(rootDir, mk.file);
-    const parsed = parseMakefileTree(abs, rootDir);
+    let parsed;
+    try { parsed = parseMakefileTree(abs, rootDir); }
+    catch { continue; }
     const score = parsed.includeDirs.length * 3 + parsed.defines.length * 3 + parsed.sourceFiles.length * 2 + parsed.includedFiles.length * 4;
     if (score > 0 || makEntries.length <= 4) {
       parsedMaks.push({ rel: mk.file, dir: toPosix(path.dirname(mk.file)) || '.', parsed, score });

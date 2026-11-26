@@ -400,7 +400,7 @@ function initializerDeclarations(statement) {
     }
     let before = name - 1;
     while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
-    shapes.set(token.v, { token, type: base, extents, pointer: part[before]?.v === '*', fields });
+    shapes.set(token.v, { token, type: base, extents, pointer: part[before]?.v === '*', union: first.some(t => t.v === 'union') && first.findIndex(t => t.v === 'union') < open, fields });
   }
   return shapes;
 }
@@ -427,7 +427,7 @@ export function findTypedefs(tokens) {
     if (token.v === '}' && scopes.length > 1) { scopes.pop().end = token; continue; }
     if ((token.v === 'struct' || token.v === 'union') && tokens[i + 1]?.t === 'id' && tokens[i + 2]?.v === '{') {
       const close = matchBrace(tokens, i + 2);
-      record(token.v + ' ' + tokens[i + 1].v, token, { fields: initializerMembers(tokens.slice(i + 3, close)) });
+      record(token.v + ' ' + tokens[i + 1].v, token, { union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close)) });
       i = close;
       continue;
     }
@@ -443,7 +443,7 @@ export function findTypedefs(tokens) {
     for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end))) {
       record(name, shape.token, shape);
       if (shape.fields && shape.type && !aliases.get(shape.type)?.some(entry => entry.declaration === token)) {
-        record(shape.type, token, { fields: shape.fields });
+        record(shape.type, token, { fields: shape.fields, union: shape.union });
       }
     }
     i = end;
@@ -494,7 +494,7 @@ function initializerLayout(root, file, lookup) {
     }
     const fields = shape?.pointer ? null : shape?.fields;
     let layout = fields ? {
-      names: [...fields.keys()],
+      names: [...fields.keys()], union: !!shape.union,
       field: name => resolve(fields.get(name), source),
     } : { pointer: !!shape?.pointer };
     for (let i = extents.length - 1; i >= 0; i--) layout = { element: layout, length: extents[i] };
@@ -517,7 +517,7 @@ function nextInitPath(path, root) {
     if (typeof part === 'string') {
       const pos = parent?.names?.indexOf(part) ?? -1;
       if (pos < 0) return null;
-      if (pos + 1 < parent.names.length) return [...path.slice(0, depth), parent.names[pos + 1]];
+      if (!parent.union && pos + 1 < parent.names.length) return [...path.slice(0, depth), parent.names[pos + 1]];
     } else {
       if (depth && (typeof part !== 'number' || parent?.length == null)) return null;
       if (!depth || part + 1 < parent.length) {

@@ -56,3 +56,10 @@ test('预处理整数保留 64 位精度和无符号语义', () => {
     assert.deepEqual(result.tokens.map(t => t.v), ['correct'], expr);
   }
 });
+
+test('字符常量及转义参与条件求值', () => {
+  for (const expr of ["MODE == 'A'", "'\\n' == 10", "'\\101' == 65", "'\\x41' == 'A'", "'\\\\' == 92", "'\\'' == 39"]) {
+    const result = preprocess(lex(`#define MODE 'A'\n#if ${expr}\nyes\n#else\nno\n#endif`), new Map(), 'test.c', { pruneInactive: true });
+    assert.deepEqual(result.tokens.map(t => t.v), ['yes'], expr);
+  }
+});

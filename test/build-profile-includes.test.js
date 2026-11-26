@@ -57,3 +57,31 @@ void dispatch(void) { RUN(); STATE = 1; }
     }
   }
 });
+
+test('配置路径加载工程外的 SDK 头文件及嵌套包含', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-sdk-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = path.join(base, 'project'), sdk = path.join(base, 'sdk');
+  fs.mkdirSync(root); fs.mkdirSync(sdk);
+  fs.writeFileSync(path.join(sdk, 'config.h'), '#include "nested.h"');
+  fs.writeFileSync(path.join(sdk, 'nested.h'), '#define FEATURE 1');
+  fs.writeFileSync(path.join(root, 'main.c'), '#include <config.h>\n#if FEATURE\nvoid yes(void) {}\n#else\nvoid no(void) {}\n#endif');
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'sdk', includeDirs: [sdk] } });
+  assert.ok(model.functions.some(f => f.name === 'yes'));
+  assert.ok(!model.functions.some(f => f.name === 'no'));
+});
+
+test('union 省略花括号后转到下一个结构体成员', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-union-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), `
+void foo(void) {} void bar(void) {}
+struct Ops { union { void (*a)(void); void (*b)(void); } u; void (*next)(void); };
+struct Ops ops = { foo, bar };
+void run(void) { ops.u.a(); ops.next(); }
+`);
+  const model = loadModel(root, { parserId: 'builtin' });
+  const edges = model.edges.filter(e => e.from === 'main.c::run');
+  assert.ok(edges.some(e => e.to === 'main.c::foo'));
+  assert.ok(edges.some(e => e.to === 'main.c::bar'));
+});

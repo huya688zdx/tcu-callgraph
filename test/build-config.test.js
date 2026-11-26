@@ -503,3 +503,15 @@ endif
 
   assert.deepEqual(result.macroArgs, ['-D', 'FEATURE=1', '-U', 'FEATURE', '-D', 'OTHER=1', '-U', 'OTHER', '-D', 'OTHER=2']);
 });
+
+test('坏 Makefile 不影响其他配置，保留快照独有的源文件', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-snapshot-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'bad.mak'), '!IF 1\nCFLAGS=-DBAD\n!ENDIF');
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all:\n\tcc keep.c deleted.c');
+  fs.writeFileSync(path.join(root, 'keep.c'), 'int keep;');
+  const profiles = discoverBuildProfiles(root).profiles;
+  assert.equal(profiles.length, 1);
+  assert.deepEqual(profiles[0].sourceFiles, ['keep.c', 'deleted.c']);
+  assert.deepEqual(selectProfileSourceFiles(profiles[0], [{ rel: 'keep.c' }, { rel: 'deleted.c' }]), ['keep.c', 'deleted.c']);
+});
