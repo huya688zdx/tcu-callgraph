@@ -628,6 +628,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     if (visible?.length) return visible.length === 1 ? visible[0] : null;
     return globalTablesByName.get(name) || null;
   };
+  // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
+  const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
+    part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
   const writtenSlots = new Map();
   const tableNames = new Set(cleanedTables.map(table => table.name));
   for (const { fn, writes } of functionRecords) {
@@ -636,16 +639,15 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       // 声明名本身已进入其局部作用域，不能把局部指针的初始化算到外层同名表。
       const table = lookupTable(fn, { ...write, col: write.col + 1 });
       if (!table || (write.escape && table.isConst)) continue;
-      if (write.escape === 'array' && (write.member || write.indices.length >= table.dims)) continue;
+      if (write.escape === 'array' && !parsedSlots.get(table).some(({ parts }) =>
+        parts.length > write.path.length && typeof parts[write.path.length] !== 'string' &&
+        compatiblePaths(parts, write.path))) continue;
       if (!writtenSlots.has(table)) writtenSlots.set(table, []);
       writtenSlots.get(table).push({ ...write, file: fn.file });
     }
   }
-  // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
-  const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
-    part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
   const possiblyWritten = (writes, path, unions = []) => writes?.some(w =>
-    w.escape || compatiblePaths(w.path, path) || unions.some(depth =>
+    w.escape === 'address' || compatiblePaths(w.path, path) || unions.some(depth =>
       typeof w.path[depth] === 'string' && w.path[depth] !== path[depth] &&
       compatiblePaths(w.path.slice(0, depth), path.slice(0, depth))));
   const matchTableSlots = (table, path, writes) => {
@@ -886,9 +888,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:11';
+    if (!hasProfile && !hasActive && !hasDefines) return 'builtin:12';
     return JSON.stringify([
-      'builtin:23',
+      'builtin:24',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

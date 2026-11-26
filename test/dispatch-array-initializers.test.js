@@ -280,3 +280,22 @@ test('无名位域不消耗初始化位置，命名位域仍消耗一个位置',
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar', 'foo', 'bar']);
 });
+
+test('回调数组成员退化为指针传出时，只作废该数组的初始目标', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-nested-array-escape-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { Fn handlers[1]; Fn intact; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void keep(void) {}',
+    'static Ops ops = { { foo }, keep };',
+    'static void mutate(Fn *p) { p[0] = bar; }',
+    'void call(void) { mutate(ops.handlers); ops.handlers[0](); ops.intact(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['keep']);
+  const escapedCall = model.indirectCalls.find(call => call.caller === 'ops.c::call' && call.member === 'handlers');
+  assert.ok(escapedCall);
+  assert.deepEqual(escapedCall.candidates, []);
+});
