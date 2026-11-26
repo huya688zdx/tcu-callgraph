@@ -260,7 +260,7 @@ let pendingMove = null;
 const moveReady = (kind, item) => state.moveTarget?.view === state.view &&
   state.moveTarget.kind === kind && state.moveTarget.item === item;
 
-function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false } = {}) {
+function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null, focusNode = null, scrollToTrunkBranch = false, directPair = false } = {}) {
   if (state.pairFlow) clearPairFlow({ paint: false });
   state.moveTarget = null;
   state.hoverRelation = null;
@@ -270,6 +270,7 @@ function selectEdge(edge, { labelId = null, trunkHits = null, trunkGroup = null,
   state.trunkHits = trunkHits;
   state.prevTrunkHits = trunkHits;
   state.trunkFocusNode = focusNode;
+  state.directPairEdge = Boolean(directPair);
   state.multiSelection = trunkGroup?.length > 1 ? {
     kind: 'edge',
     anchor: edge,
@@ -294,9 +295,11 @@ function clearTrunk() {
   state.trunkHits = null;
   state.prevTrunkHits = null;
   state.trunkFocusNode = null;
+  state.directPairEdge = false;
 }
 
 function pickTrunkEndpoint(id) {
+  if (state.directPairEdge) return false;
   const trunkHits = activeTrunk();
   if (!trunkHits) return false;
   const outgoing = trunkHits.filter((edge) => edge.from === id);
@@ -682,7 +685,23 @@ els.cv.addEventListener('pointerdown', (e) => {
 
   if (n) {
     clearTrunk();
-    if (!editable || !moveReady('node', n)) { selectNode(n.id); return; }
+    if (!editable || !moveReady('node', n)) {
+      const prev = state.selected;
+      if (prev && prev !== n.id && !state.selectedEdge) {
+        const direct = (state.view?.edges || []).filter((ed) =>
+          (ed.from === prev && ed.to === n.id) || (ed.from === n.id && ed.to === prev));
+        if (direct.length) {
+          selectEdge(direct[0], {
+            trunkHits: direct.length > 1 ? direct : null,
+            trunkGroup: direct.length > 1 ? direct : null,
+            directPair: true,
+          });
+          return;
+        }
+      }
+      selectNode(n.id);
+      return;
+    }
     pushHistory();
     state.dragNode = beginNodeMove(state.view, n);
     state.dragStart = { x: e.clientX, y: e.clientY, nx: n.x, ny: n.y };

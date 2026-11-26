@@ -1,11 +1,98 @@
 import { t } from '../i18n.js';
 import { edgeDirection } from './edge-flow.js';
 import { state, cam, els, esc } from './state.js';
-import { draw } from './render.js';
+import { draw, pulseAdded } from './render.js';
 import { focusBox } from './camera.js';
 import { traceVisiblePaths, visibleGraphKey, pathEdgeColors } from './visible-paths.js';
+import { askAi, nodeAiDetail, publishAiSelection } from './panels.js';
+import { edgeAiDetail } from './label-panel.js';
 
 let panel;
+let floatBar;
+
+function buildPairAiDetail(pair) {
+  const view = state.view;
+  if (!pair || !view) return null;
+  const nodes = pair.ids
+    .map((id) => view.nodes.find((n) => n.id === id))
+    .filter(Boolean)
+    .map(nodeAiDetail);
+  if (!nodes.length) return null;
+  if (nodes.length === 1) return nodes[0];
+  const seenEdges = new Set();
+  const edges = [];
+  const pathSummaries = [];
+  const labelOf = (id) => view.nodes.find((n) => n.id === id)?.name || id;
+  for (const p of pair.result?.paths || []) {
+    pathSummaries.push(p.nodes.map((id, i) => `${i ? stepArrow(p.steps[i - 1]) : ''}${labelOf(id)}`).join(''));
+    for (const step of p.steps || []) {
+      if (seenEdges.has(step.edge)) continue;
+      seenEdges.add(step.edge);
+      const e = view.edges[step.edge];
+      if (e) edges.push(edgeAiDetail(e));
+    }
+  }
+  return {
+    kind: 'pair',
+    ids: pair.ids.slice(),
+    nodes,
+    edges: edges.slice(0, 12),
+    pathCount: pair.result?.paths?.length || 0,
+    pathSummaries: pathSummaries.slice(0, 6),
+  };
+}
+
+function focusSinglePath(index) {
+  const pair = state.pairFlow, view = state.view;
+  const path = pair?.result?.paths?.[index];
+  if (!path || !view) return;
+  const pathNodes = view.nodes.filter((n) => path.nodes.includes(n.id));
+  const pathEdges = path.steps.map((s) => view.edges[s.edge]).filter(Boolean);
+  if (!pathNodes.length) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of pathNodes) {
+    x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y);
+    x1 = Math.max(x1, n.x + n.w); y1 = Math.max(y1, n.y + n.h);
+  }
+  focusBox({ x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) }, 80, { keepZoom: false });
+  pulseAdded(pathNodes, pathEdges, { highlightMs: 3200, rippleMs: 1200 });
+}
+
+function renderFloatBar(pair, names) {
+  if (!floatBar) {
+    floatBar = document.createElement('div');
+    floatBar.id = 'pairFlowFloat';
+    floatBar.className = 'pair-flow-float';
+    floatBar.setAttribute('role', 'status');
+    floatBar.hidden = true;
+    (els.cv?.parentElement || document.body).appendChild(floatBar);
+    floatBar.addEventListener('click', (e) => {
+      if (e.target.closest('[data-pair-clear]')) clearPairFlow();
+      else if (e.target.closest('[data-pair-focus]')) focusPath(true);
+      else if (e.target.closest('[data-pair-ai]')) {
+        const detail = buildPairAiDetail(state.pairFlow);
+        if (detail) askAi(detail);
+      }
+    });
+  }
+  if (!pair) {
+    floatBar.hidden = true;
+    floatBar.textContent = '';
+    return;
+  }
+  floatBar.hidden = false;
+  if (pair.ids.length === 1) {
+    floatBar.innerHTML = `<span class="pair-float-txt">已选起点 <strong>${names[0]}</strong>，按住 <kbd>Ctrl</kbd> 点击第二个函数查两点链路</span>` +
+      `<button type="button" data-pair-clear title="取消两点选择">取消</button>`;
+    return;
+  }
+  const n = pair.result?.paths?.length || 0;
+  const summary = n ? `${names[0]} ↔ ${names[1]}（${n} 条路径）` : `${names[0]} ↔ ${names[1]}（当前视图无直连路径）`;
+  floatBar.innerHTML = `<span class="pair-float-txt"><strong>${summary}</strong></span>` +
+    (n ? `<button type="button" data-pair-focus>聚焦</button>` : '') +
+    (window.__EXPORT ? '' : `<button type="button" class="primary" data-pair-ai>✨ 加入对话</button>`) +
+    `<button type="button" data-pair-clear title="退出两点链路">×</button>`;
+}
 function focusPath(force = false) {
   const result = state.pairFlow?.result, view = state.view;
   if (!result?.paths.length) return;
@@ -37,12 +124,23 @@ function renderPanel() {
     document.getElementById('right').prepend(panel);
     panel.addEventListener('click', e => {
       if (e.target.closest('[data-pair-clear]')) clearPairFlow();
-      if (e.target.closest('[data-pair-focus]')) focusPath(true);
+      else if (e.target.closest('[data-pair-focus]')) focusPath(true);
+      else if (e.target.closest('[data-pair-ai]')) {
+        const detail = buildPairAiDetail(state.pairFlow);
+        if (detail) askAi(detail);
+      } else {
+        const row = e.target.closest('[data-pair-path-idx]');
+        if (row) focusSinglePath(Number(row.dataset.pairPathIdx));
+      }
     });
   }
   const pair = state.pairFlow;
   panel.hidden = !pair;
-  if (!pair) { panel.textContent = ''; return; }
+  if (!pair) {
+    panel.textContent = '';
+    renderFloatBar(null, []);
+    return;
+  }
   const labels = new Map([...(pair.result?.nodes || []), ...state.view.nodes].map(n => [n.id, n.name || n.id]));
   const names = pair.ids.map(id => esc(labels.get(id) || id));
   let message = pair.ids.length === 1 ? t('pair.selected', { name: names[0] }) : names.join(' ↔ ');
@@ -53,9 +151,13 @@ function renderPanel() {
     message = [names.join(' ↔ '), r.paths.length ? t('pair.directed', { n: directed }) : t('pair.empty'),
       related ? t('pair.static', { n: related }) : ''].filter(Boolean).join(' · ');
     details = `<div class="pair-flow-hint">${r.paths.length ? t('pair.colorHint') : t('pair.scopeHint')}${r.truncated ? t('pair.truncated') : ''}</div>`;
-    if (r.paths.length) details += `<details open><summary>${t('pair.show')}</summary>${r.paths.map((p, index) => `<div class="pair-flow-path"><strong>${t('pair.number', { n: index + 1 })}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${stepArrow(p.steps[i - 1])}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? t('pair.staticHint') : t('pair.directedHint')}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? t('compare.version.before') : t('compare.version.after')).join(' / ') : t('pair.crossVersion')}</small>` : ''}</div>`).join('')}</details>`;
+    if (r.paths.length) details += `<details open><summary>${t('pair.show')}</summary>${r.paths.map((p, index) => `<div class="pair-flow-path" data-pair-path-idx="${index}" title="点击聚焦并高亮此路径" style="cursor:pointer"><strong>${t('pair.number', { n: index + 1 })}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${stepArrow(p.steps[i - 1])}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? t('pair.staticHint') : t('pair.directedHint')}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? t('compare.version.before') : t('compare.version.after')).join(' / ') : t('pair.crossVersion')}</small>` : ''}</div>`).join('')}</details>`;
   }
-  panel.innerHTML = `<h3>${t('pair.title')}</h3><div class="pair-flow-heading">${message}</div><div class="pair-flow-actions">${pair.result?.paths.length ? `<button type="button" data-pair-focus>${t('pair.focus')}</button>` : ''}<button type="button" data-pair-clear>${t('pair.clear')} <kbd>Esc</kbd></button></div>${details}`;
+  const aiBtn = !window.__EXPORT && pair.ids.length === 2
+    ? `<button type="button" data-pair-ai>✨ 加入对话</button>`
+    : '';
+  panel.innerHTML = `<h3>${t('pair.title')}</h3><div class="pair-flow-heading">${message}</div><div class="pair-flow-actions">${pair.result?.paths.length ? `<button type="button" data-pair-focus>${t('pair.focus')}</button>` : ''}${aiBtn}<button type="button" data-pair-clear>${t('pair.clear')} <kbd>Esc</kbd></button></div>${details}`;
+  renderFloatBar(pair, names);
 }
 
 document.addEventListener('callgraph:langchange', renderPanel);
@@ -64,6 +166,7 @@ export function clearPairFlow({ paint = true } = {}) {
   state.pairFlow = null;
   state.hoverRelation = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
+  renderFloatBar(null, []);
   if (paint) draw();
 }
 
@@ -91,8 +194,13 @@ export function pickPairFlow(id) {
     pair.result = traceVisiblePaths(current, ...ids);
     pair.colors = pathEdgeColors(pair.result.paths);
     renderPanel();
+    const detail = buildPairAiDetail(pair);
+    if (detail) publishAiSelection(detail);
   };
   pair.refresh(view);
   focusPath();
-  renderPanel(); draw();
+  renderPanel();
+  const detail = buildPairAiDetail(pair);
+  if (detail) publishAiSelection(detail);
+  draw();
 }

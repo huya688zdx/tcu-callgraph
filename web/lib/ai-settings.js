@@ -7,11 +7,12 @@
 import { t } from '../i18n.js';
 import { api, clientId } from './api.js';
 import { focusBox } from './camera.js';
+import { hooks } from './hooks.js';
 import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
 import { runSearch } from './panels.js';
 import { draw } from './render.js';
-import { els, state } from './state.js';
+import { edgeKey, els, state } from './state.js';
 
 const btn = document.getElementById('aiBtn');
 const drawer = document.getElementById('aiDrawer');
@@ -36,6 +37,11 @@ const messagesEl = document.getElementById('aiMessages');
 const selectionBar = document.getElementById('aiSelectionBar');
 const pinnedListEl = document.getElementById('aiPinnedList');
 const selectionRowEl = document.getElementById('aiSelectionRow');
+const trunkSwitchEl = document.getElementById('aiTrunkSwitch');
+const trunkBadgeEl = document.getElementById('aiTrunkBadge');
+const trunkSelectEl = document.getElementById('aiTrunkSelect');
+const trunkPrevBtn = document.getElementById('aiTrunkPrev');
+const trunkNextBtn = document.getElementById('aiTrunkNext');
 const selectionText = document.getElementById('aiSelectionText');
 const pinSelectionBtn = document.getElementById('aiPinSelection');
 const selectionQuestions = document.getElementById('aiSelectionQuestions');
@@ -284,7 +290,11 @@ function renderChatBar() {
 }
 
 function messageContext(message) {
-  const parts = [message.text];
+  const parts = [];
+  if (message.role === 'user' && message.selectionSummary) {
+    parts.push(`[当时画布选中：${message.selectionSummary}]`);
+  }
+  if (message.text) parts.push(message.text);
   if (message.role === 'assistant') {
     for (const tool of message.tools || []) {
       const digest = tool.digest || tool.summary;
@@ -690,10 +700,52 @@ function selectionKey(selection) {
   if (selection?.kind === 'node' && selection.id) return `node:${selection.id}`;
   if (selection?.kind === 'edge' && selection.edgeKey) return `edge:${selection.edgeKey}`;
   if (selection?.kind === 'file' && typeof selection.path === 'string') return `file:${selection.path}`;
+  if (selection?.kind === 'pair' && Array.isArray(selection.ids) && selection.ids.length >= 2) {
+    return `pair:${selection.ids.join('|')}`;
+  }
   return '';
 }
 
+function stripUiOnlySelectionFields(item) {
+  if (!item || typeof item !== 'object') return item;
+  if (item.kind !== 'edge') return item;
+  const { trunkBranches, trunkActiveIndex, trunkAll, ...clean } = item;
+  return clean;
+}
+
+function expandSelectionItems(selection) {
+  if (!selection || typeof selection !== 'object') return [];
+  if (selection.kind === 'pair') {
+    return [
+      ...(Array.isArray(selection.nodes) ? selection.nodes : []),
+      ...(Array.isArray(selection.edges) ? selection.edges : []),
+    ].map(stripUiOnlySelectionFields);
+  }
+  return [stripUiOnlySelectionFields(selection)];
+}
+
 function describeSelection(selection) {
+  if (selection.kind === 'pair') {
+    const [a, b] = selection.nodes || [];
+    const nameA = a?.name || a?.id?.split('::').pop() || selection.ids?.[0] || '';
+    const nameB = b?.name || b?.id?.split('::').pop() || selection.ids?.[1] || '';
+    const idA = a?.id || selection.ids?.[0] || nameA;
+    const idB = b?.id || selection.ids?.[1] || nameB;
+    const n = Number(selection.pathCount) || 0;
+    const caption = n
+      ? `两点链路：${nameA} ↔ ${nameB}（${n} 条路径）`
+      : `两点关系：${nameA} ↔ ${nameB}（当前画布无直连）`;
+    return {
+      caption,
+      questions: n ? [
+        ['分析两点链路', `请结合当前选中的「${idA}」与「${idB}」及其中间连线，分析这两者之间的调用与数据流关系。`],
+        ['核对关键路径', `请说明「${idA}」到「${idB}」之间各条路径的触发条件和先后顺序。`],
+      ] : [
+        ['查为何无路径', `请只读分析「${idA}」和「${idB}」为什么在当前画布没有直接相连的调用/数据流路径。`],
+        ['补齐中间链', `请查找「${idA}」与「${idB}」之间的调用或数据流关系，确认范围后加入画布。`],
+      ],
+    };
+  }
   if (selection.kind === 'node') {
     const { id, name, file, line } = selection;
     const variable = selection.nodeKind === 'var';
@@ -732,6 +784,19 @@ function describeSelection(selection) {
       ['查改动影响', `请分析${kind}「${path}」中的 Git 改动及其影响范围。`],
     ],
   };
+}
+
+function selectTrunkBranchAt(index) {
+  const branches = canvasSelection?.kind === 'edge' ? canvasSelection.trunkBranches : null;
+  if (!Array.isArray(branches) || branches.length < 2) return;
+  const wrapped = ((index % branches.length) + branches.length) % branches.length;
+  const targetDetail = branches[wrapped];
+  const trunkHits = Array.isArray(state.trunkHits) && state.trunkHits.length > 1 ? state.trunkHits : null;
+  const targetEdge = trunkHits?.find((e) => edgeKey(e) === targetDetail?.edgeKey)
+    || state.view?.edges?.find((e) => edgeKey(e) === targetDetail?.edgeKey);
+  if (targetEdge && typeof hooks.selectEdge === 'function') {
+    hooks.selectEdge(targetEdge, { trunkHits, trunkGroup: null, scrollToTrunkBranch: true });
+  }
 }
 
 function renderSelectionBar() {
@@ -779,6 +844,25 @@ function renderSelectionBar() {
   }
 
   if (selectionRowEl) selectionRowEl.hidden = !hasActive;
+  if (trunkSwitchEl) {
+    const branches = hasActive && canvasSelection.kind === 'edge' && Array.isArray(canvasSelection.trunkBranches) && canvasSelection.trunkBranches.length > 1
+      ? canvasSelection.trunkBranches
+      : null;
+    trunkSwitchEl.hidden = !branches;
+    if (branches && trunkSelectEl) {
+      const activeIdx = Number.isInteger(canvasSelection.trunkActiveIndex) && canvasSelection.trunkActiveIndex >= 0
+        ? canvasSelection.trunkActiveIndex
+        : Math.max(0, branches.findIndex((b) => b.edgeKey === canvasSelection.edgeKey));
+      if (trunkBadgeEl) trunkBadgeEl.textContent = `共线 ${activeIdx + 1}/${branches.length}`;
+      trunkSelectEl.replaceChildren(...branches.map((b, idx) => {
+        const from = b.fromName || b.from?.split('::').pop() || '';
+        const to = b.toName || b.to?.split('::').pop() || '';
+        const line = b.line ? ` :${b.line}` : '';
+        return new Option(`${idx + 1}. ${from} → ${to}${line}`, String(idx), false, idx === activeIdx);
+      }));
+      trunkSelectEl.value = String(activeIdx);
+    }
+  }
   selectionQuestions.replaceChildren();
   if (hasActive) {
     const { caption, questions } = describeSelection(canvasSelection);
@@ -818,25 +902,54 @@ function setCanvasSelection(selection, explicit = false) {
 
 function pinCurrentSelection() {
   if (!canvasSelection) return;
-  const key = selectionKey(canvasSelection);
-  if (!key || pinnedSelections.some((item) => selectionKey(item) === key)) return;
-  if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
-    setChatStatus(`最多同时暂存 ${MAX_PINNED_SELECTIONS} 个画布关系`, true);
-    return;
+  const additions = canvasSelection.kind === 'pair'
+    ? (canvasSelection.nodes || [])
+    : [stripUiOnlySelectionFields(canvasSelection)];
+  let added = 0;
+  for (const item of additions) {
+    const key = selectionKey(item);
+    if (!key || pinnedSelections.some((x) => selectionKey(x) === key)) continue;
+    if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
+      setChatStatus(`最多同时暂存 ${MAX_PINNED_SELECTIONS} 个画布关系`, true);
+      break;
+    }
+    pinnedSelections.push({ ...item });
+    added++;
   }
-  pinnedSelections.push({ ...canvasSelection });
+  if (!added) return;
   renderSelectionBar();
   setChatStatus(`已暂存到上下文（共 ${pinnedSelections.length} 项），可继续点选其他关系`);
+}
+
+function summarizeUiContext(uiContext) {
+  if (!uiContext || typeof uiContext !== 'object') return '';
+  const list = Array.isArray(uiContext.items) && uiContext.items.length ? uiContext.items : [uiContext];
+  const labels = list.map((item) => {
+    if (!item || typeof item !== 'object') return '';
+    if (item.kind === 'node') return `节点 ${item.id || item.name || ''}`.trim();
+    if (item.kind === 'edge') {
+      const endpoints = item.from && item.to ? `${item.from} → ${item.to}` : (item.edgeKey || '');
+      return endpoints ? `连线 ${endpoints}` : '';
+    }
+    if (item.kind === 'file') return item.path ? `文件 ${item.path}` : '';
+    return '';
+  }).filter(Boolean);
+  if (!labels.length) return '';
+  return labels.join('、').slice(0, 260);
 }
 
 function currentUiContext() {
   const items = [];
   const seen = new Set();
-  for (const item of [...pinnedSelections, ...(canvasSelection ? [canvasSelection] : [])]) {
-    const key = selectionKey(item);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    items.push(item);
+  const sources = [...pinnedSelections, ...(canvasSelection ? [canvasSelection] : [])];
+  for (const source of sources) {
+    for (const item of expandSelectionItems(source)) {
+      const key = selectionKey(item);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      items.push(item);
+      if (items.length >= MAX_PINNED_SELECTIONS) break;
+    }
     if (items.length >= MAX_PINNED_SELECTIONS) break;
   }
   if (!items.length) return undefined;
@@ -1429,7 +1542,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     for (const button of questionCard.querySelectorAll('.ai-q-opt')) button.disabled = true;
     questionCard.querySelector('.ai-q-hint')?.remove();
   }
-  thread.messages.push({ role: 'user', text });
+  const selectionSummary = summarizeUiContext(uiContext);
+  thread.messages.push({ role: 'user', text, ...(selectionSummary ? { selectionSummary } : {}) });
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
@@ -1761,6 +1875,15 @@ document.addEventListener('cg:ask-ai', async (event) => {
   }
 });
 if (pinSelectionBtn) pinSelectionBtn.addEventListener('click', pinCurrentSelection);
+if (trunkSelectEl) {
+  trunkSelectEl.addEventListener('change', () => selectTrunkBranchAt(Number(trunkSelectEl.value)));
+}
+if (trunkPrevBtn) {
+  trunkPrevBtn.addEventListener('click', () => selectTrunkBranchAt(Number(trunkSelectEl?.value || 0) - 1));
+}
+if (trunkNextBtn) {
+  trunkNextBtn.addEventListener('click', () => selectTrunkBranchAt(Number(trunkSelectEl?.value || 0) + 1));
+}
 clearSelectionBtn.addEventListener('click', () => {
   const key = selectionKey(canvasSelection);
   if (!key) return;

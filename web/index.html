@@ -1139,6 +1139,44 @@
   #aiDrawer #aiPinSelection:disabled { color: #2F7A47; opacity: .75; cursor: default; }
   .ai-selection-questions { display: flex; flex-wrap: wrap; gap: 5px; }
   #aiDrawer .ai-selection-questions .ai-followup-chip { min-height: 23px; padding: 2px 9px; font-size: 11px; background: #FFFFFF; }
+  .ai-trunk-switch {
+    display: flex; align-items: center; gap: 4px; width: 100%;
+    padding: 3px 6px; border-radius: 7px; background: #EEF5FC; border: 1px solid #C8DDF2;
+  }
+  .ai-trunk-switch[hidden] { display: none; }
+  .ai-trunk-badge { font-size: 10.5px; font-weight: 600; color: #185FA5; white-space: nowrap; }
+  #aiDrawer .ai-trunk-select {
+    flex: 1 1 0; min-width: 0; height: 22px; padding: 0 6px; font-size: 11.5px;
+    border-radius: 5px; border: 1px solid #BBD4EE; background: #FFFFFF; color: #0C447C;
+  }
+  #aiDrawer .ai-trunk-step {
+    flex: none; width: 22px; height: 22px; padding: 0; border-radius: 5px;
+    border: 1px solid #BBD4EE; background: #FFFFFF; color: #185FA5; font-size: 11px; line-height: 1;
+  }
+  #aiDrawer .ai-trunk-step:hover { background: #DCEBFA; }
+
+  .pair-flow-float {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 42;
+    display: inline-flex; align-items: center; gap: 8px; max-width: min(620px, calc(100% - 24px));
+    padding: 6px 10px 6px 12px; border-radius: 999px;
+    background: rgba(24, 34, 48, 0.92); color: #F8FAFC; font-size: 12px;
+    box-shadow: 0 6px 20px rgba(15, 23, 42, 0.24);
+  }
+  .pair-flow-float[hidden] { display: none; }
+  .pair-float-txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pair-flow-float kbd {
+    padding: 0 4px; border-radius: 4px; background: rgba(255,255,255,0.16); font-size: 11px;
+  }
+  .pair-flow-float button {
+    flex: none; height: 22px; padding: 0 8px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.28); background: rgba(255,255,255,0.12);
+    color: #fff; font-size: 11.5px; cursor: pointer;
+  }
+  .pair-flow-float button:hover { background: rgba(255,255,255,0.24); }
+  .pair-flow-float button.primary {
+    border-color: #38BDF8; background: #0284C7; font-weight: 500;
+  }
+  .pair-flow-float button.primary:hover { background: #0369A1; }
 
   .ai-composer {
     border-top: 1px solid #ECEAE3; padding: 8px 12px 11px;
@@ -1834,6 +1872,12 @@
       <div class="ai-selection-bar" id="aiSelectionBar" role="group" aria-label="画布选区" hidden>
         <div class="ai-pinned-list" id="aiPinnedList" hidden></div>
         <div class="ai-selection-row" id="aiSelectionRow">
+          <div class="ai-trunk-switch" id="aiTrunkSwitch" hidden>
+            <span class="ai-trunk-badge" id="aiTrunkBadge"></span>
+            <select id="aiTrunkSelect" class="ai-trunk-select" aria-label="切换共线分支"></select>
+            <button type="button" id="aiTrunkPrev" class="ai-trunk-step" title="上一条共线分支">◀</button>
+            <button type="button" id="aiTrunkNext" class="ai-trunk-step" title="下一条共线分支">▶</button>
+          </div>
           <div class="ai-selection-pill">
             <span id="aiSelectionText"></span>
             <button type="button" id="aiPinSelection" aria-label="暂存选区到多选列表" title="暂存到待提问列表，可继续点选多个画布关系">+</button>

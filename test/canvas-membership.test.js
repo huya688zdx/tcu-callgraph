@@ -192,6 +192,9 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
   assert.equal(await evaluate(`__cg.flash === ${JSON.stringify(fn('b'))} && ${detailA} && __cg.cam.k === ${zoom}`), true);
 
   await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f' }))");
+  // a 已选中时，首次点击直接相连的 var::g_pick 只聚焦两者之间的连线，再点一次切换选中该变量节点。
+  await clickNode('var::g_pick');
+  await waitFor(`__cg.selected.edge && __cg.selected.edge.includes('var::g_pick')`);
   await clickNode('var::g_pick');
   await waitFor(`__cg.selected.node === 'var::g_pick'`);
   await deleteKey();
