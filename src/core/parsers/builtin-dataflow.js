@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { preprocessProfile } from './builtin-includes.js';
 import { parseFile, collectGlobals, collectFunctions, collectParameters, collectAccesses } from '../cparse.js';
 import { decodeSource } from '../source-files.js';
 import { taskDeclarations } from '../task-declarations.js';
@@ -76,21 +77,13 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
       console.warn(`[数据流] 读取失败，已跳过 ${f.rel}：`, err.message);
     }
   }
-  const headerMacros = new Map();
-  const pruneInactive = Boolean(model.pruneInactive || (Array.isArray(model.buildDefines) && model.buildDefines.length));
-  for (const rawDef of Array.isArray(model.buildDefines) ? model.buildDefines : []) {
-    const eq = String(rawDef || '').indexOf('=');
-    const name = (eq >= 0 ? rawDef.slice(0, eq) : rawDef).trim();
-    const val = eq >= 0 ? rawDef.slice(eq + 1).trim() : '1';
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-    headerMacros.set(name, { name, params: null, body: lex(val, '<build-config>'), file: '<build-config>', line: 0, raw: val });
-  }
-  for (const f of sources.filter((f) => f.isHeader)) preprocess(lex(f.src, f.rel), headerMacros, f.rel, { pruneInactive });
-  for (const f of sources) {
+  const loadInput = f => {
     const original = lex(f.src, f.rel);
     const taskDefs = taskDeclarations(f.src, original);
-    f.src = taskDefs.source;
-    const { tokens } = preprocess(taskDefs.names.size ? lex(f.src, f.rel) : original, fileMacroScope(headerMacros), f.rel, { expand: true, pruneInactive });
+    return { tokens: taskDefs.names.size ? lex(taskDefs.source, f.rel) : original, src: taskDefs.source };
+  };
+  const saveExpanded = (f, input, { tokens }) => {
+    f.src = input.src;
     const parts = [];
     let line = 1;
     for (const tk of tokens) {
@@ -101,6 +94,18 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
     }
     f.expanded = parts.join('');
     if (!keepOriginal) delete f.src;
+  };
+  if (model.pruneInactive) {
+    preprocessProfile(model.root, sources, {
+      defines: model.buildDefines, includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
+    }, loadInput, saveExpanded, true);
+  } else {
+    const macros = new Map();
+    for (const f of sources.filter(f => f.isHeader)) preprocess(lex(f.src, f.rel), macros, f.rel);
+    for (const f of sources) {
+      const input = loadInput(f);
+      saveExpanded(f, input, preprocess(input.tokens, fileMacroScope(macros), f.rel, { expand: true }));
+    }
   }
   return { sources, failedFiles };
 }

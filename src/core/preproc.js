@@ -26,7 +26,7 @@ export function fileMacroScope(base, changes = new Map(), { trackPositions = fal
         : changes.get(name);
       return value === undefined ? base.get(name) : value;
     },
-    set(name, def) { update(name, def, def.line); },
+    set(name, def, line = def.line) { update(name, def, line); },
     delete(name, line) { update(name, null, line); },
   };
 }
@@ -193,7 +193,7 @@ function evalPreprocExpr(exprText, macros, line) {
  * @param {Map} macros  全局宏表（跨文件共享）
  * @param {string} file
  */
-export function preprocess(tokens, macros, file, { expand = false, pruneInactive = false } = {}) {
+export function preprocess(tokens, macros, file, { expand = false, pruneInactive = false, onInclude, onPragmaOnce } = {}) {
   const out = [];
   let pending = [];
   // 遇到指令前展开，保证 #define / #undef 只作用于后面的代码。
@@ -278,8 +278,21 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
     }
 
     if (dir === 'include') {
-      const im = /^[<"]([^>"]+)[>"]/.exec(rest);
-      if (im && !isInactive()) includes.push({ file, target: im[1], line: tk.line });
+      if (isInactive()) continue;
+      const operand = onInclude && !/^[<"]/.test(rest)
+        ? expandSeq(lex(rest, file).map(t => ({ ...t, line: tk.line })), macros).map(t => t.v).join('')
+        : rest;
+      const im = /^[<"]([^>"]+)[>"]/.exec(operand);
+      if (im) {
+        const entry = { file, target: im[1], line: tk.line };
+        if (onInclude) entry.resolved = onInclude(entry, operand.startsWith('"')) ?? null;
+        includes.push(entry);
+      }
+      continue;
+    }
+
+    if (dir === 'pragma' && rest === 'once' && !isInactive()) {
+      onPragmaOnce?.();
       continue;
     }
 
@@ -287,8 +300,9 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
       const n = nm ? nm[1] : '?';
       const parentInactive = isInactive();
-      if (guardName && n === guardName && frames.length === 0) {
-        frames.push({ expr: null, inactive: parentInactive, definitelyTaken: !parentInactive });
+      if (guardName && tk === preprocs[0] && frames.length === 0) {
+        const taken = !parentInactive && (!pruneInactive || !macros.get(n));
+        frames.push({ expr: null, inactive: !taken, definitelyTaken: taken });
       } else if (pruneInactive) {
         const defined = Boolean(nm && macros.get(n));
         const taken = dir === 'ifdef' ? defined : !defined;

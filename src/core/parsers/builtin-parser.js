@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { preprocessProfile } from './builtin-includes.js';
 import { collectTaskEvidence, applyTaskEvidence } from '../task-periods.js';
 import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
 import { assignCallGroups } from '../call-sequence.js';
@@ -34,10 +35,10 @@ function includedHeaders(headers, includes) {
     }
   }
   const direct = new Map();
-  for (const { file, target } of includes) {
+  for (const { file, target, resolved } of includes) {
     const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
     const relative = path.posix.join(path.posix.dirname(file), normalized);
-    const header = paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+    const header = resolved !== undefined ? resolved : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
     if (!header) continue;
     if (!direct.has(file)) direct.set(file, new Set());
     direct.get(file).add(header);
@@ -241,13 +242,6 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
   const macros = new Map();
-  for (const rawDef of Array.isArray(parserOptions?.defines) ? parserOptions.defines : []) {
-    const eq = String(rawDef || '').indexOf('=');
-    const name = (eq >= 0 ? rawDef.slice(0, eq) : rawDef).trim();
-    const val = eq >= 0 ? rawDef.slice(eq + 1).trim() : '1';
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue;
-    macros.set(name, { name, params: null, body: lex(val, '<build-config>'), file: '<build-config>', line: 0, raw: val });
-  }
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
   const macroDefs = new Map();
   const MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -281,7 +275,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
   };
 
-  const parseFile = ({ rel, abs, isHeader, bytes }) => {
+  const loadInput = ({ rel, abs, bytes }) => {
     let buf;
     try {
       const size = bytes ?? fs.statSync(abs).size;
@@ -311,8 +305,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     const original = lex(src, rel);
     const taskDefs = taskDeclarations(src, original);
     const input = taskDefs.names.size ? lex(taskDefs.source, rel) : original;
-    const fileMacros = fileMacroScope(macros, new Map(), { trackPositions: true });
-    const { tokens, includes: inc } = preprocess(input, fileMacros, rel, { pruneInactive });
+    return { tokens: input, taskDefs, bytes: src.length };
+  };
+  const recordFile = ({ rel, isHeader }, { taskDefs, bytes }, { tokens, includes: inc }, fileMacros) => {
     const typedefs = findTypedefs(tokens);
     if (typedefs.size) typedefsByFile.set(rel, typedefs);
     if (isHeader) for (const [name, entries] of typedefs) {
@@ -381,16 +376,24 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       // extern 只是声明，真实定义优先
       if (!prev || (prev.isExtern && !v.isExtern)) varById.set(v.id, v);
     }
-    if (isHeader) for (const [name, def] of fileMacros.changes) {
+    if (isHeader && !pruneInactive) for (const [name, def] of fileMacros.changes) {
       if (def) macros.set(name, def);
       else macros.delete(name);
     }
-    parsed.push({ rel, isHeader, bytes: src.length, macroChanges: isHeader ? fileMacros.changes : null });
+    parsed.push({ rel, isHeader, bytes, macroChanges: isHeader ? fileMacros.changes : null, profileScope: isHeader && pruneInactive ? fileMacros : null });
   };
 
-  // 每个文件只词法分析一次。宏按头文件顺序生效，跨文件符号在定义收齐后绑定。
-  for (const file of headers) parseFile(file);
-  for (const file of sources) parseFile(file);
+  // 构建配置按翻译单元处理 include，普通扫描沿用先头文件后源文件的顺序。
+  if (pruneInactive) {
+    preprocessProfile(root, files, parserOptions, loadInput, recordFile);
+  } else {
+    for (const file of [...headers, ...sources]) {
+      const input = loadInput(file);
+      if (!input) continue;
+      const scope = fileMacroScope(macros, new Map(), { trackPositions: true });
+      recordFile(file, input, preprocess(input.tokens, scope, file.rel), scope);
+    }
+  }
   const includesHeader = includedHeaders(headers, includes);
   const lookupInitializerType = (file, name, at) => {
     const local = typedefsByFile.get(file)?.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
@@ -792,7 +795,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     includes,
     warnings,
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
-    ...(pruneInactive ? { pruneInactive: true } : {}),
+    ...(pruneInactive ? { pruneInactive: true, includeDirs: parserOptions.includeDirs || [], forcedIncludes: parserOptions.forcedIncludes || [] } : {}),
   };
 
   return model;
@@ -808,10 +811,10 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:4';
     return JSON.stringify([
-      'builtin:4',
+      'builtin:5',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
-      hasDefines ? options.defines : [],
+      hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [],
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),
