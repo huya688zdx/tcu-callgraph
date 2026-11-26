@@ -1,8 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { lex } from '../src/core/lexer.js';
-import { expandSeq, preprocess } from '../src/core/preproc.js';
+import { expandSeq, fileMacroScope, preprocess } from '../src/core/preproc.js';
 import { scanCalls } from '../src/core/extract.js';
+
+test('条件表达式按调用行替换函数宏，保留对象宏优先级与 defined 操作数', () => {
+  const macros = fileMacroScope(new Map(), new Map(), { trackPositions: true });
+  const { tokens } = preprocess(lex(`#define ENABLED(x) (x)
+#define TEST ENABLED
+#define A 1+2
+#if TEST(1) && A*3 == 7 && defined(A) && defined ENABLED
+first
+#endif
+#undef A
+#if defined(A)
+wrong
+#elif ENABLED(!A)
+second
+#endif`), macros, 'test.c', { pruneInactive: true });
+  assert.deepEqual(tokens.map(t => t.v), ['first', 'second']);
+});
 
 test('变参参与普通 ## 拼接时，只拼接交界处的两个 token', () => {
   const macros = new Map();

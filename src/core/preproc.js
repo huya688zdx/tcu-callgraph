@@ -74,26 +74,23 @@ function parseDefineParams(text) {
 }
 
 /** 仅用于构建配置裁剪模式的轻量 C 预处理器常量表达式求值（支持 defined、!、&&、||、==、!=、<、<=、>、>=、位/算术运算）。 */
-function evalPreprocExpr(exprText, macros) {
-  let raw = String(exprText || '').trim();
-  if (!raw) return 0;
-  raw = raw.replace(/\bdefined\s*\(\s*([A-Za-z_]\w*)\s*\)/g, (_, name) => (macros.get(name) ? '1' : '0'));
-  raw = raw.replace(/\bdefined\s+([A-Za-z_]\w*)/g, (_, name) => (macros.get(name) ? '1' : '0'));
-  for (let pass = 0; pass < 8; pass++) {
-    let changed = false;
-    raw = raw.replace(/\b([A-Za-z_]\w*)\b/g, (word) => {
-      const m = macros.get(word);
-      if (!m || m.params !== null) return word;
-      const body = (m.raw ?? m.body?.map((t) => t.v).join(' ') ?? '').trim();
-      const repl = body || '1';
-      if (repl !== word) changed = true;
-      return `(${repl})`;
-    });
-    if (!changed) break;
+function evalPreprocExpr(exprText, macros, line) {
+  const tokens = lex(exprText);
+  const input = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = { ...tokens[i], line };
+    if (token.v === 'defined') {
+      // defined 检查操作数的宏名，先于普通替换处理。
+      const grouped = tokens[i + 1]?.v === '(';
+      const name = tokens[i + (grouped ? 2 : 1)];
+      if (name?.t !== 'id' || (grouped && tokens[i + 3]?.v !== ')')) return 0;
+      input.push({ ...token, t: 'num', v: macros.get(name.v, line) ? '1' : '0' });
+      i += grouped ? 3 : 1;
+    } else {
+      input.push(token);
+    }
   }
-  const toks = [];
-  const re = /0[xX][0-9a-fA-F]+[uUlL]*|0[0-7]*[uUlL]*|[1-9]\d*[uUlL]*|[A-Za-z_]\w*|&&|\|\||==|!=|<=|>=|<<|>>|[()!~+\-*/%&|^<>?:]/g;
-  for (const m of raw.matchAll(re)) toks.push(m[0]);
+  const toks = expandSeq(input, macros).map(token => token.v);
   if (!toks.length) return 0;
   let pos = 0;
   const peek = () => toks[pos];
@@ -309,7 +306,7 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
     if (dir === 'if') {
       const parentInactive = isInactive();
       if (pruneInactive) {
-        const taken = !parentInactive && evalPreprocExpr(rest, macros) !== 0;
+        const taken = !parentInactive && evalPreprocExpr(rest, macros, tk.line) !== 0;
         frames.push({
           expr: rest.replace(/\s+/g, ' '),
           inactive: parentInactive || !taken,
@@ -330,7 +327,7 @@ export function preprocess(tokens, macros, file, { expand = false, pruneInactive
           if (parentInactive || frame.definitelyTaken) {
             frame.inactive = true;
           } else {
-            const taken = evalPreprocExpr(rest, macros) !== 0;
+            const taken = evalPreprocExpr(rest, macros, tk.line) !== 0;
             frame.inactive = !taken;
             frame.definitelyTaken = taken;
           }
