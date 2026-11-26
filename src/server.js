@@ -34,6 +34,7 @@ import {
   testConnection as testAiConnection,
 } from './core/ai-agent.js';
 import { normalizeExpansions } from './core/expansion.js';
+import { routeEdges } from './core/routing.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
@@ -1723,6 +1724,94 @@ function sendFile(res, file, headers) {
  */
 const layoutKey = (rootId, mode) => `${rootId || ''}::${mode}`;
 
+const CANVAS_SNAPSHOT_LIMIT = 200;
+const canvasNumber = (value) => Number.isFinite(value) && Math.abs(value) <= 1_000_000;
+const canvasRect = ({ id, x, y, w, h }) => ({ id, x, y, w, h });
+const canvasNode = (node) => ({ ...canvasRect(node), name: node.name, kind: node.kind, file: node.file });
+
+function sanitizeCanvasLayout(raw) {
+  if (!isPlainObject(raw) || typeof raw.root !== 'string' || raw.root.length > 32_000 ||
+      !['flat', 'group', 'file', 'period'].includes(raw.mode) || !Array.isArray(raw.nodes)) return null;
+  const rects = (items, nodes = false) => {
+    if (!Array.isArray(items)) return null;
+    const byId = new Map();
+    for (const item of items.slice(0, CANVAS_SNAPSHOT_LIMIT)) {
+      if (!isPlainObject(item) || typeof item.id !== 'string' || item.id.length > 1024 ||
+          (nodes && !item.id) || byId.has(item.id) ||
+          ![item.x, item.y, item.w, item.h].every(canvasNumber) || item.w <= 0 || item.h <= 0) continue;
+      byId.set(item.id, canvasRect(item));
+    }
+    return byId;
+  };
+  const dimension = (n) => canvasNumber(n) && n >= 0 ? n : undefined;
+  return {
+    root: remapLayoutRoot(raw.root, MODEL), mode: raw.mode,
+    width: dimension(raw.width), height: dimension(raw.height),
+    nodes: rects(raw.nodes, true), groups: rects(raw.groups), containers: rects(raw.containers),
+  };
+}
+
+// 找出移动轴上第一个无冲突的位置。均匀分布时整排节点使用同一偏移。
+function clearCanvasAxis(rects, obstacles, axis, direction = 1) {
+  const [across, length, breadth] = axis === 'x' ? ['y', 'w', 'h'] : ['x', 'h', 'w'];
+  const blocked = [];
+  for (const rect of rects) for (const other of obstacles) {
+    if (rect[across] >= other[across] + other[breadth] || other[across] >= rect[across] + rect[breadth]) continue;
+    const low = other[axis] - rect[axis] - rect[length];
+    const high = other[axis] + other[length] - rect[axis];
+    blocked.push(direction > 0 ? [low, high] : [-high, -low]);
+  }
+  let offset = 0;
+  for (const [low, high] of blocked.sort((a, b) => a[0] - b[0])) {
+    if (low >= offset) break;
+    offset = Math.max(offset, high);
+  }
+  if (direction < 0 && rects.some(rect => rect[axis] < offset)) return clearCanvasAxis(rects, obstacles, axis);
+  return direction * offset;
+}
+
+function applyArrangedPositions(view, positions, groupMode) {
+  const arranged = view.nodes.filter(n => positions?.[n.id]?.arrangedFor === groupMode);
+  if (!arranged.length) return;
+  // 增量刷新会把 layoutSlots 传回服务端。重置时据此丢弃已调整的旧几何。
+  const slots = view.layoutSlots || {
+    nodes: view.nodes.map(n => ({ ...canvasRect(n), file: n.file, group: n.group })),
+    edges: view.edges.map(e => ({ ...e })),
+    groups: view.groups.map(box => ({ ...box })),
+    containers: view.containers.map(box => ({ ...box })),
+    width: view.width, height: view.height, layoutDirection: view.layoutDirection,
+  };
+  view.layoutSlots = { ...slots, aiArranged: true };
+  let changed = false;
+  for (const node of arranged) {
+    const { x, y } = positions[node.id];
+    if (![x, y].every(Number.isFinite) || (node.x === x && node.y === y)) continue;
+    changed = true;
+    Object.assign(node, { x, y });
+    for (const box of [...view.groups, ...view.containers]) {
+      if (box.root || !node.group || (node.group !== box.id && !node.group.startsWith(box.id + '/'))) continue;
+      const right = Math.max(box.x + box.w, x + node.w + 12);
+      const bottom = Math.max(box.y + box.h, y + node.h + 12);
+      box.x = Math.min(box.x, Math.max(0, x - 12));
+      box.y = Math.min(box.y, Math.max(0, y - 12));
+      box.w = right - box.x;
+      box.h = bottom - box.y;
+    }
+  }
+  if (!changed) return;
+  routeEdges(view.nodes, view.edges, { layoutDirection: view.layoutDirection });
+  for (const rect of [...view.nodes, ...view.groups, ...view.containers]) {
+    if (rect.root) continue;
+    view.width = Math.max(view.width, rect.x + rect.w + 24);
+    view.height = Math.max(view.height, rect.y + rect.h + 24);
+  }
+  for (const edge of view.edges) for (const [x, y] of edge.points || []) {
+    view.width = Math.max(view.width, x + 24);
+    view.height = Math.max(view.height, y + 24);
+  }
+  for (const box of view.containers) if (box.root) Object.assign(box, { w: view.width, h: view.height });
+}
+
 // 旧存档的外部占位节点若已有真实定义，优先绑定到生产源码。
 function remapLegacyExt(id, model) {
   if (typeof id !== 'string' || !id.startsWith('ext::')) return id;
@@ -2006,11 +2095,12 @@ async function buildView(
     }
   }
 
-  // 只恢复手工关系，旧固定坐标和折线不再参与排版。
+  // 恢复手工关系和当前布局模式下的 AI 坐标，旧固定坐标和折线仍保持原有兼容行为。
   const mode = group ? 'group' : 'flat';
   const layout = viewOverlay.layout || {};
   const layoutRoot = roots.join('+');
-  const manual = layout[layoutKey(layoutRoot, mode)]?.manual;
+  const slot = layout[layoutKey(layoutRoot, mode)];
+  const manual = slot?.manual;
   const byId = new Map(clean.map((n) => [n.id, n]));
   // 比较模式的 roots 是「保留+选中」的合集，和存手工关系时的原视图槽位键对不上；
   // 改为从全部槽位按「两端都在当前图上」找回，按端点对去重，保证手工关系仍可见。
@@ -2056,8 +2146,11 @@ async function buildView(
     if (numbers) e.callNumbers = numbers;
   }
   const groupMode = varSel.groupMode || (group ? 'file' : 'flat');
+  const positions = COMPARISON ? null : slot?.nodes;
+  if (previous?.layoutSlots?.aiArranged && !clean.some(n => positions?.[n.id]?.arrangedFor === groupMode)) previous = null;
   const laid = await layoutElk(clean, viewEdges, { group, groupMode, rootLabel: ROOT_LABEL, previous });
   assertCurrent();
+  applyArrangedPositions(laid, positions, groupMode);
 
   // 合并标注 + 变更状态
   for (const n of laid.nodes) {
@@ -2346,13 +2439,30 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/ai/chat' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       let p;
-      try { p = await readJson(req, res); } catch { return; }
+      try { p = await readJson(req, res, 8 * 1024 * 1024); } catch { return; }
       if (!currentSession(req)) return sessionConflict(res);
       const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
       let cfg;
       try { cfg = normalizeAiConfig(p.config || {}, saved); } catch (err) { return bad(res, err.message); }
       const prompt = String(p.prompt || '').trim();
       if (!prompt) return bad(res, '请输入要执行的任务');
+      const images = [];
+      for (const item of Array.isArray(p.images) ? p.images : []) {
+        const dataUrl = typeof item === 'string' ? item : item?.dataUrl;
+        if (typeof dataUrl !== 'string' || dataUrl.length > 3_000_000 ||
+            !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) continue;
+        images.push({ dataUrl, ...(typeof item?.label === 'string' ? { label: item.label.slice(0, 120) } : {}) });
+        if (images.length === 2) break;
+      }
+      const canvasLayoutRoots = (ids) => ids.map(id => remapLegacyExt(id, MODEL)).filter(Boolean);
+      let canvasSnapshot = reviewingPage(pageState) ? null : sanitizeCanvasLayout(p.canvasLayout);
+      const snapshotPage = canvasSnapshot && latestPage();
+      const snapshotView = snapshotPage ? viewSnapshot(snapshotPage) : null;
+      const snapshotRoots = canvasLayoutRoots(snapshotView?.roots || []);
+      const snapshotRoot = snapshotRoots.join('+');
+      if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
+      const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
+      let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -2710,8 +2820,171 @@ export const server = http.createServer(async (req, res) => {
         return branches.length > 1 ? branches : [];
       };
 
+      const arrangeCanvas = async (args) => {
+        const fail = error => ({ ok: false, error });
+        if (COMPARISON) return fail('比较模式不支持调整画布布局');
+        const page = latestPage();
+        if (!page || (!page.roots?.length && !page.expansions?.length && !page.vars?.length)) return fail('当前画布为空');
+        const { action } = args;
+        if (!['inspect', 'move', 'align', 'reset'].includes(action)) return fail('未知的画布布局操作');
+        const activeView = viewSnapshot(page);
+        const { roots, up, down, group, groupMode, vars, hiddenVars, expansions } = activeView;
+        const layoutRoot = canvasLayoutRoots(roots).join('+');
+        const layoutMode = group ? 'group' : 'flat';
+        const key = layoutKey(layoutRoot, layoutMode);
+        const beforeSlot = overlay.layout[key];
+        const view = await buildView(roots, up, down, group, null, {
+          want: vars, skip: hiddenVars, expansions, groupMode, signal: abort.signal,
+        });
+        assertActive();
+        const current = latestPage();
+        if (!current || !isDeepStrictEqual(activeView, viewSnapshot(current)) || overlay.layout[key] !== beforeSlot) {
+          return fail('画布布局已变化，请重新查看当前布局');
+        }
+        if (!view.nodes.length) return fail('当前画布为空');
+        const snapshot = canvasSnapshot && snapshotKey === key && snapshotSlot === beforeSlot &&
+          (canvasSnapshot.mode === groupMode || canvasSnapshot.mode === layoutMode) &&
+          isDeepStrictEqual(snapshotView, activeView) ? canvasSnapshot : null;
+        const live = snapshot && view.nodes.some(n => snapshot.nodes.has(n.id)) ? snapshot : null;
+        const nodes = view.nodes.map(n => canvasNode({ ...n, ...live?.nodes.get(n.id) }));
+        if (action === 'inspect') {
+          return {
+            ok: true, action, root: layoutRoot, mode: layoutMode, nodes,
+            groups: view.groups.map(box => live?.groups?.get(box.id) ?? canvasRect(box)),
+            containers: view.containers.map(box => live?.containers?.get(box.id) ?? canvasRect(box)),
+            canvas: { width: live?.width ?? view.width, height: live?.height ?? view.height },
+            edges: view.edges.map(({ from, to, kind }) => ({ from, to, kind })),
+            ...(view.truncated ? { truncated: true } : {}),
+          };
+        }
+
+        const byId = new Map(nodes.map(n => [n.id, n]));
+        const resolveNode = (query) => {
+          if (typeof query !== 'string' || !query.trim()) throw new Error('请提供画布节点的名称或 ID');
+          query = query.trim();
+          if (byId.has(query)) return byId.get(query);
+          const onCanvas = n => byId.has(n.id);
+          const matches = ['fn', 'var'].flatMap(kind => {
+            const { resolved, ambiguous } = resolveSymbols(MODEL, [query], kind, onCanvas);
+            return [...resolved, ...ambiguous.flatMap(item => item.candidates)].filter(id => byId.has(id));
+          });
+          // 画布也可能包含外部占位节点或具有显示别名的节点。
+          const shortName = query.replace(/\(\s*\)$/, '').toLowerCase();
+          for (const n of nodes) if (n.name?.toLowerCase() === shortName) matches.push(n.id);
+          const unique = [...new Set(matches)];
+          if (unique.length > 1) throw new Error(`画布节点「${query}」重名，请使用完整 ID：${unique.slice(0, 8).join('、')}`);
+          if (!unique.length) throw new Error(`当前画布没有节点「${query}」`);
+          return byId.get(unique[0]);
+        };
+        const gapOf = (value) => {
+          if (value == null) return 24;
+          if (!canvasNumber(value) || value < 0) throw new Error('gap 必须为非负数');
+          return value;
+        };
+        const updated = new Map();
+        if (action === 'move') {
+          if (!Array.isArray(args.moves) || !args.moves.length || args.moves.length > CANVAS_SNAPSHOT_LIMIT) {
+            return fail('moves 必须包含 1 至 200 项');
+          }
+          for (const move of args.moves) {
+            if (!isPlainObject(move) || ['x', 'y', 'dx', 'dy'].some(k => move[k] !== undefined && !canvasNumber(move[k]))) {
+              return fail('移动坐标和偏移必须是有效数字');
+            }
+            const node = resolveNode(move.id);
+            const target = { ...node };
+            let axis, direction, relativeLimit;
+            if (move.relativeTo !== undefined || move.placement !== undefined) {
+              const anchor = resolveNode(move.relativeTo);
+              const placement = move.placement;
+              if (anchor === node || !['left', 'right', 'above', 'below'].includes(placement)) {
+                return fail('相对移动需要另一个参照节点和有效的 placement');
+              }
+              const gap = gapOf(move.gap);
+              axis = ['left', 'right'].includes(placement) ? 'x' : 'y';
+              direction = ['left', 'above'].includes(placement) ? -1 : 1;
+              target.x = anchor.x;
+              target.y = anchor.y;
+              const size = axis === 'x' ? 'w' : 'h';
+              target[axis] += direction * ((direction > 0 ? anchor[size] : node[size]) + gap);
+              relativeLimit = target[axis];
+            } else if (['x', 'y', 'dx', 'dy'].every(k => move[k] === undefined)) {
+              return fail('请提供目标坐标、移动偏移或相对位置');
+            }
+            target.x = Math.max(0, (move.x ?? target.x) + (move.dx ?? 0));
+            target.y = Math.max(0, (move.y ?? target.y) + (move.dy ?? 0));
+            if (relativeLimit !== undefined) {
+              if (direction < 0 && relativeLimit < 0) return fail('参照节点在该方向没有足够空间');
+              target[axis] = direction > 0 ? Math.max(target[axis], relativeLimit) : Math.min(target[axis], relativeLimit);
+            }
+            const dx = target.x - node.x, dy = target.y - node.y;
+            axis ??= Math.abs(dx) >= Math.abs(dy) ? 'x' : 'y';
+            direction ??= (axis === 'x' ? dx : dy) < 0 ? -1 : 1;
+            target[axis] += clearCanvasAxis([target], nodes.filter(n => n !== node), axis, direction);
+            if (relativeLimit !== undefined && direction < 0 && target[axis] > relativeLimit) {
+              return fail('参照节点在该方向没有足够的无重叠空间');
+            }
+            Object.assign(node, { x: target.x, y: target.y });
+            updated.set(node.id, node);
+          }
+        } else if (action === 'align') {
+          const { axis } = args;
+          if (!['x', 'y'].includes(axis)) return fail('axis 必须为 x（同行）或 y（同列）');
+          if (!Array.isArray(args.nodes) || args.nodes.length < 2 || args.nodes.length > CANVAS_SNAPSHOT_LIMIT) {
+            return fail('请选择 2 至 200 个要对齐的节点');
+          }
+          const selected = [...new Set(args.nodes.map(resolveNode))];
+          if (selected.length < 2) return fail('请选择至少两个不同的画布节点');
+          const obstacles = nodes.filter(n => !selected.includes(n));
+          const [across, length] = axis === 'x' ? ['y', 'w'] : ['x', 'h'];
+          const line = Math.max(0, selected[0][across]);
+          selected.sort((a, b) => a[axis] - b[axis]);
+          const targets = selected.map(n => ({ ...n, [across]: line, [axis]: Math.max(0, n[axis]) }));
+          if (args.distribute === true) {
+            const gap = gapOf(args.gap);
+            for (let i = 1; i < targets.length; i++) targets[i][axis] = targets[i - 1][axis] + targets[i - 1][length] + gap;
+            const offset = clearCanvasAxis(targets, obstacles, axis);
+            for (const target of targets) target[axis] += offset;
+          } else {
+            for (const target of targets) {
+              target[axis] += clearCanvasAxis([target], obstacles, axis);
+              obstacles.push(target);
+            }
+          }
+          for (const target of targets) updated.set(target.id, target);
+        }
+
+        const clear = action === 'reset';
+        const op = clear ? 'layout.clear' : 'layout.save';
+        const positions = [...updated.values()].map(({ id, x, y }) => ({ id, x, y }));
+        const patch = Object.fromEntries(positions.map(({ id, x, y }) => [id, { x, y, arrangedFor: groupMode }]));
+        const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
+        const slot = store.transaction(() => {
+          const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
+          const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, clear });
+          store.appendEvent(PROJECT.id, {
+            op, target: key, actor: 'ai',
+            before: clear ? before : { nodes: pickKeys(before.nodes, [...updated.keys()]) },
+            after: { nodes: patch, reason, view: activeView },
+          });
+          return savedSlot;
+        });
+        overlay.layout[key] = slot;
+        if (live && !clear) {
+          snapshotSlot = slot;
+          for (const node of updated.values()) live.nodes.set(node.id, canvasRect(node));
+          // 写入后文件框和画布范围由服务端重新计算。
+          live.groups = live.containers = null;
+          live.width = live.height = undefined;
+        } else if (key === snapshotKey) {
+          canvasSnapshot = null;
+        }
+        broadcastChange(op, 'ai', { projectId: PROJECT.id });
+        return { ok: true, action, root: layoutRoot, mode: layoutMode, updatedCount: positions.length, positions, ...reviewWriteResult() };
+      };
+
       const executeAiTool = async (name, args) => {
         assertActive();
+        if (name === 'arrange_canvas') return arrangeCanvas(args);
         if (name === 'get_git_changes') {
           const q = new URLSearchParams({ limit: '80' });
           if (args.baseRef) q.set('baseRef', String(args.baseRef));
@@ -3383,22 +3656,36 @@ export const server = http.createServer(async (req, res) => {
             containerKind: f.containerKind === 'dir' ? 'dir' : 'file',
             label: String(f.label || '').slice(0, 120),
           });
-          if (raw.kind === 'node') {
-            const node = sanitizeNode(raw);
-            return node ? { ...node, selectedNode: node } : null;
-          }
-          if (raw.kind === 'edge') {
-            const edge = sanitizeEdge(raw);
-            return edge ? { ...edge, selectedEdge: edge } : null;
-          }
-          if (raw.kind === 'file') {
-            const file = sanitizeFile(raw);
-            return file ? { ...file, selectedFile: file } : null;
-          }
           const out = {};
-          if (raw.selectedNode) out.selectedNode = sanitizeNode(raw.selectedNode);
-          if (raw.selectedEdge) out.selectedEdge = sanitizeEdge(raw.selectedEdge);
-          if (raw.selectedFile) out.selectedFile = sanitizeFile(raw.selectedFile);
+          const types = [['node', 'selectedNode', sanitizeNode], ['edge', 'selectedEdge', sanitizeEdge],
+            ['file', 'selectedFile', sanitizeFile]];
+          const flat = types.find(([kind]) => raw.kind === kind);
+          for (const [, key, sanitize] of flat ? [flat] : types) {
+            if (flat) {
+              const item = sanitize(raw);
+              Object.assign(out, item, { [key]: item });
+            } else if (raw[key]) out[key] = sanitize(raw[key]);
+          }
+          if (Array.isArray(raw.items)) {
+            const items = new Map();
+            for (const entry of raw.items.slice(0, 16)) {
+              let item, id;
+              if (entry?.kind === 'node') {
+                item = sanitizeNode(entry);
+                id = item?.id || (item?.name && JSON.stringify([item.name, item.file, item.line]));
+              } else if (entry?.kind === 'edge') {
+                item = sanitizeEdge(entry);
+                id = item?.edgeKey || (item?.from && item?.to && `${item.from}->${item.to}:${item.line}`);
+              } else if (entry?.kind === 'file') {
+                item = sanitizeFile(entry);
+                id = item?.path;
+              }
+              if (!id) continue;
+              const key = JSON.stringify([item.kind, id]);
+              if (!items.has(key)) items.set(key, item);
+            }
+            if (items.size) out.items = [...items.values()];
+          }
           return Object.keys(out).length ? out : null;
         };
         const uiContext = sanitizeUiContext(p.uiContext);
@@ -3415,6 +3702,7 @@ export const server = http.createServer(async (req, res) => {
         await runAiAgent({
           config: cfg,
           prompt,
+          images,
           history: p.history || [],
           context,
           executeTool: executeAiTool,

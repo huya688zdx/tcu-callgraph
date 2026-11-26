@@ -105,6 +105,20 @@ function scrubSecret(text, apiKey) {
 function clipToolOutput(output, maxChars = 12000) {
   let text = JSON.stringify(output);
   if (text.length <= maxChars) return text;
+  if (output?.action === 'inspect' && Array.isArray(output.nodes)) {
+    const { nodes, groups, containers, edges, ...summary } = output;
+    const clipped = { ...summary, truncated: true, nodes: [], groups: [], containers: [], edges: [] };
+    let remaining = maxChars - JSON.stringify(clipped).length;
+    for (const [key, items] of Object.entries({ nodes, groups, containers, edges })) {
+      for (const item of items || []) {
+        const size = JSON.stringify(item).length + (clipped[key].length ? 1 : 0);
+        if (size > remaining) break;
+        clipped[key].push(item);
+        remaining -= size;
+      }
+    }
+    return JSON.stringify(clipped);
+  }
   // 裁剪工具结果时保留车型选择所需的目录前缀。
   const vehicleChoice = {
     ...(output?.needsVehicleChoice === true ? { needsVehicleChoice: true } : {}),
@@ -268,6 +282,40 @@ export const AGENT_TOOLS = [
     },
   },
   {
+    name: 'arrange_canvas',
+    description: '查看当前画布坐标，移动、对齐或重置画布节点。x 向右增加，y 向下增加。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['inspect', 'move', 'align', 'reset'] },
+        moves: {
+          type: 'array',
+          maxItems: 200,
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: '画布节点完整 ID 或唯一短名称' },
+              x: { type: 'number' },
+              y: { type: 'number' },
+              dx: { type: 'number' },
+              dy: { type: 'number' },
+              relativeTo: { type: 'string', description: '参照节点完整 ID 或唯一短名称' },
+              placement: { type: 'string', enum: ['right', 'left', 'below', 'above'] },
+              gap: { type: 'number', minimum: 0 },
+            },
+            required: ['id'],
+          },
+        },
+        nodes: { type: 'array', maxItems: 200, items: { type: 'string' } },
+        axis: { type: 'string', enum: ['x', 'y'], description: 'x 为水平一排（同 Y），y 为垂直一列（同 X）' },
+        distribute: { type: 'boolean' },
+        gap: { type: 'number', minimum: 0, description: '均匀分布时节点边缘之间的间距' },
+        reason: { type: 'string', maxLength: 240 },
+      },
+      required: ['action'],
+    },
+  },
+  {
     name: 'remove_from_canvas',
     description: '按函数或车型目录前缀移除当前画布中的节点，保留其他节点。',
     parameters: {
@@ -298,7 +346,16 @@ export function estimateTokens(text) {
 const TOOL_SCHEMA_TOKENS = estimateTokens(JSON.stringify(openAiToolsPayload()));
 
 export function estimateMessagesTokens(messages, includeTools = false) {
-  return messages.reduce((total, message) => total + 4 + estimateTokens(JSON.stringify(message)), includeTools ? TOOL_SCHEMA_TOKENS : 0);
+  return messages.reduce((total, message) => {
+    if (!Array.isArray(message.content)) return total + 4 + estimateTokens(JSON.stringify(message));
+    let imageTokens = 0;
+    const content = message.content.map(part => {
+      if (part?.type !== 'image_url') return part;
+      imageTokens += 600;
+      return { type: 'image_url' };
+    });
+    return total + 4 + estimateTokens(JSON.stringify({ ...message, content })) + imageTokens;
+  }, includeTools ? TOOL_SCHEMA_TOKENS : 0);
 }
 
 function openAiToolsPayload() {
@@ -336,27 +393,41 @@ function buildSystemPrompt(context, promptToolMode) {
     const selectedNode = ui.selectedNode ?? (ui.kind === 'node' ? ui : null);
     const selectedEdge = ui.selectedEdge ?? (ui.kind === 'edge' ? ui : null);
     const selectedFile = ui.selectedFile ?? (ui.kind === 'file' ? ui : null);
-    const selections = [];
     const location = (file, line) => {
       if (!line) return file;
       return file ? `${file}:${line}` : `第 ${line} 行`;
     };
-    if (selectedNode) {
-      const id = typeof selectedNode === 'string' ? selectedNode : selectedNode.id ?? selectedNode.name;
-      const source = location(selectedNode.file ?? selectedNode.path, selectedNode.line ?? selectedNode.startLine);
-      selections.push(`节点 ${[id, source].filter(Boolean).join('，')}`);
+    const formatSelection = (kind, item) => {
+      if (!item) return '';
+      if (kind === 'node') {
+        const id = typeof item === 'string' ? item : item.id || item.name;
+        const source = location(item.file ?? item.path, item.line ?? item.startLine);
+        return `节点 ${[id, source].filter(Boolean).join('，')}`;
+      }
+      if (kind === 'edge') {
+        const { from, to, id, edgeKey, file, line, labels, label } = item;
+        const endpoints = typeof item === 'string' ? item : from && to ? `${from} → ${to}` : '';
+        const texts = (Array.isArray(labels) ? labels : [labels ?? label])
+          .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
+        const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
+        return `连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`;
+      }
+      if (kind !== 'file') return '';
+      const file = typeof item === 'string' ? item : item.path || item.file;
+      return file ? `文件 ${file}` : '';
+    };
+    if (ui.items?.length) {
+      const selections = ui.items.map(item => formatSelection(item?.kind, item)).filter(Boolean);
+      ctxLines.push(`用户当前在画布上选中/暂存的对象（共 ${selections.length} 项）：`,
+        ...selections.map((text, index) => `${index + 1}. ${text}`));
+    } else {
+      const selections = [
+        formatSelection('node', selectedNode),
+        formatSelection('edge', selectedEdge),
+        formatSelection('file', selectedFile),
+      ].filter(Boolean);
+      ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
     }
-    if (selectedEdge) {
-      const { from, to, id, edgeKey, file, line, labels, label } = selectedEdge;
-      const endpoints = typeof selectedEdge === 'string' ? selectedEdge : from && to ? `${from} → ${to}` : '';
-      const texts = (Array.isArray(labels) ? labels : [labels ?? label])
-        .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
-      const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
-      selections.push(`连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`);
-    }
-    const file = typeof selectedFile === 'string' ? selectedFile : selectedFile?.path ?? selectedFile?.file;
-    if (file) selections.push(`文件 ${file}`);
-    ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
   }
 
   const base = [
@@ -375,6 +446,7 @@ function buildSystemPrompt(context, promptToolMode) {
     '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
     '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
     '10. 用户提到当前选中的函数、连线或文件时，使用当前画布选中对象中的完整 ID、端点及文件路径定位。回答解释类问题时只读分析。',
+    '11. 使用 arrange_canvas({ action: "inspect" }) 查看画布坐标，再按用户要求使用 move、align 或 reset。附有画布截图时，结合图像和 inspect 返回的节点坐标确定目标后再移动。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -518,7 +590,7 @@ function convertMessagesToPromptMode(messages, context) {
       }
       out.push({ role: 'assistant', content: textParts.join('\n') || '…' });
     } else {
-      out.push({ role: m.role, content: String(m.content || '') });
+      out.push(m);
     }
   }
   flushTools();
@@ -922,6 +994,11 @@ function summarizeToolResult(name, result) {
     return parts.join('，');
   }
   if (name === 'apply_labels') return `已写入 ${result.applied || 0} 条标签`;
+  if (name === 'arrange_canvas') {
+    if (result.action === 'inspect') return `已查看 ${result.nodes?.length ?? 0} 个画布节点的位置`;
+    if (result.action === 'reset') return '已恢复自动布局';
+    return `已调整 ${result.updatedCount} 个画布节点的位置`;
+  }
   if (name === 'remove_from_canvas') return '已从画布移除 ' + (Array.isArray(result.removed) ? result.removed.length : result.removed ?? 0) + ' 项';
   if (name === 'trace_upstream') return '已追踪 ' + Object.keys(result.pathBranches ?? {}).length + ' 个上游分支';
   return '完成';
@@ -931,6 +1008,7 @@ const DIGEST_FIELDS = [
   'snapshotId', 'includePaths', 'excludePaths', 'includeAllBranches', 'functions', 'vars', 'fromGit', 'splitByGroup',
   'id', 'file', 'pathBranches', 'needsVehicleChoice', 'isolatedGroups', 'changedFunctions', 'changedFiles', 'changedVars',
   'roots', 'matches', 'upstreamChains', 'applied', 'removed', 'bookmarks', 'edgeKeys', 'error',
+  'action', 'axis', 'updatedCount', 'positions',
 ];
 
 export function summarizeToolDigest(name, args, result) {
@@ -1044,6 +1122,7 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
 export async function runAiAgent({
   config,
   prompt,
+  images = [],
   history = [],
   context = {},
   executeTool,
@@ -1081,10 +1160,30 @@ export async function runAiAgent({
   const requiredTool = removal ? 'remove_from_canvas'
     : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
 
+  let imagesDegraded = false;
+  const userMessage = {
+    role: 'user',
+    content: images.length > 0 && !imagesDegraded
+      ? [{ type: 'text', text: userText }, ...images.map(img => ({
+        type: 'image_url', image_url: { url: typeof img === 'string' ? img : img.dataUrl },
+      }))]
+      : userText,
+  };
+  const degradeImages = (res) => {
+    if (!images.length || imagesDegraded || ![400, 422].includes(res.status)) return false;
+    const error = res.json?.error;
+    const detail = [error?.param, error?.message, typeof error === 'string' ? error : null,
+      res.json?.message, res.json?.detail].filter(Boolean);
+    if (!/image|vision|multimodal|content.*string|expected.*string|unsupported/i.test(detail.length ? JSON.stringify(detail) : res.text)) return false;
+    imagesDegraded = true;
+    userMessage.content = userText;
+    onEvent({ type: 'fallback', text: '当前模型接口不支持图片输入，已自动降级为纯文本继续' });
+    return true;
+  };
   let messages = [
     { role: 'system', content: buildSystemPrompt(context, activeMode === 'prompt') },
     ...cleanHistory,
-    { role: 'user', content: userText },
+    userMessage,
   ];
   const allThoughts = [];
   const toolLog = [];
@@ -1150,6 +1249,10 @@ export async function runAiAgent({
         const detail = error?.param || error?.message || res.text;
         if (streamMode === 'stream_usage' && /stream_options|include_usage/i.test(detail)) {
           streamMode = 'stream';
+          step--;
+          continue;
+        }
+        if (degradeImages(res)) {
           step--;
           continue;
         }
@@ -1328,7 +1431,8 @@ export async function runAiAgent({
       toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, summary, digest });
       onEvent({ type: 'tool_end', name: call.name, ok: output?.ok !== false, summary, digest });
 
-      const clipped = clipToolOutput(output, 12000);
+      const layoutBudget = Math.max(12000, Math.min(72000, config.contextWindow * 2));
+      const clipped = clipToolOutput(output, call.name === 'arrange_canvas' ? layoutBudget : 12000);
       if (callStyle === 'tool_calls' && activeMode === 'tools') {
         messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: clipped });
       } else if (callStyle === 'function_call' && activeMode === 'tools') {
@@ -1360,12 +1464,15 @@ export async function runAiAgent({
         ...(reasoningDegraded ? {} : reasoningPayload),
         messages: [...messages, { role: 'user', content: '请用 2-4 句简明中文总结以上已完成的操作结果，不要再调用工具。' }],
       };
-      const metrics = createMetrics(config, request, onEvent, recordMetrics);
-      const res = await fetchJson(chatUrl, {
-        method: 'POST',
-        headers: authHeaders(config.apiKey),
-        body: JSON.stringify(request),
-      }, fetchImpl, 15_000, signal);
+      let metrics, res;
+      do {
+        metrics = createMetrics(config, request, onEvent, recordMetrics);
+        res = await fetchJson(chatUrl, {
+          method: 'POST',
+          headers: authHeaders(config.apiKey),
+          body: JSON.stringify(request),
+        }, fetchImpl, 15_000, signal);
+      } while (!res.ok && degradeImages(res));
       if (res.ok) {
         summaryMessage = res.json?.choices?.[0]?.message;
         metrics.finish(res.json);

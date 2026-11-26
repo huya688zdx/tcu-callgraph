@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  estimateMessagesTokens,
   extractThinkingAndText,
   normalizeAiConfig,
   normalizeBaseUrl,
@@ -14,6 +15,216 @@ import {
 } from '../src/core/ai-agent.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
+
+test('runAiAgent：发送多模态图片、估算图片 token 并在 HTTP 400 时降级', async () => {
+  const prompt = '查看画布截图';
+  const small = 'data:image/png;base64,AAAA';
+  const large = 'data:image/webp;base64,' + 'A'.repeat(2_400_000);
+  const content = [
+    { type: 'text', text: prompt },
+    { type: 'image_url', image_url: { url: small } },
+    { type: 'image_url', image_url: { url: large } },
+  ];
+  const tokens = estimateMessagesTokens([{ role: 'user', content }]);
+  assert.ok(tokens >= 1200 && tokens < 1300);
+  assert.equal(tokens, estimateMessagesTokens([{
+    role: 'user', content: content.map(part => part.image_url ? { ...part, image_url: { url: small } } : part),
+  }]));
+
+  for (const rejectsImages of [false, true]) {
+    const requests = [], events = [];
+    const result = await runAiAgent({
+      config: { baseUrl: 'http://127.0.0.1:8000/v1', model: 'mock-vision', toolMode: 'tools' },
+      prompt, images: [{ dataUrl: small, label: '画布' }, { dataUrl: large }], maxSteps: 1,
+      onEvent: event => events.push(event),
+      fetchImpl: async (_url, { body }) => {
+        requests.push(JSON.parse(body).messages.at(-1).content);
+        if (requests.length === 1 && rejectsImages) {
+          return Response.json({ error: { param: 'messages', message: 'Expected message content to be a string' } }, { status: 400 });
+        }
+        return Response.json({ choices: [{ message: { content: '已查看。' } }] });
+      },
+    });
+    assert.deepEqual(requests, rejectsImages ? [content, prompt] : [content]);
+    assert.equal(result.ok, true);
+    assert.equal(result.answer, '已查看。');
+    assert.ok(result.metrics.contextEstTokens < 10_000);
+    assert.deepEqual(events.filter(event => event.type === 'fallback'), rejectsImages ? [{
+      type: 'fallback', text: '当前模型接口不支持图片输入，已自动降级为纯文本继续',
+    }] : []);
+  }
+});
+
+test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重置画布布局', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const get = route => fetch(srv.baseUrl + route, { signal: AbortSignal.timeout(15_000) }).then(res => res.json());
+  const post = (route, body) => fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const jsonPost = (route, body) => post(route, body).then(res => res.json());
+  const root = 'main.c::main';
+  const page = { roots: [root, 'can.c::Can_Init'], up: 0, down: 1 };
+  const layoutRoot = page.roots.join('+');
+  const query = '/api/view?up=0&down=1';
+  const viewUrl = query + '&roots=' + encodeURIComponent(page.roots.join(','));
+  const view = await get(viewUrl);
+  assert.equal((await jsonPost('/api/page', page)).ok, true);
+  assert.ok(view.groups.length && view.containers.length && view.edges.length);
+  const other = view.nodes.find(node => node.name === 'Task_10ms');
+  const anchor = view.nodes.find(node => node.name === 'Can_Init');
+  const liveNodes = view.nodes.map((node, i) => ({
+    id: node.id, name: node.name, kind: node.kind, file: node.file,
+    x: 1000 + i * 250, y: 1000 + i * 150, w: node.w, h: node.h,
+  }));
+  const anchorRect = liveNodes.find(node => node.id === anchor.id);
+  const liveGroups = view.groups.map(({ id, x, y, w, h }) => ({ id, x: x + 500, y, w, h }));
+  const liveContainers = view.containers.map(({ id, x, y, w, h }) => ({ id, x: x + 600, y, w, h }));
+  const canvasLayout = { root, mode: 'group', width: 6000, height: 5000,
+    nodes: liveNodes, groups: liveGroups, containers: liveContainers };
+
+  const requests = [];
+  const steps = [];
+  const outputs = [];
+  const llm = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const request = JSON.parse(Buffer.concat(chunks));
+    requests.push(request);
+    const last = request.messages.at(-1);
+    if (last.role === 'tool') outputs.push(JSON.parse(last.content));
+    const args = steps.shift();
+    const message = args ? { tool_calls: [{
+      id: 'arrange-' + requests.length, type: 'function', function: { name: 'arrange_canvas', arguments: JSON.stringify(args) },
+    }] } : { content: '已完成。' };
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ choices: [{ message }] }));
+  });
+  await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => llm.close(resolve)));
+  const config = { baseUrl: `http://127.0.0.1:${llm.address().port}/v1`, model: 'mock-layout', toolMode: 'tools' };
+  const chat = async (payload = {}) => {
+    const response = await post('/api/ai/chat', { prompt: '查看并调整画布', config, ...payload });
+    const body = await response.text();
+    assert.equal(response.status, 200, body.slice(0, 300));
+    const events = body.trim().split('\n').map(JSON.parse);
+    assert.ok(events.some(event => event.type === 'done'), body.slice(-500));
+    return events;
+  };
+
+  const png = 'data:image/png;base64,' + 'A'.repeat(2_150_000);
+  const jpeg = 'data:image/jpeg;base64,' + 'A'.repeat(2_150_000);
+  await chat({
+    images: ['data:image/gif;base64,AAAA', 'data:image/webp;base64,' + 'A'.repeat(3_000_000),
+      png, { dataUrl: jpeg, label: '画布' }, 'data:image/webp;base64,AAAA'],
+    uiContext: {
+      kind: 'file', path: 'legacy.c',
+      items: [
+        { kind: 'node', id: root, file: 'main.c', line: 42 },
+        { kind: 'node', id: root, name: '重复节点' },
+        { kind: 'node', id: other.id, file: other.file },
+        { kind: 'edge', from: root, to: other.id, labels: [{ text: 'TASK:10ms' }] },
+        { kind: 'file', path: anchor.file },
+        { kind: 'invalid', id: 'ignored' },
+      ],
+    },
+  });
+  const chatMessages = requests[0].messages;
+  assert.deepEqual(chatMessages.at(-1).content.map(part => part.image_url?.url), [undefined, png, jpeg]);
+  const system = chatMessages[0].content;
+  assert.ok(system.includes([
+    '用户当前在画布上选中/暂存的对象（共 4 项）：',
+    `1. 节点 ${root}，main.c:42`,
+    `2. 节点 ${other.id}，${other.file}`,
+    `3. 连线 ${root} → ${other.id}，标签 TASK:10ms`,
+    `4. 文件 ${anchor.file}`,
+  ].join('\n')), system);
+  assert.doesNotMatch(system, /重复节点|legacy\.c|ignored/);
+  assert.ok(requests[0].tools.some(tool => tool.function.name === 'arrange_canvas'));
+
+  const streamSignal = AbortSignal.timeout(30_000);
+  const stream = await fetch(srv.baseUrl + '/api/stream', { signal: streamSignal });
+  const reader = stream.body.getReader();
+  t.after(() => reader.cancel().catch(() => {}));
+  const decoder = new TextDecoder();
+  const initial = await reader.read();
+  assert.match(decoder.decode(initial.value), /retry:/);
+
+  steps.push(
+    { action: 'inspect' },
+    { action: 'move', reason: '移到右边', moves: [
+      { id: 'main', x: 3400, y: 3200 },
+      { id: other.id, relativeTo: anchor.name, placement: 'right', gap: 31 },
+    ] },
+    { action: 'align', nodes: ['main', other.name], axis: 'x', distribute: true, gap: 35 },
+    { action: 'inspect' },
+    { action: 'move', moves: [{ id: other.id, dx: other.w + 35 }] },
+  );
+  const events = await chat({ canvasLayout });
+  const [inspect, move, align, aligned, displaced] = outputs;
+  assert.deepEqual(inspect.nodes.find(node => node.id === anchor.id), anchorRect);
+  assert.deepEqual(inspect.groups, liveGroups);
+  assert.deepEqual(inspect.containers, liveContainers);
+  assert.deepEqual(inspect.canvas, { width: 6000, height: 5000 });
+  assert.deepEqual(inspect.edges, view.edges.map(({ from, to, kind }) => ({ from, to, kind })));
+  assert.deepEqual(move.positions, [{ id: root, x: 3400, y: 3200 },
+    { id: other.id, x: anchorRect.x + anchorRect.w + 31, y: anchorRect.y }]);
+  const [first, second] = align.positions;
+  assert.equal(first.y, 3200);
+  assert.equal(second.y, first.y);
+  assert.equal(second.x - first.x, other.w + 35);
+  for (const { id, x, y } of align.positions) {
+    const actual = aligned.nodes.find(node => node.id === id);
+    assert.deepEqual({ x: actual.x, y: actual.y }, { x, y });
+  }
+  assert.deepEqual(displaced.positions, [{ id: other.id, x: second.x + view.nodes.find(n => n.id === root).w, y: second.y }],
+    '偏移后的目标遇到同一行的节点时沿移动轴避让');
+  assert.ok(events.some(event => event.type === 'tool_end' && /action=align/.test(event.digest)));
+
+  const slot = layoutRoot + '::group';
+  const arranged = await get(viewUrl);
+  const saved = await get('/api/session/export');
+  const writes = saved.events.filter(event => event.op === 'layout.save');
+  assert.equal(writes.length, 3);
+  assert.ok(writes.every(event => event.actor === 'ai' && event.target === slot));
+  for (const { id, x, y } of [second, displaced.positions[0]]) {
+    const stored = saved.overlay.layout[slot].nodes[id];
+    const rendered = arranged.nodes.find(node => node.id === id);
+    assert.deepEqual([stored.x, stored.y], [x, y]);
+    assert.deepEqual([rendered.x, rendered.y], [x, y]);
+  }
+
+  const history = { roots: [anchor.id], up: 0, down: 0 };
+  const { eventId: at } = await jsonPost('/api/view-event', { op: 'view.snapshot', view: history });
+  assert.equal((await jsonPost('/api/page', { ...history, at })).ok, true);
+  steps.push({ action: 'reset', reason: '恢复自动布局' }, { action: 'inspect' });
+  await chat({ canvasLayout: { ...canvasLayout, width: 1 } });
+  const [reset, resetInspect] = outputs.slice(5);
+  assert.equal(reset.updatedWhileReviewing, true);
+  assert.equal(reset.root, layoutRoot);
+  assert.equal(resetInspect.canvas.width, view.width);
+  const cleared = await get('/api/session/export');
+  assert.equal(cleared.overlay.layout[slot], undefined);
+  assert.ok(cleared.events.some(event => event.op === 'layout.clear' && event.actor === 'ai' &&
+    event.target === slot && event.after.reason === '恢复自动布局'));
+  const refreshed = await jsonPost(query, { roots: page.roots, previous: arranged, projectId: view.projectId });
+  assert.deepEqual(refreshed.nodes.map(({ id, x, y }) => ({ id, x, y })), view.nodes.map(({ id, x, y }) => ({ id, x, y })));
+  const movedEvent = writes.find(event => event.after.nodes[other.id]?.x === displaced.positions[0].x);
+  const replayed = await get(`/api/view?at=${movedEvent.id}&useSnapshot=1`);
+  assert.equal(replayed.nodes.find(node => node.id === other.id).x, displaced.positions[0].x);
+
+  let broadcast = '';
+  while ((broadcast.match(/\n\n/g) || []).length < 4) {
+    const { value, done } = await reader.read();
+    assert.equal(done, false);
+    broadcast += decoder.decode(value, { stream: true });
+  }
+  const changes = [...broadcast.matchAll(/^data: (.*)$/gm)].map(([, data]) => JSON.parse(data));
+  const layouts = changes.filter(change => change.op.startsWith('layout.'));
+  assert.deepEqual(layouts.map(change => change.op), ['layout.save', 'layout.save', 'layout.save', 'layout.clear']);
+  assert.ok(layouts.every(change => change.actor === 'ai' && change.projectId === view.projectId));
+});
 
 test('normalizeBaseUrl 兼容根地址、/v1 与完整 /chat/completions，并拒绝非法协议', () => {
   assert.deepEqual(normalizeBaseUrl('http://127.0.0.1:11434'), {
