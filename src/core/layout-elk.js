@@ -1,8 +1,9 @@
 // 应用和评估共用 ELK 的层级分组与四中点端口转换。
 import { createRequire } from 'node:module';
+import { numberedCallLabel } from './labels.js';
 import { periodLabels } from './task-periods.js';
 import { textWidth, routeScore, directoryWhitespace, improveEdgeRoutes, mergeSharedRoutes } from './layout-metrics.js';
-import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from './routing.js';
+import { edgeStyleKey, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody, routeOverlapConflicts } from './routing.js';
 const require = createRequire(import.meta.url);
 const ELK = require('elkjs/lib/elk.bundled.js');
 const elk = new ELK();
@@ -13,10 +14,15 @@ const NODE_GAP = 18;
 const LAYER_GAP = 36;
 const MODEL_ORDER = 'elk.layered.considerModelOrder.strategy';
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}|${e.kind}|${e.change || 'existing'}`;
-const isReverseFlow = (e) => (e.kind === 'var' && e.via === '读') || e.kind === 'df-read';
+const isReverseFlow = (e) => (e.kind === 'var' || e.kind === 'df-read') && e.via === '读';
 const flowSource = (e) => isReverseFlow(e) ? e.to : e.from;
 const flowTarget = (e) => isReverseFlow(e) ? e.from : e.to;
-const callRank = (e) => (e.callNumbers?.length ? parseInt(e.callNumbers[0], 10) : e.orderGroup || e.line) || 0;
+function explicitRank(e) {
+  const raw = e.labels ?? e.label;
+  const label = raw && numberedCallLabel(Array.isArray(raw) ? raw : [raw]);
+  return label ? Number(label.text.trim().slice(4)) : parseInt(e.callNumbers?.[0], 10) || Number(e.orderGroup) || 0;
+}
+const callRank = e => explicitRank(e) || e.line || 0;
 
 function modelOrder(nodes, edges) {
   const incoming = new Map(), callers = new Map(), files = new Map(nodes.map(n => [n.id, n.file]));
@@ -246,56 +252,59 @@ function seedInteractive(graph, previous, initial) {
 }
 
 /** 比较走线、相连节点距离、画布比例与目录间留白。 */
-function quality(view) {
+function quality(view, routed = true) {
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
-  let distSum = 0, edgeCnt = 0;
+  let distSum = 0, projectedWire = 0, edgeCnt = 0;
   for (const e of view.edges) {
     if (e.from === e.to) continue;
     const a = byId.get(e.from), b = byId.get(e.to);
     if (!a || !b) continue;
-    distSum += Math.hypot(a.x + a.w / 2 - (b.x + b.w / 2), a.y + a.h / 2 - (b.y + b.h / 2));
+    const dx = Math.abs(a.x + a.w / 2 - b.x - b.w / 2), dy = Math.abs(a.y + a.h / 2 - b.y - b.h / 2);
+    distSum += Math.hypot(dx, dy);
+    projectedWire += dx + dy + (dx > 0.5 && dy > 0.5 ? NODE_GAP * 2 : 0);
     edgeCnt++;
   }
   const avgDist = edgeCnt ? distSum / edgeCnt : 0;
   const aspect = Math.max(1, view.width) / Math.max(1, view.height);
-  return routeScore(view.edges) +
+  return (routed ? routeScore(view.edges) : projectedWire / 50) +
     140 * Math.log(aspect) ** 2 + Math.sqrt(view.width * view.height) / 40 + avgDist * 0.22 +
     Math.sqrt(directoryWhitespace(view)) * 0.25;
 }
 
-function validLayout(view) {
-  const overlap = (a, b) => Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 0.5 &&
-    Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 0.5;
+export function validLayout(view) {
+  const overlap = (a, b) => Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x) > 1e-6 &&
+    Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y) > 1e-6;
   for (let i = 0; i < view.nodes.length; i++) for (let j = i + 1; j < view.nodes.length; j++) {
     if (overlap(view.nodes[i], view.nodes[j])) return false;
   }
   const boxes = [...view.groups, ...view.containers];
   for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
-    if (!boxes[i].id.startsWith(boxes[j].id + '/') && !boxes[j].id.startsWith(boxes[i].id + '/') &&
+    if (!boxes[i].root && !boxes[j].root && !boxes[i].id.startsWith(boxes[j].id + '/') && !boxes[j].id.startsWith(boxes[i].id + '/') &&
         overlap(boxes[i], boxes[j])) return false;
   }
-  const inside = (child, parent) => child.x >= parent.x - 1 && child.y >= parent.y - 1 &&
-    child.x + child.w <= parent.x + parent.w + 1 && child.y + child.h <= parent.y + parent.h + 1;
+  const inside = (child, parent) => child.x > parent.x && child.y > parent.y &&
+    child.x + child.w < parent.x + parent.w && child.y + child.h < parent.y + parent.h;
   const groupById = new Map(view.groups.map((g) => [g.id, g]));
   for (const n of view.nodes) {
-    if (!n.group) continue;
+    if (!n.group && !view.groups.length) continue;
     const g = groupById.get(n.group);
     if (!g || !inside(n, g)) return false;
   }
   const boxById = new Map(boxes.map((b) => [b.id, b]));
   for (const b of boxes) {
     const slash = b.id.lastIndexOf('/');
-    if (slash > 0) {
-      const parent = boxById.get(b.id.slice(0, slash));
-      if (parent && !inside(b, parent)) return false;
+    if (!b.root && (slash > 0 || boxById.has(''))) {
+      const parent = boxById.get(slash > 0 ? b.id.slice(0, slash) : '');
+      if (!parent || !inside(b, parent)) return false;
     }
   }
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   const onPort = (n, p) => n && p && [[n.x + n.w / 2, n.y], [n.x + n.w / 2, n.y + n.h],
-    [n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.5);
+    [n.x, n.y + n.h / 2], [n.x + n.w, n.y + n.h / 2]].some((q) => Math.hypot(q[0] - p[0], q[1] - p[1]) < 1e-6);
   return view.edges.every((e) => {
     const pts = e.points;
-    if (!pts || pts.length < 2) return false;
+    if (!pts || pts.length < 2 || pts.some(([x, y], i) => !Number.isFinite(x) || !Number.isFinite(y) ||
+        (i && Math.abs(x - pts[i-1][0]) > 1e-6 && Math.abs(y - pts[i-1][1]) > 1e-6))) return false;
     if (!onPort(byId.get(e.from), pts[0]) || !onPort(byId.get(e.to), pts.at(-1))) return false;
     if (e.from === e.to) {
       if (Math.hypot(pts[0][0] - pts.at(-1)[0], pts[0][1] - pts.at(-1)[1]) <= 0.5) return false;
@@ -306,40 +315,82 @@ function validLayout(view) {
   });
 }
 
+// 端点所属框及其祖先允许进出。每对文件只构造一次兄弟框障碍，需绕行的同组边一起布线。
+function avoidSiblingBoxes(view, subset = view.edges) {
+  const boxes = [...view.groups, ...view.containers].filter(b => !b.root);
+  const conflicts = routeOverlapConflicts(view.edges, { differentStylesOnly: true }).byEdge;
+  if (!conflicts.size && boxes.length < 2) return;
+  const nodes = new Map(view.nodes.map(n => [n.id, n]));
+  const pairs = new Map();
+  for (const edge of subset) {
+    if (edge.custom || !edge.points?.length) continue;
+    const a = nodes.get(edge.from).group, b = nodes.get(edge.to).group;
+    const key = JSON.stringify(a < b ? [a,b] : [b,a]);
+    if (!pairs.has(key)) {
+      const owns = id => [a,b].some(group => group === id || group?.startsWith(id + '/'));
+      const obstacles = boxes.filter(box => {
+        const slash = box.id.lastIndexOf('/');
+        return !owns(box.id) && (slash < 0 || owns(box.id.slice(0, slash)));
+      });
+      pairs.set(key, { a, b, obstacles, edges: [] });
+    }
+    const pair = pairs.get(key);
+    if (conflicts.has(edge) || pair.obstacles.some(box => pathCrossesBody(edge.points, box))) pair.edges.push(edge);
+  }
+  const groupDirections = new Map(view.groups.map(g => [g.id, g.layoutDirection]));
+  for (const { a, b, obstacles, edges } of pairs.values()) {
+    if (!edges.length) continue;
+    const trials = edges.map(e => ({ ...e }));
+    const batch = new Set(edges);
+    const inside = view.nodes.filter(n => !boxes.length || n.group === a || n.group === b);
+    routeEdges([...inside, ...obstacles.map(box => ({ ...box, id: Symbol(box.id) }))], trials,
+      { layoutDirection: view.layoutDirection, groupDirections, optimizeFaces: true, searchGaps: true,
+        existing: collectSegments(view.edges.filter(e => !batch.has(e))) });
+    trials.forEach((trial, i) => { if (!trial.blocked) edges[i].points = trial.points; });
+  }
+}
+
+function finishRoutes(view, subset = view.edges) {
+  avoidSiblingBoxes(view, subset);
+  mergeSharedRoutes(view, subset);
+  const conflicts = () => routeOverlapConflicts(view.edges, { differentStylesOnly: true }).byEdge;
+  let remaining = conflicts();
+  if (!remaining.size) return;
+  // 当不同文件对争用同一端口时，固定其余边单独重试，只接受异色重合长度下降的路线。
+  for (const e of subset.filter(e => remaining.has(e)).sort((a, b) => remaining.get(b) - remaining.get(a))) {
+    if (!remaining.has(e)) continue;
+    const before = e.points;
+    avoidSiblingBoxes(view, [e]);
+    const next = conflicts();
+    if ((next.get(e) || 0) < remaining.get(e)) remaining = next;
+    else e.points = before;
+  }
+}
+
 function finalizeCandidate(view) {
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   improveEdgeRoutes(view, view.edges, (e) => byId.get(e.from)?.file !== byId.get(e.to)?.file);
-  mergeSharedRoutes(view);
-  return view;
+  finishRoutes(view);
+  return fitRoutedBounds(view);
 }
 
 /** 保护基准布局已成立的同级显式调用顺序与跨顶层容器数据流向。 */
 function preservesSemanticOrder(baseline, candidate, edges) {
   const posMap = (view, axis) => new Map(view.nodes.map((n) => [n.id, n[axis]]));
-  const topBoxOf = (n) => (n?.file || 'unknown').split('/')[0];
   const nodeById = new Map(baseline.nodes.map((n) => [n.id, n]));
   const baseCross = posMap(baseline, baseline.layoutDirection === 'RIGHT' ? 'y' : 'x');
   const candCross = posMap(candidate, candidate.layoutDirection === 'RIGHT' ? 'y' : 'x');
   const byCaller = new Map();
   for (const e of edges) {
     if (e.from === e.to || e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
-    if (!e.callNumbers?.length && !e.orderGroup) continue;
-    let rec = byCaller.get(e.from);
-    if (!rec) { rec = { targets: new Map(), explicit: false }; byCaller.set(e.from, rec); }
-    if (e.callNumbers?.length) rec.explicit = true;
-    const prev = rec.targets.get(e.to);
-    const rank = callRank(e);
-    if (prev === undefined || rank < prev) rec.targets.set(e.to, rank);
+    if (!explicitRank(e)) continue;
+    if (!byCaller.has(e.from)) byCaller.set(e.from, new Map());
+    const targets = byCaller.get(e.from);
+    targets.set(e.to, Math.min(targets.get(e.to) ?? Infinity, callRank(e)));
   }
-  const hasDirs = (candidate.containers || []).length > 0;
-  for (const { targets, explicit } of byCaller.values()) {
+  for (const targets of byCaller.values()) {
     if (targets.size < 2) continue;
     const ordered = [...targets.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
-    const sameFile = new Set(ordered.map((id) => nodeById.get(id)?.file)).size === 1;
-    const distinctTop = new Set(ordered.map((id) => topBoxOf(nodeById.get(id)))).size === ordered.length;
-    const shouldCheck = (sameFile && explicit) || (!hasDirs && (sameFile || distinctTop) &&
-      ordered.every((id) => !(nodeById.get(id)?.file || '').includes('/')));
-    if (!shouldCheck) continue;
     const mono = (pos) => ordered.every((id, i) => !i || pos.get(ordered[i - 1]) < pos.get(id));
     if (mono(baseCross) && !mono(candCross)) return false;
   }
@@ -360,22 +411,21 @@ function preservesSemanticOrder(baseline, candidate, edges) {
       if (!writers.has(e.to)) writers.set(e.to, []);
       writers.get(e.to).push(e.from);
     } else if (e.kind === 'df-read') {
-      if (!readers.has(e.from)) readers.set(e.from, []);
-      readers.get(e.from).push(e.to);
+      const variable = flowSource(e);
+      if (!readers.has(variable)) readers.set(variable, []);
+      readers.get(variable).push(flowTarget(e));
     }
   }
-  if (!hasDirs) {
-    for (const [varId, ws] of writers) {
-      const rs = readers.get(varId);
-      if (!rs) continue;
-      const vTop = topBoxOf(nodeById.get(varId));
-      for (const w of ws) for (const r of rs) {
-        if (w === r) continue;
-        const wTop = topBoxOf(nodeById.get(w)), rTop = topBoxOf(nodeById.get(r));
-        if (wTop === vTop || vTop === rTop || wTop === rTop) continue;
-        if (baseMain.get(w) < baseMain.get(varId) && baseMain.get(varId) < baseMain.get(r)) {
-          if (!(candMain.get(w) < candMain.get(varId) && candMain.get(varId) < candMain.get(r))) return false;
-        }
+  for (const [varId, ws] of writers) {
+    const rs = readers.get(varId);
+    if (!rs) continue;
+    for (const w of ws) for (const r of rs) {
+      if (w === r) continue;
+      // 同一模块的访问可在调用链侧翼表达，三个不同模块的写→变量→读仍沿主流向。
+      const files = [w, varId, r].map(id => nodeById.get(id)?.file || 'unknown');
+      if (new Set(files).size !== 3) continue;
+      if (baseMain.get(w) < baseMain.get(varId) && baseMain.get(varId) < baseMain.get(r)) {
+        if (!(candMain.get(w) < candMain.get(varId) && candMain.get(varId) < candMain.get(r))) return false;
       }
     }
   }
@@ -464,8 +514,108 @@ function reusePeriodPositions(box, previousNodes, previousGroups) {
   }
 }
 
-async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false, period = null, previous = null }) {
+// 在四个相邻通道中试排。每条轨道按访问重心排序，前推再回压以满足间距和边界。
+function placeStateWing(box, states, peers, external, origin, pad) {
+  const base = box.functionBox;
+  const local = new Map(box.leafNodes.filter(n => base.pos.has(n.id)).map(n => {
+    const p = base.pos.get(n.id);
+    return [n.id, [p.x + n.w / 2, p.y + n.h / 2]];
+  }));
+  const access = states.map(n => (peers.get(n.id) || []).flatMap(id => {
+    if (local.has(id)) return [{ xy: local.get(id), local: true }];
+    const p = external?.get(id);
+    return p ? [{ xy: [p.x - origin.x, p.y - origin.y], local: false }] : [];
+  }));
+  const pack = (side, members) => {
+    const horizontal = side === 'bottom' || side === 'top';
+    const axis = horizontal ? 0 : 1, cross = 1 - axis;
+    const size = horizontal ? 'w' : 'h', thickness = horizontal ? 'h' : 'w';
+    const start = horizontal ? pad : TOP_PADDING;
+    const extent = Math.max(base[size] - start - pad, ...members.map(i => states[i][size]),
+      Math.sqrt(members.reduce((area, i) => area + (states[i].w + NODE_GAP) * (states[i].h + NODE_GAP), 0)));
+    const items = members.map(i => ({ n: states[i], i, center: access[i].length
+      ? access[i].reduce((sum, a) => sum + a.xy[axis], 0) / access[i].length : start + extent / 2 }))
+      .sort((a, b) => a.center - b.center);
+    const rows = [];
+    let used = 0;
+    for (const item of items) {
+      if (!rows.length || used + item.n[size] > extent) { rows.push([]); used = 0; }
+      rows.at(-1).push(item);
+      used += item.n[size] + NODE_GAP;
+    }
+    const shift = [0, 0];
+    const depth = rows.reduce((d, row) => d + NODE_GAP + Math.max(...row.map(it => it.n[thickness])), 0);
+    const before = side === 'left' || side === 'top';
+    if (before) shift[cross] = depth;
+    const dims = [base.w, base.h];
+    dims[axis] = Math.max(dims[axis], extent + start + pad);
+    dims[cross] += depth;
+    let offset = before ? (horizontal ? TOP_PADDING : pad) : base[thickness] - pad + NODE_GAP;
+    const positions = new Map();
+    for (const row of rows) {
+      let low = start;
+      for (const item of row) {
+        item.at = Math.max(low, Math.round(item.center - item.n[size] / 2));
+        low = item.at + item.n[size] + NODE_GAP;
+      }
+      let high = start + extent;
+      for (const it of row.slice().reverse()) {
+        const at = Math.min(it.at, high - it.n[size]);
+        high = at - NODE_GAP;
+        const x = horizontal ? at : offset, y = horizontal ? offset : at;
+        positions.set(it.n.id, { x, y });
+      }
+      offset += Math.max(...row.map(it => it.n[thickness])) + NODE_GAP;
+    }
+    return { positions, dims, shift };
+  };
+  let best;
+  const consider = ({ positions, dims, shift }) => {
+    let wire = 0;
+    for (const [i, n] of states.entries()) {
+      const p = positions.get(n.id);
+      for (const peer of access[i]) {
+        wire += Math.abs(p.x + n.w / 2 - peer.xy[0] - (peer.local ? shift[0] : 0)) +
+          Math.abs(p.y + n.h / 2 - peer.xy[1] - (peer.local ? shift[1] : 0));
+      }
+    }
+    const score = wire + Math.sqrt(dims[0] * dims[1]) + 20 * Math.abs(Math.log(dims[0] / dims[1]));
+    if (!best || score < best.score) best = { score, positions, dims, shift };
+  };
+  const indices = [...states.keys()];
+  for (const side of ['bottom', 'right', 'top', 'left']) consider(pack(side, indices));
+  // 访问者位于函数块两端时也比较双侧通道。两条对侧通道分属互不相交的半平面。
+  for (const axis of [0, 1]) {
+    const size = axis === 0 ? base.w : base.h;
+    const before = [], after = [];
+    for (const i of indices) {
+      const links = access[i];
+      const center = links.length ? links.reduce((sum, p) => sum + p.xy[axis], 0) / links.length : size / 2;
+      (center < size / 2 ? before : after).push(i);
+    }
+    if (!before.length || !after.length) continue;
+    const first = pack(axis ? 'top' : 'left', before);
+    const second = pack(axis ? 'bottom' : 'right', after);
+    for (const [id, p] of second.positions) {
+      first.positions.set(id, { x: p.x + first.shift[0], y: p.y + first.shift[1] });
+    }
+    first.dims[axis] += second.dims[axis] - size;
+    first.dims[1 - axis] = Math.max(first.dims[1 - axis], second.dims[1 - axis]);
+    consider(first);
+  }
+  box.relPos = best.positions;
+  for (const [id, p] of base.pos) box.relPos.set(id, { x: p.x + best.shift[0], y: p.y + best.shift[1] });
+  [box.w, box.h] = best.dims;
+}
+
+async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packMain = false, period = null, previous = null, cache = new Map(), deferRouting = false }) {
   const order = modelOrder(sized, edges);
+  const peers = new Map(sized.map(n => [n.id, []]));
+  for (const e of edges) {
+    if (e.from === e.to) continue;
+    peers.get(e.from).push(e.to);
+    peers.get(e.to).push(e.from);
+  }
   const root = { id: '', label: '', children: new Map(), leafNodes: [] };
   let boxCount = 0;
   for (const n of sized) {
@@ -481,7 +631,10 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     }
     cur.leafNodes.push(n);
   }
-  if (!period && boxCount < 2 && sized.length <= 120 && !sized.some(n => n.kind === 'var')) return null;
+  if (!period && boxCount < 2 && sized.length <= 120 && !sized.some(n => n.kind === 'var')) {
+    const broad = sized.length >= 6 && (!edges.length || [...peers.values()].some(list => new Set(list).size >= 5));
+    if (!broad) return null;
+  }
   // 单子目录只是外层包装，主方向应在第一个有兄弟框的目录生效。
   let mainBox = root;
   while (mainBox.children.size === 1 && !mainBox.leafNodes.length) {
@@ -490,9 +643,9 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
     mainBox = child;
   }
   // 多个并列目录可以沿两轴摆放，避免层级链占满整个主轴。
-  if (packMain && (mainBox.children.size < 3 || (sized.length <= 120 && [...mainBox.children.values()].some(child => child.fileGroup)))) return null;
+  if (packMain && mainBox.children.size < 3) return null;
 
-  async function layoutBox(box, depth, dirOverride = null, hints = null) {
+  async function layoutBox(box, depth, dirOverride = null) {
     const childItems = [];
     for (const child of box.children.values()) {
       childItems.push({ id: 'box:' + child.id, isBox: true, ref: child, width: child.w, height: child.h, ord: child.minOrd });
@@ -525,9 +678,9 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
       else { prev.count++; prev.rank = Math.min(prev.rank, rank); }
     }
 
-    if (hints) childItems.sort((a, b) => (hints.get(a.id) ?? 0) - (hints.get(b.id) ?? 0) || a.ord - b.ord);
-    else childItems.sort((a, b) => a.ord - b.ord);
+    childItems.sort((a, b) => a.ord - b.ord);
 
+    const hybrid = fileDir === 'AUTO';
     const isRoot = depth === 0;
     const sidePad = isRoot ? ROOT_PAD : 14;
     const direction = box.fileGroup ? (fileDir === 'AUTO' ? rootDir : fileDir) : box === mainBox ? rootDir : dirDir;
@@ -555,18 +708,64 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
       return;
     }
     const pad = isRoot ? `[top=${TOP_PADDING},left=${ROOT_PAD},bottom=${ROOT_PAD},right=${ROOT_PAD}]` : `[top=${TOP_PADDING},left=14,bottom=14,right=14]`;
-    const gap = box.fileGroup ? 16 : 30;
-    const layerGap = box.fileGroup ? 28 : 44;
+    const gap = box.fileGroup ? 16 : hybrid ? 20 : 30;
+    // 同一外部调用者显式编号的一组孤立目标需要共用一层，避免矩形装箱把顺序折到下一行。
+    if (!period && agg.size === 0 && !states.length) {
+      const calls = new Map();
+      for (const e of edges) {
+        const target = memberOf.get(e.to), rank = explicitRank(e);
+        if (!target || !rank || memberOf.has(e.from) || e.kind === 'var' || e.kind?.startsWith('df-')) continue;
+        if (!calls.has(e.from)) calls.set(e.from, new Map());
+        const ranks = calls.get(e.from);
+        ranks.set(target, Math.min(rank, ranks.get(target) ?? Infinity));
+      }
+      const before = new Map(childItems.map(c => [c.id, new Set()]));
+      for (const ranks of calls.values()) {
+        let previous = [], current = [], rank;
+        for (const [id, next] of [...ranks].sort((a, b) => a[1] - b[1])) {
+          if (rank !== next) { previous = current; current = []; rank = next; }
+          for (const prior of previous) before.get(id).add(prior);
+          current.push(id);
+        }
+      }
+      if ([...before.values()].some(set => set.size)) {
+        const remaining = new Set(childItems);
+        const sequence = [];
+        while (remaining.size) {
+          const next = [...remaining].find(c => !before.get(c.id).size);
+          if (!next) break;
+          sequence.push(next);
+          remaining.delete(next);
+          for (const prior of before.values()) prior.delete(next.id);
+        }
+        childItems.splice(0, childItems.length, ...sequence, ...remaining);
+        const horizontal = rootDir === 'RIGHT';
+        let x = sidePad, y = TOP_PADDING;
+        box.relPos = new Map();
+        for (const item of childItems) {
+          box.relPos.set(item.id, { x, y });
+          if (horizontal) y += item.height + gap;
+          else x += item.width + gap;
+        }
+        box.w = horizontal ? Math.max(...childItems.map(c => c.width)) + 2 * sidePad : x - gap + sidePad;
+        box.h = horizontal ? y - gap + sidePad : Math.max(...childItems.map(c => c.height)) + TOP_PADDING + sidePad;
+        box.usedDir = rootDir;
+        return;
+      }
+    }
+    const serialLayer = !period && box.fileGroup && agg.size && new Set([...agg.values()].map(e => e.s)).size === agg.size &&
+      new Set([...agg.values()].map(e => e.t)).size === agg.size;
+    const layerGap = box.fileGroup ? (serialLayer ? 20 : 28) : hybrid ? 30 : 44;
     const pack = packMain && box === mainBox;
 
-    const runDir = async (dir) => {
-      if (agg.size === 0 || pack) {
+    const solve = async (dir, packed) => {
+      if (packed) {
         return elk.layout({
           id: 'g:' + box.id,
           layoutOptions: {
             'elk.algorithm': 'rectpacking',
             'elk.padding': pad,
-            'elk.spacing.nodeNode': String(box.fileGroup ? gap : LAYER_GAP),
+            'elk.spacing.nodeNode': String(hybrid ? gap : box.fileGroup ? gap : LAYER_GAP),
             'elk.aspectRatio': '1.15',
           },
           children: childItems.map((it) => ({ id: it.id, width: it.width, height: it.height })),
@@ -587,7 +786,7 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
           'elk.layered.compaction.postCompaction.strategy': 'EDGE_LENGTH',
           'elk.layered.compaction.connectedComponents': 'true',
           'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
-          'elk.layered.considerModelOrder.strategy': hints ? 'PREFER_NODES' : 'NODES_AND_EDGES',
+          'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
           'elk.layered.thoroughness': '7',
           'elk.randomSeed': '1',
         },
@@ -599,37 +798,80 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
       });
     };
 
+    const signature = JSON.stringify([sidePad, gap, layerGap, box.fileGroup, childItems.map(c => [c.id, c.width, c.height]), [...agg.values()]]);
+    const run = (dir, packed) => {
+      const key = (packed ? 'grid' : dir) + signature;
+      if (!cache.has(key)) cache.set(key, solve(dir, packed));
+      return cache.get(key);
+    };
     let usedDir = dirOverride || direction;
-    let best = await runDir(usedDir);
-    if (!dirOverride && box.fileGroup && fileDir === 'AUTO' && agg.size) {
-      const extreme = Math.max(best.width / best.height, best.height / best.width) > 2.6;
-      const preserveDirection = edges.some(e => {
-        if (e.from === e.to || e.kind === 'var' || e.kind?.startsWith('df-') || e.kind === 'dataflow') return false;
-        const source = memberOf.has(e.from), target = memberOf.has(e.to);
-        return (source && target) || (!extreme && (source || target));
-      });
-      if (!preserveDirection) {
-        const other = direction === 'RIGHT' ? 'DOWN' : 'RIGHT', alt = await runDir(other);
-        if (Math.abs(Math.log(alt.width / alt.height)) < Math.abs(Math.log(best.width / best.height))) {
-          best = alt;
-          usedDir = other;
+    let best = await run(usedDir, !agg.size || pack);
+    if (hybrid && !dirOverride && agg.size && !pack && box !== mainBox) {
+      const other = direction === 'RIGHT' ? 'DOWN' : 'RIGHT';
+      // 投影到本层的真实边同时反映链深、扇出和文件之间的访问频率。
+      // 父层水平组合时偏好窄框；父层垂直组合时偏好宽框。
+      const target = (box.fileGroup ? rootDir : direction) === 'RIGHT' ? 0.85 : 1.65;
+      const localStates = new Set(states.map(n => n.id));
+      const boundary = [];
+      for (const e of edges) {
+        if (localStates.has(e.from) || localStates.has(e.to)) continue;
+        const source = memberOf.get(flowSource(e)), target = memberOf.get(flowTarget(e));
+        if (source && !target) boundary.push({ id: source, incoming: false });
+        if (!source && target) boundary.push({ id: target, incoming: true });
+      }
+      const localCost = result => {
+        const centers = new Map(result.children.map(c => [c.id, [c.x + c.width/2, c.y + c.height/2]]));
+        let wire = 0, count = 0;
+        for (const { s, t, count: weight } of agg.values()) {
+          const a = centers.get(s), b = centers.get(t);
+          wire += weight * (Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]));
+          count += weight;
         }
+        const axis = rootDir === 'RIGHT' ? 0 : 1, span = axis ? result.height : result.width;
+        const access = boundary.reduce((sum, port) => {
+          const coordinate = centers.get(port.id)[axis];
+          return sum + (port.incoming ? coordinate : span - coordinate);
+        }, 0);
+        return (wire + 0.5 * access) / (count + 0.5 * boundary.length) + Math.sqrt(result.width * result.height) * 0.25 +
+          65 * Math.log(result.width / result.height / target) ** 2;
+      };
+      const alt = await run(other, false);
+      if (localCost(alt) < localCost(best)) { best = alt; usedDir = other; }
+      // 星形图单独保留调用者所在的层，只折叠对面的兄弟节点。
+      const sources = new Set([...agg.values()].map(e => e.s)), targets = new Set([...agg.values()].map(e => e.t));
+      if (childItems.length >= 6 && (sources.size === 1 || targets.size === 1)) {
+        const fanout = sources.size === 1;
+        const hub = fanout ? sources.values().next().value : targets.values().next().value;
+        const grid = await run(usedDir, true);
+        const branches = grid.children.filter(c => c.id !== hub);
+        const center = grid.children.find(c => c.id === hub);
+        const left = Math.min(...branches.map(c => c.x)), top = Math.min(...branches.map(c => c.y));
+        const w = Math.max(...branches.map(c => c.x + c.width)) - left, h = Math.max(...branches.map(c => c.y + c.height)) - top;
+        for (const dir of ['RIGHT', 'DOWN']) {
+          const horizontal = dir === 'RIGHT';
+          const width = horizontal ? w + layerGap + center.width : Math.max(w, center.width);
+          const height = horizontal ? Math.max(h, center.height) : h + layerGap + center.height;
+          const x = horizontal ? (fanout ? center.width + layerGap : 0) : (width - w)/2;
+          const y = horizontal ? (height - h)/2 : (fanout ? center.height + layerGap : 0);
+          const children = branches.map(c => ({ ...c, x: sidePad + x + c.x - left, y: TOP_PADDING + y + c.y - top }));
+          children.push({ ...center,
+            x: sidePad + (horizontal ? (fanout ? 0 : w + layerGap) : (width - center.width)/2),
+            y: TOP_PADDING + (horizontal ? (height - center.height)/2 : (fanout ? 0 : h + layerGap)) });
+          const wrapped = { width: width + 2 * sidePad, height: height + TOP_PADDING + sidePad, children };
+          if (localCost(wrapped) < localCost(best)) { best = wrapped; usedDir = dir; }
+        }
+      } else if (childItems.length >= 6 && agg.size * 2 < childItems.length) {
+        const grid = await run(usedDir, true);
+        if (localCost(grid) < localCost(best)) best = grid;
       }
     }
     box.w = best.width;
     box.h = best.height;
-    box.relPos = new Map(best.children.map((c) => [c.id, { x: c.x, y: c.y }]));
+    box.relPos = new Map(best.children.map(c => [c.id, { x: c.x, y: c.y }]));
     if (states.length) {
-      let x = sidePad, y = box.h + NODE_GAP, rowH = 0;
-      const width = Math.max(box.w, Math.sqrt(states.reduce((area, n) => area + (n.w + NODE_GAP) * (n.h + NODE_GAP), 0)));
-      for (const n of states) {
-        if (x > sidePad && x + n.w + sidePad > width) { x = sidePad; y += rowH + NODE_GAP; rowH = 0; }
-        box.relPos.set(n.id, { x, y });
-        box.w = Math.max(box.w, x + n.w + sidePad);
-        x += n.w + NODE_GAP;
-        rowH = Math.max(rowH, n.h);
-      }
-      box.h = y + rowH + sidePad;
+      box.states = states;
+      box.functionBox = { pos: box.relPos, w: box.w, h: box.h };
+      placeStateWing(box, states, peers, null, null, sidePad);
     }
     if (pack && agg.size) {
       // 网格没有固定主轴，用调用最多的目录对确定流向。
@@ -652,11 +894,14 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
   }
   await pass1(root, 0);
 
-  const absPos = new Map();
+  const absPos = new Map(), origins = new Map();
   const computeAbs = (box, ox, oy) => {
+    origins.set(box.id, { x: ox, y: oy });
+    box.members = box.leafNodes.map(n => n.id);
     for (const child of box.children.values()) {
       const p = box.relPos.get('box:' + child.id);
       computeAbs(child, ox + p.x, oy + p.y);
+      box.members.push(...child.members);
     }
     for (const n of box.leafNodes) {
       const p = box.relPos.get(n.id);
@@ -668,90 +913,122 @@ async function bottomUpCandidate(sized, edges, { rootDir, dirDir, fileDir, packM
   async function pass2(box, depth) {
     const prevW = box.w, prevH = box.h;
     const childChanged = (await Promise.all([...box.children.values()].map((child) => pass2(child, depth + 1)))).some(Boolean);
-    if (box.fileGroup && box.leafNodes.length > 1) {
-      const ids = new Set(box.leafNodes.map((n) => n.id));
-      const intraOrder = new Map();
+    if (childChanged) await layoutBox(box, depth, box.usedDir);
+    if (box.states) {
+      placeStateWing(box, box.states, peers, absPos, origins.get(box.id), 14);
+    } else {
+      // 固定每个子项的层，沿横切轴对齐真实端点。边界取当前框内剩余空间，
+      // 与主轴投影重叠的兄弟限制可移动区间，因此不会挤进邻框。
+      const vertical = box.usedDir === 'DOWN';
+      const [main, size, cross, breadth] = vertical ? ['y','h','x','w'] : ['x','w','y','h'];
+      const children = [...box.children.values()].map(c => ({ id: 'box:' + c.id, w: c.w, h: c.h, ids: c.members }));
+      children.push(...box.leafNodes.map(n => ({ id: n.id, w: n.w, h: n.h, ids: [n.id] })));
+      const owner = new Map(children.flatMap(c => c.ids.map(id => [id, c.id])));
+      const ordered = new Map();
       for (const e of edges) {
-        if (!ids.has(e.to) || e.from === e.to) continue;
-        if (e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) continue;
-        if (!e.callNumbers?.length && !e.orderGroup) continue;
-        if (!intraOrder.has(e.from)) intraOrder.set(e.from, new Set());
-        intraOrder.get(e.from).add(e.to);
+        if (!owner.has(e.to) || !explicitRank(e)) continue;
+        if (!ordered.has(e.from)) ordered.set(e.from, new Set());
+        ordered.get(e.from).add(owner.get(e.to));
       }
-      const hasExplicitOrder = [...intraOrder.values()].some((targets) => targets.size >= 2);
-      if (!hasExplicitOrder) {
-        const vertical = box.usedDir === 'DOWN';
-        const hints = new Map();
-        let hasExternal = false;
-        for (const n of box.leafNodes) {
-          let sum = 0, cnt = 0;
-          for (const e of edges) {
-            const peer = e.from === n.id ? e.to : e.to === n.id ? e.from : null;
-            if (!peer || ids.has(peer)) continue;
-            const pt = absPos.get(peer);
-            if (pt) { sum += vertical ? pt.x : pt.y; cnt++; hasExternal = true; }
+      if (children.length > 1 && ![...ordered.values()].some(set => set.size > 1)) {
+        for (const c of children) {
+          c.pos = box.relPos.get(c.id);
+          let dx = 0, dy = 0, count = 0;
+          c.anchors = [];
+          for (const id of c.ids) for (const peer of peers.get(id)) {
+            if (owner.get(peer) === c.id) continue;
+            const self = absPos.get(id), p = absPos.get(peer);
+            c.anchors.push(c.pos[cross] + p[cross] - self[cross]);
+            dx += p.x - self.x;
+            dy += p.y - self.y;
+            count++;
           }
-          const self = absPos.get(n.id);
-          hints.set(n.id, cnt ? sum / cnt : (vertical ? self.x : self.y));
+          c.weight = count;
+          c.goal = { x: c.pos.x + dx / (count || 1), y: c.pos.y + dy / (count || 1) };
         }
-        if (hasExternal) await layoutBox(box, depth, box.usedDir, hints);
+        // 同尺寸槽位可以交换。纯变量框可同时沿两轴匹配外部读写重心。
+        const varsOnly = box.fileGroup && box.leafNodes.every(n => n.kind === 'var');
+        const cost = (c, pos) => varsOnly
+          ? c.weight * ((pos.x - c.goal.x) ** 2 + (pos.y - c.goal.y) ** 2)
+          : c.weight * Math.abs(pos[cross] - c.goal[cross]);
+        for (let i = 0; i < children.length; i++) for (let j = i+1; j < children.length; j++) {
+          const a = children[i], b = children[j];
+          if (a.w !== b.w || a.h !== b.h || (!varsOnly && a.pos[main] !== b.pos[main])) continue;
+          if (cost(a, b.pos) + cost(b, a.pos) >= cost(a, a.pos) + cost(b, b.pos)) continue;
+          [a.pos, b.pos] = [b.pos, a.pos];
+          box.relPos.set(a.id, a.pos);
+          box.relPos.set(b.id, b.pos);
+        }
+        const pad = depth === 0 ? ROOT_PAD : 14;
+        for (const c of children) {
+          if (!c.weight) continue;
+          let lo = vertical ? pad : TOP_PADDING, hi = box[breadth] - pad - c[breadth];
+          for (const other of children) {
+            if (c === other || c.pos[main] + c[size] <= other.pos[main] || other.pos[main] + other[size] <= c.pos[main]) continue;
+            if (other.pos[cross] < c.pos[cross]) lo = Math.max(lo, other.pos[cross] + other[breadth] + NODE_GAP);
+            else hi = Math.min(hi, other.pos[cross] - c[breadth] - NODE_GAP);
+          }
+          if (lo > hi) continue;
+          // 重心给出对齐建议，中位数最小化曼哈顿距离。保留已直连的端口可省去两个弯。
+          c.anchors.sort((a, b) => a - b);
+          const costAt = x => c.anchors.reduce((sum, a) => sum + Math.abs(a - x) + (Math.abs(a - x) > 1e-6 ? NODE_GAP : 0), 0);
+          let bestCost = costAt(c.pos[cross]);
+          for (const at of [c.goal[cross], c.anchors[Math.floor(c.anchors.length / 2)]]) {
+            const x = Math.max(lo, Math.min(hi, at)), cost = costAt(x);
+            if (cost < bestCost - 1e-6) { c.pos[cross] = x; bestCost = cost; }
+          }
+        }
       }
-    } else if (!box.fileGroup && childChanged) {
-      await layoutBox(box, depth, box.usedDir);
     }
     return Math.abs(box.w - prevW) > 0.5 || Math.abs(box.h - prevH) > 0.5;
   }
-  if (edges.length && sized.length <= 120 && !period) await pass2(root, 0);
+  if (edges.length && fileDir === 'AUTO' && !period) await pass2(root, 0);
 
   const view = { nodes: [], groups: [], containers: [], width: root.w, height: root.h,
-    layoutDirection: packMain && fileDir === 'AUTO' ? mainBox.usedDir : rootDir };
+    layoutDirection: mainBox.children.size === 1 ? mainBox.children.values().next().value.usedDir :
+      packMain && fileDir === 'AUTO' ? mainBox.usedDir : rootDir };
   const flatten = (box, ox, oy, depth) => {
     for (const child of box.children.values()) {
       const p = box.relPos.get('box:' + child.id);
       const x = ox + p.x, y = oy + p.y;
-      const entry = { id: child.id, label: child.label, x, y, w: child.w, h: child.h, depth, ...period?.boxes.get(child.id) };
+      const entry = { id: child.id, label: child.label, x, y, w: child.w, h: child.h, depth, ...(fileDir === 'AUTO' && { layoutDirection: child.usedDir }), ...period?.boxes.get(child.id) };
       (child.fileGroup ? view.groups : view.containers).push(entry);
       flatten(child, x, y, depth + 1);
     }
     for (const n of box.leafNodes) {
       const p = box.relPos.get(n.id);
-      view.nodes.push({ ...n, x: ox + p.x, y: oy + p.y, group: box.id });
+      view.nodes.push({ ...n, x: ox + p.x, y: oy + p.y, group: box.id,
+        ...(fileDir === 'AUTO' && { layoutDirection: box.usedDir }) });
     }
   };
   flatten(root, 0, 0, 1);
   if (period) view.containers.sort((a, b) => a.y - b.y);
 
+  view.edges = edges;
+  return deferRouting ? view : routeCandidate(view);
+}
+
+function routeCandidate(view) {
+  const edges = view.edges;
   // 克隆边送入路由器，避免写入临时属性破坏输出契约。
   const routed = edges.map((e) => ({ ...e }));
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   view.edges = routed;
-  routeEdges(view.nodes, routed, { layoutDirection: view.layoutDirection, searchGaps: true });
+  const groupDirections = new Map(view.groups.map(g => [g.id, g.layoutDirection]));
+  routeEdges(view.nodes, routed, { layoutDirection: view.layoutDirection, groupDirections, searchGaps: true,
+    optimizeFaces: true });
   improveEdgeRoutes(view, routed, (e) => byId.get(e.from)?.file !== byId.get(e.to)?.file);
   const bad = routed.filter((e) => e.blocked ||
     pathBlockedByNodes(e.points, view.nodes, new Set([e.from, e.to])) ||
     pathCrossesBody(e.points, byId.get(e.from)) || pathCrossesBody(e.points, byId.get(e.to)));
   if (bad.length) improveEdgeRoutes(view, bad, () => true);
-  mergeSharedRoutes(view);
-  if (period || sized.length > 120) {
-    // 跨组边必须穿出所属框，其余兄弟框作为整块障碍物。
-    const boxes = [...view.containers, ...view.groups];
-    for (const edge of routed) {
-      const owners = [byId.get(edge.from).group, byId.get(edge.to).group];
-      const owned = id => owners.some(group => group === id || group.startsWith(id + '/'));
-      const obstacles = boxes.filter(box => {
-        const slash = box.id.lastIndexOf('/');
-        return !owned(box.id) && (slash < 0 || owned(box.id.slice(0, slash)));
-      });
-      if (!obstacles.some(box => pathCrossesBody(edge.points, box))) continue;
-      const trial = { ...edge };
-      const inside = view.nodes.filter(n => owners.includes(n.group));
-      routeEdges([...inside, ...obstacles.map(box => ({ ...box, id: Symbol(box.id) }))], [trial],
-        { layoutDirection: view.layoutDirection, searchGaps: true });
-      if (!trial.blocked) edge.points = trial.points;
-    }
-  }
+  finishRoutes(view);
   view.edges = edges.map((e, i) => ({ ...e, points: routed[i].points }));
 
+  return fitRoutedBounds(view);
+}
+
+function fitRoutedBounds(view) {
   let minX = 0, minY = 0, maxX = view.width, maxY = view.height;
   for (const e of view.edges) for (const [x, y] of e.points || []) {
     minX = Math.min(minX, x - ROOT_PAD);
@@ -828,6 +1105,7 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
     return old && old.file === n.file && old.w === n.w && old.h === n.h;
   })) {
     const files = new Set(sized.map((n) => n.file || 'unknown'));
+    const groupDirections = new Map(previous.groups?.map(g => [g.id, g.layoutDirection]));
     const directories = new Set();
     for (const file of files) {
       for (let slash = file.lastIndexOf('/'); slash >= 0; slash = file.lastIndexOf('/', slash - 1)) {
@@ -837,7 +1115,8 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
     }
     const view = { width: previous.width, height: previous.height, layoutDirection: direction,
       nodes: sized.map((n) => ({ ...n, x: oldNodes.get(n.id).x, y: oldNodes.get(n.id).y,
-        ...(group ? { group: n.file || 'unknown' } : {}) })),
+        ...(group ? { group: n.file || 'unknown' } : {}),
+        ...(group && groupDirections.get(n.file || 'unknown') && { layoutDirection: groupDirections.get(n.file || 'unknown') }) })),
       edges: edges.map((e) => {
         const old = oldEdges.get(edgeKey(e));
         return { ...e, points: old?.points.map((p) => [...p]),
@@ -848,9 +1127,10 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
     };
     const addedEdges = view.edges.filter((e) => !e.points);
     if (addedEdges.length) {
-      routeEdges(view.nodes, addedEdges, { existing: collectSegments(view.edges.filter((e) => e.points)), layoutDirection: direction });
+      routeEdges(view.nodes, addedEdges, { existing: collectSegments(view.edges.filter((e) => e.points)), layoutDirection: direction,
+        groupDirections });
       improveEdgeRoutes(view, addedEdges, () => false);
-      mergeSharedRoutes(view, addedEdges);
+      finishRoutes(view, addedEdges);
     }
     for (const e of addedEdges) for (const [x, y] of e.points) {
       view.width = Math.max(view.width, x + ROOT_PAD);
@@ -889,14 +1169,37 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
     }
     const graph = graphOf(sized, edges, dir, faces, true, group);
     if (previous && sized.some((n) => oldNodes.has(n.id))) seedInteractive(graph, previous, first);
-    return { ...converted(await layoutGraph(graph), sized, edges), layoutDirection: dir };
+    const result = converted(await layoutGraph(graph), sized, edges);
+    if (!group) for (const n of result.nodes) delete n.group;
+    return { ...result, layoutDirection: dir };
   };
   const medium = group && (sized.length > 120 || edges.length > 240) && sized.length <= 400 && edges.length <= 900;
   if (!previous && medium) {
-    const cfg = { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT' };
-    for (const packMain of [true, false]) {
-      const candidate = await bottomUpCandidate(sized, edges, { ...cfg, packMain });
-      if (candidate && validLayout(candidate)) return withRoot(candidate, rootLabel);
+    const serial = edges.length === sized.length - 1 && new Set(edges.map(e => e.from)).size === edges.length &&
+      new Set(edges.map(e => e.to)).size === edges.length && !sized.some(n => n.kind === 'var');
+    const cache = new Map();
+    const configs = serial ? [
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT', packMain: true },
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT' },
+    ] : [
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT' },
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO', packMain: true },
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO' },
+      { rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' },
+    ];
+    // 大图先比较未布线的矩形和端点。只对通过顺序检查的优先候选做整图路由。
+    const candidates = [];
+    for (const cfg of configs) {
+      const candidate = await bottomUpCandidate(sized, edges, { ...cfg, cache, deferRouting: true });
+      if (!candidate) continue;
+      if (serial) {
+        if (validLayout(routeCandidate(candidate))) return withRoot(candidate, rootLabel);
+      } else if (!candidates.length || preservesSemanticOrder(candidates[0].view, candidate, edges)) {
+        candidates.push({ view: candidate, score: quality(candidate, false) });
+      }
+    }
+    for (const { view } of candidates.sort((a, b) => a.score - b.score)) {
+      if (validLayout(routeCandidate(view))) return withRoot(view, rootLabel);
     }
   }
   let view = await generate(direction);
@@ -905,28 +1208,43 @@ export async function layoutElk(nodes, edges, { group = true, groupMode = 'file'
     const baseline = finalizeCandidate(view);
     view = baseline;
     let score = validLayout(baseline) ? quality(baseline) : Infinity;
-    const consider = (candidate, checkSemantic = false) => {
+    let overlap = Number.isFinite(score) ? routeOverlapConflicts(baseline.edges, { differentStylesOnly: true }).length : Infinity;
+    const consider = candidate => {
       if (!candidate || !validLayout(candidate)) return;
-      if (checkSemantic && !preservesSemanticOrder(baseline, candidate, edges)) return;
+      if (!preservesSemanticOrder(baseline, candidate, edges)) return;
       const next = quality(candidate);
-      if (next < score) { view = candidate; score = next; }
+      const conflict = routeOverlapConflicts(candidate.edges, { differentStylesOnly: true }).length;
+      if (conflict < overlap || (conflict === overlap && next < score)) {
+        view = candidate;
+        score = next;
+        overlap = conflict;
+      }
     };
     const downTask = generate('DOWN').then(finalizeCandidate);
-    const buConfigs = edges.length
-      ? [
-          { rootDir: 'RIGHT', dirDir: 'RIGHT', fileDir: 'AUTO' },
-          { rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' },
-          { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO' },
-          { rootDir: 'DOWN', dirDir: 'DOWN', fileDir: 'AUTO' },
-          { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'AUTO', packMain: true },
-        ]
-      : [{ rootDir: 'DOWN', dirDir: 'RIGHT', fileDir: 'AUTO' }];
+    const cache = new Map();
+    const buConfigs = edges.length ? [
+      { rootDir: 'RIGHT', dirDir: 'DOWN' }, { rootDir: 'DOWN', dirDir: 'RIGHT' },
+      { rootDir: 'RIGHT', dirDir: 'DOWN', packMain: true },
+      { rootDir: 'RIGHT', dirDir: 'DOWN', fileDir: 'RIGHT' },
+    ] : [{ rootDir: 'DOWN', dirDir: 'RIGHT' }];
     const buTasks = group && sized.length <= 120 && edges.length <= 240
-      ? buConfigs.map((cfg) => bottomUpCandidate(sized, edges, cfg))
+      ? buConfigs.map(cfg => bottomUpCandidate(sized, edges, { fileDir: 'AUTO', ...cfg, cache }))
       : [];
     const [downView, ...buViews] = await Promise.all([downTask, ...buTasks]);
     consider(downView);
-    for (const cand of buViews) consider(cand, true);
+    for (const cand of buViews) consider(cand);
+    if (!Number.isFinite(score)) {
+      // ELK 极窄通道偶尔压住节点。保留几何候选，用避障网格重建全部边再校验。
+      for (const candidate of [baseline, downView, ...buViews]) {
+        if (!candidate) continue;
+        candidate.edges = edges;
+        const repaired = routeCandidate(candidate);
+        if (validLayout(repaired)) { view = repaired; break; }
+      }
+      if (!validLayout(view)) throw new Error('无法为当前节点生成有效的正交布局');
+    }
+    // 最后仅对获选画面的真实交点做局部换面，无需在每个候选中重复搜索。
+    improveEdgeRoutes(view, view.edges, () => true, true);
   } else {
     mergeSharedRoutes(view);
   }

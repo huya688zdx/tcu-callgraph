@@ -218,6 +218,7 @@ test('无头浏览器：变量勾选与入图一致，添加或定位调用关�
   assert.equal(await evaluate(`__cg.view.nodes.some(node => node.id === ${JSON.stringify(fn('d'))})`), true);
   assert.equal((await request('/api/node?id=var%3A%3Ag_pick')).hidden, false, '关系预览也解除变量删除标记');
 
+  await evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f' }))");
   const point = await canvasPoint('__cg.view.groups[0]', ['box.x + 15', 'box.y + 12']);
   for (const type of ['mousePressed', 'mouseReleased']) {
     await chrome.send('Input.dispatchMouseEvent', { type, x: point[0], y: point[1], button: 'left', clickCount: 2 });

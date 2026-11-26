@@ -156,6 +156,27 @@ test('数据流从写入函数经变量到读取函数，输出路径仍按存�
   }
 });
 
+test('已保存的コール順以及变量指向读者的 df-read 使用实际语义顺序', async () => {
+  const nodes = ['boot', 'last', 'first', 'middle'].map(id => ({ id, file: 'task.c' }));
+  const calls = ['last', 'first', 'middle'].map((to, i) => ({
+    from: 'boot', to, kind: 'direct', orderGroup: i + 1, label: { text: 'コール順' + [3, 1, 2][i] },
+  }));
+  const view = await layoutElk(nodes, calls);
+  const cross = view.layoutDirection === 'RIGHT' ? 'y' : 'x';
+  const positions = new Map(view.nodes.map(n => [n.id, n[cross]]));
+  assert.ok(positions.get('first') < positions.get('middle') && positions.get('middle') < positions.get('last'));
+
+  const accesses = [{ from: 'store', to: 'signal', kind: 'df-write', via: 'rpm' },
+    { from: 'signal', to: 'load', kind: 'df-read', via: 'rpm' }];
+  const flow = await layoutElk(['load','signal','store'].map(id => ({
+    id, file: 'src/' + id + '.c', kind: id === 'signal' ? 'var' : 'function',
+  })), accesses);
+  const main = flow.layoutDirection === 'RIGHT' ? 'x' : 'y';
+  const coords = new Map(flow.nodes.map(n => [n.id, n[main]]));
+  assert.ok(coords.get('store') < coords.get('signal') && coords.get('signal') < coords.get('load'));
+  assert.deepEqual(flow.edges.map(({ points, ...e }) => e), accesses);
+});
+
 test('跨文件变量布局减少向右绕行的台阶', async () => {
   const nodes = [['f', 'bsw/can.c'], ['buf', 'bsw/can.c'], ['len', 'bsw/can.c'],
     ['state', 'bsw/can.c'], ['fail', 'bsw/can.c'], ['gear', 'app/control.c'],
