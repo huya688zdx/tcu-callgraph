@@ -251,6 +251,13 @@ test('导出前检查兼容头和数据库的目标类型', t => {
   fs.mkdirSync(database);
   assert.throws(generate, /普通文件/);
   assert.equal(fs.existsSync(shim), false);
+  fs.rmdirSync(database);
+  // 模拟系统报告兼容头目录解析到工程外；测试只在本用例的工程目录内读写。
+  const realpath = fs.realpathSync;
+  t.mock.method(fs, 'realpathSync', file => file === path.dirname(shim) ? path.dirname(root) : realpath(file));
+  assert.throws(generate, /超出工程目录/);
+  assert.equal(fs.existsSync(shim), false);
+  assert.equal(fs.existsSync(database), false);
 });
 
 test('编译数据库从编译工作目录展开独立的 @flags.rsp，保留带空格的路径', t => {
