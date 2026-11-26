@@ -210,17 +210,19 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
 
 function expandMakeVars(str, vars, depth = 0) {
   if (!str || depth > 8 || !str.includes('$')) return str;
-  const next = str.replace(/\$\(([^()$\s]+)\)|\$\{([^{}$\s]+)\}/g, (full, a, b) => {
-    const key = a || b;
-    return Object.hasOwn(vars, key) ? vars[key] : full;
+  return str.replace(/\$\(([\w.-]+)\)|\$\{([\w.-]+)\}/g, (_, a, b) => {
+    const variable = vars.get(a || b);
+    if (!variable) return '';
+    return variable.simple ? variable.value : expandMakeVars(variable.value, vars, depth + 1);
   });
-  return next === str ? next : expandMakeVars(next, vars, depth + 1);
 }
 
 /** 递归解析 .mak / .mac / Makefile（支持 !include、include、-include、$(CDIR) 与 @rsp）。 */
 export function parseMakefileTree(entryAbs, rootDir) {
   const entryDir = path.dirname(entryAbs);
-  const vars = {
+  const defaults = {
+    CC: 'cc',
+    CXX: 'g++',
     CDIR: entryDir,
     CURDIR: entryDir,
     TOPDIR: rootDir,
@@ -228,13 +230,14 @@ export function parseMakefileTree(entryAbs, rootDir) {
     PROJ_DIR: entryDir,
     PROJECT_DIR: entryDir,
   };
+  const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
+  const recipes = [];
   const collected = {
     includeDirs: new Set(),
     defines: new Set(),
     forcedIncludes: new Set(),
     sourceFiles: new Set(),
     includedFiles: [],
-    rawSample: [],
   };
   const visited = new Set();
 
@@ -247,7 +250,6 @@ export function parseMakefileTree(entryAbs, rootDir) {
     if (!text) return;
     const dir = path.dirname(absPath);
     collected.includedFiles.push(toPosix(path.relative(rootDir, absPath)));
-    if (collected.rawSample.length < 4) collected.rawSample.push(text.slice(0, 4000));
 
     // 合并反斜杠续行
     const rawLines = text.split(/\r\n|\r|\n/);
@@ -268,9 +270,14 @@ export function parseMakefileTree(entryAbs, rootDir) {
     }
     if (buf) lines.push(buf);
 
+    let prerequisites = '';
     for (const rawLine of lines) {
       const line = rawLine.replace(/^\s*#.*$/, '').trim();
       if (!line) continue;
+      if (rawLine.startsWith('\t')) {
+        recipes.push({ command: line, prerequisites });
+        continue;
+      }
 
       // !include / include / -include / sinclude
       const incMatch = /^(?:!|-|s)?include\s+(.+)$/i.exec(line);
@@ -287,25 +294,55 @@ export function parseMakefileTree(entryAbs, rootDir) {
       }
 
       // 变量定义：VAR = / := / ?= / += val
-      const assignMatch = /^([A-Za-z_][A-Za-z0-9_]*)\s*([:+?]?=)\s*(.*)$/.exec(line);
+      const assignMatch = /^(?:export\s+)?([\w.-]+)\s*([:+?]?=)\s*(.*)$/.exec(line);
       if (assignMatch) {
         const [, varName, op, rhsRaw] = assignMatch;
-        const rhs = expandMakeVars(rhsRaw.replace(/\s+#.*$/, '').trim(), vars);
-        if (op === '+=' && Object.hasOwn(vars, varName)) vars[varName] = `${vars[varName]} ${rhs}`.trim();
-        else if (op !== '?=' || !Object.hasOwn(vars, varName)) vars[varName] = rhs;
-        // 顺手提取变量值中的 -I / -D / @rsp / .c 列表
-        extractCompilerFlags(tokenizeArgs(rhs), dir, rootDir, collected);
+        const previous = vars.get(varName);
+        if (op === '?=' && previous) continue;
+        const simple = op === ':=' || (op === '+=' && Boolean(previous?.simple));
+        let value = rhsRaw.replace(/\s+#.*$/, '').trim();
+        if (simple) value = expandMakeVars(value, vars);
+        if (op === '+=' && previous) value = `${previous.value} ${value}`.trim();
+        vars.set(varName, { value, simple });
         continue;
       }
 
-      // 规则或命令行：展开变量后抽取 -I / -D / @rsp / .c
-      const expanded = expandMakeVars(line, vars);
-      extractCompilerFlags(tokenizeArgs(expanded), dir, rootDir, collected);
+      const rule = /^[^:]+::?\s*([^;]*)(?:;(.*))?$/.exec(line);
+      if (rule) {
+        // 普通规则的依赖在读入时展开；命令（包括分号后的内联命令）等所有定义收齐。
+        prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
+        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites });
+      } else if (/^ +\S/.test(rawLine)) {
+        // 一些 NMAKE 工程以空格缩进命令。
+        recipes.push({ command: line, prerequisites });
+      }
     }
   };
 
   processFile(entryAbs, 0);
-  const meta = detectArchAndCompiler(collected.rawSample.join('\n'));
+  const compilers = new Set();
+  for (const { command, prerequisites } of recipes) {
+    const deps = prerequisites.split('|')[0];
+    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), vars)
+      .replace(/\$[<^+]/g, ref => ref === '$<' ? `"${tokenizeArgs(deps)[0] || ''}"` : deps);
+    const args = tokenizeArgs(expanded);
+    const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
+    const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');
+    // 兼容工程自定义的 CC 名称，同时避免将 echo、清理等命令的参数计入配置。
+    const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER)\)|\$\{(?:CC|CXX|C_COMPILER)\})(?:\s|$)/i;
+    if (!compilerVar.test(command) &&
+        !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
+    if (args.length) compilers.add(compiler);
+    extractCompilerFlags(args, entryDir, rootDir, collected);
+  }
+  if (!recipes.length) {
+    // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。
+    compilers.add(expandMakeVars('$(CC) $(CXX)', vars));
+    for (const key of ['CPPFLAGS', 'CFLAGS', 'CXXFLAGS', 'INCLUDES', 'DEFINES', 'SRCS', 'C_SRCS', 'SOURCES']) {
+      extractCompilerFlags(tokenizeArgs(expandMakeVars(`$(${key})`, vars)), entryDir, rootDir, collected);
+    }
+  }
+  const meta = detectArchAndCompiler([...compilers].join('\n'));
   return {
     ...meta,
     includeDirs: [...collected.includeDirs],
