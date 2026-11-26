@@ -152,14 +152,20 @@ export function labelLayout(view = state.view, reuse = false) {
   return out;
 }
 
-/** 命中最上层的标签（标签画在节点之上，所以倒序找）；返回具体命中了哪一条 */
+/** 命中最上层的标签（标签画在节点之上，所以倒序找）；优先命中当前已选连线的标签，防止被淡化背景边的标签抢走点击。 */
 export function hitLabel(p, view = state.view) {
   const items = labelLayout(view, true);
-  for (let i = items.length - 1; i >= 0; i--) {
-    const { rect: r } = items[i];
-    if (p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2) {
-      return items[i];
+  const hitAt = (item) => {
+    const { rect: r } = item;
+    return p.x >= r.x - 2 && p.x <= r.x + r.w + 2 && p.y >= r.y - 2 && p.y <= r.y + r.h + 2;
+  };
+  if (state.selectedEdge) {
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].edge === state.selectedEdge && hitAt(items[i])) return items[i];
     }
+  }
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (hitAt(items[i])) return items[i];
   }
   return null;
 }
