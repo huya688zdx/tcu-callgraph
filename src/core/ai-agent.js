@@ -170,6 +170,21 @@ export const AGENT_TOOLS = [
     },
   },
   {
+    name: 'inspect_build_config',
+    description: '只读摸底工程的构建配置与多核项目结构：支持 action="scan" 递归扫描全部 .cproject/.project（含多核多 .cproject、各机种 configurationName、路径映射、排除规则）、.mak/Makefile、QAC 目录及 .pl 脚本；action="summarize_cproject" 深度摘要指定 .cproject；action="read" 按行读取或关键词检索单个构建/配置文件。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['scan', 'summarize_cproject', 'read'], description: '默认 scan；read 时需传 file' },
+        file: { type: 'string', description: '工程内相对路径，如 "CPU0/.cproject"、"Debug/app.mak"、"qac/run.pl"' },
+        startLine: { type: 'integer', description: 'action=read 时的起始行号（从 1 开始）' },
+        endLine: { type: 'integer', description: 'action=read 时的结束行号（单次最多 200 行）' },
+        query: { type: 'string', description: 'action=read 时在目标构建文件内按关键词检索匹配行' },
+        encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], description: '文本编码，默认 auto' },
+      },
+    },
+  },
+  {
     name: 'find_symbols',
     description: '按关键词搜索工程中的函数或全局变量；不传 query 时返回当前画布摘要和顶层 TASK/ISR 入口。',
     parameters: {
@@ -578,7 +593,8 @@ function buildSystemPrompt(context, promptToolMode) {
     '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径（如上轮提过的某条调用链或其他相关函数）当成本轮隐含需求去追查或写入画布。回答“为什么没有上游调用链/为什么未连线/这个函数做什么”等解释排查类问题时，只使用只读工具（read_function、trace_upstream、find_symbols），不得擅自修改画布。',
     '12. 整理画布布局时：用户要求“整理画布/排版/排整齐/减少交叉”时优先调用 arrange_canvas({ action: "tidy", direction: "LR" })（或 "TB"）；移动/对齐整个文件框或目录容器用 move_group / align_groups；精调单个节点时先 inspect 再 move/align。附有画布截图时结合图像与坐标操作。',
     '13. 间接调用链（函数指针、1D/2D 常量结构体数组如 z[idx]() / e[r][c]()、回调注册、状态机/中断派发、复杂宏）：当静态图缺少调用链或用户问“为什么找不到上游/调用关系”时，先用 inspect_indirect_calls 和 read_source 核查实际源码与分派表初始化代码，按代码逻辑精准判断真正会调用哪些目标。纯排查提问时只解释查证结果；用户要求补齐/加入调用链（或确认后），调用 add_call_edge 只加入经源码确认的具体边（切勿把无关的表项全量写入）。',
-    '14. 除调用 ask_user 外，每次普通最终回复的末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（给出 2–3 个结合本轮函数/变量/发现的后续建议）。',
+    '14. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
+    '15. 除调用 ask_user 外，每次普通最终回复的末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（给出 2–3 个结合本轮函数/变量/发现的后续建议）。',
     '',
     '当前上下文：',
     ...ctxLines,
@@ -1112,6 +1128,18 @@ function summarizeToolResult(name, result) {
   if (name === 'get_git_changes') {
     if (result.noChanges) return 'Git 工作区无 C/H 源码改动';
     return `发现 ${result.changedFiles?.length || 0} 个文件、${result.changedFunctions?.length || 0} 个变更函数`;
+  }
+  if (name === 'inspect_build_config') {
+    if (result.counts) {
+      const c = result.counts;
+      return `扫描构建配置：${c.cprojects} 个 .cproject、${c.makefiles} 个 .mak/Makefile、${c.qacFiles} 个 QAC 配置、${c.perlScripts} 个 .pl 脚本`;
+    }
+    if (result.file && Array.isArray(result.configurations)) {
+      return `已解析 ${result.file}（${result.configurations.length} 套机种配置）`;
+    }
+    if (result.file && result.matches) return `在 ${result.file} 中找到 ${result.matches.length} 处匹配`;
+    if (result.file) return `已读构建文件 ${result.file}:${result.startLine}-${result.endLine}`;
+    return '已检查构建配置';
   }
   if (name === 'find_symbols') {
     const summary = result.matches
