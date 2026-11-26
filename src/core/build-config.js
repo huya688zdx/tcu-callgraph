@@ -119,7 +119,9 @@ function tokenizeArgs(line) {
   let started = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && ((quote !== "'" && line[i + 1] === '"') || (!quote && line[i + 1] === '#'))) {
+    const next = line[i + 1] || '';
+    if (ch === '\\' && ((quote !== "'" && next === '"') || (!quote &&
+        (next === '#' || (process.platform !== 'win32' && /\s/.test(next)))))) {
       cur += line[i + 1];
       started = true;
       i++;
@@ -206,6 +208,7 @@ function extractedOptions(config) {
     forcedIncludes: [...config.forcedIncludes],
     macroIncludes: [...config.macroIncludes],
     ...(config.languageStandard ? { languageStandard: config.languageStandard } : {}),
+    ...(config.workingDirectory ? { workingDirectory: config.workingDirectory } : {}),
   };
 }
 
@@ -592,7 +595,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (ambiguous || changedDirectory) throw new Error('暂不支持含管道、替代分支或切换目录的 Make 编译命令');
       requireResolvedMake(invocation);
       if (args.length) compilers.add(compiler);
-      const unit = compilerConfig();
+      const unit = { ...compilerConfig(), workingDirectory: entryDir };
       extractCompilerFlags(args, entryDir, rootDir, unit);
       // 同一源文件已有明确配方时，隐式规则只用于补齐其他编译单元。
       const sources = [...unit.sourceFiles].filter(rel => !builtIn || !Object.hasOwn(compilationUnits, rel));
@@ -1064,10 +1067,11 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
   const cwd = profile.dir && profile.dir !== '.' ? path.resolve(absRoot, profile.dir) : absRoot;
   const entries = activeRels.map((rel) => {
     const absFile = path.resolve(absRoot, rel);
+    const config = profile.compilationUnits?.[rel] || profile;
     return {
-      directory: cwd,
+      directory: config.workingDirectory || cwd,
       file: absFile,
-      arguments: [...argsFor(profile.compilationUnits?.[rel] || profile), absFile],
+      arguments: [...argsFor(config), absFile],
     };
   });
 

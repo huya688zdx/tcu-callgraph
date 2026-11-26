@@ -76,13 +76,14 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
   for (const source of files) {
     if (source.isHeader) continue;
     const config = options.compilationUnits?.[source.rel] || options;
+    const workingDirectory = path.resolve(root, config.workingDirectory || options.workingDirectory || '.');
     const includeOptions = profileIncludeOptions(config);
     const dirsFor = flag => includeOptions.filter(([kind]) => kind === flag).map(([, dir]) => path.resolve(root, dir));
     const system = dirsFor('-isystem');
     const after = dirsFor('-idirafter');
     const systemKeys = new Set([...system, ...after].map(key));
     const search = uniqueDirs([...dirsFor('-I').filter(dir => !systemKeys.has(key(dir))), ...system, ...after]);
-    if (!includeOptions.length) search.push(path.resolve(root));
+    if (!includeOptions.length) search.push(workingDirectory);
     const quotedSearch = uniqueDirs([...dirsFor('-iquote'), ...search]);
     const forced = [...(config.macroIncludes || []).map(target => [target, true]),
       ...(config.forcedIncludes || []).map(target => [target, false])];
@@ -124,7 +125,10 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
             byPath.set(absKey, header);
           }
           if (!header) { if (external || options.allowLocalIncludes) options.onMissingInclude?.(abs); continue; }
-          const changed = processFile(header, { get: name => scope.get(name, line) }, macrosOnly, { dirs, index });
+          const changed = processFile(header, {
+            get: name => scope.get(name, line),
+            isUnknown: name => scope.isUnknown(name, line),
+          }, macrosOnly, { dirs, index });
           if (changed) for (const [name, def] of changed) {
             if (uncertain || def === undefined) scope.forget(name, line);
             else if (def) scope.set(name, def, line);
@@ -137,7 +141,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       const implicit = [];
       if (!file.isHeader) forced.forEach(([target, macrosOnly], i) => {
         const entry = { file: file.rel, target, line: i - forced.length };
-        entry.resolved = include(entry, true, false, false, root, macrosOnly) ?? null;
+        entry.resolved = include(entry, true, false, false, workingDirectory, macrosOnly) ?? null;
         implicit.push(entry);
       });
       const result = preprocess(input.tokens, scope, file.rel, {

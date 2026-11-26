@@ -27,6 +27,13 @@ export function fileMacroScope(base, changes = new Map(), { trackPositions = fal
       }
       return changes.has(name) ? changes.get(name) : base.get(name);
     },
+    isUnknown(name, line) {
+      if (history && line !== undefined) {
+        const entry = history.get(name)?.findLast(change => change.line < line);
+        return entry ? entry.value === undefined : !!base.isUnknown?.(name);
+      }
+      return changes.has(name) ? changes.get(name) === undefined : !!base.isUnknown?.(name);
+    },
     set(name, def, line = def.line) { update(name, def, line); },
     delete(name, line) { update(name, null, line); },
     forget(name, line) { update(name, undefined, line); },
@@ -97,9 +104,9 @@ function evalPreprocExpr(exprText, macros, line, keepUnknown = false) {
       // defined 检查操作数的宏名，先于普通替换处理。
       const grouped = tokens[i + 1]?.v === '(';
       const name = tokens[i + (grouped ? 2 : 1)];
-      if (name?.t !== 'id' || (grouped && tokens[i + 3]?.v !== ')')) return 0;
+      if (name?.t !== 'id' || (grouped && tokens[i + 3]?.v !== ')')) return undefined;
       const def = macros.get(name.v, line);
-      if (keepUnknown && def === undefined) return undefined;
+      if (def === undefined && (keepUnknown || macros.isUnknown?.(name.v, line))) return undefined;
       input.push({ ...token, t: 'num', v: def ? '1' : '0' });
       i += grouped ? 3 : 1;
     } else {
@@ -107,10 +114,11 @@ function evalPreprocExpr(exprText, macros, line, keepUnknown = false) {
     }
   }
   const expanded = expandSeq(input, macros);
-  if (keepUnknown && expanded.some((token, i) => token.t === 'id' && macros.get(token.v, line) === undefined &&
+  if (expanded.some((token, i) => token.t === 'id' &&
+      (macros.isUnknown?.(token.v, line) || (keepUnknown && macros.get(token.v, line) === undefined)) &&
       !(/^(?:u8|[LuU])$/.test(token.v) && expanded[i + 1]?.v.startsWith("'")))) return undefined;
   const toks = expanded.map(token => token.v);
-  if (!toks.length) return 0;
+  if (!toks.length) return undefined;
   // C 预处理表达式按 intmax_t/uintmax_t 求值，避免 JS 的 32 位截断。
   const integer = (v, unsigned = false) => ({ v: unsigned ? BigInt.asUintN(64, v) : BigInt.asIntN(64, v), unsigned });
   const truth = x => x.v !== 0n;
@@ -181,7 +189,10 @@ function evalPreprocExpr(exprText, macros, line, keepUnknown = false) {
     }
     return value;
   };
-  try { return truth(expression()) ? 1 : 0; } catch { return 0; }
+  try {
+    const value = expression();
+    return pos === toks.length ? Number(truth(value)) : undefined;
+  } catch { return undefined; }
 }
 
 /**
@@ -221,6 +232,7 @@ export function preprocess(tokens, macros, file, {
   };
   const isInactive = () => frames.some((f) => f.inactive);
   const isUncertain = () => frames.some((f) => f.uncertain);
+  const forget = (name, line) => (macros.forget || macros.delete).call(macros, name, line);
   let cond;
 
   for (let k = 0; k < tokens.length; k++) {
@@ -244,7 +256,7 @@ export function preprocess(tokens, macros, file, {
     if (dir === 'define') {
       const def = parseMacroDefinition(rest, file, tk.line, currentCond());
       if (def) {
-        if (isUncertain()) macros.forget(def.name, tk.line);
+        if (isUncertain()) forget(def.name, tk.line);
         else macros.set(def.name, def);
       }
       continue;
@@ -253,7 +265,7 @@ export function preprocess(tokens, macros, file, {
     if (dir === 'undef') {
       const nm = /^([A-Za-z_]\w*)/.exec(rest);
       if (nm) {
-        if (isUncertain()) macros.forget(nm[1], tk.line);
+        if (isUncertain()) forget(nm[1], tk.line);
         else macros.delete(nm[1], tk.line);
       }
       continue;
@@ -287,7 +299,7 @@ export function preprocess(tokens, macros, file, {
         frames.push({ expr: null, inactive: !taken, definitelyTaken: taken });
       } else if (pruneInactive) {
         const definition = nm ? macros.get(n, tk.line) : null;
-        const uncertain = definition === undefined && !!hasUnresolvedIncludes?.();
+        const uncertain = definition === undefined && (hasUnresolvedIncludes?.() || macros.isUnknown?.(n, tk.line));
         const defined = Boolean(definition);
         const taken = dir === 'ifdef' ? defined : !defined;
         frames.push({

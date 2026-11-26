@@ -924,3 +924,39 @@ test('Make 只有链接配方时从内置规则恢复实际编译单元', t => {
   assert.equal(unit.rel, 'main.c');
   assert.deepEqual(unit.args.slice(unit.args.indexOf('-D')), ['-D', 'FEATURE=1', '-D', 'UNIT', '-D', 'EXTRA=1']);
 });
+
+test('嵌套 Make 配置从实际编译目录搜索强制头，流程图采用同一配置', async t => {
+  const root = temporaryProject(t);
+  write(root, 'build/Makefile', 'all:\n\tcc -I../sdk -include config.h -c ../main.c');
+  write(root, 'config.h', '#define FEATURE 0\n#define RUN wrong\n');
+  write(root, 'sdk/config.h', '#define FEATURE 1\n#define RUN selected\n');
+  write(root, 'main.c', [
+    '#if FEATURE', 'static void selected(void) {}', 'void enabled(void) { RUN(); }',
+    '#else', 'void disabled(void) {}', '#endif',
+  ].join('\n'));
+  const profileId = 'make::build/Makefile';
+  const profile = discoverBuildProfiles(root).profiles.find(item => item.id === profileId);
+  const files = scanSources(root);
+  assert.equal(profile.compilationUnits['main.c'].workingDirectory, path.join(root, 'build'));
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  assert.equal(readCompileCommands(root, compileCommandsPath)[0].cwd, path.join(root, 'build'));
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId });
+  const query = new URLSearchParams({ id: 'main.c::enabled', expandMacros: 1 });
+  const graph = await request('/api/flowchart?' + query);
+  assert.ok(graph.nodes.some(node => node.kind === 'call' && node.text.includes('selected()')));
+  assert.ok(graph.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === 'sdk/config.h'));
+});
+
+test('POSIX Make 配方的转义空格保留真实源码和包含路径', { skip: process.platform === 'win32' }, t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -Iinclude\\ flags -c main\\ app.c');
+  write(root, 'include flags/config.h', '#define FEATURE 1');
+  write(root, 'main app.c', '#include <config.h>\n#if FEATURE\nvoid active(void) {}\n#endif');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.sourceFiles, ['main app.c']);
+  assert.deepEqual(profile.includeDirs, [path.join(root, 'include flags')]);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, scanSources(root), profile);
+  assert.deepEqual(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name), ['active']);
+});

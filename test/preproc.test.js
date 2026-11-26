@@ -63,3 +63,15 @@ test('字符常量及转义参与条件求值', () => {
     assert.deepEqual(result.tokens.map(t => t.v), ['yes'], expr);
   }
 });
+
+test('不能求值的预处理操作保留分支，并避免把条件重定义当成确定值', () => {
+  const source = [
+    '#define CHOICE 0',
+    '#if __has_include("feature.h")', '#define CHOICE 1', 'maybe_present', '#else', 'maybe_missing', '#endif',
+    '#if CHOICE', 'maybe_on', '#else', 'maybe_off', '#endif',
+    '#if UNKNOWN_MACRO', 'inactive', '#endif',
+  ].join('\n');
+  const macros = fileMacroScope(new Map(), new Map(), { trackPositions: true });
+  const result = preprocess(lex(source), macros, 'sample.c', { pruneInactive: true });
+  assert.deepEqual(result.tokens.map(token => token.v), ['maybe_present', 'maybe_missing', 'maybe_on', 'maybe_off']);
+});

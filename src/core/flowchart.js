@@ -892,7 +892,7 @@ function flowchartMacroConfig(model, fn) {
   return model.compilationUnits?.[fn.file] || {
     defines: model.buildDefines, macroArgs: model.macroArgs, includeDirs: model.includeDirs,
     includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes, macroIncludes: model.macroIncludes,
-    languageStandard: model.languageStandard,
+    languageStandard: model.languageStandard, workingDirectory: model.workingDirectory,
   };
 }
 
@@ -906,7 +906,7 @@ function flowchartProfileMacros(model, fn, tokens, read, config) {
     return { tokens: entry.macroTokens };
   };
   preprocessProfile(model.root, [source], {
-    ...config, availableFiles: model.files, allowUnlistedIncludes: false,
+    workingDirectory: model.workingDirectory, ...config, availableFiles: model.files, allowUnlistedIncludes: false,
   }, load, (file, input, result, scope) => {
     if (file !== source) return;
     for (const [name, def] of scope.changes) {

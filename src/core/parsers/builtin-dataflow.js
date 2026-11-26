@@ -104,6 +104,7 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
       compilationUnits: model.compilationUnits, defines: model.buildDefines,
       includeDirs: model.includeDirs, includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes,
       macroArgs: model.macroArgs, macroIncludes: model.macroIncludes, languageStandard: model.languageStandard,
+      workingDirectory: model.workingDirectory,
     };
     if (keepOriginal) preprocessProfile(model.root, sources, profile, loadInput,
       (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)));
