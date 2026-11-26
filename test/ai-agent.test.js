@@ -524,6 +524,52 @@ test('e2e：AI 向上移动后为文件和每层目录留出标题空间', async
   assert.equal(invalid.nodes.find(node => node.id === root).y, node.y);
 });
 
+test('e2e：移动嵌套目录时按外框定位，并保留参照目录下方的间隔', async t => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-move-directories-'));
+  t.after(() => fs.rmSync(target, { recursive: true, force: true, maxRetries: 3 }));
+  const roots = [];
+  for (const [directory, name] of [['alpha/deep', 'entry'], ['beta', 'worker']]) {
+    fs.mkdirSync(path.join(target, directory), { recursive: true });
+    fs.writeFileSync(path.join(target, directory, 'unit.c'), `void ${name}(void) {}\n`);
+    roots.push(`${directory}/unit.c::${name}`);
+  }
+  const moves = [
+    { id: 'alpha', x: 720, y: 640 },
+    { id: 'beta', relativeTo: 'alpha', placement: 'below', gap: 36 },
+  ];
+  let result;
+  const llm = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const last = JSON.parse(Buffer.concat(chunks)).messages.at(-1);
+    if (last.role === 'tool') result = JSON.parse(last.content);
+    const message = result ? { content: '已移动。' } : { tool_calls: [{
+      id: 'move', type: 'function', function: { name: 'arrange_canvas', arguments: JSON.stringify({ action: 'move_group', moves }) },
+    }] };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ choices: [{ message }] }));
+  });
+  await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => llm.close(resolve)));
+  const srv = await launchServer({ target });
+  t.after(srv.close);
+  const post = (route, body) => fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post('/api/page', { roots, up: 0, down: 0, groupMode: 'file' });
+  const chat = await post('/api/ai/chat', { prompt: '移动这两个目录', config: {
+    model: 'mock-layout', baseUrl: `http://127.0.0.1:${llm.address().port}/v1`, toolMode: 'tools',
+  } });
+  assert.match(await chat.text(), /"type":"done"/);
+  assert.equal(result?.ok, true, JSON.stringify(result));
+  const view = await fetch(srv.baseUrl + '/api/view?groupMode=file&up=0&down=0&roots=' +
+    encodeURIComponent(roots.join(','))).then(res => res.json());
+  const alpha = view.containers.find(box => box.id === 'alpha');
+  const beta = view.containers.find(box => box.id === 'beta');
+  assert.deepEqual([alpha.x, alpha.y], [720, 640]);
+  assert.deepEqual([beta.x, beta.y], [alpha.x, alpha.y + alpha.h + 36]);
+});
+
 test('明确的英文编辑请求即使带问号也可以调用写工具，解释请求仍只读', async () => {
   for (const [prompt, allowed] of [['Can you add Task_10ms to the canvas?', true], ['Why is Task_10ms missing?', false]]) {
     const executed = [];

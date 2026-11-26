@@ -1867,7 +1867,7 @@ function discardCollidingArrangements(nodes, targets) {
   return targets.filter(({ node, x, y }) => moves.has(node) || (node.x === x && node.y === y));
 }
 
-function expandedArrangementBoxes(view, targets) {
+function arrangementBoxGeometry(view, targets) {
   const targetByNode = new Map(targets.map(({ node, x, y }) => [node.id, { x, y, w: node.w, h: node.h }]));
   const files = new Map(view.groups.map(box => [box.id, { box, bounds: canvasRect(box), kind: 'file' }]));
   const directories = view.containers.map(box => ({ box, bounds: canvasRect(box), kind: 'dir' }));
@@ -1909,13 +1909,10 @@ function expandedArrangementBoxes(view, targets) {
     const children = boxes.filter(candidate => inside(dir, candidate));
     if (!children.some(child => expanded.has(child))) continue;
     if (dir.box.root) {
-      const { pad, top } = contentPadding(dir);
+      const { pad } = contentPadding(dir);
       let maxX = dir.bounds.x + dir.bounds.w;
       let maxY = dir.bounds.y + dir.bounds.h;
       for (const child of children) {
-        if (child.bounds.y < dir.bounds.y + top) {
-          return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
-        }
         maxX = Math.max(maxX, child.bounds.x + child.bounds.w + pad);
         maxY = Math.max(maxY, child.bounds.y + child.bounds.h + pad);
       }
@@ -1924,14 +1921,20 @@ function expandedArrangementBoxes(view, targets) {
       continue;
     }
     fitBounds(dir, children.map(child => child.bounds));
-    const parent = directories.find(candidate => inside(candidate, dir));
-    const minY = parent?.box.root ? parent.bounds.y + contentPadding(parent).top : 0;
-    if (dir.bounds.y < minY) {
-      return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
-    }
   }
+  return { expanded, boxes, directories };
+}
+
+function expandedArrangementBoxes(view, targets) {
+  const { expanded, boxes, directories } = arrangementBoxGeometry(view, targets);
   for (const entry of expanded) {
-    if (entry.kind !== 'file') continue;
+    if (entry.box.root) {
+      const minY = entry.bounds.y + contentPadding(entry).top;
+      if (boxes.some(child => inside(entry, child) && child.bounds.y < minY)) {
+        return { error: '画布顶部没有足够空间容纳文件框或目录的标题，请下移目标位置' };
+      }
+      continue;
+    }
     const parent = directories.find(candidate => inside(candidate, entry));
     const minY = parent?.box.root ? parent.bounds.y + contentPadding(parent).top : 0;
     if (entry.bounds.y < minY) {
@@ -3263,9 +3266,14 @@ export const server = http.createServer(async (req, res) => {
           }
           for (const target of targets) updated.set(target.id, target);
         } else if (action === 'move_group' || action === 'align_groups') {
+          const geometry = {
+            nodes: nodes.map(n => ({ ...n, group: nodeGroup.get(n.id) })),
+            groups: view.groups.map(box => ({ ...box, ...live?.groups?.get(box.id) })),
+            containers: view.containers.map(box => ({ ...box, ...live?.containers?.get(box.id) })),
+          };
           const allBoxes = [
-            ...view.groups.map(box => ({ kind: 'file', box: { ...(live?.groups?.get(box.id) ?? canvasRect(box)), id: box.id, label: box.label } })),
-            ...view.containers.filter(c => !c.root).map(box => ({ kind: 'dir', box: { ...(live?.containers?.get(box.id) ?? canvasRect(box)), id: box.id, label: box.label } })),
+            ...geometry.groups.map(box => ({ kind: 'file', box })),
+            ...geometry.containers.filter(c => !c.root).map(box => ({ kind: 'dir', box })),
           ];
           const resolveBox = (query) => {
             if (typeof query !== 'string' || !query.trim()) throw new Error('请提供文件框或目录容器的 ID 或名称');
@@ -3288,15 +3296,12 @@ export const server = http.createServer(async (req, res) => {
               const g = nodeGroup.get(n.id);
               return g && (g === entry.box.id || g.startsWith(entry.box.id + '/'));
             });
-          const boxBoundsNow = (entry) => {
-            const members = boxMembers(entry);
-            if (!members.length) return { ...entry.box };
-            const { pad, top } = contentPadding(entry);
-            const minX = Math.min(...members.map(n => n.x));
-            const minY = Math.min(...members.map(n => n.y));
-            const maxX = Math.max(...members.map(n => n.x + n.w));
-            const maxY = Math.max(...members.map(n => n.y + n.h));
-            return { id: entry.box.id, x: Math.max(0, minX - pad), y: Math.max(0, minY - top), w: maxX - minX + pad * 2, h: maxY - minY + top + pad };
+          const boundsForMove = entries => {
+            // 本批已移动和即将移动的节点都按保存时的规则包框；未改动的参照框沿用当前尺寸。
+            const moved = new Set([...updated.values(), ...entries.flatMap(boxMembers)]);
+            const targets = [...moved].map(n => ({ node: { ...n, group: nodeGroup.get(n.id) }, x: n.x, y: n.y }));
+            const { boxes } = arrangementBoxGeometry(geometry, targets);
+            return new Map(boxes.map(({ box, bounds }) => [box, bounds]));
           };
           const shiftEntry = (entry, dx, dy) => {
             const members = boxMembers(entry);
@@ -3313,7 +3318,8 @@ export const server = http.createServer(async (req, res) => {
             if (!list.length) return fail('move_group 需要提供 group 或 moves');
             for (const move of list) {
               const entry = resolveBox(move.id ?? move.group);
-              const cur = boxBoundsNow(entry);
+              const bounds = boundsForMove([entry]);
+              const cur = bounds.get(entry.box);
               let targetX = cur.x;
               let targetY = cur.y;
               let axis = 'x';
@@ -3323,7 +3329,7 @@ export const server = http.createServer(async (req, res) => {
                 if (anchorEntry.box.id === entry.box.id || !['left', 'right', 'above', 'below'].includes(move.placement)) {
                   return fail('相对移动容器需要另一个参照容器和有效的 placement');
                 }
-                const anchor = boxBoundsNow(anchorEntry);
+                const anchor = bounds.get(anchorEntry.box);
                 const gap = gapOf(move.gap ?? 36);
                 axis = ['left', 'right'].includes(move.placement) ? 'x' : 'y';
                 direction = ['left', 'above'].includes(move.placement) ? -1 : 1;
@@ -3346,7 +3352,7 @@ export const server = http.createServer(async (req, res) => {
               const obstacleRects = allBoxes
                 .filter(b => b.kind === 'file' && !boxMembers(b).some(n => memberIds.has(n.id)))
                 .map(b => {
-                  const r = boxBoundsNow(b);
+                  const r = bounds.get(b.box);
                   return { x: r.x - 16, y: r.y - 16, w: r.w + 32, h: r.h + 32 };
                 });
               targetRect[axis] += clearCanvasAxis([targetRect], obstacleRects, axis, direction);
@@ -3361,7 +3367,8 @@ export const server = http.createServer(async (req, res) => {
             const entries = [...new Map(queries.map(q => { const b = resolveBox(q); return [b.box.id, b]; })).values()];
             if (entries.length < 2) return fail('至少需要 2 个文件框或目录容器才能对齐');
             const gap = gapOf(args.gap ?? 36);
-            const items = entries.map(entry => ({ entry, rect: boxBoundsNow(entry) }));
+            const bounds = boundsForMove(entries);
+            const items = entries.map(entry => ({ entry, rect: bounds.get(entry.box) }));
             items.sort((a, b) => a.rect[axis] - b.rect[axis]);
             const across = axis === 'x' ? 'y' : 'x';
             const length = axis === 'x' ? 'w' : 'h';
