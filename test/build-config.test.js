@@ -237,6 +237,22 @@ test('工程 B 从纯 Make 的变量、子 Makefile 和响应文件恢复 V850 �
   assert.equal(report.cprojectCount, 0);
 });
 
+test('导出前检查兼容头和数据库的目标类型', t => {
+  const root = temporaryProject(t);
+  const profile = { id: 'test', arch: 'rh850' };
+  const shim = path.join(root, '.tcu-callgraph-compat', 'compat_rh850.h');
+  const database = write(root, 'compile_commands.json', '[]');
+  fs.mkdirSync(shim, { recursive: true });
+  const generate = () => materializeCompileCommands(root, profile, { exportPath: 'compile_commands.json' });
+  assert.throws(generate, /普通文件/);
+  assert.equal(fs.readFileSync(database, 'utf8'), '[]');
+  fs.rmdirSync(shim);
+  fs.unlinkSync(database);
+  fs.mkdirSync(database);
+  assert.throws(generate, /普通文件/);
+  assert.equal(fs.existsSync(shim), false);
+});
+
 test('编译数据库从编译工作目录展开独立的 @flags.rsp，保留带空格的路径', t => {
   const root = projectB(t);
   const directory = path.join(root, 'build');

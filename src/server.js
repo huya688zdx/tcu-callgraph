@@ -5121,22 +5121,6 @@ export const server = http.createServer(async (req, res) => {
           if (!relCheck || relCheck.startsWith('..') || path.isAbsolute(relCheck) || !/\.json$/i.test(relCheck)) {
             return bad(res, '导出路径必须位于工程目录内且以 .json 结尾');
           }
-          // 二次校验真实路径，阻止符号链接或目录联接跳出工程根目录
-          const realRoot = fs.realpathSync(scanRoot);
-          let ancestor = path.dirname(absExport);
-          while (!fs.existsSync(ancestor)) {
-            const parent = path.dirname(ancestor);
-            if (parent === ancestor) break;
-            ancestor = parent;
-          }
-          const realAncestor = fs.realpathSync(ancestor);
-          const realRel = path.relative(realRoot, realAncestor).replace(/\\/g, '/');
-          if (realRel === '..' || realRel.startsWith('../') || path.isAbsolute(realRel)) {
-            return bad(res, '导出目标真实路径超出工程目录范围');
-          }
-          if (fs.lstatSync(absExport, { throwIfNoEntry: false })?.isSymbolicLink()) {
-            return bad(res, '不允许覆盖符号链接文件');
-          }
           const scan = await analysisJob('scan', () => scanRoot);
           const mat = materializeCompileCommands(scanRoot, profile, { files: scan.files, exportPath: relCheck });
           return json(res, {

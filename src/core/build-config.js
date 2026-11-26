@@ -652,6 +652,24 @@ function writeFileIfChanged(filePath, content) {
   return true;
 }
 
+/** 写入任何导出文件前，核对其目录实际位置和最终文件类型。 */
+function validateExportFile(root, target) {
+  const relative = path.relative(root, target);
+  const outside = rel => rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel);
+  if (!relative || outside(relative)) throw new Error('导出路径必须位于工程目录内');
+  const realRoot = fs.realpathSync(root);
+  let directory = root;
+  for (const part of relative.split(path.sep).slice(0, -1)) {
+    directory = path.join(directory, part);
+    if (!fs.lstatSync(directory, { throwIfNoEntry: false })) break;
+    const real = fs.realpathSync(directory);
+    if (outside(path.relative(realRoot, real))) throw new Error('导出目标真实路径超出工程目录范围');
+    if (!fs.statSync(real).isDirectory()) throw new Error('导出目标父路径必须是目录');
+  }
+  const file = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (file && !file.isFile()) throw new Error('导出目标必须是普通文件，不允许覆盖符号链接');
+}
+
 /** 为指定构建配置生成标准 compile_commands.json（及配套 GHS 兼容垫片头）。 */
 export function materializeCompileCommands(rootDir, profile, { files = [], cacheDir = null, exportPath = null } = {}) {
   if (!profile) throw new Error('未指定构建配置');
@@ -665,10 +683,10 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     : path.dirname(compileCommandsPath);
 
   const needsGhsShim = ['rh850', 'v850'].includes(profile.arch) || /ghs|v800|ccrh|ccv850/i.test(profile.compiler || '');
-  let shimPath = null;
-  if (needsGhsShim) {
-    shimPath = path.join(shimDir, `compat_${profile.arch || 'v800'}.h`);
-    writeFileIfChanged(shimPath, buildGhsCompatShim(profile.arch));
+  const shimPath = needsGhsShim ? path.join(shimDir, `compat_${profile.arch || 'v800'}.h`) : null;
+  if (exportPath) {
+    validateExportFile(absRoot, compileCommandsPath);
+    if (shimPath) validateExportFile(absRoot, shimPath);
   }
 
   const activeRels = selectProfileSourceFiles(profile, files);
@@ -709,6 +727,7 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     };
   });
 
+  if (shimPath) writeFileIfChanged(shimPath, buildGhsCompatShim(profile.arch));
   writeFileIfChanged(compileCommandsPath, JSON.stringify(entries, null, 2) + '\n');
 
   return {
