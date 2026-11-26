@@ -319,3 +319,17 @@ test('未解析的系统头使未知宏的分支保持可见，已知构建宏�
   const model = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'system', defines: ['BUILD=1'] } });
   assert.deepEqual(model.functions.map(fn => fn.name).sort(), ['absent', 'enabled', 'narrow', 'present', 'wide']);
 });
+
+test('未知编译器内建宏保留可能分支，显式 -U 仍确定删除该宏', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compiler-define-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), [
+    '#ifdef __GNUC__', 'void gcc_path(void) {}', '#else', 'void fallback_path(void) {}', '#endif',
+    '#if LOCAL_DEBUG', 'void disabled(void) {}', '#endif',
+  ].join('\n'));
+  const parse = macroArgs => loadModel(root, { parserId: 'builtin', parserOptions: {
+    buildProfileId: 'compiler', compilationUnits: { 'main.c': { defines: [], macroArgs } },
+  } }).functions.map(fn => fn.name).sort();
+  assert.deepEqual(parse([]), ['fallback_path', 'gcc_path']);
+  assert.deepEqual(parse(['-U', '__GNUC__']), ['fallback_path']);
+});

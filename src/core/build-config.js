@@ -312,7 +312,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
 }
 
 function requireResolvedMake(text) {
-  if (/\$(?:\(|\{)/.test(text)) throw new Error('暂不支持未解析的 Make 表达式');
+  if (/\$[({?%|*@<^+]/.test(text.replaceAll('$$', ''))) throw new Error('暂不支持未解析的 Make 表达式');
   return text;
 }
 
@@ -574,7 +574,8 @@ export function parseMakefileTree(entryAbs, rootDir) {
     const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
       ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
     const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(target) || vars)
-      .replace(/\$[@*<^+]/g, ref => {
+      .replace(/\$\$|\$[@*<^+]/g, ref => {
+        if (ref === '$$') return ref;
         if (ref === '$*' && stem === undefined) return ref;
         const paths = ref === '$@' ? [target || ''] : ref === '$*' ? [stem] : ref === '$<' ? deps.slice(0, 1)
           : ref === '$^' ? [...new Set(deps)] : deps;

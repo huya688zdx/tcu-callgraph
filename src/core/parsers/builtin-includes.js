@@ -33,7 +33,7 @@ export function profilePredefinedMacros(file, config) {
   ]);
   const macroArgs = config.macroArgs || [];
   for (let i = 0; i < macroArgs.length; i += 2) {
-    if (macroArgs[i] === '-U') macros.delete(macroArgs[i + 1]);
+    if (macroArgs[i] === '-U') macros.set(macroArgs[i + 1], null);
   }
   return buildMacros(config.defines, macros);
 }
@@ -160,7 +160,11 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
       stack.delete(fileKey);
       return scope.changes;
     }
-    processFile(source, predefined);
+    processFile(source, {
+      get: name => predefined.get(name),
+      // 编译器和目标平台的保留宏无法从构建参数完整推断。
+      isUnknown: name => !predefined.has(name) && /^(?:__|_[A-Z])/.test(name),
+    });
   }
   for (const [file, entry] of headers) {
     if (compiled.has(key(file.rel))) continue;

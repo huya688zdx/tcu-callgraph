@@ -888,7 +888,7 @@ export const builtinParser = {
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
     if (!hasProfile && !hasActive && !hasDefines) return 'builtin:11';
     return JSON.stringify([
-      'builtin:22',
+      'builtin:23',
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},

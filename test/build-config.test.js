@@ -960,3 +960,14 @@ test('POSIX Make 配方的转义空格保留真实源码和包含路径', { skip
   const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, scanSources(root), profile);
   assert.deepEqual(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name), ['active']);
 });
+
+test('Make 配方的未解析自动变量不会发布为全工程配置', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o', 'main.o: main.c', '\tcc -DFEATURE=1 -c $? -o $@',
+  ].join('\n'));
+  write(root, 'main.c', 'void active(void) {}');
+  write(root, 'debug.c', 'void unused(void) {}');
+  assert.throws(() => parseMakefileTree(makefile, root), /未解析的 Make 表达式/);
+  assert.deepEqual(discoverBuildProfiles(root).profiles, []);
+});
