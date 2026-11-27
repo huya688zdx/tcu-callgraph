@@ -214,3 +214,25 @@ void exec(const Ops *p) {
   assert.deepEqual(strictNames('driver.c::run_mach'), ['fnB']);
   assert.deepEqual(strictNames('framework.c::exec'), []);
 });
+
+test('expand 模式保留同函数内调用点之后的赋值候选（覆盖循环第二轮调用）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-loop-fnptr-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'loop.c'), `
+typedef void (*Fn)(void);
+static void first_fn(void) {}
+static void second_fn(void) {}
+static Fn cb_slot[1] = { first_fn };
+void loop_step(void) {
+  for (int i = 0; i < 2; i++) {
+    cb_slot[0]();
+    cb_slot[0] = second_fn;
+  }
+}
+`);
+  const expandModel = loadModel(dir);
+  const targets = (expandModel._index.outAdj.get('loop.c::loop_step') || [])
+    .filter(e => e.kind === 'fnptr').map(e => e.callee);
+  assert.ok(targets.includes('first_fn'), 'expand 模式应保留初始目标 first_fn');
+  assert.ok(targets.includes('second_fn'), 'expand 模式应包含同函数内调用之后写入的 second_fn');
+});

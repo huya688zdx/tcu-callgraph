@@ -921,7 +921,6 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         }
         if (dispatchPolicy === 'expand' && writes) {
           for (const w of writes) {
-            if (w.fnId === fn.id && (w.line > call.line || (w.line === call.line && (w.col ?? 0) >= (call.col ?? 0)))) continue;
             if (!w.escape && !compatiblePaths(w.path, source.path) && !compatiblePaths(source.path, w.path)) continue;
             for (const rhsT of (w.rhsTargets || [])) {
               if (targetKind(rhsT, w.file, { line: w.line, col: w.col }, w.fnId) !== 'function') continue;

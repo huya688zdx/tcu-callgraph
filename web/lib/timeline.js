@@ -446,15 +446,23 @@ exitBtn?.addEventListener('click', exitReview);
 function syncTimelineControls() {
   if (scopeBookmarkWrap) {
     scopeBookmarkWrap.hidden = !state.activeBookmark;
-    if (!state.activeBookmark && scopeBookmarkCheck) {
-      scopeBookmarkCheck.checked = false;
-      tl.bookmarkId = null;
+    if (scopeBookmarkCheck) {
+      if (!state.activeBookmark) {
+        scopeBookmarkCheck.checked = false;
+        tl.bookmarkId = null;
+      } else {
+        tl.bookmarkId = scopeBookmarkCheck.checked ? state.activeBookmark.id : null;
+      }
     }
   }
   if (checkpointBtn) {
     checkpointBtn.disabled = state.at > 0 || !!state.view?.comparison || !state.roots.length;
   }
 }
+
+window.addEventListener('cg:bookmark-changed', () => {
+  syncTimelineControls();
+});
 
 btn?.addEventListener('click', () => {
   openModal('timelineModal');

@@ -13,6 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { openStore } from '../src/core/store.js';
+import { diffViewScopes } from '../src/core/view-scope.js';
 
 const jsonPost = (base, p, body) =>
   fetch(base + p, {
@@ -285,4 +286,14 @@ test('书签原地更新、版本冲突 409、书签快照回放与检查点里�
   const ms = await (await fetch(`${base}/api/events?level=milestone&bookmarkId=${created.bookmark.id}`)).json();
   assert.ok(ms.events.some((e) => e.op === 'view.checkpoint' && e.ctx?.checkpointName === '检查点一'));
   assert.ok(ms.events.some((e) => e.op === 'bookmark.save' && e.ctx?.action === 'update'));
+});
+
+test('diffViewScopes 能识别同一函数的局部展开层数变化', () => {
+  const diff = diffViewScopes(
+    { roots: ['a.c::f'], expansions: [{ root: 'a.c::f', up: 0, down: 1 }] },
+    { roots: ['a.c::f'], expansions: [{ root: 'a.c::f', up: 0, down: 2 }] },
+  );
+  assert.equal(diff.changed, true);
+  assert.equal(diff.expansionDepthChanged, true);
+  assert.match(diff.summary, /局部展开/);
 });

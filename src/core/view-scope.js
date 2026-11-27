@@ -50,6 +50,12 @@ export function diffViewScopes(before = {}, after = {}) {
   const nextVarSet = new Set(next.vars);
   const addedVars = next.vars.filter((v) => !prevVarSet.has(v));
   const removedVars = prev.vars.filter((v) => !nextVarSet.has(v));
+  const prevExpMap = new Map(prev.expansions.map((e) => [e.root, `${e.up}:${e.down}`]));
+  const nextExpMap = new Map(next.expansions.map((e) => [e.root, `${e.up}:${e.down}`]));
+  const expansionDepthChanged =
+    [...prevExpMap.entries()].some(([root, depth]) => nextExpMap.has(root) && nextExpMap.get(root) !== depth) ||
+    (!addedNodes.length && !removedNodes.length &&
+      (prevExpMap.size !== nextExpMap.size || [...nextExpMap.entries()].some(([root, depth]) => prevExpMap.get(root) !== depth)));
   const depthChanged = prev.up !== next.up || prev.down !== next.down;
   const layoutChanged = prev.groupMode !== next.groupMode;
   const hiddenChanged = JSON.stringify(prev.hiddenVars) !== JSON.stringify(next.hiddenVars);
@@ -65,6 +71,7 @@ export function diffViewScopes(before = {}, after = {}) {
   if (addedVars.length) parts.push(`+${addedVars.length} 个变量`);
   if (removedVars.length) parts.push(`-${removedVars.length} 个变量`);
   if (depthChanged) parts.push(`深度 ↑${next.up}↓${next.down}`);
+  if (expansionDepthChanged) parts.push('调整局部展开层数');
   if (layoutChanged) parts.push(`布局→${next.groupMode === 'period' ? '按轮次' : next.groupMode === 'flat' ? '扁平' : '按文件'}`);
   if (!parts.length && hiddenChanged) parts.push('更新变量显隐');
 
@@ -74,6 +81,7 @@ export function diffViewScopes(before = {}, after = {}) {
     addedVars,
     removedVars,
     depthChanged,
+    expansionDepthChanged,
     layoutChanged,
     hiddenChanged,
     changed: parts.length > 0,
