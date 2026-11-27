@@ -14,7 +14,7 @@ import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
 import { buildStandaloneHtml } from './lib/html.js';
-import './lib/ui-select.js';
+import { positionPopover } from './lib/ui-select.js';
 // 样式设置面板：恢复已存主题并接好「样式」按钮，纯副作用导入
 import './lib/appearance.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
@@ -323,7 +323,9 @@ function syncBookmarkBadge() {
   }
   if (bookmarkBtn) {
     if (bm) {
-      bookmarkBtn.textContent = `🔖 ${bm.name}${dirty ? ' ●' : ''}`;
+      const name = document.createElement('span');
+      name.textContent = bm.name + (dirty ? ' ●' : '');
+      bookmarkBtn.replaceChildren('🔖 ', name);
       bookmarkBtn.title = dirty ? t('bookmark.dirtyHint') : t('bookmark.currentName', { name: bm.name });
     } else if (hasContent && !state.view?.comparison) {
       bookmarkBtn.textContent = `🔖 ${t('bookmark.unnamed')}`;
@@ -1045,14 +1047,25 @@ els.cv.addEventListener('pointerdown', (event) => {
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
 const toolMenus = [...document.querySelectorAll('header .tool-menu')];
+function positionToolMenus() {
+  for (const menu of toolMenus) {
+    if (menu.open) positionPopover(menu.querySelector('.tool-popover'),
+      menu.querySelector('summary').getBoundingClientRect(), window.innerHeight * 0.7, true);
+  }
+}
+document.getElementById('app').addEventListener('scroll', positionToolMenus);
 document.addEventListener('click', (event) => {
   for (const menu of toolMenus) {
     if (!menu.contains(event.target) || event.target.closest('button')) menu.open = false;
   }
 });
 for (const menu of toolMenus) {
-  menu.querySelector('summary').addEventListener('click', () => {
+  menu.addEventListener('toggle', positionToolMenus);
+  menu.querySelector('summary').addEventListener('click', (event) => {
+    event.preventDefault();
     for (const other of toolMenus) if (other !== menu) other.open = false;
+    menu.open = !menu.open;
+    positionToolMenus();
   });
 }
 document.addEventListener('keydown', (event) => {
@@ -1103,9 +1116,15 @@ document.addEventListener('callgraph:langchange', () => {
   if (document.getElementById('secDataflow').hidden) renderDetail(state.selected, null, { notifySelection: false }).catch(() => {});
   renderLabelPanel({ notifySelection: false });
   syncCanvasControls();
+  positionToolMenus();
   draw();
 });
-window.addEventListener('resize', () => { constrainCam(); resize(); });
+window.addEventListener('resize', () => { constrainCam(); resize(); positionToolMenus(); });
+// 工具栏会因译文或书签换行，浮层随它的实际高度定位。
+new ResizeObserver(([entry]) => {
+  document.documentElement.style.setProperty('--toolbar-height', entry.target.offsetHeight + 'px');
+  positionToolMenus();
+}).observe(document.querySelector('header'));
 resize();
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {

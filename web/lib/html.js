@@ -53,13 +53,18 @@ export async function buildStandaloneHtml() {
 <style>${css}
 #app { grid-template-columns: minmax(0, 1fr) 310px; grid-template-areas: "top top" "main right"; }
 .offline-bar { display:flex; align-items:center; flex-wrap:wrap; gap:12px; padding:10px 14px; }
+.offline-bar > span { min-width:0; overflow-wrap:anywhere; }
 .offline-bar .hint { white-space:normal; }
+@media (max-width:720px) {
+  #app { grid-template-columns:minmax(0, 1fr); grid-template-areas:"top" "main" "right";
+    grid-template-rows:auto minmax(18rem, 56vh) minmax(16rem, 1fr); }
+}
 </style></head><body>
 <div id="app">
 <header class="offline-bar"><b>${esc(t('app.title'))}</b><span>${esc(title)}</span><button id="offlineFit">${esc(t('help.fit'))}</button>
 <button id="offlinePng">${esc(t('offline.png'))}</button><button id="offlineSvg">${esc(t('btn.svg'))}</button>
 <span class="hint">${esc(t('offline.hint'))}</span></header>
-<main><canvas id="cv"></canvas>${document.getElementById('legend').outerHTML}<div id="tooltip"></div><div id="ctxMenu" class="ctx-menu"></div></main>
+<main><canvas id="cv"></canvas><div class="canvas-status">${document.getElementById('legend').outerHTML}</div><div id="tooltip"></div><div id="ctxMenu" class="ctx-menu"></div></main>
 ${right.outerHTML}
 </div><div hidden><input id="search"><ul id="results"></ul></div>
 <script>

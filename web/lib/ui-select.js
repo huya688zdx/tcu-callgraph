@@ -32,15 +32,20 @@ function position() {
   if (!active || !active.isConnected) { close(); return; }
   const rect = controls.get(active).button.getBoundingClientRect();
   pop.style.minWidth = `${rect.width}px`;
+  positionPopover(pop, rect, 266);
+}
+
+// 同一套视口边界也用于工具栏的导出和帮助菜单；工具栏换行后锚点可能靠左。
+export function positionPopover(panel, rect, maxHeight, alignEnd = false) {
   const below = window.innerHeight - rect.bottom - 12;
   const above = rect.top - 12;
-  pop.style.maxHeight = `${Math.max(40, Math.min(266, Math.max(below, above)))}px`;
-  pop.style.left = '0px';
-  pop.style.top = '0px';
-  const width = pop.offsetWidth;
-  const height = pop.offsetHeight;
-  pop.style.left = `${Math.max(6, Math.min(rect.left, window.innerWidth - width - 6))}px`;
-  pop.style.top = `${Math.max(6, rect.bottom + 6 + height <= window.innerHeight ? rect.bottom + 6 : rect.top - height - 6)}px`;
+  panel.style.maxHeight = `${Math.max(40, Math.min(maxHeight, Math.max(below, above)))}px`;
+  panel.style.left = '0px';
+  panel.style.top = '0px';
+  const width = panel.offsetWidth, height = panel.offsetHeight;
+  const left = alignEnd ? rect.right - width : rect.left;
+  panel.style.left = `${Math.max(6, Math.min(left, document.documentElement.clientWidth - width - 6))}px`;
+  panel.style.top = `${Math.max(6, height <= below ? rect.bottom + 6 : rect.top - height - 6)}px`;
 }
 
 function highlight(index) {

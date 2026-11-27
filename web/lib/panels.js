@@ -613,10 +613,11 @@ function openTreeMenu(ev, kind, payload) {
 
 function buildTreeNode(node, depth, expanded = new Map()) {
   const wrap = document.createElement('div');
-  const row = document.createElement('div');
+  const row = document.createElement('button');
+  row.type = 'button';
   row.className = 'tn ' + node.type;
   row.dataset.path = node.path == null ? '' : node.path;
-  row.style.paddingLeft = depth * 8 + 4 + 'px';
+  row.style.paddingInlineStart = `min(${depth * 8 + 4}px, 28%)`;
 
   const children = visibleTreeChildren(node);
   const count = node.functions?.length || 0;
@@ -654,7 +655,7 @@ function buildTreeNode(node, depth, expanded = new Map()) {
       const fr = document.createElement('div');
       fr.className = 'tn fn';
       fr.dataset.fnid = f.id;
-      fr.style.paddingLeft = (depth + 1) * 8 + 18 + 'px';
+      fr.style.paddingInlineStart = `min(${(depth + 1) * 8 + 18}px, 32%)`;
       const lab = document.createElement('span');
       lab.className = 'nm';
       lab.textContent = f.name;

@@ -305,10 +305,10 @@ export async function launchCdp({
     };
 
     /** 敲一个键；modifiers 用 CDP 的位掩码（1=Alt 2=Ctrl 4=Meta 8=Shift） */
-    const pressKey = async ({ key, code, vk, modifiers } = {}) => {
+    const pressKey = async ({ key, code, vk, modifiers, text } = {}) => {
       const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
       if (modifiers) base.modifiers = modifiers;
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base });
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', ...base, text });
       await send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
     };
 
