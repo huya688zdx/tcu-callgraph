@@ -282,3 +282,70 @@ test('Clang 聚合复制按复制时的声明和成员解析回调', requiresCla
     });
   }
 });
+
+test('Clang 按调用点和子对象保留传址写入的回调候选', requiresClang, async t => {
+  const dir = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run; Fn slots[2]; } Ops;
+typedef struct { Ops rows[2]; } Group;
+void first(void) {} void second(void) {} void noise(void) {}
+void init(Ops *p) { p->run = second; p->slots[0] = second; }
+void set_slot(Fn *p) { *p = second; }
+void via_index(Ops *p) { p[0].run = second; }
+void next_index(Ops *p) { p[1].run = second; }
+void any_index(Ops *p, int i) { p[i].run = second; }
+void cast_write(const Ops *p) { ((Ops *)p)->run = second; }
+void forward(Ops *p) { p->slots[0] = first; init(p); }
+void noop(Ops *p) { (void)p->run; }
+void opaque(Ops *);
+void inspect(const Ops *p) { (void)p->run; }
+void calls(void) {
+  Ops local = {first, {first,first}}, sibling = {noise, {noise,noise}};
+  local.run(); init(&local); local.run(); sibling.run(); local.slots[0](); local.slots[1]();
+}
+void nested(void) {
+  Group g = {{{first,{first,first}}, {noise,{noise,noise}}}};
+  init(&g.rows[0]); g.rows[0].run(); g.rows[1].run();
+}
+void address(void) {
+  Ops local = {first}; inspect(&local); (void)sizeof((init(&local), 0));
+  (void)(&local != 0); local.run(); set_slot(&local.run); local.run();
+}
+void alias(void) { Ops s = {first}; Ops *p = &s; init(p); s.run(); }
+void alias_later(void) { Ops s = {first}; Ops *p = &s; s.run = first; init(p); s.run(); }
+void boundaries(void) { Ops s = {first}; noop(&s); s.run(); opaque(&s); s.run(); }
+void forwarding(void) { Ops s = {first}; forward(&s); s.run(); }
+void indexed(void) { Ops rows[2] = {{first}, {noise}}; via_index(&rows[0]); rows[0].run(); rows[1].run(); }
+void decay(void) { Ops rows[2] = {{first}, {noise}}; init(rows); rows[0].run(); rows[1].run();
+  next_index(rows); rows[1].run(); }
+void offset(int i) { Ops rows[2] = {{first}, {noise}}; next_index(&rows[0]); rows[0].run(); rows[1].run();
+  any_index(&rows[0], i); rows[0].run(); }
+void mutable(void) { Ops s = {first}; cast_write(&s); s.run(); }
+void snapshots(void) { Ops s = {first}; Ops before = s; init(&s); Ops after = s; before.run(); after.run(); }
+void branches(int n) { Ops s = {first}; if (n) init(&s); else s.run(); s.run(); }
+void loop(int n) { Ops s = {first}; while (n--) { s.run(); init(&s); } }
+void readonly(void) { const Ops s = {first}; inspect(&s); s.run(); }`);
+  const changed = ['first', 'second'];
+  for (const policy of ['expand', 'strict']) {
+    const model = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [name, expected] of Object.entries({
+      calls: [['first'], changed, ['noise'], changed, ['first']],
+      nested: [changed, ['noise']], address: [['first'], changed], alias: [changed], alias_later: [changed],
+      boundaries: [['first'], changed], forwarding: [changed], indexed: [changed, ['noise']],
+      offset: [['first'], ['noise','second'], changed], decay: [changed, ['noise'], ['noise','second']], mutable: [changed],
+      snapshots: [['first'], changed], branches: [['first'], changed], loop: [changed],
+    })) await t.test(policy + ' ' + name, () => {
+      const id = 'main.c::' + name;
+      const sites = model.indirectCalls.filter(s => s.caller === id).sort((a,b) => a.line - b.line || a.col - b.col);
+      assert.deepEqual(sites.map(s => s.candidates.map(c => c.name).sort()), expected);
+      assert.ok(sites.every(s => s.resolution === (policy === 'strict' ? 'unresolved' : 'possible')));
+      const edges = (model._index.outAdj.get(id) || []).filter(e => e.kind === 'fnptr' && !e.to.startsWith('ext::'));
+      assert.deepEqual(sites.map(s => edges.filter(e => e.siteId === s.siteId).map(e => e.callee).sort()),
+        policy === 'strict' ? expected.map(() => []) : expected);
+      assert.ok(edges.every(e => e.resolution === 'possible'));
+    });
+    await t.test(policy + ' readonly', () => {
+      const edges = model._index.outAdj.get('main.c::readonly').filter(e => e.kind === 'fnptr');
+      assert.deepEqual(edges.map(e => [e.callee, e.resolution]), [['first', 'exact']]);
+    });
+  }
+});

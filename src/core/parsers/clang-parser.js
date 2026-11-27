@@ -7,7 +7,7 @@ import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
-  readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
+  readTranslationUnit, transferredValues, typeOf, variableModel, walk } from './clang-ast.js';
 import { aggregateCopyReader, matchingSlot } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
@@ -103,6 +103,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     if (!addressTaken.has(sig)) addressTaken.set(sig, new Set());
     addressTaken.get(sig).add(target);
   };
+  const indirectFieldWrites = new Map(), forwardedParams = new Set();
   const localFields = new WeakMap();
   const fieldsFor = (unit, node) => {
     const scope = unit.scopeOf.get(node);
@@ -128,6 +129,13 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     for (const record of unit.functions) {
       const direct = new Set();
       for (const node of walk(record.body)) {
+        for (const value of transferredValues(node)) {
+          if (!typeOf(value).includes('*')) continue;
+          for (const use of walk(value)) {
+            const ref = use.referencedDecl;
+            if (ref?.kind === 'ParmVarDecl') forwardedParams.add(objectKey(ref, unit));
+          }
+        }
         if (node.kind === 'VarDecl' && node.init && node.storageClass !== 'extern') {
           indexTable(node, unit, fieldsFor(unit, node));
         }
@@ -144,16 +152,19 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         declWrites.get(declKey).push({ ...w, record });
         if (w.fieldId) {
           const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
-          for (const target of w.targets) indexField(fields, unit, w.fieldId, w.slot, target);
+          for (const target of w.targets) {
+            indexField(fields, unit, w.fieldId, w.slot, target);
+            if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, target);
+          }
         }
       }
     }
   }
 
-  const copyReaders = new WeakMap();
-  function copiedTargets(record, pointer, call) {
+  const slotReaders = new WeakMap();
+  function trackedTargets(record, pointer, call) {
     if (!pointer?.member || pointer.throughPointer) return null;
-    if (!copyReaders.has(record)) {
+    if (!slotReaders.has(record)) {
       const ambientTargets = (key, slot) => {
         if (typeof key !== 'string') return [];
         const ids = [];
@@ -163,9 +174,29 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         for (const w of declWrites.get(key) || []) if (w.record !== record && matchingSlot(w.slot, slot)) ids.push(...w.targets);
         return ids;
       };
-      copyReaders.set(record, aggregateCopyReader(record, objectKey, resolveFunction, ambientTargets));
+      // 只看直接被调函数对应形参的写入。地址经别名或未知函数传递时，按声明字段保留间接写候选。
+      const parameterWrites = (callee, index) => {
+        const unit = record.context;
+        const id = resolveDecl(fnRef(callee)?.referencedDecl, unit, fnDecls, publicFns);
+        const definitions = recordsById.get(id);
+        const target = definitions?.find(r => r.context === unit) || definitions?.[0];
+        const param = children(target?.node).filter(n => n.kind === 'ParmVarDecl')[index];
+        if (!param) return [null];
+        const writes = (declWrites.get(param) || []).filter(w => w.throughPointer);
+        if (forwardedParams.has(param)) writes.push(null);
+        return writes;
+      };
+      const fieldWrites = (fieldId, slot) => {
+        const entries = indirectFieldWrites.get(fieldKey(record.context, fieldId));
+        const ids = [];
+        for (const [indices, targets] of entries || []) {
+          if (matchingSlot(indices, memberIndices(slot))) ids.push(...targets);
+        }
+        return ids;
+      };
+      slotReaders.set(record, aggregateCopyReader(record, objectKey, resolveFunction, ambientTargets, { parameterWrites, fieldWrites }));
     }
-    return copyReaders.get(record)(pointer, call);
+    return slotReaders.get(record)(pointer, call);
   }
   const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
@@ -188,12 +219,12 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       const signature = functionSignature(typeOf(callee), context);
       const varKey = objectKey(pointer?.decl, context);
       const table = tables.get(varKey);
-      const copied = copiedTargets(record, pointer, node);
-      // 空数组表示已追踪到一次复制，但源成员未知；不要重新引入旧初始化值。
-      const exact = copied === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+      const tracked = trackedTargets(record, pointer, node);
+      // 空数组表示追踪过该成员，但目前的值未知；不能重新引入旧初始化值。
+      const exact = tracked === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const matchingSlots = copied || [];
-      if (copied === null && table) {
+      const matchingSlots = tracked || [];
+      if (tracked === null && table) {
         if (pointer.slot.includes('[*]')) {
           for (const [slot, to] of table.slots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(to);
           for (const [slot, tos] of table.candidateSlots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(...tos);
@@ -203,7 +234,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
       }
       const objectWrites = declWrites.get(varKey) || [];
-      const writesForVar = copied === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
+      const writesForVar = tracked === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
       const writtenTargets = writesForVar.flatMap(w => w.targets);
       const field = fieldKey(context, pointer?.fieldId);
       const fieldCandidates = new Set();

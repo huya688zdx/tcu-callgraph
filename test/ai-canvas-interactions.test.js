@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
@@ -122,4 +123,87 @@ test('浏览器中的 AI 链路、数据流上下文与跨窗口书签', async t
     const { list } = await (await fetch(srv.baseUrl + '/api/bookmarks')).json();
     assert.deepEqual(list.find(b => b.id === bookmark.id).roots, [to]);
   });
+});
+
+test('浏览器悬停 AI 链路节点时只为对应画布节点描边，离开和切换工程会清除', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const post = async (route, data) => {
+    const res = await fetch(srv.baseUrl + route, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    assert.ok(res.ok, route);
+    return res.json();
+  };
+  const main = 'main.c::main', gear = 'gear.c::Gear_Init';
+  const scope = { roots: [main], up: 0, down: 1, group: false };
+  // 两个真实工程都有 main.c::main。旧工程的悬停若泄漏，会在新工程的同名框上出现。
+  const next = await post('/api/switch', { path: path.resolve('samples/demo') });
+  await post('/api/page', scope);
+  await post('/api/switch', { path: path.resolve('samples/tcu') });
+  await post('/api/page', scope);
+  await post('/api/ai/config', { baseUrl: srv.baseUrl + '/v1', model: 'fixture' });
+  await post('/api/ai/chats', { activeId: 'hover', threads: [{ id: 'hover', messages: [{
+    role: 'assistant', text: '调用链', chains: [{ id: 'start', steps: [{ id: main }, { id: gear }] }],
+  }] }] });
+
+  const br = await launchCdp({ url: srv.baseUrl });
+  t.after(() => br.close());
+  await br.waitFor('window.__cg?.view?.nodes.some(n => n.id === ' + JSON.stringify(gear) + ')');
+  await br.evaluate("document.getElementById('aiBtn').click()");
+  await br.waitFor("document.querySelectorAll('.ai-chain-node').length === 2");
+  await br.evaluate("Promise.all(document.getElementById('aiDrawer').getAnimations().map(a => a.finished))");
+  const moveTo = async selector => {
+    const pos = await br.evaluate(`(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      el.scrollIntoView({block:'nearest'});
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })()`);
+    await br.send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...pos });
+    assert.ok(await br.evaluate("document.querySelector(" + JSON.stringify(selector) + ").matches(':hover')"), selector);
+  };
+  const outlines = (...ids) => br.evaluate(`(() => {
+    const { view, cam } = window.__cg;
+    const ctx = document.getElementById('cv').getContext('2d');
+    return ${JSON.stringify(ids)}.map(id => {
+      const n = view.nodes.find(n => n.id === id), d = devicePixelRatio;
+      const x = Math.round((cam.x + (n.x + n.w / 2) * cam.k) * d);
+      const y = Math.round((cam.y + n.y * cam.k) * d);
+      // 取节点上边框中央的一段像素，避开圆角、连线和文本。
+      const pixels = ctx.getImageData(x - 8, y - 3, 16, 7).data;
+      let painted = false;
+      for (let i = 0; i < pixels.length; i += 4) {
+        if (pixels[i + 3] <= 200) continue;
+        painted = true;
+        if (pixels[i + 2] - pixels[i] > 100 && pixels[i + 2] - pixels[i + 1] > 100) return true;
+      }
+      if (!painted) throw new Error('看不到节点边框 ' + id);
+      return false;
+    });
+  })()`);
+  const first = '.ai-chain-node:first-child', last = '.ai-chain-node:last-child';
+  assert.deepEqual(await outlines(main, gear), [false, false]);
+  await moveTo(first);
+  assert.deepEqual(await outlines(main, gear), [true, false], '只高亮第一步的画布边框');
+  await moveTo(last);
+  assert.deepEqual(await outlines(main, gear), [false, true], '悬停转移到第二步');
+  await moveTo('.ai-chain-title');
+  assert.deepEqual(await outlines(main, gear), [false, false], '离开芯片后两处恢复原描边');
+  await moveTo(first);
+  assert.deepEqual(await outlines(main), [true]);
+  // 切换对话会移除芯片，即使指针不动也不能遗留高亮。
+  await br.evaluate("document.getElementById('aiNewChat').click()");
+  await br.waitFor("!document.querySelector('.ai-chain-node')");
+  assert.deepEqual(await outlines(main), [false]);
+  await br.evaluate("const sel = document.getElementById('aiChatSelect'); sel.value = 'hover'; sel.dispatchEvent(new Event('change'))");
+  await moveTo('.ai-chain-title');
+  await moveTo(first);
+  assert.deepEqual(await outlines(main), [true]);
+  // 用工程选择器切换而不移动指针，避免 mouseleave 代替工程清理。
+  await br.evaluate(`document.getElementById('projectBtn').click();
+    document.getElementById('projectPath').value = ${JSON.stringify(path.resolve('samples/demo'))};
+    document.getElementById('projectOpen').click();`);
+  await br.waitFor('window.__cg.view?.projectId === ' + next.project.id + ' && window.__cg.view.nodes.some(n => n.id === ' + JSON.stringify(main) + ')');
+  assert.deepEqual(await outlines(main), [false], '新工程中同 ID 节点使用普通描边');
 });

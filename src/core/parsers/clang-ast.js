@@ -21,6 +21,14 @@ export const fnRef = (node) => {
 const initializers = (node) => node.array_filler?.length ? node.array_filler.slice(1) : children(node);
 export const initializer = (node) => children(node).find((n) => !n.kind?.endsWith('Attr'));
 
+// 只有传递、保存或返回指针值才可能让地址逃逸。比较地址、取 sizeof 等不构成传址写入。
+export function transferredValues(node) {
+  if (node.kind === 'CallExpr') return children(node).slice(1);
+  if (node.kind === 'VarDecl' && node.init) return [initializer(node)];
+  if (node.kind === 'BinaryOperator' && node.opcode === '=') return [children(node)[1]];
+  return node.kind === 'ReturnStmt' ? children(node) : [];
+}
+
 export function* walk(node) {
   yield node;
   for (const child of children(node)) yield* walk(child);
@@ -409,6 +417,8 @@ export function pointerExpression(node, context = null) {
     return {
       ...base,
       slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      ...(node.kind === 'ArraySubscriptExpr' && !base.slot && !base.throughPointer && baseNode.castKind !== 'ArrayToPointerDecay'
+        ? { pointerIndex: constant ?? '*' } : {}),
       throughPointer: base.throughPointer || node.isArrow ||
         (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay'),
       fieldId: node.kind === 'MemberExpr' ? node.referencedMemberDecl : base.fieldId,
@@ -446,7 +456,7 @@ export function collectAssignmentWrites(body, context, resolveFunction) {
     if (!targets.length && !/\(\s*\*/.test(typeOf(children(node)[0]))) continue;
     const pos = context.loc.begin(node);
     writes.push({
-      node, decl: lhs.decl,
+      node, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
       slot: lhs.slot,
       fieldId: lhs.fieldId,
       line: pos?.line ?? 0,

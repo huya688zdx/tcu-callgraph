@@ -1802,6 +1802,13 @@ function chainEdgeKeys(chain, nodeIds) {
   });
 }
 
+function clearChainHover(nodeId) {
+  if (nodeId && state.aiHover?.nodeId === nodeId) {
+    state.aiHover = null;
+    draw();
+  }
+}
+
 function renderChainCards(box, chains) {
   if (!Array.isArray(chains) || !chains.length) return;
   const txtEl = box.querySelector('.ai-msg-text');
@@ -1875,15 +1882,11 @@ function renderChainCards(box, chains) {
         locateSymbolFromChat(step.id || step.name);
       });
       nodeBtn.addEventListener('mouseenter', () => {
+        if (!step.id) return;
         state.aiHover = { nodeId: step.id };
         draw();
       });
-      nodeBtn.addEventListener('mouseleave', () => {
-        if (state.aiHover?.nodeId === step.id) {
-          state.aiHover = null;
-          draw();
-        }
-      });
+      nodeBtn.addEventListener('mouseleave', () => clearChainHover(step.id));
       body.appendChild(nodeBtn);
     });
     card.append(head, body);
@@ -1999,6 +2002,7 @@ function renderChangesetUndo(box, changeset) {
 
 function renderThreadMessages() {
   if (!messagesEl) return;
+  clearChainHover(state.aiHover?.nodeId); // 替换消息 DOM 不会触发旧芯片的 mouseleave。
   const th = activeThread();
   renderTelemetry(th);
   updateChatControls();
