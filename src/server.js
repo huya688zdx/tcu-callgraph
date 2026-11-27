@@ -5125,35 +5125,36 @@ export const server = http.createServer(async (req, res) => {
             seedIds = (cur?.roots || []).slice(0, 6);
             if (!seedIds.length) return { ok: false, error: '当前画布为空，请提供 root 或 targets 函数/变量名' };
           } else {
-            const fnRes = resolveSymbols(MODEL, rawTargets, 'fn');
-            if (fnRes.ambiguous.length) {
-              const branches = branchesFromIds(MODEL, fnRes.ambiguous.flatMap(a => a.candidates || []));
-              return {
-                ok: false,
-                needsVehicleChoice: branches.length > 1,
-                ...(branches.length > 1 ? { pathBranches: branches } : {}),
-                ambiguous: fnRes.ambiguous,
-                error: '目标函数存在多处定义，请先明确具体「文件::函数名」或目录分支',
-              };
+            let matches = rawTargets.map(resolveFnOrVar);
+            if (matches.some(m => m.notFound.length) && !COMPARISON && MODEL.source !== 'dot') {
+              // 暂定全局定义可能要到数据流索引建立后才成为图节点。
+              await ensureAnalysis(MODEL);
+              assertActive();
+              matches = rawTargets.map(resolveFnOrVar);
             }
-            seedIds = fnRes.resolved;
-            if (!seedIds.length) {
-              const varRes = resolveSymbols(MODEL, rawTargets, 'var');
-              if (varRes.resolved.length) seedIds = varRes.resolved;
-              else return { ok: false, error: `未找到目标符号：${rawTargets.join(', ')}`, notFound: fnRes.notFound };
+            const ambiguous = matches.flatMap(m => m.ambiguous);
+            if (ambiguous.length) {
+              const branches = branchesFromIds(MODEL, ambiguous.flatMap(a => a.candidates || []));
+              return { ok: false, needsVehicleChoice: branches.length > 1,
+                ...(branches.length > 1 ? { pathBranches: branches } : {}), ambiguous,
+                error: '目标符号存在多处定义，请先指定完整函数或变量 ID' };
             }
+            const notFound = matches.flatMap(m => m.notFound);
+            if (notFound.length) return { ok: false, error: `未找到目标符号：${notFound.join(', ')}`, notFound };
+            seedIds = [...new Set(matches.flatMap(m => m.resolved))];
           }
           const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'both';
           const depth = Math.max(1, Math.min(5, Math.trunc(Number(args.depth) || 2)));
           const focusFilter = normalizePathPrefixes(args.focusFilter);
           const includeDataflow = args.includeDataflow !== false;
           const addToCanvas = args.addToCanvas !== false;
-          const sliceNodes = new Map(); // id -> { depthSigned, order }
+          if (addToCanvas && COMPARISON) return { ok: false, error: '比较模式下请用 addToCanvas: false 生成只读导览' };
+          const sliceNodes = new Map(); // 节点 ID → 相对根的有向层级
           const sliceEdges = [];
           const seenEdge = new Set();
           const allowId = (id) => {
             const n = MODEL._index?.byId?.get(id);
-            if (!n || n.external || overlay.deleted.nodes[id]) return false;
+            if (!n || n.external || n.headerSymbol || overlay.deleted.nodes[id]) return false;
             if (focusFilter.length && n.kind !== 'var') {
               const file = fileOfNodeId(MODEL, id);
               if (!focusFilter.some(pref => fileMatchesPathPrefix(file, pref)) && !seedIds.includes(id)) return false;
@@ -5163,44 +5164,48 @@ export const server = http.createServer(async (req, res) => {
           for (const sid of seedIds) {
             if (allowId(sid) && !sliceNodes.has(sid)) sliceNodes.set(sid, 0);
           }
-          if (direction === 'up' || direction === 'both') {
-            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
-            while (q.length && sliceNodes.size < 40) {
-              const cur = q.shift();
-              if (cur.d >= depth) continue;
-              for (const e of MODEL._index?.inAdj?.get(cur.id) || []) {
-                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                if (!allowId(e.from)) continue;
-                const ek = edgeKeyOf(e);
-                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
-                if (!sliceNodes.has(e.from)) {
-                  sliceNodes.set(e.from, -(cur.d + 1));
-                  q.push({ id: e.from, d: cur.d + 1 });
-                }
-                if (sliceNodes.size >= 40) break;
-              }
+          // 数据流按「写者 → 变量 → 读者」讲解，画布则将读写合为「函数 → 变量」一条边。
+          const presentationEdgeKey = e => {
+            if (!e.df) return edgeKeyOf(e);
+            const writer = e.kind === 'df-write';
+            const fn = writer ? e.from : e.to, variable = writer ? e.to : e.from;
+            if (COMPARISON) {
+              const edge = MODEL._index.outAdj.get(fn)?.find(edge => edge.kind === 'var' && edge.to === variable);
+              if (edge) return edgeKeyOf(edge);
             }
-          }
-          if (direction === 'down' || direction === 'both') {
-            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
-            while (q.length && sliceNodes.size < 40) {
-              const cur = q.shift();
-              if (cur.d >= depth) continue;
-              for (const e of MODEL._index?.outAdj?.get(cur.id) || []) {
-                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                if (!allowId(e.to)) continue;
-                const ek = edgeKeyOf(e);
-                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
-                if (!sliceNodes.has(e.to)) {
-                  sliceNodes.set(e.to, cur.d + 1);
-                  q.push({ id: e.to, d: cur.d + 1 });
-                }
+            return canvasEdgeKey({ from: fn, to: variable, kind: 'var' });
+          };
+          for (const upstream of [true, false]) {
+            if (upstream ? direction === 'down' : direction === 'up') continue;
+            const visited = new Set(seedIds.filter(id => sliceNodes.has(id)));
+            const queue = [...visited].map(id => ({ id, d: 0 }));
+            while (queue.length && sliceNodes.size < 40) {
+              const { id, d } = queue.shift();
+              if (d >= depth) continue;
+              let edges;
+              if (MODEL._index.byId.get(id)?.kind === 'var') {
+                const dir = upstream ? 'in' : 'out';
+                const flow = await (COMPARISON ? comparisonDataflow(COMPARISON, id, dir) : dataflowFor(MODEL, id, dir));
+                assertActive();
+                edges = flow.edges;
+              } else {
+                const adj = upstream ? MODEL._index.inAdj : MODEL._index.outAdj;
+                edges = (adj.get(id) || []).filter(e => e.kind !== 'var' && !e.headerReference);
+              }
+              for (const e of edges) {
+                const peer = upstream ? e.from : e.to;
+                const key = presentationEdgeKey(e);
+                if (!allowId(peer) || overlay.deleted.edges[key]) continue;
+                const relation = e.df ? e.kind + ':' + key : key;
+                if (!seenEdge.has(relation)) { seenEdge.add(relation); sliceEdges.push(e); }
+                if (!sliceNodes.has(peer)) sliceNodes.set(peer, (upstream ? -1 : 1) * (d + 1));
+                if (!visited.has(peer)) { visited.add(peer); queue.push({ id: peer, d: d + 1 }); }
                 if (sliceNodes.size >= 40) break;
               }
             }
           }
           const fnSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind !== 'var');
-          let varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
+          const varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
           if (includeDataflow && !COMPARISON && MODEL.source !== 'dot') {
             await ensureAnalysis(MODEL);
             assertActive();
@@ -5226,7 +5231,9 @@ export const server = http.createServer(async (req, res) => {
             }
           }
           let composedResult = null;
-          if (addToCanvas && !COMPARISON && fnSliceIds.length) {
+          if (!sliceNodes.size) return { ok: false, error: '没有可用于导览的可见目标' };
+          if (addToCanvas) {
+            if (!fnSliceIds.length) return { ok: false, error: '当前方向和筛选范围内没有读写函数可用于组图', addedToCanvas: false };
             const minLayer = Math.min(...fnSliceIds.map(id => sliceNodes.get(id) ?? 0));
             const topRoots = fnSliceIds.filter(id => (sliceNodes.get(id) ?? 0) === minLayer);
             const restFns = fnSliceIds.filter(id => !topRoots.includes(id));
@@ -5241,8 +5248,8 @@ export const server = http.createServer(async (req, res) => {
                 down: 0,
                 reason: String(args.title || 'AI 逻辑链智能呈现').slice(0, 120),
               }, { chatClientId });
-            } catch {
-              composedResult = null;
+            } catch (error) {
+              return { ok: false, error: error.message, addedToCanvas: false };
             }
           }
           // 构建按执行层级排序的 Walkthrough 步骤
@@ -5257,8 +5264,8 @@ export const server = http.createServer(async (req, res) => {
           const steps = sortedDepths.slice(0, 6).map((d, idx) => {
             const nids = layers.get(d).slice(0, 10);
             const names = nids.map(id => toChainStep(id).name);
-            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(edgeKeyOf);
-            const roleLabel = d < 0 ? '上游触发与调用者' : d === 0 ? '核心关注节点' : '下游执行链路';
+            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(presentationEdgeKey);
+            const roleLabel = d < 0 ? '上游函数' : d === 0 ? '核心关注节点' : '下游函数';
             return {
               index: idx,
               title: `${roleLabel} (${names.slice(0, 3).join('、')}${names.length > 3 ? '…' : ''})`,
@@ -5271,10 +5278,10 @@ export const server = http.createServer(async (req, res) => {
           if (varSliceIds.length) {
             steps.push({
               index: steps.length,
-              title: `关联全局变量数据流 (${varSliceIds.length})`,
-              summary: `共享读写变量：${varSliceIds.map(v => toChainStep(v).name).join('、')}`,
+              title: `全局变量 (${varSliceIds.length})`,
+              summary: `变量：${varSliceIds.map(v => toChainStep(v).name).join('、')}`,
               nodeIds: varSliceIds,
-              edgeKeys: [],
+              edgeKeys: [...new Set(sliceEdges.filter(e => e.df).map(presentationEdgeKey))],
               focusNodeId: varSliceIds[0],
             });
           }
@@ -5286,20 +5293,20 @@ export const server = http.createServer(async (req, res) => {
           const chains = [];
           for (const e of sliceEdges.slice(0, 6)) {
             chains.push({
-              id: `pres_edge:${edgeKeyOf(e)}`,
+              id: `pres_edge:${e.kind}:${presentationEdgeKey(e)}`,
               title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
-              kind: 'call',
-              edgeKeys: [edgeKeyOf(e)],
+              kind: e.df ? 'dataflow' : 'call',
+              edgeKeys: [presentationEdgeKey(e)],
               steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
             });
           }
           const canvasOverlay = {
             action: 'highlight',
             nodeIds: [...fnSliceIds, ...varSliceIds].slice(0, 60),
-            edgeKeys: sliceEdges.map(edgeKeyOf).slice(0, 80),
+            edgeKeys: [...new Set(sliceEdges.map(presentationEdgeKey))].slice(0, 80),
             label: presTitle,
           };
-          sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
+          if (composedResult) sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
           return {
             ok: true,
             title: presTitle,
@@ -5307,7 +5314,8 @@ export const server = http.createServer(async (req, res) => {
             edgeCount: sliceEdges.length,
             presentation,
             chains,
-            canvasOverlay,
+            addedToCanvas: Boolean(composedResult),
+            ...(composedResult ? { canvasOverlay } : {}),
             ...(composedResult?.updatedWhileReviewing ? { updatedWhileReviewing: true, reviewNote: composedResult.reviewNote } : {}),
           };
         }
@@ -5380,7 +5388,7 @@ export const server = http.createServer(async (req, res) => {
             for (const ic of MODEL.indirectCalls || []) {
               if (!visNodes.has(ic.caller)) continue;
               const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !overlay.deleted.nodes[c.id]);
-              if (missing.length || ic.unresolved) unexpanded.push({ ic, missing });
+              if (missing.length || ic.resolution === 'unresolved') unexpanded.push({ ic, missing });
               if (unexpanded.length >= 12) break;
             }
             if (unexpanded.length) {

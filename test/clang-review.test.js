@@ -102,3 +102,65 @@ int read(void) { return b[1]; }`;
   const result = await compare(t, source, source.replace('= 2;', '= 7;'));
   assert.ok(result.model._index.byId.get('main.c::read').impactChainIds.includes('main.c::direct'));
 });
+
+test('Clang 通过内层声明字段归集回调，隔离同名字段及外层回调', requiresClang, async t => {
+  const dir = project(t, [
+    '#include "nested.h"',
+    'typedef struct { struct { Fn run; } inside; } Anonymous;',
+    'struct Local { Fn run; };',
+    'void nested(void) {} void outer(void) {} void different(void) {} void item(void) {}',
+    'static Outer holder = { .inner = { .run = nested, .slots = { item, nested } }, .run = outer };',
+    'static Other unrelated = { .run = different };',
+    'static Anonymous unnamed = { .inside.run = item };',
+    'static struct Local local = { outer };',
+    'void anon_call(Anonymous *p) { p->inside.run(); }',
+    'void local_call(struct Local *p) { p->run(); }',
+    'void shadow(void) { struct Local { Fn other; } s; }',
+    'void inner_call(Outer *p) { p->inner.run(); }',
+    'void outer_call(Outer *p) { p->run(); }',
+    'void other_call(Other *p) { p->run(); }',
+    'void array_call(Outer *p, int i) { p->inner.slots[i](); }',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'nested.h'), [
+    'typedef void (*Fn)(void);', 'typedef struct { Fn run; Fn slots[2]; } Inner;',
+    'typedef struct { Inner inner; Fn run; } Outer;', 'typedef struct { Fn run; } Other;',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'other.c'), [
+    '#include "nested.h"', 'struct Local { Fn run; }; extern void different(void);',
+    'static struct Local local = { different };',
+    'void foreign_call(struct Local *p) { p->run(); }',
+    'void shared_call(Outer *p) { p->inner.run(); }',
+  ].join('\n'));
+  for (const policy of ['expand', 'strict']) {
+    const model = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [fn, expected] of [['main.c::inner_call', ['nested']], ['main.c::outer_call', ['outer']],
+      ['main.c::other_call', ['different']], ['main.c::array_call', ['item', 'nested']], ['main.c::anon_call', ['item']],
+      ['main.c::local_call', ['outer']], ['other.c::foreign_call', ['different']], ['other.c::shared_call', ['nested']]]) {
+      const site = model.indirectCalls.find(s => s.caller === fn);
+      assert.deepEqual(site?.candidates.map(c => c.name).sort(), expected, fn);
+      assert.equal(site.resolution, policy === 'strict' ? 'unresolved' : 'possible');
+    }
+  }
+});
+
+test('Clang 下标只采信整个表达式的常量值，保留窄化转换', requiresClang, async t => {
+  const dir = project(t, [
+    'typedef void (*Fn)(void); void good(void) {} void wrong(void) {}',
+    'static Fn const slots[] = { [1] = good, [257] = wrong };',
+    'void narrowed(void) { slots[(unsigned char)257](); }',
+    'void literal(void) { slots[1](); }',
+    'static Fn const small[] = { wrong, wrong, good };',
+    'void shifted(void) { small[(0x80000000u >> 31) + 1](); }',
+  ].join('\n'));
+  for (const parserId of ['builtin', 'clang-ast']) {
+    const model = await buildIndex(dir, { parserId, parserOptions: { dispatchPolicy: 'strict' } });
+    const exact = name => (model._index.outAdj.get('main.c::' + name) || [])
+      .filter(e => e.kind === 'fnptr' && e.resolution === 'exact').map(e => e.to);
+    assert.deepEqual(exact('literal'), ['main.c::good']);
+    for (const fn of ['narrowed', 'shifted']) {
+      const targets = exact(fn);
+      if (targets.length) assert.deepEqual(targets, ['main.c::good'], parserId + ' ' + fn);
+      else assert.ok(model.indirectCalls.some(s => s.caller === 'main.c::' + fn), parserId + ' ' + fn);
+    }
+  }
+});

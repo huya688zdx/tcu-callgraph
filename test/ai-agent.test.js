@@ -2658,3 +2658,172 @@ test('未过期的画布撤销保留独立书签和后来的视口', async t => 
   assert.deepEqual(restored.cam, cam);
   assert.deepEqual((await (await fetch(srv.baseUrl + '/api/bookmarks')).json()).list, [independent]);
 });
+
+test('画布工具按真实变量根和间接调用点返回可操作的结果', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-present-var-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'logic.c'), [
+    'int shared; int unused = 7;',
+    'void writer(void) { shared = 1; }', 'int reader(void) { return shared; }',
+    'typedef void (*Fn)(void); extern Fn callbacks[];',
+    'void unknown(int i) { callbacks[i](); }', 'void unrelated(int i) { callbacks[i](); }',
+    'void other(void) {} static Fn const known[] = { writer, other };',
+    'void possible(int i) { known[i](); } void single(void) { known[0](); }',
+    ...Array.from({ length: 81 }, (_, i) => 'void f' + i + '(void) {}'),
+  ].join('\n'));
+  const srv = await launchServer({ target: dir });
+  t.after(srv.close);
+  let job, result;
+  const { run, post } = await mockAiTurn(t, srv.baseUrl, last => {
+    if (last.role === 'tool') { result = JSON.parse(last.content); return []; }
+    return [job];
+  });
+  const page = async () => (await (await fetch(srv.baseUrl + '/api/page?saved=1')).json()).page;
+  const v = 'var::shared', writer = 'logic.c::writer', reader = 'logic.c::reader';
+  for (const [direction, peers] of [['both', [writer, reader]], ['up', [writer]], ['down', [reader]]]) {
+    await t.test('以变量为根构图 ' + direction, async () => {
+      job = ['present_logic', { root: v, direction, depth: 1, mode: 'replace' }];
+      await run('呈现 shared 的读写者');
+      assert.equal(result.ok, true, result.error);
+      const saved = await page();
+      assert.deepEqual(saved?.vars, [v]);
+      assert.deepEqual([...saved.roots, ...saved.expansions.map(s => s.root)].sort(), peers.slice().sort());
+      assert.deepEqual(result.chains.map(c => [c.kind, ...c.steps.map(s => s.id)]).sort(),
+        peers.map(id => ['dataflow', ...(id === writer ? [id, v] : [v, id])]).sort());
+      const view = await (await post('/api/view?up=0&down=0', saved)).json();
+      const visibleEdges = view.edges.filter(e => e.kind === 'var').map(e => e.from + '->' + e.to + ':' + e.line);
+      assert.deepEqual(result.canvasOverlay.edgeKeys.toSorted(), visibleEdges.sort());
+      assert.equal(result.addedToCanvas, true);
+    });
+  }
+  await t.test('预览混合目标不改变画布或发送高亮', async () => {
+    const before = await page();
+    job = ['present_logic', { targets: [writer, v], direction: 'down', depth: 1, includeDataflow: false, addToCanvas: false }];
+    const events = await run('只生成这两个目标的导览');
+    assert.equal(result.ok, true, result.error);
+    assert.equal(result.addedToCanvas, false);
+    const ids = result.presentation.steps.flatMap(s => s.nodeIds);
+    for (const id of [writer, reader, v]) assert.ok(ids.includes(id), id);
+    assert.equal(events.some(e => e.type === 'canvas_overlay' || e.type === 'changeset'), false);
+    assert.deepEqual(await page(), before);
+  });
+  await t.test('无读写者的变量返回明确结果，保留已有页面', async () => {
+    const before = await page();
+    job = ['present_logic', { root: 'var::unused', mode: 'replace' }];
+    const events = await run('呈现 unused');
+    assert.equal(result.ok, false);
+    assert.match(result.error, /读写|函数/);
+    assert.equal(events.some(e => ['presentation', 'canvas_overlay', 'changeset'].includes(e.type)), false);
+    assert.deepEqual(await page(), before);
+    job = ['present_logic', { root: 'var::unused', addToCanvas: false }];
+    const preview = await run('只读导览 unused');
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.presentation.steps.flatMap(s => s.nodeIds), ['var::unused']);
+    assert.deepEqual(result.chains, []);
+    assert.equal(preview.some(e => e.type === 'canvas_overlay'), false);
+  });
+  await t.test('组图校验失败时返回失败，不发送导览或改变页面', async () => {
+    const before = await page();
+    job = ['present_logic', { targets: Array.from({ length: 81 }, (_, i) => 'logic.c::f' + i), mode: 'replace' }];
+    const events = await run('呈现指定函数');
+    assert.equal(result.ok, false);
+    assert.match(result.error, /80/);
+    assert.equal(events.some(e => ['presentation', 'canvas_overlay', 'changeset'].includes(e.type)), false);
+    assert.deepEqual(await page(), before);
+  });
+  await t.test('只诊断可见调用方，包含没有候选项的未解析调用点', async () => {
+    const id = 'logic.c::unknown';
+    job = ['inspect_indirect_calls', { function: id }];
+    await run('核实 unknown 的间接调用');
+    const site = result.indirectCalls.find(s => s.caller === id);
+    assert.equal(site.resolution, 'unresolved');
+    assert.deepEqual(site.candidates, []);
+    await post('/api/page', { roots: [id], up: 0, down: 0 });
+    for (const check of ['indirect', 'all']) {
+      job = ['diagnose_canvas', { check }];
+      await run('诊断当前画布');
+      const issue = result.healthReport.issues.find(i => i.category === 'indirect');
+      assert.deepEqual(issue?.nodeIds, [id]);
+      assert.match(issue.detail, /callbacks/);
+    }
+    await post('/api/page', { roots: [writer], up: 0, down: 0 });
+    job = ['diagnose_canvas', { check: 'indirect' }];
+    await run('诊断新的画布');
+    assert.deepEqual(result.healthReport.issues, []);
+    const possible = 'logic.c::possible';
+    await post('/api/page', { roots: [possible], up: 0, down: 0 });
+    await run('诊断未展开的候选项');
+    assert.deepEqual(result.healthReport.issues[0]?.nodeIds, [possible]);
+    await post('/api/page', { roots: [possible, writer, 'logic.c::other', 'logic.c::single'], up: 0, down: 0 });
+    await run('诊断候选已显示的调用点和精确调用');
+    assert.deepEqual(result.healthReport.issues, []);
+  });
+  await t.test('比较模式明确区分只读导览和组图请求', async () => {
+    const versions = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-present-versions-'));
+    t.after(() => fs.rmSync(versions, { recursive: true, force: true }));
+    const beforePath = path.join(versions, 'before'), afterPath = path.join(versions, 'after');
+    fs.mkdirSync(beforePath);
+    fs.mkdirSync(afterPath);
+    const source = fs.readFileSync(path.join(dir, 'logic.c'), 'utf8');
+    fs.writeFileSync(path.join(beforePath, 'logic.c'), source);
+    fs.writeFileSync(path.join(afterPath, 'logic.c'), source.replace('shared = 1', 'shared = 2'));
+    const prep = await (await post('/api/compare', { beforePath, afterPath })).json();
+    assert.ok(prep.ok, prep.error);
+    const applied = await (await post('/api/compare/apply', { previewId: prep.preview.id, selectedIds: [writer, v] })).json();
+    assert.ok(applied.ok, applied.error);
+    job = ['present_logic', { root: v }];
+    const events = await run('呈现比较图的 shared');
+    assert.equal(result.ok, false);
+    assert.match(result.error, /比较/);
+    assert.equal(events.some(e => e.type === 'canvas_overlay' || e.type === 'presentation'), false);
+    job = ['present_logic', { root: v, direction: 'up', depth: 1, addToCanvas: false }];
+    await run('只读导览比较图的 shared');
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(result.chains.map(c => c.steps.map(s => s.id)), [[writer, v]]);
+    const view = await (await fetch(srv.baseUrl + '/api/view')).json();
+    const edge = view.edges.find(e => e.kind === 'var' && e.from === writer && e.to === v);
+    assert.deepEqual(result.chains[0].edgeKeys, [edge.from + '->' + edge.to + ':' + edge.line]);
+  });
+});
+
+test('浏览器在发起 AI 删除的窗口解除书签，再用 Ctrl+S 另存当前画布', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const root = 'gear.c::Gear_Init';
+  let id, toolResult, action = 'update';
+  const { post } = await mockAiTurn(t, srv.baseUrl, last => {
+    if (last.role === 'tool') { toolResult = JSON.parse(last.content); return []; }
+    return [['manage_bookmarks', { action, id }]];
+  });
+  const created = await (await post('/api/bookmarks', { name: '原书签', roots: [root] })).json();
+  id = created.bookmark.id;
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.waitFor('Boolean(window.__cg?.view)');
+  await browser.evaluate("document.getElementById('bookmarkBtn').click()");
+  await browser.waitFor("Boolean(document.querySelector('.bm-open'))");
+  await browser.evaluate("document.querySelector('.bm-open').click()");
+  const active = "(await import('/lib/state.js')).state.activeBookmark";
+  await browser.waitFor(`(async () => (${active})?.id === ${id} && !document.querySelector('.modal.show'))()`);
+  await browser.evaluate("window.bookmarkEvents = []; window.addEventListener('cg:bookmark-changed', e => window.bookmarkEvents.push(e.detail.bookmark?.id ?? null))");
+  const chat = prompt => browser.evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    return (await api.aiChat({ prompt: ${JSON.stringify(prompt)} })).text();
+  })()`);
+  await chat('请更新原书签');
+  assert.equal(toolResult.bookmark.revision, created.bookmark.revision + 1);
+  assert.equal(await browser.evaluate(`(async () => (${active}).revision)()`), created.bookmark.revision);
+  action = 'delete';
+  await chat('请删除原书签');
+  assert.equal(toolResult.ok, true);
+  await browser.waitFor(`(async () => (${active}) === null)()`, { timeoutMs: 3000 });
+  assert.deepEqual(await browser.evaluate("window.bookmarkEvents"), [id, null]);
+  await browser.evaluate("window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, cancelable: true }))");
+  await browser.waitFor("Boolean(document.querySelector('#bookmarkModal.show'))");
+  await browser.evaluate("document.getElementById('bookmarkName').value = '新书签'; document.getElementById('bookmarkSave').click()");
+  await browser.waitFor(`(async () => (${active})?.name === '新书签')()`);
+  const { list } = await (await fetch(srv.baseUrl + '/api/bookmarks')).json();
+  assert.deepEqual(list.map(b => [b.name, b.roots]), [['新书签', [root]]]);
+  assert.notEqual(list[0].id, id);
+});

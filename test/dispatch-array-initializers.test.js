@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadModel } from '../src/core/index.js';
+import { parseConstIndex } from '../src/core/extract.js';
+import { lex } from '../src/core/lexer.js';
 
 test('分派表写入后保留间接调用，未受影响的下标、字段和同名表仍可解析', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-table-write-'));
@@ -447,5 +449,48 @@ test('枚举分派按使用位置解析文件、函数与嵌套块作用域', t 
       assert.deepEqual(targets('loop'), ['second', 'first']);
       assert.deepEqual(targets('included'), ['second', 'second', 'first']);
     }
+  }
+});
+
+test('C 整数下标按值选择槽位，宽度或符号不确定时保留间接调用', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-integer-slots-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'index.c'), [
+    'typedef void (*Fn)(void); void first(void) {} void second(void) {} void third(void) {}',
+    'static Fn const table[] = { first, second, third };',
+    '#define HIGH (0x80000000u >> 31)',
+    'enum { HIGH_SLOT = HIGH + 1 };',
+    'void shifted(void) { table[(0x80000000u >> 31) + 1](); }',
+    'void enumerated(void) { table[HIGH_SLOT](); }',
+    'void wide(void) { table[(0x100000001ULL & 0x100000000ULL) != 0](); }',
+    'void signedness(void) { table[(-1 < 1u) + 1](); }',
+    'void wrap(void) { table[((0u - 1u) > 1u) + 1](); }',
+    'void plain(void) { table[(7 / 2) - 1](); }',
+    'void uncertain(void) { table[(1u >> 32) + 1](); }',
+  ].join('\n'));
+  for (const policy of ['strict', 'expand']) {
+    const model = loadModel(dir, { parserOptions: { dispatchPolicy: policy } });
+    const exact = fn => (model._index.outAdj.get('index.c::' + fn) || [])
+      .filter(e => e.kind === 'fnptr' && e.resolution === 'exact').map(e => e.callee);
+    for (const [fn, target] of [['shifted', 'third'], ['enumerated', 'third'], ['wide', 'second'], ['plain', 'third']]) {
+      assert.deepEqual(exact(fn), [target], fn);
+    }
+    for (const [fn, target] of [['signedness', 'second'], ['wrap', 'third'], ['uncertain', null]]) {
+      const resolved = exact(fn);
+      if (resolved.length) assert.deepEqual(resolved, target ? [target] : [], fn);
+      else assert.ok(model.indirectCalls.some(site => site.caller === 'index.c::' + fn), fn);
+    }
+  }
+});
+
+test('C 整数下标保留可移植运算，遇到转换、溢出或不支持的字面量返回未知', () => {
+  for (const [expr, value] of [['3u - 1u', 2], ['(-7 / 3) + 4', 2], ['0x100000000ULL >> 32', 1],
+    ['(0x100000003ULL ^ 0x100000001ULL) | 1', 3], ["'\\02'", 2]]) {
+    assert.equal(parseConstIndex(lex(expr)), value, expr);
+  }
+  for (const expr of ['-1u < 1', '(0xffffffffu + 1u) == 0', '(1 << 31) > 0', '1 >> 32',
+    '(-2 >> 1) + 1', '(~0u) > 0', '(1 ? -1 : 1u) < 0', '9007199254740993ULL == 9007199254740992ULL',
+    '1UU + 1', '1 / 0', "'A' == 65"]) {
+    assert.equal(parseConstIndex(lex(expr)), null, expr);
   }
 });

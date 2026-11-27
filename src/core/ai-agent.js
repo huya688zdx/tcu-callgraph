@@ -468,10 +468,10 @@ export const AGENT_TOOLS = [
       properties: {
         root: { type: 'string', description: '主切入函数或 var:: 变量' },
         targets: { type: 'array', items: { type: 'string' }, description: '多个聚焦函数或变量列表' },
-        direction: { type: 'string', enum: ['up', 'down', 'both'], description: '切片方向，默认 both' },
+        direction: { type: 'string', enum: ['up', 'down', 'both'], description: '切片方向，变量的 up 追踪写者，down 追踪读者，默认 both' },
         depth: { type: 'integer', minimum: 1, maximum: 5, description: '切片深度 (1-5)，默认 2' },
-        includeDataflow: { type: 'boolean', description: '是否包含共享全局变量，默认 true' },
-        addToCanvas: { type: 'boolean', description: '是否推送到画布显示，默认 true（设 false 可仅做只读导览）' },
+        includeDataflow: { type: 'boolean', description: '是否补充函数关联的全局变量，默认 true；显式指定的变量始终保留' },
+        addToCanvas: { type: 'boolean', description: '默认 true，需要可见函数才能组图；false 只返回导览。比较模式仅支持只读导览' },
         mode: { type: 'string', enum: ['add', 'replace'], description: '画布更新模式：add 追加 / replace 替换' },
         title: { type: 'string', description: '导览主题标题，如“档位切换与油压保护逻辑”' },
         focusFilter: { type: 'array', items: { type: 'string' }, description: '可选：限定目录前缀，如 ["z145"]' },

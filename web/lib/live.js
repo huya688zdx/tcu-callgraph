@@ -203,21 +203,21 @@ if (es) {
     const projectId = m.projectId ?? m.page?.projectId;
     if (projectId != null && projectId !== state.view?.projectId) return;
     if (m.op.startsWith('bookmark.')) {
-      if (m.clientId !== clientId && m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
+      // AI 工具的请求来自同一个窗口，但没有执行书签面板的本地更新。
+      if (m.actor !== 'ai' && m.clientId === clientId) return;
+      if (m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
         state.activeBookmark = bookmarkMetadata(state.activeBookmark, m.bookmark, m.op === 'bookmark.rename');
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
-      } else if (m.clientId !== clientId && m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
+      } else if (m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
         const prev = state.activeBookmark;
         state.activeBookmark = null;
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: null, prev, remote: true } }));
       }
-      if (m.actor === 'ai' || m.clientId !== clientId) {
-        reloadBookmarks();
-        void reloadTimeline();
-        if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
-      }
+      reloadBookmarks();
+      void reloadTimeline();
+      if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
       return;
     }
     if (m.actor !== 'ai') return;

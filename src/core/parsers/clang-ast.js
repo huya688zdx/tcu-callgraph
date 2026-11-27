@@ -181,14 +181,25 @@ export function readTranslationUnit(ast, root, unit, files) {
     const { id, kind, name } = node;
     if (id && kind?.endsWith('Decl')) context.declarations.set(id, { node, position });
     if (kind === 'EnumDecl') collectEnum(node, context, insideFunction);
-    if (kind === 'RecordDecl' && node.completeDefinition) {
+    if (kind === 'RecordDecl' && node.completeDefinition && !insideFunction) {
       recordsById.set(id, node);
       if (name) context.records.set(`${node.tagUsed} ${name}`, node);
+      // 内嵌匿名记录的 FieldDecl 与定义从同一源位置开始。保留 Clang 的完整类型名。
+      const anonymous = new Map();
+      for (const child of children(node)) {
+        const start = loc.begin(child);
+        if (!start) continue;
+        const key = `${start.abs}:${start.offset}`;
+        if (child.kind === 'RecordDecl' && !child.name && child.completeDefinition) anonymous.set(key, child);
+        if (child.kind === 'FieldDecl' && anonymous.has(key)) {
+          context.records.set(typeOf(child).replace(/\s*\[[^\]]*\]/g, ''), anonymous.get(key));
+        }
+      }
     }
     if (kind === 'TypedefDecl' && name && !node.isImplicit) {
       context.aliases.set(name, typeOf(node));
       const tag = [...walk(node)].find((child) => child.ownedTagDecl || child.decl?.kind === 'RecordDecl');
-      if (tag) aliasRecords.set(name, (tag.ownedTagDecl || tag.decl).id);
+      if (tag && !insideFunction) aliasRecords.set(name, (tag.ownedTagDecl || tag.decl).id);
     }
     if (position?.file && name && !node.isImplicit) {
       if (kind === 'FunctionDecl') {
@@ -261,14 +272,15 @@ function recordType(type, context) {
 }
 
 function constIndexValue(node, context) {
-  if (!node) return null;
-  for (const n of walk(node)) {
-    if (n.kind === 'ConstantExpr' && n.value != null && /^-?\d+$/.test(String(n.value))) {
-      const v = Number(n.value);
-      return Number.isSafeInteger(v) ? v : null;
-    }
+  // 只有整个下标或不改变数值的包装层可以提供精确值。窄化转换不能剥除。
+  let u = node;
+  while (u && (u.kind === 'ParenExpr' || (u.kind === 'ImplicitCastExpr' && u.castKind === 'NoOp'))) {
+    u = children(u)[0];
   }
-  const u = unwrap(node);
+  if (u?.kind === 'ConstantExpr' && /^-?\d+$/.test(String(u.value))) {
+    const v = Number(u.value);
+    return Number.isSafeInteger(v) ? v : null;
+  }
   if (u?.kind === 'IntegerLiteral' && u.value != null) {
     const v = Number(u.value);
     return Number.isSafeInteger(v) ? v : null;
@@ -285,7 +297,7 @@ function constIndexValue(node, context) {
 }
 
 /** Clang 的语义 InitListExpr 已把位置和指定初始化排列到了字段/下标对应的槽上。 */
-export function pointerSlots(node, context, resolveFunction, candidateSlots = null) {
+export function pointerSlots(node, context, resolveFunction, candidateSlots, indexField) {
   const slots = new Map();
   function collectRhsRefs(expr, out) {
     const u = unwrap(expr);
@@ -300,22 +312,27 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots = nu
       collectRhsRefs(children(u)[2], out);
     }
   }
-  function visit(value, slot) {
+  function visit(value, slot, fieldId) {
     value = unwrap(value);
     if (!value) return;
     const ref = fnRef(value);
     if (ref) {
-      slots.set(slot, resolveFunction(ref.referencedDecl, context));
+      const target = resolveFunction(ref.referencedDecl, context);
+      slots.set(slot, target);
+      if (fieldId) indexField(fieldId, target);
     } else if (value.kind === 'ConditionalOperator' && candidateSlots) {
       const cands = [];
       collectRhsRefs(value, cands);
       if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
+      if (fieldId) for (const target of cands) indexField(fieldId, target);
     } else if (value.kind === 'InitListExpr') {
       const type = typeOf(value);
+      const isArray = /\[[^\]]*\]$/.test(type);
       const fields = children(recordType(type, context)).filter((field) => field.kind === 'FieldDecl');
       initializers(value).forEach((child, i) => {
-        const field = value.field?.name || fields[i]?.name;
-        visit(child, field ? `${slot}.${field}` : /\[.*\]/.test(type) ? `${slot}[${i}]` : slot);
+        const field = value.field || fields[i];
+        const childSlot = field?.name ? `${slot}.${field.name}` : isArray ? `${slot}[${i}]` : slot;
+        visit(child, childSlot, field?.id || (isArray ? fieldId : null));
       });
     }
   }
@@ -366,6 +383,7 @@ export function pointerExpression(node, context = null) {
     return {
       ...base,
       slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      fieldId: node.kind === 'MemberExpr' ? node.referencedMemberDecl : base.fieldId,
       member: node.kind === 'MemberExpr' ? node.name : base.member,
       baseType: rawBaseType || base.baseType,
       exact: base.exact && !node.isArrow && (node.kind !== 'ArraySubscriptExpr' || constant !== null),
@@ -398,8 +416,7 @@ export function collectAssignmentWrites(body, context, resolveFunction) {
     writes.push({
       decl: lhs.decl,
       slot: lhs.slot,
-      member: lhs.member,
-      baseType: lhs.baseType || normalizeRecordBaseType(typeOf(children(node)[0]), context),
+      fieldId: lhs.fieldId,
       line: pos?.line ?? 0,
       targets: [...new Set(targets)],
     });

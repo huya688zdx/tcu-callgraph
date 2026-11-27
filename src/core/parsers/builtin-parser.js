@@ -1249,9 +1249,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:27';
+    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:28';
     return JSON.stringify([
-      'builtin:27',
+      'builtin:28',
       policy,
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,

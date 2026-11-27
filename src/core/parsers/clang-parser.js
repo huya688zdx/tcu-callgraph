@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
-import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, normalizeRecordBaseType, pointerExpression, pointerSlots,
+import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
@@ -76,28 +76,16 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const resolveVariable = (ref, unit) => ref?.kind === 'VarDecl' ? varDecls.get(unit).get(ref.id) : undefined;
 
   const tables = new Map(), addressTaken = new Map(), calls = [], byRecordField = new Map(), declWrites = new Map();
-  const recordTypeKeys = (rawType, context) => {
-    if (!rawType) return [];
-    const keys = new Set([rawType]);
-    keys.add(rawType.replace(/^(?:struct|union)\s+/, ''));
-    const norm = normalizeRecordBaseType(rawType, context);
-    if (norm) {
-      keys.add(norm);
-      keys.add(norm.replace(/^(?:struct|union)\s+/, ''));
-    }
-    return [...keys].filter(Boolean);
+  // 同一头文件声明在不同编译单元有不同 AST id，但共享源码位置。
+  const fieldKey = (unit, id) => {
+    const field = unit.declarations.get(id);
+    return field?.position?.file && `${field.position.file}:${field.position.offset}:${field.node.name}`;
   };
-  const indexRecordField = (rawType, context, slot, targetId) => {
-    if (!rawType || !slot || !targetId) return;
-    const dot = slot.lastIndexOf('.');
-    if (dot < 0) return;
-    const fieldName = slot.slice(dot + 1);
-    if (!fieldName) return;
-    for (const key of recordTypeKeys(rawType, context)) {
-      const k = `${key}::${fieldName}`;
-      if (!byRecordField.has(k)) byRecordField.set(k, new Set());
-      byRecordField.get(k).add(targetId);
-    }
+  const indexField = (unit, id, target) => {
+    const key = fieldKey(unit, id);
+    if (!key) return;
+    if (!byRecordField.has(key)) byRecordField.set(key, new Set());
+    byRecordField.get(key).add(target);
   };
   const noteAddress = (ref, unit) => {
     const target = resolveFunction(ref.referencedDecl, unit);
@@ -108,13 +96,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   for (const unit of units) {
     for (const node of unit.globals) {
       const candidateSlots = new Map();
-      const slots = pointerSlots(node, unit, resolveFunction, candidateSlots);
-      const rawType = normalizeRecordBaseType(typeOf(node), unit);
+      const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
+        (id, target) => indexField(unit, id, target));
       if (slots.size || candidateSlots.size) {
         const id = varDecls.get(unit).get(node.id);
-        tables.set(id, { slots, candidateSlots, constant: hasConstSlots(node), baseType: rawType });
-        for (const [slot, targetId] of slots) indexRecordField(rawType, unit, slot, targetId);
-        for (const [slot, targetIds] of candidateSlots) for (const targetId of targetIds) indexRecordField(rawType, unit, slot, targetId);
+        tables.set(id, { slots, candidateSlots, constant: hasConstSlots(node) });
       }
       const init = node.init && children(node).find((n) => !n.kind.endsWith('Attr'));
       if (init) for (const child of walk(init)) {
@@ -135,9 +121,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         const declKey = resolveVariable(w.decl, unit) || w.decl.id;
         if (!declWrites.has(declKey)) declWrites.set(declKey, []);
         declWrites.get(declKey).push(w);
-        if (w.member) {
-          for (const targetId of w.targets) indexRecordField(w.baseType, unit, `.${w.member}`, targetId);
-        }
+        if (w.fieldId) for (const target of w.targets) indexField(unit, w.fieldId, target);
       }
     }
   }
@@ -184,13 +168,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         return slotRegex ? slotRegex.test(w.slot) : false;
       });
       const writtenTargets = writesForVar.flatMap(w => w.targets);
-      const fieldCandidates = new Set();
-      if (pointer?.member && pointer?.baseType) {
-        for (const key of recordTypeKeys(pointer.baseType, context)) {
-          const hit = byRecordField.get(`${key}::${pointer.member}`);
-          if (hit) for (const id of hit) fieldCandidates.add(id);
-        }
-      }
+      const fieldCandidates = byRecordField.get(fieldKey(context, pointer?.fieldId)) || new Set();
       if (dispatchPolicy === 'strict') {
         if (exact && !writtenTargets.length) {
           candidates = [exact];

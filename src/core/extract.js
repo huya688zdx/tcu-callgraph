@@ -561,17 +561,17 @@ export function findTypedefs(tokens, macros, enumValues = collectEnumValues(toke
 }
 
 function parseSingleIntLiteral(v) {
-  if (/^'(?:[^'\\]|\\[abfnrtv\\'"0?])'$/.test(v)) {
-    const ch = v.slice(1, -1);
-    const esc = { '\\0': 0, '\\a': 7, '\\b': 8, '\\t': 9, '\\n': 10, '\\v': 11, '\\f': 12, '\\r': 13, '\\\\': 92, "\\'": 39, '\\"': 34 };
-    return ch.length === 1 ? ch.charCodeAt(0) : (esc[ch] ?? null);
+  if (v.startsWith("'")) {
+    // 普通字符及命名转义依赖目标执行字符集。仅小数值转义可不依赖字符集求值。
+    const esc = /^'\\(?:([0-7]{1,3})|x([0-9a-fA-F]+))'$/.exec(v);
+    if (!esc) return null;
+    const code = Number.parseInt(esc[1] || esc[2], esc[1] ? 8 : 16);
+    return code <= 127 ? code : null;
   }
-  const s = v.replace(/[uUlL]+$/, '');
-  if (/^0[xX][0-9a-fA-F]+$/.test(s)) return Number(s);
-  if (/^0[bB][01]+$/.test(s)) return Number.parseInt(s.slice(2), 2);
-  if (/^0[0-7]*$/.test(s)) return Number.parseInt(s, 8);
-  if (/^[1-9]\d*$/.test(s)) return Number(s);
-  return null;
+  const literal = /^(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9]\d*)(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?$/.exec(v);
+  if (!literal) return null;
+  const digits = literal[1];
+  return Number(/^0[0-7]+$/.test(digits) ? '0o' + digits.slice(1) : digits);
 }
 
 /** 枚举成员从声明处可见，离开声明所在块后恢复外层同名绑定。 */
@@ -671,6 +671,11 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
     }
     return null;
   }
+  // 没有目标 ABI 时，仅在整数提升、符号转换和溢出都不影响结果时折叠。
+  // 非负操作数转换至公共类型保持其值。小有符号常量组成的表达式也可安全产生负值。
+  const smallSigned = tokens.every(t => t.t !== 'id' && (t.t !== 'num' ||
+    (!/[uU]/.test(t.v) && (parseSingleIntLiteral(t.v) ?? Infinity) <= 32767)));
+  const portable = n => n >= (smallSigned ? -32767 : 0) && n <= 32767 ? n : null;
   let pos = 0;
   const peek = () => tokens[pos];
   const parsePrimary = () => {
@@ -685,11 +690,13 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
     }
     if (tk.t === 'num' || tk.t === 'str') {
       pos++;
-      return parseSingleIntLiteral(tk.v);
+      const n = parseSingleIntLiteral(tk.v);
+      return Number.isSafeInteger(n) ? n : null;
     }
     if (tk.t === 'id' && enumValues?.has(tk.v, tk)) {
       pos++;
-      return enumValues.get(tk.v, tk);
+      const n = enumValues.get(tk.v, tk);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
     }
     return null;
   };
@@ -700,8 +707,8 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
       const sub = parseUnary();
       if (sub === null) return null;
       if (v === '+') return +sub;
-      if (v === '-') return -sub;
-      if (v === '~') return ~sub;
+      if (v === '-') return portable(-sub);
+      if (v === '~') return null; // 取反的值依赖提升后的宽度和符号表示。
       return sub ? 0 : 1;
     }
     return parsePrimary();
@@ -718,18 +725,22 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
     return left;
   };
   const parseMul = () => parseBin(parseUnary, ['*', '/', '%'], (a, op, b) => {
-    if (op === '*') return a * b;
+    if (op === '*') return portable(a * b);
     if (b === 0) return null;
-    return op === '/' ? Math.trunc(a / b) : a % b;
+    return Number(op === '/' ? BigInt(a) / BigInt(b) : BigInt(a) % BigInt(b));
   });
-  const parseAdd = () => parseBin(parseMul, ['+', '-'], (a, op, b) => (op === '+' ? a + b : a - b));
-  const parseShift = () => parseBin(parseAdd, ['<<', '>>'], (a, op, b) => (op === '<<' ? a << b : a >> b));
+  const parseAdd = () => parseBin(parseMul, ['+', '-'], (a, op, b) => portable(op === '+' ? a + b : a - b));
+  const parseShift = () => parseBin(parseAdd, ['<<', '>>'], (a, op, b) => {
+    // 整数提升后至少 16 位，左值本身也给出位宽下限。其余移位计数依赖目标类型。
+    if (a < 0 || b < 0 || b >= Math.max(16, a.toString(2).length)) return null;
+    return op === '>>' ? Number(BigInt(a) >> BigInt(b)) : portable(Number(BigInt(a) << BigInt(b)));
+  });
   const parseRel = () => parseBin(parseShift, ['<', '<=', '>', '>='], (a, op, b) =>
     (op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : a >= b) ? 1 : 0);
   const parseEq = () => parseBin(parseRel, ['==', '!='], (a, op, b) => ((op === '==' ? a === b : a !== b) ? 1 : 0));
-  const parseBitAnd = () => parseBin(parseEq, ['&'], (a, _, b) => a & b);
-  const parseBitXor = () => parseBin(parseBitAnd, ['^'], (a, _, b) => a ^ b);
-  const parseBitOr = () => parseBin(parseBitXor, ['|'], (a, _, b) => a | b);
+  const parseBitAnd = () => parseBin(parseEq, ['&'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) & BigInt(b)));
+  const parseBitXor = () => parseBin(parseBitAnd, ['^'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) ^ BigInt(b)));
+  const parseBitOr = () => parseBin(parseBitXor, ['|'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) | BigInt(b)));
   const parseLogAnd = () => parseBin(parseBitOr, ['&&'], (a, _, b) => (a && b ? 1 : 0));
   const parseLogOr = () => parseBin(parseLogAnd, ['||'], (a, _, b) => (a || b ? 1 : 0));
   const parseTernary = () => {
