@@ -28,27 +28,37 @@ void address(void) { Fn slots[] = {a}; Fn *p = &slots[0]; *p = b; slots[0](); }
 void dynamic(int i) { table[i](); }
 `);
   fs.writeFileSync(path.join(dir, 'writer.c'), '#include "api.h"\nvoid edit_shared(void) { shared[1] = b; }\n');
-  const model = loadModel(dir);
-  const resolved = name => (model._index.outAdj.get('app.c::' + name) || [])
+  const strictModel = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const strictResolved = name => (strictModel._index.outAdj.get('app.c::' + name) || [])
     .filter(edge => edge.kind === 'fnptr').map(edge => edge.via);
-  const unresolved = name => model.indirectCalls.filter(site => site.caller === 'app.c::' + name)
+  const strictUnresolved = name => strictModel.indirectCalls.filter(site => site.caller === 'app.c::' + name)
     .map(site => site.expr);
-  assert.deepEqual(resolved('dispatch'), ['table[1]']);
-  assert.deepEqual(unresolved('dispatch'), ['table[0]']);
-  assert.deepEqual(resolved('call'), ['rows[0].stop', 'shared[0]']);
-  assert.deepEqual(unresolved('call'), ['rows[0].run', 'shared[1]']);
-  assert.deepEqual(resolved('local'), ['table[0]']);
-  assert.deepEqual(unresolved('local'), ['table[1]']);
+  assert.deepEqual(strictResolved('dispatch'), ['table[1]']);
+  assert.deepEqual(strictUnresolved('dispatch'), ['table[0]']);
+  assert.deepEqual(strictResolved('call'), ['rows[0].stop', 'shared[0]']);
+  assert.deepEqual(strictUnresolved('call'), ['rows[0].run', 'shared[1]']);
+  assert.deepEqual(strictResolved('local'), ['table[0]']);
+  assert.deepEqual(strictUnresolved('local'), ['table[1]']);
   for (const name of ['alias', 'address']) {
-    assert.deepEqual(resolved(name), []);
-    assert.deepEqual(unresolved(name), ['slots[0]']);
+    assert.deepEqual(strictResolved(name), []);
+    assert.deepEqual(strictUnresolved(name), ['slots[0]']);
   }
-  const candidates = name => model.indirectCalls.find(site => site.caller === 'app.c::' + name).candidates;
-  assert.deepEqual(candidates('dispatch'), []);
-  assert.deepEqual(candidates('dynamic').map(candidate => candidate.slot), ['[1]']);
+  const strictCandidates = name => strictModel.indirectCalls.find(site => site.caller === 'app.c::' + name).candidates;
+  assert.deepEqual(strictCandidates('dispatch'), []);
+  assert.deepEqual(strictCandidates('dynamic').map(candidate => candidate.slot), ['[1]']);
+
+  // 默认 expand 模式：运行时赋值写入 `table[0] = b`、`table[1] = b` 等也连出候选边
+  const expandModel = loadModel(dir);
+  const expandTargets = name => (expandModel._index.outAdj.get('app.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => `${edge.via}->${edge.callee}`);
+  assert.ok(expandTargets('dispatch').includes('table[0]->b'));
+  assert.ok(expandTargets('call').includes('rows[0].run->b'));
+  assert.ok(expandTargets('call').includes('shared[1]->b'));
+  assert.ok(expandTargets('local').includes('table[1]->b'));
+  assert.ok(expandTargets('dynamic').some(x => x.endsWith('->a')) && expandTargets('dynamic').some(x => x.endsWith('->b')));
 });
 
-test('下标可能命中未解析的初始化值时保留间接调用，已知位置仍能直连', t => {
+test('下标可能命中未解析的初始化值时保留间接调用，已知位置仍能直连；expand 展开三元候选', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-unknown-target-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.writeFileSync(path.join(dir, 'dispatch.c'), `
@@ -66,7 +76,7 @@ void members(int i, Ops left, Ops right) {
   entries[i].run(); entries[0].run();
 }
 `);
-  const model = loadModel(dir);
+  const model = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
   const targets = name => (model._index.outAdj.get('dispatch.c::' + name) || [])
     .filter(edge => edge.kind === 'fnptr').map(edge => edge.callee);
   assert.deepEqual(targets('uncertain'), []);
@@ -76,6 +86,11 @@ void members(int i, Ops left, Ops right) {
   const sites = model.indirectCalls.filter(site => site.caller === 'dispatch.c::uncertain');
   assert.deepEqual(sites.map(site => site.candidates.map(c => c.name)), [['a'], [], ['a'], []]);
   assert.deepEqual(model.fnptrTables.find(t => t.name === 'overrides').map, { '[1]': 'b' });
+
+  const expanded = loadModel(dir);
+  const expTargets = name => (expanded._index.outAdj.get('dispatch.c::' + name) || [])
+    .filter(edge => edge.kind === 'fnptr').map(edge => edge.callee);
+  assert.ok(expTargets('uncertain').includes('a') && expTargets('uncertain').includes('b'));
 });
 
 test('用字段声明区分标量花括号和单元素数组，包括没有调用点的头文件类型', t => {
@@ -119,13 +134,14 @@ void a(void) {} void b(void) {} void c(void) {} void d(void) {}
 static Fn flat[][COLS] = {a, b, c, d};
 static void (*const mixed[][2])(void) = {{a}, b, {c}, {d}};
 static Fn designated[4][2][2] = {[1][0][1] = a, b, c, [2] = {d}, a};
+extern const int EXT_WIDTH;
+static Fn unknown[][EXT_WIDTH] = {a, b, c, [2] = {d}};
 enum { WIDTH = 2 };
-static Fn unknown[][WIDTH] = {a, b, c, [2] = {d}};
 static Fn rows[][WIDTH] = {{a}, {b, c}};
 void call(void) {
   flat[1][0](); mixed[0][0](); mixed[1][1](); mixed[2][0]();
   designated[1][1][0](); designated[2][0][0](); designated[3][0][0]();
-  rows[1][1](); unknown[1][0]();
+  rows[WIDTH - 1][1](); unknown[1][0]();
 }
 `);
   const model = loadModel(dir);
@@ -142,5 +158,59 @@ void call(void) {
   const site = model.indirectCalls.find(call => call.receiver === 'unknown');
   assert.deepEqual(site.candidates.map(candidate => candidate.name), ['b', 'c']);
   const targets = model._index.outAdj.get('table.c::call').filter(edge => edge.kind === 'fnptr');
-  assert.deepEqual(targets.map(edge => edge.callee), ['c', 'a', 'c', 'd', 'b', 'd', 'a', 'c']);
+  assert.deepEqual(targets.map(edge => edge.callee), ['c', 'a', 'c', 'd', 'b', 'd', 'a', 'c', 'b', 'c']);
+});
+
+test('Problem 6：未初始化结构体/数组运行时赋值、结构体指针参数与枚举偏移分派', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-problem6-dispatch-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.h'), `
+typedef void (*Fn)(void);
+typedef struct { Fn step; Fn reset; } Ops;
+enum { BASE = 1, STEP = 1 };
+`);
+  fs.writeFileSync(path.join(dir, 'driver.c'), `
+#include "ops.h"
+static void fnB(void) {}
+static void fnR(void) {}
+static void fnD(void) {}
+static void fnE(void) {}
+static void fnUnused(void) {}
+void (*g_other_cb)(void) = fnUnused;
+static const Ops c_ops = { .step = fnE, .reset = fnR };
+Ops mach;
+Fn blank[4];
+static const Fn enum_tbl[4] = { [BASE] = fnD, [BASE + STEP] = fnB };
+void init(void) {
+  mach.step = fnB;
+  blank[0] = fnD;
+}
+void run_mach(int i) {
+  mach.step();
+  blank[0]();
+  blank[i]();
+  enum_tbl[BASE + STEP]();
+}
+`);
+  fs.writeFileSync(path.join(dir, 'framework.c'), `
+#include "ops.h"
+void exec(const Ops *p) {
+  p->step();
+}
+`);
+  const model = loadModel(dir);
+  const fnptrNames = id => new Set((model._index.outAdj.get(id) || [])
+    .filter(e => e.kind === 'fnptr').map(e => e.callee));
+  assert.deepEqual(fnptrNames('driver.c::run_mach'), new Set(['fnB', 'fnD']));
+  // Typed struct pointer `p->step()` matches Ops.step without leaking fnUnused/fnR
+  assert.deepEqual(fnptrNames('framework.c::exec'), new Set(['fnB', 'fnE']));
+  assert.ok(!fnptrNames('framework.c::exec').has('fnUnused'));
+  assert.ok(!fnptrNames('framework.c::exec').has('fnR'));
+
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const strictNames = id => (strict._index.outAdj.get(id) || [])
+    .filter(e => e.kind === 'fnptr').map(e => e.callee);
+  // strict 模式只保留枚举算术确定常量槽位 enum_tbl[BASE + STEP] -> fnB
+  assert.deepEqual(strictNames('driver.c::run_mach'), ['fnB']);
+  assert.deepEqual(strictNames('framework.c::exec'), []);
 });

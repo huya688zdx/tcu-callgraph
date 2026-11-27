@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
-import { children, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
+import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, normalizeRecordBaseType, pointerExpression, pointerSlots,
   readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
@@ -31,7 +31,7 @@ function resolveDecl(ref, context, byDecl, exported) {
     || (declaration && declaration.node.storageClass !== 'static' ? exported.get(ref.name) : undefined);
 }
 
-function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
+function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispatchPolicy = 'expand') {
   const functions = new Map(), defs = new Map(), externals = new Map();
   const fnDecls = new Map(), varDecls = new Map(), publicFns = new Map();
   const functionRecords = [], recordsById = new Map();
@@ -75,7 +75,30 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
   // 局部变量即使与全局同名也不能从名字回退到全局定义。
   const resolveVariable = (ref, unit) => ref?.kind === 'VarDecl' ? varDecls.get(unit).get(ref.id) : undefined;
 
-  const tables = new Map(), addressTaken = new Map(), calls = [];
+  const tables = new Map(), addressTaken = new Map(), calls = [], byRecordField = new Map(), declWrites = new Map();
+  const recordTypeKeys = (rawType, context) => {
+    if (!rawType) return [];
+    const keys = new Set([rawType]);
+    keys.add(rawType.replace(/^(?:struct|union)\s+/, ''));
+    const norm = normalizeRecordBaseType(rawType, context);
+    if (norm) {
+      keys.add(norm);
+      keys.add(norm.replace(/^(?:struct|union)\s+/, ''));
+    }
+    return [...keys].filter(Boolean);
+  };
+  const indexRecordField = (rawType, context, slot, targetId) => {
+    if (!rawType || !slot || !targetId) return;
+    const dot = slot.lastIndexOf('.');
+    if (dot < 0) return;
+    const fieldName = slot.slice(dot + 1);
+    if (!fieldName) return;
+    for (const key of recordTypeKeys(rawType, context)) {
+      const k = `${key}::${fieldName}`;
+      if (!byRecordField.has(k)) byRecordField.set(k, new Set());
+      byRecordField.get(k).add(targetId);
+    }
+  };
   const noteAddress = (ref, unit) => {
     const target = resolveFunction(ref.referencedDecl, unit);
     const sig = functionSignature(typeOf(ref.referencedDecl) || typeOf(ref), unit);
@@ -84,10 +107,14 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
   };
   for (const unit of units) {
     for (const node of unit.globals) {
-      const slots = pointerSlots(node, unit, resolveFunction);
-      if (slots.size) {
+      const candidateSlots = new Map();
+      const slots = pointerSlots(node, unit, resolveFunction, candidateSlots);
+      const rawType = normalizeRecordBaseType(typeOf(node), unit);
+      if (slots.size || candidateSlots.size) {
         const id = varDecls.get(unit).get(node.id);
-        tables.set(id, { slots, constant: hasConstSlots(node) });
+        tables.set(id, { slots, candidateSlots, constant: hasConstSlots(node), baseType: rawType });
+        for (const [slot, targetId] of slots) indexRecordField(rawType, unit, slot, targetId);
+        for (const [slot, targetIds] of candidateSlots) for (const targetId of targetIds) indexRecordField(rawType, unit, slot, targetId);
       }
       const init = node.init && children(node).find((n) => !n.kind.endsWith('Attr'));
       if (init) for (const child of walk(init)) {
@@ -104,17 +131,25 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
         }
         if (node.kind === 'DeclRefExpr' && node.referencedDecl?.kind === 'FunctionDecl' && !direct.has(node)) noteAddress(node, unit);
       }
+      for (const w of collectAssignmentWrites(record.body, unit, resolveFunction)) {
+        const declKey = resolveVariable(w.decl, unit) || w.decl.id;
+        if (!declWrites.has(declKey)) declWrites.set(declKey, []);
+        declWrites.get(declKey).push(w);
+        if (w.member) {
+          for (const targetId of w.targets) indexRecordField(w.baseType, unit, `.${w.member}`, targetId);
+        }
+      }
     }
   }
 
-  const edges = new Map(), callTargets = new WeakMap();
+  const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
   for (const unit of units) for (const entry of unit.loc.includes) includes.set(...entry);
   for (const { record, node, callee, ref } of calls) {
     const { context, fn } = record;
     const pos = context.loc.begin(node);
     const line = pos?.line ?? fn.line;
-    let candidates, kind, via;
+    let candidates, kind, via, siteId, resolution, dynamicDispatch = false;
     if (ref) {
       candidates = [resolveFunction(ref.referencedDecl, context)];
       const macro = [pos, context.loc.end(node), context.loc.begin(ref)].find((p) => p?.macro && !p.macroArgument);
@@ -122,21 +157,97 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
       if (macro) via = context.loc.token(macro) || ref.referencedDecl.name;
     } else {
       kind = 'fnptr';
-      const pointer = pointerExpression(callee);
+      siteId = `${fn.id}@${line}:${pos?.col ?? 0}`;
+      const pointer = pointerExpression(callee, context);
       const expression = context.loc.text(callee) || pointer?.decl?.name || '<间接调用>';
       const signature = functionSignature(typeOf(callee), context);
-      const table = tables.get(resolveVariable(pointer?.decl, context));
+      const varKey = resolveVariable(pointer?.decl, context) || pointer?.decl?.id;
+      const table = tables.get(varKey);
       const exact = pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const slotPattern = table?.constant && pointer?.slot.includes('[*]')
+      const slotRegex = table && pointer?.slot.includes('[*]')
         ? new RegExp('^' + pointer.slot.split('[*]').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\[\\d+\\]') + '$') : null;
-      const matchingSlots = slotPattern ? [...table.slots].filter(([slot, to]) => slotPattern.test(slot) && targets?.has(to))
-        .map(([, to]) => to) : [];
-      candidates = exact ? [exact] : matchingSlots.length ? [...new Set(matchingSlots)] : [...(targets || [])];
-      if (!candidates.length) candidates = [addExternal(`ext::fnptr::${fn.file}::${expression}::${signature}`, expression)];
-      via = `${expression}（${exact ? '初始化槽位' : targets?.size
-        ? `类型签名 ${signature} + 已取地址函数${matchingSlots.length ? ' + 表字段' : ''}`
-        : `未解析，类型 ${signature || '未知'}`}）`;
+      const matchingSlots = [];
+      if (table) {
+        if (table.slots.get(pointer?.slot)) matchingSlots.push(table.slots.get(pointer.slot));
+        for (const ct of (table.candidateSlots?.get(pointer?.slot) || [])) matchingSlots.push(ct);
+        if (slotRegex) {
+          for (const [slot, to] of table.slots) if (slotRegex.test(slot) && (!targets?.size || targets.has(to))) matchingSlots.push(to);
+          for (const [slot, tos] of (table.candidateSlots || [])) {
+            if (slotRegex.test(slot)) for (const to of tos) if (!targets?.size || targets.has(to)) matchingSlots.push(to);
+          }
+        }
+      }
+      const writesForVar = (declWrites.get(varKey) || []).filter(w => {
+        if (!pointer?.slot) return !w.slot;
+        if (w.slot === pointer.slot) return true;
+        return slotRegex ? slotRegex.test(w.slot) : false;
+      });
+      const writtenTargets = writesForVar.flatMap(w => w.targets);
+      const fieldCandidates = new Set();
+      if (pointer?.member && pointer?.baseType) {
+        for (const key of recordTypeKeys(pointer.baseType, context)) {
+          const hit = byRecordField.get(`${key}::${pointer.member}`);
+          if (hit) for (const id of hit) fieldCandidates.add(id);
+        }
+      }
+      if (dispatchPolicy === 'strict') {
+        if (exact && !writtenTargets.length) {
+          candidates = [exact];
+          resolution = 'exact';
+          via = `${expression}（初始化槽位）`;
+        } else {
+          candidates = [];
+          resolution = 'unresolved';
+          const fallbackList = [...new Set([...matchingSlots, ...writtenTargets, ...fieldCandidates])];
+          indirectCalls.push({
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
+            expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
+            resolution, truncated: false, matchedSlots: fallbackList.length,
+            candidates: fallbackList.map(id => ({ slot: pointer?.slot || '', name: (functions.get(id) || externals.get(id))?.name || id, id })),
+          });
+        }
+      } else {
+        const combinedSlots = [...new Set([...matchingSlots, ...writtenTargets])];
+        const hasMemberType = Boolean(pointer?.member && pointer?.baseType);
+        if (exact && !writtenTargets.length) {
+          candidates = [exact];
+          resolution = 'exact';
+          via = `${expression}（初始化槽位）`;
+        } else if (combinedSlots.length) {
+          candidates = combinedSlots.slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = `${expression}（静态槽位展开）`;
+        } else if (fieldCandidates.size) {
+          candidates = [...fieldCandidates].slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = `${expression}（结构体字段 ${pointer.baseType}.${pointer.member}）`;
+        } else if (!hasMemberType && targets?.size) {
+          candidates = [...targets].slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = `${expression}（类型签名 ${signature} + 已取地址函数）`;
+        } else {
+          candidates = [addExternal(`ext::fnptr::${fn.file}::${expression}::${signature}`, expression)];
+          resolution = 'unresolved';
+          via = `${expression}（未解析，类型 ${signature || '未知'}）`;
+        }
+        if (resolution !== 'exact') {
+          const icCands = candidates.filter(id => !id.startsWith('ext::fnptr::')).map(id => ({
+            slot: pointer?.slot || '',
+            name: (functions.get(id) || externals.get(id))?.name || id,
+            id,
+          }));
+          indirectCalls.push({
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
+            expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
+            resolution, truncated: (combinedSlots.length || fieldCandidates.size || targets?.size || 0) > 32,
+            matchedSlots: icCands.length, candidates: icCands,
+          });
+        }
+      }
     }
     callTargets.set(node, candidates.flatMap((id) => {
       const records = recordsById.get(id);
@@ -144,7 +255,10 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
       return [records.find((r) => r.context === context) || records[0]];
     }));
     for (const to of candidates) {
-      const edge = { from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, col: pos?.col, via };
+      const edge = {
+        from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, col: pos?.col, via,
+        ...(siteId ? { siteId, resolution, ...(dynamicDispatch ? { dynamicDispatch: true } : {}) } : {}),
+      };
       edges.set(JSON.stringify([edge.from, to, line, kind, via, pos?.offset]), edge);
     }
   }
@@ -165,7 +279,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
     for (const item of unit.enumDeclarations) enumDeclarations.set(JSON.stringify([item.file, item.hash]), item);
   }
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
-    edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings,
+    edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings, indirectCalls,
     enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
     fnptrTables: [...tables].map(([id, { slots }]) => ({
       id, name: defs.get(id).name, file: defs.get(id).file,
@@ -317,7 +431,7 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     }
     if (!parsed.length) throw new Error(warnings.map((w) => `${w.file}：${w.error}`).join('；'));
     const files = found.filter((f) => f.isHeader || selected.has(f.rel)).map(({ abs, ...f }) => f);
-    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))),
+    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs])), options.dispatchPolicy === 'strict' ? 'strict' : 'expand'),
       ...(responseFiles.size && { responseFiles: [...responseFiles] }), elapsedMs: Date.now() - started };
   } finally {
     if (dependenciesDir) fs.rmSync(dependenciesDir, { recursive: true, force: true });

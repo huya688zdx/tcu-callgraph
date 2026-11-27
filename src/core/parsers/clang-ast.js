@@ -260,15 +260,56 @@ function recordType(type, context) {
   return context.records.get(key) || context.records.get(key.replace(/^struct /, ''));
 }
 
+function constIndexValue(node, context) {
+  if (!node) return null;
+  for (const n of walk(node)) {
+    if (n.kind === 'ConstantExpr' && n.value != null && /^-?\d+$/.test(String(n.value))) {
+      const v = Number(n.value);
+      return Number.isSafeInteger(v) ? v : null;
+    }
+  }
+  const u = unwrap(node);
+  if (u?.kind === 'IntegerLiteral' && u.value != null) {
+    const v = Number(u.value);
+    return Number.isSafeInteger(v) ? v : null;
+  }
+  if (u?.kind === 'CharacterLiteral' && Number.isSafeInteger(u.value)) return u.value;
+  if (u?.kind === 'DeclRefExpr' && u.referencedDecl?.kind === 'EnumConstantDecl') {
+    const ev = context?.enumById?.get(u.referencedDecl.id)?.value;
+    if (ev != null && /^-?\d+$/.test(String(ev))) {
+      const v = Number(ev);
+      return Number.isSafeInteger(v) ? v : null;
+    }
+  }
+  return null;
+}
+
 /** Clang 的语义 InitListExpr 已把位置和指定初始化排列到了字段/下标对应的槽上。 */
-export function pointerSlots(node, context, resolveFunction) {
+export function pointerSlots(node, context, resolveFunction, candidateSlots = null) {
   const slots = new Map();
+  function collectRhsRefs(expr, out) {
+    const u = unwrap(expr);
+    if (!u) return;
+    const ref = fnRef(u);
+    if (ref) {
+      out.push(resolveFunction(ref.referencedDecl, context));
+      return;
+    }
+    if (u.kind === 'ConditionalOperator') {
+      collectRhsRefs(children(u)[1], out);
+      collectRhsRefs(children(u)[2], out);
+    }
+  }
   function visit(value, slot) {
     value = unwrap(value);
     if (!value) return;
     const ref = fnRef(value);
     if (ref) {
       slots.set(slot, resolveFunction(ref.referencedDecl, context));
+    } else if (value.kind === 'ConditionalOperator' && candidateSlots) {
+      const cands = [];
+      collectRhsRefs(value, cands);
+      if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
     } else if (value.kind === 'InitListExpr') {
       const type = typeOf(value);
       const fields = children(recordType(type, context)).filter((field) => field.kind === 'FieldDecl');
@@ -298,18 +339,70 @@ export function functionSignature(type, context) {
   return normalized.slice(0, start) + normalized.slice(start).replace(/^\(\*(?:const|volatile|restrict|\*)*\)(?=\()/, '');
 }
 
-export function pointerExpression(node) {
+export function normalizeRecordBaseType(type, context) {
+  if (!type) return null;
+  let cleaned = type.replace(/\b(const|volatile|restrict)\b/g, '').replace(/[*&]/g, '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return null;
+  if (context?.aliases?.has(cleaned)) {
+    const expanded = context.aliases.get(cleaned).replace(/\b(const|volatile|restrict)\b/g, '').trim();
+    if (expanded) return expanded;
+  }
+  return cleaned;
+}
+
+export function pointerExpression(node, context = null) {
   node = unwrap(node);
-  if (node?.kind === 'DeclRefExpr') return { decl: node.referencedDecl, slot: '', exact: true };
+  if (node?.kind === 'DeclRefExpr') {
+    return { decl: node.referencedDecl, slot: '', member: null, baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
+  }
   if (!node) return null;
   if (node.kind === 'MemberExpr' || node.kind === 'ArraySubscriptExpr') {
-    const base = pointerExpression(children(node)[0]);
+    const baseNode = children(node)[0];
+    const base = pointerExpression(baseNode, context);
     if (!base) return null;
-    const index = unwrap(children(node)[1]);
-    const constant = index?.kind === 'IntegerLiteral' ? index.value : null;
-    return { ...base, slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
-      exact: base.exact && !node.isArrow && (node.kind !== 'ArraySubscriptExpr' || constant !== null) };
+    const rawIndex = children(node)[1];
+    const constant = node.kind === 'ArraySubscriptExpr' ? constIndexValue(rawIndex, context) : null;
+    const rawBaseType = node.kind === 'MemberExpr' ? normalizeRecordBaseType(typeOf(baseNode), context) : base.baseType;
+    return {
+      ...base,
+      slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      member: node.kind === 'MemberExpr' ? node.name : base.member,
+      baseType: rawBaseType || base.baseType,
+      exact: base.exact && !node.isArrow && (node.kind !== 'ArraySubscriptExpr' || constant !== null),
+    };
   }
-  if (node.kind === 'UnaryOperator' && node.opcode === '*') return pointerExpression(children(node)[0]);
+  if (node.kind === 'UnaryOperator' && node.opcode === '*') return pointerExpression(children(node)[0], context);
   return null;
+}
+
+export function collectAssignmentWrites(body, context, resolveFunction) {
+  const writes = [];
+  const collectRhs = (expr, out) => {
+    const u = unwrap(expr);
+    if (!u) return;
+    const ref = fnRef(u);
+    if (ref) { out.push(resolveFunction(ref.referencedDecl, context)); return; }
+    if (u.kind === 'ConditionalOperator') {
+      collectRhs(children(u)[1], out);
+      collectRhs(children(u)[2], out);
+    }
+  };
+  for (const node of walk(body)) {
+    if (node.kind !== 'BinaryOperator' || node.opcode !== '=' || children(node).length < 2) continue;
+    const lhs = pointerExpression(children(node)[0], context);
+    if (!lhs?.decl) continue;
+    const targets = [];
+    collectRhs(children(node)[1], targets);
+    if (!targets.length) continue;
+    const pos = context.loc.begin(node);
+    writes.push({
+      decl: lhs.decl,
+      slot: lhs.slot,
+      member: lhs.member,
+      baseType: lhs.baseType || normalizeRecordBaseType(typeOf(children(node)[0]), context),
+      line: pos?.line ?? 0,
+      targets: [...new Set(targets)],
+    });
+  }
+  return writes;
 }

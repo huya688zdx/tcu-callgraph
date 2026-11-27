@@ -113,11 +113,12 @@ test('Clang AST：激活分支、宏签名、位置和指定初始化、类型�
   }
   assert.deepEqual(runnable.filter((e) => e.kind === 'fnptr' && e.line === 25).map((e) => e.callee).sort(), ['Run_A', 'Run_B']);
   const dispatch = model.edges.filter((e) => e.from === fn('Dispatch') && e.kind === 'fnptr');
-  for (const line of [30, 31]) {
-    const candidates = dispatch.filter((e) => e.line === line);
-    assert.deepEqual(candidates.map((e) => e.callee).sort(), ['Enter_A', 'Enter_B', 'Run_A', 'Run_B']);
-    assert.ok(candidates.every((e) => /已取地址函数/.test(e.via)));
-  }
+  const fpCandidates = dispatch.filter((e) => e.line === 30);
+  assert.deepEqual(fpCandidates.map((e) => e.callee).sort(), ['Enter_A', 'Enter_B', 'Run_A', 'Run_B']);
+  assert.ok(fpCandidates.every((e) => /已取地址函数/.test(e.via)));
+  const memberCandidates = dispatch.filter((e) => e.line === 31);
+  assert.deepEqual(memberCandidates.map((e) => e.callee).sort(), ['Run_A', 'Run_B']);
+  assert.ok(memberCandidates.every((e) => /结构体字段/.test(e.via)));
   assert.ok(dispatch.some((e) => e.to.startsWith('ext::fnptr::') && /未解析/.test(e.via)));
   const df = model._df, edges = model.edges, vars = model.variables;
   assert.deepEqual([...df.fnAccess.get(fn('Enter_A')).writes.get('var::g_state').fields], ['count']);
