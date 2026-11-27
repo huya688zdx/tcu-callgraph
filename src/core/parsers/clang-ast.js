@@ -301,7 +301,7 @@ function recordType(type, context) {
   return context.records.get(key) || context.records.get(key.replace(/^struct /, ''));
 }
 
-function constIndexValue(node, context) {
+export function constIndexValue(node, context) {
   // 只有整个下标或不改变数值的包装层可以提供精确值。窄化转换不能剥除。
   let u = node;
   while (u && (u.kind === 'ParenExpr' || (u.kind === 'ImplicitCastExpr' && u.castKind === 'NoOp'))) {
@@ -417,6 +417,8 @@ export function pointerExpression(node, context = null) {
     return {
       ...base,
       slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      ...(node.kind === 'ArraySubscriptExpr' && constant === null
+        ? { bounds: [...(base.bounds || []), Number(/\[(\d+)\]/.exec(typeOf(unwrap(baseNode)))?.[1])] } : {}),
       ...(node.kind === 'ArraySubscriptExpr' && !base.slot && !base.throughPointer && baseNode.castKind !== 'ArrayToPointerDecay'
         ? { pointerIndex: constant ?? '*' } : {}),
       throughPointer: base.throughPointer || node.isArrow ||
@@ -428,40 +430,24 @@ export function pointerExpression(node, context = null) {
     };
   }
   if (node.kind === 'UnaryOperator' && node.opcode === '*') {
-    const base = pointerExpression(children(node)[0], context);
+    const operand = children(node)[0], base = pointerExpression(operand, context);
+    // (*cb)() 对函数指示符的解引用等价于 cb()，而 (*slot)() 仍需读取另一个对象。
+    if (context && cleanType(typeOf(node), context.aliases) === functionSignature(typeOf(operand), context)) return base;
     return base && { ...base, throughPointer: true };
   }
   return null;
 }
 
-export function collectAssignmentWrites(body, context, resolveFunction) {
+export function collectAssignmentWrites(body, context) {
   const writes = [];
-  const collectRhs = (expr, out) => {
-    const u = unwrap(expr);
-    if (!u) return;
-    const ref = fnRef(u);
-    if (ref) { out.push(resolveFunction(ref.referencedDecl, context)); return; }
-    if (u.kind === 'ConditionalOperator') {
-      collectRhs(children(u)[1], out);
-      collectRhs(children(u)[2], out);
-    }
-  };
   for (const node of walk(body)) {
-    if (node.kind !== 'BinaryOperator' || node.opcode !== '=' || children(node).length < 2) continue;
-    const lhs = pointerExpression(children(node)[0], context);
+    if (node.kind !== 'BinaryOperator' || node.opcode !== '=') continue;
+    const [target, value] = children(node);
+    if (!/\(\s*\*/.test(cleanType(typeOf(target), context.aliases))) continue;
+    const lhs = pointerExpression(target, context);
     if (!lhs?.decl) continue;
-    const targets = [];
-    collectRhs(children(node)[1], targets);
-    // 赋入未知回调同样可能覆盖初始槽，不能仅凭没有已知 RHS 就认定精确。
-    if (!targets.length && !/\(\s*\*/.test(typeOf(children(node)[0]))) continue;
-    const pos = context.loc.begin(node);
-    writes.push({
-      node, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
-      slot: lhs.slot,
-      fieldId: lhs.fieldId,
-      line: pos?.line ?? 0,
-      targets: [...new Set(targets)],
-    });
+    writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
+      slot: lhs.slot, fieldId: lhs.fieldId });
   }
   return writes;
 }

@@ -8,7 +8,7 @@ import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, file
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, transferredValues, typeOf, variableModel, walk } from './clang-ast.js';
-import { aggregateCopyReader, matchingSlot } from './clang-copy.js';
+import { callbackSlotReader, matchingSlot } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
 import { lex } from '../lexer.js';
@@ -146,35 +146,66 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
         if (node.kind === 'DeclRefExpr' && node.referencedDecl?.kind === 'FunctionDecl' && !direct.has(node)) noteAddress(node, unit);
       }
-      for (const w of collectAssignmentWrites(record.body, unit, resolveFunction)) {
+      for (const w of collectAssignmentWrites(record.body, unit)) {
         const declKey = objectKey(w.decl, unit);
         if (!declWrites.has(declKey)) declWrites.set(declKey, []);
-        declWrites.get(declKey).push({ ...w, record });
+        w.record = record;
+        declWrites.get(declKey).push(w);
         if (w.fieldId) {
           const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
-          for (const target of w.targets) {
-            indexField(fields, unit, w.fieldId, w.slot, target);
-            if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, target);
-          }
+          indexField(fields, unit, w.fieldId, w.slot, w);
+          if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, w);
         }
       }
     }
   }
 
-  const slotReaders = new WeakMap();
-  function trackedTargets(record, pointer, call) {
-    if (!pointer?.member || pointer.throughPointer) return null;
-    if (!slotReaders.has(record)) {
-      const ambientTargets = (key, slot) => {
-        if (typeof key !== 'string') return [];
+  const readers = new WeakMap(), writeValues = new WeakMap();
+  let writeDepth = 0;
+  function writeValue(write) {
+    if (!writeValues.has(write)) {
+      // 跨对象或跨函数的循环依赖只提供未知值，不用已经过期的初始化器填补。
+      const incomplete = { targets: [], unknown: true, parameters: [] };
+      if (writeDepth >= 32) return incomplete;
+      writeValues.set(write, incomplete);
+      writeDepth++;
+      try { writeValues.set(write, readerFor(write.record).atAssignment(write)); }
+      finally { writeDepth--; }
+    }
+    return writeValues.get(write);
+  }
+  function fieldValues(fields, key, indices) {
+    const targets = new Set();
+    let unknown = false;
+    for (const [slot, entries] of fields?.get(key) || []) {
+      if (!matchingSlot(slot, indices)) continue;
+      for (const entry of entries) {
+        if (typeof entry === 'string') targets.add(entry);
+        else {
+          const value = writeValue(entry);
+          for (const id of value.targets) targets.add(id);
+          unknown ||= value.unknown || value.parameters.length > 0;
+        }
+      }
+    }
+    return { targets: [...targets], unknown };
+  }
+  function readerFor(record) {
+    if (!readers.has(record)) {
+      const ambient = (key, slot) => {
+        if (typeof key !== 'string' && key?.storageClass !== 'static') return { targets: [], unknown: false };
         const ids = [];
+        let unknown = !!defs.get(key)?.isExtern && !slot;
         const table = tables.get(key);
         for (const [path, id] of table?.slots || []) if (matchingSlot(path, slot)) ids.push(id);
         for (const [path, targets] of table?.candidateSlots || []) if (matchingSlot(path, slot)) ids.push(...targets);
-        for (const w of declWrites.get(key) || []) if (w.record !== record && matchingSlot(w.slot, slot)) ids.push(...w.targets);
-        return ids;
+        for (const w of declWrites.get(key) || []) if (matchingSlot(w.slot, slot)) {
+          const value = writeValue(w);
+          ids.push(...value.targets);
+          unknown ||= value.unknown || value.parameters.length > 0;
+        }
+        return { targets: ids, unknown };
       };
-      // 只看直接被调函数对应形参的写入。地址经别名或未知函数传递时，按声明字段保留间接写候选。
       const parameterWrites = (callee, index) => {
         const unit = record.context;
         const id = resolveDecl(fnRef(callee)?.referencedDecl, unit, fnDecls, publicFns);
@@ -186,17 +217,10 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         if (forwardedParams.has(param)) writes.push(null);
         return writes;
       };
-      const fieldWrites = (fieldId, slot) => {
-        const entries = indirectFieldWrites.get(fieldKey(record.context, fieldId));
-        const ids = [];
-        for (const [indices, targets] of entries || []) {
-          if (matchingSlot(indices, memberIndices(slot))) ids.push(...targets);
-        }
-        return ids;
-      };
-      slotReaders.set(record, aggregateCopyReader(record, objectKey, resolveFunction, ambientTargets, { parameterWrites, fieldWrites }));
+      const fieldWrites = (id, slot) => fieldValues(indirectFieldWrites, fieldKey(record.context, id), memberIndices(slot));
+      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue }));
     }
-    return slotReaders.get(record)(pointer, call);
+    return readers.get(record);
   }
   const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
@@ -219,11 +243,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       const signature = functionSignature(typeOf(callee), context);
       const varKey = objectKey(pointer?.decl, context);
       const table = tables.get(varKey);
-      const tracked = trackedTargets(record, pointer, node);
+      const tracked = pointer?.decl ? readerFor(record).atCall(pointer, node) : null;
       // 空数组表示追踪过该成员，但目前的值未知；不能重新引入旧初始化值。
       const exact = tracked === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const matchingSlots = tracked || [];
+      const matchingSlots = tracked?.targets || [];
       if (tracked === null && table) {
         if (pointer.slot.includes('[*]')) {
           for (const [slot, to] of table.slots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(to);
@@ -233,19 +257,21 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           matchingSlots.push(...(table.candidateSlots.get(pointer.slot) || []));
         }
       }
-      const objectWrites = declWrites.get(varKey) || [];
+      const objectWrites = varKey == null ? [] : declWrites.get(varKey) || [];
       const writesForVar = tracked === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
-      const writtenTargets = writesForVar.flatMap(w => w.targets);
+      const writtenValues = writesForVar.map(writeValue);
+      const writtenTargets = writtenValues.flatMap(value => value.targets);
       const field = fieldKey(context, pointer?.fieldId);
       const fieldCandidates = new Set();
-      const knownObject = table || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
+      let unknownValue = tracked?.unknown || tracked?.parameters.length > 0 || writtenValues.some(v => v.unknown || v.parameters.length > 0);
+      const knownObject = tracked || table || (!pointer?.throughPointer && defs.has(varKey) && !defs.get(varKey).isExtern) || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
         (pointer.member || objectWrites.length || /\[[^\]]*\]$/.test(typeOf(pointer.decl))));
       if (field && !knownObject) {
         const indices = memberIndices(pointer.slot);
         const collect = fields => {
-          for (const [slot, ids] of fields?.get(field) || []) {
-            if (matchingSlot(slot, indices)) for (const id of ids) fieldCandidates.add(id);
-          }
+          const value = fieldValues(fields, field, indices);
+          for (const id of value.targets) fieldCandidates.add(id);
+          unknownValue ||= value.unknown;
         };
         collect(byRecordField);
         for (let scope = context.scopeOf.get(node); scope; scope = context.scopeOf.get(scope)) collect(localFields.get(scope));
@@ -267,7 +293,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           });
         }
       } else {
-        const combinedSlots = [...new Set([...matchingSlots, ...writtenTargets])];
+        const combinedSlots = [...new Set([...matchingSlots, ...writtenTargets,
+          ...(unknownValue ? [...fieldCandidates, ...(targets || [])] : [])])];
         const signatureTargets = !knownObject && !(pointer?.member && pointer.baseType) ? targets : null;
         if (exact && !writesForVar.length) {
           candidates = [exact];
@@ -277,7 +304,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           candidates = combinedSlots.slice(0, 32);
           resolution = 'possible';
           dynamicDispatch = true;
-          via = `${expression}（静态槽位展开）`;
+          via = unknownValue && targets?.size ? `${expression}（槽位与同签名的已取地址函数）` : `${expression}（静态槽位展开）`;
         } else if (fieldCandidates.size) {
           candidates = [...fieldCandidates].slice(0, 32);
           resolution = 'possible';

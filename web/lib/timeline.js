@@ -288,6 +288,7 @@ let reviewTime = 0;
 let reviewSeq = 0;
 let changingReview = false;
 let restoringSnapshot = false;
+let reviewAfterRestore = null;
 let latestUpdated = false;
 let reviewSessionChanged = false;
 
@@ -318,6 +319,7 @@ function showBar() {
 
 function hideBar() {
   ++reviewSeq;
+  reviewAfterRestore = null;
   preReview = null;
   reviewTime = 0;
   changingReview = false;
@@ -329,7 +331,14 @@ function hideBar() {
 
 /** 进入回看：把 state.at 指到某个事件，重新拉一次视图 */
 async function reviewAt(eventId, ts) {
-  if (reviewTransition() || reviewSessionChanged || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (reviewSessionChanged || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (restoringSnapshot && !state.at && state.view) {
+    // 恢复已提交；在新画布上进入用户最后选中的历史条目。
+    reviewAfterRestore = { eventId, ts };
+    closeModal();
+    return;
+  }
+  if (reviewTransition()) return;
   if (!state.at) {
     preReview = { roots: [...state.roots], expansions: structuredClone(state.expansions),
       up: state.up, down: state.down, group: state.group, groupMode: state.groupMode, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
@@ -421,10 +430,16 @@ restoreBtn?.addEventListener('click', async () => {
     if (r.restoredView) await hooks.restoreTimelineView(r.restoredView, r.eventId);
     else await hooks.reloadAll();
   } catch (error) {
+    reviewAfterRestore = null;
     alert(error.message || t('timeline.restoreFailed'));
   } finally {
     restoringSnapshot = false;
     syncReviewControls();
+  }
+  if (reviewAfterRestore) {
+    const { eventId, ts } = reviewAfterRestore;
+    reviewAfterRestore = null;
+    await reviewAt(eventId, ts);
   }
 });
 

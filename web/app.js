@@ -259,7 +259,7 @@ hooks.restoreTimelineView = async (snapshot, revision) => {
   deleteStack.length = 0;
   const view = await loadView(snapshot.roots, { ...snapshot, nav: false, empty: !!snapshot.empty });
   if (!view) throw new Error(t('app.viewFailed'));
-  await loadStats();
+  void loadStats().catch(error => console.warn(error));
 };
 hooks.renderDetail = renderDetail;
 hooks.syncComparison = syncComparison;

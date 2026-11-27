@@ -349,3 +349,83 @@ void readonly(void) { const Ops s = {first}; inspect(&s); s.run(); }`);
     });
   }
 });
+
+test('Clang 在调用点读取标量和数组的回调值，按赋值时刻保留来源', requiresClang, async t => {
+  const dir = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run; Fn slots[2]; } Ops;
+typedef struct { Ops rows[2]; } Group;
+void first(void) {} void second(void) {} void third(void) {} void unrelated(void) {}
+int different(int x) { return x; }
+static int (*used)(int) = different;
+static Fn const global_slots[] = {second, third};
+static Fn empty;
+static Fn shared = first;
+Fn unknown(void); void opaque(Fn *);
+void set(Fn *p) { *p = second; } void next(Fn *p) { p[1] = third; }
+void supply(Fn *p, Fn src) { Fn tmp = src; *p = tmp; }
+void from_local(Fn *p) { Fn f = second; *p = f; f = unrelated; }
+void from_table(Fn *p) { *p = global_slots[1]; }
+void assign_shared(void) { Fn f = second; shared = f; f = unrelated; }
+void read_shared(void) { shared(); }
+void scalar(void) { Fn other = second, cb = first; cb(); cb = other; other = third; cb(); other(); }
+void spelling(void) { Fn f = first, src = second; f = src; (*f)(); }
+void declaration(void) { Fn src = second, cb = src; src = unrelated; cb(); }
+void chain(void) { Fn a = third, b = first, c = second; a = b = c; c = unrelated; a(); b(); }
+void branches(int n) { Fn src = second, cb = first; if (n) cb = src; else cb(); cb(); }
+void conditional(int n) { Fn src = second, cb = n ? src : third; src = unrelated; cb(); }
+void nested(void) { Group g = {{{first,{first,second}}, {third,{third,unrelated}}}};
+  Fn cb = g.rows[0].slots[1]; g.rows[0].slots[1] = unrelated;
+  g.rows[1].run = cb; cb = first; g.rows[1].run(); g.rows[0].slots[1](); g.rows[0].run(); }
+void subscripts(int i) { Fn slots[] = {first,second}; slots[0] = 0; Fn cb = slots[i];
+  slots[1] = unrelated; cb(); slots[i](); }
+void sparse(int i) { Fn slots[640] = {first}; slots[0] = 0; if (slots[i]) slots[i]();
+  slots[639] = third; slots[i](); }
+void lifecycle(void) { Fn f = first; f = 0; if (f) f(); Fn e = empty; if (e) e(); }
+void slot_address(void) { Fn cb = first, sibling = unrelated; cb(); set(&cb); cb(); sibling(); }
+void array_address(void) { Fn slots[] = {first,unrelated,first}; set(slots); next(&slots[1]);
+  slots[0](); slots[1](); slots[2](); }
+void nested_address(void) { Ops s = {unrelated,{first,third}}; set(s.slots); s.run(); s.slots[0](); s.slots[1](); }
+void caller_offset(int i) { Fn a[] = {first,first,unrelated}; set(1 + a); a[0](); a[1](); a[2]();
+  set(a + i); a[2](); }
+void local_pointer(void) { Fn a[] = {first,unrelated,third}; Fn *p = &a[2] - 1;
+  *p = a[2]; (*p)(); a[1](); set(p); a[0](); a[1](); }
+void bound_parameter(void) { Fn f = first, src[] = {third,second}; supply(&f, src[0]); src[0] = unrelated; f(); Fn g = unrelated; supply(&g, second); g(); }
+void invalidated(void) { Fn f = first; opaque(&f); f = 0; if (f) f(); }
+void recurring(void) { static Fn f = first; Fn src = second; f(); f = src; }
+void setter_copy(void) { Fn a = first, b = first; from_local(&a); from_table(&b); a(); b(); }
+void loop(int n) { Fn cb = first, other = second; while (n--) { cb(); cb = other; } }
+void shadows(void) { Fn f = first; { Fn f = unrelated, other = second; f = other; f(); } f(); }
+void snapshot(void) { Fn a = first; set(&a); Fn b = a; a = 0; b(); if (a) a(); }
+void generic(Fn arg, int n) { Fn f = arg; f(); f = first; f = unknown(); f(); f = n ? second : arg; f(); }
+void escaping(void) { Fn f = first, untouched = third; opaque(&f); f(); untouched(); }
+void static_empty(void) { if (empty) empty(); }
+void exact(void) { global_slots[1](); }`);
+  const both = ['first','second'], three = ['first','third'];
+  const compatible = ['first','second','third','unrelated'];
+  for (const policy of ['expand','strict']) {
+    const model = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const expand = policy === 'expand';
+    const expected = {
+      scalar: [['first'], ['second'], ['third']], spelling: [['second']], declaration: [['second']], chain: [['second'], ['second']],
+      branches: [['first'], both], conditional: [['second','third']], nested: [['second'], ['unrelated'], ['first']],
+      subscripts: [['second'], ['unrelated']], sparse: [[], ['third']], lifecycle: [[], []], slot_address: [['first'], both, ['unrelated']],
+      array_address: [both, ['unrelated'], three], nested_address: [['unrelated'], both, ['third']],
+      caller_offset: [['first'], both, ['unrelated'], ['second','unrelated']], bound_parameter: [three, ['second','unrelated']],
+      local_pointer: [['third'], ['third'], ['first'], ['second','third']], invalidated: [[]], recurring: [both], setter_copy: [both, three], read_shared: [both], loop: [both], shadows: [['second'], ['first']],
+      snapshot: [both, []], generic: expand ? [compatible, compatible, compatible] : [[], [], ['second']],
+      escaping: [expand ? compatible : ['first'], ['third']], static_empty: [[]],
+    };
+    for (const [name, targets] of Object.entries(expected)) await t.test(policy + ' ' + name, () => {
+      const caller = 'main.c::' + name;
+      const sites = model.indirectCalls.filter(s => s.caller === caller).sort((a,b) => a.line - b.line || a.col - b.col);
+      assert.deepEqual(sites.map(s => s.candidates.map(c => c.name).sort()), targets);
+      assert.deepEqual(sites.map(s => s.resolution), targets.map(ids => expand && ids.length ? 'possible' : 'unresolved'));
+      const edges = model.edges.filter(e => e.from === caller && e.kind === 'fnptr' && !e.to.startsWith('ext::'));
+      assert.deepEqual(sites.map(s => edges.filter(e => e.siteId === s.siteId).map(e => e.callee).sort()),
+        expand ? targets : targets.map(() => []));
+    });
+    await t.test(policy + ' exact', () => {
+      assert.deepEqual(model.edges.filter(e => e.from === 'main.c::exact' && e.kind === 'fnptr').map(e => [e.callee, e.resolution]), [['third', 'exact']]);
+    });
+  }
+});

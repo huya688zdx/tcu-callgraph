@@ -375,11 +375,25 @@ test('浏览器从回看恢复时保留另一窗口后来保存的画布，检�
   const { eventId } = await post('/api/view-event', { op: 'view.checkpoint', ctx: { checkpointName: '历史基线' }, view: { roots: [historical], up: 0, down: 0 } });
   await post('/api/page', { roots: ['main.c::main'], up: 0, down: 0 });
   const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
-  const review = async id => {
+  const holdResponse = async prefix => {
+    await br.evaluate(`(prefix => {
+      const realFetch = window.fetch;
+      window.responseHeld = false;
+      const pause = new Promise(resolve => { window.releaseResponse = () => { window.fetch = realFetch; resolve(); }; });
+      window.fetch = async (...args) => {
+        const res = await realFetch(...args);
+        if (args[0].startsWith(prefix)) { window.responseHeld = true; await pause; }
+        return res;
+      };
+    })(${JSON.stringify(prefix)})`);
+    return () => br.evaluate('window.releaseResponse()');
+  };
+  const review = async (id, afterClick) => {
     await br.evaluate("document.getElementById('timelineBtn').click()");
     const entry = '.ev[data-id="' + id + '"] .ev-review';
     await br.waitFor('Boolean(document.querySelector(' + JSON.stringify(entry) + '))');
     await br.evaluate('document.querySelector(' + JSON.stringify(entry) + ').click()');
+    if (afterClick) await afterClick();
     await br.waitFor('window.__cg?.at === ' + id + ' && !document.getElementById("reviewRestore").disabled');
   };
   await br.waitFor('window.__cg?.root === "main.c::main"');
@@ -395,14 +409,21 @@ test('浏览器从回看恢复时保留另一窗口后来保存的画布，检�
   assert.match(await br.evaluate("String(window.restoreError)"), /checkpoint unavailable/);
   assert.equal(await br.evaluate('window.__cg.at'), eventId);
   db.exec('DROP TRIGGER fail_checkpoint');
+  // 旁栏统计未完成时，用户仍可回看下一条历史。
+  const releaseStats = await holdResponse('/api/stats?summary=1');
   await br.evaluate("document.getElementById('reviewRestore').click()");
   await br.waitFor('window.__cg.at === 0 && window.__cg.root === ' + JSON.stringify(historical));
   const cp = (await get('/api/events?detail=1')).events.find(e => e.target === '恢复前自动快照');
   assert.deepEqual(cp?.after.view.expansions, [{ root: latest, up: 0, down: 0 }]);
+  await br.waitFor('window.responseHeld === true');
   await review(cp.id);
+  await releaseStats();
+  // 服务端已恢复，但本地画布仍在加载时，用户选中的下一条历史也要生效。
+  const releaseView = await holdResponse('/api/view?');
   await br.evaluate("document.getElementById('reviewRestore').click()");
   await br.waitFor('window.__cg.at === 0 && window.__cg.view.nodes.some(n => n.id === ' + JSON.stringify(latest) + ')');
   assert.deepEqual((await get('/api/page?saved=1')).page.expansions, cp.after.view.expansions);
   const unnamed = await post('/api/view-event', { op: 'view.checkpoint', view: cp.after.view });
-  await review(unnamed.eventId);
+  await br.waitFor('window.responseHeld === true');
+  await review(unnamed.eventId, releaseView);
 });
