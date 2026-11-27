@@ -646,6 +646,9 @@ export function openStore({ dbPath, userData } = {}) {
        WHERE project_id = ? AND id <= ? AND json_type(after, '$.view') = 'object' ORDER BY id ASC`
     ),
     eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
+    canvasEventMax: db.prepare(`SELECT MAX(id) AS id FROM event WHERE project_id = ?
+      AND op NOT IN ('bookmark.save', 'bookmark.delete', 'view.checkpoint', 'view.snapshot')
+      AND (op != 'restore_point' OR COALESCE(json_extract(ctx, '$.canvasChanged'), 1) != 0)`),
     eventAnchor: db.prepare("SELECT id FROM event WHERE project_id = ? AND op = 'baseline' LIMIT 1"),
     eventDump: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY id ASC LIMIT ?'),
 
@@ -675,6 +678,10 @@ export function openStore({ dbPath, userData } = {}) {
          grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars,
          hidden_vars = excluded.hidden_vars, expansions = excluded.expansions,
          revision = bookmark.revision + 1, updated_at = excluded.updated_at`
+    ),
+    bmRestore: db.prepare(
+      `INSERT INTO bookmark (id, project_id, name, roots, up, down, grouped, group_mode, vars, hidden_vars,
+        expansions, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
     ),
     bmUpdateById: db.prepare(
       `UPDATE bookmark
@@ -923,6 +930,10 @@ export function openStore({ dbPath, userData } = {}) {
       return q.eventUpTo.all(projectId, eventId).map(toEvent);
     },
 
+    latestCanvasEventId(projectId) {
+      return Number(q.canvasEventMax.get(projectId).id || 0);
+    },
+
     latestEventId(projectId) {
       const r = q.eventMax.get(projectId);
       return Number(r?.id || 0);
@@ -1086,6 +1097,13 @@ export function openStore({ dbPath, userData } = {}) {
         if (err.errcode === 2067) throw new Error('已存在同名书签，请换一个名称');
         throw err;
       }
+    },
+
+    restoreDeletedBookmark(projectId, before, lastRevision) {
+      const row = q.bmRestore.get(before.id, projectId, before.name, str(before.roots), before.up, before.down,
+        before.group ? 1 : 0, before.groupMode, str(before.vars), str(before.hiddenVars), str(before.expansions),
+        lastRevision + 1, before.createdAt, nowMs());
+      return toBookmark(row);
     },
 
     renameBookmark(projectId, id, newName) {

@@ -411,3 +411,41 @@ test('回调数组成员退化为指针传出时，只作废该数组的初始�
   assert.ok(escapedCall);
   assert.deepEqual(escapedCall.candidates, []);
 });
+
+test('枚举分派按使用位置解析文件、函数与嵌套块作用域', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-enum-scope-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'a-shared.h'), '#include "z-base.h"\nenum { HEADER_SLOT = BASE };\n');
+  fs.writeFileSync(path.join(dir, 'z-base.h'), 'enum { BASE = 1 };\n');
+  fs.writeFileSync(path.join(dir, 'local.h'), 'enum { SLOT = 1 };\n');
+  fs.writeFileSync(path.join(dir, 'scope.c'), [
+    'typedef void (*Fn)(void); enum { SLOT = 0 };',
+    'void first(void) {} void second(void) {}',
+    'static const Fn table[] = { first, second };',
+    '#define PICK SLOT', '#include "a-shared.h"',
+    'void outside(void) { table[PICK](); }',
+    'void shadow(void) { table[SLOT]();', '{ enum { SLOT = 1, NEXT = SLOT }; table[NEXT](); }', 'table[SLOT](); }',
+    'void other(void) { enum { SLOT = 1 }; table[PICK](); }',
+    'void arg(int SLOT) { table[SLOT](); }',
+    'void variable(int i) { int SLOT = i; table[SLOT](); }',
+    'struct Holder { enum { FIELD_SLOT = 1 } member; }; void member(void) { table[FIELD_SLOT](); }',
+    'void loop(void) { for (enum { SLOT = 1 } i = 0; i < 1; ++i) table[SLOT]();', 'table[SLOT](); }',
+    'void included(void) { table[HEADER_SLOT](); {', '#include "local.h"', 'table[SLOT](); }', 'table[SLOT](); }',
+  ].join('\n'));
+  for (const dispatchPolicy of ['strict', 'expand']) {
+    for (const defines of [[], ['CONFIGURED=1']]) {
+      const model = loadModel(dir, { parserOptions: { dispatchPolicy, defines } });
+      const targets = name => (model._index.outAdj.get('scope.c::' + name) || [])
+        .filter(e => e.kind === 'fnptr').map(e => e.callee);
+      assert.deepEqual(targets('outside'), ['first']);
+      assert.deepEqual(targets('shadow'), ['first', 'second', 'first']);
+      assert.deepEqual(targets('other'), ['second']);
+      for (const name of ['arg', 'variable']) {
+        assert.equal((model._index.outAdj.get('scope.c::' + name) || []).some(e => e.kind === 'fnptr' && e.resolution === 'exact'), false);
+      }
+      assert.deepEqual(targets('member'), ['second']);
+      assert.deepEqual(targets('loop'), ['second', 'first']);
+      assert.deepEqual(targets('included'), ['second', 'second', 'first']);
+    }
+  }
+});

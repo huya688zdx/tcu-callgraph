@@ -2230,9 +2230,15 @@ test('e2e：双击已选两点连线不误切其他共线、输入框动态建�
 
 async function mockAiTurn(t, baseUrl, nextCalls) {
   const llm = http.createServer(async (req, res) => {
+    if (req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'mock' }] }));
+      return;
+    }
     let raw = '';
     for await (const chunk of req) raw += chunk;
-    const tools = await nextCalls(JSON.parse(raw).messages.at(-1));
+    const body = JSON.parse(raw);
+    const tools = await nextCalls(body.messages.at(-1), body);
     const message = !tools.length ? { content: '已完成。' } : {
       tool_calls: tools.map(([name, args], i) => ({ id: 'call' + i, type: 'function',
         function: { name, arguments: JSON.stringify(args) } })),
@@ -2246,8 +2252,8 @@ async function mockAiTurn(t, baseUrl, nextCalls) {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   await post('/api/ai/config', { baseUrl: 'http://127.0.0.1:' + llm.address().port, model: 'mock', toolMode: 'tools' });
-  const run = async prompt => {
-    const chat = await post('/api/ai/chat', { prompt });
+  const run = async (prompt, options = {}) => {
+    const chat = await post('/api/ai/chat', { prompt, ...options });
     return (await chat.text()).trim().split('\n').map(JSON.parse);
   };
   return { post, run };
@@ -2465,4 +2471,190 @@ test('AI 新能力：pair/dataflow 上下文服务端证据补全、present_logi
   assert.ok(guideIdx > 0 && helpIdx > 0);
   const helpSlice = html.slice(helpIdx, html.indexOf('</details>', helpIdx));
   assert.doesNotMatch(helpSlice, /present_logic|subagent|aiPaneGuide|AI 助手/, '独立画布 #helpMenu 不应混入 AI 功能指南');
+});
+
+test('AI 查询按真实的读写边报告变量、两点证据与不支持的透镜', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-dataflow-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'flow.c'), [
+    'int shared;', 'void writer(void) { shared = 7; }', 'int reader(void) { return shared; }',
+  ].join('\n'));
+  const srv = await launchServer({ target: dir });
+  t.after(srv.close);
+  let job, request, output;
+  const { run } = await mockAiTurn(t, srv.baseUrl, (last, body) => {
+    if (last.role === 'tool') { output = JSON.parse(last.content); return []; }
+    request = body;
+    return [job];
+  });
+  const v = 'var::shared', writer = 'flow.c::writer', reader = 'flow.c::reader';
+  for (const dir of ['out', 'in', 'both']) {
+    await t.test('全局变量 ' + dir, async () => {
+      job = ['inspect_dataflow', { target: v, dir }];
+      await run('查询 shared 的数据流');
+      const expected = [];
+      if (dir !== 'out') expected.push([writer, v, 'df-write', 2]);
+      if (dir !== 'in') expected.push([v, reader, 'df-read', 3]);
+      assert.equal(output.ok, true);
+      assert.deepEqual(output.edges.map(e => [e.from, e.to, e.kind, e.line]).sort(), expected.sort());
+      assert.deepEqual(output.peers.map(n => n.id).sort(), expected.map(([a, b]) => a === v ? b : a).sort());
+      assert.deepEqual(output.chains.map(c => c.steps.map(n => n.id)).sort(), expected.map(e => e.slice(0, 2)).sort());
+    });
+  }
+  await t.test('两点上下文包含变量与每一次读写的位置', async () => {
+    job = ['inspect_dataflow', { target: reader, peer: writer }];
+    await run('说明这两个函数的数据流', { uiContext: { items: [{ kind: 'pair', fromId: reader, toId: writer }] } });
+    const firstUser = request.messages.at(-1).content;
+    assert.doesNotMatch(firstUser, /undefined/);
+    assert.match(firstUser, /writer.*W.*flow\.c:2.*shared.*R.*flow\.c:3.*reader/);
+    assert.deepEqual(output.sharedVars.map(x => x.id), [v]);
+    assert.deepEqual(output.chains[0].steps.map(s => s.id), [writer, v, reader]);
+  });
+  await t.test('不宣告未实现的 lens，也不发出视觉成功事件', async () => {
+    job = ['canvas_visual', { action: 'lens', lens: 'dataflow' }];
+    const events = await run('切换画布透镜');
+    const schema = request.tools.find(x => x.function.name === 'canvas_visual').function.parameters.properties;
+    assert.equal(output.ok, false);
+    assert.equal(schema.action.enum.includes('lens'), false);
+    assert.match(output.error, /不支持/);
+    assert.equal(events.some(e => e.type === 'canvas_overlay'), false);
+  });
+});
+
+test('撤销对整个画布做并发校验，冲突时保留画布和书签', async t => {
+  for (const edit of ['标注', '布局', '页面', '另一轮推断边', '页面改后改回', '两次 AI 写入之间', '等待最终答复时']) {
+    await t.test(edit, async t => {
+      const srv = await launchServer();
+      t.after(srv.close);
+      const target = 'gear.c::Gear_Init', bookmarkName = 'AI 将保存';
+      const compose = ['add_to_canvas', { functions: [target], includeTasks: false, bookmarkName }];
+      const saveLabel = () => post('/api/overlay', { nodeId: target, data: { note: '用户标注' } });
+      let step = 0, otherTurn = false;
+      const { run, post } = await mockAiTurn(t, srv.baseUrl, async last => {
+        if (otherTurn) return last.role === 'user'
+          ? [['add_call_edge', { edges: [{ from: 'main.c::main', to: target, line: 321 }], includeTasks: false, addToCanvas: false }]] : [];
+        if (last.role === 'user') return [compose];
+        if (step++ === 0 && ['两次 AI 写入之间', '等待最终答复时'].includes(edit)) {
+          if (!(await saveLabel()).ok) throw Error('标注未写入');
+          if (edit === '两次 AI 写入之间') return [compose];
+        }
+        return [];
+      });
+      const events = await run('请将函数加入画布并保存书签');
+      const id = events.find(e => e.type === 'changeset')?.changesetId;
+      assert.ok(id);
+      if (edit === '标注') assert.ok((await saveLabel()).ok);
+      if (edit === '布局') assert.ok((await post('/api/layout', { root: target, mode: 'flat', nodes: { [target]: { x: 50, y: 80 } } })).ok);
+      if (edit === '页面') assert.ok((await post('/api/page', { roots: ['main.c::main'], up: 3, down: 1 })).ok);
+      if (edit === '页面改后改回') {
+        const original = (await (await fetch(srv.baseUrl + '/api/page?saved=1')).json()).page;
+        assert.ok((await post('/api/page', { ...original, down: original.down + 1 })).ok);
+        assert.ok((await post('/api/page', original)).ok);
+      }
+      if (edit === '另一轮推断边') {
+        otherTurn = true;
+        const second = await run('请存下这条推断边');
+        assert.ok(second.some(e => e.type === 'tool_end' && e.ok));
+      }
+      const read = async () => {
+        const session = await (await fetch(srv.baseUrl + '/api/session/export')).json();
+        return { overlay: session.overlay, page: session.lastView, marks: session.bookmarks, events: session.eventsTotal };
+      };
+      const before = await read();
+      assert.ok(before.marks.some(b => b.name === bookmarkName));
+      assert.equal((await post('/api/ai/undo-changeset', { changesetId: id })).status, 409);
+      assert.deepEqual(await read(), before);
+    });
+  }
+});
+
+test('撤销书签删除保留原 ID、作用域与后来取得同名的记录', async t => {
+  for (const mode of ['删除已有', '覆盖后删除', '删除后同名重建', '新建后删除', '独立同名冲突']) {
+    await t.test(mode, async t => {
+      const srv = await launchServer();
+      t.after(srv.close);
+      const name = '保存的入口';
+      const save = ['manage_bookmarks', { action: 'save', name }];
+      const remove = id => ['manage_bookmarks', { action: 'delete', id }];
+      let original, step = 0, newId;
+      const { run, post } = await mockAiTurn(t, srv.baseUrl, last => {
+        if (last.role === 'user') return [['覆盖后删除', '新建后删除'].includes(mode) ? save : remove(original.id)];
+        if (step++ === 0) {
+          if (['覆盖后删除', '新建后删除'].includes(mode)) return [remove(JSON.parse(last.content).bookmark.id)];
+          if (mode === '删除后同名重建') return [save];
+        } else if (mode === '删除后同名重建') newId = JSON.parse(last.content).bookmark.id;
+        return [];
+      });
+      const list = async () => (await (await fetch(srv.baseUrl + '/api/bookmarks')).json()).list;
+      if (mode !== '新建后删除') original = (await (await post('/api/bookmarks', { name, roots: ['main.c::main'], up: 3, down: 2,
+        vars: ['var::x'], groupMode: 'period', hiddenVars: ['var::y'], expansions: [{ root: 'a.c::f', up: 1, down: 2 }] })).json()).bookmark;
+      const events = await run('按指定顺序管理书签');
+      assert.ok(events.filter(e => e.type === 'tool_end').every(e => e.ok));
+      const id = events.find(e => e.type === 'changeset')?.changesetId;
+      if (mode === '新建后删除') {
+        if (id) assert.equal((await post('/api/ai/undo-changeset', { changesetId: id })).status, 200);
+        assert.deepEqual(await list(), []);
+        return;
+      }
+      assert.ok(id);
+      if (mode === '独立同名冲突') {
+        const newer = (await (await post('/api/bookmarks', { name, roots: ['other.c::new'] })).json()).bookmark;
+        assert.equal((await post('/api/ai/undo-changeset', { changesetId: id })).status, 409);
+        assert.deepEqual(await list(), [newer]);
+        return;
+      }
+      if (mode === '删除后同名重建') assert.notEqual(newId, original.id);
+      assert.equal((await post('/api/ai/undo-changeset', { changesetId: id })).status, 200);
+      const [restored] = await list();
+      assert.ok(restored);
+      assert.deepEqual({ ...restored, revision: original.revision, updatedAt: original.updatedAt }, original);
+      assert.ok(restored.revision > original.revision + (mode === '覆盖后删除' ? 1 : 0));
+    });
+  }
+});
+
+test('浏览器撤销旧画布时显示冲突并保留新标注', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const target = 'gear.c::Gear_Init';
+  const { run, post } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ?
+    [['add_to_canvas', { functions: [target], includeTasks: false }]] : []);
+  const events = await run('请将 Gear_Init 加入画布');
+  const change = events.find(e => e.type === 'changeset');
+  assert.ok(change);
+  await post('/api/ai/chats', { activeId: 'undo', threads: [{ id: 'undo', messages: [
+    { role: 'assistant', text: '已加入画布。', changeset: { id: change.changesetId, ops: change.ops } },
+  ] }] });
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.waitFor('Boolean(window.__cg?.view)');
+  await browser.evaluate("document.getElementById('aiBtn').click()");
+  await browser.waitFor("Boolean(document.querySelector('.ai-undo-btn'))");
+  await post('/api/overlay', { nodeId: target, data: { note: '保留我的新标注' } });
+  await browser.evaluate("document.querySelector('.ai-undo-btn').click()");
+  await browser.waitFor("!document.querySelector('.ai-undo-btn').disabled || document.querySelector('.ai-undo-btn').textContent.includes('已撤销')");
+  assert.match(await browser.evaluate("document.getElementById('aiChatStatus').textContent"), /撤销失败.*修改/);
+  const session = await (await fetch(srv.baseUrl + '/api/session/export')).json();
+  assert.equal(session.overlay.nodes[target].note, '保留我的新标注');
+});
+
+test('未过期的画布撤销保留独立书签和后来的视口', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const { run, post } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ?
+    [['add_to_canvas', { functions: ['gear.c::Gear_Init'], mode: 'replace', includeTasks: false }]] : []);
+  const page = async () => (await (await fetch(srv.baseUrl + '/api/page?saved=1')).json()).page;
+  await post('/api/page', { roots: ['main.c::main'], up: 1, down: 0, cam: { x: 1, y: 2, k: 1 } });
+  const events = await run('替换画布');
+  const id = events.find(e => e.type === 'changeset')?.changesetId;
+  assert.ok(id);
+  const cam = { x: 11, y: 22, k: 0.8 };
+  await post('/api/page', { ...await page(), cam });
+  const independent = (await (await post('/api/bookmarks', { name: '另一个书签', roots: ['adc.c::Adc_Init'] })).json()).bookmark;
+  assert.equal((await post('/api/ai/undo-changeset', { changesetId: id })).status, 200);
+  const restored = await page();
+  assert.deepEqual(restored.roots, ['main.c::main']);
+  assert.deepEqual(restored.cam, cam);
+  assert.deepEqual((await (await fetch(srv.baseUrl + '/api/bookmarks')).json()).list, [independent]);
 });

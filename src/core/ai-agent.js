@@ -480,14 +480,13 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'canvas_visual',
-    description: '控制当前浏览器的轻量视觉叠加层（只作用于展示高亮/流动画/透镜，不写入持久画布数据）。',
+    description: '控制当前浏览器的轻量视觉叠加层（只作用于展示高亮/流动画，不写入持久画布数据）。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['highlight', 'play_flow', 'lens', 'clear'], description: 'highlight 高亮 / play_flow 播放流动画 / lens 切换视觉透镜 / clear 清除' },
+        action: { type: 'string', enum: ['highlight', 'play_flow', 'clear'], description: 'highlight 高亮 / play_flow 播放流动画 / clear 清除' },
         nodeIds: { type: 'array', items: { type: 'string' }, description: '要高亮的节点 ID 列表' },
         edgeKeys: { type: 'array', items: { type: 'string' }, description: '要高亮的边键列表 (from->to)' },
-        lens: { type: 'string', enum: ['default', 'dataflow', 'indirect', 'changes'], description: 'action=lens 时的透镜模式' },
         label: { type: 'string', description: '画布悬浮提示徽章文字' },
       },
       required: ['action'],
@@ -1364,7 +1363,6 @@ function summarizeToolResult(name, result) {
   if (name === 'canvas_visual') {
     if (result.action === 'clear') return '已清除画布叠加视觉高亮';
     if (result.action === 'play_flow') return `已触发数据流动画（${result.edgeKeys?.length || 0} 条连线）`;
-    if (result.action === 'lens') return `已切换视觉透镜：${result.lens || 'default'}`;
     return `已在画布高亮 ${result.nodeIds?.length || 0} 个节点`;
   }
   if (name === 'diagnose_canvas') {

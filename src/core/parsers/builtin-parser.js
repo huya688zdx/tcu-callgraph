@@ -38,7 +38,7 @@ function sharedDirectoryDepth(directory, file) {
   return depth;
 }
 
-function includedHeaders(paths, includes) {
+function headerResolver(paths) {
   const suffixes = new Map();
   for (const rel of paths) {
     for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
@@ -46,11 +46,19 @@ function includedHeaders(paths, includes) {
       suffixes.set(suffix, suffixes.has(suffix) ? null : rel);
     }
   }
-  const direct = new Map();
-  for (const { file, target, resolved } of includes) {
+  return ({ file, target, resolved }) => {
     const normalized = path.posix.normalize(target.replace(/\\/g, '/'));
     const relative = path.posix.join(path.posix.dirname(file), normalized);
-    const header = resolved !== undefined ? resolved : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+    return resolved !== undefined ? resolved : paths.has(relative) ? relative : paths.has(normalized) ? normalized : suffixes.get(normalized);
+  };
+}
+
+function includedHeaders(paths, includes) {
+  const resolve = headerResolver(paths);
+  const direct = new Map();
+  for (const entry of includes) {
+    const { file } = entry;
+    const header = resolve(entry);
     if (!header) continue;
     if (!direct.has(file)) direct.set(file, new Set());
     direct.get(file).add(header);
@@ -271,21 +279,28 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const pendingFieldInitializers = [];
   const dispatchDeclarations = new Map();
   const aliasUsesByFile = new Map();
-  const enumsByFile = new Map();
+  const enumHeaderSources = new Map(), enumHeaderExports = new Map();
+  const configuredEnums = new Map();
   const scheduleRows = [];
   const tentativeCounters = new Set();
   const seenFnId = new Set();
   const varById = new Map();
   const dispatchPolicy = parserOptions?.dispatchPolicy === 'strict' ? 'strict' : 'expand';
 
-  const visibleEnumsFor = (rel) => {
-    const merged = new Map();
-    for (const [hdrRel, map] of enumsByFile) {
-      if (hdrRel === rel || HDR_EXT.test(hdrRel)) {
-        for (const [k, v] of map) merged.set(k, v);
-      }
-    }
-    return merged;
+  const resolveEnumHeader = headerResolver(new Set(headers.map(header => header.rel)));
+  const enumImports = (inc, lookup) => inc.flatMap(entry => {
+    const values = lookup(resolveEnumHeader(entry));
+    return values?.size ? [{ line: entry.line, values }] : [];
+  });
+  // 普通扫描按文件顺序读头文件。首次使用时再按 include 关系求导出值，打断循环引用。
+  const exportedEnums = file => {
+    if (enumHeaderExports.has(file)) return enumHeaderExports.get(file);
+    const source = enumHeaderSources.get(file);
+    if (!source) return null;
+    enumHeaderExports.set(file, null);
+    const { fileValues } = collectEnumValues(source.tokens, source.macros, enumImports(source.includes, exportedEnums));
+    enumHeaderExports.set(file, fileValues);
+    return fileValues;
   };
 
   const recordFunctionCalls = (record, body, fileMacros) => {
@@ -303,7 +318,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
   };
 
-  const recordHeaderContext = (file, input, tokens, macros, source) => {
+  const recordHeaderContext = (file, input, tokens, macros, source, inc) => {
+    if (!configuredEnums.has(source)) configuredEnums.set(source, new Map());
+    const headers = configuredEnums.get(source);
+    const { enumValues, fileValues } = collectEnumValues(tokens, macros, enumImports(inc, header => headers.get(header)));
+    headers.set(file.rel, fileValues);
     // 大多数头文件只声明符号；只有包含函数定义的头才需要比对宏展开后的调用。
     input.hasHeaderFunctions ??= findFunctions(input.tokens.filter(token => token.t !== 'preproc'), file.rel).length > 0;
     if (!input.hasHeaderFunctions) return;
@@ -319,7 +338,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       for (const fn of findFunctions(tokens, file.rel)) {
         const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
         const calls = [];
-        scanCalls(body, { macros }, calls);
+        scanCalls(body, { macros, enumValues }, calls);
         recordFunctionCalls({ fn, calls }, body, macros);
         if (!variant.callsByName.has(fn.name)) variant.callsByName.set(fn.name, calls.filter(call => call.callee));
       }
@@ -365,16 +384,21 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     return { tokens: input, taskDefs, bytes: src.length };
   };
   const recordFile = ({ rel, isHeader }, { taskDefs, bytes }, { tokens, includes: inc }, fileMacros) => {
-    const typedefs = findTypedefs(tokens, fileMacros);
+    if (isHeader && (inc.length || tokens.some(t => t.v === 'enum'))) {
+      enumHeaderSources.set(rel, { tokens, macros: fileMacros, includes: inc });
+      enumHeaderExports.clear();
+    }
+    const configured = configuredEnums.get(rel);
+    const imports = enumImports(inc, configured ? file => configured.get(file) : exportedEnums);
+    const { enumValues: visibleEnums } = collectEnumValues(tokens, fileMacros, imports);
+    configuredEnums.delete(rel);
+    const typedefs = findTypedefs(tokens, fileMacros, visibleEnums);
     if (typedefs.size) typedefsByFile.set(rel, typedefs);
     if (isHeader) for (const [name, entries] of typedefs) {
       if (!entries.some(entry => entry.fileScope)) continue;
       if (!typedefHeadersByName.has(name)) typedefHeadersByName.set(name, []);
       typedefHeadersByName.get(name).push(rel);
     }
-    const { enumValues: fileEnums } = collectEnumValues(tokens, fileMacros);
-    if (fileEnums.size) enumsByFile.set(rel, fileEnums);
-    const visibleEnums = visibleEnumsFor(rel, inc);
     const dispatchScopes = new Set();
     const aliasUses = [];
     scheduleRows.push(...staticSchedule(tokens, rel, fileMacros));
@@ -461,6 +485,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       recordFile(file, input, preprocess(input.tokens, scope, file.rel), scope);
     }
   }
+  enumHeaderSources.clear();
+  enumHeaderExports.clear();
   const headerPaths = new Set(parsed.filter(file => file.isHeader).map(file => file.rel));
   for (const { resolved } of includes) if (resolved) headerPaths.add(resolved);
   const includesHeader = includedHeaders(headerPaths, includes);
@@ -1223,9 +1249,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:26';
+    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:27';
     return JSON.stringify([
-      'builtin:26',
+      'builtin:27',
       policy,
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,

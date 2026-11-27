@@ -236,3 +236,24 @@ test('公共变量样例：按值传参、同名形参与文件私有变量不�
   assert.equal(shadow.reads, 0, '同名形参不应读全局变量');
   assert.equal(shadow.writes, 0);
 });
+
+test('单目标变量数据流保留单侧使用和独立版本的来源位置', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-variable-target-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const before = path.join(root, 'before'), after = path.join(root, 'after');
+  for (const dir of [before, after]) fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(before, 'flow.c'), 'int shared;\nvoid writer(void) { shared = 1; }\n');
+  fs.writeFileSync(path.join(after, 'flow.c'), 'int shared;\n\nint reader(void) { return shared; }\n');
+  const id = 'var::shared';
+  const writes = await dataflowFor(loadModel(before), id, 'both');
+  assert.deepEqual(writes.edges.map(e => [e.from, e.to, e.kind, e.line]), [['flow.c::writer', id, 'df-write', 2]]);
+  const { compareProjects, comparisonDataflow } = await import('../src/core/compare.js');
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project);
+  fs.copyFileSync(path.join(after, 'flow.c'), path.join(project, 'flow.c'));
+  const compared = await compareProjects(project, before, after);
+  const both = await comparisonDataflow(compared, id, 'both');
+  assert.deepEqual(both.edges.map(e => [e.from, e.to, e.version, e.line]), [
+    ['flow.c::writer', id, 'before', 2], [id, 'flow.c::reader', 'after', 3],
+  ]);
+});

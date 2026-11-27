@@ -276,6 +276,24 @@ function sendClientEvent(clientId, event, data = {}) {
   }
 }
 
+// 普通页面上报和推断边写入不一定产生时间轴事件。只对实际内容变化计数。
+let canvasEditRevision = 0;
+function savedCanvasState() {
+  return { page: latestPage(), overlay: store.loadOverlay(PROJECT.id), inferredEdges: loadInferredEdges(PROJECT.id),
+    eventId: store.latestCanvasEventId(PROJECT.id), editRevision: canvasEditRevision };
+}
+
+function sameCanvasPage(a, b) {
+  if (!a || !b) return a === b;
+  return (a.revision ?? 0) === (b.revision ?? 0) && isDeepStrictEqual(viewSnapshot(a), viewSnapshot(b));
+}
+
+function sameSavedCanvas(a, b) {
+  return a.eventId === b.eventId && a.editRevision === b.editRevision && sameCanvasPage(a.page, b.page) &&
+    isDeepStrictEqual(a.overlay, b.overlay) &&
+    isDeepStrictEqual(a.inferredEdges, b.inferredEdges);
+}
+
 const aiChangesets = new Map();
 function saveAiChangeset(entry) {
   if (!entry?.id) return;
@@ -542,6 +560,7 @@ function loadInferredEdges(projectId) {
 }
 
 function saveInferredEdges(projectId, list) {
+  if (!isDeepStrictEqual(list, loadInferredEdges(projectId))) canvasEditRevision++;
   store.setSetting(inferredEdgesKey(projectId), list);
 }
 
@@ -971,6 +990,11 @@ const hasAnnotationValue = (value) => Array.isArray(value) ? value.length > 0 :
   typeof value === 'string' ? value.trim().length > 0 : value != null;
 
 const stringArray = (value) => Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [];
+
+function variablesOnPaths(result, paths) {
+  const ids = new Set(paths.flatMap(p => p.edges.map(e => e.variable)));
+  return result.nodes.filter(n => n.kind === 'var' && ids.has(n.id));
+}
 
 function viewSnapshot(view) {
   const groupMode = resolveGroupMode(view.groupMode, view.group);
@@ -2650,58 +2674,63 @@ export const server = http.createServer(async (req, res) => {
       if (snap.sessionRevision !== sessionRevision) {
         return json(res, { ok: false, error: '画布已进入其他比较或刷新会话，无法撤销' }, 409);
       }
-      const nextPage = snap.page ? {
-        ...snap.page,
-        projectId: PROJECT.id,
-        reviewing: false,
-        at: 0,
-        ts: Date.now(),
-      } : null;
-      const undoCanvas = snap.ops.some(op => op !== 'manage_bookmarks');
-      const restoredOverlay = undoCanvas ? snap.overlay : store.loadOverlay(PROJECT.id);
+      const canvas = snap.canvas;
+      const restorePage = canvas && !sameCanvasPage(canvas.before.page, canvas.after.page);
       const bookmarkEvents = [];
+      let nextPage;
       const eventId = store.transaction(() => {
+        if (canvas && (canvas.stale || !sameSavedCanvas(canvas.after, savedCanvasState()))) return null;
+        const restoredNames = new Set();
         for (const [id, change] of snap.bookmarks) {
-          if (store.getBookmark(PROJECT.id, id)?.revision !== change.revision) return null;
-        }
-        for (const [id, { before }] of snap.bookmarks) {
-          if (before) {
-            const { bookmark } = store.updateBookmarkById(PROJECT.id, id, before);
-            bookmarkEvents.push(['bookmark.save', { bookmark }]);
-          } else {
-            store.deleteBookmark(PROJECT.id, id);
-            bookmarkEvents.push(['bookmark.delete', { bookmarkId: id }]);
+          if ((store.getBookmark(PROJECT.id, id)?.revision ?? null) !== change.revision) return null;
+          if (change.before) {
+            if (restoredNames.has(change.before.name)) return null;
+            restoredNames.add(change.before.name);
+            const occupant = store.findBookmark(PROJECT.id, change.before.name);
+            if (occupant && occupant.id !== id && snap.bookmarks.get(occupant.id)?.before !== null) return null;
           }
         }
-        if (undoCanvas) {
-          store.replaceOverlay(PROJECT.id, restoredOverlay);
-          saveInferredEdges(PROJECT.id, snap.inferredEdges || []);
+        // 同名重建会获得新 ID。先移除本轮新建的记录，为原 ID 释放名字。
+        for (const [id, { before }] of snap.bookmarks) {
+          if (before) continue;
+          store.deleteBookmark(PROJECT.id, id);
+          bookmarkEvents.push(['bookmark.delete', { bookmarkId: id }]);
         }
-        const eventPage = undoCanvas ? nextPage : store.getSetting(savedViewKey());
+        for (const [id, { before, revision, lastRevision }] of snap.bookmarks) {
+          if (!before) continue;
+          const bookmark = revision === null ? store.restoreDeletedBookmark(PROJECT.id, before, lastRevision)
+            : store.updateBookmarkById(PROJECT.id, id, before).bookmark;
+          bookmarkEvents.push(['bookmark.save', { bookmark }]);
+        }
+        const restored = canvas ? canvas.before.overlay : store.loadOverlay(PROJECT.id);
+        if (canvas) {
+          store.replaceOverlay(PROJECT.id, restored);
+          saveInferredEdges(PROJECT.id, canvas.before.inferredEdges);
+        }
+        const currentPage = latestPage();
+        nextPage = restorePage ? canvas.before.page && { ...canvas.before.page, reviewing: false, at: 0, ts: Date.now() } : currentPage;
+        if (restorePage && nextPage && currentPage) {
+          for (const key of ['cam', 'ctxBox', 'selected', 'selectedEdge', 'activeBookmark']) {
+            if (!isDeepStrictEqual(currentPage[key], canvas.after.page?.[key])) nextPage[key] = currentPage[key];
+          }
+        }
         const evId = store.appendEvent(PROJECT.id, {
-          op: 'restore_point',
-          target: `ai-undo#${changesetId.slice(0, 8)}`,
-          after: eventPage ? { ...restoredOverlay, view: viewSnapshot(eventPage) } : restoredOverlay,
-          actor: 'user',
+          op: 'restore_point', target: `ai-undo#${changesetId.slice(0, 8)}`,
+          after: nextPage ? { ...restored, view: viewSnapshot(nextPage) } : restored, actor: 'user',
+          ctx: { canvasChanged: Boolean(canvas) },
         });
-        if (!undoCanvas) return evId;
-        if (nextPage) {
-          nextPage.revision = evId;
+        if (restorePage) {
+          if (nextPage) nextPage.revision = evId;
           store.setSetting(savedViewKey(), nextPage);
-        } else if (!COMPARISON) {
-          store.setSetting(savedViewKey(), null);
         }
         return evId;
       });
-      if (eventId === null) return json(res, { ok: false, conflict: true, error: '书签已被其他操作修改，无法撤销本轮改图' }, 409);
-      if (undoCanvas) {
-        applyInferredEdges(MODEL, PROJECT.id, snap.inferredEdges || []);
+      if (eventId === null) return json(res, { ok: false, conflict: true, error: '画布或书签已有其他修改，无法撤销本轮改图' }, 409);
+      if (canvas) {
+        applyInferredEdges(MODEL, PROJECT.id, canvas.before.inferredEdges);
         S = stats(MODEL);
-        pageState = nextPage;
-        overlay.nodes = restoredOverlay.nodes || {};
-        overlay.edges = restoredOverlay.edges || {};
-        overlay.deleted = restoredOverlay.deleted || { nodes: {}, edges: {} };
-        overlay.layout = restoredOverlay.layout || {};
+        Object.assign(overlay, canvas.before.overlay);
+        if (restorePage) pageState = nextPage;
       }
       aiChangesets.delete(changesetId);
       for (const [op, detail] of bookmarkEvents) broadcastChange(op, 'user', { projectId: PROJECT.id, ...detail });
@@ -3862,7 +3891,7 @@ export const server = http.createServer(async (req, res) => {
           if (error) return fail(error);
         }
         const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
-        const slot = store.transaction(() => {
+        const slot = withCanvasWrite('arrange_canvas', () => store.transaction(() => {
           const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
           const resetPositions = clear ? groupMode : undefined;
           const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, resetPositions });
@@ -3872,7 +3901,7 @@ export const server = http.createServer(async (req, res) => {
             after: { nodes: patch, resetPositions, reason, view: activeView },
           });
           return savedSlot;
-        });
+        }));
         overlay.layout[key] = slot;
         if (live && !clear) {
           snapshotSlot = slot;
@@ -3891,33 +3920,44 @@ export const server = http.createServer(async (req, res) => {
       const collectedSubagents = [];
       let turnChangeset = null;
       const turnWriteOps = new Set();
-      const ensureTurnSnapshot = (opName) => {
-        if (opName) turnWriteOps.add(opName);
-        if (COMPARISON || turnChangeset) return;
-        turnChangeset = {
-          id: randomUUID(),
-          projectId: PROJECT.id,
-          sessionRevision: expectedSession,
-          page: structuredClone(latestPage() || null),
-          overlay: store.loadOverlay(PROJECT.id),
-          inferredEdges: loadInferredEdges(PROJECT.id),
-          bookmarks: new Map(),
-          ops: [],
-          createdAt: Date.now(),
-        };
+      const ensureTurnSnapshot = op => {
+        turnWriteOps.add(op);
+        turnChangeset ??= { id: randomUUID(), projectId: PROJECT.id, sessionRevision: expectedSession,
+          bookmarks: new Map(), ops: [], createdAt: Date.now() };
+        return turnChangeset;
       };
-      const recordBookmarkWrite = ({ prev, bookmark }) => {
-        if (!turnChangeset) return;
-        const last = turnChangeset.bookmarks.get(bookmark.id);
-        // 连续 AI 写入共享首次保存前的基线；两次写入之间若有独立编辑，保留那次编辑。
+
+      // 仅在同步写入两侧取样。模型等待、布局计算或其他工具运行期间的独立编辑不能算作本轮写入。
+      const withCanvasWrite = (op, write) => {
+        if (COMPARISON) return write();
+        const { result, before, after } = store.transaction(() => {
+          const before = savedCanvasState();
+          const result = write();
+          return { result, before, after: COMPARISON ? null : savedCanvasState() };
+        });
+        if (after && !sameSavedCanvas(before, after)) {
+          const change = ensureTurnSnapshot(op);
+          if (change.canvas) {
+            if (!sameSavedCanvas(change.canvas.after, before)) change.canvas.stale = true;
+            change.canvas.after = after;
+          } else change.canvas = { before, after, stale: false };
+        }
+        return result;
+      };
+      const recordBookmarkWrite = ({ prev = null, bookmark = null }, op = 'manage_bookmarks') => {
+        const changes = ensureTurnSnapshot(op).bookmarks;
+        const id = (bookmark || prev).id;
+        const last = changes.get(id);
         const before = last && last.revision === prev?.revision ? last.before : prev;
-        turnChangeset.bookmarks.set(bookmark.id, { before, revision: bookmark.revision });
+        if (!before && !bookmark) changes.delete(id);
+        else changes.set(id, { before, revision: bookmark?.revision ?? null, lastRevision: (bookmark || prev).revision });
       };
 
       const executeAiTool = async (name, args) => {
+        const write = operation => withCanvasWrite(name, operation);
+        const compose = (...params) => write(() => composeMcpView(...params));
         assertActive();
         if (name === 'arrange_canvas') {
-          if (args?.action && args.action !== 'inspect') ensureTurnSnapshot('arrange_canvas');
           return arrangeCanvas(args);
         }
         if (name === 'get_git_changes') {
@@ -4071,7 +4111,6 @@ export const server = http.createServer(async (req, res) => {
         }
         if (name === 'remove_from_canvas') {
           if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能局部移除节点' };
-          ensureTurnSnapshot('remove_from_canvas');
           const excludePaths = normalizePathPrefixes(args.excludePaths);
           const rawFns = Array.isArray(args.functions) ? args.functions : [];
           if (!excludePaths.length && !rawFns.length) {
@@ -4142,7 +4181,7 @@ export const server = http.createServer(async (req, res) => {
             reviewing: false,
             ts: Date.now(),
           };
-          store.transaction(() => {
+          write(() => store.transaction(() => {
             nextPage.revision = store.appendEvent(PROJECT.id, {
               op: 'view.compose',
               actor: 'ai',
@@ -4151,7 +4190,7 @@ export const server = http.createServer(async (req, res) => {
               after: { ...nextPage, count: keptIds.length, rootCount: nextRoots.length, reason, view: viewSnapshot(nextPage) },
             });
             store.setSetting(key, nextPage);
-          });
+          }));
           const review = reviewWriteResult();
           if (!review.updatedWhileReviewing) pageState = nextPage;
           broadcastChange('view.compose', 'ai', { page: nextPage, reason });
@@ -4468,7 +4507,6 @@ export const server = http.createServer(async (req, res) => {
           if (!resolvedEdges.length) {
             return { ok: false, error: '未解析到有效的调用边端点', notFound };
           }
-          ensureTurnSnapshot('add_call_edge');
           const currentList = loadInferredEdges(PROJECT.id);
           let nextList;
           let newlyAddedCount = 0;
@@ -4486,7 +4524,7 @@ export const server = http.createServer(async (req, res) => {
             }
             nextList = [...byPair.values()];
           }
-          saveInferredEdges(PROJECT.id, nextList);
+          write(() => saveInferredEdges(PROJECT.id, nextList));
           applyInferredEdges(MODEL, PROJECT.id, nextList);
           S = stats(MODEL);
 
@@ -4508,7 +4546,7 @@ export const server = http.createServer(async (req, res) => {
               let composed = null;
               if (includeTasks && aliveFrom.length) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: aliveFrom,
                     functionIds: aliveTo.filter((id) => !aliveFrom.includes(id)),
@@ -4523,7 +4561,7 @@ export const server = http.createServer(async (req, res) => {
               }
               if (!composed) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: [],
                     functionIds: endpointIds,
@@ -4761,13 +4799,12 @@ export const server = http.createServer(async (req, res) => {
           let composed;
           let fallbackNote = '';
           const composeOptions = { chatClientId };
-          ensureTurnSnapshot('add_to_canvas');
           try {
-            composed = composeMcpView(composePayload, composeOptions);
+            composed = compose(composePayload, composeOptions);
           } catch (err) {
             if (includeTasks && !pureVars && /80|入口过多/.test(err.message)) {
               actualFnIds = activeFnsForCanvas.slice(0, 40);
-              composed = composeMcpView({
+              composed = compose({
                 mode,
                 ...(snapshotId ? { snapshotId } : {}),
                 roots: actualFnIds,
@@ -4837,12 +4874,12 @@ export const server = http.createServer(async (req, res) => {
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
-          bookmarkWrites.forEach(recordBookmarkWrite);
+          bookmarkWrites.forEach(saved => recordBookmarkWrite(saved, 'add_to_canvas'));
           if (createdBookmarks.length) broadcastChange('bookmark.save', 'ai', { projectId: PROJECT.id });
           // 组图成功后再仅对本次选入画布/书签的变更节点与新增连线写入变更分类（避免未选节点或报错时误写标注）。
           if (!COMPARISON && args.fromGit && (detectedNodeChanges.size || detectedAddedEdges.length)) {
             const scopedNodeIds = new Set([...allGroupCanvasIds, ...actualFnIds, ...scopes.flatMap(g => g.varIds), ...(composed.page.vars || [])]);
-            store.transaction(() => {
+            write(() => store.transaction(() => {
               overlay.nodes = overlay.nodes || {};
               overlay.edges = overlay.edges || {};
               for (const [id, ch] of detectedNodeChanges) {
@@ -4861,7 +4898,7 @@ export const server = http.createServer(async (req, res) => {
                 const merged = writeAnnotation('edge', key, { change: 'added' }, 'ai');
                 if (merged) overlay.edges[key] = merged;
               }
-            });
+            }));
           }
           // 自动将画布上可达的 TASK 周期（含函数头注释中的周期）以线段标签（TASK:xms）形式标出，替代函数左上角角标。
           let autoTaskLabels = 0;
@@ -4881,7 +4918,7 @@ export const server = http.createServer(async (req, res) => {
                 taskItems.push({ edgeKey: s.edgeKey, preset: 'task', text: s.text });
               }
               if (taskItems.length && MODEL === labelModel) {
-                const applied = applyMcpTaskLabels({ items: taskItems, merge: true });
+                const applied = write(() => applyMcpTaskLabels({ items: taskItems, merge: true }));
                 autoTaskLabels = applied.edgeKeys?.length || 0;
               }
             } catch { /* 自动 TASK 线段标签不影响主组图结果 */ }
@@ -4961,8 +4998,7 @@ export const server = http.createServer(async (req, res) => {
             });
           }
           assertActive();
-          ensureTurnSnapshot('apply_labels');
-          const applied = applyMcpTaskLabels({ items, merge: true });
+          const applied = write(() => applyMcpTaskLabels({ items, merge: true }));
           return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [], ...reviewWriteResult() };
         }
         const toChainStep = (id, edgeKind) => {
@@ -5023,13 +5059,12 @@ export const server = http.createServer(async (req, res) => {
             const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, targetId, peerId) : pairDataflow(MODEL, targetId, peerId));
             assertActive();
             const rwPaths = (df.paths || []).slice(0, maxPaths);
-            const sharedVars = (df.sharedVars || []).slice(0, 20);
+            const sharedVars = variablesOnPaths(df, rwPaths).slice(0, 20);
             const chains = rwPaths.slice(0, 6).map((p, idx) => ({
               id: `dfpair:${targetId}:${peerId}:${idx}`,
-              title: `${targetNode?.name || targetId} ↔ ${peerNode?.name || peerId} (${p.direction || 'rw'})`,
+              title: `${toChainStep(p.nodes[0]).name} → ${toChainStep(p.nodes.at(-1)).name}`,
               kind: 'dataflow',
-              steps: (Array.isArray(p.nodes) && p.nodes.length ? p.nodes : [p.writer, p.varId, p.reader].filter(Boolean))
-                .map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
+              steps: p.nodes.map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
             }));
             return {
               ok: true,
@@ -5192,12 +5227,11 @@ export const server = http.createServer(async (req, res) => {
           }
           let composedResult = null;
           if (addToCanvas && !COMPARISON && fnSliceIds.length) {
-            ensureTurnSnapshot('present_logic');
             const minLayer = Math.min(...fnSliceIds.map(id => sliceNodes.get(id) ?? 0));
             const topRoots = fnSliceIds.filter(id => (sliceNodes.get(id) ?? 0) === minLayer);
             const restFns = fnSliceIds.filter(id => !topRoots.includes(id));
             try {
-              composedResult = composeMcpView({
+              composedResult = compose({
                 mode: args.mode === 'replace' ? 'replace' : 'add',
                 roots: topRoots.length ? topRoots : fnSliceIds.slice(0, 4),
                 functionIds: restFns,
@@ -5278,12 +5312,12 @@ export const server = http.createServer(async (req, res) => {
           };
         }
         if (name === 'canvas_visual') {
-          const action = ['highlight', 'play_flow', 'lens', 'clear'].includes(args.action) ? args.action : 'highlight';
+          const action = args.action || 'highlight';
+          if (!['highlight', 'play_flow', 'clear'].includes(action)) return { ok: false, error: '不支持此画布视觉操作' };
           const payload = {
             action,
             nodeIds: (Array.isArray(args.nodeIds) ? args.nodeIds : []).slice(0, 80).map(String),
             edgeKeys: (Array.isArray(args.edgeKeys) ? args.edgeKeys : []).slice(0, 120).map(String),
-            ...(args.lens ? { lens: ['default', 'dataflow', 'indirect', 'changes'].includes(args.lens) ? args.lens : 'default' } : {}),
             ...(typeof args.label === 'string' && args.label.trim() ? { label: args.label.trim().slice(0, 80) } : {}),
           };
           sendClientEvent(chatClientId, 'canvas_overlay', payload);
@@ -5415,7 +5449,6 @@ export const server = http.createServer(async (req, res) => {
             return { ok: true, action, bookmarks: store.listBookmarks(PROJECT.id) };
           }
           if (COMPARISON) return { ok: false, error: '比较模式不支持修改书签' };
-          ensureTurnSnapshot('manage_bookmarks');
           if (action === 'checkpoint') {
             const label = String(args.checkpointName || args.name || 'AI 检查点').trim().slice(0, 80);
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
@@ -5451,19 +5484,20 @@ export const server = http.createServer(async (req, res) => {
           if (action === 'delete') {
             const id = Number(args.id);
             if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'delete 需要提供有效的书签 id' };
-            const gone = store.listBookmarks(PROJECT.id).find(b => b.id === id);
-            const okDel = store.deleteBookmark(PROJECT.id, id);
-            if (okDel) {
+            const removed = store.transaction(() => {
+              const before = store.getBookmark(PROJECT.id, id);
+              if (!before || !store.deleteBookmark(PROJECT.id, id)) return null;
               store.appendEvent(PROJECT.id, {
-                op: 'bookmark.delete',
-                actor: 'ai',
-                target: gone?.name || `#${id}`,
-                before: gone ? bookmarkEventPayload(gone) : null,
-                ctx: { ...(gone?.id && { bookmarkId: gone.id }), bookmarkName: gone?.name || `#${id}`, action: 'delete', milestone: true },
+                op: 'bookmark.delete', actor: 'ai', target: before.name, before: bookmarkEventPayload(before),
+                ctx: { bookmarkId: id, bookmarkName: before.name, action: 'delete', milestone: true },
               });
-              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: gone?.name || null, projectId: PROJECT.id, clientId: chatClientId });
+              return before;
+            });
+            if (removed) {
+              recordBookmarkWrite({ prev: removed });
+              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: removed.name, projectId: PROJECT.id, clientId: chatClientId });
             }
-            return { ok: okDel, action, removed: okDel ? 1 : 0 };
+            return { ok: Boolean(removed), action, removed: removed ? 1 : 0 };
           }
           return { ok: false, error: `未知书签操作：${action}` };
         }
@@ -5619,7 +5653,7 @@ export const server = http.createServer(async (req, res) => {
               edgeKeys: (Array.isArray(vp?.edgeKeys) ? vp.edgeKeys : []).slice(0, 20).map(k => String(k).slice(0, 320)),
               names: (Array.isArray(vp?.names) ? vp.names : []).slice(0, 20).map(s => String(s).slice(0, 120)),
             })),
-            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => ({
+            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => typeof rp === 'string' ? rp.slice(0, 600) : ({
               direction: String(rp?.direction || '').slice(0, 16),
               varId: String(rp?.varId || '').slice(0, 200),
               varName: String(rp?.varName || '').slice(0, 120),
@@ -5743,12 +5777,20 @@ export const server = http.createServer(async (req, res) => {
             try {
               const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
               assertActive();
-              if (df.sharedVars?.length) {
-                lines.push(`- 共享全局变量: ${df.sharedVars.slice(0, 8).map(v => `${v.name} (${v.id})`).join('、')}`);
-              }
-              for (const p of (df.paths || []).slice(0, 5)) {
-                const label = `${shortName(p.writer)} --W:${p.varName}--> ${shortName(p.reader)} (${p.direction || 'rw'}${p.line ? `, L${p.line}` : ''})`;
-                lines.push(`- 读写链路: ${label}`);
+              const variables = variablesOnPaths(df, df.paths);
+              if (variables.length) lines.push('- 共享全局变量: ' + variables.slice(0, 8).map(v => v.name + ' (' + v.id + ')').join('、'));
+              const nodes = new Map(df.nodes.map(n => [n.id, n]));
+              for (const p of df.paths.slice(0, 5)) {
+                for (const [version, edges] of Object.entries(p.evidenceByVersion || { '': p.edges })) {
+                  const parts = [nodes.get(p.nodes[0])?.name || p.nodes[0]];
+                  for (const e of edges) {
+                    const write = e.kind === 'df-write';
+                    const file = nodes.get(write ? e.from : e.to)?.file;
+                    const loc = e.line ? ' ' + (file ? file + ':' : 'L') + e.line : '';
+                    parts.push('--' + (write ? 'W' : 'R') + loc + '-->', nodes.get(e.to)?.name || e.to);
+                  }
+                  lines.push('- 读写链路' + (version ? ' [' + version + ']' : '') + ': ' + parts.join(' '));
+                }
               }
             } catch { /* ignore enrichment dataflow errors */ }
             try {
@@ -5812,7 +5854,7 @@ export const server = http.createServer(async (req, res) => {
           signal: abort.signal,
           beforeDone: async ({ onEvent }) => {
             const extra = {};
-            if (turnChangeset && turnWriteOps.size) {
+            if (turnChangeset && (turnChangeset.canvas || turnChangeset.bookmarks.size)) {
               turnChangeset.ops = [...turnWriteOps];
               saveAiChangeset(turnChangeset);
               const cs = { id: turnChangeset.id, ops: turnChangeset.ops };
@@ -5965,7 +6007,8 @@ export const server = http.createServer(async (req, res) => {
             if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
             if (p.comparisonId !== undefined && p.comparisonId !== (COMPARISON?.id ?? null)) return sessionConflict(res);
             const key = 'ui.last-view.' + PROJECT.id;
-            const revision = COMPARISON ? COMPARISON.composedPage?.revision ?? 0 : store.getSetting(key)?.revision ?? 0;
+            const previous = COMPARISON ? COMPARISON.composedPage : store.getSetting(key);
+            const revision = previous?.revision ?? 0;
             const reviewing = Number(p.at) > 0;
             if (!reviewing && (!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
@@ -5996,8 +6039,10 @@ export const server = http.createServer(async (req, res) => {
               const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
               const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
               const saved = { ...pageState, cam, ctxBox };
-              if (!COMPARISON) store.setSetting(key, saved);
-              else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
+              if (!COMPARISON) {
+                store.setSetting(key, saved);
+                if (!sameCanvasPage(previous, saved)) canvasEditRevision++;
+              } else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
             }
             json(res, { ok: true });
           })

@@ -38,18 +38,18 @@ const fnNodeOf = (model, id) => {
 };
 
 /**
- * 查询一个函数的数据流关系
+ * 查询函数或全局变量的数据流关系
  * @param {object} model
- * @param {string} fnId 函数节点 id
+ * @param {string} fnId 函数或变量的节点 id
  * @param {'out'|'in'|'both'} dir out=它的写影响到谁；in=谁的状态影响它
  */
 export async function dataflowFor(model, fnId, dir = 'out') {
-  const fn = model._index.byId.get(fnId);
-  if (!fn) throw new Error('函数不存在');
-
   const idx = await buildDataflowIndex(model);
+  const fn = model._index.byId.get(fnId);
+  if (!fn) throw new Error('函数或变量不存在');
+  const variable = idx.byId.get(fnId);
   const acc = idx.fnAccess.get(fnId);
-  if (!acc) return { ok: true, fn: { id: fn.id, name: fn.name }, vars: [], nodes: [], edges: [], empty: true };
+  if (!acc && !variable) return { ok: true, fn: { id: fn.id, name: fn.name }, vars: [], nodes: [], edges: [], empty: true };
 
   const nodes = new Map();
   const edges = [];
@@ -127,6 +127,29 @@ export async function dataflowFor(model, fnId, dir = 'out') {
 
   const wantOut = dir === 'out' || dir === 'both';
   const wantIn = dir === 'in' || dir === 'both';
+
+  if (variable) {
+    let truncated = false;
+    for (const [enabled, access, kind] of [[wantIn, idx.writers, 'df-write'], [wantOut, idx.readers, 'df-read']]) {
+      if (!enabled) continue;
+      const writers = kind === 'df-write';
+      const ids = access.get(fnId) || new Set();
+      const peers = [];
+      for (const id of ids) {
+        if (peers.length >= MAX_PEERS) { truncated = true; break; }
+        const peer = fnNodeOf(model, id);
+        if (!peer) continue;
+        addNode(peer);
+        const rec = idx.fnAccess.get(id)?.[writers ? 'writes' : 'reads'].get(fnId);
+        pushEdge(writers ? id : fnId, writers ? fnId : id, kind, variable.name, firstLine(rec));
+        peers.push({ id, name: peer.name, file: peer.file, taskPeriods: periods.get(id) || [] });
+      }
+      if (peers.length) vars.push({ id: fnId, name: fn.name, mode: writers ? 'write' : 'read', peers });
+    }
+    return { ok: true, fn: { id: fn.id, name: fn.name, file: fn.file, line: fn.line }, dir, vars,
+      nodes: [...nodes.values()], edges, writes: idx.writers.get(fnId)?.size || 0,
+      reads: idx.readers.get(fnId)?.size || 0, truncated };
+  }
 
   if (wantOut) {
     for (const [varId, rec] of acc.writes) {

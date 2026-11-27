@@ -2831,7 +2831,6 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         action: ev.action || 'highlight',
         nodeIds: ev.nodeIds || [],
         edgeKeys: ev.edgeKeys || [],
-        lens: ev.lens,
         label: ev.label,
       };
       draw();
