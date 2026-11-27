@@ -265,7 +265,7 @@ function broadcastChange(op, actor, extra = {}) {
 /** 向指定浏览器客户端（或全员）推送非持久化的轻量视觉叠加事件（如 AI 导览高亮 / 数据流动画）。 */
 function sendClientEvent(clientId, event, data = {}) {
   if (!sseClients.size) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, ts: Date.now() })}\n\n`;
+  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, sessionRevision, ts: Date.now() })}\n\n`;
   for (const res of sseClients) {
     if (clientId && res._clientId !== clientId) continue;
     try {
@@ -1237,6 +1237,52 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
   if (requestId !== undefined) readSnapshots.set(MODEL, snapshot);
   return { ok: true, source: !forceGit && COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
     comparisonId: !forceGit ? (COMPARISON?.id ?? null) : null, ...result };
+}
+
+function callEvidenceSides(model, comparison) {
+  return comparison ? [['before', comparison.beforeModel], ['after', comparison.afterModel]] : [['current', model]];
+}
+
+function isCallEvidence(edge) {
+  return (CALL_KINDS.has(edge.kind) || edge.kind === 'manual') && !edge.headerReference && edge.resolution !== 'unresolved';
+}
+
+// 比较画布把同一条件下的多个调用点画为一条边。证据来自源版本，着色使用画布实际的键。
+function evidenceEdgeKey(edge, version, comparison) {
+  if (!comparison) return edgeKeyOf(edge);
+  const visible = comparison.model._index.outAdj.get(edge.from)?.find(e => e.to === edge.to && e.kind !== 'var' &&
+    e[version + 'Calls']?.some(call => call.line === edge.line && call.kind === edge.kind && call.cond === edge.cond));
+  return edgeKeyOf(visible || edge);
+}
+
+function possibleCall(edge) {
+  return edge.inferred || edge.dynamicDispatch || (edge.kind === 'fnptr' && edge.resolution !== 'exact');
+}
+
+function taskCallEvidence(model, id, limit) {
+  const { upstreamTasks, upstreamChains } = traceToTasks(model, id, { limit });
+  return new Map(upstreamTasks.map((task, i) => [task.id, {
+    name: task.name, possible: upstreamChains[i].edges.some(possibleCall),
+  }]));
+}
+
+function shortestCallPath(model, from, to, version, comparison) {
+  if (overlay.deleted.nodes[from] || overlay.deleted.nodes[to]) return null;
+  const queue = [{ id: from, path: [from], possible: false }], seen = new Set([from]);
+  const deletedEdges = Object.keys(overlay.deleted.edges).length > 0;
+  for (let i = 0; i < queue.length; i++) {
+    const { id, path, possible } = queue[i];
+    if (path.length > 5) continue;
+    for (const edge of model._index.outAdj.get(id) || []) {
+      if (!isCallEvidence(edge) || overlay.deleted.nodes[edge.to] ||
+          (deletedEdges && overlay.deleted.edges[evidenceEdgeKey(edge, version, comparison)]) || seen.has(edge.to)) continue;
+      const next = { id: edge.to, path: [...path, edge.to], possible: Boolean(possible || possibleCall(edge)) };
+      if (edge.to === to) return next;
+      seen.add(edge.to);
+      queue.push(next);
+    }
+  }
+  return null;
 }
 
 // 比较的合并图含两个版本的边；在一个确定版本内回溯，防止拼出从未存在的路径。
@@ -4035,9 +4081,9 @@ export const server = http.createServer(async (req, res) => {
           const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'up';
           const depth = Math.max(1, Math.min(6, Math.trunc(Number(args.depth) || 4)));
           const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
-          const toChainStep = (id, edgeKind) => {
+          const toChainStep = (side, id, edgeKind) => {
             const cleanId = String(id || '');
-            const node = MODEL._index?.byId?.get(cleanId);
+            const node = side._index?.byId?.get(cleanId);
             return {
               id: cleanId,
               name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
@@ -4047,49 +4093,56 @@ export const server = http.createServer(async (req, res) => {
             };
           };
           const structuredChains = [];
-          const addChain = (direction, path, edgeKeys) => {
+          const addChain = (side, version, direction, path, edgeKeys, possible) => {
             if (path.length < 2 || structuredChains.length >= 8) return;
-            const first = toChainStep(path[0]), last = toChainStep(path.at(-1));
+            const first = toChainStep(side, path[0]), last = toChainStep(side, path.at(-1));
+            const label = COMPARISON ? '[' + version + '] ' : '';
             structuredChains.push({
               id: `${direction}:${first.id}->${last.id}:${structuredChains.length}`,
-              title: (direction === 'down' ? '下游 ' : '') + `${first.name} → ${last.name}`,
-              kind: 'call', steps: path.map((nid, i) => toChainStep(nid, i ? 'call' : undefined)), edgeKeys,
+              title: label + (possible ? '可能 ' : '') + (direction === 'down' ? '下游 ' : '') + `${first.name} → ${last.name}`,
+              kind: 'call', ...(COMPARISON ? { traceVersion: version } : {}), ...(possible ? { possible: true } : {}),
+              steps: path.map((nid, i) => toChainStep(side, nid, i ? 'call' : undefined)), edgeKeys,
             });
           };
-          const traces = resolved.slice(0, 15).map((id) => {
+          const trace = (side, version, id) => {
             const tr = direction === 'down' ? { upstreamTasks: [], upstreamChains: [], totalTasks: 0 }
-              : traceToTasks(MODEL, id, { limit });
-            for (const chain of tr.upstreamChains.slice(0, 4)) addChain('up', chain.path, chain.edges.map(e => e.edgeKey));
-            const directCallers = (MODEL._index?.inAdj?.get(id) || [])
-              .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
+              : traceToTasks(side, id, { limit });
+            const keyFor = edge => evidenceEdgeKey(edge, version, COMPARISON);
+            for (const chain of tr.upstreamChains.slice(0, 4)) {
+              addChain(side, version, 'up', chain.path, chain.edges.map(keyFor), chain.edges.some(possibleCall));
+            }
+            const directCallers = (side._index?.inAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.from])
               .slice(0, 20)
-              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
-            const directCallees = direction === 'up' ? [] : (MODEL._index?.outAdj?.get(id) || [])
-              .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to])
+              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
+            const directCallees = direction === 'up' ? [] : (side._index?.outAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to])
               .slice(0, 20)
-              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
+              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
             const downstreamPaths = [];
             if (direction === 'down' || direction === 'both') {
-              const stack = [{ node: id, path: [id], edgeKeys: [] }];
+              const stack = [{ node: id, path: [id], edgeKeys: [], possible: false }];
               while (stack.length && downstreamPaths.length < 12) {
                 const cur = stack.shift();
-                const outs = (MODEL._index?.outAdj?.get(cur.node) || [])
-                  .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[edgeKeyOf(e)]);
+                const outs = (side._index?.outAdj?.get(cur.node) || [])
+                  .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[keyFor(e)]);
                 if (!outs.length || cur.path.length > depth) {
                   if (cur.path.length > 1) {
                     downstreamPaths.push(cur.path);
-                    if (downstreamPaths.length <= 4) addChain('down', cur.path, cur.edgeKeys);
+                    if (downstreamPaths.length <= 4) addChain(side, version, 'down', cur.path, cur.edgeKeys, cur.possible);
                   }
                   continue;
                 }
                 for (const e of outs.slice(0, 6)) {
                   if (cur.path.includes(e.to)) continue;
-                  stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, edgeKeyOf(e)] });
+                  stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, keyFor(e)],
+                    possible: cur.possible || possibleCall(e) });
                 }
               }
             }
             return {
               id,
+              ...(COMPARISON ? { traceVersion: version } : {}),
               upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
               chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
               downstreamPaths,
@@ -4097,8 +4150,12 @@ export const server = http.createServer(async (req, res) => {
               ...(directCallees.length ? { directCallees } : {}),
               totalTasks: tr.totalTasks || 0,
             };
-          });
-          const pathBranches = summarizeVehicleBranches(MODEL, resolved);
+          };
+          const sides = callEvidenceSides(MODEL, COMPARISON);
+          const traces = sides.flatMap(([version, side]) => resolved.slice(0, 15)
+            .filter(id => side._index.byId.has(id)).map(id => trace(side, version, id)));
+          const pathBranches = sides.flatMap(([version, side]) => summarizeVehicleBranches(side, resolved)
+            .map(branch => COMPARISON ? { ...branch, traceVersion: version } : branch));
           return {
             ok: true,
             direction,
@@ -5150,14 +5207,18 @@ export const server = http.createServer(async (req, res) => {
           const includeDataflow = args.includeDataflow !== false;
           const addToCanvas = args.addToCanvas !== false;
           if (addToCanvas && COMPARISON) return { ok: false, error: '比较模式下请用 addToCanvas: false 生成只读导览' };
+          // 一份导览只能讲述一个版本。优先修改后，删除的根可回到修改前。
+          const side = callEvidenceSides(MODEL, COMPARISON).reverse().find(([, m]) => !COMPARISON || seedIds.every(id => m._index.byId.has(id)));
+          if (!side) return { ok: false, error: '所选根不在同一版本中，无法生成单版本导览' };
+          const [traceVersion, source] = side;
           const sliceNodes = new Map(); // 节点 ID → 相对根的有向层级
           const sliceEdges = [];
           const seenEdge = new Set();
           const allowId = (id) => {
-            const n = MODEL._index?.byId?.get(id);
+            const n = source._index?.byId?.get(id);
             if (!n || n.external || n.headerSymbol || overlay.deleted.nodes[id]) return false;
             if (focusFilter.length && n.kind !== 'var') {
-              const file = fileOfNodeId(MODEL, id);
+              const file = fileOfNodeId(source, id);
               if (!focusFilter.some(pref => fileMatchesPathPrefix(file, pref)) && !seedIds.includes(id)) return false;
             }
             return true;
@@ -5167,11 +5228,12 @@ export const server = http.createServer(async (req, res) => {
           }
           // 数据流按「写者 → 变量 → 读者」讲解，画布则将读写合为「函数 → 变量」一条边。
           const presentationEdgeKey = e => {
-            if (!e.df) return edgeKeyOf(e);
+            if (!e.df) return evidenceEdgeKey(e, traceVersion, COMPARISON);
             const writer = e.kind === 'df-write';
             const fn = writer ? e.from : e.to, variable = writer ? e.to : e.from;
             if (COMPARISON) {
-              const edge = MODEL._index.outAdj.get(fn)?.find(edge => edge.kind === 'var' && edge.to === variable);
+              const edge = MODEL._index.outAdj.get(fn)?.find(edge => edge.kind === 'var' && edge.to === variable &&
+                edge.versions?.includes(traceVersion) && (edge.via === '读写' || edge.via === (writer ? '写' : '读')));
               if (edge) return edgeKeyOf(edge);
             }
             return canvasEdgeKey({ from: fn, to: variable, kind: 'var' });
@@ -5184,14 +5246,14 @@ export const server = http.createServer(async (req, res) => {
               const { id, d } = queue.shift();
               if (d >= depth) continue;
               let edges;
-              if (MODEL._index.byId.get(id)?.kind === 'var') {
+              if (source._index.byId.get(id)?.kind === 'var') {
                 const dir = upstream ? 'in' : 'out';
-                const flow = await (COMPARISON ? comparisonDataflow(COMPARISON, id, dir) : dataflowFor(MODEL, id, dir));
+                const flow = await dataflowFor(source, id, dir);
                 assertActive();
                 edges = flow.edges;
               } else {
-                const adj = upstream ? MODEL._index.inAdj : MODEL._index.outAdj;
-                edges = (adj.get(id) || []).filter(e => e.kind !== 'var' && !e.headerReference);
+                const adj = upstream ? source._index.inAdj : source._index.outAdj;
+                edges = (adj.get(id) || []).filter(isCallEvidence);
               }
               for (const e of edges) {
                 const peer = upstream ? e.from : e.to;
@@ -5261,7 +5323,7 @@ export const server = http.createServer(async (req, res) => {
             layers.get(d).push(id);
           }
           const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
-          const presTitle = String(args.title || `${toChainStep(seedIds[0]).name} 调用与数据流导览`).slice(0, 80);
+          const presTitle = (COMPARISON ? '[' + traceVersion + '] ' : '') + String(args.title || `${toChainStep(seedIds[0]).name} 调用与数据流导览`).slice(0, 80);
           const steps = sortedDepths.slice(0, 6).map((d, idx) => {
             const nids = layers.get(d).slice(0, 10);
             const names = nids.map(id => toChainStep(id).name);
@@ -5293,9 +5355,10 @@ export const server = http.createServer(async (req, res) => {
           };
           const chains = [];
           for (const e of sliceEdges.slice(0, 6)) {
+            const label = COMPARISON ? '[' + traceVersion + '] ' : '';
             chains.push({
               id: `pres_edge:${e.kind}:${presentationEdgeKey(e)}`,
-              title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              title: label + (possibleCall(e) ? '可能 ' : '') + `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
               kind: e.df ? 'dataflow' : 'call',
               edgeKeys: [presentationEdgeKey(e)],
               steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
@@ -5311,6 +5374,7 @@ export const server = http.createServer(async (req, res) => {
           return {
             ok: true,
             title: presTitle,
+            ...(COMPARISON ? { traceVersion } : {}),
             nodeCount: fnSliceIds.length + varSliceIds.length,
             edgeCount: sliceEdges.length,
             presentation,
@@ -5758,30 +5822,27 @@ export const server = http.createServer(async (req, res) => {
           }
           const lines = [];
           const shortName = (id) => model._index.byId.get(id)?.name || String(id).replace(/^var::/, '').split('::').pop();
+          const sides = callEvidenceSides(model, COMPARISON);
           for (const [a, b] of pairs.slice(0, 2)) {
             if (!model._index.byId.has(a) || !model._index.byId.has(b) || a === b) continue;
-            const shortestCallPath = (src, dst, maxDepth = 5) => {
-              const q = [[src]];
-              const seen = new Set([src]);
-              while (q.length) {
-                const path = q.shift();
-                if (path.length > maxDepth) continue;
-                const tail = path[path.length - 1];
-                for (const e of model._index.outAdj.get(tail) || []) {
-                  if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                  if (e.to === dst) return [...path, dst];
-                  if (!seen.has(e.to)) { seen.add(e.to); q.push([...path, e.to]); }
-                }
+            for (const [version, side] of sides) {
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              const byId = side._index.byId;
+              if (!byId.has(a) || !byId.has(b)) {
+                lines.push('- 调用通路' + label + ': 该版本缺少所选端点');
+                continue;
               }
-              return null;
-            };
-            const fwd = shortestCallPath(a, b);
-            const rev = fwd ? null : shortestCallPath(b, a);
-            const path = fwd || rev;
-            if (path) {
-              lines.push(`- 调用通路: ${path.map(shortName).join(' → ')}`);
-            } else {
-              lines.push(`- 调用通路: ${shortName(a)} 与 ${shortName(b)} 5 跳内无直接调用路径`);
+              const found = shortestCallPath(side, a, b, version, COMPARISON) || shortestCallPath(side, b, a, version, COMPARISON);
+              const evidence = found ? found.path.map(id => byId.get(id)?.name || id).join(' → ') +
+                (found.possible ? '（含可能调用）' : '') : shortName(a) + ' 与 ' + shortName(b) + ' 5 跳内无调用路径';
+              lines.push('- 调用通路' + label + ': ' + evidence);
+              const tasksA = taskCallEvidence(side, a, 20), tasksB = taskCallEvidence(side, b, 20);
+              const common = [];
+              for (const [id, task] of tasksA) {
+                const other = tasksB.get(id);
+                if (other) common.push(task.name + (task.possible || other.possible ? '（可能）' : ''));
+              }
+              if (common.length) lines.push('- 公共上游 TASK/ISR' + label + ': ' + common.slice(0, 4).join('、'));
             }
             try {
               const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
@@ -5802,23 +5863,13 @@ export const server = http.createServer(async (req, res) => {
                 }
               }
             } catch { /* ignore enrichment dataflow errors */ }
-            try {
-              const trA = traceToTasks(model, a, { limit: 20 });
-              const trB = traceToTasks(model, b, { limit: 20 });
-              const setB = new Set((trB.upstreamTasks || []).map(t => t.id));
-              const commonTasks = (trA.upstreamTasks || []).filter(t => setB.has(t.id)).slice(0, 4);
-              if (commonTasks.length) {
-                lines.push(`- 公共上游 TASK/ISR: ${commonTasks.map(t => t.name).join('、')}`);
-              }
-            } catch { /* ignore */ }
           }
-          if (!pairs.length && nodeIds.length === 1 && model._index.byId.get(nodeIds[0])?.kind !== 'var') {
-            try {
-              const tr = traceToTasks(model, nodeIds[0], { limit: 10 });
-              if (tr.upstreamTasks?.length) {
-                lines.push(`- 触发 TASK/ISR: ${tr.upstreamTasks.slice(0, 6).map(t => t.name).join('、')}`);
-              }
-            } catch { /* ignore */ }
+          if (!pairs.length && nodeIds.length === 1) {
+            for (const [version, side] of sides) {
+              const tasks = [...taskCallEvidence(side, nodeIds[0], 10).values()];
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              if (tasks.length) lines.push('- 触发 TASK/ISR' + label + ': ' + tasks.slice(0, 6).map(t => t.name + (t.possible ? '（可能）' : '')).join('、'));
+            }
           }
           return lines.slice(0, 28).join('\n');
         };

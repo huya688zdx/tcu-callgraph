@@ -2944,3 +2944,169 @@ test('成功撤销 AI 组图后，较早发出的组图请求不能再覆盖页�
   assert.equal(await br.evaluate('window.oldViewRequests'), 1);
   assert.equal(await br.evaluate('window.__cg.view.nodes.some(n=>n.id === ' + JSON.stringify(extra) + ')'), false);
 });
+
+test('AI 比较调用路径和导览在单个版本内取证', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-version-path-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const create = (version, old) => {
+    const dir = path.join(root, version);
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'logic.c'), [
+      'void b(void) {} void spare(void) {}',
+      old ? 'void mid(void) {}' : 'void mid(void) { b(); }',
+      old ? 'void a(void) { mid(); }' : 'void a(void) {}',
+      old ? 'void beforeOnly(void) { b(); }' : 'void afterOnly(void) { b(); }',
+      old ? 'void both(void) { b(); }' : '\nvoid both(void) { b(); }', 'void Task_10ms(void) { a(); }',
+      'typedef void (*Fn)(void); static Fn const callbacks[] = {b, spare};',
+      'void dispatch(int i) { callbacks[i](); }', 'void exactCall(void) { callbacks[0](); }',
+      'int pick; void Task_20ms(void) { dispatch(pick); }',
+      old ? 'void right(void) {} void left(void) { right(); }' : 'void left(void) {} void right(void) { left(); }',
+    ].join('\n'));
+    return dir;
+  };
+  const beforePath = create('before', true), afterPath = create('after', false);
+  const srv = await launchServer({ target: create('base', false) });
+  t.after(srv.close);
+  let sent, tool, output;
+  const { run, post } = await mockAiTurn(t, srv.baseUrl, (last, body) => {
+    if (last.role === 'tool') { output = JSON.parse(last.content); return []; }
+    sent = body.messages.at(-1).content;
+    return tool ? [tool] : [];
+  });
+  const id = s => 'logic.c::' + s;
+  const prepared = await (await post('/api/compare', { beforePath, afterPath })).json();
+  assert.ok(prepared.ok, prepared.error);
+  const active = await (await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: [id('a')] })).json();
+  assert.ok(active.ok, active.error);
+  const pair = async (a, b) => {
+    sent = '';
+    await run('检查所选两点的调用路径', { uiContext: { items: [{ kind: 'pair', fromId: id(a), toId: id(b) }] } });
+    return sent.split('\n').filter(l => l.includes('调用通路')).join('\n');
+  };
+  await t.test('分属两侧的边不能拼接，也不能产生共同的上游任务', async () => {
+    const lines = await pair('a', 'b');
+    assert.doesNotMatch(sent, /a → mid → b|公共上游 TASK\/ISR.*Task_10ms/);
+    for (const side of ['before', 'after']) assert.ok(lines.includes('[' + side + ']'), lines);
+  });
+  await t.test('两侧相同、各侧独有、反向及未映射端点', async () => {
+    for (const side of ['before', 'after']) {
+      const fn = side + 'Only';
+      const lines = await pair('b', fn);
+      const version = lines.split('\n').find(l => l.includes('[' + side + ']'));
+      assert.ok(version?.includes(fn + ' → b'), lines);
+      assert.ok(!lines.split('\n').some(l => !l.includes('[' + side + ']') && l.includes(' → ')), lines);
+    }
+    const both = await pair('both', 'b');
+    for (const side of ['before', 'after']) assert.ok(both.split('\n').some(l => l.includes('[' + side + ']') && l.includes('both → b')), both);
+    const reversed = await pair('left', 'right');
+    assert.match(reversed, /\[before\].*left → right/);
+    assert.match(reversed, /\[after\].*right → left/);
+    assert.doesNotMatch(await pair('beforeOnly', 'afterOnly'), / → /);
+    assert.doesNotMatch(await pair('missing', 'b'), / → /);
+  });
+  await t.test('间接候选路径标出不确定性', async () => {
+    const lines = await pair('dispatch', 'b');
+    for (const side of ['before', 'after']) assert.ok(lines.split('\n').some(l =>
+      l.includes('[' + side + ']') && l.includes('dispatch → b') && /可能|候选/.test(l)), lines);
+    assert.match(sent, /公共上游 TASK\/ISR.*Task_20ms（可能）/);
+    const exact = await pair('exactCall', 'b');
+    assert.match(exact, /exactCall → b/);
+    assert.doesNotMatch(exact, /可能|候选/);
+  });
+  await t.test('单点触发任务不穿越版本', async () => {
+    await run('检查 b 的入口', { uiContext: { kind: 'node', id: id('b') } });
+    assert.doesNotMatch(sent, /触发 TASK\/ISR.*Task_10ms/);
+  });
+  await t.test('AI 链路工具和只读导览不产生跨版本步骤', async () => {
+    tool = ['trace_upstream', { functions: [id('a')], direction: 'down', depth: 3 }];
+    await run('追踪 a');
+    assert.ok(output.ok, output.error);
+    assert.ok(output.traces.every(tr => ['before','after'].includes(tr.traceVersion)));
+    assert.ok(output.traces.some(tr => tr.traceVersion === 'before' && tr.downstreamPaths.some(p => p.includes(id('mid')))));
+    assert.ok(output.traces.every(tr => tr.downstreamPaths.every(p => !p.includes(id('b')))));
+    tool = ['trace_upstream', { functions: [id('both')], direction: 'down' }];
+    await run('核对两侧调用点');
+    const keys = output.chains.map(c => c.edgeKeys);
+    assert.deepEqual(output.chains.map(c => c.traceVersion), ['before', 'after']);
+    assert.deepEqual(keys[0], keys[1], '同一条比较画布边在两侧的源行不同');
+    assert.ok(keys[0][0].startsWith(id('both') + '->' + id('b') + ':'));
+    tool = ['present_logic', { root: id('a'), direction: 'down', depth: 3, addToCanvas: false }];
+    await run('呈现 a');
+    assert.ok(output.ok, output.error);
+    assert.ok(['before','after'].includes(output.traceVersion));
+    assert.ok(output.presentation.steps.every(s => !s.nodeIds.includes(id('b'))));
+    tool = ['present_logic', { root: id('beforeOnly'), direction: 'down', addToCanvas: false }];
+    await run('呈现旧入口');
+    assert.equal(output.traceVersion, 'before');
+    assert.ok(output.presentation.steps.some(s => s.nodeIds.includes(id('b'))));
+    tool = ['present_logic', { targets: [id('beforeOnly'), id('afterOnly')], addToCanvas: false }];
+    await run('呈现两个入口');
+    assert.equal(output.ok, false);
+    assert.match(output.error, /版本/);
+  });
+});
+
+test('浏览器切换工程清理导览并隔离之前发出的视觉响应', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const { post } = await mockAiTurn(t, srv.baseUrl, () => []);
+  const id = 'gear.c::Gear_Init';
+  const guide = { title: '旧工程导览', steps: [{ title: '旧步骤', nodeIds: [id] }] };
+  await post('/api/ai/chats', { activeId: 'old', threads: [{ id: 'old', messages: [{
+    role: 'assistant', text: '旧工程', presentation: guide,
+    chains: [{ id: 'chain', steps: [{ id }, { id: 'gear.c::Gear_Apply' }] }],
+  }] }] });
+  await post('/api/page', { roots: [id], up: 0, down: 0 });
+  const br = await launchCdp();
+  t.after(() => br.close());
+  await br.send('Page.enable');
+  await br.send('Page.addScriptToEvaluateOnNewDocument', { source:
+    'window.EventSource = class extends EventSource { constructor(...args) { super(...args); window.appStream = this; } };' });
+  await br.send('Page.navigate', { url: srv.baseUrl });
+  await br.waitFor('Boolean(window.__cg?.view?.projectId && window.appStream)');
+  const oldId = await br.evaluate('window.__cg.view.projectId');
+  await br.evaluate("document.getElementById('aiBtn').click()");
+  await br.waitFor("document.querySelector('.ai-pres-card button') && document.getElementById('aiModel').value === 'mock'");
+  await br.evaluate("document.querySelector('.ai-pres-card button').click(); document.querySelector('.ai-chain-node').dispatchEvent(new MouseEvent('mouseenter'))");
+  const visual = '({ hud: !document.querySelector("#aiPresentationHud").hidden, guide: window.__cg.presentation?.title ?? null, overlay: window.__cg.aiOverlay?.action ?? null, hover: window.__cg.aiHover?.nodeId ?? null })';
+  const shown = { hud: true, guide: guide.title, overlay: 'highlight', hover: id };
+  const cleared = { hud: false, guide: null, overlay: null, hover: null };
+  assert.deepEqual(await br.evaluate(visual), shown);
+  await t.test('同工程刷新保留正在使用的导览与高亮', async () => {
+    await br.evaluate("(async () => (await import('/lib/hooks.js')).hooks.reloadAll({ preserveAiChat: true }))()");
+    assert.deepEqual(await br.evaluate(visual), shown);
+  });
+  await br.evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    api.aiChat = async () => new Response(new ReadableStream({ start(c) { window.finishOldChat = () => {
+      const events = [{type:'presentation',presentation:${JSON.stringify(guide)}},{type:'canvas_overlay',action:'play_flow',nodeIds:[${JSON.stringify(id)}]}, {type:'done',answer:'完成'}];
+      c.enqueue(new TextEncoder().encode(events.map(e=>JSON.stringify(e)).join('\\n')+'\\n')); c.close();
+    }; } }));
+    const input = document.getElementById('aiPromptInput');
+    input.value = '请展示导览'; input.dispatchEvent(new Event('input', {bubbles:true}));
+    document.getElementById('aiSendChat').click();
+  })()`);
+  await br.waitFor('Boolean(window.finishOldChat)');
+  await br.evaluate(`document.getElementById('projectBtn').click();
+    document.getElementById('projectPath').value = ${JSON.stringify(path.resolve('samples/deep'))};
+    document.getElementById('projectOpen').click()`);
+  await br.waitFor('Boolean(window.__cg?.view?.projectId && window.__cg.view.projectId !== ' + oldId + ')');
+  await t.test('工程选择器切换后画布与 HUD 即时清空', async () => {
+    assert.deepEqual(await br.evaluate(visual), cleared);
+  });
+  await t.test('延迟到达的旧对话和旧 SSE 不改写新工程，新工程事件正常生效', async () => {
+    await br.evaluate('window.finishOldChat(); new Promise(r => setTimeout(r, 10))');
+    assert.deepEqual(await br.evaluate(visual), cleared);
+    const event = (projectId, action, revision) => br.evaluate(`window.appStream.dispatchEvent(new MessageEvent('canvas_overlay',
+      { data: JSON.stringify({ projectId:${projectId}, action:${JSON.stringify(action)}, sessionRevision:${revision}, nodeIds:['selected'] }) }))`);
+    const currentId = await br.evaluate('window.__cg.view.projectId');
+    const revision = await br.evaluate('window.__cg.view.sessionRevision');
+    assert.ok(Number.isInteger(revision));
+    await event(currentId, 'highlight', revision);
+    await event(oldId, 'clear');
+    await event(oldId, 'play_flow');
+    await event(currentId, 'clear', revision - 1);
+    assert.deepEqual(await br.evaluate(visual), { ...cleared, overlay: 'highlight' });
+  });
+});

@@ -231,3 +231,54 @@ test('Clang 局部回调表采用声明身份和词法作用域，同名对象�
     assert.ok(model.fnptrTables.every(table => table.name !== 'row' && table.name !== 'slots'));
   }
 });
+
+test('Clang 聚合复制按复制时的声明和成员解析回调', requiresClang, async t => {
+  const dir = project(t, [
+    'typedef void (*Fn)(void); typedef struct { Fn run; Fn slots[2]; } Ops;',
+    'typedef struct { Ops rows[2]; } Group;',
+    'void alpha(void) {} void beta(void) {} void noise(void) {}',
+    'static const Ops original = {alpha, {beta, alpha}}, other = {beta, {alpha, beta}}, unrelated = {noise, {noise, noise}};',
+    'static const Group group = {{{alpha,{beta,alpha}}, {beta,{alpha,beta}}}};',
+    'Ops unknown(void);',
+    'void declare(void) { const Ops copy = original; copy.run(); copy.slots[0](); }',
+    'void assign(void) { Ops copy = unrelated; copy = original; copy.run(); }',
+    'void chain(void) { Group g = group; Ops row = g.rows[1]; Ops next; next = row; next.slots[0](); }',
+    'void member(void) { Group g = {0}; g.rows[1] = original; g.rows[1].run(); g.rows[0].run(); }',
+    'void designated(void) { Group g = {.rows = {original, other}}; g.rows[1].slots[0](); }',
+    'void choose(int n) { const Ops copy = n ? original : other; copy.run(); }',
+    'void partial(int n) { const Ops copy = n ? original : unknown(); copy.run(); }',
+    'void overwrite(void) { Ops copy = original; copy = unknown(); copy.run(); }',
+    'void branch(int n) { Ops copy = original; if(n) copy = other; copy.run(); }',
+    'void snapshots(void) { Ops src = original; src.run = beta; Ops dst = src; src.run = noise; dst.run(); dst.run = alpha; src.run(); dst.run(); }',
+    'void sparse(void) { Ops c = original; int slots[] = {[3] = (c.run(), 0)}; }',
+    'void chain_assign(void) { Ops a,b; a = b = original; b = other; a.run(); b.run(); }',
+    'void loop(int n) { Ops x = original; while(n--) { Ops dst = x; dst.run(); x = other; } }',
+    'void branches(int n) { Ops c = unrelated; if(n) { c = original; c.run(); } else { c = other; c.run(); } }',
+    'void jump(void) { Ops c = original; goto done; c = unrelated; done: c.run(); }',
+    'void dynamic(int i) { Group g = group; g.rows[i] = original; g.rows[1].run(); }',
+    'void literal(int n) { Ops x = n ? (Ops){beta,{alpha,beta}} : original; x.run(); x = (Ops){alpha,{beta,beta}}; x.slots[1](); }',
+    'void unknownptr(Ops *p) { Ops dst = *p; dst.run(); }',
+    'void again(void) { Ops dst = original; dst = dst; dst.run(); }',
+    'void shadow(void) { Ops src = original; { Ops src = other; Ops copy = src; copy.run(); } Ops copy = src; copy.run(); }',
+    'void isolated(void) { Ops src = unrelated; Ops copy = src; copy.run(); }',
+  ].join('\n'));
+  for (const policy of ['strict', 'expand']) {
+    const m = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [caller, expected] of Object.entries({
+      declare: [['alpha'], ['beta']], assign: [['alpha']], chain: [['alpha']],
+      member: [['alpha'], []], designated: [['alpha']], choose: [['alpha', 'beta']],
+      partial: [['alpha']], overwrite: [[]], branch: [['alpha', 'beta']],
+      sparse: [['alpha']], chain_assign: [['alpha'], ['beta']], loop: [['alpha','beta']], branches: [['alpha'], ['beta']], jump: [[]],
+      dynamic: [['alpha','beta']], literal: [['alpha','beta'], ['beta']], unknownptr: [[]], again: [['alpha']],
+      snapshots: [['beta'], ['noise'], ['alpha']], shadow: [['beta'], ['alpha']], isolated: [['noise']],
+    })) await t.test(policy + ' ' + caller, () => {
+      const id = 'main.c::' + caller;
+      const sites = m.indirectCalls.filter(s => s.caller === id).sort((a, b) => a.line - b.line || a.col - b.col);
+      assert.deepEqual(sites.map(s => s.candidates.map(c => c.name).sort()), expected);
+      assert.deepEqual(sites.map(s => s.resolution), expected.map(c => policy === 'expand' && c.length ? 'possible' : 'unresolved'));
+      const edges = (m._index.outAdj.get(id) || []).filter(e => e.kind === 'fnptr' && !e.to.startsWith('ext::'));
+      assert.ok(edges.every(e => e.resolution === 'possible'));
+      assert.deepEqual([...new Set(edges.map(e => e.callee))].sort(), policy === 'strict' ? [] : [...new Set(expected.flat())].sort());
+    });
+  }
+});

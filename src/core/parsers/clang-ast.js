@@ -173,7 +173,7 @@ export function readTranslationUnit(ast, root, unit, files) {
   const loc = sourceLocations(root, unit, files);
   loc.record(ast);
   const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map(),
-    declaratorSources: new WeakMap(), initializerRecords: new WeakMap(), scopeOf: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
+    declaratorSources: new WeakMap(), valueRecords: new WeakMap(), scopeOf: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
   const recordsById = new Map();
   const recordScopes = [context.records], typedefRecords = new Map();
   function collect(node, insideFunction, parentScope) {
@@ -213,12 +213,12 @@ export function readTranslationUnit(ast, root, unit, files) {
         scope.set(name, decl);
       }
     }
-    if (kind === 'InitListExpr') {
+    if (node.type && (kind.endsWith('Expr') || ['VarDecl', 'BinaryOperator', 'ConditionalOperator', 'UnaryOperator'].includes(kind))) {
       // Clang 的 typedef id 优先；同名结构标签按初始化器所在块查找。
       let decl = typedefRecords.get(node.type?.typeAliasDeclId);
       const type = typeOf(node).replace(/\b(const|volatile|restrict)\b/g, '').trim();
       for (let i = recordScopes.length - 1; !decl && i >= 0; i--) decl = recordScopes[i].get(type);
-      if (decl) context.initializerRecords.set(node, recordsById.get(decl.id) || decl);
+      if (decl) context.valueRecords.set(node, recordsById.get(decl.id) || decl);
     }
     if (position?.file && name && !node.isImplicit) {
       if (kind === 'FunctionDecl') {
@@ -318,6 +318,15 @@ function constIndexValue(node, context) {
   return null;
 }
 
+export function initializerMembers(value, context) {
+  const fields = children(context.valueRecords.get(value)).filter(field => field.kind === 'FieldDecl');
+  const isArray = /\[[^\]]*\]$/.test(typeOf(value));
+  return initializers(value).map((child, i) => {
+    const field = value.field || fields[i];
+    return { child, field, suffix: field?.name ? '.' + field.name : isArray ? '[' + i + ']' : '' };
+  });
+}
+
 /** Clang 的语义 InitListExpr 已把位置和指定初始化排列到了字段/下标对应的槽上。 */
 export function pointerSlots(node, context, resolveFunction, candidateSlots, indexField) {
   const slots = new Map();
@@ -348,14 +357,9 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots, ind
       if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
       if (fieldId) for (const target of cands) indexField(fieldId, slot, target);
     } else if (value.kind === 'InitListExpr') {
-      const type = typeOf(value);
-      const isArray = /\[[^\]]*\]$/.test(type);
-      const fields = children(context.initializerRecords.get(value)).filter(field => field.kind === 'FieldDecl');
-      initializers(value).forEach((child, i) => {
-        const field = value.field || fields[i];
-        const childSlot = field?.name ? `${slot}.${field.name}` : isArray ? `${slot}[${i}]` : slot;
-        visit(child, childSlot, field?.id || (isArray ? fieldId : null));
-      });
+      for (const { child, field, suffix } of initializerMembers(value, context)) {
+        visit(child, slot + suffix, field?.id || (suffix.startsWith('[') ? fieldId : null));
+      }
     }
   }
   visit(initializer(node), '');

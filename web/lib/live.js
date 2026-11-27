@@ -234,7 +234,8 @@ if (es) {
   es.addEventListener('canvas_overlay', (ev) => {
     let m = null;
     try { m = JSON.parse(ev.data || '{}'); } catch { return; }
-    if (!m || typeof m !== 'object') return;
+    if (!m || m.projectId == null || m.projectId !== state.view?.projectId ||
+        (m.sessionRevision != null && m.sessionRevision !== state.view.sessionRevision)) return;
     if (m.action === 'clear') {
       state.aiOverlay = null;
       state.presentation = null;

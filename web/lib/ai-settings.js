@@ -7,7 +7,7 @@
 import { t } from '../i18n.js';
 import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
-import { focusBox } from './camera.js';
+import { focusBox, stopCamAnim } from './camera.js';
 import { hooks } from './hooks.js';
 import { refreshAfterAiUndo } from './live.js';
 import { selectNode } from './menu.js';
@@ -2681,7 +2681,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     const wait = Math.max(16, 48 - (performance.now() - lastPaintAt));
     paintTimer = setTimeout(() => flushStreamPaint(false), wait);
   };
-  activeStreamFlush = () => flushStreamPaint(true);
+  const flushThisStream = () => flushStreamPaint(true);
+  activeStreamFlush = flushThisStream;
   const stopThinking = () => {
     dirtyThinking = false;
     if (thinkingSince !== null) {
@@ -2740,7 +2741,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
   };
   const handleLine = (line) => {
-    if (terminalReceived || !line.trim()) return;
+    if (!isCurrent() || terminalReceived || !line.trim()) return;
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
     if (ev.type === 'status') {
@@ -2922,7 +2923,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    consumeUnpinnedStagedSelections(uiContext);
+    if (isCurrent()) consumeUnpinnedStagedSelections(uiContext);
     reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -2949,7 +2950,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       clearTimeout(paintTimer);
       paintTimer = 0;
     }
-    activeStreamFlush = null;
+    if (activeStreamFlush === flushThisStream) activeStreamFlush = null;
     clearTimeout(streamTimer);
     if (reader) {
       void reader.cancel().catch(() => {});
@@ -3310,6 +3311,10 @@ messagesEl.addEventListener('scroll', () => {
 
 // 切换工程时自动隔离并切换到目标工程的独立对话列表
 document.addEventListener('cg:project-changed', () => {
+  state.aiHover = null;
+  stopCamAnim();
+  activatePresentation(null);
+  messagesEl.innerHTML = EMPTY_CHAT_HTML;
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
   pinnedSelections.length = 0;

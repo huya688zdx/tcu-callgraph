@@ -8,6 +8,7 @@ import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, file
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
+import { aggregateCopyReader, matchingSlot } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
 import { lex } from '../lexer.js';
@@ -23,16 +24,6 @@ function hasConstSlots(node) {
   const type = typeOf(node);
   const pointer = /\(\s*\*([^)]*)\)/.exec(type);
   return pointer ? /\bconst\b/.test(pointer[1]) : /^const\b/.test(type);
-}
-
-// slot 由 AST 生成，只有方括号中的运行时下标可以匹配另一侧的下标。
-function matchingSlot(a, b) {
-  if (a === b) return true;
-  if (!a.includes('[*]') && !b.includes('[*]')) return false;
-  const indices = /(\[(?:\*|-?\d+)\])/;
-  const left = a.split(indices), right = b.split(indices);
-  return left.length === right.length && left.every((part, i) => part === right[i] ||
-    (i % 2 === 1 && (part === '[*]' || right[i] === '[*]')));
 }
 
 function resolveDecl(ref, context, byDecl, exported) {
@@ -150,7 +141,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       for (const w of collectAssignmentWrites(record.body, unit, resolveFunction)) {
         const declKey = objectKey(w.decl, unit);
         if (!declWrites.has(declKey)) declWrites.set(declKey, []);
-        declWrites.get(declKey).push(w);
+        declWrites.get(declKey).push({ ...w, record });
         if (w.fieldId) {
           const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
           for (const target of w.targets) indexField(fields, unit, w.fieldId, w.slot, target);
@@ -159,6 +150,23 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     }
   }
 
+  const copyReaders = new WeakMap();
+  function copiedTargets(record, pointer, call) {
+    if (!pointer?.member || pointer.throughPointer) return null;
+    if (!copyReaders.has(record)) {
+      const ambientTargets = (key, slot) => {
+        if (typeof key !== 'string') return [];
+        const ids = [];
+        const table = tables.get(key);
+        for (const [path, id] of table?.slots || []) if (matchingSlot(path, slot)) ids.push(id);
+        for (const [path, targets] of table?.candidateSlots || []) if (matchingSlot(path, slot)) ids.push(...targets);
+        for (const w of declWrites.get(key) || []) if (w.record !== record && matchingSlot(w.slot, slot)) ids.push(...w.targets);
+        return ids;
+      };
+      copyReaders.set(record, aggregateCopyReader(record, objectKey, resolveFunction, ambientTargets));
+    }
+    return copyReaders.get(record)(pointer, call);
+  }
   const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
   for (const unit of units) for (const entry of unit.loc.includes) includes.set(...entry);
@@ -180,10 +188,12 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       const signature = functionSignature(typeOf(callee), context);
       const varKey = objectKey(pointer?.decl, context);
       const table = tables.get(varKey);
-      const exact = pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+      const copied = copiedTargets(record, pointer, node);
+      // 空数组表示已追踪到一次复制，但源成员未知；不要重新引入旧初始化值。
+      const exact = copied === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const matchingSlots = [];
-      if (table) {
+      const matchingSlots = copied || [];
+      if (copied === null && table) {
         if (pointer.slot.includes('[*]')) {
           for (const [slot, to] of table.slots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(to);
           for (const [slot, tos] of table.candidateSlots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(...tos);
@@ -193,7 +203,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
       }
       const objectWrites = declWrites.get(varKey) || [];
-      const writesForVar = objectWrites.filter(w => matchingSlot(w.slot, pointer.slot));
+      const writesForVar = copied === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
       const writtenTargets = writesForVar.flatMap(w => w.targets);
       const field = fieldKey(context, pointer?.fieldId);
       const fieldCandidates = new Set();
