@@ -1672,12 +1672,16 @@ export async function runAiAgent({
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
     ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
   };
-  const finish = async (answer, suggestions = []) => {
+  let terminalResult;
+  const finish = (...args) => terminalResult ??= finishTurn(...args);
+  async function finishTurn(answer, suggestions = [], question = null) {
     signal?.throwIfAborted();
     const extra = typeof beforeDone === 'function' ? (await beforeDone({ toolLog, onEvent })) || {} : {};
+    signal?.throwIfAborted();
     const result = {
       ok: true,
       answer: normalizeLineBreaks(answer).trim(),
+      ...(question ? { awaitingUser: true, ...question } : {}),
       ...(suggestions.length ? { suggestions } : {}),
       ...(collectedChains.length ? { chains: collectedChains.slice(0, 12) } : {}),
       ...(latestPresentation ? { presentation: latestPresentation } : {}),
@@ -1689,9 +1693,9 @@ export async function runAiAgent({
       modeUsed: activeMode,
       ...(lastMetrics ? { metrics: lastMetrics } : {}),
     };
-    onEvent({ type: 'done', ...result });
+    onEvent({ type: question ? 'question' : 'done', ...result });
     return result;
-  };
+  }
 
   let step = 0;
   for (; step < maxSteps; step++) {
@@ -1860,20 +1864,7 @@ export async function runAiAgent({
         : [];
       const options = parsedOptions.some(option => option.label === '全部保留') ? parsedOptions : parsedOptions.slice(0, 6);
       const allowCustom = ask.arguments?.allowCustom !== false;
-      const thinking = allThoughts.join('\n\n');
-      onEvent({ type: 'question', question, options, allowCustom, thinking, ...(lastMetrics ? { metrics: lastMetrics } : {}) });
-      return {
-        ok: true,
-        awaitingUser: true,
-        question,
-        options,
-        allowCustom,
-        answer: question,
-        thinking,
-        toolLog,
-        modeUsed: activeMode,
-        ...(lastMetrics ? { metrics: lastMetrics } : {}),
-      };
+      return await finish(question, [], { question, options, allowCustom });
     }
 
     // 把模型本轮输出加入历史（确保 tool_calls 数量与后续 role:tool 回复一一对应）

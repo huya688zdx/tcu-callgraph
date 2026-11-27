@@ -661,12 +661,12 @@ export function openStore({ dbPath, userData } = {}) {
 
     cacheGet: db.prepare('SELECT model FROM parse_cache WHERE fingerprint = ?'),
     cachePut: db.prepare(
-      `INSERT INTO parse_cache (fingerprint, created_at, stats, model) VALUES (?, ?, ?, ?)
-       ON CONFLICT(fingerprint) DO UPDATE SET created_at = excluded.created_at, stats = excluded.stats, model = excluded.model`
+      // 同毫秒内刷新同一份缓存也获得新的 rowid，供裁剪按实际写入先后排序。
+      'INSERT OR REPLACE INTO parse_cache (fingerprint, created_at, stats, model) VALUES (?, ?, ?, ?)'
     ),
     cacheDel: db.prepare('DELETE FROM parse_cache WHERE fingerprint = ?'),
     cachePrune: db.prepare(
-      'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC LIMIT ?)'
+      'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC, rowid DESC LIMIT ?)'
     ),
 
     bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),

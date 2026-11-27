@@ -132,14 +132,14 @@ test('解析缓存：按压缩后的体积限制缓存', (t) => {
   assert.deepEqual(store.getCachedModel('compressed'), large, '原始数据超过上限但可高效压缩时仍应复用');
 });
 
-test('解析缓存：按 created_at 只保留最近 N 份', (t) => {
+test('解析缓存：按 created_at 与同毫秒内的写入顺序只保留最近 N 份', (t) => {
   const store = tmpStore(t);
-  const model = loadModel(SAMPLE);
-  for (let i = 0; i < 5; i++) {
-    store.putCachedModel(`k${i}`, model, { keep: 3 });
-  }
-  const rows = store.db.prepare('SELECT fingerprint FROM parse_cache ORDER BY created_at DESC').all();
-  assert.equal(rows.length, 3);
-  // 最新写入的一定在
-  assert.ok(rows.some((r) => r.fingerprint === 'k4'));
+  t.mock.method(Date, 'now', () => 123456);
+  const keys = () => store.db.prepare('SELECT fingerprint FROM parse_cache ORDER BY fingerprint').all().map(r => r.fingerprint);
+  for (let i = 0; i < 5; i++) store.putCachedModel('k' + i, { i }, { keep: 3 });
+  assert.deepEqual(keys(), ['k2', 'k3', 'k4']);
+  store.putCachedModel('k2', { refreshed: true }, { keep: 3 });
+  store.putCachedModel('k5', {}, { keep: 3 });
+  assert.deepEqual(keys(), ['k2', 'k4', 'k5']);
+  assert.deepEqual(store.getCachedModel('k2'), { refreshed: true });
 });

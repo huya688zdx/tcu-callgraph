@@ -429,3 +429,68 @@ void exact(void) { global_slots[1](); }`);
     });
   }
 });
+
+test('Clang 全局回调保留两次访问之间的被调函数写入', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+void first(void) {} void second(void) {} void third(void) {} void other(void) {}
+Fn cb = third, elsewhere = other, slots[2] = {first, third};
+extern void unknown_code(void);
+void init(void) { cb = second; }
+void recursion(int n) { if (n) recursion(n - 1); else init(); }
+void assign(Fn value) { cb = value; }
+void setter(Fn *p) { *p = second; }
+static Fn private_cb = first;
+void public_setter(void) { setter(&private_cb); }
+void private_unknown(void) { private_cb = first; unknown_code(); private_cb(); }
+void through_address(void) { setter(&cb); }
+void inspect_address(Fn const *p) { (void)p; }
+void inspect_global(void) { inspect_address(&cb); }
+void type_only(void) { (void)sizeof((init(), 0)); (void)sizeof(cb = second); }
+void wrapper(void) { init(); }
+void harmless(void) { elsewhere = other; }
+void nested_noop(void) { harmless(); }
+void change_slot(void) { slots[1] = second; }
+void direct(void) { cb = first; init(); cb(); }
+void via_wrapper(void) { cb = first; wrapper(); cb(); }
+void optional(int n) { cb = first; if (n) init(); cb(); }
+void noop(void) { cb = first; nested_noop(); cb(); }
+void shadow(void) { cb = first; init(); cb = third; cb(); }
+void prior(void) { cb = first; cb(); init(); }
+void disjoint(int n) { cb = first; if (n) { init(); } else { cb(); } }
+void copy(void) { cb = first; wrapper(); Fn saved = cb; cb = other; saved(); }
+void local(void) { Fn cb = first; init(); cb(); }
+void sibling(void) { slots[0] = first; change_slot(); slots[0](); }
+void same_slot(void) { slots[1] = first; change_slot(); slots[1](); }
+void uncertain(void) { cb = first; unknown_code(); cb(); }
+void reentrant(void) { cb = first; recursion(1); cb(); }
+void via_arg(void) { cb = first; assign(third); cb(); }
+void via_address(void) { cb = first; through_address(); cb(); }
+void readonly(void) { cb = first; inspect_global(); cb(); }
+void unevaluated(void) { cb = first; type_only(); cb(); }
+void recovered(void) { unknown_code(); cb = first; cb(); }`);
+  for (const policy of ['strict','expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const changed = ['first','second'];
+    const expects = { direct: changed, via_wrapper: changed, optional: changed, noop: ['first'],
+      shadow: ['third'], prior: ['first'], disjoint: ['first'], copy: changed, local: ['first'],
+      sibling: ['first'], same_slot: changed, reentrant: changed, via_arg: ['first','third'],
+      via_address: changed, readonly: ['first'], unevaluated: ['first'], recovered: ['first'] };
+    for (const [name, targets] of Object.entries(expects)) await t.test(policy + ' ' + name, () => {
+      const caller = 'main.c::' + name;
+      const site = model.indirectCalls.find(s => s.caller === caller);
+      assert.deepEqual(site?.candidates.map(c => c.name).sort(), targets);
+      assert.equal(site.resolution, policy === 'expand' ? 'possible' : 'unresolved');
+      assert.deepEqual(model.edges.filter(e => e.from === caller && e.kind === 'fnptr').map(e => e.callee).sort(),
+        policy === 'expand' ? targets : []);
+    });
+    await t.test(policy + ' unknown', () => {
+      const site = model.indirectCalls.find(s => s.caller === 'main.c::uncertain');
+      assert.ok(site.candidates.some(c => c.name === 'second'), '不透明调用仍可能间接运行 init');
+      assert.notEqual(site.resolution, 'exact');
+      const privateSite = model.indirectCalls.find(s => s.caller === 'main.c::private_unknown');
+      assert.notEqual(privateSite.resolution, 'exact');
+      if (policy === 'expand') assert.ok(privateSite.candidates.some(c => c.name === 'second'),
+        '不透明调用可经过对外部可见的 public_setter 间接修改内部变量');
+    });
+  }
+});

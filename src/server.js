@@ -3122,6 +3122,10 @@ export const server = http.createServer(async (req, res) => {
             if (!edgeMap.has(k)) edgeMap.set(k, e);
           }
         }
+        return canvasLabelsForEdges(model, nodeIds, edgeMap, overlay);
+      };
+
+      const canvasLabelsForEdges = async (model, nodeIds, edgeMap, viewOverlay) => {
         if (!nodeIds.size) {
           return { canvasNodeCount: 0, canvasEdges: [], suggestedLabels: [], commentTasks: [] };
         }
@@ -3129,8 +3133,8 @@ export const server = http.createServer(async (req, res) => {
           : await analyzeTasks(model, { onlyIds: nodeIds });
         assertActive();
         const canvasEdges = [...edgeMap.values()].slice(0, 60).map((e) => {
-          const key = annotationEdgeKey(overlay.edges, e, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, e, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           return {
             from: e.from,
             to: e.to,
@@ -3141,8 +3145,8 @@ export const server = http.createServer(async (req, res) => {
         const suggestedLabels = [];
         for (const s of detected.suggestions || []) {
           if (!edgeMap.has(s.edgeKey)) continue;
-          const key = annotationEdgeKey(overlay.edges, { from: s.from, to: s.to, line: s.line }, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, { from: s.from, to: s.to, line: s.line }, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           if (existing.some((l) => l.preset === s.preset)) continue;
           const orderMatch = s.preset === 'call' ? /^コール順(\d+)$/.exec(s.text) : null;
           suggestedLabels.push({
@@ -5422,8 +5426,20 @@ export const server = http.createServer(async (req, res) => {
         }
         if (name === 'diagnose_canvas') {
           const check = ['all', 'orphans', 'indirect', 'labels', 'layout'].includes(args.check) ? args.check : 'all';
-          const page = latestPage();
-          if (!page || (!(page.roots?.length) && !(page.expansions?.length))) {
+          const page = pageState?.projectId === PROJECT.id && (pageState.comparisonId ?? null) === (COMPARISON?.id ?? null)
+            ? pageState : latestPage();
+          const at = !COMPARISON && page?.at > 0 ? page.at : 0;
+          const historical = at ? store.viewAt(PROJECT.id, at) : null;
+          const viewOverlay = at ? store.overlayAt(PROJECT.id, at) : overlay;
+          const scope = viewSnapshot(historical || page || {});
+          const roots = historical?.empty ? [] : scope.roots;
+          const expansions = historical?.empty ? [] : scope.expansions;
+          const fallback = COMPARISON && !roots.length && !(scope.empty && !expansions.length && !scope.vars.length);
+          const view = await buildView(fallback ? COMPARISON.roots : roots, fallback ? 0 : scope.up, fallback ? 0 : scope.down,
+            scope.group, null, { want: scope.vars, skip: scope.hiddenVars, expansions, groupMode: scope.groupMode,
+              preview: true, signal: abort.signal }, viewOverlay);
+          assertActive();
+          if (!view.nodes.length) {
             return {
               ok: true,
               healthReport: {
@@ -5434,33 +5450,15 @@ export const server = http.createServer(async (req, res) => {
             };
           }
           const issues = [];
-          const labelCtx = await collectCanvasLabelContext(MODEL, page);
-          assertActive();
-          const activeView = viewSnapshot(page);
-          const visRoots = (activeView.roots || []).map(id => remapLegacyExt(id, MODEL)).filter(id => MODEL._index.byId.has(id));
-          const visExps = normalizeExpansions((activeView.expansions || [])
-            .map(s => ({ ...s, root: remapLegacyExt(s.root, MODEL) }))
-            .filter(s => MODEL._index.byId.has(s.root)));
-          const visNodes = new Set();
-          const visAdjCount = new Map();
-          for (const sc of [...visRoots.map(r => ({ root: r, up: activeView.up || 0, down: activeView.down || 0 })), ...visExps]) {
-            const sub = subgraph(MODEL, sc.root, { up: sc.up, down: sc.down, maxNodes: 200, includeVariables: true });
-            for (const n of sub.nodes) if (!overlay.deleted.nodes[n.id]) visNodes.add(n.id);
-            for (const e of sub.edges) {
-              if (!overlay.deleted.edges[edgeKeyOf(e)]) {
-                visAdjCount.set(e.from, (visAdjCount.get(e.from) || 0) + 1);
-                visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
-              }
-            }
+          const visNodes = new Set(view.nodes.map(n => n.id));
+          const connected = new Set(view.edges.flatMap(e => [e.from, e.to]));
+          let labelCtx;
+          if (check === 'all' || check === 'labels') {
+            const functions = new Set(view.nodes.filter(n => n.kind !== 'var').map(n => n.id));
+            const edges = new Map(view.edges.filter(e => functions.has(e.from) && functions.has(e.to)).map(e => [edgeKeyOf(e), e]));
+            labelCtx = await canvasLabelsForEdges(MODEL, functions, edges, viewOverlay);
           }
-          for (const id of visNodes) {
-            for (const e of MODEL._index?.outAdj?.get(id) || []) {
-              if (e.headerReference || !visNodes.has(e.to) || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-              visAdjCount.set(id, (visAdjCount.get(id) || 0) + 1);
-              visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
-            }
-          }
-          if ((check === 'all' || check === 'labels') && labelCtx.suggestedLabels.length) {
+          if (labelCtx?.suggestedLabels.length) {
             const sample = labelCtx.suggestedLabels.slice(0, 6);
             issues.push({
               id: 'missing_labels',
@@ -5476,7 +5474,7 @@ export const server = http.createServer(async (req, res) => {
             const unexpanded = [];
             for (const ic of MODEL.indirectCalls || []) {
               if (!visNodes.has(ic.caller)) continue;
-              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !overlay.deleted.nodes[c.id]);
+              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !viewOverlay.deleted.nodes[c.id]);
               if (missing.length || ic.resolution === 'unresolved') unexpanded.push({ ic, missing });
               if (unexpanded.length >= 12) break;
             }
@@ -5493,7 +5491,7 @@ export const server = http.createServer(async (req, res) => {
             }
           }
           if ((check === 'all' || check === 'orphans') && visNodes.size >= 2) {
-            const orphans = [...visNodes].filter(id => (visAdjCount.get(id) || 0) === 0);
+            const orphans = [...visNodes].filter(id => !connected.has(id));
             if (orphans.length) {
               issues.push({
                 id: 'isolated_nodes',

@@ -118,6 +118,10 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       tables.set(objectKey(node, unit), { slots, candidateSlots, constant: hasConstSlots(node) });
     }
   };
+  const definitionOf = (ref, unit) => {
+    const definitions = recordsById.get(resolveDecl(ref?.referencedDecl, unit, fnDecls, publicFns));
+    return definitions?.find(r => r.context === unit) || definitions?.[0] || null;
+  };
   for (const unit of units) {
     for (const node of unit.globals) {
       if (node.init) indexTable(node, unit, byRecordField);
@@ -190,6 +194,43 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     }
     return { targets: [...targets], unknown };
   }
+  // 已知函数只引入它及其被调函数在该全局槽位上的写入。未知调用保留可能性。
+  const reachable = new Map();
+  const targetOfCall = (call, unit) => definitionOf(fnRef(children(call)[0]), unit);
+  function reachableCallees(direct) {
+    const records = new Set([direct]);
+    for (const record of records) {
+      if (!record) continue;
+      for (const nested of readerFor(record).calls) {
+        const target = targetOfCall(nested, record.context);
+        if (records.has(target)) continue;
+        if (records.size >= 128) {
+          records.add(null);
+          return records;
+        }
+        records.add(target);
+      }
+    }
+    return records;
+  }
+  function globalWritesFrom(call, unit, key, slot) {
+    const direct = targetOfCall(call, unit);
+    if (!reachable.has(direct)) reachable.set(direct, reachableCallees(direct));
+    const records = reachable.get(direct), opaque = records.has(null);
+    const writes = new Set();
+    let unknown = opaque;
+    for (const w of declWrites.get(key) || []) {
+      if ((opaque || records.has(w.record)) && matchingSlot(w.slot, slot) && readerFor(w.record).isEvaluated(w.node)) writes.add(w);
+    }
+    for (const record of records) {
+      if (!record) continue;
+      for (const effect of readerFor(record).addressWrites(key, slot)) {
+        if (effect) writes.add(effect);
+        else unknown = true;
+      }
+    }
+    return { writes, direct, unknown };
+  }
   function readerFor(record) {
     if (!readers.has(record)) {
       const ambient = (key, slot) => {
@@ -208,9 +249,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       };
       const parameterWrites = (callee, index) => {
         const unit = record.context;
-        const id = resolveDecl(fnRef(callee)?.referencedDecl, unit, fnDecls, publicFns);
-        const definitions = recordsById.get(id);
-        const target = definitions?.find(r => r.context === unit) || definitions?.[0];
+        const target = definitionOf(fnRef(callee), unit);
         const param = children(target?.node).filter(n => n.kind === 'ParmVarDecl')[index];
         if (!param) return [null];
         const writes = (declWrites.get(param) || []).filter(w => w.throughPointer);
@@ -218,7 +257,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         return writes;
       };
       const fieldWrites = (id, slot) => fieldValues(indirectFieldWrites, fieldKey(record.context, id), memberIndices(slot));
-      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue }));
+      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }));
     }
     return readers.get(record);
   }

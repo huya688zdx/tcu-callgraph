@@ -36,7 +36,7 @@ function argumentSlot(base, write) {
 }
 
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值；传址写入只作为可能值。
-export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue }) {
+export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
   const indirectActions = [], aliases = new Map(), rebound = new Set();
   // 只绑定初始化后既不改写、也不按地址传出的局部指针。其他别名保持保守。
@@ -134,7 +134,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     });
     const point = { order: ++order, guards, loop };
     const call = node.kind === 'CallExpr' && node;
-    if (call) indirectActions.push(point);
+    if (call) {
+      point.call = call;
+      indirectActions.push(point);
+    }
     if (call || (node.kind === 'BinaryOperator' && node.opcode === '=')) points.set(node, point);
     const localPointer = node.kind === 'VarDecl' && !['static', 'extern'].includes(node.storageClass) &&
       node.init && !rebound.has(node) && typeOf(node).includes('*');
@@ -210,6 +213,18 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         unknown = true;
       }
     }
+    function evaluateWrite(effect, call, point, depth) {
+      const result = writeValue(effect);
+      merge(result);
+      if (!result.parameters.length) return;
+      const formals = children(effect.record.node).filter(n => n.kind === 'ParmVarDecl');
+      for (const param of result.parameters) {
+        const index = formals.indexOf(param);
+        const arg = call && index >= 0 && children(call)[index + 1];
+        if (arg) evaluate(arg, '', point, depth + 1);
+        else unknown = true;
+      }
+    }
     function read(source, path, at, depth, fieldId) {
       const exposed = escapes.get(source)?.filter(w => !w.effect && reaches(w.point, at) && relativeSlot(w.slot, path));
       function possibleAliasWrite(since) {
@@ -219,6 +234,15 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
             !indirectActions.some(p => p !== at && reaches(since, p) && reaches(p, at))) return;
         if (fieldId) merge(fieldWrites(fieldId, path));
         else unknown = true;
+      }
+      function mergeInterveningCalls(since) {
+        if (typeof source !== 'string') return;
+        for (const action of indirectActions) {
+          if (!action.call || action === at || !reaches(since, action) || !reaches(action, at)) continue;
+          const effects = globalWritesFrom(action.call, unit, source, path);
+          unknown ||= effects.unknown;
+          for (const w of effects.writes) evaluateWrite(w, w.record === effects.direct ? action.call : null, action, depth);
+        }
       }
       const history = writes.get(source) || [];
       // 大数组或未知长度保留符号下标。某个具体槽一旦被必经赋值覆盖，就不再取它更早的值。
@@ -238,20 +262,13 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         }
         if (excluded) continue;
         if (effect) {
-          const result = writeValue(effect);
-          merge(result);
-          const formals = children(effect.record.node).filter(n => n.kind === 'ParmVarDecl');
-          for (const param of result.parameters) {
-            const index = formals.indexOf(param);
-            const arg = index >= 0 && children(call)[index + 1];
-            if (arg) evaluate(arg, '', point, depth + 1);
-            else unknown = true;
-          }
+          evaluateWrite(effect, call, point, depth);
         } else {
           evaluate(value, match.rest, point, depth, fieldId);
           if (mandatory && !slot.includes('[*]')) shadowed?.add(slot);
           if ((mandatory && match.covers) || budget < 0) {
             possibleAliasWrite(point);
+            mergeInterveningCalls(point);
             // 块内 static 初始化只执行一次。前次调用留下的写入同样可达。
             if (source?.storageClass === 'static' && point.declaration === source) merge(ambient(source, path));
             return;
@@ -268,6 +285,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return { targets: [...targets], unknown, parameters: [...parameters] };
   }
   return {
+    calls: indirectActions.filter(p => p.call).map(p => p.call),
+    isEvaluated: node => points.has(node),
+    addressWrites: (key, slot) => (escapes.get(key) || []).filter(w => relativeSlot(w.slot, slot)).map(w => w.effect),
     atCall(pointer, call) {
       const src = objectSlot(pointer), at = points.get(call);
       if (!src) return null;
