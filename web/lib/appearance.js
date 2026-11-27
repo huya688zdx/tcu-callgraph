@@ -53,6 +53,7 @@ const SECTIONS = [
       { path: 'node.fnDash', label: 'style.fnDash', kind: 'toggle' },
       { path: 'node.varBorder', label: 'style.varBorder', kind: 'line' },
       { path: 'node.varDash', label: 'style.varDash', kind: 'toggle' },
+      { path: 'node.tintFill', label: 'style.tintFill', kind: 'toggle', onLabel: 'style.on', offLabel: 'style.off' },
       { path: 'node.selected', label: 'style.selectedBorder', kind: 'line' },
       { path: 'node.external', label: 'style.externalFill' },
     ],
@@ -61,6 +62,7 @@ const SECTIONS = [
     title: 'style.edges',
     items: [
       { path: 'edge.call', label: 'legend.call', kind: 'line' },
+      { path: 'edge.fnptr', label: 'legend.fnptr', kind: 'line' },
       { path: 'edge.var', label: 'style.dataFlow', kind: 'dash' },
       { path: 'edge.added', label: 'style.newEdge', kind: 'line' },
       { path: 'edge.manual', label: 'style.manualPreview', kind: 'dash' },
@@ -70,6 +72,7 @@ const SECTIONS = [
     title: 'style.containers',
     items: [
       { path: 'bg', label: 'style.canvasBg' },
+      { path: 'canvas.gridDots', label: 'style.gridDots', kind: 'toggle', onLabel: 'style.on', offLabel: 'style.off' },
       { path: 'container.fill', label: 'style.containerFill' },
       { path: 'container.stroke', label: 'style.containerBorder', kind: 'line' },
     ],
@@ -95,7 +98,7 @@ const PRESETS = [
       'node.border': '#252B31', 'node.varBorder': '#252B31',
       'node.external': '#F6F7F8', 'node.externalBorder': '#7C8389',
       'node.selected': '#174975', 'node.hover': '#29628F',
-      'edge.call': '#252B31', 'edge.var': '#454D56',
+      'edge.call': '#252B31', 'edge.fnptr': '#5B4FA8', 'edge.var': '#454D56',
       'edge.added': '#A52A38', 'edge.manual': '#315D40',
       'container.fill': '#E7EDF2', 'container.stroke': '#697784',
     },
@@ -110,7 +113,7 @@ const PRESETS = [
       'node.border': '#6D6556', 'node.varBorder': '#77705F',
       'node.external': '#F5EFE4', 'node.externalBorder': '#A69A87',
       'node.selected': '#476C6D', 'node.hover': '#658A86',
-      'edge.call': '#645D50', 'edge.var': '#627260',
+      'edge.call': '#645D50', 'edge.fnptr': '#7C6E9F', 'edge.var': '#627260',
       'edge.added': '#9B5752', 'edge.manual': '#61764E',
       'container.fill': '#E8DFC9', 'container.stroke': '#A3967A',
     },
@@ -277,8 +280,8 @@ function advancedSection({ title, items }) {
         ? `<div class="appearance-line-type">
             <span id="${item.path}Label">${esc(t(item.label))}</span>
             <div class="appearance-segment" role="group" aria-labelledby="${item.path}Label">
-              <button type="button" data-flag="${item.path}" value="true">${t('style.dashed')}</button>
-              <button type="button" data-flag="${item.path}" value="false">${t('style.solid')}</button>
+              <button type="button" data-flag="${item.path}" value="true">${t(item.onLabel || 'style.dashed')}</button>
+              <button type="button" data-flag="${item.path}" value="false">${t(item.offLabel || 'style.solid')}</button>
             </div>
           </div>`
         : colorControl(item)).join('')}

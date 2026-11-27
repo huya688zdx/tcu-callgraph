@@ -4,7 +4,7 @@
  */
 import { t } from '../i18n.js';
 import { els, state, cam, THEME, hexToRgba, FONT, shortFile, edgeKey } from './state.js';
-import { isDataEdge, edgeDirection } from './edge-flow.js';
+import { isDataEdge, edgeDirection, EDGE_DASH, dashSegments } from './edge-flow.js';
 import { canvasPeriodBadge, periodBadgeBox, periodContainerStyle, PERIOD_COLORS, periodSubtitle } from './period-text.js';
 import { edgePoints } from './geometry.js';
 import { midAnchor } from '/core/labels.js';
@@ -199,7 +199,8 @@ function drawEffects(now) {
   if (now >= (state.recent?.rippleUntil ?? 0) && effects.some((effect) => effect.kind === 'ripple')) {
     effects = effects.filter((effect) => effect.kind !== 'ripple');
   }
-  if (prefersReducedMotion() && !state.pairFlow && effects.some((effect) => effect.kind === 'stream')) {
+  const hasActiveFlow = Boolean(state.pairFlow || state.aiOverlay?.action === 'play_flow');
+  if (prefersReducedMotion() && !hasActiveFlow && effects.some((effect) => effect.kind === 'stream')) {
     effects = effects.filter((effect) => effect.kind !== 'stream');
   }
   if (!effects.length && !state.flash) { releaseEffectCanvas(); return; }
@@ -272,16 +273,18 @@ function drawEffects(now) {
     const speedPx = 68;
     const travelPx = (now * 0.001 * speedPx) % spacingPx;
     let totalPulses = 0;
-    const MAX_PULSES = 56;
+    const MAX_PULSES = hasActiveFlow ? 128 : 56;
+    const minLenPx = hasActiveFlow ? 12 : 20;
     for (const stream of streams) {
       if (totalPulses >= MAX_PULSES) break;
       const tailPath = new Path2D();
+      const orbPath = new Path2D();
       const headPath = new Path2D();
       let count = 0;
       for (const seg of stream.segments) {
         if (totalPulses >= MAX_PULSES) break;
         const lenPx = seg.size * c.k;
-        if (lenPx < 20) continue;
+        if (lenPx < minLenPx) continue;
         const nOff = seg.offset || 0;
         const sx0 = seg.x * c.k + c.x - seg.dy * nOff;
         const sy0 = seg.y * c.k + c.y + seg.dx * nOff;
@@ -291,31 +294,40 @@ function drawEffects(now) {
             Math.max(sy0, sy1) < -16 || Math.min(sy0, sy1) > H + 16) continue;
         const phasePx = ((seg.phase * c.k) % spacingPx + spacingPx) % spacingPx;
         let dPx = (travelPx - phasePx + spacingPx) % spacingPx;
-        if (dPx < 8) dPx += spacingPx;
-        for (; dPx <= lenPx - 8 && totalPulses < MAX_PULSES; dPx += spacingPx) {
+        const edgePad = Math.min(8, lenPx * 0.25);
+        if (dPx < edgePad) dPx += spacingPx;
+        for (; dPx <= lenPx - edgePad && totalPulses < MAX_PULSES; dPx += spacingPx) {
           const hx = sx0 + seg.dx * dPx;
           const hy = sy0 + seg.dy * dPx;
           if (hx < -12 || hx > W + 12 || hy < -12 || hy > H + 12) continue;
-          const tailLen = Math.min(16, dPx - 4);
+          const tailLen = Math.min(18, dPx - 4);
           if (tailLen > 3) {
             tailPath.moveTo(hx - seg.dx * tailLen, hy - seg.dy * tailLen);
             tailPath.lineTo(hx - seg.dx * 1.5, hy - seg.dy * 1.5);
           }
+          orbPath.moveTo(hx + 5.6, hy);
+          orbPath.arc(hx, hy, 5.6, 0, Math.PI * 2);
           // 紧贴连线中心的流线型箭头
           headPath.moveTo(hx + seg.dx * 5.2, hy + seg.dy * 5.2);
           headPath.lineTo(hx - seg.dx * 3.6 + seg.dy * 3.4, hy - seg.dy * 3.6 - seg.dx * 3.4);
           headPath.lineTo(hx - seg.dx * 1.3, hy - seg.dy * 1.3);
           headPath.lineTo(hx - seg.dx * 3.6 - seg.dy * 3.4, hy - seg.dy * 3.6 + seg.dx * 3.4);
           headPath.closePath();
-          const pad = (tailLen + 8) * c.dpr;
+          const pad = (tailLen + 12) * c.dpr;
           markDirtyPixels(hx * c.dpr - pad, hy * c.dpr - pad, hx * c.dpr + pad, hy * c.dpr + pad);
           count++;
           totalPulses++;
         }
       }
       if (count) {
+        ctx.fillStyle = hexToRgba(stream.color, 0.26);
+        ctx.fill(orbPath);
+        ctx.strokeStyle = hexToRgba(stream.color, 0.20);
+        ctx.lineWidth = 6.5;
+        ctx.lineCap = 'round';
+        ctx.stroke(tailPath);
         ctx.strokeStyle = stream.tailColor;
-        ctx.lineWidth = 3.2;
+        ctx.lineWidth = 2.6;
         ctx.lineCap = 'round';
         ctx.stroke(tailPath);
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
@@ -493,12 +505,26 @@ function draw({ geometryUnchanged = false } = {}) {
   const trunkHits = state.trunkHits;
   const trunkNodes = trunkHits?.length > 1 && trunkHits.includes(focusedEdge)
     ? new Set(trunkHits.flatMap((e) => [e.from, e.to])) : null;
+  const aiStep = state.presentation?.steps?.[state.presentation.activeStep ?? 0] || null;
+  const aiOverlayAction = state.aiOverlay?.action || '';
+  const aiFlowActive = aiOverlayAction === 'play_flow';
+  const aiActiveNodes = new Set([...(aiStep?.nodeIds || []), ...(state.aiOverlay?.nodeIds || [])]);
+  const aiActiveEdges = new Set([...(aiStep?.edgeKeys || []), ...(state.aiOverlay?.edgeKeys || [])]);
+  const aiHoverNodes = new Set(state.aiHover?.nodeIds || []);
+  const aiHoverEdges = new Set(state.aiHover?.edgeKeys || []);
+  const aiOrderMap = new Map();
+  if (aiStep || aiOverlayAction === 'spotlight' || aiOverlayAction === 'walkthrough') {
+    for (const id of [...(aiStep?.nodeIds || []), ...(state.aiOverlay?.nodeIds || [])]) {
+      if (!aiOrderMap.has(id)) aiOrderMap.set(id, aiOrderMap.size + 1);
+    }
+  }
+  const hasAiDim = Boolean((aiStep || aiOverlayAction === 'spotlight' || aiOverlayAction === 'walkthrough') && (aiActiveNodes.size || aiActiveEdges.size));
   const selectedNodes = state.multiSelection?.nodes || null;
   const relations = !focusedEdges.size && !selectedNodes?.size && state.selected
     ? classifySelectionRelations(v, state.selected) : null;
   let activeBoxes = relations?.activeBoxes || null;
-  if (!activeBoxes && (focusedNodes?.size || selectedNodes?.size)) {
-    const activeIds = focusedNodes?.size ? focusedNodes : selectedNodes;
+  if (!activeBoxes && (focusedNodes?.size || selectedNodes?.size || (hasAiDim && aiActiveNodes.size))) {
+    const activeIds = focusedNodes?.size ? focusedNodes : selectedNodes?.size ? selectedNodes : aiActiveNodes;
     activeBoxes = new Set();
     for (const n of v.nodes) {
       if (!activeIds.has(n.id) || !n.group) continue;
@@ -519,17 +545,22 @@ function draw({ geometryUnchanged = false } = {}) {
     if (peer !== hoverRel.peerId) return false;
     return !hoverRel.dir || hoverRel.dir === role || role === 'both' || e.from === e.to;
   };
+  const isAiEdge = (e, ek) => aiActiveEdges.has(ek) || (aiFlowActive && !aiActiveEdges.size && aiActiveNodes.has(e.from) && aiActiveNodes.has(e.to));
   const related = [];
   const emphasized = [];
+  const aiEdges = [];
   for (const e of v.edges) {
     if (focusedEdges.has(e) || !pathVisible(edgePoints(e), area)) continue;
+    const ek = edgeKey(e);
     if (relations ? relations.edgeRoles.has(e)
       : !focusedEdges.size && (selectedNodes ? selectedNodes.has(e.from) || selectedNodes.has(e.to)
         : state.selected && (e.from === state.selected || e.to === state.selected))) {
       const role = relations?.edgeRoles.get(e);
       if (hoverRel && matchesHover(e, role)) emphasized.push(e);
       else related.push(e);
-    } else drawEdge(ctx, e, false, false, null, false, dim);
+    } else if (isAiEdge(e, ek) || aiHoverEdges.has(ek)) {
+      aiEdges.push(e);
+    } else drawEdge(ctx, e, false, false, null, false, dim || hasAiDim);
   }
   const hasEmphasized = emphasized.length > 0;
   for (const e of related) {
@@ -544,6 +575,13 @@ function draw({ geometryUnchanged = false } = {}) {
     if (!pathVisible(edgePoints(e), area)) continue;
     const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || state.multiSelection.trunk || e === focusedEdge;
     drawEdge(ctx, e, false, true, tracedColors.get(e), animated);
+  }
+  for (const e of aiEdges) {
+    const ek = edgeKey(e);
+    const hovered = aiHoverEdges.has(ek);
+    const active = isAiEdge(e, ek);
+    const anim = aiFlowActive || (Boolean(aiStep) && active);
+    drawEdge(ctx, e, false, true, hovered || aiFlowActive || aiStep ? '#6366F1' : '#7C3AED', anim);
   }
   if (rawFlowStreams.length) {
     for (const stream of mergeFlowStreams(rawFlowStreams)) {
@@ -579,8 +617,11 @@ function draw({ geometryUnchanged = false } = {}) {
   }
 
   const nb = neighborSet();
+  const aiCtx = (aiActiveNodes.size || aiHoverNodes.size || hasAiDim)
+    ? { activeNodes: aiActiveNodes, hoverNodes: aiHoverNodes, orderMap: aiOrderMap, dimOthers: hasAiDim && !dim && !selectedNodes?.size }
+    : null;
   for (const n of v.nodes) {
-    if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null, trunkNodes?.has(n.id));
+    if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null, trunkNodes?.has(n.id), aiCtx);
   }
   for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
     const node = v.nodes.find(n => n.id === id);
@@ -747,9 +788,35 @@ function drawGroup(ctx, g, dimmed = false) {
 }
 
 /** 圆角正交折线（严格水平/垂直段，折点用二次贝塞尔过渡） */
-function strokeRounded(ctx, pts) {
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+function strokeRounded(ctx, pts, radius = 7) {
+  if (!pts || pts.length < 2) return;
+  const clean = [pts[0]];
+  for (let i = 1; i < pts.length; i++) {
+    const prev = clean[clean.length - 1];
+    if (Math.hypot(pts[i][0] - prev[0], pts[i][1] - prev[1]) >= 0.01) clean.push(pts[i]);
+  }
+  if (clean.length < 2) return;
+  ctx.moveTo(clean[0][0], clean[0][1]);
+  if (radius <= 0 || clean.length === 2) {
+    for (let i = 1; i < clean.length; i++) ctx.lineTo(clean[i][0], clean[i][1]);
+    return;
+  }
+  for (let i = 1; i < clean.length - 1; i++) {
+    const prev = clean[i - 1], cur = clean[i], next = clean[i + 1];
+    const dx1 = prev[0] - cur[0], dy1 = prev[1] - cur[1], d1 = Math.hypot(dx1, dy1);
+    const dx2 = next[0] - cur[0], dy2 = next[1] - cur[1], d2 = Math.hypot(dx2, dy2);
+    if (d1 < 0.01 || d2 < 0.01) continue;
+    const u1x = dx1 / d1, u1y = dy1 / d1, u2x = dx2 / d2, u2y = dy2 / d2;
+    if (Math.abs(u1x * u2y - u1y * u2x) < 1e-4) {
+      ctx.lineTo(cur[0], cur[1]);
+      continue;
+    }
+    const rad = Math.min(radius, d1 * 0.45, d2 * 0.45);
+    ctx.lineTo(cur[0] + u1x * rad, cur[1] + u1y * rad);
+    ctx.quadraticCurveTo(cur[0], cur[1], cur[0] + u2x * rad, cur[1] + u2y * rad);
+  }
+  const last = clean[clean.length - 1];
+  ctx.lineTo(last[0], last[1]);
 }
 
 function drawEdge(ctx, e, related, selected, traceColor = null, animated = true, dimmed = false, relationMeta = null) {
@@ -765,6 +832,8 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     ? THEME.edge.added
     : isDataEdge(e)
     ? THEME.edge.var
+    : e.kind === 'fnptr'
+    ? (THEME.edge.fnptr || THEME.edge.call)
     : THEME.edge.call;
   const color = dimmed
     ? mixHex(THEME.bg, baseColor, e.change === 'added' ? 0.16 : 0.09)
@@ -772,28 +841,43 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
   const invK = Math.max(1, 1 / cam.k);
   ctx.save();
   if (relationMeta?.subdued) ctx.globalAlpha = 0.42;
-  ctx.beginPath();
-  strokeRounded(ctx, pts);
+  const dashed = isDataEdge(e);
+  const segments = dashed ? dashSegments(pts) : null;
+  if (dashed) ctx.setLineDash(EDGE_DASH);
+  else {
+    ctx.beginPath();
+    strokeRounded(ctx, pts);
+  }
+  const stroke = () => {
+    if (!dashed) { ctx.stroke(); return; }
+    // 宽高亮的圆头会填满 4px 间隔。各描边层沿同一世界坐标相位落笔。
+    ctx.lineCap = 'butt';
+    for (const { start, end, offset } of segments) {
+      ctx.beginPath();
+      ctx.lineDashOffset = offset;
+      ctx.moveTo(...start);
+      ctx.lineTo(...end);
+      ctx.stroke();
+    }
+  };
 
   if (state.recent?.edges.has(edgeKey(e))) {
     ctx.strokeStyle = hexToRgba(RECENT_COLOR, 0.22);
     ctx.lineWidth = Math.max(4.5, 3 / cam.k);
-    ctx.stroke();
+    stroke();
   }
-  // 变量访问的选中外圈也用虚线，避免连续色带填满线芯间隙。
-  if (isDataEdge(e) && (!dimmed || cam.k >= 0.45)) ctx.setLineDash([7, 4]);
   if (traceColor || selected) {
     // 选中和路径追踪着色在外圈，保留线芯和箭头的变更状态。
     ctx.strokeStyle = traceColor || hexToRgba(SELECTED_EDGE_COLOR, 0.54);
     ctx.lineWidth = (traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
     ctx.globalAlpha = traceColor ? 0.9 : 1;
-    ctx.stroke();
+    stroke();
   } else if (hasRole) {
     ctx.strokeStyle = hexToRgba(roleColor, 0.58);
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.lineWidth = Math.min(18, (relationMeta.emphasized ? 6.8 : 5.6) * invK);
-    ctx.stroke();
+    stroke();
   }
 
   ctx.strokeStyle = color;
@@ -801,7 +885,7 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     : hasRole ? Math.min(10, (relationMeta.emphasized ? 3.4 : 2.6) * invK)
     : related ? 2.2 : 1.4;
   ctx.globalAlpha = relationMeta?.subdued ? 0.42 : 1;
-  ctx.stroke();
+  stroke();
   ctx.setLineDash([]);
 
   const direction = edgeDirection(e);
@@ -893,9 +977,10 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
 /**
  * @param {Set<string>|null} nb 选中节点的邻接集合（draw 时统一算好传进来；为空表示没有选中）
  */
-function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trunkEndpoint = false) {
+function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trunkEndpoint = false, aiCtx = null) {
   const { x, y, w, h } = n;
   const isVar = n.kind === 'var';
+  const rx = isVar ? Math.min(16, h / 2) : 8;
   const allNodes = !!state.multiSelection?.nodes;
   const selected = allNodes ? state.multiSelection.nodes.has(n.id) : state.selected === n.id;
   const hover = state.hover === n.id;
@@ -905,6 +990,9 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const recentlyAdded = state.recent?.nodes.has(n.id);
   const role = !selected && nodeRoles?.get(n.id);
   const isHoverPeer = state.hoverRelation?.peerId === n.id;
+  const aiActive = Boolean(aiCtx?.activeNodes?.has(n.id));
+  const aiHovered = Boolean(aiCtx?.hoverNodes?.has(n.id));
+  const aiDimmed = Boolean(aiCtx?.dimOthers && !selected && !edgeRelated && !aiActive && !aiHovered);
   const invK = Math.max(1, 1 / cam.k);
   const comparing = Boolean(state.view?.comparison);
   const taskEntry = n.isTaskEntry || n.taskEntry;
@@ -917,13 +1005,13 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const accent = changed ? '#8A490E' : null;
   const dimmed =
     allNodes ? !selected : focusedNodes ? !edgeRelated : state.selected && !selected && !(nb ? nb.has(n.id) : isNeighbor(n.id));
-  const alpha = dimmed ? (trunkEndpoint ? 0.65 : 0.22) : 1;
+  const alpha = dimmed ? (trunkEndpoint ? 0.65 : 0.22) : aiDimmed ? 0.26 : 1;
 
   ctx.save();
   if (trunkEndpoint) {
     const focused = state.trunkFocusNode === n.id;
     const gap = 4 / cam.k;
-    roundRect(ctx, x - gap, y - gap, w + gap * 2, h + gap * 2, 8 + gap);
+    roundRect(ctx, x - gap, y - gap, w + gap * 2, h + gap * 2, rx + gap);
     ctx.strokeStyle = focused ? '#0369A1' : edgeRelated ? '#197FAF' : '#358EAD';
     ctx.lineWidth = (focused ? 3 : edgeRelated ? 2 : 1.5) / cam.k;
     if (!edgeRelated) ctx.setLineDash([4 / cam.k, 3 / cam.k]);
@@ -935,7 +1023,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const batchSelected = selected && state.multiSelection?.kind === 'nodes';
   if (selected && (!allNodes || batchSelected)) {
     const ringGap = Math.min(8, 3 * invK);
-    roundRect(ctx, x - ringGap, y - ringGap, w + ringGap * 2, h + ringGap * 2, 10);
+    roundRect(ctx, x - ringGap, y - ringGap, w + ringGap * 2, h + ringGap * 2, rx + 2);
     ctx.strokeStyle = batchSelected ? '#2563EB' : hexToRgba(THEME.node.selected, 0.24);
     ctx.lineWidth = Math.min(7, 2.8 * invK);
     if (batchSelected) ctx.setLineDash([5 * invK, 3 * invK]);
@@ -943,11 +1031,20 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ctx.setLineDash([]);
   }
 
-  roundRect(ctx, x, y, w, h, 8);
+  if (aiActive || aiHovered) {
+    const aiGap = Math.min(8, 3.5 * invK);
+    roundRect(ctx, x - aiGap, y - aiGap, w + aiGap * 2, h + aiGap * 2, rx + 3);
+    ctx.strokeStyle = hexToRgba(aiHovered ? '#6366F1' : '#7C3AED', aiHovered ? 0.24 : 0.22);
+    ctx.lineWidth = Math.min(8, 4.5 * invK);
+    ctx.stroke();
+  }
+
+  roundRect(ctx, x, y, w, h, rx);
   // 变量节点和函数节点用同一套底色语义（既存/变更/追加/删除）。
-  const baseFill = n.external
+  const rawFill = n.external
     ? THEME.node.external
     : THEME.fill[n.change] || THEME.fill.existing;
+  const baseFill = !n.external && THEME.node.tintFill ? mixHex('#FFFFFF', rawFill, 0.42) : rawFill;
   ctx.fillStyle = dropTarget ? '#EAF3DE' : n.color || baseFill;
   ctx.fill();
 
@@ -955,6 +1052,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   ctx.lineWidth = recentlyAdded ? 2.4
     : dropTarget ? 2.6
     : selected || edgeRelated ? Math.min(6, 2.6 * invK)
+    : aiHovered ? Math.min(6, 2.6 * invK)
+    : aiActive ? Math.min(5.5, 2.2 * invK)
     : role ? Math.min(5.5, (isHoverPeer ? 3.2 : 2.2) * invK)
     : accent ? Math.min(10, 2.3 * invK)
     : hover ? 1.6 : 1;
@@ -964,6 +1063,10 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ? '#639922'
     : selected || edgeRelated
     ? THEME.node.selected
+    : aiHovered
+    ? '#6366F1'
+    : aiActive
+    ? '#7C3AED'
     : hover
     ? THEME.node.hover
     : role
@@ -982,12 +1085,12 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const animated = collectingEffects && selected && !state.dragNode && ((allNodes && n.id === state.selected) ||
     state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
   const dash = ctx.getLineDash();
-  if (animated && dash.length) recordBoxEffect(n, dash, ctx.lineWidth, 8, ctx.strokeStyle);
+  if (animated && dash.length) recordBoxEffect(n, dash, ctx.lineWidth, rx, ctx.strokeStyle);
   else ctx.stroke();
   if (animated && !dash.length) {
     const gap = 4 / cam.k;
     recordBoxEffect({ x: x - gap, y: y - gap, w: w + gap * 2, h: h + gap * 2 },
-      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, 10);
+      [5 / cam.k, 4 / cam.k], 1.5 / cam.k, rx + 2);
   }
   ctx.setLineDash([]);
   ctx.globalAlpha = alpha;
@@ -996,6 +1099,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     const thickness = Math.min(10, 3.4 * invK);
     ctx.fillStyle = accent;
     roundRect(ctx, x + 4, y + 6, thickness, h - 12, thickness / 2);
+    ctx.fill();
+  } else if (taskEntry && !isVar) {
+    const thickness = Math.min(6, 2.6 * invK);
+    ctx.fillStyle = '#0E7490';
+    roundRect(ctx, x + 4, y + 7, thickness, h - 14, thickness / 2);
     ctx.fill();
   }
 
@@ -1086,6 +1194,23 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     if (collectingEffects && performance.now() < state.recent.rippleUntil) {
       effects.push({ kind: 'ripple', box: n, started: state.recent.started, dur: state.recent.rippleDur || RECENT_RIPPLE_MS, color: RECENT_COLOR });
     }
+  }
+  if (aiCtx?.orderMap?.has(n.id) && cam.k >= 0.35) {
+    const stepText = String(aiCtx.orderMap.get(n.id));
+    const bh = 16, bw = Math.max(18, stepText.length * 7 + 10);
+    const bx = x - 6, by = y - 6;
+    ctx.globalAlpha = 1;
+    roundRect(ctx, bx, by, bw, bh, bh / 2);
+    ctx.fillStyle = '#6366F1';
+    ctx.fill();
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = `bold 10px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(stepText, bx + bw / 2, by + bh / 2);
   }
   ctx.restore();
 }

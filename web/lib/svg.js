@@ -1,4 +1,4 @@
-import { isDataEdge, svgMarkers } from './edge-flow.js';
+import { buildRoundedSvgPath, isDataEdge, svgEdgeStroke } from './edge-flow.js';
 /**
  * 导出：SVG 构建与下载
  * 注意：这里的样式与 render.js 是两套实现，改动样式时两边都要动
@@ -11,6 +11,15 @@ import { deletedEdgeMarkSvg, labelSvg } from '/core/labels.js';
 
 /** 只接受 #RRGGBB：n.color 可经 /api/overlay 落库，导出的 SVG 会被浏览器直接打开 */
 const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+function softTintFill(hex) {
+  if (!HEX_COLOR.test(hex || '')) return hex;
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.round(((n >> 16) & 255) * 0.42 + 255 * 0.58);
+  const g = Math.round(((n >> 8) & 255) * 0.42 + 255 * 0.58);
+  const b = Math.round((n & 255) * 0.42 + 255 * 0.58);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+}
 
 function buildSVG() {
   const v = state.view;
@@ -62,6 +71,7 @@ function buildSVG() {
   // 与画布一致：箭头跟随调用、变量访问和新增边的颜色。
   for (const [name, c] of [
     ['dark', THEME.edge.call],
+    ['fnptr', THEME.edge.fnptr],
     ['var', THEME.edge.var],
     ['red', THEME.edge.added],
   ]) {
@@ -102,30 +112,25 @@ function buildSVG() {
 
   for (let i = 0; i < v.edges.length; i++) {
     const e = v.edges[i];
-    const d = (e.points || []).map(([x, y], j) => `${j ? 'L' : 'M'}${x} ${y}`).join(' ');
-    // 与画布 drawEdge 相同：新增=红，变量访问=自己的线色（虚线），其余=调用色
-    const c = e.change === 'added' ? THEME.edge.added : isDataEdge(e) ? THEME.edge.var : THEME.edge.call;
-    // 虚实与画布 drawEdge 相同：按类型走主题开关
-    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
-    const mk = e.change === 'added' ? 'mk-red' : isDataEdge(e) ? 'mk-var' : 'mk-dark';
-    out.push(
-      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.4"${dash}${svgMarkers(e, mk)} data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
-    );
+    const d = buildRoundedSvgPath(e.points || [], 7);
+    // 与画布 drawEdge 相同：新增=红，变量访问=自己的线色（虚线），函数指针=主题色（实线），其余=调用色
+    const isFnPtr = e.kind === 'fnptr';
+    const c = e.change === 'added' ? THEME.edge.added : isDataEdge(e) ? THEME.edge.var : isFnPtr ? THEME.edge.fnptr : THEME.edge.call;
+    const mk = e.change === 'added' ? 'mk-red' : isDataEdge(e) ? 'mk-var' : isFnPtr ? 'mk-fnptr' : 'mk-dark';
+    out.push(svgEdgeStroke(e, esc(d), c, 1.4, mk, `data-ei="${i}" data-from="${esc(e.from)}" data-to="${esc(e.to)}"`));
     if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 
   for (const n of v.nodes) {
     const isVar = n.kind === 'var';
+    const rx = isVar ? Math.min(16, n.h / 2) : 8;
     out.push(`<g data-id="${esc(n.id)}">`);
     // 与画布保持一致：按变更分类上色，变量实线框、函数虚线框。
     const custom = HEX_COLOR.test(n.color || '') ? n.color : '';
-    const fill =
-      custom ||
-      (n.external
-        ? THEME.node.external
-        : THEME.fill[n.change] || THEME.fill.existing);
+    const baseFill = n.external ? THEME.node.external : THEME.fill[n.change] || THEME.fill.existing;
+    const fill = custom || (THEME.node.tintFill && !n.external ? softTintFill(baseFill) : baseFill);
     out.push(
-      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="8" fill="${esc(fill)}" stroke="${n.external ? THEME.node.externalBorder : isVar ? THEME.node.varBorder : THEME.node.border}" stroke-width="1"${(isVar ? THEME.node.varDash : THEME.node.fnDash) ? ' stroke-dasharray="5 3"' : ''}/>`
+      `<rect x="${n.x.toFixed(1)}" y="${n.y.toFixed(1)}" width="${n.w}" height="${n.h}" rx="${rx}" fill="${esc(fill)}" stroke="${n.external ? THEME.node.externalBorder : isVar ? THEME.node.varBorder : THEME.node.border}" stroke-width="1"${(isVar ? THEME.node.varDash : THEME.node.fnDash) ? ' stroke-dasharray="5 3"' : ''}/>`
     );
     if (n.note) {
       out.push(`<circle cx="${(n.x + 8).toFixed(1)}" cy="${(n.y + 8).toFixed(1)}" r="3.2" fill="#EF9F27"/>`);

@@ -25,8 +25,9 @@ const DIR = { top: [0, -1], bottom: [0, 1], left: [-1, 0], right: [1, 0] };
 const SIDES = new Set(['top', 'bottom', 'left', 'right']);
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const sideChoices = (preferred, pinned) => SIDES.has(pinned) ? [pinned] : [preferred, ...[...SIDES].filter(side => side !== preferred)];
 
-/** 不同线型或变更颜色不能共用干线；入口处不可避免的短引线除外。 */
+/** 相同样式的虚线按世界坐标同相描边，可以汇流；虚线、实线和不同颜色分别占用走廊。 */
 export const edgeStyleKey = (e) => `${e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-') ? e.kind : 'direct'}|${e.change || 'existing'}${e.color ? '|' + e.color.toLowerCase() : ''}`;
 
 export function canShareTrunk(a, b) {
@@ -35,15 +36,15 @@ export function canShareTrunk(a, b) {
 
 const samePort = (p, q) => Math.abs(p[0] - q[0]) < 0.5 && Math.abs(p[1] - q[1]) < 0.5;
 
-export function incompatibleOverlap(a, b) {
+export function incompatibleOverlap(a, b, portAllowance = STUB) {
   if (canShareTrunk(a, b)) return 0;
   const A = a.points || [];
   const B = b.points || [];
   let length = 0;
   for (let i = 1; i < A.length; i++) {
-    const axis = Math.abs(A[i][1] - A[i - 1][1]) < 0.5 ? 0 : 1;
+    const axis = A[i][1] === A[i - 1][1] ? 0 : 1;
     for (let j = 1; j < B.length; j++) {
-      const otherAxis = Math.abs(B[j][1] - B[j - 1][1]) < 0.5 ? 0 : 1;
+      const otherAxis = B[j][1] === B[j - 1][1] ? 0 : 1;
       if (axis !== otherAxis || Math.abs(A[i][1 - axis] - B[j][1 - axis]) >= 0.5) continue;
       const overlap = Math.min(Math.max(A[i][axis], A[i - 1][axis]), Math.max(B[j][axis], B[j - 1][axis])) -
         Math.max(Math.min(A[i][axis], A[i - 1][axis]), Math.min(B[j][axis], B[j - 1][axis]));
@@ -53,7 +54,8 @@ export function incompatibleOverlap(a, b) {
         (j === B.length - 1 && a.from === b.to && samePort(A[0], B[j])));
       const end = i === A.length - 1 && ((j === 1 && a.to === b.from && samePort(A[i], B[0])) ||
         (j === B.length - 1 && a.to === b.to && samePort(A[i], B[j])));
-      length += Math.max(0, overlap - (Number(start) + Number(end)) * STUB);
+      // 很短的整条直线也不能被另一种线型完全覆盖。
+      length += start && end ? overlap : Math.max(0, overlap - (Number(start) + Number(end)) * portAllowance);
     }
   }
   return length;
@@ -71,11 +73,11 @@ export function routeBounds(points) {
 export const boundsMeet = (a, b, margin = 0.5) => a.minX < b.maxX + margin && b.minX < a.maxX + margin &&
   a.minY < b.maxY + margin && b.minY < a.maxY + margin;
 
-function overlapWithRouted(edge, routed) {
+function overlapWithRouted(edge, routed, portAllowance = STUB) {
   const bounds = routeBounds(edge.points);
   let length = 0;
   for (const other of routed) {
-    if (boundsMeet(bounds, other.bounds)) length += incompatibleOverlap(edge, other.edge);
+    if (boundsMeet(bounds, other.bounds)) length += incompatibleOverlap(edge, other.edge, portAllowance);
   }
   return length;
 }
@@ -92,7 +94,7 @@ export function routeOverlapConflicts(edges, { differentStylesOnly = false } = {
     if (b.minX >= a.maxX + 0.5) break;
     if ((differentStylesOnly && a.style === b.style) || !boundsMeet(a, b)) continue;
     const overlap = incompatibleOverlap(a.edge, b.edge);
-    if (overlap < 0.5) continue;
+    if (!overlap) continue;
     length += overlap;
     if (a.style !== b.style) styleLength += overlap;
     for (const e of [a.edge, b.edge]) {
@@ -117,6 +119,28 @@ export function portAt(n, side) {
     default:
       return [n.x + n.w, n.y + n.h / 2];
   }
+}
+
+/** 两个正对中点能用一段连接时，钉面仍优先，障碍由调用处按当前视图检查。 */
+export function straightConnection(e, a, b) {
+  let sides;
+  if (a.y + a.h / 2 === b.y + b.h / 2) {
+    if (a.x + a.w < b.x) sides = ['right', 'left'];
+    else if (b.x + b.w < a.x) sides = ['left', 'right'];
+  } else if (a.x + a.w / 2 === b.x + b.w / 2) {
+    if (a.y + a.h < b.y) sides = ['bottom', 'top'];
+    else if (b.y + b.h < a.y) sides = ['top', 'bottom'];
+  }
+  if (!sides || (SIDES.has(e.fromSide) && e.fromSide !== sides[0]) ||
+      (SIDES.has(e.toSide) && e.toSide !== sides[1])) return null;
+  return { sides, points: [portAt(a, sides[0]), portAt(b, sides[1])] };
+}
+
+/** 只计紧贴端口的弯；短直连及错位中点间的小段均无此代价。 */
+export function shortPortDeficit(points) {
+  if (points.length < 3) return 0;
+  const deficit = (a, b) => Math.max(0, STUB - Math.abs(a[0] - b[0]) - Math.abs(a[1] - b[1]));
+  return deficit(points[0], points[1]) + deficit(points.at(-1), points.at(-2));
 }
 
 /** 点相对节点最近的一侧 */
@@ -387,12 +411,12 @@ export function pathBlockedByNodes(points, nodes, skip) {
  */
 function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSide) {
   let fallback = null;
-  const sideOrder = (fixed, preferred) => {
-    if (SIDES.has(fixed)) return [fixed];
-    return [preferred, ...[...SIDES].filter((side) => side !== preferred)];
-  };
-  const fromSides = sideOrder(fixedFromSide, fromSide);
-  const toSides = sideOrder(fixedToSide, toSide);
+  const better = (trial, best) => !best || trial.conflicts < best.conflicts ||
+    (trial.conflicts === best.conflicts && (trial.shared < best.shared ||
+      (trial.shared === best.shared && trial.score < best.score)));
+  const others = ctx.currentEdge ? ctx.routed.filter(r => !canShareTrunk(ctx.currentEdge, r.edge)) : [];
+  const fromSides = sideChoices(fromSide, fixedFromSide);
+  const toSides = sideChoices(toSide, fixedToSide);
   const skip = new Set([a.id, b.id]);
   const minX = Math.min(...ctx.nodes.map((n) => n.x)) - CLEAR - SPACING;
   const maxX = Math.max(...ctx.nodes.map((n) => n.x + n.w)) + CLEAR + SPACING;
@@ -433,18 +457,22 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSid
         candidates.push(collapse([p0, s0, [x, s0[1]], [x, s1[1]], s1, p1]));
       }
       for (const points of candidates) {
+        if (points.length < 2 || deriveSideStart(points[0], points[1]) !== sa ||
+            deriveSideEnd(points.at(-2), points.at(-1)) !== sb) continue;
         if (pathBlockedByNodes(points, ctx.nodes, skip)) continue;
         if (crossesEndpoints(points, a, b)) continue;
         const length = points.slice(1).reduce((sum, p, i) =>
           sum + Math.abs(p[0] - points[i][0]) + Math.abs(p[1] - points[i][1]), 0);
-        const conflicts = ctx.currentEdge ? overlapWithRouted({ ...ctx.currentEdge, points }, ctx.routed) : 0;
-        const score = length + points.length * 6 + conflicts * 20;
-        if (!best || conflicts < best.conflicts || (conflicts === best.conflicts && score < best.score)) best = { points, score, conflicts };
+        const trial = ctx.currentEdge && { ...ctx.currentEdge, points };
+        const conflicts = trial ? overlapWithRouted(trial, others) : 0;
+        const shared = trial ? overlapWithRouted(trial, others, 0) : 0;
+        const score = length + points.length * 6 + shortPortDeficit(points) * 8;
+        const candidate = { points, score, conflicts, shared };
+        if (better(candidate, best)) best = candidate;
       }
       // 优先保留原端口方向；只在该方向完全无安全通道时尝试其他端口侧。
-      if (!ctx.optimizeFaces && best && best.conflicts < 0.5) return best.points;
-      if (best && (!fallback || best.conflicts < fallback.conflicts ||
-          (best.conflicts === fallback.conflicts && best.score < fallback.score))) fallback = best;
+      if (!ctx.optimizeFaces && best && !best.shared) return best.points;
+      if (best && better(best, fallback)) fallback = best;
     }
   }
   return fallback?.points || null;
@@ -453,13 +481,23 @@ function routeAroundNodes(a, b, fromSide, toSide, ctx, fixedFromSide, fixedToSid
 /** 多层障碍可能需要连续绕过几个拐角。沿障碍外缘的坐标网格搜索可达通道。 */
 function routeThroughGaps(a, b, sa, sb, nodes, edge = null, routed = []) {
   const incompatible = edge ? routed.filter(r => !canShareTrunk(edge, r.edge)) : [];
-  const terminals = (node, sides) => (Array.isArray(sides) ? sides : [sides]).flatMap(side => {
-    const port = portAt(node, side), tip = port.map((v, i) => v + DIR[side][i] * (CLEAR + 1));
-    const segment = [port, tip];
-    if (pathBlockedByNodes(segment, nodes, new Set([node.id])) ||
-        (edge && overlapWithRouted({ ...edge, points: node === a ? segment : segment.reverse() }, incompatible) > 0.5)) return [];
-    return [{ port, tip, axis: Number(DIR[side][1] !== 0) }];
-  });
+  // 多种样式被钉在同一中点时，在短引线上选不同分叉点；一个固定的分叉点
+  // 只容得下向两侧各转出一条独立通道。
+  const leads = incompatible.length ? Array.from({ length: STUB - CLEAR }, (_, i) => STUB - i) : [STUB, CLEAR + 1];
+  const terminals = (node, sides) => {
+    const out = [], skip = new Set([node.id]);
+    for (const side of Array.isArray(sides) ? sides : [sides]) {
+      const port = portAt(node, side);
+      for (const lead of leads) {
+        const tip = port.map((v, i) => v + DIR[side][i] * lead);
+        const segment = node === a ? [port, tip] : [tip, port];
+        if (pathBlockedByNodes(segment, nodes, skip) ||
+            (edge && overlapWithRouted({ ...edge, points: segment }, incompatible))) continue;
+        out.push({ port, tip, axis: Number(DIR[side][1] !== 0), cost: lead + 2 * (STUB - lead) });
+      }
+    }
+    return out;
+  };
   const starts = terminals(a, sa), goals = terminals(b, sb);
   if (!starts.length || !goals.length) return null;
   // 按走廊坐标索引异色占用段，网格扩展时只查同一条横线或竖线。
@@ -479,8 +517,15 @@ function routeThroughGaps(a, b, sa, sb, nodes, edge = null, routed = []) {
     }
     return false;
   };
-  const ticks = (axis, size, i) => [...new Set([...starts, ...goals].map(t => t.tip[i]).concat(
-    nodes.flatMap(n => [n[axis] - CLEAR - 1, n[axis] + n[size] + CLEAR + 1])))].sort((x, y) => x - y);
+  const ticks = (axis, size, i) => {
+    const coords = new Set([...starts, ...goals].map(t => t.tip[i]));
+    for (const n of nodes) { coords.add(n[axis] - CLEAR - 1); coords.add(n[axis] + n[size] + CLEAR + 1); }
+    // 被占走廊两侧也有可通行的车道，即使那里的坐标没有落在任何节点外缘上。
+    for (const list of lanes[1-i].values()) for (const [coord] of list) {
+      coords.add(coord - SPACING); coords.add(coord + SPACING);
+    }
+    return [...coords].sort((x, y) => x - y);
+  };
   const xs = ticks('x', 'w', 0), ys = ticks('y', 'h', 1);
   const index = ([x, y]) => ys.indexOf(y) * xs.length + xs.indexOf(x);
   const point = k => [xs[k % xs.length], ys[Math.floor(k / xs.length)]];
@@ -516,9 +561,9 @@ function routeThroughGaps(a, b, sa, sb, nodes, edge = null, routed = []) {
   for (const start of starts) {
     const state = index(start.tip) * 2 + start.axis;
     startPorts.set(state, start.port);
-    costs.set(state, 0);
+    costs.set(state, start.cost);
     parents.set(state, -1);
-    push({ state, distance: 0, estimate: 0 });
+    push({ state, distance: start.cost, estimate: start.cost });
   }
   let finish, best = Infinity;
   while (heap.length) {
@@ -528,7 +573,7 @@ function routeThroughGaps(a, b, sa, sb, nodes, edge = null, routed = []) {
     const cell = Math.floor(state / 2), col = cell % xs.length, row = Math.floor(cell / xs.length);
     const goal = goalPorts.get(cell);
     if (goal) {
-      const total = distance + (goal.axis === state % 2 ? 0 : STUB);
+      const total = distance + goal.cost + (goal.axis === state % 2 ? 0 : STUB);
       if (total < best) { finish = state; best = total; }
     }
     const p = point(cell);
@@ -618,10 +663,23 @@ export function collapse(pts) {
 const callKinds = new Set(['direct', 'macro', 'fnptr', 'manual']);
 const isCall = e => callKinds.has(e.kind);
 
+// 横向间隔清楚、纵向投影相交或几乎相接时，层方向不能强迫边在端口处拐小弯。
+export function nearFacing(a, b) {
+  const gx = Math.max(b.x - a.x - a.w, a.x - b.x - b.w);
+  const gy = Math.max(b.y - a.y - a.h, a.y - b.y - b.h);
+  const dominant = (gap, offset, breadth) => gap >= STUB && gap - offset >= STUB &&
+    (offset < STUB || (offset <= breadth && gap >= 4 * offset));
+  if (dominant(gx, gy, Math.min(a.h, b.h))) return b.x > a.x ? ['right', 'left'] : ['left', 'right'];
+  if (dominant(gy, gx, Math.min(a.w, b.w))) return b.y > a.y ? ['bottom', 'top'] : ['top', 'bottom'];
+  return null;
+}
+
 export function semanticFaces(e, a, b, direction, callNodes, groupDirections) {
   const sourceDir = groupDirections?.get(a.group) || a.layoutDirection;
   const targetDir = groupDirections?.get(b.group) || b.layoutDirection;
   if (sourceDir && sourceDir === targetDir && a.group === b.group) direction = sourceDir;
+  const facing = nearFacing(a, b);
+  if (facing && (direction || sourceDir || targetDir)) return facing;
   if (isCall(e) && sourceDir && targetDir && sourceDir !== targetDir) {
     const h = b.x >= a.x + a.w ? ['right', 'left'] : a.x >= b.x + b.w ? ['left', 'right'] : null;
     const v = b.y >= a.y + a.h ? ['bottom', 'top'] : a.y >= b.y + b.h ? ['top', 'bottom'] : null;
@@ -633,7 +691,7 @@ export function semanticFaces(e, a, b, direction, callNodes, groupDirections) {
   if (isCall(e)) {
     if (right && b.x >= a.x + a.w - 4) return ['right', 'left'];
     if (!right && b.y >= a.y + a.h - 4) return ['bottom', 'top'];
-  } else if ((e.kind === 'var' || e.kind?.startsWith('df-')) && (callNodes.has(e.from) || callNodes.has(e.to))) {
+  } else if ((e.kind === 'var' || e.kind === 'dataflow' || e.kind?.startsWith('df-')) && (callNodes.has(e.from) || callNodes.has(e.to))) {
     if (right && b.y >= a.y + a.h) return ['bottom', 'top'];
     if (right && a.y >= b.y + b.h) return ['top', 'bottom'];
     if (!right && b.x >= a.x + a.w) return ['right', 'left'];
@@ -665,10 +723,10 @@ function classify(e, a, b, hint, roles) {
     g0 = dy >= 0 ? 'bottom' : 'top';
     g1 = dy >= 0 ? 'top' : 'bottom';
   }
-  // 面提示（faceHints，交叉优化器给的初值）：优先级低于用户钉面，高于几何判定；
-  // 不锁死——并面/母线照常运行，提示的价值由优化器实测交叉数裁决
-  sa = sa || (hint && SIDES.has(hint.from) ? hint.from : roles?.[0] || g0);
-  sb = sb || (hint && SIDES.has(hint.to) ? hint.to : roles?.[1] || g1);
+  // 钉面优先；明确的相向面和语义流向优先于旧提示，其余位置才用提示作初值。
+  const facing = roles || nearFacing(a, b);
+  sa = sa || facing?.[0] || (SIDES.has(hint?.from) ? hint.from : g0);
+  sb = sb || facing?.[1] || (SIDES.has(hint?.to) ? hint.to : g1);
   if (DIR[sa][1] !== 0 && DIR[sb][1] !== 0) {
     const span = DIR[sa][1] > 0 ? b.y - (a.y + a.h) : a.y - (b.y + b.h);
     return { sa, sb, type: span > LOOP_THRESHOLD ? 'long' : 'direct' };
@@ -681,7 +739,7 @@ function classify(e, a, b, hint, roles) {
 
 /**
  * 每面一口制：同一节点同一面的所有进出边共用该面的中心。
- * 不区分线类型——不同类型的边共用首段，后画的盖住先画的，视觉上是一根线从口里分叉。
+ * 异样式在这里也只能占用中点，走廊冲突在实际路由时处理。
  * 用户显式钉过出/入面的边同样并入该面的口——用户钉的是面，不是点位。
  */
 function assignPorts(autos, nodeMap) {
@@ -880,6 +938,7 @@ function routeFanoutBus(list, ctx) {
   let sa = null;
   for (const [s, c] of saCount) if (!sa || c > saCount.get(sa)) sa = s;
   if (sa !== 'top' && sa !== 'bottom') return false;
+  if (list.some(it => it.sa !== sa || (it.roles && it.roles[1] !== sa))) return false;
   const source = list[0].a;
   const minY = Math.min(source.y, ...list.map((it) => it.b.y));
   const maxY = Math.max(source.y + source.h, ...list.map((it) => it.b.y + it.b.h));
@@ -934,13 +993,13 @@ function routeFanoutBus(list, ctx) {
 }
 
 /** 四面汇流：只调整到达目标前的末段，保留源端已有的分叉干线和手工走线。 */
-function routeFaninBus(list, ctx) {
+function routeFaninBus(list, ctx, otherRoutes) {
   if (list.length < 2) return false;
   const side = list[0].sb;
   const axis = side === 'top' || side === 'bottom' ? 1 : 0;
   const sign = DIR[side][axis];
   const p1 = portAt(list[0].b, side);
-  for (let k = 1; k <= 32; k++) {
+  for (let k = Math.ceil(STUB / SPACING); k <= 32; k++) {
     const bus = p1[axis] + sign * k * SPACING;
     const paths = [];
     for (const it of list) {
@@ -963,7 +1022,8 @@ function routeFaninBus(list, ctx) {
       branch[axis] = bus;
       const points = collapse([...prefix, branch, hub, p1]);
       const skip = new Set([it.a.id, it.b.id]);
-      if (pathBlockedByNodes(points, ctx.nodes, skip) || crossesEndpoints(points, it.a, it.b)) break;
+      if (pathBlockedByNodes(points, ctx.nodes, skip) || crossesEndpoints(points, it.a, it.b) ||
+          overlapWithRouted({ ...it.e, points }, otherRoutes)) break;
       paths.push(points);
     }
     if (paths.length !== list.length) continue;
@@ -1052,13 +1112,14 @@ function routeMixedVH(e, a, b, sa, sb, ctx) {
   const nodes = ctx.nodes;
   // 先试端口延长线的交点；无遮挡时不必额外插入中间通道。
   const simple = collapse([p0, [p0[0], p1[1]], p1]);
-  if (!pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
+  if ((p1[1] - p0[1]) * d0 >= STUB && (p0[0] - p1[0]) * DIR[sb][0] >= STUB &&
+      !pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
   const y0s = p0[1] + d0 * STUB;
   const xq = p1[0] + DIR[sb][0] * STUB; // 目标进入线（目标外侧）
 
   const lo = Math.min(y0s, p1[1]);
   const hi = Math.max(y0s, p1[1]);
-  const my = findFreeH(
+  const lane = findFreeH(
     (y0s + p1[1]) / 2,
     lo,
     hi,
@@ -1068,6 +1129,7 @@ function routeMixedVH(e, a, b, sa, sb, ctx) {
     skip,
     ctx.placed
   );
+  const my = (lane - y0s) * d0 < 0 ? y0s : lane;
 
   let vx = xq;
   if (vLineBlocked({ x: xq, y1: my, y2: p1[1] }, nodes, skip)) {
@@ -1085,13 +1147,14 @@ function routeMixedHV(e, a, b, sa, sb, ctx) {
   const skip = new Set([a.id, b.id]);
   const nodes = ctx.nodes;
   const simple = collapse([p0, [p1[0], p0[1]], p1]);
-  if (!pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
+  if ((p1[0] - p0[0]) * d0 >= STUB && (p0[1] - p1[1]) * DIR[sb][1] >= STUB &&
+      !pathBlockedByNodes(simple, nodes, skip) && !crossesEndpoints(simple, a, b)) return simple;
   const x0s = p0[0] + d0 * STUB;
   const yq = p1[1] + DIR[sb][1] * STUB;
 
   const lo = Math.min(x0s, p1[0]);
   const hi = Math.max(x0s, p1[0]);
-  const mx = findFreeV(
+  const lane = findFreeV(
     (x0s + p1[0]) / 2,
     lo,
     hi,
@@ -1101,6 +1164,7 @@ function routeMixedHV(e, a, b, sa, sb, ctx) {
     skip,
     ctx.placed
   );
+  const mx = (lane - x0s) * d0 < 0 ? x0s : lane;
 
   let vy = yq;
   if (hLineBlocked({ y: yq, x1: mx, x2: p1[0] }, nodes, skip)) {
@@ -1199,13 +1263,14 @@ function routeLong(e, a, b, sa, sb, ctx) {
 function routeSelf(e, a, ctx) {
   const skip = new Set([a.id]);
   let best = null, bestCost = Infinity;
-  for (const distance of [STUB, CLEAR + 1, STUB + SPACING]) {
+  for (const distance of [STUB, CLEAR + 1, STUB + SPACING,
+    ...Array.from({ length: STUB - CLEAR - 2 }, (_, i) => STUB - i - 1)]) {
     for (const [from, to] of [['right','bottom'], ['left','top'], ['right','top'], ['left','bottom']]) {
       const p = portAt(a, from), q = portAt(a, to);
       const x = p[0] + DIR[from][0] * distance, y = q[1] + DIR[to][1] * distance;
       const points = [p, [x,p[1]], [x,y], [q[0],y], q];
       if (pathBlockedByNodes(points, ctx.nodes, skip)) continue;
-      const cost = overlapWithRouted({ ...e, points }, ctx.loopRoutes);
+      const cost = overlapWithRouted({ ...e, points }, ctx.routed);
       if (cost < bestCost) { best = points; bestCost = cost; }
       if (!cost) return points;
     }
@@ -1324,7 +1389,7 @@ export function routeEdges(nodes, edges, opts = {}) {
     lanes: { left: [], right: [] },
     laneLeftMin: null,
     laneRightMax: null,
-    loopRoutes: (opts.existing?.edges || []).map(edge => ({ edge, bounds: routeBounds(edge.points) })),
+    routed: (opts.existing?.edges || []).map(edge => ({ edge, bounds: routeBounds(edge.points) })),
     rowGaps: null,
     colGaps: null,
   };
@@ -1334,7 +1399,6 @@ export function routeEdges(nodes, edges, opts = {}) {
 
   const callNodes = opts.callNodes || callEndpoints(edges);
   const autos = [];
-  const preserved = new Set();
   const restoreCustom = new Set();
   for (const e of edges) {
     const a = nodeMap.get(e.from);
@@ -1350,8 +1414,7 @@ export function routeEdges(nodes, edges, opts = {}) {
       }
       e._p0 = e.points[0];
       e._p1 = e.points.at(-1);
-      ctx.loopRoutes.push({ edge: e, bounds: routeBounds(e.points) });
-      preserved.add(e);
+      ctx.routed.push({ edge: e, bounds: routeBounds(e.points) });
       e.back = true;
       continue;
     }
@@ -1370,8 +1433,8 @@ export function routeEdges(nodes, edges, opts = {}) {
         e.points = collapse(e.points);
         blocked = pathCrossesNodes(e.points, nodes);
       }
-      if (!blocked) {
-        preserved.add(e);
+      if (!blocked && !overlapWithRouted(e, ctx.routed)) {
+        ctx.routed.push({ edge: e, bounds: routeBounds(e.points) });
         const segments = collectSegments([e]);
         for (const s of segments.h) addH(ctx.placed, s.y, s.x1, s.x2);
         for (const s of segments.v) addV(ctx.placed, s.x, s.y1, s.y2);
@@ -1383,7 +1446,7 @@ export function routeEdges(nodes, edges, opts = {}) {
         e.custom = false;
         restoreCustom.add(e);
       }
-      const c = classify({ ...e, fromSide: e.fromSide || sa, toSide: e.toSide || sb }, a, b, opts.faceHints?.get(e));
+      const c = classify(e, a, b, opts.faceHints?.get(e) || { from: sa, to: sb });
       autos.push({ e, a, b, ...c });
       continue;
     }
@@ -1405,13 +1468,12 @@ export function routeEdges(nodes, edges, opts = {}) {
   }
   const items = [...pairFirst.values()];
   for (const it of items) {
-    const p0 = portAt(it.a, it.sa);
-    const p1 = portAt(it.b, it.sb);
-    const d = DIR[it.sa];
-    it.straight = d[0] === -DIR[it.sb][0] && d[1] === -DIR[it.sb][1] &&
-      (p0[0] === p1[0] || p0[1] === p1[1]) &&
-      (p1[0] - p0[0]) * d[0] + (p1[1] - p0[1]) * d[1] > 0 &&
-      !pathBlockedByNodes([p0, p1], nodes, new Set([it.a.id, it.b.id]));
+    const direct = straightConnection(it.e, it.a, it.b);
+    if (direct && !pathBlockedByNodes(direct.points, nodes, new Set([it.a.id, it.b.id]))) {
+      [it.sa, it.sb] = direct.sides;
+      it.type = 'direct';
+      it.straight = true;
+    }
   }
 
   // ---- 出线面统一：同源的边尽量并到同一出线面（多数面吸收少数面），同目标同理。
@@ -1495,12 +1557,14 @@ export function routeEdges(nodes, edges, opts = {}) {
           if (SIDES.has(it.e[pinnedKey])) continue; // 用户钉过面，不并
           const n = it[nodeKeyOf];
           const o = it[otherKey];
+          const facing = nearFacing(n, o);
+          if (isV(major) && facing && !isV(facing[0])) continue;
           const oCx = o.x + o.w / 2;
           const oCy = o.y + o.h / 2;
-          if (major === 'right' && oCx < n.x) continue;
-          if (major === 'left' && oCx > n.x + n.w) continue;
-          if (major === 'bottom' && oCy < n.y) continue;
-          if (major === 'top' && oCy > n.y + n.h) continue;
+          if (major === 'right' && oCx < n.x + n.w + STUB) continue;
+          if (major === 'left' && oCx > n.x - STUB) continue;
+          if (major === 'bottom' && oCy < n.y + n.h + STUB) continue;
+          if (major === 'top' && oCy > n.y - STUB) continue;
           // 代价评估：该边并入后与组内其它边（按各自当前面）的估计交叉 + 折弯段数，
           // 与维持原面同口径对比；逐条顺序采纳，后面的少数面能看到前面已并的结果。
           // 不并侧若因此多占一个出口面（该面只剩这一条边），按 1 个折弯当量记一口收益——
@@ -1628,7 +1692,7 @@ export function routeEdges(nodes, edges, opts = {}) {
     if (alt && !crossesEndpoints(alt, it.a, it.b)) {
       it.e.points = alt;
     } else {
-      const path = opts.searchGaps && routeThroughGaps(it.a, it.b, it.sa, it.sb, nodes);
+      const path = routeThroughGaps(it.a, it.b, sideChoices(it.sa, it.e.fromSide), sideChoices(it.sb, it.e.toSide), nodes);
       if (path) it.e.points = path;
       else it.e.blocked = true;
     }
@@ -1636,32 +1700,45 @@ export function routeEdges(nodes, edges, opts = {}) {
 
   // 统一末段汇流，包含已做源端分叉的边；不能因为共享了出口就放弃合并入口。
   const fanins = new Map();
-  for (const e of [...items.map((it) => it.e), ...edges.filter((e) => e.custom && !restoreCustom.has(e) && !opts.preservePaths)]) {
+  const autoRoutes = items.map(({ e }) => ({ edge: e, bounds: routeBounds(e.points) }));
+  for (const route of autoRoutes) {
+    const e = route.edge;
     if (!nodeMap.has(e.from) || !nodeMap.has(e.to)) continue;
     if (e.blocked || e.from === e.to || !e.points || e.points.length < 2) continue;
     const sb = deriveSideEnd(e.points.at(-2), e.points.at(-1));
     const key = e.to + '\u0000' + edgeStyleKey(e) + '\u0000' + sb;
     if (!fanins.has(key)) fanins.set(key, []);
-    fanins.get(key).push({ e, a: nodeMap.get(e.from), b: nodeMap.get(e.to), sb });
+    fanins.get(key).push({ e, a: nodeMap.get(e.from), b: nodeMap.get(e.to), sb, route });
   }
-  for (const list of fanins.values()) routeFaninBus(list, ctx);
+  for (const list of fanins.values()) {
+    if (list.length < 2) continue;
+    const others = [...ctx.routed, ...autoRoutes].filter(r => !canShareTrunk(list[0].e, r.edge));
+    if (routeFaninBus(list, ctx, others)) {
+      // 后面的异样式汇流必须看到已经迁移的通道。
+      for (const it of list) it.route.bounds = routeBounds(it.e.points);
+    }
+  }
 
   // 先保留手工线和可直连的线，再把冲突的长线分开；四个边中点始终不变。
-  ctx.routed = [...(opts.existing?.edges || []), ...preserved].map((edge) => ({ edge, bounds: routeBounds(edge.points) }));
-  for (const it of items.slice().sort((a, b) => Number(b.straight) - Number(a.straight))) {
-    const overlap = overlapWithRouted(it.e, ctx.routed);
-    if (overlap > 0.5) {
+  for (const it of items.slice().sort((a, b) => Number(!!b.straight) - Number(!!a.straight))) {
+    const shared = overlapWithRouted(it.e, ctx.routed, 0);
+    if (shared > 0) {
+      const overlap = overlapWithRouted(it.e, ctx.routed);
       ctx.currentEdge = it.e;
       const alt = routeAroundNodes(it.a, it.b, it.sa, it.sb, ctx, it.e.fromSide, it.e.toSide);
       let remaining = alt ? overlapWithRouted({ ...it.e, points: alt }, ctx.routed) : Infinity;
-      if (remaining < overlap - 0.5) it.e.points = alt;
+      if (remaining < overlap || (alt && remaining === overlap &&
+          overlapWithRouted({ ...it.e, points: alt }, ctx.routed, 0) < shared)) it.e.points = alt;
       else remaining = overlap;
-      if (remaining > 0.5 && opts.searchGaps) {
+      if (remaining > 0) {
         // 简单通道仍与异色边重合时，在同一障碍网格里把那些占用段也排除。
-        const sources = it.e.fromSide ? [it.e.fromSide] : [it.sa, ...[...SIDES].filter(s => s !== it.sa)];
-        const targets = it.e.toSide ? [it.e.toSide] : [it.sb, ...[...SIDES].filter(s => s !== it.sb)];
+        const sources = sideChoices(it.sa, it.e.fromSide), targets = sideChoices(it.sb, it.e.toSide);
         const path = routeThroughGaps(it.a, it.b, sources, targets, nodes, it.e, ctx.routed);
-        if (path && overlapWithRouted({ ...it.e, points: path }, ctx.routed) < remaining) it.e.points = path;
+        if (path && !overlapWithRouted({ ...it.e, points: path }, ctx.routed)) {
+          it.e.points = path;
+          remaining = 0;
+        }
+        if (remaining > 0) it.e.blocked = true;
       }
     }
     ctx.routed.push({ edge: it.e, bounds: routeBounds(it.e.points) });
@@ -1710,10 +1787,33 @@ export function collectSegments(edges) {
 /** 生成带圆角的 SVG path d（折点用二次贝塞尔过渡） */
 export function roundedPathD(pts, r = 0) {
   if (!pts || pts.length < 2) return '';
-  const f = (x) => Math.round(x * 10) / 10;
-  let d = `M ${f(pts[0][0])} ${f(pts[0][1])}`;
+  const clean = [pts[0]];
   for (let i = 1; i < pts.length; i++) {
-    d += ` L ${f(pts[i][0])} ${f(pts[i][1])}`;
+    const prev = clean[clean.length - 1];
+    if (Math.hypot(pts[i][0] - prev[0], pts[i][1] - prev[1]) >= 0.01) clean.push(pts[i]);
   }
-  return d;
+  if (clean.length < 2) return '';
+  const f = (x) => Math.round(x * 10) / 10;
+  if (r <= 0 || clean.length === 2) {
+    let d = `M ${f(clean[0][0])} ${f(clean[0][1])}`;
+    for (let i = 1; i < clean.length; i++) d += ` L ${f(clean[i][0])} ${f(clean[i][1])}`;
+    return d;
+  }
+  const cmds = [`M ${f(clean[0][0])} ${f(clean[0][1])}`];
+  for (let i = 1; i < clean.length - 1; i++) {
+    const prev = clean[i - 1], cur = clean[i], next = clean[i + 1];
+    const dx1 = prev[0] - cur[0], dy1 = prev[1] - cur[1], d1 = Math.hypot(dx1, dy1);
+    const dx2 = next[0] - cur[0], dy2 = next[1] - cur[1], d2 = Math.hypot(dx2, dy2);
+    if (d1 < 0.01 || d2 < 0.01) continue;
+    const u1x = dx1 / d1, u1y = dy1 / d1, u2x = dx2 / d2, u2y = dy2 / d2;
+    if (Math.abs(u1x * u2y - u1y * u2x) < 1e-4) {
+      cmds.push(`L ${f(cur[0])} ${f(cur[1])}`);
+      continue;
+    }
+    const rad = Math.min(r, d1 * 0.45, d2 * 0.45);
+    cmds.push(`L ${f(cur[0] + u1x * rad)} ${f(cur[1] + u1y * rad)} Q ${f(cur[0])} ${f(cur[1])} ${f(cur[0] + u2x * rad)} ${f(cur[1] + u2y * rad)}`);
+  }
+  const last = clean[clean.length - 1];
+  cmds.push(`L ${f(last[0])} ${f(last[1])}`);
+  return cmds.join(' ');
 }

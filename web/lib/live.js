@@ -29,7 +29,7 @@ import { notifyGitChanged } from './git-compare.js';
 
 let es = null;
 try {
-  es = new EventSource('/api/stream');
+  es = new EventSource('/api/stream?clientId=' + encodeURIComponent(clientId));
 } catch {
   /* 环境不支持 SSE：退回「手动刷新可见」，不影响其他功能 */
 }
@@ -207,7 +207,9 @@ if (es) {
         state.activeBookmark = {
           ...state.activeBookmark,
           name: m.bookmark.name,
-          revision: m.bookmark.revision || state.activeBookmark.revision,
+          revision: m.op === 'bookmark.rename'
+            ? (m.bookmark.revision || state.activeBookmark.revision)
+            : state.activeBookmark.revision,
         };
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
@@ -232,6 +234,38 @@ if (es) {
     lastAiOp = m.op || '';
     if (state.at || reviewTransition()) markReviewUpdated();
     scheduleReload();
+  });
+  es.addEventListener('canvas_overlay', (ev) => {
+    let m = null;
+    try { m = JSON.parse(ev.data || '{}'); } catch { return; }
+    if (!m || typeof m !== 'object') return;
+    if (m.action === 'clear') {
+      state.aiOverlay = null;
+      state.presentation = null;
+      document.dispatchEvent(new CustomEvent('cg:ai-overlay-cleared'));
+      draw({ geometryUnchanged: true });
+      return;
+    }
+    state.aiOverlay = {
+      action: m.action || 'spotlight',
+      nodeIds: Array.isArray(m.nodeIds) ? m.nodeIds.filter(Boolean) : [],
+      edgeKeys: Array.isArray(m.edgeKeys) ? m.edgeKeys.filter(Boolean) : [],
+      title: typeof m.title === 'string' ? m.title : '',
+      updatedAt: Date.now(),
+    };
+    if (m.focus && state.view && state.aiOverlay.nodeIds.length) {
+      const hit = new Set(state.aiOverlay.nodeIds);
+      const matched = (state.view.nodes || []).filter((n) => hit.has(n.id));
+      if (matched.length) {
+        const minX = Math.min(...matched.map((n) => n.x));
+        const minY = Math.min(...matched.map((n) => n.y));
+        const maxX = Math.max(...matched.map((n) => n.x + n.w));
+        const maxY = Math.max(...matched.map((n) => n.y + n.h));
+        focusBox({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+        return;
+      }
+    }
+    draw({ geometryUnchanged: true });
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror
 }

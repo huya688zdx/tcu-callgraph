@@ -85,6 +85,10 @@ const state = {
   flash: null,
   /** 本次新加入的节点和连线，呼吸提示到期后自动清除。 */
   recent: null,
+  /** AI 叠加层高亮/漫游与双向悬停状态（纯只读视觉层，不修改用户选区） */
+  aiOverlay: null,
+  presentation: null,
+  aiHover: null,
 };
 
 const cam = { x: 0, y: 0, k: 1 };
@@ -102,6 +106,7 @@ export const THEME = {
   bg: '#F7F6F2',
   edge: {
     call: '#2C2C2A', // 函数调用
+    fnptr: '#7F77DD', // 函数指针调用
     var: '#2C2C2A', // 变量访问
     added: '#D9303E', // 新增边
     manual: '#639922', // 手动连线预览
@@ -116,6 +121,10 @@ export const THEME = {
     hover: '#378ADD', // 悬停高亮
     fnDash: true, // 函数框虚线（关 = 实线）
     varDash: false, // 变量框虚线（开 = 虚线）
+    tintFill: false, // 节点柔色卡片背景
+  },
+  canvas: {
+    gridDots: true, // 画布点阵网格
   },
   /** 变更分类底色：既存 / 变更 / 追加 / 删除（画布右键分类菜单与图例同源） */
   fill: {
@@ -147,11 +156,13 @@ function syncThemeSideEffects() {
     if (el) el.style.borderTopColor = c;
   };
   chip('lg-call', THEME.edge.call);
+  chip('lg-fnptr', THEME.edge.fnptr);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
   // 删除边沿用调用色、中央带 X：图例里画的是 SVG，所以走 color 而不是 border
   const delChip = document.getElementById('lg-del');
   if (delChip) delChip.style.color = THEME.edge.call;
+  document.querySelector('main')?.classList.toggle('no-grid', !THEME.canvas?.gridDots);
 }
 
 /** 设置单个颜色（'fill.existing' 这类路径）。非法值拒绝，返回是否成功 */
