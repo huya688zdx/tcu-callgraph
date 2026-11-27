@@ -20,7 +20,7 @@ import { draw, pulseAdded } from './render.js';
 import { constrainCam, focusBox } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { markReviewUpdated, reloadTimeline, reviewTransition } from './timeline.js';
-import { reloadBookmarks } from './bookmarks.js';
+import { bookmarkMetadata, reloadBookmarks } from './bookmarks.js';
 import { closeModal } from './modal.js';
 import { syncProjectLabel } from './projects.js';
 import { notifyGitChanged } from './git-compare.js';
@@ -204,13 +204,7 @@ if (es) {
     if (projectId != null && projectId !== state.view?.projectId) return;
     if (m.op.startsWith('bookmark.')) {
       if (m.clientId !== clientId && m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
-        state.activeBookmark = {
-          ...state.activeBookmark,
-          name: m.bookmark.name,
-          revision: m.op === 'bookmark.rename'
-            ? (m.bookmark.revision || state.activeBookmark.revision)
-            : state.activeBookmark.revision,
-        };
+        state.activeBookmark = bookmarkMetadata(state.activeBookmark, m.bookmark, m.op === 'bookmark.rename');
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
       } else if (m.clientId !== clientId && m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {

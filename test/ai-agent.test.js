@@ -779,6 +779,37 @@ test('runAiAgent：旧版 OpenAI 接口拒绝 tools 时自动降级纯对话模�
   assert.ok(events.some(e => e.type === 'fallback'));
 });
 
+for (const toolMode of ['prompt', 'auto']) {
+  test(`只读子调查在 ${toolMode} 模式获得专属角色、调用格式及允许工具的参数`, async () => {
+    const role = '只读子调查：查证给定函数。';
+    const calls = [];
+    const result = await runAiAgent({
+      config: { baseUrl: 'http://localhost', model: 'mock', toolMode },
+      prompt: '核对 sample.c::first', context: { canvasRoots: ['unrelated.c::parent'] },
+      systemPromptOverride: role, isSubagent: true, allowedTools: ['read_function'],
+      executeTool: async (name, args) => { calls.push([name, args]); return { ok: true }; },
+      fetchImpl: async (_url, { body }) => {
+        const req = JSON.parse(body);
+        const system = req.messages[0].content;
+        if (req.tools) {
+          assert.equal(toolMode, 'auto');
+          assert.equal(system, role);
+          assert.deepEqual(req.tools.map(t => t.function.name), ['read_function']);
+          return Response.json({ error: { message: 'tools is not supported' } }, { status: 400 });
+        }
+        assert.ok(system.startsWith(role));
+        assert.match(system, /<tool_call>.*"arguments".*<\/tool_call>/);
+        assert.match(system, /read_function.*"encoding"/);
+        assert.doesNotMatch(system, /add_to_canvas|run_subagent|unrelated\.c::parent/);
+        const content = calls.length ? '已核实。' : '<tool_call>{"name":"read_function","arguments":{"name":"sample.c::first"}}</tool_call>';
+        return Response.json({ choices: [{ message: { content } }] });
+      },
+    });
+    assert.equal(result.answer, '已核实。');
+    assert.deepEqual(calls, [['read_function', { name: 'sample.c::first' }]]);
+  });
+}
+
 test('runAiAgent：兼容旧版 OpenAI function_call 字段', async () => {
   let turn = 0;
   const fetchImpl = async () => {
@@ -2195,6 +2226,107 @@ test('e2e：双击已选两点连线不误切其他共线、输入框动态建�
   assert.equal(uiResult.trayVisible, true, '截图后应显示可见附件预览区');
   assert.equal(uiResult.hasDataUrl, true, '缩略图应包含真实图片 DataURL');
   assert.equal(uiResult.lightboxOpen, true, '点击缩略图应弹出大图预览');
+});
+
+async function mockAiTurn(t, baseUrl, nextCalls) {
+  const llm = http.createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const tools = await nextCalls(JSON.parse(raw).messages.at(-1));
+    const message = !tools.length ? { content: '已完成。' } : {
+      tool_calls: tools.map(([name, args], i) => ({ id: 'call' + i, type: 'function',
+        function: { name, arguments: JSON.stringify(args) } })),
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ choices: [{ message }] }));
+  });
+  await new Promise(resolve => llm.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => llm.close(resolve)));
+  const post = (route, body) => fetch(baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  await post('/api/ai/config', { baseUrl: 'http://127.0.0.1:' + llm.address().port, model: 'mock', toolMode: 'tools' });
+  const run = async prompt => {
+    const chat = await post('/api/ai/chat', { prompt });
+    return (await chat.text()).trim().split('\n').map(JSON.parse);
+  };
+  return { post, run };
+}
+
+test('AI 上下游调用链与导览卡保留每个调用点的行号', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-chain-sites-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'logic.c'), [
+    'void leaf(void) {}', 'void Task_10ms(void) {', '  leaf();', '  leaf();', '}',
+  ].join('\n'));
+  const srv = await launchServer({ target: dir });
+  t.after(srv.close);
+  const { run } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'tool' ? [] : [
+    ['trace_upstream', { functions: ['Task_10ms'], direction: 'down' }],
+    ['trace_upstream', { functions: ['leaf'], direction: 'up' }],
+    ['present_logic', { root: 'Task_10ms', direction: 'down', includeDataflow: false, addToCanvas: false }],
+  ]);
+  const events = await run('请呈现调用链');
+  const key = 'logic.c::Task_10ms->logic.c::leaf:';
+  const chains = events.filter(e => e.type === 'chains').map(e => e.chains.map(c => c.edgeKeys));
+  assert.deepEqual(chains, [[[key + '3'], [key + '4']], [[key + '3']], [[key + '3'], [key + '4']]]);
+});
+
+test('撤销整轮同名书签保存保留原作用域，并检测独立写入', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  let nextCalls;
+  const { post, run } = await mockAiTurn(t, srv.baseUrl, last => nextCalls(last));
+  const list = async () => (await (await fetch(srv.baseUrl + '/api/bookmarks')).json()).list;
+  const save = name => ['manage_bookmarks', { action: 'save', name }];
+  for (const conflict of [null, 'existing', 'created']) {
+    await t.test(conflict ? '并发修改 ' + conflict + ' 时整轮撤销返回冲突' : '已有书签恢复，新增书签移除', async () => {
+      const names = ['原书签-' + conflict, '新书签-' + conflict];
+      nextCalls = last => last.role === 'tool' ? [] : names.flatMap(name => [save(name), save(name)]);
+      const scope = { roots: ['main.c::main'], up: 2, down: 3, groupMode: 'period',
+        vars: ['var::speed'], hiddenVars: ['var::gear'], expansions: [{ root: 'app.c::tick', up: 1, down: 2 }] };
+      const original = (await (await post('/api/bookmarks', { ...scope, name: names[0] })).json()).bookmark;
+      const events = await run('请保存当前画布为指定的两个书签');
+      assert.deepEqual(events.filter(e => e.type === 'tool_end').map(e => e.ok), [true, true, true, true]);
+      const { changesetId } = events.find(e => e.type === 'changeset');
+      const saved = (await list()).filter(b => names.includes(b.name));
+      assert.equal(saved.find(b => b.name === original.name).revision, original.revision + 2);
+      if (conflict) {
+        const edited = saved.find(b => b.name === names[conflict === 'created' ? 1 : 0]);
+        await post('/api/bookmarks/update', { id: edited.id, expectedRevision: edited.revision, down: 7 });
+        const beforeUndo = await list();
+        assert.equal((await post('/api/ai/undo-changeset', { changesetId })).status, 409);
+        assert.deepEqual(await list(), beforeUndo);
+        return;
+      }
+      await post('/api/page', { roots: ['main.c::main'], up: 2, down: 0, group: false });
+      const currentPage = await (await fetch(srv.baseUrl + '/api/page?saved=1')).json();
+      assert.equal((await post('/api/ai/undo-changeset', { changesetId })).status, 200);
+      assert.deepEqual((await (await fetch(srv.baseUrl + '/api/page?saved=1')).json()).page, currentPage.page);
+      const remaining = (await list()).filter(b => names.includes(b.name));
+      assert.equal(remaining.length, 1);
+      const [restored] = remaining;
+      assert.deepEqual({ ...restored, revision: original.revision, updatedAt: original.updatedAt }, original);
+      assert.ok(restored.revision > original.revision + 2);
+    });
+  }
+  await t.test('在两次 AI 保存之间插入的用户编辑可恢复', async () => {
+    const name = '交错写入';
+    let edit;
+    nextCalls = async last => {
+      if (last.role !== 'tool') return [save(name)];
+      if (edit) return [];
+      const { bookmark } = JSON.parse(last.content);
+      edit = (await (await post('/api/bookmarks/update', { id: bookmark.id, expectedRevision: bookmark.revision, down: 9 })).json()).bookmark;
+      return [save(name)];
+    };
+    const events = await run('请保存当前画布书签');
+    const { changesetId } = events.find(e => e.type === 'changeset');
+    assert.equal((await post('/api/ai/undo-changeset', { changesetId })).status, 200);
+    const restored = (await list()).find(b => b.id === edit.id);
+    assert.equal(restored.down, 9);
+    assert.ok(restored.revision > edit.revision);
+  });
 });
 
 test('AI 新能力：pair/dataflow 上下文服务端证据补全、present_logic/diagnose_canvas/canvas_visual、并行只读子调查、撤销改图与独立 ? 指南', async (t) => {

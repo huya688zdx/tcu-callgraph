@@ -237,6 +237,26 @@ void loop_step(void) {
   assert.ok(targets.includes('second_fn'), 'expand 模式应包含同函数内调用之后写入的 second_fn');
 });
 
+test('标量回调在同一循环的后续迭代采用新目标，直线代码和 strict 保留原行为', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-scalar-loop-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'loop.c'), [
+    'typedef void (*Fn)(void);',
+    'static void first(void) {} static void second(void) {} static void later(void) {}',
+    'static Fn cb = first;',
+    'void run(void) { cb = first; for (int i = 0; i < 2; ++i) { cb(); cb = second; } cb = later; }',
+    'void once(void) { Fn local = first; local(); local = later; }',
+  ].join('\n'));
+  const targets = (model, name) => (model._index.outAdj.get('loop.c::' + name) || [])
+    .filter(e => e.kind === 'fnptr').map(e => e.callee).sort();
+  const expanded = loadModel(dir);
+  assert.deepEqual(targets(expanded, 'run'), ['first', 'second']);
+  assert.deepEqual(targets(expanded, 'once'), ['first']);
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  assert.deepEqual(targets(strict, 'run'), []);
+  assert.deepEqual(targets(strict, 'once'), []);
+});
+
 test('结构体成员数组在声明位置展开头文件宏，省略花括号时保留后续回调', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-width-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

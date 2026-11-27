@@ -9,7 +9,7 @@ import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
 import { expandSeq, fileMacroScope, preprocess } from '../preproc.js';
-import { collectDispatchDeclarations, collectEnumValues, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
+import { collectDispatchDeclarations, collectEnumValues, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls, statementEnd } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
 
@@ -19,6 +19,17 @@ import { definitionsOf, fingerprint, macroDiff } from './builtin-comparison.js';
 
 const isTestFile = (file) => /(^|\/)(tests?|unit|stubs?|mocks?)(\/|_|-)/i.test(file);
 const isHostSimFile = (file) => /(^|\/)(host|sim|simulator|pc|posix|win32)(\/|_|-)/i.test(file);
+
+function outerLoopRanges(tokens) {
+  const ranges = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (!['for', 'while', 'do'].includes(tokens[i].v)) continue;
+    const start = tokens[i];
+    i = statementEnd(tokens, i) - 1;
+    ranges.push({ start, end: tokens[i] });
+  }
+  return ranges;
+}
 
 function sharedDirectoryDepth(directory, file) {
   const parts = file.split('/');
@@ -387,6 +398,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       const writes = findDispatchWrites(body, fileMacros, aliasUses, visibleEnums);
       if (localTables.size || writes.length || calls.length || fn.params.length) dispatchScopes.add(tokens[fn.bodyStart]);
       const record = { fn, calls, writes, mentions: variableMentions(body) };
+      if (dispatchPolicy === 'expand' && writes.some(w => !w.path.length && w.rhsTargets?.length)) {
+        record.loops = outerLoopRanges(body);
+      }
       functionRecords.push(record);
       // 只延后有歧义的调用，等待头文件类型别名和包含关系收齐。
       if (calls.some(call => call.parenthesized || call.requiresTypes)) deferredTypedefCalls.push({ record, body, fileMacros });
@@ -869,7 +883,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   };
 
   const indirectCalls = [];
-  for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
+  for (const { fn, calls, nesting, mentions, taskEvidence, loops } of functionRecords) {
     const edgeStart = edges.length;
     for (const call of headerCalls(fn, calls)) {
       if (call.callee) {
@@ -890,9 +904,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
                   cands.set(id + '\0' + slot.slot, { slot: slot.slot || call.callee, name: ct, id });
                 }
               }
+              const loop = loops?.find(({ start, end }) => compareLocation(start, call) <= 0 && compareLocation(call, end) <= 0);
               for (const w of (writtenSlots.get(tbl) || [])) {
-                if (w.fnId === fn.id && (w.line > call.line || (w.line === call.line && (w.col ?? 0) >= (call.col ?? 0)))) continue;
                 if (w.path.length) continue;
+                // 同一循环内靠后的写入可能经回边到达下一轮调用。
+                if (w.fnId === fn.id && compareLocation(w, call) >= 0 && (!loop || compareLocation(w, loop.end) > 0)) continue;
                 for (const rhsT of (w.rhsTargets || [])) {
                   if (targetKind(rhsT, w.file, { line: w.line, col: w.col }, w.fnId) !== 'function') continue;
                   const id = resolveCallee(rhsT, w.file);
@@ -1207,9 +1223,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:13';
+    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:26';
     return JSON.stringify([
-      'builtin:25',
+      'builtin:26',
       policy,
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,

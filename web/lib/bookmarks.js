@@ -23,6 +23,13 @@ let renderSeq = 0;
 
 const modeLabel = (group) => t(group ? 'bookmark.grouped' : 'bookmark.flat');
 
+export function bookmarkMetadata(active, incoming, renamed) {
+  if (incoming.revision < active.revision) return active;
+  // 只跨过已知基线上的一次纯改名；跳号意味着可能漏掉了作用域更新。
+  const revision = renamed && incoming.revision === active.revision + 1 ? incoming.revision : active.revision;
+  return { ...active, name: incoming.name, revision };
+}
+
 function meta(b) {
   const roots = (b.roots || []).filter(Boolean);
   const names = roots.map((id) => id.split('::').at(-1));
@@ -219,11 +226,7 @@ function editName(row, bookmark, renameButton) {
         if (!result?.ok) throw new Error(result?.error);
         if (state.activeBookmark?.id === bookmark.id && result.bookmark) {
           const prev = state.activeBookmark;
-          state.activeBookmark = {
-            ...state.activeBookmark,
-            name: result.bookmark.name,
-            revision: result.bookmark.revision || state.activeBookmark.revision,
-          };
+          state.activeBookmark = bookmarkMetadata(prev, result.bookmark, true);
           hooks.syncBookmarkBadge?.();
           window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev } }));
         }
@@ -273,7 +276,7 @@ async function saveUpdateByBookmark(bookmark, button) {
     const scope = currentViewScope();
     const result = await api.updateBookmark({
       id: bookmark.id,
-      expectedRevision: bookmark.revision,
+      expectedRevision: state.activeBookmark?.id === bookmark.id ? state.activeBookmark.revision : bookmark.revision,
       ...scope,
     });
     if (result?.conflict) {

@@ -1791,6 +1791,16 @@ function renderSubagentCards(box, subagents, before = null) {
   }
 }
 
+function chainEdgeKeys(chain, nodeIds) {
+  if (chain.edgeKeys?.length) return chain.edgeKeys;
+  // 旧版单边导览卡把完整调用点键存在 id 中，其他旧链路只保留了端点。
+  if (chain.id?.startsWith('pres_edge:')) return [chain.id.slice('pres_edge:'.length)];
+  return nodeIds.slice(1).map((to, i) => {
+    const from = nodeIds[i];
+    return chain.kind === 'dataflow' && from.startsWith('var::') ? `${to}->${from}` : `${from}->${to}`;
+  });
+}
+
 function renderChainCards(box, chains) {
   if (!Array.isArray(chains) || !chains.length) return;
   const txtEl = box.querySelector('.ai-msg-text');
@@ -1809,8 +1819,7 @@ function renderChainCards(box, chains) {
     actions.className = 'ai-chain-actions';
 
     const nodeIds = steps.map((s) => s.id).filter(Boolean);
-    const edgeKeys = [];
-    for (let i = 0; i + 1 < nodeIds.length; i++) edgeKeys.push(`${nodeIds[i]}->${nodeIds[i + 1]}`);
+    const edgeKeys = chainEdgeKeys(chain, nodeIds);
 
     const hlBtn = document.createElement('button');
     hlBtn.type = 'button';

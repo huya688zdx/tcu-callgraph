@@ -762,7 +762,7 @@ function buildTurnUserText(userText, uiContext, attachments = []) {
   return sections.join('\n');
 }
 
-function buildSystemPrompt(context, promptToolMode, toolDefs = AGENT_TOOLS) {
+function canvasSystemPrompt(context) {
   const ctxLines = [
     `当前工程：${context.projectName || '未命名'}（函数 ${context.fnCount ?? 0} / 变量 ${context.varCount ?? 0}）`,
     `当前画布入口：${context.canvasRoots?.length ? context.canvasRoots.join(', ') : '空画布'}`,
@@ -794,16 +794,18 @@ function buildSystemPrompt(context, promptToolMode, toolDefs = AGENT_TOOLS) {
     ...ctxLines,
   ];
 
-  if (promptToolMode) {
-    base.push(
-      '',
-      '【工具调用格式】需要调用工具时，只输出如下标签块（不要额外废话），等待工具结果后再继续：',
-      '<tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
-      '可用工具清单：',
-      ...toolDefs.map(t => `- ${t.name}: ${t.description} 参数: ${JSON.stringify(t.parameters.properties)}`),
-    );
-  }
   return base.join('\n');
+}
+
+function buildSystemPrompt(role, promptToolMode, toolDefs) {
+  if (!promptToolMode) return role;
+  return [
+    role, '',
+    '【工具调用格式】需要调用工具时，只输出如下标签块（不要额外废话），等待工具结果后再继续：',
+    '<tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
+    '可用工具清单：',
+    ...toolDefs.map(t => `- ${t.name}: ${t.description} 参数: ${JSON.stringify(t.parameters)}`),
+  ].join('\n');
 }
 
 function flattenContent(content, thoughts) {
@@ -902,8 +904,8 @@ function buildReasoningPayload(effort) {
 }
 
 /** 把已包含 tool_calls / role:tool / role:function 的会话无损转为纯 system/user/assistant，避免回退时重跑写工具。 */
-function convertMessagesToPromptMode(messages, context, toolDefs = AGENT_TOOLS) {
-  const out = [{ role: 'system', content: context.systemPromptOverride || buildSystemPrompt(context, true, toolDefs) }];
+function convertMessagesToPromptMode(messages, role, toolDefs) {
+  const out = [{ role: 'system', content: buildSystemPrompt(role, true, toolDefs) }];
   let pendingToolTexts = [];
   const flushTools = () => {
     if (!pendingToolTexts.length) return;
@@ -1590,7 +1592,7 @@ export async function runAiAgent({
     allowedTools ?? (isSubagent ? SUBAGENT_READONLY_TOOLS : null),
   );
   const activeToolNames = new Set(activeToolDefs.map(t => t.name));
-  const promptContext = systemPromptOverride ? { ...context, systemPromptOverride } : context;
+  const rolePrompt = systemPromptOverride || canvasSystemPrompt(context);
 
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
   const historyBudget = Math.floor(config.contextWindow * 0.65);
@@ -1641,7 +1643,7 @@ export async function runAiAgent({
     return true;
   };
   let messages = [
-    { role: 'system', content: systemPromptOverride || buildSystemPrompt(promptContext, activeMode === 'prompt', activeToolDefs) },
+    { role: 'system', content: buildSystemPrompt(rolePrompt, activeMode === 'prompt', activeToolDefs) },
     ...cleanHistory,
     userMessage,
   ];
@@ -1755,7 +1757,7 @@ export async function runAiAgent({
         switchedToPrompt = true;
         activeMode = 'prompt';
         // 保留已执行的工具结果并转换为纯对话格式，绝不丢弃历史导致重复执行写工具。
-        messages = convertMessagesToPromptMode(messages, promptContext, activeToolDefs);
+        messages = convertMessagesToPromptMode(messages, rolePrompt, activeToolDefs);
         onEvent({ type: 'fallback', text: '接口不支持标准 tools / role:tool，已自动切换为旧版纯对话兼容模式' });
         step--;
         continue;

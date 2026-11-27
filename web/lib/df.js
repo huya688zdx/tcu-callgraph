@@ -294,8 +294,9 @@ function buildDataflowAiDetail() {
   return {
     kind: 'dataflow',
     id: `dataflow:${res.fn.id}`,
-    fnId: res.fn.id,
-    fnName: res.fn.name,
+    targetId: res.fn.id,
+    targetName: res.fn.name,
+    dir: 'both',
     file: res.fn.file || '',
     line: res.fn.line || 0,
     label: `数据流 · ${res.fn.name} (${rows.length})`,

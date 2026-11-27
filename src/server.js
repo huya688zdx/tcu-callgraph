@@ -1759,7 +1759,7 @@ function saveBookmarkWithEvent(data, actor = 'user', { isForeground = true, acti
         ...(diff?.changed ? { diffSummary: diff.summary } : {}),
       },
     });
-    return result;
+    return { ...result, prev };
   });
 }
 
@@ -2657,19 +2657,34 @@ export const server = http.createServer(async (req, res) => {
         at: 0,
         ts: Date.now(),
       } : null;
-      const restoredOverlay = structuredClone(snap.overlay || { nodes: {}, edges: {}, deleted: { nodes: {}, edges: {} }, layout: {} });
+      const undoCanvas = snap.ops.some(op => op !== 'manage_bookmarks');
+      const restoredOverlay = undoCanvas ? snap.overlay : store.loadOverlay(PROJECT.id);
+      const bookmarkEvents = [];
       const eventId = store.transaction(() => {
-        store.replaceOverlay(PROJECT.id, restoredOverlay);
-        saveInferredEdges(PROJECT.id, snap.inferredEdges || []);
-        for (const bmId of snap.createdBookmarkIds || []) {
-          try { store.deleteBookmark(PROJECT.id, bmId); } catch { /* ignore */ }
+        for (const [id, change] of snap.bookmarks) {
+          if (store.getBookmark(PROJECT.id, id)?.revision !== change.revision) return null;
         }
+        for (const [id, { before }] of snap.bookmarks) {
+          if (before) {
+            const { bookmark } = store.updateBookmarkById(PROJECT.id, id, before);
+            bookmarkEvents.push(['bookmark.save', { bookmark }]);
+          } else {
+            store.deleteBookmark(PROJECT.id, id);
+            bookmarkEvents.push(['bookmark.delete', { bookmarkId: id }]);
+          }
+        }
+        if (undoCanvas) {
+          store.replaceOverlay(PROJECT.id, restoredOverlay);
+          saveInferredEdges(PROJECT.id, snap.inferredEdges || []);
+        }
+        const eventPage = undoCanvas ? nextPage : store.getSetting(savedViewKey());
         const evId = store.appendEvent(PROJECT.id, {
           op: 'restore_point',
           target: `ai-undo#${changesetId.slice(0, 8)}`,
-          after: nextPage ? { ...restoredOverlay, view: viewSnapshot(nextPage) } : restoredOverlay,
+          after: eventPage ? { ...restoredOverlay, view: viewSnapshot(eventPage) } : restoredOverlay,
           actor: 'user',
         });
+        if (!undoCanvas) return evId;
         if (nextPage) {
           nextPage.revision = evId;
           store.setSetting(savedViewKey(), nextPage);
@@ -2678,14 +2693,18 @@ export const server = http.createServer(async (req, res) => {
         }
         return evId;
       });
-      applyInferredEdges(MODEL, PROJECT.id, snap.inferredEdges || []);
-      S = stats(MODEL);
-      pageState = nextPage;
-      overlay.nodes = restoredOverlay.nodes || {};
-      overlay.edges = restoredOverlay.edges || {};
-      overlay.deleted = restoredOverlay.deleted || { nodes: {}, edges: {} };
-      overlay.layout = restoredOverlay.layout || {};
+      if (eventId === null) return json(res, { ok: false, conflict: true, error: '书签已被其他操作修改，无法撤销本轮改图' }, 409);
+      if (undoCanvas) {
+        applyInferredEdges(MODEL, PROJECT.id, snap.inferredEdges || []);
+        S = stats(MODEL);
+        pageState = nextPage;
+        overlay.nodes = restoredOverlay.nodes || {};
+        overlay.edges = restoredOverlay.edges || {};
+        overlay.deleted = restoredOverlay.deleted || { nodes: {}, edges: {} };
+        overlay.layout = restoredOverlay.layout || {};
+      }
       aiChangesets.delete(changesetId);
+      for (const [op, detail] of bookmarkEvents) broadcastChange(op, 'user', { projectId: PROJECT.id, ...detail });
       broadcastChange('restore_point', 'user', { projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
       return json(res, { ok: true, eventId, undoneOps: snap.ops || [] });
     }
@@ -2696,6 +2715,7 @@ export const server = http.createServer(async (req, res) => {
         id: String(ch?.id || '').slice(0, 120),
         title: String(ch?.title || '').slice(0, 120),
         kind: ['call', 'dataflow', 'mixed'].includes(ch?.kind) ? ch.kind : 'call',
+        ...(Array.isArray(ch?.edgeKeys) && { edgeKeys: ch.edgeKeys.slice(0, 19).map(k => String(k).slice(0, 512)) }),
         steps: (Array.isArray(ch?.steps) ? ch.steps : []).slice(0, 20).map((s) => ({
           id: String(s?.id || '').slice(0, 200),
           name: String(s?.name || '').slice(0, 120),
@@ -3881,15 +3901,17 @@ export const server = http.createServer(async (req, res) => {
           page: structuredClone(latestPage() || null),
           overlay: store.loadOverlay(PROJECT.id),
           inferredEdges: loadInferredEdges(PROJECT.id),
-          createdBookmarkIds: [],
+          bookmarks: new Map(),
           ops: [],
           createdAt: Date.now(),
         };
       };
-      const recordCreatedBookmark = (bmId) => {
-        if (turnChangeset && Number.isInteger(bmId) && bmId > 0) {
-          turnChangeset.createdBookmarkIds.push(bmId);
-        }
+      const recordBookmarkWrite = ({ prev, bookmark }) => {
+        if (!turnChangeset) return;
+        const last = turnChangeset.bookmarks.get(bookmark.id);
+        // 连续 AI 写入共享首次保存前的基线；两次写入之间若有独立编辑，保留那次编辑。
+        const before = last && last.revision === prev?.revision ? last.before : prev;
+        turnChangeset.bookmarks.set(bookmark.id, { before, revision: bookmark.revision });
       };
 
       const executeAiTool = async (name, args) => {
@@ -3983,9 +4005,20 @@ export const server = http.createServer(async (req, res) => {
               ...(edgeKind ? { edgeKind } : {}),
             };
           };
+          const structuredChains = [];
+          const addChain = (direction, path, edgeKeys) => {
+            if (path.length < 2 || structuredChains.length >= 8) return;
+            const first = toChainStep(path[0]), last = toChainStep(path.at(-1));
+            structuredChains.push({
+              id: `${direction}:${first.id}->${last.id}:${structuredChains.length}`,
+              title: (direction === 'down' ? '下游 ' : '') + `${first.name} → ${last.name}`,
+              kind: 'call', steps: path.map((nid, i) => toChainStep(nid, i ? 'call' : undefined)), edgeKeys,
+            });
+          };
           const traces = resolved.slice(0, 15).map((id) => {
             const tr = direction === 'down' ? { upstreamTasks: [], upstreamChains: [], totalTasks: 0 }
               : traceToTasks(MODEL, id, { limit });
+            for (const chain of tr.upstreamChains.slice(0, 4)) addChain('up', chain.path, chain.edges.map(e => e.edgeKey));
             const directCallers = (MODEL._index?.inAdj?.get(id) || [])
               .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
               .slice(0, 20)
@@ -3996,18 +4029,21 @@ export const server = http.createServer(async (req, res) => {
               .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
             const downstreamPaths = [];
             if (direction === 'down' || direction === 'both') {
-              const stack = [{ node: id, path: [id] }];
+              const stack = [{ node: id, path: [id], edgeKeys: [] }];
               while (stack.length && downstreamPaths.length < 12) {
                 const cur = stack.shift();
                 const outs = (MODEL._index?.outAdj?.get(cur.node) || [])
                   .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[edgeKeyOf(e)]);
                 if (!outs.length || cur.path.length > depth) {
-                  if (cur.path.length > 1) downstreamPaths.push(cur.path);
+                  if (cur.path.length > 1) {
+                    downstreamPaths.push(cur.path);
+                    if (downstreamPaths.length <= 4) addChain('down', cur.path, cur.edgeKeys);
+                  }
                   continue;
                 }
                 for (const e of outs.slice(0, 6)) {
                   if (cur.path.includes(e.to)) continue;
-                  stack.push({ node: e.to, path: [...cur.path, e.to] });
+                  stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, edgeKeyOf(e)] });
                 }
               }
             }
@@ -4021,35 +4057,13 @@ export const server = http.createServer(async (req, res) => {
               totalTasks: tr.totalTasks || 0,
             };
           });
-          const structuredChains = [];
-          for (const tr of traces) {
-            for (const c of tr.chains.slice(0, 4)) {
-              const p = Array.isArray(c.path) ? c.path : [];
-              if (p.length >= 2) {
-                structuredChains.push({
-                  id: `up:${p[0]}->${p[p.length - 1]}:${structuredChains.length}`,
-                  title: `${toChainStep(p[0]).name} → ${toChainStep(p[p.length - 1]).name}`,
-                  kind: 'call',
-                  steps: p.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
-                });
-              }
-            }
-            for (const dp of (tr.downstreamPaths || []).slice(0, 4)) {
-              structuredChains.push({
-                id: `down:${dp[0]}->${dp[dp.length - 1]}:${structuredChains.length}`,
-                title: `下游 ${toChainStep(dp[0]).name} → ${toChainStep(dp[dp.length - 1]).name}`,
-                kind: 'call',
-                steps: dp.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
-              });
-            }
-          }
           const pathBranches = summarizeVehicleBranches(MODEL, resolved);
           return {
             ok: true,
             direction,
             functions: resolved,
             traces,
-            ...(structuredChains.length ? { chains: structuredChains.slice(0, 8) } : {}),
+            ...(structuredChains.length ? { chains: structuredChains } : {}),
             ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ambiguous,
             notFound,
@@ -4771,6 +4785,7 @@ export const server = http.createServer(async (req, res) => {
           if (snapshotId && COMPARISON?.id === snapshotId) expectedSession = sessionRevision;
           // 多个相互隔离的改动自动拆分为多个书签视图（或用户显式指定 bookmarkName 时保存书签）
           const createdBookmarks = [];
+          const bookmarkWrites = [];
           const allGroupCanvasIds = new Set([
             ...(composed.page.roots || []),
             ...(composed.page.expansions || []).map((s) => s.root),
@@ -4795,7 +4810,7 @@ export const server = http.createServer(async (req, res) => {
                   vars: bmVars,
                   expansions: bmExpansions,
                 }, 'ai', { isForeground: false });
-                recordCreatedBookmark(savedBm.bookmark?.id);
+                bookmarkWrites.push(savedBm);
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -4818,10 +4833,11 @@ export const server = http.createServer(async (req, res) => {
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
               }, 'ai', { isForeground: false });
-              recordCreatedBookmark(savedBm.bookmark?.id);
+              bookmarkWrites.push(savedBm);
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
+          bookmarkWrites.forEach(recordBookmarkWrite);
           if (createdBookmarks.length) broadcastChange('bookmark.save', 'ai', { projectId: PROJECT.id });
           // 组图成功后再仅对本次选入画布/书签的变更节点与新增连线写入变更分类（避免未选节点或报错时误写标注）。
           if (!COMPARISON && args.fromGit && (detectedNodeChanges.size || detectedAddedEdges.length)) {
@@ -5239,6 +5255,7 @@ export const server = http.createServer(async (req, res) => {
               id: `pres_edge:${edgeKeyOf(e)}`,
               title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
               kind: 'call',
+              edgeKeys: [edgeKeyOf(e)],
               steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
             });
           }
@@ -5417,7 +5434,7 @@ export const server = http.createServer(async (req, res) => {
             if (!bmName) return { ok: false, error: '保存书签需要提供 name' };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const r = saveBookmarkWithEvent({ ...viewSnapshot(page), name: bmName }, 'ai', { isForeground: true });
-            recordCreatedBookmark(r.bookmark?.id);
+            recordBookmarkWrite(r);
             broadcastChange('bookmark.save', 'ai', { bookmark: r.bookmark, projectId: PROJECT.id, clientId: chatClientId });
             return { ok: true, action, bookmark: r.bookmark };
           }
@@ -5427,6 +5444,7 @@ export const server = http.createServer(async (req, res) => {
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const resUp = store.updateBookmarkById(PROJECT.id, id, viewSnapshot(page));
             if (!resUp) return { ok: false, error: '找不到指定书签' };
+            recordBookmarkWrite(resUp);
             broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
             return { ok: true, action, bookmark: resUp.bookmark };
           }
@@ -5616,8 +5634,8 @@ export const server = http.createServer(async (req, res) => {
           });
           const sanitizeDataflow = (df) => (!df || typeof df !== 'object' ? null : {
             kind: 'dataflow',
-            targetId: String(df.targetId || df.id || '').slice(0, 200),
-            targetName: String(df.targetName || df.name || '').slice(0, 120),
+            targetId: String(df.targetId || df.fnId || df.id || '').slice(0, 200),
+            targetName: String(df.targetName || df.fnName || df.name || '').slice(0, 120),
             dir: ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out',
             vars: (Array.isArray(df.vars) ? df.vars : []).slice(0, 16).map(v => ({
               id: String(v?.id || v || '').slice(0, 200),
@@ -6683,7 +6701,7 @@ export const server = http.createServer(async (req, res) => {
                 projectId: PROJECT.id,
                 clientId: req.headers['x-callgraph-client'],
               });
-              json(res, { ok: true, ...r });
+              json(res, { ok: true, bookmark: r.bookmark, overwritten: r.overwritten });
             } catch (err) {
               bad(res, String(err.message || err));
             }
