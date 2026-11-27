@@ -328,7 +328,7 @@ test('运行时写入联合体其他成员会作废重叠槽，独立实例和�
     'static Ops rows[2] = { { .u = { .a = foo }, .next = keep }, { .u = { .a = foo } } };',
     'void call(void) { rows[0].u.b = bar; rows[0].u.a(); rows[1].u.a(); rows[0].next(); }',
   ].join('\n'));
-  const model = loadModel(dir);
+  const model = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'keep']);
   assert.equal(model.indirectCalls.filter(call => call.caller === 'ops.c::call').length, 1);
@@ -384,7 +384,7 @@ test('回调数组成员退化为指针传出时，只作废该数组的初始�
     'static void mutate(Fn *p) { p[0] = bar; }',
     'void call(void) { mutate(ops.handlers); ops.handlers[0](); ops.intact(); }',
   ].join('\n'));
-  const model = loadModel(dir);
+  const model = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
   const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
   assert.deepEqual(edges.map(edge => edge.callee), ['keep']);
   const escapedCall = model.indirectCalls.find(call => call.caller === 'ops.c::call' && call.member === 'handlers');
