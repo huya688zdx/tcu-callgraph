@@ -43,6 +43,10 @@ const state = {
   hiddenVars: new Set(),
   /** 时间轴回看：0 表示看当前状态，>0 表示看这个事件之后的历史状态 */
   at: 0,
+  /** 当前绑定的书签：{ id, name, revision, baseFingerprint }，未绑定为 null */
+  activeBookmark: null,
+  /** 切换书签时暂存各视图的未保存草稿，防止切换丢失范围改动 */
+  bookmarkDrafts: new Map(),
   selected: null,
   hover: null,
   /** 右侧详情面板悬停某条调用/变量关系时高亮画布对应连线：{ peerId, dir } */
@@ -210,6 +214,42 @@ const esc = (s) =>
 const nodeById = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
 
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}`;
+const currentViewScope = () => ({
+  roots: [...state.roots],
+  up: state.up,
+  down: state.down,
+  group: state.group,
+  groupMode: state.groupMode,
+  vars: [...state.vars],
+  hiddenVars: [...state.hiddenVars],
+  expansions: state.expansions || [],
+});
+
+const sortUnique = (arr) => [...new Set((Array.isArray(arr) ? arr : []).filter((v) => typeof v === 'string' && v))].sort();
+
+const scopeFingerprint = (scope = {}) => {
+  const s = scope && typeof scope === 'object' ? scope : {};
+  const gm = ['file', 'period', 'flat'].includes(s.groupMode) ? s.groupMode : s.group === false ? 'flat' : 'file';
+  const exps = [...(Array.isArray(s.expansions) ? s.expansions : [])]
+    .filter((e) => e && typeof e.root === 'string' && e.root)
+    .map((e) => ({ root: e.root, up: Number(e.up) || 0, down: Number(e.down) || 0 }))
+    .sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0));
+  return JSON.stringify({
+    roots: sortUnique(s.roots),
+    up: Math.max(0, Number(s.up) || 0),
+    down: Math.max(0, Number(s.down) || 0),
+    groupMode: gm,
+    vars: sortUnique(s.vars),
+    hiddenVars: sortUnique(s.hiddenVars),
+    expansions: exps,
+  });
+};
+
+const isBookmarkDirty = () => {
+  if (!state.activeBookmark?.baseFingerprint) return false;
+  return scopeFingerprint(currentViewScope()) !== state.activeBookmark.baseFingerprint;
+};
+
 export {
   els,
   state,
@@ -220,4 +260,7 @@ export {
   esc,
   nodeById,
   edgeKey,
+  currentViewScope,
+  scopeFingerprint,
+  isBookmarkDirty,
 };

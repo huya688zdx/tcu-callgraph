@@ -227,3 +227,62 @@ test('回放一致性：书签事件带完整载荷，删除后仍能从事件�
     vars: ['g_ops_4at'],
   });
 });
+
+test('书签原地更新、版本冲突 409、书签快照回放与检查点里程碑筛选', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(() => srv.close());
+  const base = srv.baseUrl;
+
+  const created = await jsonPost(base, '/api/bookmarks', {
+    name: '主调度链路',
+    roots: ['main.c::main'],
+    up: 1,
+    down: 2,
+    hiddenVars: ['var::g_flag'],
+    createOnly: true,
+  });
+  assert.equal(created.ok, true);
+  assert.equal(created.bookmark.revision, 1);
+  assert.deepEqual(created.bookmark.hiddenVars, ['var::g_flag']);
+
+  // 同名 createOnly 返回 409
+  const dupRes = await fetch(`${base}/api/bookmarks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: '主调度链路', roots: ['main.c::main'], createOnly: true }),
+  });
+  assert.equal(dupRes.status, 409);
+
+  // 原地更新
+  const updated = await jsonPost(base, '/api/bookmarks/update', {
+    id: created.bookmark.id,
+    expectedRevision: 1,
+    roots: ['main.c::main', 'gear.c::Gear_Apply'],
+    hiddenVars: [],
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.bookmark.revision, 2);
+
+  // 过期 revision 返回 409 冲突
+  const staleRes = await fetch(`${base}/api/bookmarks/update`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: created.bookmark.id, expectedRevision: 1, roots: ['main.c::main'] }),
+  });
+  assert.equal(staleRes.status, 409);
+  const staleJson = await staleRes.json();
+  assert.equal(staleJson.conflict, true);
+
+  // view.checkpoint + level=milestone + bookmarkId 过滤
+  const cp = await jsonPost(base, '/api/view-event', {
+    op: 'view.checkpoint',
+    label: '检查点一',
+    view: { roots: ['main.c::main', 'gear.c::Gear_Apply'], expansions: [], up: 1, down: 2 },
+    ctx: { bookmarkId: created.bookmark.id, bookmarkName: '主调度链路', checkpointName: '检查点一', milestone: 1 },
+  });
+  assert.equal(cp.ok, true);
+
+  const ms = await (await fetch(`${base}/api/events?level=milestone&bookmarkId=${created.bookmark.id}`)).json();
+  assert.ok(ms.events.some((e) => e.op === 'view.checkpoint' && e.ctx?.checkpointName === '检查点一'));
+  assert.ok(ms.events.some((e) => e.op === 'bookmark.save' && e.ctx?.action === 'update'));
+});

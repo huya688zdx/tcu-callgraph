@@ -200,15 +200,31 @@ if (es) {
       toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }
-    if (m.actor !== 'ai') return;
     const projectId = m.projectId ?? m.page?.projectId;
     if (projectId != null && projectId !== state.view?.projectId) return;
     if (m.op.startsWith('bookmark.')) {
-      reloadBookmarks();
-      void reloadTimeline();
-      if (state.at || reviewTransition()) markReviewUpdated();
+      if (m.clientId !== clientId && m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
+        state.activeBookmark = {
+          ...state.activeBookmark,
+          name: m.bookmark.name,
+          revision: m.bookmark.revision || state.activeBookmark.revision,
+        };
+        hooks.syncBookmarkBadge?.();
+        window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
+      } else if (m.clientId !== clientId && m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
+        const prev = state.activeBookmark;
+        state.activeBookmark = null;
+        hooks.syncBookmarkBadge?.();
+        window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: null, prev, remote: true } }));
+      }
+      if (m.actor === 'ai' || m.clientId !== clientId) {
+        reloadBookmarks();
+        void reloadTimeline();
+        if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
+      }
       return;
     }
+    if (m.actor !== 'ai') return;
     if (m.op === 'view.compose' && m.page) {
       if (m.page.revision <= Math.max(pageRevision, pendingCompose?.page.revision ?? 0)) return;
       pendingCompose = m;
@@ -256,6 +272,7 @@ export function savePage(force = false) {
     groupMode: state.groupMode,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
+    activeBookmark: state.activeBookmark,
     selected: state.selected,
     selectedEdge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
     ctxBox: state.ctxBox,
@@ -310,9 +327,11 @@ export async function restorePage({ root = null, isCurrent = () => true } = {}) 
       Object.assign(state, { up: saved.up, down: saved.down, groupMode, group: groupMode !== 'flat' });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
+      state.activeBookmark = saved.activeBookmark || null;
       els.groupMode.checked = state.group;
       els.layoutGroupSelect.value = state.groupMode;
     }
+    hooks.syncBookmarkBadge?.();
     let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
     if (!root && !saved) {
       const project = await api.project().catch(() => null);

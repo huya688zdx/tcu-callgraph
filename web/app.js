@@ -3,7 +3,7 @@
  * 具体职责已拆到 lib/ 下的模块
  */
 import { applyI18n, t } from './i18n.js';
-import { els, state, cam, deleteStack, edgeKey } from './lib/state.js';
+import { els, state, cam, deleteStack, edgeKey, currentViewScope, scopeFingerprint, isBookmarkDirty } from './lib/state.js';
 import { api } from './lib/api.js';
 import { hooks } from './lib/hooks.js';
 import { fit, revealAdded, stopCamAnim, constrainCam } from './lib/camera.js';
@@ -78,7 +78,10 @@ function rememberView(prior) {
 
 function recordViewEvent(op = 'view.snapshot') {
   if (!state.view?.projectId || state.at || state.view.comparison) return;
-  api.recordViewEvent({ op, projectId: state.view.projectId, view: currentViewSnapshot() })
+  const ctx = state.activeBookmark
+    ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name }
+    : undefined;
+  api.recordViewEvent({ op, projectId: state.view.projectId, view: currentViewSnapshot(), ...(ctx ? { ctx } : {}) })
     .then((result) => {
       if (!result?.ok) throw new Error(result?.error || t('app.viewFailed'));
       return reloadTimeline();
@@ -211,6 +214,7 @@ async function loadView(rootId, opts = {}) {
   history.stack = [];
   history.idx = -1;
   pushHistory();
+  hooks.syncBookmarkBadge?.();
   if (opts.recordOp) recordViewEvent(opts.recordOp);
   // 查找完成时立即保存范围，避免紧接着刷新还读到定时上报前的旧入口。
   await savePage(true).catch((error) => console.warn(t('app.scopeSaveFailed'), error));
@@ -304,22 +308,110 @@ hooks.restoreComparison = async () => {
   await Promise.all([loadStats(), loadTree()]);
 };
 
-/** 应用书签：把保存的视图参数写回 state 和工具栏控件，再重新加载 */
+const bookmarkSplit = document.getElementById('bookmarkSplit');
+const bookmarkBtn = document.getElementById('bookmarkBtn');
+const bookmarkQuickSave = document.getElementById('bookmarkQuickSave');
+
+function syncBookmarkBadge() {
+  const bm = state.activeBookmark;
+  const dirty = isBookmarkDirty();
+  const hasContent = state.roots.length > 0 || state.expansions.length > 0;
+  const readOnly = state.at > 0 || !!state.view?.comparison;
+  if (bookmarkSplit) {
+    bookmarkSplit.classList.toggle('active', !!bm);
+    bookmarkSplit.classList.toggle('dirty', !!bm && dirty);
+  }
+  if (bookmarkBtn) {
+    if (bm) {
+      bookmarkBtn.textContent = `🔖 ${bm.name}${dirty ? ' ●' : ''}`;
+      bookmarkBtn.title = dirty ? t('bookmark.dirtyHint') : `当前书签：${bm.name}`;
+    } else if (hasContent && !state.view?.comparison) {
+      bookmarkBtn.textContent = `🔖 ${t('bookmark.unnamed')}`;
+      bookmarkBtn.title = t('btn.bookmark');
+    } else {
+      bookmarkBtn.textContent = t('btn.bookmark');
+      bookmarkBtn.title = t('btn.bookmark');
+    }
+  }
+  if (bookmarkQuickSave) {
+    bookmarkQuickSave.hidden = readOnly || (!dirty && (!hasContent || !!bm));
+    bookmarkQuickSave.classList.toggle('dirty', dirty);
+    bookmarkQuickSave.textContent = bm ? t('common.save') : t('bookmark.saveAs');
+    bookmarkQuickSave.title = bm ? '更新当前书签 (Ctrl+S)' : '保存为书签 (Ctrl+S)';
+  }
+}
+hooks.syncBookmarkBadge = syncBookmarkBadge;
+
+async function saveActiveBookmark({ saveAs = false } = {}) {
+  if (state.at || state.view?.comparison || !state.roots.length) return;
+  const bm = state.activeBookmark;
+  if (saveAs || !bm?.id) {
+    bookmarkBtn?.click();
+    return;
+  }
+  const scope = currentViewScope();
+  const result = await api.updateBookmark({
+    id: bm.id,
+    expectedRevision: bm.revision,
+    ...scope,
+  });
+  if (result?.conflict) {
+    alert(t('bookmark.conflict'));
+    bookmarkBtn?.click();
+    return;
+  }
+  if (!result?.ok || !result.bookmark) throw new Error(result?.error || t('bookmark.failed'));
+  const saved = result.bookmark;
+  state.activeBookmark = {
+    id: saved.id,
+    name: saved.name,
+    revision: saved.revision || 1,
+    baseFingerprint: scopeFingerprint(scope),
+  };
+  state.bookmarkDrafts.delete(String(saved.id));
+  syncBookmarkBadge();
+  await savePage(true).catch(() => {});
+  void reloadTimeline();
+}
+
+bookmarkQuickSave?.addEventListener('click', () => {
+  saveActiveBookmark().catch(reportCanvasError);
+});
+document.addEventListener('callgraph:langchange', syncBookmarkBadge);
+
+/** 应用书签：先暂存未保存草稿、以参数请求 loadView，成功后再切 activeBookmark 并派发事件 */
 hooks.applyBookmark = async (b) => {
-  if (state.at) return;
+  if (state.at || canvasAction) return;
   pendingVarChoices.clear();
-  state.up = Number.isInteger(b.up) ? b.up : 1;
-  state.down = Number.isInteger(b.down) ? b.down : 1;
-  state.groupMode = b.groupMode ?? (b.group === false ? 'flat' : 'file');
-  state.group = state.groupMode !== 'flat';
-  state.vars = new Set(b.vars || []);
-  state.hiddenVars.clear();
-
-  els.groupMode.checked = state.group;
-
-  els.layoutGroupSelect.value = state.groupMode;
+  const prev = state.activeBookmark;
+  if (prev ? isBookmarkDirty() : (state.roots.length > 0 || state.expansions.length > 0)) {
+    const draftKey = prev?.id ? String(prev.id) : '__unnamed__';
+    state.bookmarkDrafts.set(draftKey, { scope: currentViewScope(), cam: { ...cam } });
+  }
   const roots = (b.roots || []).filter(Boolean);
-  await loadView(roots.length ? roots : null, { expansions: b.expansions || [] });
+  const up = Number.isInteger(b.up) ? b.up : 1;
+  const down = Number.isInteger(b.down) ? b.down : 1;
+  const groupMode = b.groupMode ?? (b.group === false ? 'flat' : 'file');
+  const vars = b.vars || [];
+  const hiddenVars = b.hiddenVars || [];
+  const expansions = b.expansions || [];
+  const view = await loadView(roots.length ? roots : null, {
+    empty: !roots.length && !expansions.length,
+    expansions,
+    up,
+    down,
+    group: groupMode !== 'flat',
+    groupMode,
+    vars,
+    hiddenVars,
+  });
+  if (!view) return;
+  state.activeBookmark = b.id
+    ? { id: b.id, name: b.name, revision: b.revision || 1, baseFingerprint: scopeFingerprint(b) }
+    : null;
+  syncBookmarkBadge();
+  await savePage(true).catch(() => {});
+  window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev } }));
 };
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
@@ -327,6 +419,9 @@ hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
   const epoch = ++reloadEpoch;
   pendingVarChoices.clear();
   comparisonPage = null;
+  state.activeBookmark = null;
+  state.bookmarkDrafts.clear();
+  syncBookmarkBadge();
   const seq = ++viewSeq;
   viewRequest?.abort();
   if (state.pairFlow) clearPairFlow({ paint: false });
@@ -595,6 +690,11 @@ window.addEventListener('keydown', (e) => {
   if (document.querySelector('.modal.show')) return;
   const tag = document.activeElement && document.activeElement.tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    saveActiveBookmark({ saveAs: e.shiftKey }).catch(reportCanvasError);
+    return;
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
     e.preventDefault();
     if (state.at || canvasAction) return;
@@ -656,6 +756,7 @@ const buildProfileInfo = document.getElementById('buildProfileInfo');
 const buildMultiCoreHint = document.getElementById('buildMultiCoreHint');
 const buildParserSelect = document.getElementById('buildParserSelect');
 const buildStrictCheck = document.getElementById('buildStrictCheck');
+const buildDispatchExpandCheck = document.getElementById('buildDispatchExpandCheck');
 const buildClangBin = document.getElementById('buildClangBin');
 const buildClangStatus = document.getElementById('buildClangStatus');
 const buildConfigMessage = document.getElementById('buildConfigMessage');
@@ -745,6 +846,9 @@ function renderBuildConfigModal() {
   }
   if (buildStrictCheck) {
     buildStrictCheck.checked = buildConfigState.strictCompileCommands !== false;
+  }
+  if (buildDispatchExpandCheck) {
+    buildDispatchExpandCheck.checked = buildConfigState.dispatchPolicy !== 'strict';
   }
   if (buildClangBin) {
     buildClangBin.value = buildConfigState.clangBin || '';
@@ -841,6 +945,7 @@ buildConfigApply?.addEventListener('click', async () => {
       parserId: buildParserSelect?.value || 'builtin',
       clangBin: buildClangBin?.value ?? '',
       strictCompileCommands: Boolean(buildStrictCheck?.checked),
+      dispatchPolicy: buildDispatchExpandCheck && !buildDispatchExpandCheck.checked ? 'strict' : 'expand',
     });
     if (!result?.ok) {
       if (result?.clangStatus && buildClangStatus) {

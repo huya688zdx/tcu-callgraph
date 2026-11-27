@@ -335,6 +335,7 @@
   .lbl-demo.task { color: #2C2C2A; background: #fff; border: 1.4px solid #2C2C2A; }
   .lbl-demo.conn { color: #C0392B; background: #fff; border: 1.4px solid #C0392B; }
   .lbl-demo.call { color: #2C2C2A; background: transparent; border: 0; padding-left: 0; }
+  .lbl-demo.free { color: #2C2C2A; background: #fff; border: 1.4px solid #4A5568; }
   .lbl-colors { display: flex; align-items: center; gap: 8px; }
   .lbl-colors input[type=color] {
     width: 34px; height: 24px; padding: 0; border: 1px solid rgba(0,0,0,.16);
@@ -860,11 +861,43 @@
   }
   .tl-more:hover { background: #F5F4EF; }
 
-  /* 书签行 */
+  /* 书签行与分体胶囊 */
+  .bm-split {
+    display: inline-flex; align-items: center; border-radius: 7px;
+    border: 1px solid rgba(31, 31, 29, 0.14); background: #FFFFFF; overflow: hidden;
+  }
+  .bm-split.active { background: #EFF6FD; border-color: #9EC5EC; }
+  .bm-split.dirty { border-color: #D97706; }
+  .bm-split > button {
+    border: 0 !important; border-radius: 0 !important; background: transparent;
+    height: 28px; box-shadow: none;
+  }
+  .bm-split > button:hover { background: rgba(24, 95, 165, 0.08); }
+  #bookmarkQuickSave {
+    border-left: 1px solid rgba(31, 31, 29, 0.12) !important;
+    font-size: 11.5px; font-weight: 600; color: #185FA5; padding: 0 8px;
+  }
+  #bookmarkQuickSave.dirty { background: #FFF7ED; color: #B45309; }
   .bm-summary {
     margin: 10px 12px 0; padding: 8px 10px; border: 1px solid #DFEAF4;
     border-radius: 8px; background: #F4F8FC; color: #124B71; font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
   }
+  .bm-summary-actions { display: inline-flex; gap: 6px; flex-shrink: 0; }
+  .bm-summary-actions button { height: 24px; padding: 0 8px; font-size: 11.5px; }
+  .bm.is-active { border-color: #8FC0EB; background: #F4F9FE; }
+  .bm-active-tag {
+    display: inline-block; margin-left: 5px; padding: 1px 6px; border-radius: 999px;
+    background: #185FA5; color: #fff; font-size: 10.5px; font-weight: 500;
+  }
+  .tl-extra-tools {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 14px 8px;
+    border-bottom: 1px solid #ECEAE2; background: #FAF9F6; font-size: 12px;
+  }
+  .tl-extra-tools label { display: inline-flex; align-items: center; gap: 4px; color: #4E4D49; cursor: pointer; }
+  .tl-cp-box { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: 1; min-width: 190px; justify-content: flex-end; }
+  .tl-cp-box input { flex: 1; max-width: 240px; height: 26px; padding: 0 8px; font-size: 12px; border: 1px solid rgba(0,0,0,0.16); border-radius: 6px; }
+  .tl-cp-box button { height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
   .bm {
     display: flex; align-items: center; gap: 10px; padding: 9px 10px; margin-bottom: 5px;
     border: 1px solid #EEEDE8; border-radius: 8px; cursor: pointer;
@@ -1631,7 +1664,10 @@
         <button id="clearCanvas" type="button" disabled data-i18n="timeline.kindClearCanvas">清空画布</button>
       </div>
       <div class="top-actions" aria-label="工程工具" data-i18n-aria-label="toolbar.projectTools">
-        <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
+        <div class="bm-split" id="bookmarkSplit">
+          <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
+          <button id="bookmarkQuickSave" type="button" title="保存当前视图或书签改动 (Ctrl+S)" hidden>保存</button>
+        </div>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
         <details class="tool-menu" id="exportMenu">
           <summary data-i18n="toolbar.export">导出</summary>
@@ -1824,6 +1860,10 @@
       <label class="build-check">
         <input type="checkbox" id="buildStrictCheck" checked>
         <span>严格单机种编译数据库模式（仅解析当前所选配置包含的 .c 文件，防止多机种同名函数串扰）</span>
+      </label>
+      <label class="build-check">
+        <input type="checkbox" id="buildDispatchExpandCheck" checked>
+        <span>静态分派候选全展开（对结构成员、多维表索引与运行时赋值保留全部静态函数指针候选边，并用虚线区分）</span>
       </label>
       <label class="build-field">
         <span>Clang 可执行文件路径（可选，支持内网便携版 clang.exe）</span>
@@ -2040,16 +2080,24 @@
     <div class="tl-tools">
       <input id="tlSearch" type="search" placeholder="搜索函数名 / 备注…" data-i18n-ph="timeline.search">
       <div class="tl-chips" id="tlChips">
-        <button data-ops="" class="on" data-i18n="timeline.all">全部</button>
-        <button data-ops="edge.annotate,labels.renumber" data-i18n="timeline.kindEdge">连线标签</button>
-        <button data-ops="node.annotate" data-i18n="timeline.kindNode">节点标注</button>
-        <button data-ops="layout.save,layout.clear" data-i18n="timeline.kindLayout">布局</button>
-        <button data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
-        <button data-ops="bookmark.save,bookmark.delete" data-i18n="timeline.kindBookmark">书签</button>
-        <button data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
-        <button data-ops="view.snapshot,view.clear" data-i18n="timeline.kindCanvas">画布</button>
+        <button data-level="milestone" data-ops="" class="on" data-i18n="timeline.milestone">关键节点</button>
+        <button data-level="" data-ops="" data-i18n="timeline.all">全部</button>
+        <button data-level="" data-ops="edge.annotate,labels.renumber" data-i18n="timeline.kindEdge">连线标签</button>
+        <button data-level="" data-ops="node.annotate" data-i18n="timeline.kindNode">节点标注</button>
+        <button data-level="" data-ops="layout.save,layout.clear" data-i18n="timeline.kindLayout">布局</button>
+        <button data-level="" data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
+        <button data-level="" data-ops="bookmark.save,bookmark.delete,view.checkpoint" data-i18n="timeline.kindBookmark">书签</button>
+        <button data-level="" data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
+        <button data-level="" data-ops="view.snapshot,view.clear" data-i18n="timeline.kindCanvas">画布</button>
       </div>
       <span class="tl-count" id="tlCount"></span>
+    </div>
+    <div class="tl-extra-tools">
+      <label id="tlScopeBookmarkWrap" hidden><input type="checkbox" id="tlScopeBookmark"> <span data-i18n="timeline.currentBookmark">仅当前书签</span></label>
+      <div class="tl-cp-box">
+        <input id="tlCheckpointInput" type="text" maxlength="80" placeholder="输入检查点名称（可选），如「核对完周期入口」…" data-i18n-ph="bookmark.checkpointPlaceholder">
+        <button id="tlCheckpointBtn" type="button" data-i18n="bookmark.checkpoint">打检查点</button>
+      </div>
     </div>
     <div class="modal-body" id="timelineList"></div>
   </div>

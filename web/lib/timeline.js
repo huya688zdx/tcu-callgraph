@@ -11,7 +11,7 @@
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { state, cam, edgeKey } from './state.js';
+import { currentViewScope, isBookmarkDirty, state, cam, edgeKey } from './state.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
 import { constrainCam } from './camera.js';
@@ -24,6 +24,10 @@ const listEl = document.getElementById('timelineList');
 const searchEl = document.getElementById('tlSearch');
 const chipsEl = document.getElementById('tlChips');
 const countEl = document.getElementById('tlCount');
+const scopeBookmarkCheck = document.getElementById('tlScopeBookmark');
+const scopeBookmarkWrap = document.getElementById('tlScopeBookmarkWrap');
+const checkpointInput = document.getElementById('tlCheckpointInput');
+const checkpointBtn = document.getElementById('tlCheckpointBtn');
 const bar = document.getElementById('reviewBar');
 const barText = document.getElementById('reviewText');
 const restoreBtn = document.getElementById('reviewRestore');
@@ -45,11 +49,12 @@ const OP_KIND = {
   'bookmark.delete': 'Bookmark',
   'view.compose': 'Compose',
   'view.snapshot': 'Canvas',
+  'view.checkpoint': 'Checkpoint',
   'view.clear': 'ClearCanvas',
 };
 
-/** 面板状态：已加载的事件、过滤条件、翻页游标 */
-const tl = { events: [], ops: [], q: '', hasMore: false, total: 0, loading: false, seq: 0 };
+/** 面板状态：默认展示「关键节点」（milestone） */
+const tl = { events: [], ops: [], level: 'milestone', bookmarkId: null, q: '', hasMore: false, total: 0, loading: false, seq: 0 };
 
 const pad = (n) => String(n).padStart(2, '0');
 const hhmm = (ts) => {
@@ -132,8 +137,14 @@ function describe(e) {
       return t('op.restore_point');
     case 'manual.variable.bind':
       return t('op.manual.variable.bind');
-    case 'bookmark.save':
-      return [t('op.bookmark.save'), b.roots ? t('common.scopeCount', { n: b.roots }) : ''].filter(Boolean).join(' · ');
+    case 'bookmark.save': {
+      const act = e.ctx?.action === 'update' ? '更新书签' : e.ctx?.action === 'rename' ? '重命名书签' : t('op.bookmark.save');
+      return [
+        act,
+        e.ctx?.diffSummary || '',
+        b.roots ? t('common.scopeCount', { n: b.roots }) : '',
+      ].filter(Boolean).join(' · ');
+    }
     case 'bookmark.delete':
       return t('op.bookmark.delete');
     case 'view.compose': {
@@ -141,8 +152,17 @@ function describe(e) {
       const caption = b.count == null ? t('timeline.compose') : t('timeline.composeCount', { n: b.count });
       return [caption, reason].filter(Boolean).join(' · ');
     }
+    case 'view.checkpoint':
+      return [
+        e.ctx?.bookmarkName ? `书签「${e.ctx.bookmarkName}」` : '',
+        e.ctx?.diffSummary || (b.count != null ? t('timeline.canvasCount', { n: b.count }) : ''),
+      ].filter(Boolean).join(' · ');
     case 'view.snapshot':
-      return [t('timeline.canvasCount', { n: b.count ?? 0 }), b.label].filter(Boolean).join(' · ');
+      return [
+        e.ctx?.bookmarkName ? `书签「${e.ctx.bookmarkName}」` : '',
+        e.ctx?.diffSummary || t('timeline.canvasCount', { n: b.count ?? 0 }),
+        b.label,
+      ].filter(Boolean).join(' · ');
     case 'view.clear':
       return t('timeline.kindClearCanvas');
     case 'orphan.purge':
@@ -188,6 +208,7 @@ function renderAll() {
     const target = e.target || '';
     const codeTarget = ['Node', 'Edge', 'Delete', 'Layout', 'Compose'].includes(kind);
     const displayTarget = kind === 'Canvas' || kind === 'ClearCanvas' ? ''
+      : kind === 'Checkpoint' ? (e.ctx?.checkpointName || b.label || target || t('timeline.kindCheckpoint'))
       : kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
       : kind === 'Compose' && !target.includes('::') ? '' : target;
     const { title, meta } = codeTarget
@@ -235,7 +256,7 @@ async function load({ append = false } = {}) {
   const seq = ++tl.seq;
   const before = append && tl.events.length ? tl.events[tl.events.length - 1].id : 0;
   try {
-    const r = await api.events({ limit: PAGE, before, ops: tl.ops, q: tl.q });
+    const r = await api.events({ limit: PAGE, before, ops: tl.ops, level: tl.level, bookmarkId: tl.bookmarkId, q: tl.q });
     if (seq !== tl.seq) return; // 过滤条件变了，丢弃过期响应
     const list = r.events || [];
     tl.events = append ? [...tl.events, ...list] : list;
@@ -385,6 +406,19 @@ restoreBtn?.addEventListener('click', async () => {
   restoringSnapshot = true;
   syncReviewControls();
   try {
+    // 非破坏性恢复：若当前恢复前工作区有节点且曾偏离书签，先自动记录安全检查点
+    if (preReview && (preReview.roots?.length || preReview.expansions?.length) && !state.view?.comparison) {
+      await api.saveCheckpoint('恢复前自动快照', {
+        roots: preReview.roots,
+        expansions: preReview.expansions,
+        up: preReview.up,
+        down: preReview.down,
+        group: preReview.group,
+        groupMode: preReview.groupMode,
+        vars: preReview.vars,
+        hiddenVars: preReview.hiddenVars,
+      }, state.activeBookmark ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name } : {}).catch(() => {});
+    }
     const r = await api.restore(state.at);
     if (seq !== reviewSeq) return;
     if (!r?.ok) throw new Error(r?.error || t('timeline.restoreFailed'));
@@ -402,9 +436,51 @@ restoreBtn?.addEventListener('click', async () => {
 
 exitBtn?.addEventListener('click', exitReview);
 
+function syncTimelineControls() {
+  if (scopeBookmarkWrap) {
+    scopeBookmarkWrap.hidden = !state.activeBookmark;
+    if (!state.activeBookmark && scopeBookmarkCheck) {
+      scopeBookmarkCheck.checked = false;
+      tl.bookmarkId = null;
+    }
+  }
+  if (checkpointBtn) {
+    checkpointBtn.disabled = state.at > 0 || !!state.view?.comparison || !state.roots.length;
+  }
+}
+
 btn?.addEventListener('click', () => {
   openModal('timelineModal');
+  syncTimelineControls();
   load();
+});
+
+scopeBookmarkCheck?.addEventListener('change', () => {
+  tl.bookmarkId = scopeBookmarkCheck.checked && state.activeBookmark ? state.activeBookmark.id : null;
+  load();
+});
+
+async function submitCheckpoint() {
+  if (state.at > 0 || state.view?.comparison || !state.roots.length || !checkpointBtn) return;
+  checkpointBtn.disabled = true;
+  const name = checkpointInput?.value.trim() || `检查点 ${hhmm(Date.now())}`;
+  try {
+    const r = await api.saveCheckpoint(name, currentViewScope(), state.activeBookmark
+      ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name }
+      : {});
+    if (!r?.ok) throw new Error(r?.error || '记录检查点失败');
+    if (checkpointInput) checkpointInput.value = '';
+    await load();
+  } catch (err) {
+    alert(err.message || '记录检查点失败');
+  } finally {
+    syncTimelineControls();
+  }
+}
+
+checkpointBtn?.addEventListener('click', submitCheckpoint);
+checkpointInput?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) submitCheckpoint();
 });
 
 // 搜索：输入 220ms 后触发，避免每敲一个字都打一次库
@@ -420,6 +496,7 @@ searchEl?.addEventListener('input', () => {
 chipsEl?.querySelectorAll('button').forEach((chip) => {
   chip.addEventListener('click', () => {
     chipsEl.querySelectorAll('button').forEach((c) => c.classList.toggle('on', c === chip));
+    tl.level = chip.dataset.level || '';
     tl.ops = chip.dataset.ops ? chip.dataset.ops.split(',').filter(Boolean) : [];
     load();
   });

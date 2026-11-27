@@ -21,7 +21,7 @@ import { analysisJob } from './analysis-jobs.js';
 import { DatabaseSync } from 'node:sqlite';
 import { normalizeExpansions } from './expansion.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function resolveGroupMode(mode, grouped) {
   return ['file', 'period', 'flat'].includes(mode) ? mode : grouped === false ? 'flat' : 'file';
@@ -35,18 +35,20 @@ export function resolveGroupMode(mode, grouped) {
  */
 const BOOKMARK_DDL = `
 CREATE TABLE IF NOT EXISTS bookmark (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-  name       TEXT NOT NULL,
-  roots      TEXT NOT NULL DEFAULT '[]',
-  up         INTEGER NOT NULL DEFAULT 1,
-  down       INTEGER NOT NULL DEFAULT 1,
-  grouped    INTEGER NOT NULL DEFAULT 1,
-  group_mode TEXT,
-  vars       TEXT NOT NULL DEFAULT '[]',
-  expansions TEXT NOT NULL DEFAULT '[]',
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  roots       TEXT NOT NULL DEFAULT '[]',
+  up          INTEGER NOT NULL DEFAULT 1,
+  down        INTEGER NOT NULL DEFAULT 1,
+  grouped     INTEGER NOT NULL DEFAULT 1,
+  group_mode  TEXT,
+  vars        TEXT NOT NULL DEFAULT '[]',
+  hidden_vars TEXT NOT NULL DEFAULT '[]',
+  expansions  TEXT NOT NULL DEFAULT '[]',
+  revision    INTEGER NOT NULL DEFAULT 1,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
   UNIQUE (project_id, name)
 );
 CREATE INDEX IF NOT EXISTS bookmark_by_project ON bookmark(project_id, updated_at DESC);
@@ -211,7 +213,7 @@ export function fingerprintFiles(files = []) {
  */
 export function cacheKey(files = [], focus = '', parserKey = 'builtin') {
   const h = createHash('sha1');
-  h.update('analyzed-model-v30-dispatch-writes\0');
+  h.update('analyzed-model-v31-dispatch-expand\0');
   if (parserKey !== 'builtin') h.update(`parser\u0000${parserKey}\n`);
   const list = [...files].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   for (const f of list) {
@@ -240,7 +242,9 @@ const toBookmark = (r) => ({
   group: !!r.grouped,
   groupMode: resolveGroupMode(r.group_mode, !!r.grouped),
   vars: parse(r.vars, []),
+  hiddenVars: parse(r.hidden_vars, []),
   expansions: parse(r.expansions, []),
+  revision: Number(r.revision) || 1,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
 });
@@ -267,14 +271,16 @@ const cnt = (v) => (Array.isArray(v) ? v.length : v && typeof v === 'object' ? O
 function briefOf(e) {
   const a = e.after || {};
   const brief = {};
-  if ((e.op === 'view.snapshot' || e.op === 'view.clear') && a.view) {
-    const { roots, expansions, vars, empty } = a.view;
+  if ((e.op === 'view.snapshot' || e.op === 'view.clear' || e.op === 'view.checkpoint') && a.view) {
+    const { roots = [], expansions = [], vars = [], empty } = a.view;
     return {
       count: new Set([...roots, ...expansions.map(({ root }) => root)]).size,
       roots: roots.length,
       vars: vars.length,
       empty: !!empty,
-      label: e.ctx?.label || '',
+      label: e.ctx?.checkpointName || e.ctx?.label || '',
+      ...(e.op === 'view.checkpoint' && e.ctx?.bookmarkName && { bookmarkName: e.ctx.bookmarkName }),
+      ...(e.op === 'view.checkpoint' && e.ctx?.diffSummary && { diffSummary: e.ctx.diffSummary }),
     };
   }
   // 会话导入的 after 是整份 overlay（回放要用），直接数节点会得出
@@ -306,7 +312,12 @@ function briefOf(e) {
       cnt(a.layoutSlots) +
       (a.layoutNodes || []).reduce((s, x) => s + cnt(x.ids), 0);
   }
-  if (e.op === 'bookmark.save' && Array.isArray(a.roots)) brief.roots = a.roots.length;
+  if (e.op === 'bookmark.save') {
+    if (Array.isArray(a.roots)) brief.roots = a.roots.length;
+    if (a.revision) brief.revision = a.revision;
+    if (e.ctx?.action) brief.action = e.ctx.action;
+    if (e.ctx?.diffSummary) brief.diffSummary = e.ctx.diffSummary;
+  }
   return brief;
 }
 
@@ -476,6 +487,11 @@ function migrate(db) {
     if (cur < 5 && !db.prepare('PRAGMA table_info(bookmark)').all().some(c => c.name === 'group_mode')) {
       db.exec('ALTER TABLE bookmark ADD COLUMN group_mode TEXT');
     }
+    if (cur < 6) {
+      const cols = new Set(db.prepare('PRAGMA table_info(bookmark)').all().map(c => c.name));
+      if (!cols.has('hidden_vars')) db.exec("ALTER TABLE bookmark ADD COLUMN hidden_vars TEXT NOT NULL DEFAULT '[]'");
+      if (!cols.has('revision')) db.exec('ALTER TABLE bookmark ADD COLUMN revision INTEGER NOT NULL DEFAULT 1');
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec('COMMIT');
   } catch (err) {
@@ -540,7 +556,7 @@ export function openStore({ dbPath, userData } = {}) {
     return stmt;
   };
 
-  const buildEventQuery = (kind, projectId, { beforeId = 0, ops = [], q: query = '', limit = 50 } = {}) => {
+  const buildEventQuery = (kind, projectId, { beforeId = 0, ops = [], q: query = '', level = '', bookmarkId = null, limit = 50 } = {}) => {
     const where = ['project_id = ?'];
     const params = [projectId];
     // 游标和 limit 都在这里再兜一次：调用方传进 NaN 的话，绑定到 SQL 里会变成
@@ -554,11 +570,18 @@ export function openStore({ dbPath, userData } = {}) {
       where.push(`op IN (${ops.map(() => '?').join(',')})`);
       params.push(...ops);
     }
+    if (level === 'milestone') {
+      where.push(
+        "(op IN ('baseline','restore_point','session.import','bookmark.save','bookmark.delete','view.checkpoint','view.compose','view.clear') OR json_extract(ctx, '$.milestone') = 1)"
+      );
+    }
+    if (bookmarkId !== null && bookmarkId !== undefined && bookmarkId !== '') {
+      where.push("CAST(json_extract(ctx, '$.bookmarkId') AS TEXT) = ?");
+      params.push(String(bookmarkId));
+    }
     if (query) {
-      // target 是函数 id / 视图 key，after 是 JSON 文本：两个 LIKE 够用了，
-      // 真要做全文检索再上 FTS，现在没必要
-      where.push('(target LIKE ? OR after LIKE ?)');
-      params.push(`%${query}%`, `%${query}%`);
+      where.push('(target LIKE ? OR after LIKE ? OR ctx LIKE ?)');
+      params.push(`%${query}%`, `%${query}%`, `%${query}%`);
     }
     const body = where.join(' AND ');
     const safeLimit = Number.isFinite(Number(limit)) ? Math.max(1, Math.trunc(Number(limit))) : 50;
@@ -642,16 +665,24 @@ export function openStore({ dbPath, userData } = {}) {
     ),
 
     bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),
+    bmById: db.prepare('SELECT * FROM bookmark WHERE project_id = ? AND id = ?'),
     bmByName: db.prepare('SELECT * FROM bookmark WHERE project_id = ? AND name = ?'),
     bmUpsert: db.prepare(
-      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, group_mode, vars, expansions, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO bookmark (project_id, name, roots, up, down, grouped, group_mode, vars, hidden_vars, expansions, revision, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
        ON CONFLICT(project_id, name) DO UPDATE SET
          roots = excluded.roots, up = excluded.up, down = excluded.down,
-         grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars, expansions = excluded.expansions,
-         updated_at = excluded.updated_at`
+         grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars,
+         hidden_vars = excluded.hidden_vars, expansions = excluded.expansions,
+         revision = bookmark.revision + 1, updated_at = excluded.updated_at`
     ),
-    bmRename: db.prepare('UPDATE bookmark SET name = ?, updated_at = ? WHERE project_id = ? AND id = ? RETURNING *'),
+    bmUpdateById: db.prepare(
+      `UPDATE bookmark
+       SET name = ?, roots = ?, up = ?, down = ?, grouped = ?, group_mode = ?,
+           vars = ?, hidden_vars = ?, expansions = ?, revision = revision + 1, updated_at = ?
+       WHERE project_id = ? AND id = ? RETURNING *`
+    ),
+    bmRename: db.prepare('UPDATE bookmark SET name = ?, revision = revision + 1, updated_at = ? WHERE project_id = ? AND id = ? RETURNING *'),
     bmDelete: db.prepare('DELETE FROM bookmark WHERE project_id = ? AND id = ?'),
   };
 
@@ -856,8 +887,8 @@ export function openStore({ dbPath, userData } = {}) {
      * 现在只回一个 brief（变更分类、备注、条数这类几十字节的摘要），
      * 需要完整载荷时（回放）走 eventsUpTo。
      */
-    listEventsPage(projectId, { limit = 50, beforeId = 0, ops = [], q: query = '', withPayload = false } = {}) {
-      const { sql, params } = buildEventQuery('select', projectId, { beforeId, ops, q: query, limit });
+    listEventsPage(projectId, { limit = 50, beforeId = 0, ops = [], q: query = '', level = '', bookmarkId = null, withPayload = false } = {}) {
+      const { sql, params } = buildEventQuery('select', projectId, { beforeId, ops, q: query, level, bookmarkId, limit });
       return prep(sql)
         .all(...params)
         .map((r) => {
@@ -870,13 +901,14 @@ export function openStore({ dbPath, userData } = {}) {
             op: e.op,
             target: e.target,
             brief: briefOf(e),
+            ...(e.ctx ? { ctx: e.ctx } : {}),
             ...(withPayload ? { before: e.before, after: e.after } : {}),
           };
         });
     },
 
-    countEvents(projectId, { ops = [], q: query = '' } = {}) {
-      const { sql, params } = buildEventQuery('count', projectId, { ops, q: query });
+    countEvents(projectId, { ops = [], q: query = '', level = '', bookmarkId = null } = {}) {
+      const { sql, params } = buildEventQuery('count', projectId, { ops, q: query, level, bookmarkId });
       const r = prep(sql).get(...params);
       return Number(r?.c || 0);
     },
@@ -968,6 +1000,12 @@ export function openStore({ dbPath, userData } = {}) {
       return q.bmList.all(projectId).map(toBookmark);
     },
 
+    /** 按 id 取书签 */
+    getBookmark(projectId, id) {
+      const r = q.bmById.get(projectId, Number(id));
+      return r ? toBookmark(r) : null;
+    },
+
     /** 按名字找书签：保存时用来取「覆盖前」的旧值，写进时间轴的 before */
     findBookmark(projectId, name) {
       const r = q.bmByName.get(projectId, String(name || '').trim());
@@ -978,7 +1016,7 @@ export function openStore({ dbPath, userData } = {}) {
      * 保存书签。同名视为覆盖（UNIQUE(project_id,name) + upsert），
      * 用户不用先删再存；返回是否覆盖，前端据此提示。
      */
-    saveBookmark(projectId, { name, roots = [], up = 1, down = 1, group = true, groupMode, vars = [], expansions = [] }) {
+    saveBookmark(projectId, { name, roots = [], up = 1, down = 1, group = true, groupMode, vars = [], hiddenVars = [], expansions = [] }) {
       const clean = String(name || '').trim();
       if (!clean) throw new Error('书签名称不能为空');
       if (!Array.isArray(roots)) throw new Error('roots 必须是数组');
@@ -994,11 +1032,60 @@ export function openStore({ dbPath, userData } = {}) {
         groupMode === 'flat' ? 0 : 1,
         groupMode,
         str(Array.isArray(vars) ? vars : []),
+        str(Array.isArray(hiddenVars) ? hiddenVars : []),
         str(normalizeExpansions(expansions)),
         ts,
         ts
       );
       return { bookmark: toBookmark(q.bmByName.get(projectId, clean)), overwritten: existed };
+    },
+
+    /** 按 id 原地更新书签作用域/名称（支持乐观锁 expectedRevision） */
+    updateBookmarkById(projectId, id, patch = {}, expectedRevision = null) {
+      const numId = Number(id);
+      if (!Number.isFinite(numId) || numId <= 0) throw new Error('id 必须是正整数');
+      const current = api.getBookmark(projectId, numId);
+      if (!current) return null;
+      if (expectedRevision !== null && expectedRevision !== undefined && Number(expectedRevision) !== current.revision) {
+        return { conflict: true, current };
+      }
+      const nextName = patch.name !== undefined ? String(patch.name || '').trim() : current.name;
+      if (!nextName) throw new Error('书签名称不能为空');
+      const nextRoots = patch.roots !== undefined ? patch.roots : current.roots;
+      if (!Array.isArray(nextRoots)) throw new Error('roots 必须是数组');
+      const nextUp = patch.up !== undefined ? (Number(patch.up) || 0) : current.up;
+      const nextDown = patch.down !== undefined ? (Number(patch.down) || 0) : current.down;
+      const nextGroupMode = resolveGroupMode(
+        patch.groupMode !== undefined ? patch.groupMode : current.groupMode,
+        patch.group !== undefined ? patch.group : current.group
+      );
+      const nextVars = patch.vars !== undefined ? (Array.isArray(patch.vars) ? patch.vars : []) : current.vars;
+      const nextHiddenVars = patch.hiddenVars !== undefined
+        ? (Array.isArray(patch.hiddenVars) ? patch.hiddenVars : [])
+        : current.hiddenVars;
+      const nextExpansions = patch.expansions !== undefined
+        ? normalizeExpansions(patch.expansions)
+        : current.expansions;
+      try {
+        const row = q.bmUpdateById.get(
+          nextName,
+          str(nextRoots),
+          nextUp,
+          nextDown,
+          nextGroupMode === 'flat' ? 0 : 1,
+          nextGroupMode,
+          str(nextVars),
+          str(nextHiddenVars),
+          str(nextExpansions),
+          nowMs(),
+          projectId,
+          numId
+        );
+        return row ? { conflict: false, bookmark: toBookmark(row), prev: current } : null;
+      } catch (err) {
+        if (err.errcode === 2067) throw new Error('已存在同名书签，请换一个名称');
+        throw err;
+      }
     },
 
     renameBookmark(projectId, id, newName) {

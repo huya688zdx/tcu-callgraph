@@ -38,6 +38,7 @@ import { routeEdges } from './core/routing.js';
 import { contentPadding, inside } from '../web/lib/hierarchy.js';
 import { boundSavedCodeAttachments, sanitizeCodeAttachments } from '../web/lib/ai-code-attachments.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
+import { diffViewScopes } from './core/view-scope.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
 import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
@@ -129,22 +130,26 @@ const compileCommandsKey = scanRoot => 'parser.compileCommandsPath.' + fileKey(p
 const clangBinKey = 'parser.clangBin';
 const buildProfileKey = scanRoot => 'parser.buildProfile.' + fileKey(path.resolve(scanRoot));
 const strictCompileCommandsKey = scanRoot => 'parser.strictCompileCommands.' + fileKey(path.resolve(scanRoot));
+const dispatchPolicyKey = scanRoot => 'parser.dispatchPolicy.' + fileKey(path.resolve(scanRoot));
 const configuredClangBin = () => String(store.getSetting(clangBinKey) || '').trim();
 const configuredBuildProfile = scanRoot => store.getSetting(buildProfileKey(scanRoot)) || null;
 const configuredStrictCompile = scanRoot => store.getSetting(strictCompileCommandsKey(scanRoot));
+const configuredDispatchPolicy = scanRoot => store.getSetting(dispatchPolicyKey(scanRoot)) === 'strict' ? 'strict' : 'expand';
 const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => {
   const buildProfileId = configuredBuildProfile(scanRoot) || undefined;
+  const dispatchPolicy = configuredDispatchPolicy(scanRoot);
   if (id === 'clang-ast') {
     const clangBin = configuredClangBin() || undefined;
     const strictSaved = configuredStrictCompile(scanRoot);
     return {
       compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)),
+      dispatchPolicy,
       ...(clangBin ? { clangBin } : {}),
       ...(buildProfileId ? { buildProfileId } : {}),
       ...(strictSaved !== undefined && strictSaved !== null ? { strictCompileCommands: Boolean(strictSaved) } : {}),
     };
   }
-  return buildProfileId ? { buildProfileId } : {};
+  return { dispatchPolicy, ...(buildProfileId ? { buildProfileId } : {}) };
 };
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
@@ -830,6 +835,7 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
       if (cfg.buildProfileId !== undefined) store.setSetting(buildProfileKey(model.root), cfg.buildProfileId || null);
       if (cfg.strictCompileCommands !== undefined) store.setSetting(strictCompileCommandsKey(model.root), Boolean(cfg.strictCompileCommands));
       if (cfg.compileCommandsPath !== undefined) store.setSetting(compileCommandsKey(model.root), cfg.compileCommandsPath || null);
+      if (cfg.dispatchPolicy !== undefined) store.setSetting(dispatchPolicyKey(model.root), cfg.dispatchPolicy === 'strict' ? 'strict' : 'expand');
     } else if (selection.parserId === 'clang-ast') {
       store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
     }
@@ -1064,14 +1070,16 @@ function annotationEdgeKey(edges, edge, model) {
 }
 
 function normalizeAiLabel(raw) {
-  if (!isPlainObject(raw) || !['task', 'call', 'conn'].includes(raw.preset)) {
-    throw new Error('标签 preset 必须是 task / call / conn');
+  if (!isPlainObject(raw) || !['task', 'call', 'conn', 'free'].includes(raw.preset)) {
+    throw new Error('标签 preset 必须是 task / call / conn / free');
   }
   const { preset, order, note, num, id, dx, dy } = raw;
-  for (const key of ['border', 'color']) {
-    const supplied = typeof raw[key] === 'string' ? raw[key].toUpperCase() : raw[key];
-    if (supplied !== undefined && supplied !== LABEL_PRESETS[preset][key]) {
-      throw new Error(`${preset} 标签的 ${key} 由预设决定，请省略自定义配色`);
+  if (preset !== 'free') {
+    for (const key of ['border', 'color']) {
+      const supplied = typeof raw[key] === 'string' ? raw[key].toUpperCase() : raw[key];
+      if (supplied !== undefined && supplied !== LABEL_PRESETS[preset][key]) {
+        throw new Error(`${preset} 标签的 ${key} 由预设决定，请省略自定义配色`);
+      }
     }
   }
   let { text } = raw;
@@ -1082,6 +1090,7 @@ function normalizeAiLabel(raw) {
     throw new Error(`标签依据最多 ${LABEL_NOTE_MAX} 字`);
   }
   if (preset === 'task' && !text?.trim()) throw new Error('TASK 标签需要非空文字');
+  if (preset === 'free' && !text?.trim()) throw new Error('自由框标签需要非空文字');
   if (preset === 'call') {
     const textOrder = callLabelOrder(text?.trim());
     const n = order === undefined ? textOrder : order;
@@ -1090,9 +1099,15 @@ function normalizeAiLabel(raw) {
     }
     text = `コール順${n}`;
   }
-  // 复用预设配色，保留原有的标签标识和位置；コール順（call）标签不附带注释说明。
-  const cleanNote = preset === 'call' ? undefined : note;
-  return { preset, text, ...(cleanNote === undefined ? {} : { note: cleanNote }), ...(num === undefined ? {} : { num }), id, dx, dy };
+  // 复用预设配色，保留原有的标签标识和位置；コール順（call）和自由框（free）标签不附带注释说明。
+  const cleanNote = preset === 'call' || preset === 'free' ? undefined : note;
+  const style = preset === 'free'
+    ? {
+        ...(raw.border !== undefined ? { border: raw.border } : {}),
+        ...(raw.color !== undefined ? { color: raw.color } : {}),
+      }
+    : {};
+  return { preset, text, ...style, ...(cleanNote === undefined ? {} : { note: cleanNote }), ...(num === undefined ? {} : { num }), id, dx, dy };
 }
 
 function checkAiCallOrders(index, updates) {
@@ -1565,17 +1580,23 @@ function applyMcpTaskLabels({ items, merge = true }) {
       presetsByEdge.set(key, new Set());
     }
     const touched = presetsByEdge.get(key);
-    if (touched.has(label.preset)) throw new Error(`同一连线不得重复提交 ${label.preset} 标签：${key}`);
+    if (label.preset !== 'free' && touched.has(label.preset)) {
+      throw new Error(`同一连线不得重复提交 ${label.preset} 标签：${key}`);
+    }
     touched.add(label.preset);
     const labels = updates.get(key);
     const current = overlay.edges[key];
-    const old = normalizeLabels(current?.labels ?? current?.label).find((entry) => entry.preset === label.preset);
-    const replacement = { ...label, id: old?.id, dx: old?.dx, dy: old?.dy };
+    const currentLabels = normalizeLabels(current?.labels ?? current?.label);
+    const old = label.preset === 'free'
+      ? currentLabels.find((entry) => entry.preset === 'free' &&
+          ((label.id && entry.id === label.id) || entry.text === label.text))
+      : currentLabels.find((entry) => entry.preset === label.preset);
+    const replacement = { ...label, id: label.id ?? old?.id, dx: label.dx ?? old?.dx, dy: label.dy ?? old?.dy };
     if (label.preset === 'conn') replacement.num = old?.num ?? nextConnNumber(occupied);
     const next = normalizeLabel(replacement);
     occupied.push(next);
-    const position = labels.findIndex((entry) => entry.preset === label.preset);
-    const remaining = labels.filter((entry) => entry.preset !== label.preset);
+    const position = old ? labels.findIndex((entry) => entry.id === old.id) : -1;
+    const remaining = old ? labels.filter((entry) => entry.id !== old.id) : labels.slice();
     remaining.splice(position < 0 ? remaining.length : position, 0, next);
     updates.set(key, remaining);
   }
@@ -1678,17 +1699,35 @@ const bookmarkEventPayload = (b) => ({
   group: !!b.group,
   ...(b.groupMode === 'period' && { groupMode: b.groupMode }),
   vars: b.vars || [],
+  ...(Array.isArray(b.hiddenVars) && b.hiddenVars.length && { hiddenVars: b.hiddenVars }),
   expansions: b.expansions || [],
 });
 
-function saveBookmarkWithEvent(data, actor = 'user') {
+function saveBookmarkWithEvent(data, actor = 'user', { isForeground = true, action } = {}) {
   return store.transaction(() => {
     const prev = store.findBookmark(PROJECT.id, data.name);
     const result = store.saveBookmark(PROJECT.id, data);
+    const bm = result.bookmark;
+    const afterPayload = bookmarkEventPayload(bm);
+    const diff = prev ? diffViewScopes(prev, bm) : null;
+    const resolvedAction = action || (prev ? 'update' : 'create');
     store.appendEvent(PROJECT.id, {
-      op: 'bookmark.save', actor, target: result.bookmark.name,
+      op: 'bookmark.save',
+      actor,
+      target: bm.name,
       before: prev ? bookmarkEventPayload(prev) : null,
-      after: bookmarkEventPayload(result.bookmark),
+      after: {
+        ...afterPayload,
+        ...(isForeground ? { view: viewSnapshot(bm) } : {}),
+      },
+      ctx: {
+        bookmarkId: bm.id,
+        bookmarkName: bm.name,
+        revision: bm.revision || 1,
+        action: resolvedAction,
+        milestone: true,
+        ...(diff?.changed ? { diffSummary: diff.summary } : {}),
+      },
     });
     return result;
   });
@@ -4491,7 +4530,7 @@ export const server = http.createServer(async (req, res) => {
                   groupMode,
                   vars: bmVars,
                   expansions: bmExpansions,
-                }, 'ai');
+                }, 'ai', { isForeground: false });
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -4513,7 +4552,7 @@ export const server = http.createServer(async (req, res) => {
                 groupMode: composed.page.groupMode || 'file',
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
-              }, 'ai');
+              }, 'ai', { isForeground: false });
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
@@ -4624,7 +4663,9 @@ export const server = http.createServer(async (req, res) => {
             }
             const lineSuffix = Number.isInteger(Number(item.line)) && Number(item.line) > 0 ? `:${Number(item.line)}` : '';
             const edgeKey = `${from.resolved[0]}->${to.resolved[0]}${lineSuffix}`;
-            const dedupeKey = `${edgeKey}|${item.preset}`;
+            const dedupeKey = item.preset === 'free'
+              ? `${edgeKey}|${item.preset}|${item.text ?? ''}`
+              : `${edgeKey}|${item.preset}`;
             if (seenEdgePreset.has(dedupeKey)) continue;
             seenEdgePreset.add(dedupeKey);
             items.push({
@@ -4632,7 +4673,9 @@ export const server = http.createServer(async (req, res) => {
               preset: item.preset,
               ...(item.text !== undefined ? { text: String(item.text) } : {}),
               ...(item.order !== undefined ? { order: Number(item.order) } : {}),
-              ...(item.preset !== 'call' && item.note !== undefined ? { note: String(item.note) } : {}),
+              ...(item.preset === 'free' && item.border !== undefined ? { border: item.border } : {}),
+              ...(item.preset === 'free' && item.color !== undefined ? { color: item.color } : {}),
+              ...(item.preset !== 'call' && item.preset !== 'free' && item.note !== undefined ? { note: String(item.note) } : {}),
             });
           }
           assertActive();
@@ -4888,10 +4931,20 @@ export const server = http.createServer(async (req, res) => {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
             }
             const str = (v) => (typeof v === 'string' ? v : null);
+            const activeBookmark = isPlainObject(p.activeBookmark) && Number(p.activeBookmark.id) > 0
+              ? {
+                  id: Number(p.activeBookmark.id),
+                  name: String(p.activeBookmark.name || ''),
+                  revision: Number(p.activeBookmark.revision) || 1,
+                  ...(typeof p.activeBookmark.baseFingerprint === 'string'
+                    ? { baseFingerprint: p.activeBookmark.baseFingerprint } : {}),
+                }
+              : null;
             pageState = {
               ...viewSnapshot(p),
               projectId: PROJECT.id,
               ...(COMPARISON ? { comparisonId: COMPARISON.id } : {}),
+              activeBookmark,
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               reviewing,
@@ -4931,22 +4984,39 @@ export const server = http.createServer(async (req, res) => {
       if (p.revision !== undefined && p.revision !== (store.getSetting('ui.last-view.' + PROJECT.id)?.revision ?? 0)) {
         return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
       }
-      if (!['view.snapshot', 'view.clear'].includes(p.op) || !isPlainObject(p.view)) {
-        return bad(res, '画布事件需要 view.snapshot 或 view.clear，以及视图参数');
+      if (!['view.snapshot', 'view.clear', 'view.checkpoint'].includes(p.op) || !isPlainObject(p.view)) {
+        return bad(res, '画布事件需要 view.snapshot / view.clear / view.checkpoint，以及视图参数');
       }
       let view;
       try { view = viewSnapshot(p.view); } catch (err) { return bad(res, err.message); }
       if (p.label !== undefined && typeof p.label !== 'string') return bad(res, 'label 必须是文字');
       const label = p.label?.trim() ?? '';
       const latest = store.latestEventId(PROJECT.id);
-      if (isDeepStrictEqual(view, store.viewAt(PROJECT.id, latest))) {
+      const prevView = store.viewAt(PROJECT.id, latest);
+      if (p.op !== 'view.checkpoint' && isDeepStrictEqual(view, prevView)) {
         return json(res, { ok: true, deduplicated: true });
       }
+      const rawCtx = isPlainObject(p.ctx) ? p.ctx : {};
+      const checkpointName = typeof rawCtx.checkpointName === 'string' ? rawCtx.checkpointName.trim().slice(0, 80) : '';
+      const diff = prevView ? diffViewScopes(prevView, view) : null;
+      const ctx = {
+        ...(label && { label }),
+        ...(Number(rawCtx.bookmarkId) > 0 && { bookmarkId: Number(rawCtx.bookmarkId) }),
+        ...(typeof rawCtx.bookmarkName === 'string' && rawCtx.bookmarkName.trim() && { bookmarkName: rawCtx.bookmarkName.trim().slice(0, 80) }),
+        ...(checkpointName && { checkpointName }),
+        ...(typeof rawCtx.diffSummary === 'string' && rawCtx.diffSummary.trim()
+          ? { diffSummary: rawCtx.diffSummary.trim().slice(0, 120) }
+          : (diff?.changed ? { diffSummary: diff.summary } : {})),
+        ...(p.op === 'view.checkpoint' || rawCtx.milestone ? { milestone: 1 } : {}),
+      };
       const eventId = store.appendEvent(PROJECT.id, {
-        op: p.op, actor: 'user', target: label || view.roots[0] || '', after: { view },
-        ctx: label ? { label } : null,
+        op: p.op,
+        actor: 'user',
+        target: checkpointName || label || ctx.bookmarkName || view.roots[0] || '',
+        after: { view },
+        ctx: Object.keys(ctx).length ? ctx : null,
       });
-      broadcastChange(p.op, 'user');
+      broadcastChange(p.op, 'user', { eventId, ...(ctx.bookmarkId ? { bookmarkId: ctx.bookmarkId } : {}) });
       return json(res, { ok: true, eventId });
     }
 
@@ -5037,6 +5107,7 @@ export const server = http.createServer(async (req, res) => {
         clangStatus,
         activeProfileId,
         strictCompileCommands,
+        dispatchPolicy: configuredDispatchPolicy(scanRoot),
         compileCommandsPath: customCompileCommandsPath,
         detectedCompileCommands,
         totalSourceFiles: scan.files.filter((f) => !f.isHeader).length,
@@ -5061,9 +5132,14 @@ export const server = http.createServer(async (req, res) => {
           clangBin,
           strictCompileCommands,
           compileCommandsPath,
+          dispatchPolicy,
           exportCompileCommands,
           exportPath,
         } = body || {};
+
+        if (dispatchPolicy !== undefined && !['expand', 'strict'].includes(dispatchPolicy)) {
+          return bad(res, 'dispatchPolicy 必须是 expand 或 strict');
+        }
 
         if (clangBin !== undefined && (typeof clangBin !== 'string' || clangBin.includes('\0'))) {
           return bad(res, 'clangBin 必须是有效的可执行文件路径');
@@ -5138,14 +5214,18 @@ export const server = http.createServer(async (req, res) => {
           return json(res, { ok: false, error: clangStatus.reason || 'Clang 不可用', clangStatus }, 400);
         }
 
+        const nextDispatchPolicy = dispatchPolicy !== undefined
+          ? (dispatchPolicy === 'strict' ? 'strict' : 'expand')
+          : configuredDispatchPolicy(scanRoot);
         const nextParserOptions = nextParserId === 'clang-ast'
           ? {
               compileCommandsPath: nextDbPath,
               strictCompileCommands: nextStrict,
+              dispatchPolicy: nextDispatchPolicy,
               ...(nextClangBin ? { clangBin: nextClangBin } : {}),
               ...(nextProfileId ? { buildProfileId: nextProfileId } : {}),
             }
-          : { ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
+          : { dispatchPolicy: nextDispatchPolicy, ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
 
         const { stats: st } = await openTarget(root, {
           selection: {
@@ -5156,6 +5236,7 @@ export const server = http.createServer(async (req, res) => {
               buildProfileId: nextProfileId,
               strictCompileCommands: nextStrict,
               compileCommandsPath: nextDbPath,
+              dispatchPolicy: nextDispatchPolicy,
             },
           },
         });
@@ -5167,6 +5248,7 @@ export const server = http.createServer(async (req, res) => {
           activeParser: MODEL.parserId,
           activeProfileId: nextProfileId,
           strictCompileCommands: nextStrict,
+          dispatchPolicy: nextDispatchPolicy,
           clangBin: nextClangBin,
           clangStatus,
           parser: parserInfo(),
@@ -5570,9 +5652,15 @@ export const server = http.createServer(async (req, res) => {
         readJson(req, res)
           .then((p) => {
             try {
-              // 状态 + 事件同一个事务：崩溃时要么都进库、要么都不进，
-              // 不会出现「书签改了但时间轴没记」这种回放对不上的状态
-              const r = saveBookmarkWithEvent(p);
+              if (p.createOnly && store.findBookmark(PROJECT.id, p.name)) {
+                return json(res, { ok: false, error: '已存在同名书签，请换个名称或选择更新已有书签' }, 409);
+              }
+              const r = saveBookmarkWithEvent(p, 'user', { isForeground: p.foreground !== false });
+              broadcastChange('bookmark.save', 'user', {
+                bookmark: r.bookmark,
+                projectId: PROJECT.id,
+                clientId: req.headers['x-callgraph-client'],
+              });
               json(res, { ok: true, ...r });
             } catch (err) {
               bad(res, String(err.message || err));
@@ -5583,6 +5671,55 @@ export const server = http.createServer(async (req, res) => {
           });
         return;
       }
+    }
+
+    if (u.pathname === '/api/bookmarks/update' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const id = Number(p.id);
+          if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          try {
+            const out = store.transaction(() => {
+              const resUpdate = store.updateBookmarkById(PROJECT.id, id, p, p.expectedRevision);
+              if (!resUpdate) return { notFound: true };
+              if (resUpdate.conflict) return { conflict: true, current: resUpdate.current };
+              const bm = resUpdate.bookmark;
+              const diff = diffViewScopes(resUpdate.prev, bm);
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.save',
+                actor: 'user',
+                target: bm.name,
+                before: bookmarkEventPayload(resUpdate.prev),
+                after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
+                ctx: {
+                  bookmarkId: bm.id,
+                  bookmarkName: bm.name,
+                  action: 'update',
+                  milestone: true,
+                  ...(diff.changed ? { diffSummary: diff.summary } : {}),
+                },
+              });
+              return { bookmark: bm };
+            });
+            if (out.notFound) return json(res, { ok: false, error: '找不到该书签' }, 404);
+            if (out.conflict) {
+              return json(res, { ok: false, conflict: true, bookmark: out.current, error: '该书签已被其他窗口修改' }, 409);
+            }
+            broadcastChange('bookmark.save', 'user', {
+              bookmark: out.bookmark,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
+            });
+            json(res, { ok: true, bookmark: out.bookmark });
+          } catch (err) {
+            bad(res, String(err.message || err));
+          }
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
     }
 
     if (u.pathname === '/api/bookmarks/rename' && req.method === 'POST') {
@@ -5601,8 +5738,14 @@ export const server = http.createServer(async (req, res) => {
                 target: bookmark.name,
                 before: prev ? bookmarkEventPayload(prev) : null,
                 after: bookmarkEventPayload(bookmark),
+                ctx: { bookmarkId: bookmark.id, bookmarkName: bookmark.name, action: 'rename', milestone: true },
               });
               return bookmark;
+            });
+            broadcastChange('bookmark.rename', 'user', {
+              bookmark: result,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
             });
             json(res, { ok: true, bookmark: result });
           } catch (err) {
@@ -5621,8 +5764,10 @@ export const server = http.createServer(async (req, res) => {
         .then((p) => {
           const id = Number(p.id);
           if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          let deletedBm = null;
           const ok = store.transaction(() => {
             const gone = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
+            deletedBm = gone || null;
             const ok = store.deleteBookmark(PROJECT.id, id);
             // 删掉的整份内容进 before，将来要按事件重建才不至于只剩个名字
             if (ok) {
@@ -5630,10 +5775,19 @@ export const server = http.createServer(async (req, res) => {
                 op: 'bookmark.delete',
                 target: gone?.name || `#${id}`,
                 before: gone ? bookmarkEventPayload(gone) : null,
+                ctx: { ...(gone?.id && { bookmarkId: gone.id }), bookmarkName: gone?.name || `#${id}`, action: 'delete', milestone: true },
               });
             }
             return ok;
           });
+          if (ok) {
+            broadcastChange('bookmark.delete', 'user', {
+              bookmarkId: id,
+              bookmarkName: deletedBm?.name || null,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
+            });
+          }
           json(res, { ok, removed: ok ? 1 : 0 });
         })
         .catch((err) => {
@@ -5646,6 +5800,7 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/session/export') {
       const withEvents = u.searchParams.get('events') !== '0';
       const eventsTotal = store.countEvents(PROJECT.id);
+      const savedPage = store.getSetting('ui.last-view.' + PROJECT.id);
       const payload = {
         format: 'tcu-callgraph-session',
         version: 1,
@@ -5660,6 +5815,7 @@ export const server = http.createServer(async (req, res) => {
         overlay: store.loadOverlay(PROJECT.id),
         manualNodes: loadManualNodes(PROJECT.id),
         bookmarks: store.listBookmarks(PROJECT.id),
+        ...(savedPage ? { lastView: viewSnapshot(savedPage), activeBookmark: savedPage.activeBookmark || null } : {}),
         events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
         eventsTotal,
         eventsTruncated: withEvents && eventsTotal > 5000,
@@ -5796,6 +5952,7 @@ export const server = http.createServer(async (req, res) => {
             store.appendEvent(PROJECT.id, {
               op: 'session.import',
               target: p.project?.name || 'session',
+              ctx: { milestone: 1, action: 'import' },
               after: {
                 ...store.loadOverlay(PROJECT.id),
                 manualNodes: manualNodesMap(reconciled.list),
@@ -5839,13 +5996,17 @@ export const server = http.createServer(async (req, res) => {
       const beforeId = Number(u.searchParams.get('before') || 0) || 0;
       const ops = (u.searchParams.get('ops') || '').split(',').filter(Boolean);
       const query = (u.searchParams.get('q') || '').trim();
+      const level = (u.searchParams.get('level') || '').trim();
+      const bookmarkId = u.searchParams.get('bookmarkId');
       const withPayload = u.searchParams.get('detail') === '1';
       // 多取一条用来判断还有没有下一页，避免 count 和分页对不上
-      const rows = store.listEventsPage(PROJECT.id, { limit: limit + 1, beforeId, ops, q: query, withPayload: true });
+      const rows = store.listEventsPage(PROJECT.id, {
+        limit: limit + 1, beforeId, ops, q: query, level, bookmarkId, withPayload: true,
+      });
       const hasMore = rows.length > limit;
       return json(res, {
         latest: store.latestEventId(PROJECT.id),
-        total: store.countEvents(PROJECT.id, { ops, q: query }),
+        total: store.countEvents(PROJECT.id, { ops, q: query, level, bookmarkId }),
         hasMore,
         events: rows.slice(0, limit).map((event) => timelineEvent(event, withPayload)),
       });

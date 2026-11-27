@@ -432,3 +432,37 @@ test('store：同一路径不同大小写认成同一个工程（Windows 大小�
   assert.equal(b.id, a.id, '大小写不同不应新建工程');
   assert.equal(s.listProjects().length, 1, '工程表里只应有一条');
 });
+
+test('store：v6 书签支持 hiddenVars / revision 乐观锁与 milestone / bookmarkId 事件过滤', (t) => {
+  const s = tmpStore(t);
+  assert.equal(s.version, 6);
+  const p = s.upsertProject({ path: PROJ_A, name: 'alpha' });
+  const r1 = s.saveBookmark(p.id, { name: '链路A', roots: ['a.c::f1'], hiddenVars: ['var::v1'], vars: ['var::v2'] });
+  assert.equal(r1.bookmark.revision, 1);
+  assert.deepEqual(r1.bookmark.hiddenVars, ['var::v1']);
+
+  const u1 = s.updateBookmarkById(p.id, r1.bookmark.id, { roots: ['a.c::f1', 'a.c::f2'], hiddenVars: [] }, 1);
+  assert.equal(u1.conflict, false);
+  assert.equal(u1.bookmark.revision, 2);
+  assert.deepEqual(u1.bookmark.roots, ['a.c::f1', 'a.c::f2']);
+  assert.deepEqual(u1.bookmark.hiddenVars, []);
+
+  const conflict = s.updateBookmarkById(p.id, r1.bookmark.id, { roots: ['a.c::f3'] }, 1);
+  assert.equal(conflict.conflict, true);
+  assert.equal(conflict.current.revision, 2);
+
+  s.appendEvent(p.id, { op: 'node.annotate', target: 'a.c::f1', after: { note: '细粒度改动' } });
+  s.appendEvent(p.id, {
+    op: 'view.checkpoint',
+    target: '确认初版',
+    after: { view: { roots: ['a.c::f1'], expansions: [], up: 1, down: 1, group: true, groupMode: 'file', vars: [], hiddenVars: [] } },
+    ctx: { bookmarkId: r1.bookmark.id, bookmarkName: '链路A', checkpointName: '确认初版', milestone: 1 },
+  });
+  const milestones = s.listEventsPage(p.id, { level: 'milestone' });
+  assert.equal(milestones.length, 1);
+  assert.equal(milestones[0].op, 'view.checkpoint');
+  assert.equal(milestones[0].ctx?.checkpointName, '确认初版');
+  const scoped = s.listEventsPage(p.id, { bookmarkId: r1.bookmark.id });
+  assert.equal(scoped.length, 1);
+  assert.equal(s.countEvents(p.id, { level: 'milestone', bookmarkId: r1.bookmark.id }), 1);
+});
