@@ -333,10 +333,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     const variants = headerVariants.get(file.rel);
     let variant = variants.get(key);
     if (!variant) {
-      variant = { callsByName: new Map(), sources: new Set() };
+      variant = { callsByName: new Map(), sources: new Set(), functionLines: new Set() };
       variants.set(key, variant);
       for (const fn of findFunctions(tokens, file.rel)) {
         const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+        for (const token of body) variant.functionLines.add(token.line);
         const calls = [];
         scanCalls(body, { macros, enumValues }, calls);
         recordFunctionCalls({ fn, calls }, body, macros);
@@ -768,6 +769,28 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       writtenSlots.get(table).push({ ...write, file: fn.file, fnId: fn.id });
     }
   }
+  // 头文件 static 对象在每个翻译单元有独立实例。头函数的一个图节点可以代表多个实例。
+  const unitsByHeader = new Map();
+  const writesForCall = (table, file, call) => {
+    const writes = writtenSlots.get(table);
+    if (!writes?.length || !table.isStatic || !headerPaths.has(table.file)) return writes;
+    let units = [file];
+    if (headerPaths.has(file)) {
+      const variants = headerVariants.get(file);
+      if (call.sourceFiles) units = [...call.sourceFiles];
+      else if (variants) units = [...variants.values()].filter(v => v.functionLines.has(call.line)).flatMap(v => [...v.sources]);
+      else {
+        if (!unitsByHeader.has(file)) unitsByHeader.set(file, sources.filter(s => includesHeader(s.rel, file)).map(s => s.rel));
+        units = unitsByHeader.get(file);
+        if (!units.length) return writes; // 独立头文件缺少包含者，保留可能的写入。
+      }
+    }
+    return writes.filter(w => {
+      const variants = headerVariants.get(w.file);
+      if (variants) return [...variants.values()].some(v => v.functionLines.has(w.line) && units.some(unit => v.sources.has(unit)));
+      return units.some(unit => unit === w.file || includesHeader(unit, w.file));
+    });
+  };
   // 索引 typedef / struct tag 同名别名，支持 `const Ops *p; p->step()` 按结构体类型+字段解析。
   const recordTypeKeys = (rawType, file, at) => {
     if (!rawType) return [];
@@ -901,7 +924,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         for (const source of sources) {
           const resolvedTarget = resolveCallee(call.callee, fn.file, source);
           const key = JSON.stringify([call.line, call.col, call.kind, resolvedTarget]);
-          if (!direct.has(key)) direct.set(key, { ...call, resolvedTarget });
+          if (!direct.has(key)) direct.set(key, { ...call, resolvedTarget, sourceFiles: new Set() });
+          direct.get(key).sourceFiles.add(source);
         }
       }
     }
@@ -931,7 +955,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
                 }
               }
               const loop = loops?.find(({ start, end }) => compareLocation(start, call) <= 0 && compareLocation(call, end) <= 0);
-              for (const w of (writtenSlots.get(tbl) || [])) {
+              for (const w of (writesForCall(tbl, fn.file, call) || [])) {
                 if (w.path.length) continue;
                 // 同一循环内靠后的写入可能经回边到达下一轮调用。
                 if (w.fnId === fn.id && compareLocation(w, call) >= 0 && (!loop || compareLocation(w, loop.end) > 0)) continue;
@@ -1005,11 +1029,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       let hasSlotWrite = false;
       for (const source of sources) {
         if (!source.table) continue;
-        let writes = writtenSlots.get(source.table);
-        if (writes && source.table.isStatic && headerPaths.has(source.table.file) && !headerPaths.has(fn.file)) {
-          // 头文件里的 static 对象在每个翻译单元有独立实例。
-          writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
-        }
+        const writes = writesForCall(source.table, fn.file, call);
         if (possiblyWritten(writes, source.path) || (aliasBinding?.alias && source.path.includes(null))) {
           uncertain = true;
           hasSlotWrite = true;
@@ -1249,9 +1269,9 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:28';
+    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:29';
     return JSON.stringify([
-      'builtin:28',
+      'builtin:29',
       policy,
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,

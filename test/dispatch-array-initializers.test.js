@@ -494,3 +494,69 @@ test('C 整数下标保留可移植运算，遇到转换、溢出或不支持的
     assert.equal(parseConstIndex(lex(expr)), null, expr);
   }
 });
+
+test('内置分派按翻译单元隔离头文件 static 回调写入，保留公共回调', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-header-callback-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const files = {
+    'shared.h': [
+      '#ifndef SHARED_H', '#define SHARED_H', 'typedef void (*Fn)(void);',
+      'void first(void); void second(void); void third(void); void fourth(void); void from_header(void);',
+      'static Fn cb = first;', 'static Fn slots[] = {first};', 'extern Fn public_cb;', '#endif',
+    ],
+    'read.h': ['#include "shared.h"', 'static inline void hread(void) { cb(); }',
+      'static inline void harray(void) { slots[0](); }'],
+    'include_read.h': ['#include "read.h"'],
+    'write.h': ['#include "shared.h"', 'static inline void hwrite(void) { cb = from_header; slots[0] = from_header; }'],
+    'a.c': ['#include "read.h"', '#include "write.h"',
+      'void awrite(void) { cb = second; slots[0] = second; public_cb = second; hwrite(); }',
+      'void aread(void) { cb(); }'],
+    'b.c': ['#include "include_read.h"', 'void bread(void) { cb(); }', 'void barray(void) { slots[0](); }',
+      'void public_read(void) { public_cb(); }'],
+    'c.c': ['#include "shared.h"', 'void cwrite(void) { cb = third; slots[0] = third; public_cb = third; }',
+      'void cread(void) { cb(); }'],
+    'd.c': ['#include "include_read.h"', 'void dwrite(void) { cb = fourth; slots[0] = fourth; }'],
+    'conditional.h': ['#include "shared.h"', 'static inline void profile_set(void) {', '#ifdef WRITER',
+      'cb = third;', '#endif', '}', 'static inline void profile_read(void) {', '#ifndef WRITER', 'cb();', '#endif', '}'],
+    'p.c': ['#define WRITER 1', '#include "conditional.h"', 'void pread(void) { cb(); }'],
+    'q.c': ['#include "conditional.h"', 'void qread(void) { cb(); }'],
+    'targets.c': ['#include "shared.h"', 'Fn public_cb = first;',
+      'void first(void) {} void second(void) {} void third(void) {} void fourth(void) {} void from_header(void) {}'],
+  };
+  for (const [name, lines] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), lines.join('\n'));
+  for (const defines of [[], ['BUILD=1']]) {
+    const label = defines.length ? '构建配置' : '默认扫描';
+    const m = loadModel(dir, { parserOptions: { defines, dispatchPolicy: 'expand' } });
+    const check = (caller, expected) => {
+      const edges = (m._index.outAdj.get(caller) || []).filter(e => e.kind === 'fnptr');
+      assert.deepEqual([...new Set(edges.map(e => e.to))].sort(), expected.map(n => 'targets.c::' + n).sort(), caller);
+      for (const site of m.indirectCalls.filter(s => s.caller === caller)) {
+        assert.deepEqual([...new Set(site.candidates.map(c => c.name))].sort(), [...expected].sort(), caller);
+      }
+    };
+    await t.test(label + ' 无写入的源文件只看到自己初始化的标量回调', () => check('b.c::bread', ['first']));
+    await t.test(label + ' 本文件和包含的头函数可以写自己的实例', () => {
+      check('a.c::aread', ['first', 'second', 'from_header']);
+      check('c.c::cread', ['first', 'third']);
+    });
+    await t.test(label + ' 头文件调用点合并多个直接或间接包含者的合法写入', () =>
+      check('read.h::hread', ['first', 'second', 'fourth', 'from_header']));
+    await t.test(label + ' 数组也只匹配有共同翻译单元的写入', () => {
+      check('b.c::barray', ['first']);
+      check('read.h::harray', ['first', 'second', 'fourth', 'from_header']);
+    });
+    await t.test(label + ' extern 声明绑定到各翻译单元共享的定义', () =>
+      check('b.c::public_read', ['first', 'second', 'third']));
+    await t.test(label + ' 严格模式维持标量策略，其他实例的写入不影响固定数组槽', () => {
+      const strict = loadModel(dir, { parserOptions: { defines, dispatchPolicy: 'strict' } });
+      const pointers = caller => (strict._index.outAdj.get(caller) || []).filter(e => e.kind === 'fnptr');
+      for (const caller of ['a.c::aread', 'b.c::bread', 'read.h::hread']) assert.deepEqual(pointers(caller), []);
+      assert.deepEqual(pointers('b.c::barray').map(e => [e.callee, e.resolution]), [['first', 'exact']]);
+    });
+    if (defines.length) await t.test('构建配置按各翻译单元实际启用的头文件调用和写入判断', () => {
+      check('p.c::pread', ['first', 'third']);
+      check('q.c::qread', ['first']);
+      check('conditional.h::profile_read', ['first']);
+    });
+  }
+});

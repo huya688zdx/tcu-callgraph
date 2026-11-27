@@ -1833,6 +1833,30 @@ function saveBookmarkWithEvent(data, actor = 'user', { isForeground = true, acti
   });
 }
 
+function updateBookmarkWithEvent(id, patch, actor, expectedRevision) {
+  return store.transaction(() => {
+    const result = store.updateBookmarkById(PROJECT.id, id, patch, expectedRevision);
+    if (!result || result.conflict) return result;
+    const bm = result.bookmark;
+    const diff = diffViewScopes(result.prev, bm);
+    store.appendEvent(PROJECT.id, {
+      op: 'bookmark.save',
+      actor,
+      target: bm.name,
+      before: bookmarkEventPayload(result.prev),
+      after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
+      ctx: {
+        bookmarkId: bm.id,
+        bookmarkName: bm.name,
+        action: 'update',
+        milestone: true,
+        ...(diff.changed ? { diffSummary: diff.summary } : {}),
+      },
+    });
+    return result;
+  });
+}
+
 /** 本机来源白名单：Electron / 浏览器都用 127.0.0.1 或 localhost 打开 */
 const LOCAL_ORIGIN = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/;
 
@@ -5548,7 +5572,7 @@ export const server = http.createServer(async (req, res) => {
             const id = Number(args.id);
             if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'update 需要提供有效的书签 id' };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
-            const resUp = store.updateBookmarkById(PROJECT.id, id, viewSnapshot(page));
+            const resUp = updateBookmarkWithEvent(id, viewSnapshot(page), 'ai');
             if (!resUp) return { ok: false, error: '找不到指定书签' };
             recordBookmarkWrite(resUp);
             broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
@@ -6825,29 +6849,8 @@ export const server = http.createServer(async (req, res) => {
           const id = Number(p.id);
           if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
           try {
-            const out = store.transaction(() => {
-              const resUpdate = store.updateBookmarkById(PROJECT.id, id, p, p.expectedRevision);
-              if (!resUpdate) return { notFound: true };
-              if (resUpdate.conflict) return { conflict: true, current: resUpdate.current };
-              const bm = resUpdate.bookmark;
-              const diff = diffViewScopes(resUpdate.prev, bm);
-              store.appendEvent(PROJECT.id, {
-                op: 'bookmark.save',
-                actor: 'user',
-                target: bm.name,
-                before: bookmarkEventPayload(resUpdate.prev),
-                after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
-                ctx: {
-                  bookmarkId: bm.id,
-                  bookmarkName: bm.name,
-                  action: 'update',
-                  milestone: true,
-                  ...(diff.changed ? { diffSummary: diff.summary } : {}),
-                },
-              });
-              return { bookmark: bm };
-            });
-            if (out.notFound) return json(res, { ok: false, error: '找不到该书签' }, 404);
+            const out = updateBookmarkWithEvent(id, p, 'user', p.expectedRevision);
+            if (!out) return json(res, { ok: false, error: '找不到该书签' }, 404);
             if (out.conflict) {
               return json(res, { ok: false, conflict: true, bookmark: out.current, error: '该书签已被其他窗口修改' }, 409);
             }

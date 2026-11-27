@@ -3110,3 +3110,144 @@ test('浏览器切换工程清理导览并隔离之前发出的视觉响应', as
     assert.deepEqual(await br.evaluate(visual), { ...cleared, overlay: 'highlight' });
   });
 });
+
+test('AI 按 ID 更新书签时原子保存项目内的书签里程碑', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  let ids;
+  const { post, run } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'tool' ? [] :
+    ids.map(id => ['manage_bookmarks', { action: 'update', id }]));
+  const update = (...values) => { ids = values; return run('请用当前画布更新指定书签'); };
+  const get = route => fetch(srv.baseUrl + route).then(r => r.json());
+  const project = await get('/api/project');
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(project.db);
+  t.after(() => db.close());
+  const before = { roots: ['main.c::main'], up: 1, down: 3, groupMode: 'period', group: true,
+    vars: ['var::old'], hiddenVars: ['var::hidden'], expansions: [{ root: 'gear.c::Gear_Init', up: 0, down: 1 }] };
+  const after = { roots: ['gear.c::Gear_Apply'], up: 0, down: 2, groupMode: 'flat', group: false,
+    vars: ['var::new'], hiddenVars: ['var::other'], expansions: [{ root: 'gear.c::Gear_Init', up: 1, down: 2 }] };
+  const create = async name => (await (await post('/api/bookmarks', { ...before, name })).json()).bookmark;
+  const recorded = await create('保存证据'), twice = await create('同轮覆盖'), rejected = await create('事务回滚');
+  const list = async () => (await get('/api/bookmarks')).list;
+  const events = async id => (await get('/api/events?detail=1&ops=bookmark.save&bookmarkId=' + id)).events;
+  assert.ok((await (await post('/api/page', after)).json()).ok);
+  const stream = await fetch(srv.baseUrl + '/api/stream', { signal: AbortSignal.timeout(30000) });
+  const reader = stream.body.getReader();
+  t.after(() => reader.cancel().catch(() => {}));
+  await reader.read();
+
+  await t.test('全局和书签时间线记录同一个 AI 事件，SQLite 保留完整快照', async () => {
+    const turn = await update(recorded.id);
+    assert.equal(turn.find(e => e.type === 'tool_end')?.ok, true);
+    const all = (await get('/api/events?detail=1')).events;
+    const found = all.filter(e => e.actor === 'ai' && e.op === 'bookmark.save' && e.ctx.bookmarkId === recorded.id);
+    assert.equal(found.length, 1);
+    const [e] = found;
+    assert.equal(e.target, recorded.name);
+    assert.equal(e.ctx.bookmarkName, recorded.name);
+    assert.equal(e.ctx.action, 'update');
+    assert.equal(e.ctx.milestone, true);
+    assert.match(e.ctx.diffSummary, /Gear_Apply/);
+    assert.deepEqual(e.before, { name: recorded.name, ...before });
+    const { groupMode, ...afterScope } = after;
+    assert.deepEqual(e.after, { name: recorded.name, ...afterScope, view: { ...afterScope, groupMode, empty: false } });
+    const timeline = (await get('/api/events?level=milestone&bookmarkId=' + recorded.id)).events;
+    const item = timeline.find(entry => entry.id === e.id);
+    assert.equal(item?.brief.action, 'update');
+    assert.equal(item.brief.diffSummary, e.ctx.diffSummary);
+    assert.equal((await events(twice.id)).some(entry => entry.id === e.id), false);
+    const stored = db.prepare('SELECT project_id, after FROM event WHERE id = ?').get(e.id);
+    assert.equal(stored.project_id, project.id);
+    assert.deepEqual(JSON.parse(stored.after), e.after);
+  });
+
+  await t.test('同轮两次更新可一次撤销，未改变的范围不生成差异摘要', async () => {
+    const initial = await events(twice.id);
+    const turn = await update(twice.id, twice.id);
+    assert.deepEqual(turn.filter(e => e.type === 'tool_end').map(e => e.ok), [true, true]);
+    const changes = turn.filter(e => e.type === 'changeset');
+    assert.equal(changes.length, 1);
+    const history = (await events(twice.id)).filter(e => e.actor === 'ai');
+    const saved = (await list()).find(b => b.id === twice.id);
+    assert.equal(saved.revision, twice.revision + 2);
+    const stale = await post('/api/bookmarks/update', { id: twice.id, expectedRevision: twice.revision, down: 9 });
+    assert.equal(stale.status, 409);
+    assert.equal((await post('/api/ai/undo-changeset', { changesetId: changes[0].changesetId })).status, 200);
+    const restored = (await list()).find(b => b.id === twice.id);
+    assert.deepEqual({ ...restored, revision: twice.revision, updatedAt: twice.updatedAt }, twice);
+    assert.equal(history.length, 2);
+    assert.equal(history[0].ctx.diffSummary, undefined);
+    assert.ok(history[1].ctx.diffSummary);
+    assert.deepEqual((await events(twice.id)).map(e => e.id), [...history, ...initial].map(e => e.id));
+  });
+
+  await t.test('事件写入失败时回滚书签，缺失 ID 也不产生历史或撤销项', async () => {
+    const initial = await events(rejected.id);
+    db.exec("CREATE TRIGGER reject_ai_update BEFORE INSERT ON event WHEN NEW.actor='ai' AND NEW.op='bookmark.save' BEGIN SELECT RAISE(ABORT,'update event failed'); END");
+    let failed;
+    try { failed = await update(rejected.id); } finally { db.exec('DROP TRIGGER reject_ai_update'); }
+    const missing = await update(999999), noId = await update(undefined);
+    assert.equal((await post('/api/bookmarks/update', { id: 999999, down: 1 })).status, 404);
+    for (const turn of [missing, noId, failed]) {
+      assert.equal(turn.find(e => e.type === 'tool_end')?.ok, false);
+      assert.ok(!turn.some(e => e.type === 'changeset'));
+    }
+    assert.deepEqual((await list()).find(b => b.id === rejected.id), rejected);
+    assert.deepEqual(await events(rejected.id), initial);
+    assert.deepEqual(await events(999999), []);
+  });
+
+  await t.test('成功更新每次广播一次，失败操作没有广播', async () => {
+    // 已提交的改名事件作为 SSE 边界，不靠睡眠来断言没有额外广播。
+    const marker = await post('/api/bookmarks/rename', { id: rejected.id, name: '广播边界' });
+    assert.ok(marker.ok);
+    const decoder = new TextDecoder();
+    const received = [];
+    let pending = '';
+    while (!received.some(e => e.op === 'bookmark.rename')) {
+      const { value, done } = await reader.read();
+      assert.equal(done, false);
+      pending += decoder.decode(value, { stream: true });
+      const frames = pending.split('\n\n');
+      pending = frames.pop();
+      for (const frame of frames) {
+        const line = frame.split('\n').find(l => l.startsWith('data: '));
+        if (line) received.push(JSON.parse(line.slice(6)));
+      }
+    }
+    const writes = received.filter(e => e.op === 'bookmark.save' && e.actor === 'ai');
+    assert.deepEqual(writes.map(e => [e.projectId, e.bookmark.id]), [
+      [project.id, recorded.id], [project.id, twice.id], [project.id, twice.id],
+    ]);
+  });
+
+  await t.test('浏览器在仅当前书签的时间线显示 AI 更新和范围摘要', async browserTest => {
+    try { resolveChromePath(); } catch (err) { browserTest.skip(err.message); return; }
+    const br = await launchCdp({ url: srv.baseUrl });
+    browserTest.after(() => br.close());
+    await br.waitFor('Boolean(window.__cg?.view)');
+    await br.evaluate("document.getElementById('bookmarkBtn').click()");
+    await br.waitFor("Boolean(document.querySelector('.bm-open'))");
+    await br.evaluate("[...document.querySelectorAll('.bm')].find(b => b.querySelector('.nm').textContent.trim() === '保存证据').querySelector('.bm-open').click()");
+    await br.waitFor("(async () => (await import('/lib/state.js')).state.activeBookmark?.id === " + recorded.id + ")()");
+    await br.evaluate("document.getElementById('timelineBtn').click()");
+    await br.waitFor("document.getElementById('timelineList').textContent.includes('广播边界')");
+    await br.evaluate("document.getElementById('tlScopeBookmark').click()");
+    await br.waitFor("document.getElementById('tlScopeBookmark').checked && document.getElementById('timelineList').textContent.includes('保存证据') && !document.getElementById('timelineList').textContent.includes('广播边界')");
+    const rows = await br.evaluate("[...document.querySelectorAll('#timelineList .ev')].filter(e => e.querySelector('.ai-badge')).map(e => e.textContent)");
+    assert.equal(rows.length, 1);
+    assert.match(rows[0], /保存证据/);
+    assert.match(rows[0], /更新书签.*Gear_Apply/s);
+  });
+
+  await t.test('切换项目后旧书签 ID 不属于新项目', async () => {
+    const changed = await (await post('/api/switch', { path: path.resolve('samples/deep') })).json();
+    assert.ok(changed.ok, changed.error);
+    const turn = await update(recorded.id);
+    assert.equal(turn.find(e => e.type === 'tool_end')?.ok, false);
+    assert.ok(!turn.some(e => e.type === 'changeset'));
+    assert.deepEqual(await events(recorded.id), []);
+    assert.deepEqual(await list(), []);
+  });
+});
