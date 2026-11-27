@@ -54,7 +54,7 @@ const OP_KIND = {
 };
 
 /** 面板状态：默认展示「关键节点」（milestone） */
-const tl = { events: [], ops: [], level: 'milestone', bookmarkId: null, q: '', hasMore: false, total: 0, loading: false, seq: 0 };
+const tl = { events: [], ops: [], level: '', bookmarkId: null, q: '', hasMore: false, total: 0, loading: false, seq: 0 };
 
 const pad = (n) => String(n).padStart(2, '0');
 const hhmm = (ts) => {
@@ -249,7 +249,7 @@ function setCount() {
 }
 
 /** 拉一页。append=true 时接着上一页往后取（游标 = 已加载的最后一条 id） */
-async function load({ append = false } = {}) {
+async function load({ append = false, allowFallback = true } = {}) {
   if (reviewSessionChanged) return;
   if (append && tl.loading) return;
   tl.loading = true;
@@ -271,6 +271,13 @@ async function load({ append = false } = {}) {
     }
   } finally {
     if (seq === tl.seq) tl.loading = false;
+  }
+  if (!append && allowFallback && tl.level === 'milestone' && !tl.ops.length && !tl.q && !tl.bookmarkId && tl.total === 0) {
+    tl.level = '';
+    chipsEl?.querySelectorAll('button').forEach((c) => {
+      c.classList.toggle('on', !c.dataset.level && !c.dataset.ops);
+    });
+    return load({ append: false, allowFallback: false });
   }
   setCount();
   renderAll();

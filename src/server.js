@@ -25,6 +25,7 @@ import { analysisJob, analysisModel } from './core/analysis-jobs.js';
 import { createMcpServer } from './mcp.js';
 import {
   DEFAULT_AI_CONFIG,
+  SUBAGENT_READONLY_TOOLS,
   compactConversation,
   listModels as listAiModels,
   normalizeAiConfig,
@@ -258,6 +259,31 @@ function broadcastChange(op, actor, extra = {}) {
     } catch {
       sseClients.delete(res);
     }
+  }
+}
+
+/** 向指定浏览器客户端（或全员）推送非持久化的轻量视觉叠加事件（如 AI 导览高亮 / 数据流动画）。 */
+function sendClientEvent(clientId, event, data = {}) {
+  if (!sseClients.size) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, ts: Date.now() })}\n\n`;
+  for (const res of sseClients) {
+    if (clientId && res._clientId !== clientId) continue;
+    try {
+      writeSse(res, payload);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+const aiChangesets = new Map();
+function saveAiChangeset(entry) {
+  if (!entry?.id) return;
+  if (aiChangesets.has(entry.id)) aiChangesets.delete(entry.id);
+  aiChangesets.set(entry.id, entry);
+  while (aiChangesets.size > 20) {
+    const oldest = aiChangesets.keys().next().value;
+    aiChangesets.delete(oldest);
   }
 }
 
@@ -2606,8 +2632,105 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (u.pathname === '/api/ai/undo-changeset' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      if (COMPARISON) return bad(res, '比较模式不支持撤销 AI 改图');
+      const changesetId = typeof p?.changesetId === 'string' ? p.changesetId.trim() : '';
+      if (!changesetId) return bad(res, '缺少 changesetId');
+      const snap = aiChangesets.get(changesetId);
+      if (!snap || snap.projectId !== PROJECT.id) {
+        return json(res, { ok: false, error: '未找到可撤销的本轮 AI 改动记录（可能已撤销或工程已切换）' }, 404);
+      }
+      if (snap.sessionRevision !== sessionRevision) {
+        return json(res, { ok: false, error: '画布已进入其他比较或刷新会话，无法撤销' }, 409);
+      }
+      const nextPage = snap.page ? {
+        ...snap.page,
+        projectId: PROJECT.id,
+        reviewing: false,
+        at: 0,
+        ts: Date.now(),
+      } : null;
+      const restoredOverlay = structuredClone(snap.overlay || { nodes: {}, edges: {}, deleted: { nodes: {}, edges: {} }, layout: {} });
+      const eventId = store.transaction(() => {
+        store.replaceOverlay(PROJECT.id, restoredOverlay);
+        saveInferredEdges(PROJECT.id, snap.inferredEdges || []);
+        for (const bmId of snap.createdBookmarkIds || []) {
+          try { store.deleteBookmark(PROJECT.id, bmId); } catch { /* ignore */ }
+        }
+        const evId = store.appendEvent(PROJECT.id, {
+          op: 'restore_point',
+          target: `ai-undo#${changesetId.slice(0, 8)}`,
+          after: nextPage ? { ...restoredOverlay, view: viewSnapshot(nextPage) } : restoredOverlay,
+          actor: 'user',
+        });
+        if (nextPage) {
+          nextPage.revision = evId;
+          store.setSetting(savedViewKey(), nextPage);
+        } else if (!COMPARISON) {
+          store.setSetting(savedViewKey(), null);
+        }
+        return evId;
+      });
+      applyInferredEdges(MODEL, PROJECT.id, snap.inferredEdges || []);
+      S = stats(MODEL);
+      pageState = nextPage;
+      overlay.nodes = restoredOverlay.nodes || {};
+      overlay.edges = restoredOverlay.edges || {};
+      overlay.deleted = restoredOverlay.deleted || { nodes: {}, edges: {} };
+      overlay.layout = restoredOverlay.layout || {};
+      aiChangesets.delete(changesetId);
+      broadcastChange('restore_point', 'user', { projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
+      return json(res, { ok: true, eventId, undoneOps: snap.ops || [] });
+    }
+
     if (u.pathname === '/api/ai/chats') {
       const chatKey = `ai.chats.${PROJECT.id}`;
+      const sanitizeChainList = (rawChains) => (Array.isArray(rawChains) ? rawChains : []).slice(0, 12).map((ch) => ({
+        id: String(ch?.id || '').slice(0, 120),
+        title: String(ch?.title || '').slice(0, 120),
+        kind: ['call', 'dataflow', 'mixed'].includes(ch?.kind) ? ch.kind : 'call',
+        steps: (Array.isArray(ch?.steps) ? ch.steps : []).slice(0, 20).map((s) => ({
+          id: String(s?.id || '').slice(0, 200),
+          name: String(s?.name || '').slice(0, 120),
+          file: String(s?.file || '').slice(0, 200),
+          line: Number(s?.line) || 0,
+          ...(s?.edgeKind ? { edgeKind: String(s.edgeKind).slice(0, 24) } : {}),
+        })).filter((s) => s.id),
+      })).filter((ch) => ch.steps.length);
+      const sanitizePresentation = (raw) => {
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.steps) || !raw.steps.length) return null;
+        return {
+          id: String(raw.id || '').slice(0, 120),
+          title: String(raw.title || '逻辑导览').slice(0, 120),
+          steps: raw.steps.slice(0, 12).map((s, idx) => ({
+            index: Number(s?.index) || idx,
+            title: String(s?.title || `步骤 ${idx + 1}`).slice(0, 120),
+            summary: String(s?.summary || '').slice(0, 400),
+            nodeIds: (Array.isArray(s?.nodeIds) ? s.nodeIds : []).slice(0, 40).map((id) => String(id).slice(0, 200)),
+            edgeKeys: (Array.isArray(s?.edgeKeys) ? s.edgeKeys : []).slice(0, 60).map((k) => String(k).slice(0, 320)),
+            ...(s?.focusNodeId ? { focusNodeId: String(s.focusNodeId).slice(0, 200) } : {}),
+          })),
+        };
+      };
+      const sanitizeHealthReport = (raw) => {
+        if (!raw || typeof raw !== 'object') return null;
+        return {
+          score: Math.max(0, Math.min(100, Number(raw.score) || 0)),
+          summary: String(raw.summary || '').slice(0, 300),
+          issues: (Array.isArray(raw.issues) ? raw.issues : []).slice(0, 20).map((it) => ({
+            id: String(it?.id || '').slice(0, 80),
+            category: String(it?.category || '').slice(0, 32),
+            severity: ['high', 'medium', 'low'].includes(it?.severity) ? it.severity : 'medium',
+            title: String(it?.title || '').slice(0, 120),
+            detail: String(it?.detail || '').slice(0, 300),
+            nodeIds: (Array.isArray(it?.nodeIds) ? it.nodeIds : []).slice(0, 20).map((id) => String(id).slice(0, 200)),
+            ...(it?.fixPrompt ? { fixPrompt: String(it.fixPrompt).slice(0, 300) } : {}),
+          })),
+        };
+      };
       const sanitizeChats = (raw) => {
         const list = Array.isArray(raw?.threads) ? raw.threads : [];
         const threads = [];
@@ -2620,49 +2743,81 @@ export const server = http.createServer(async (req, res) => {
           const title = String(item.title || '新对话').trim().slice(0, 80) || '新对话';
           const customTitle = Boolean(item.customTitle);
           const updatedAt = Number(item.updatedAt) || Date.now();
+          const bookmarkId = Number.isInteger(item.bookmarkId) && item.bookmarkId > 0 ? item.bookmarkId : null;
+          const bookmarkName = typeof item.bookmarkName === 'string' && item.bookmarkName.trim()
+            ? item.bookmarkName.trim().slice(0, 80) : '';
           const messages = (Array.isArray(item.messages) ? item.messages : []).slice(-80)
             .filter((m) => m && ['user', 'assistant'].includes(m.role))
-            .map((m) => ({
-              role: m.role,
-              text: String(m.text || '').slice(0, 8000),
-              ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
-                ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
-              ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
-              ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
-              ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
-              ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
-              ...(Array.isArray(m.tools) && m.tools.length ? {
-                tools: m.tools.slice(0, 20).map((tl) => ({
-                  name: String(tl?.name || '').slice(0, 64),
-                  ok: tl?.ok !== false,
-                  summary: String(tl?.summary || '').slice(0, 240),
-                  ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
-                })),
-              } : {}),
-              ...(Array.isArray(m.questionOptions) && m.questionOptions.length ? {
-                questionOptions: m.questionOptions.slice(0, 8).map((opt) => ({
-                  label: String(opt?.label || '').slice(0, 120),
-                  ...(opt?.description ? { description: String(opt.description).slice(0, 240) } : {}),
-                })).filter((opt) => opt.label),
-                ...(Number.isInteger(m.questionSelected) && m.questionSelected >= 0 ? { questionSelected: m.questionSelected } : {}),
-                ...(m.allowCustom === false ? { allowCustom: false } : {}),
-              } : {}),
-              ...(m.metrics && typeof m.metrics === 'object' ? {
-                metrics: {
-                  promptTokens: Number(m.metrics.promptTokens) || 0,
-                  completionTokens: Number(m.metrics.completionTokens) || 0,
-                  totalTokens: Number(m.metrics.totalTokens) || 0,
-                  contextEstTokens: Number(m.metrics.contextEstTokens) || 0,
-                  contextWindow: Number(m.metrics.contextWindow) || 32768,
-                  tokPerSec: Number(m.metrics.tokPerSec) || 0,
-                  elapsedMs: Number(m.metrics.elapsedMs) || 0,
-                  estimated: Boolean(m.metrics.estimated),
-                },
-              } : {}),
-              ...(m.isSummary ? { isSummary: true } : {}),
-              ...(m.error ? { error: true } : {}),
-            }));
-          threads.push({ id, title, ...(customTitle ? { customTitle: true } : {}), updatedAt, messages });
+            .map((m) => {
+              const chains = m.role === 'assistant' ? sanitizeChainList(m.chains) : [];
+              const presentation = m.role === 'assistant' ? sanitizePresentation(m.presentation) : null;
+              const healthReport = m.role === 'assistant' ? sanitizeHealthReport(m.healthReport) : null;
+              const subagents = m.role === 'assistant' && Array.isArray(m.subagents) ? m.subagents.slice(0, 4).map((sa) => ({
+                id: String(sa?.id || '').slice(0, 80),
+                title: String(sa?.title || '').slice(0, 80),
+                ok: sa?.ok !== false,
+                summary: String(sa?.summary || '').slice(0, 1200),
+                steps: Number(sa?.steps) || 0,
+              })) : [];
+              const changeset = m.role === 'assistant' && m.changeset?.id ? {
+                id: String(m.changeset.id).slice(0, 80),
+                ops: (Array.isArray(m.changeset.ops) ? m.changeset.ops : []).slice(0, 10).map((op) => String(op).slice(0, 40)),
+              } : null;
+              return {
+                role: m.role,
+                text: String(m.text || '').slice(0, 8000),
+                ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
+                  ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
+                ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
+                ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
+                ...(chains.length ? { chains } : {}),
+                ...(presentation ? { presentation } : {}),
+                ...(healthReport ? { healthReport } : {}),
+                ...(subagents.length ? { subagents } : {}),
+                ...(changeset ? { changeset } : {}),
+                ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
+                ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
+                ...(Array.isArray(m.tools) && m.tools.length ? {
+                  tools: m.tools.slice(0, 20).map((tl) => ({
+                    name: String(tl?.name || '').slice(0, 64),
+                    ok: tl?.ok !== false,
+                    summary: String(tl?.summary || '').slice(0, 240),
+                    ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
+                  })),
+                } : {}),
+                ...(Array.isArray(m.questionOptions) && m.questionOptions.length ? {
+                  questionOptions: m.questionOptions.slice(0, 8).map((opt) => ({
+                    label: String(opt?.label || '').slice(0, 120),
+                    ...(opt?.description ? { description: String(opt.description).slice(0, 240) } : {}),
+                  })).filter((opt) => opt.label),
+                  ...(Number.isInteger(m.questionSelected) && m.questionSelected >= 0 ? { questionSelected: m.questionSelected } : {}),
+                  ...(m.allowCustom === false ? { allowCustom: false } : {}),
+                } : {}),
+                ...(m.metrics && typeof m.metrics === 'object' ? {
+                  metrics: {
+                    promptTokens: Number(m.metrics.promptTokens) || 0,
+                    completionTokens: Number(m.metrics.completionTokens) || 0,
+                    totalTokens: Number(m.metrics.totalTokens) || 0,
+                    contextEstTokens: Number(m.metrics.contextEstTokens) || 0,
+                    contextWindow: Number(m.metrics.contextWindow) || 32768,
+                    tokPerSec: Number(m.metrics.tokPerSec) || 0,
+                    elapsedMs: Number(m.metrics.elapsedMs) || 0,
+                    estimated: Boolean(m.metrics.estimated),
+                  },
+                } : {}),
+                ...(m.isSummary ? { isSummary: true } : {}),
+                ...(m.error ? { error: true } : {}),
+              };
+            });
+          threads.push({
+            id,
+            title,
+            ...(customTitle ? { customTitle: true } : {}),
+            ...(bookmarkId ? { bookmarkId } : {}),
+            ...(bookmarkName ? { bookmarkName } : {}),
+            updatedAt,
+            messages,
+          });
         }
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
@@ -3708,9 +3863,37 @@ export const server = http.createServer(async (req, res) => {
         return { ok: true, action, root: layoutRoot, mode: layoutMode, updatedCount: positions.length, positions, ...reviewWriteResult() };
       };
 
+      const chatClientId = String(req.headers['x-callgraph-client'] || '').slice(0, 128);
+      const collectedSubagents = [];
+      let turnChangeset = null;
+      const turnWriteOps = new Set();
+      const ensureTurnSnapshot = (opName) => {
+        if (opName) turnWriteOps.add(opName);
+        if (COMPARISON || turnChangeset) return;
+        turnChangeset = {
+          id: randomUUID(),
+          projectId: PROJECT.id,
+          sessionRevision: expectedSession,
+          page: structuredClone(latestPage() || null),
+          overlay: store.loadOverlay(PROJECT.id),
+          inferredEdges: loadInferredEdges(PROJECT.id),
+          createdBookmarkIds: [],
+          ops: [],
+          createdAt: Date.now(),
+        };
+      };
+      const recordCreatedBookmark = (bmId) => {
+        if (turnChangeset && Number.isInteger(bmId) && bmId > 0) {
+          turnChangeset.createdBookmarkIds.push(bmId);
+        }
+      };
+
       const executeAiTool = async (name, args) => {
         assertActive();
-        if (name === 'arrange_canvas') return arrangeCanvas(args);
+        if (name === 'arrange_canvas') {
+          if (args?.action && args.action !== 'inspect') ensureTurnSnapshot('arrange_canvas');
+          return arrangeCanvas(args);
+        }
         if (name === 'get_git_changes') {
           const q = new URLSearchParams({ limit: '80' });
           if (args.baseRef) q.set('baseRef', String(args.baseRef));
@@ -3782,26 +3965,87 @@ export const server = http.createServer(async (req, res) => {
               notFound,
             };
           }
+          const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'up';
+          const depth = Math.max(1, Math.min(6, Math.trunc(Number(args.depth) || 4)));
           const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
+          const toChainStep = (id, edgeKind) => {
+            const cleanId = String(id || '');
+            const node = MODEL._index?.byId?.get(cleanId);
+            return {
+              id: cleanId,
+              name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
+              file: node?.file || '',
+              line: Number(node?.line) || 0,
+              ...(edgeKind ? { edgeKind } : {}),
+            };
+          };
           const traces = resolved.slice(0, 15).map((id) => {
-            const tr = traceToTasks(MODEL, id, { limit });
+            const tr = direction === 'down' ? { upstreamTasks: [], upstreamChains: [], totalTasks: 0 }
+              : traceToTasks(MODEL, id, { limit });
             const directCallers = (MODEL._index?.inAdj?.get(id) || [])
               .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
               .slice(0, 20)
               .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
+            const directCallees = direction === 'up' ? [] : (MODEL._index?.outAdj?.get(id) || [])
+              .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to])
+              .slice(0, 20)
+              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
+            const downstreamPaths = [];
+            if (direction === 'down' || direction === 'both') {
+              const stack = [{ node: id, path: [id] }];
+              while (stack.length && downstreamPaths.length < 12) {
+                const cur = stack.shift();
+                const outs = (MODEL._index?.outAdj?.get(cur.node) || [])
+                  .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[edgeKeyOf(e)]);
+                if (!outs.length || cur.path.length > depth) {
+                  if (cur.path.length > 1) downstreamPaths.push(cur.path);
+                  continue;
+                }
+                for (const e of outs.slice(0, 6)) {
+                  if (cur.path.includes(e.to)) continue;
+                  stack.push({ node: e.to, path: [...cur.path, e.to] });
+                }
+              }
+            }
             return {
               id,
               upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
               chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
+              downstreamPaths,
               directCallers,
+              ...(directCallees.length ? { directCallees } : {}),
               totalTasks: tr.totalTasks || 0,
             };
           });
+          const structuredChains = [];
+          for (const tr of traces) {
+            for (const c of tr.chains.slice(0, 4)) {
+              const p = Array.isArray(c.path) ? c.path : [];
+              if (p.length >= 2) {
+                structuredChains.push({
+                  id: `up:${p[0]}->${p[p.length - 1]}:${structuredChains.length}`,
+                  title: `${toChainStep(p[0]).name} → ${toChainStep(p[p.length - 1]).name}`,
+                  kind: 'call',
+                  steps: p.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
+                });
+              }
+            }
+            for (const dp of (tr.downstreamPaths || []).slice(0, 4)) {
+              structuredChains.push({
+                id: `down:${dp[0]}->${dp[dp.length - 1]}:${structuredChains.length}`,
+                title: `下游 ${toChainStep(dp[0]).name} → ${toChainStep(dp[dp.length - 1]).name}`,
+                kind: 'call',
+                steps: dp.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
+              });
+            }
+          }
           const pathBranches = summarizeVehicleBranches(MODEL, resolved);
           return {
             ok: true,
+            direction,
             functions: resolved,
             traces,
+            ...(structuredChains.length ? { chains: structuredChains.slice(0, 8) } : {}),
             ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ambiguous,
             notFound,
@@ -3809,6 +4053,7 @@ export const server = http.createServer(async (req, res) => {
         }
         if (name === 'remove_from_canvas') {
           if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能局部移除节点' };
+          ensureTurnSnapshot('remove_from_canvas');
           const excludePaths = normalizePathPrefixes(args.excludePaths);
           const rawFns = Array.isArray(args.functions) ? args.functions : [];
           if (!excludePaths.length && !rawFns.length) {
@@ -3989,45 +4234,58 @@ export const server = http.createServer(async (req, res) => {
           return { ok: true, query, matches, total: matches.length };
         }
         if (name === 'read_function') {
-          const target = String(args.name || args.id || '').trim();
-          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, [target], 'fn');
-          if (!resolved.length) {
-            return { ok: false, error: ambiguous.length ? '函数名重名，请改用候选中的完整「文件::函数名」' : `未找到函数：${target}`, ambiguous, notFound };
-          }
-          const q = new URLSearchParams({ id: resolved[0] });
-          if (['auto', 'cp932', 'utf-8'].includes(args.encoding)) q.set('encoding', args.encoding);
-          const src = await readMcpSource(q);
-          assertActive();
-          const fnNode = MODEL._index.byId.get(resolved[0]);
-          const headerInfo = fnNode ? await analyzeTasks(MODEL, { headerId: fnNode.id }) : { comment: '', period: null };
-          assertActive();
-          const lines = String(src.source || '').split('\n');
-          const kept = [];
-          let chars = 0;
-          let clipped = false;
-          for (const line of lines) {
-            if (kept.length >= 120 || chars + line.length + 1 > 8000) { clipped = true; break; }
-            kept.push(line);
-            chars += line.length + 1;
-          }
-          return {
-            ok: true,
-            id: src.id,
-            name: src.name,
-            file: src.file,
-            startLine: src.startLine,
-            endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
-            truncated: Boolean(src.truncated || clipped),
-            sourceEncoding: src.sourceEncoding,
-            ...(headerInfo.comment ? { headerComment: headerInfo.comment.slice(0, 1200) } : {}),
-            ...(headerInfo.period ? { commentPeriod: headerInfo.period } : {}),
-            source: clipped ? kept.join('\n') + '\n/* ... */' : kept.join('\n'),
-            taskPeriods: src.taskPeriods,
-            upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
-            calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
-            indirectCalls: (MODEL.indirectCalls || []).filter(ic => ic.caller === src.id).slice(0, 15),
-            varAccess: (src.varAccess || []).slice(0, 25),
+          const readSingleFunction = async (fnId, encoding) => {
+            const q = new URLSearchParams({ id: fnId });
+            if (['auto', 'cp932', 'utf-8'].includes(encoding)) q.set('encoding', encoding);
+            const src = await readMcpSource(q);
+            assertActive();
+            const fnNode = MODEL._index.byId.get(fnId);
+            const headerInfo = fnNode ? await analyzeTasks(MODEL, { headerId: fnNode.id }) : { comment: '', period: null };
+            assertActive();
+            const lines = String(src.source || '').split('\n');
+            const kept = [];
+            let chars = 0;
+            let clipped = false;
+            for (const line of lines) {
+              if (kept.length >= 120 || chars + line.length + 1 > 8000) { clipped = true; break; }
+              kept.push(line);
+              chars += line.length + 1;
+            }
+            return {
+              ok: true,
+              id: src.id,
+              name: src.name,
+              file: src.file,
+              startLine: src.startLine,
+              endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
+              truncated: Boolean(src.truncated || clipped),
+              sourceEncoding: src.sourceEncoding,
+              ...(headerInfo.comment ? { headerComment: headerInfo.comment.slice(0, 1200) } : {}),
+              ...(headerInfo.period ? { commentPeriod: headerInfo.period } : {}),
+              source: clipped ? kept.join('\n') + '\n/* ... */' : kept.join('\n'),
+              taskPeriods: src.taskPeriods,
+              upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
+              calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
+              indirectCalls: (MODEL.indirectCalls || []).filter(ic => ic.caller === src.id).slice(0, 15),
+              varAccess: (src.varAccess || []).slice(0, 25),
+            };
           };
+          const rawNames = Array.isArray(args.names) && args.names.length
+            ? args.names.slice(0, 6)
+            : [String(args.name || args.id || '').trim()].filter(Boolean);
+          if (!rawNames.length) return { ok: false, error: '请提供函数名 name 或批量 names 列表' };
+          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, rawNames, 'fn');
+          if (!resolved.length) {
+            return { ok: false, error: ambiguous.length ? '函数名重名，请改用候选中的完整「文件::函数名」' : `未找到函数：${rawNames[0]}`, ambiguous, notFound };
+          }
+          if (Array.isArray(args.names) && args.names.length) {
+            const items = [];
+            for (const id of resolved.slice(0, 6)) {
+              items.push(await readSingleFunction(id, args.encoding));
+            }
+            return { ok: true, batch: true, items, ambiguous, notFound };
+          }
+          return await readSingleFunction(resolved[0], args.encoding);
         }
         if (name === 'read_source') {
           const encoding = ['auto', 'cp932', 'utf-8'].includes(args.encoding) ? args.encoding : 'auto';
@@ -4192,6 +4450,7 @@ export const server = http.createServer(async (req, res) => {
           if (!resolvedEdges.length) {
             return { ok: false, error: '未解析到有效的调用边端点', notFound };
           }
+          ensureTurnSnapshot('add_call_edge');
           const currentList = loadInferredEdges(PROJECT.id);
           let nextList;
           let newlyAddedCount = 0;
@@ -4483,7 +4742,8 @@ export const server = http.createServer(async (req, res) => {
             };
           let composed;
           let fallbackNote = '';
-          const composeOptions = { chatClientId: req.headers['x-callgraph-client'] };
+          const composeOptions = { chatClientId };
+          ensureTurnSnapshot('add_to_canvas');
           try {
             composed = composeMcpView(composePayload, composeOptions);
           } catch (err) {
@@ -4531,6 +4791,7 @@ export const server = http.createServer(async (req, res) => {
                   vars: bmVars,
                   expansions: bmExpansions,
                 }, 'ai', { isForeground: false });
+                recordCreatedBookmark(savedBm.bookmark?.id);
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -4553,6 +4814,7 @@ export const server = http.createServer(async (req, res) => {
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
               }, 'ai', { isForeground: false });
+              recordCreatedBookmark(savedBm.bookmark?.id);
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
@@ -4679,8 +4941,610 @@ export const server = http.createServer(async (req, res) => {
             });
           }
           assertActive();
+          ensureTurnSnapshot('apply_labels');
           const applied = applyMcpTaskLabels({ items, merge: true });
           return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [], ...reviewWriteResult() };
+        }
+        const toChainStep = (id, edgeKind) => {
+          const cleanId = String(id || '');
+          const node = MODEL._index?.byId?.get(cleanId);
+          return {
+            id: cleanId,
+            name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
+            file: node?.file || '',
+            line: Number(node?.line) || 0,
+            ...(edgeKind ? { edgeKind } : {}),
+          };
+        };
+        const resolveFnOrVar = (raw) => {
+          const text = String(raw || '').trim();
+          if (!text) return { resolved: [], ambiguous: [], notFound: [] };
+          const exact = MODEL._index?.byId?.get(text);
+          if (exact && !exact.external && !overlay.deleted.nodes[exact.id]) {
+            return { resolved: [exact.id], ambiguous: [], notFound: [] };
+          }
+          const fnRes = resolveSymbols(MODEL, [text], 'fn');
+          if (fnRes.resolved.length || fnRes.ambiguous.length) return fnRes;
+          return resolveSymbols(MODEL, [text], 'var');
+        };
+        if (name === 'inspect_dataflow') {
+          const rawTarget = String(args.target || '').trim();
+          if (!rawTarget) return { ok: false, error: '请提供要分析的数据流符号 target' };
+          const maxPaths = Math.max(1, Math.min(20, Math.trunc(Number(args.maxPaths) || 10)));
+          if (!COMPARISON && MODEL.source !== 'dot') {
+            await ensureAnalysis(MODEL);
+            assertActive();
+          }
+          const tRes = resolveFnOrVar(rawTarget);
+          if (!tRes.resolved.length) {
+            return {
+              ok: false,
+              error: tRes.ambiguous.length ? '目标符号存在重名，请指定完整「文件::符号名」或 var::' : `未找到符号：${rawTarget}`,
+              ambiguous: tRes.ambiguous,
+              notFound: tRes.notFound,
+            };
+          }
+          const targetId = tRes.resolved[0];
+          const targetNode = MODEL._index?.byId?.get(targetId);
+          const rawPeer = typeof args.peer === 'string' ? args.peer.trim() : '';
+          if (rawPeer) {
+            const pRes = resolveFnOrVar(rawPeer);
+            if (!pRes.resolved.length) {
+              return {
+                ok: false,
+                error: pRes.ambiguous.length ? '对端符号存在重名，请指定完整「文件::符号名」' : `未找到对端符号：${rawPeer}`,
+                ambiguous: pRes.ambiguous,
+                notFound: pRes.notFound,
+              };
+            }
+            const peerId = pRes.resolved[0];
+            if (peerId === targetId) return { ok: false, error: 'target 与 peer 不能相同' };
+            const peerNode = MODEL._index?.byId?.get(peerId);
+            const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, targetId, peerId) : pairDataflow(MODEL, targetId, peerId));
+            assertActive();
+            const rwPaths = (df.paths || []).slice(0, maxPaths);
+            const sharedVars = (df.sharedVars || []).slice(0, 20);
+            const chains = rwPaths.slice(0, 6).map((p, idx) => ({
+              id: `dfpair:${targetId}:${peerId}:${idx}`,
+              title: `${targetNode?.name || targetId} ↔ ${peerNode?.name || peerId} (${p.direction || 'rw'})`,
+              kind: 'dataflow',
+              steps: (Array.isArray(p.nodes) && p.nodes.length ? p.nodes : [p.writer, p.varId, p.reader].filter(Boolean))
+                .map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
+            }));
+            return {
+              ok: true,
+              target: targetId,
+              targetName: targetNode?.name || targetId,
+              peer: peerId,
+              peerName: peerNode?.name || peerId,
+              rwPaths,
+              sharedVars,
+              ...(df.partial ? { partial: true } : {}),
+              chains,
+            };
+          }
+          const dir = ['in', 'out', 'both'].includes(args.dir) ? args.dir : 'both';
+          const dirs = dir === 'both' ? ['in', 'out'] : [dir];
+          const allEdges = [];
+          const touchedVarIds = new Set();
+          const touchedPeerIds = new Set();
+          for (const d of dirs) {
+            const resDf = await (COMPARISON ? comparisonDataflow(COMPARISON, targetId, d) : dataflowFor(MODEL, targetId, d));
+            assertActive();
+            for (const e of resDf.edges || []) allEdges.push({ ...e, dir: d });
+            for (const v of resDf.vars || []) if (v?.id) touchedVarIds.add(v.id);
+            for (const n of resDf.nodes || []) if (n?.id && n.id !== targetId) touchedPeerIds.add(n.id);
+          }
+          const chains = [];
+          const seenChain = new Set();
+          for (const e of allEdges.slice(0, maxPaths)) {
+            const k = `${e.from}->${e.to}`;
+            if (seenChain.has(k)) continue;
+            seenChain.add(k);
+            chains.push({
+              id: `df:${k}:${chains.length}`,
+              title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              kind: 'dataflow',
+              steps: [toChainStep(e.from), toChainStep(e.to, 'var')],
+            });
+          }
+          return {
+            ok: true,
+            target: targetId,
+            targetName: targetNode?.name || targetId,
+            dir,
+            vars: [...touchedVarIds].slice(0, 20).map((id) => toChainStep(id)),
+            peers: [...touchedPeerIds].slice(0, 20).map((id) => toChainStep(id)),
+            edges: allEdges.slice(0, 40),
+            chains: chains.slice(0, 8),
+          };
+        }
+        if (name === 'present_logic') {
+          const rawTargets = [
+            ...(typeof args.root === 'string' && args.root.trim() ? [args.root.trim()] : []),
+            ...(Array.isArray(args.targets) ? args.targets : []),
+          ].filter(Boolean);
+          let seedIds = [];
+          if (!rawTargets.length) {
+            const cur = latestPage();
+            seedIds = (cur?.roots || []).slice(0, 6);
+            if (!seedIds.length) return { ok: false, error: '当前画布为空，请提供 root 或 targets 函数/变量名' };
+          } else {
+            const fnRes = resolveSymbols(MODEL, rawTargets, 'fn');
+            if (fnRes.ambiguous.length) {
+              const branches = branchesFromIds(MODEL, fnRes.ambiguous.flatMap(a => a.candidates || []));
+              return {
+                ok: false,
+                needsVehicleChoice: branches.length > 1,
+                ...(branches.length > 1 ? { pathBranches: branches } : {}),
+                ambiguous: fnRes.ambiguous,
+                error: '目标函数存在多处定义，请先明确具体「文件::函数名」或目录分支',
+              };
+            }
+            seedIds = fnRes.resolved;
+            if (!seedIds.length) {
+              const varRes = resolveSymbols(MODEL, rawTargets, 'var');
+              if (varRes.resolved.length) seedIds = varRes.resolved;
+              else return { ok: false, error: `未找到目标符号：${rawTargets.join(', ')}`, notFound: fnRes.notFound };
+            }
+          }
+          const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'both';
+          const depth = Math.max(1, Math.min(5, Math.trunc(Number(args.depth) || 2)));
+          const focusFilter = normalizePathPrefixes(args.focusFilter);
+          const includeDataflow = args.includeDataflow !== false;
+          const addToCanvas = args.addToCanvas !== false;
+          const sliceNodes = new Map(); // id -> { depthSigned, order }
+          const sliceEdges = [];
+          const seenEdge = new Set();
+          const allowId = (id) => {
+            const n = MODEL._index?.byId?.get(id);
+            if (!n || n.external || overlay.deleted.nodes[id]) return false;
+            if (focusFilter.length && n.kind !== 'var') {
+              const file = fileOfNodeId(MODEL, id);
+              if (!focusFilter.some(pref => fileMatchesPathPrefix(file, pref)) && !seedIds.includes(id)) return false;
+            }
+            return true;
+          };
+          for (const sid of seedIds) {
+            if (allowId(sid) && !sliceNodes.has(sid)) sliceNodes.set(sid, 0);
+          }
+          if (direction === 'up' || direction === 'both') {
+            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
+            while (q.length && sliceNodes.size < 40) {
+              const cur = q.shift();
+              if (cur.d >= depth) continue;
+              for (const e of MODEL._index?.inAdj?.get(cur.id) || []) {
+                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
+                if (!allowId(e.from)) continue;
+                const ek = edgeKeyOf(e);
+                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
+                if (!sliceNodes.has(e.from)) {
+                  sliceNodes.set(e.from, -(cur.d + 1));
+                  q.push({ id: e.from, d: cur.d + 1 });
+                }
+                if (sliceNodes.size >= 40) break;
+              }
+            }
+          }
+          if (direction === 'down' || direction === 'both') {
+            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
+            while (q.length && sliceNodes.size < 40) {
+              const cur = q.shift();
+              if (cur.d >= depth) continue;
+              for (const e of MODEL._index?.outAdj?.get(cur.id) || []) {
+                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
+                if (!allowId(e.to)) continue;
+                const ek = edgeKeyOf(e);
+                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
+                if (!sliceNodes.has(e.to)) {
+                  sliceNodes.set(e.to, cur.d + 1);
+                  q.push({ id: e.to, d: cur.d + 1 });
+                }
+                if (sliceNodes.size >= 40) break;
+              }
+            }
+          }
+          const fnSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind !== 'var');
+          let varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
+          if (includeDataflow && !COMPARISON && MODEL.source !== 'dot') {
+            await ensureAnalysis(MODEL);
+            assertActive();
+            const df = MODEL._df;
+            if (df?.fnAccess) {
+              const fnSet = new Set(fnSliceIds);
+              const varScore = new Map();
+              for (const fid of fnSliceIds) {
+                const acc = df.fnAccess.get(fid);
+                if (!acc) continue;
+                for (const vid of [...(acc.reads?.keys() || []), ...(acc.writes?.keys() || [])]) {
+                  if (overlay.deleted.nodes[vid]) continue;
+                  varScore.set(vid, (varScore.get(vid) || 0) + 1);
+                }
+              }
+              const topVars = [...varScore.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 6)
+                .map(([vid]) => vid);
+              for (const vid of topVars) {
+                if (!varSliceIds.includes(vid) && fnSet.size) varSliceIds.push(vid);
+              }
+            }
+          }
+          let composedResult = null;
+          if (addToCanvas && !COMPARISON && fnSliceIds.length) {
+            ensureTurnSnapshot('present_logic');
+            const minLayer = Math.min(...fnSliceIds.map(id => sliceNodes.get(id) ?? 0));
+            const topRoots = fnSliceIds.filter(id => (sliceNodes.get(id) ?? 0) === minLayer);
+            const restFns = fnSliceIds.filter(id => !topRoots.includes(id));
+            try {
+              composedResult = composeMcpView({
+                mode: args.mode === 'replace' ? 'replace' : 'add',
+                roots: topRoots.length ? topRoots : fnSliceIds.slice(0, 4),
+                functionIds: restFns,
+                changedFunctionIds: [],
+                vars: varSliceIds,
+                up: 0,
+                down: 0,
+                reason: String(args.title || 'AI 逻辑链智能呈现').slice(0, 120),
+              }, { chatClientId });
+            } catch {
+              composedResult = null;
+            }
+          }
+          // 构建按执行层级排序的 Walkthrough 步骤
+          const layers = new Map();
+          for (const id of fnSliceIds) {
+            const d = sliceNodes.get(id) ?? 0;
+            if (!layers.has(d)) layers.set(d, []);
+            layers.get(d).push(id);
+          }
+          const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
+          const presTitle = String(args.title || `${toChainStep(seedIds[0]).name} 调用与数据流导览`).slice(0, 80);
+          const steps = sortedDepths.slice(0, 6).map((d, idx) => {
+            const nids = layers.get(d).slice(0, 10);
+            const names = nids.map(id => toChainStep(id).name);
+            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(edgeKeyOf);
+            const roleLabel = d < 0 ? '上游触发与调用者' : d === 0 ? '核心关注节点' : '下游执行链路';
+            return {
+              index: idx,
+              title: `${roleLabel} (${names.slice(0, 3).join('、')}${names.length > 3 ? '…' : ''})`,
+              summary: `涉及 ${nids.length} 个函数：${names.join('、')}`,
+              nodeIds: nids,
+              edgeKeys: stepEdges,
+              focusNodeId: nids[0],
+            };
+          });
+          if (varSliceIds.length) {
+            steps.push({
+              index: steps.length,
+              title: `关联全局变量数据流 (${varSliceIds.length})`,
+              summary: `共享读写变量：${varSliceIds.map(v => toChainStep(v).name).join('、')}`,
+              nodeIds: varSliceIds,
+              edgeKeys: [],
+              focusNodeId: varSliceIds[0],
+            });
+          }
+          const presentation = {
+            id: `pres_${Date.now().toString(36)}`,
+            title: presTitle,
+            steps,
+          };
+          const chains = [];
+          for (const e of sliceEdges.slice(0, 6)) {
+            chains.push({
+              id: `pres_edge:${edgeKeyOf(e)}`,
+              title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              kind: 'call',
+              steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
+            });
+          }
+          const canvasOverlay = {
+            action: 'highlight',
+            nodeIds: [...fnSliceIds, ...varSliceIds].slice(0, 60),
+            edgeKeys: sliceEdges.map(edgeKeyOf).slice(0, 80),
+            label: presTitle,
+          };
+          sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
+          return {
+            ok: true,
+            title: presTitle,
+            nodeCount: fnSliceIds.length + varSliceIds.length,
+            edgeCount: sliceEdges.length,
+            presentation,
+            chains,
+            canvasOverlay,
+            ...(composedResult?.updatedWhileReviewing ? { updatedWhileReviewing: true, reviewNote: composedResult.reviewNote } : {}),
+          };
+        }
+        if (name === 'canvas_visual') {
+          const action = ['highlight', 'play_flow', 'lens', 'clear'].includes(args.action) ? args.action : 'highlight';
+          const payload = {
+            action,
+            nodeIds: (Array.isArray(args.nodeIds) ? args.nodeIds : []).slice(0, 80).map(String),
+            edgeKeys: (Array.isArray(args.edgeKeys) ? args.edgeKeys : []).slice(0, 120).map(String),
+            ...(args.lens ? { lens: ['default', 'dataflow', 'indirect', 'changes'].includes(args.lens) ? args.lens : 'default' } : {}),
+            ...(typeof args.label === 'string' && args.label.trim() ? { label: args.label.trim().slice(0, 80) } : {}),
+          };
+          sendClientEvent(chatClientId, 'canvas_overlay', payload);
+          return { ok: true, ...payload, canvasOverlay: payload };
+        }
+        if (name === 'diagnose_canvas') {
+          const check = ['all', 'orphans', 'indirect', 'labels', 'layout'].includes(args.check) ? args.check : 'all';
+          const page = latestPage();
+          if (!page || (!(page.roots?.length) && !(page.expansions?.length))) {
+            return {
+              ok: true,
+              healthReport: {
+                score: 100,
+                summary: '当前画布为空，暂无可诊断的节点。',
+                issues: [],
+              },
+            };
+          }
+          const issues = [];
+          const labelCtx = await collectCanvasLabelContext(MODEL, page);
+          assertActive();
+          const activeView = viewSnapshot(page);
+          const visRoots = (activeView.roots || []).map(id => remapLegacyExt(id, MODEL)).filter(id => MODEL._index.byId.has(id));
+          const visExps = normalizeExpansions((activeView.expansions || [])
+            .map(s => ({ ...s, root: remapLegacyExt(s.root, MODEL) }))
+            .filter(s => MODEL._index.byId.has(s.root)));
+          const visNodes = new Set();
+          const visAdjCount = new Map();
+          for (const sc of [...visRoots.map(r => ({ root: r, up: activeView.up || 0, down: activeView.down || 0 })), ...visExps]) {
+            const sub = subgraph(MODEL, sc.root, { up: sc.up, down: sc.down, maxNodes: 200, includeVariables: true });
+            for (const n of sub.nodes) if (!overlay.deleted.nodes[n.id]) visNodes.add(n.id);
+            for (const e of sub.edges) {
+              if (!overlay.deleted.edges[edgeKeyOf(e)]) {
+                visAdjCount.set(e.from, (visAdjCount.get(e.from) || 0) + 1);
+                visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
+              }
+            }
+          }
+          for (const id of visNodes) {
+            for (const e of MODEL._index?.outAdj?.get(id) || []) {
+              if (e.headerReference || !visNodes.has(e.to) || overlay.deleted.edges[edgeKeyOf(e)]) continue;
+              visAdjCount.set(id, (visAdjCount.get(id) || 0) + 1);
+              visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
+            }
+          }
+          if ((check === 'all' || check === 'labels') && labelCtx.suggestedLabels.length) {
+            const sample = labelCtx.suggestedLabels.slice(0, 6);
+            issues.push({
+              id: 'missing_labels',
+              category: 'labels',
+              severity: 'medium',
+              title: `缺少 ${labelCtx.suggestedLabels.length} 条推荐标签 (TASK / コール順)`,
+              detail: sample.map(s => `${toChainStep(s.from).name}→${toChainStep(s.to).name}(${s.text})`).join('；'),
+              nodeIds: [...new Set(sample.flatMap(s => [s.from, s.to]))],
+              fixPrompt: '请调用 apply_labels({ autoDetect: true }) 自动补全当前画布缺失的 TASK 与调用顺序标签。',
+            });
+          }
+          if (check === 'all' || check === 'indirect') {
+            const unexpanded = [];
+            for (const ic of MODEL.indirectCalls || []) {
+              if (!visNodes.has(ic.caller)) continue;
+              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !overlay.deleted.nodes[c.id]);
+              if (missing.length || ic.unresolved) unexpanded.push({ ic, missing });
+              if (unexpanded.length >= 12) break;
+            }
+            if (unexpanded.length) {
+              issues.push({
+                id: 'indirect_unexpanded',
+                category: 'indirect',
+                severity: 'high',
+                title: `画布函数包含 ${unexpanded.length} 处未展开或待核实的间接调用点`,
+                detail: unexpanded.slice(0, 4).map(({ ic }) => `${toChainStep(ic.caller).name} (${ic.expr || ic.table?.name || 'fnptr'})`).join('；'),
+                nodeIds: [...new Set(unexpanded.map(u => u.ic.caller))],
+                fixPrompt: '请用 inspect_indirect_calls 与 read_source 核实当前画布中未展开的间接调用点，并用 add_call_edge 补全确切调用边。',
+              });
+            }
+          }
+          if ((check === 'all' || check === 'orphans') && visNodes.size >= 2) {
+            const orphans = [...visNodes].filter(id => (visAdjCount.get(id) || 0) === 0);
+            if (orphans.length) {
+              issues.push({
+                id: 'isolated_nodes',
+                category: 'orphans',
+                severity: 'low',
+                title: `当前视图存在 ${orphans.length} 个孤立节点`,
+                detail: orphans.slice(0, 6).map(id => toChainStep(id).name).join('、'),
+                nodeIds: orphans.slice(0, 15),
+                fixPrompt: `请对孤立节点 ${orphans.slice(0, 3).map(id => toChainStep(id).name).join('、')} 追踪上游调用链并补充关系。`,
+              });
+            }
+          }
+          if ((check === 'all' || check === 'layout') && canvasSnapshot?.nodes?.size) {
+            const rects = [...canvasSnapshot.nodes.entries()].filter(([id]) => visNodes.has(id)).map(([id, r]) => ({ id, ...r }));
+            const overlaps = [];
+            for (let i = 0; i < rects.length && overlaps.length < 10; i++) {
+              for (let j = i + 1; j < rects.length; j++) {
+                const a = rects[i], b = rects[j];
+                if (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y) {
+                  overlaps.push([a.id, b.id]);
+                }
+              }
+            }
+            if (overlaps.length) {
+              issues.push({
+                id: 'layout_overlaps',
+                category: 'layout',
+                severity: 'medium',
+                title: `检测到 ${overlaps.length} 对节点框存在位置重叠`,
+                detail: overlaps.slice(0, 4).map(([a, b]) => `${toChainStep(a).name} 与 ${toChainStep(b).name}`).join('；'),
+                nodeIds: [...new Set(overlaps.flat())].slice(0, 12),
+                fixPrompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 自动整理画布消除节点重叠。',
+              });
+            }
+          }
+          const penalty = issues.reduce((sum, it) => sum + (it.severity === 'high' ? 25 : it.severity === 'medium' ? 15 : 8), 0);
+          const score = Math.max(20, 100 - penalty);
+          return {
+            ok: true,
+            healthReport: {
+              score,
+              summary: issues.length ? `画布体检得分 ${score}/100，发现 ${issues.length} 类问题` : '画布体检 100/100：标注、调用链与排版均健康',
+              issues,
+            },
+          };
+        }
+        if (name === 'manage_bookmarks') {
+          const action = String(args.action || '').trim();
+          if (action === 'list') {
+            return { ok: true, action, bookmarks: store.listBookmarks(PROJECT.id) };
+          }
+          if (COMPARISON) return { ok: false, error: '比较模式不支持修改书签' };
+          ensureTurnSnapshot('manage_bookmarks');
+          if (action === 'checkpoint') {
+            const label = String(args.checkpointName || args.name || 'AI 检查点').trim().slice(0, 80);
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const eventId = store.appendEvent(PROJECT.id, {
+              op: 'view.checkpoint',
+              actor: 'ai',
+              target: label,
+              after: { view: viewSnapshot(page) },
+              ctx: { milestone: true, action: 'checkpoint', checkpointName: label },
+            });
+            broadcastChange('view.checkpoint', 'ai', { eventId, target: label });
+            return { ok: true, action, checkpointName: label, eventId };
+          }
+          if (action === 'save') {
+            const bmName = String(args.name || '').trim().slice(0, 60);
+            if (!bmName) return { ok: false, error: '保存书签需要提供 name' };
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const r = saveBookmarkWithEvent({ ...viewSnapshot(page), name: bmName }, 'ai', { isForeground: true });
+            recordCreatedBookmark(r.bookmark?.id);
+            broadcastChange('bookmark.save', 'ai', { bookmark: r.bookmark, projectId: PROJECT.id, clientId: chatClientId });
+            return { ok: true, action, bookmark: r.bookmark };
+          }
+          if (action === 'update') {
+            const id = Number(args.id);
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'update 需要提供有效的书签 id' };
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const resUp = store.updateBookmarkById(PROJECT.id, id, viewSnapshot(page));
+            if (!resUp) return { ok: false, error: '找不到指定书签' };
+            broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
+            return { ok: true, action, bookmark: resUp.bookmark };
+          }
+          if (action === 'delete') {
+            const id = Number(args.id);
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'delete 需要提供有效的书签 id' };
+            const gone = store.listBookmarks(PROJECT.id).find(b => b.id === id);
+            const okDel = store.deleteBookmark(PROJECT.id, id);
+            if (okDel) {
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.delete',
+                actor: 'ai',
+                target: gone?.name || `#${id}`,
+                before: gone ? bookmarkEventPayload(gone) : null,
+                ctx: { ...(gone?.id && { bookmarkId: gone.id }), bookmarkName: gone?.name || `#${id}`, action: 'delete', milestone: true },
+              });
+              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: gone?.name || null, projectId: PROJECT.id, clientId: chatClientId });
+            }
+            return { ok: okDel, action, removed: okDel ? 1 : 0 };
+          }
+          return { ok: false, error: `未知书签操作：${action}` };
+        }
+        if (name === 'run_subagent') {
+          if (!cfg.subagentEnabled) {
+            return { ok: false, error: '只读子调查功能已在设置中关闭' };
+          }
+          const rawTasks = Array.isArray(args.tasks) ? args.tasks.slice(0, 3) : [];
+          if (!rawTasks.length) return { ok: false, error: 'run_subagent 需要至少 1 个调查任务' };
+          const maxConcurrency = Math.max(1, Math.min(3, Number(cfg.subagentMaxConcurrency) || 2));
+          const subMaxSteps = Math.max(2, Math.min(12, Number(cfg.subagentMaxSteps) || 6));
+          const readOnlyExecute = async (toolName, toolArgs) => {
+            if (!SUBAGENT_READONLY_TOOLS.has(toolName)) {
+              return { ok: false, blocked: true, error: `只读子调查禁止调用：${toolName}` };
+            }
+            return await executeAiTool(toolName, toolArgs);
+          };
+          const subSystemPrompt = [
+            '你是 TCU C 调用图只读子调查代理（运行于隔离上下文，深度=1）。',
+            '只能调用只读工具（find_symbols / read_function / read_source / trace_upstream / inspect_indirect_calls / inspect_dataflow / inspect_build_config / get_git_changes / diagnose_canvas）核实源码与图谱事实，禁止改图或向用户提问。',
+            '完成核实后，用 3–5 句简明中文总结：关键发现、精确函数/变量 ID（文件::符号名）与关键位置行号。',
+            `当前工程：${PROJECT.name}（函数 ${MODEL.functions?.length || 0} / 变量 ${MODEL.variables?.length || 0}）`,
+          ].join('\n');
+          const taskDefs = rawTasks.map((t, idx) => ({
+            id: `sub_${Date.now().toString(36)}_${idx + 1}`,
+            title: String(t?.title || `子调查 #${idx + 1}`).trim().slice(0, 80) || `子调查 #${idx + 1}`,
+            goal: String(t?.goal || '').trim().slice(0, 1200),
+            seedSymbols: (Array.isArray(t?.seedSymbols) ? t.seedSymbols : []).slice(0, 8).map(s => String(s || '').trim()).filter(Boolean),
+          })).filter(t => t.goal);
+          if (!taskDefs.length) return { ok: false, error: '子调查任务缺少明确目标 goal' };
+          const results = new Array(taskDefs.length);
+          let cursor = 0;
+          const runWorker = async () => {
+            while (cursor < taskDefs.length) {
+              const myIdx = cursor++;
+              const task = taskDefs[myIdx];
+              assertActive();
+              sendEvent({ type: 'subagent_start', id: task.id, index: myIdx, title: task.title, goal: task.goal, seedSymbols: task.seedSymbols });
+              const subPrompt = [
+                `调查主题：${task.title}`,
+                `调查目标：${task.goal}`,
+                ...(task.seedSymbols.length ? [`参考起始符号：${task.seedSymbols.join(', ')}`] : []),
+              ].join('\n');
+              try {
+                const subRes = await runAiAgent({
+                  config: {
+                    ...cfg,
+                    reasoningEffort: cfg.reasoningEffort === 'high' ? 'medium' : cfg.reasoningEffort,
+                  },
+                  prompt: subPrompt,
+                  context: {
+                    projectName: PROJECT.name,
+                    fnCount: MODEL.functions?.length || 0,
+                    varCount: MODEL.variables?.length || 0,
+                    canvasRoots: (latestPage()?.roots || []).slice(0, 8),
+                  },
+                  executeTool: readOnlyExecute,
+                  onEvent: (ev) => {
+                    if (ev.type === 'tool_end') {
+                      sendEvent({ type: 'subagent_progress', id: task.id, title: task.title, tool: ev.name, ok: ev.ok, summary: ev.summary });
+                    }
+                  },
+                  allowedTools: SUBAGENT_READONLY_TOOLS,
+                  systemPromptOverride: subSystemPrompt,
+                  isSubagent: true,
+                  maxSteps: subMaxSteps,
+                  signal: abort.signal,
+                });
+                const item = {
+                  id: task.id,
+                  title: task.title,
+                  ok: true,
+                  summary: subRes.answer || '',
+                  chains: subRes.chains || [],
+                  steps: subRes.toolLog?.length || 0,
+                };
+                results[myIdx] = item;
+                collectedSubagents.push({ id: item.id, title: item.title, ok: true, summary: item.summary, steps: item.steps });
+                sendEvent({ type: 'subagent_end', ...item });
+              } catch (err) {
+                if (abort.signal.aborted) throw err;
+                const item = {
+                  id: task.id,
+                  title: task.title,
+                  ok: false,
+                  summary: `子调查失败：${String(err?.message || err).slice(0, 200)}`,
+                  chains: [],
+                  steps: 0,
+                };
+                results[myIdx] = item;
+                collectedSubagents.push({ id: item.id, title: item.title, ok: false, summary: item.summary, steps: 0 });
+                sendEvent({ type: 'subagent_end', ...item });
+              }
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(maxConcurrency, taskDefs.length) }, () => runWorker()));
+          const mergedChains = results.flatMap(r => Array.isArray(r?.chains) ? r.chains : []).slice(0, 8);
+          return {
+            ok: true,
+            count: results.length,
+            results: results.map(({ id, title, ok, summary, steps }) => ({ id, title, ok, summary, steps })),
+            ...(mergedChains.length ? { chains: mergedChains } : {}),
+          };
         }
         return { ok: false, error: `未知工具：${name}` };
       };
@@ -4722,15 +5586,61 @@ export const server = http.createServer(async (req, res) => {
             containerKind: f.containerKind === 'dir' ? 'dir' : 'file',
             label: String(f.label || '').slice(0, 120),
           });
+          const sanitizePair = (pr) => (!pr || typeof pr !== 'object' ? null : {
+            kind: 'pair',
+            fromId: String(pr.fromId || '').slice(0, 200),
+            fromName: String(pr.fromName || '').slice(0, 120),
+            toId: String(pr.toId || '').slice(0, 200),
+            toName: String(pr.toName || '').slice(0, 120),
+            visiblePaths: (Array.isArray(pr.visiblePaths) ? pr.visiblePaths : []).slice(0, 8).map(vp => ({
+              direction: String(vp?.direction || '').slice(0, 16),
+              edgeKeys: (Array.isArray(vp?.edgeKeys) ? vp.edgeKeys : []).slice(0, 20).map(k => String(k).slice(0, 320)),
+              names: (Array.isArray(vp?.names) ? vp.names : []).slice(0, 20).map(s => String(s).slice(0, 120)),
+            })),
+            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => ({
+              direction: String(rp?.direction || '').slice(0, 16),
+              varId: String(rp?.varId || '').slice(0, 200),
+              varName: String(rp?.varName || '').slice(0, 120),
+              writer: String(rp?.writer || '').slice(0, 200),
+              reader: String(rp?.reader || '').slice(0, 200),
+              line: Number(rp?.line) || 0,
+            })),
+            sharedVars: (Array.isArray(pr.sharedVars) ? pr.sharedVars : []).slice(0, 16).map(v => ({
+              id: String(v?.id || v || '').slice(0, 200),
+              name: String(v?.name || v || '').slice(0, 120),
+            })),
+          });
+          const sanitizeDataflow = (df) => (!df || typeof df !== 'object' ? null : {
+            kind: 'dataflow',
+            targetId: String(df.targetId || df.id || '').slice(0, 200),
+            targetName: String(df.targetName || df.name || '').slice(0, 120),
+            dir: ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out',
+            vars: (Array.isArray(df.vars) ? df.vars : []).slice(0, 16).map(v => ({
+              id: String(v?.id || v || '').slice(0, 200),
+              name: String(v?.name || v || '').slice(0, 120),
+            })),
+            peers: (Array.isArray(df.peers) ? df.peers : []).slice(0, 16).map(peer => ({
+              id: String(peer?.id || peer || '').slice(0, 200),
+              name: String(peer?.name || peer || '').slice(0, 120),
+            })),
+          });
           const out = {};
-          const types = [['node', 'selectedNode', sanitizeNode], ['edge', 'selectedEdge', sanitizeEdge],
-            ['file', 'selectedFile', sanitizeFile]];
+          const types = [
+            ['node', 'selectedNode', sanitizeNode],
+            ['edge', 'selectedEdge', sanitizeEdge],
+            ['file', 'selectedFile', sanitizeFile],
+            ['pair', 'selectedPair', sanitizePair],
+            ['dataflow', 'selectedDataflow', sanitizeDataflow],
+          ];
           const flat = types.find(([kind]) => raw.kind === kind);
           for (const [, key, sanitize] of flat ? [flat] : types) {
             if (flat) {
               const item = sanitize(raw);
               Object.assign(out, item, { [key]: item });
             } else if (raw[key]) out[key] = sanitize(raw[key]);
+          }
+          if (typeof raw.relationIntent === 'string' && ['auto', 'compare', 'path', 'dataflow', 'common_callers'].includes(raw.relationIntent)) {
+            out.relationIntent = raw.relationIntent;
           }
           if (Array.isArray(raw.items)) {
             const items = new Map();
@@ -4742,6 +5652,12 @@ export const server = http.createServer(async (req, res) => {
               } else if (entry?.kind === 'edge') {
                 item = sanitizeEdge(entry);
                 id = item?.edgeKey || (item?.from && item?.to && `${item.from}->${item.to}:${item.line}`);
+              } else if (entry?.kind === 'pair') {
+                item = sanitizePair(entry);
+                id = item?.fromId && item?.toId && [item.fromId, item.toId].sort().join('<->');
+              } else if (entry?.kind === 'dataflow') {
+                item = sanitizeDataflow(entry);
+                id = item?.targetId && `${item.targetId}:${item.dir}`;
               } else if (entry?.kind === 'file') {
                 item = sanitizeFile(entry);
                 id = item?.path;
@@ -4754,14 +5670,103 @@ export const server = http.createServer(async (req, res) => {
           }
           return Object.keys(out).length ? out : null;
         };
+        const enrichTurnContext = async (model, ui) => {
+          if (!ui || !model?._index) return '';
+          const nodeIds = [];
+          const pushNode = (id) => {
+            if (id && model._index.byId.has(id) && !nodeIds.includes(id)) nodeIds.push(id);
+          };
+          const pairs = [];
+          if (ui.selectedPair?.fromId && ui.selectedPair?.toId) pairs.push([ui.selectedPair.fromId, ui.selectedPair.toId]);
+          if (ui.selectedNode?.id) pushNode(ui.selectedNode.id);
+          if (ui.selectedDataflow?.targetId) pushNode(ui.selectedDataflow.targetId);
+          for (const item of ui.items || []) {
+            if (item?.kind === 'node' && item.id) pushNode(item.id);
+            else if (item?.kind === 'pair' && item.fromId && item.toId) pairs.push([item.fromId, item.toId]);
+            else if (item?.kind === 'dataflow' && item.targetId) pushNode(item.targetId);
+          }
+          if (!pairs.length && nodeIds.length >= 2) pairs.push([nodeIds[0], nodeIds[1]]);
+          const needsAnalysis = Boolean(pairs.length || ui.selectedDataflow || (ui.items || []).some(i => i?.kind === 'dataflow') || ui.relationIntent === 'dataflow');
+          if (needsAnalysis && !COMPARISON && model.source !== 'dot') {
+            await ensureAnalysis(model);
+            assertActive();
+          }
+          const lines = [];
+          const shortName = (id) => model._index.byId.get(id)?.name || String(id).replace(/^var::/, '').split('::').pop();
+          for (const [a, b] of pairs.slice(0, 2)) {
+            if (!model._index.byId.has(a) || !model._index.byId.has(b) || a === b) continue;
+            const shortestCallPath = (src, dst, maxDepth = 5) => {
+              const q = [[src]];
+              const seen = new Set([src]);
+              while (q.length) {
+                const path = q.shift();
+                if (path.length > maxDepth) continue;
+                const tail = path[path.length - 1];
+                for (const e of model._index.outAdj.get(tail) || []) {
+                  if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
+                  if (e.to === dst) return [...path, dst];
+                  if (!seen.has(e.to)) { seen.add(e.to); q.push([...path, e.to]); }
+                }
+              }
+              return null;
+            };
+            const fwd = shortestCallPath(a, b);
+            const rev = fwd ? null : shortestCallPath(b, a);
+            const path = fwd || rev;
+            if (path) {
+              lines.push(`- 调用通路: ${path.map(shortName).join(' → ')}`);
+            } else {
+              lines.push(`- 调用通路: ${shortName(a)} 与 ${shortName(b)} 5 跳内无直接调用路径`);
+            }
+            try {
+              const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
+              assertActive();
+              if (df.sharedVars?.length) {
+                lines.push(`- 共享全局变量: ${df.sharedVars.slice(0, 8).map(v => `${v.name} (${v.id})`).join('、')}`);
+              }
+              for (const p of (df.paths || []).slice(0, 5)) {
+                const label = `${shortName(p.writer)} --W:${p.varName}--> ${shortName(p.reader)} (${p.direction || 'rw'}${p.line ? `, L${p.line}` : ''})`;
+                lines.push(`- 读写链路: ${label}`);
+              }
+            } catch { /* ignore enrichment dataflow errors */ }
+            try {
+              const trA = traceToTasks(model, a, { limit: 20 });
+              const trB = traceToTasks(model, b, { limit: 20 });
+              const setB = new Set((trB.upstreamTasks || []).map(t => t.id));
+              const commonTasks = (trA.upstreamTasks || []).filter(t => setB.has(t.id)).slice(0, 4);
+              if (commonTasks.length) {
+                lines.push(`- 公共上游 TASK/ISR: ${commonTasks.map(t => t.name).join('、')}`);
+              }
+            } catch { /* ignore */ }
+          }
+          if (!pairs.length && nodeIds.length === 1 && model._index.byId.get(nodeIds[0])?.kind !== 'var') {
+            try {
+              const tr = traceToTasks(model, nodeIds[0], { limit: 10 });
+              if (tr.upstreamTasks?.length) {
+                lines.push(`- 触发 TASK/ISR: ${tr.upstreamTasks.slice(0, 6).map(t => t.name).join('、')}`);
+              }
+            } catch { /* ignore */ }
+          }
+          return lines.slice(0, 28).join('\n');
+        };
         const uiContext = sanitizeUiContext(p.uiContext);
+        if (uiContext) {
+          const enrichment = await enrichTurnContext(MODEL, uiContext);
+          if (enrichment) uiContext.enrichment = enrichment;
+        }
         uiSelectedIds = new Set([
           ...(uiContext?.selectedNode?.id ? [uiContext.selectedNode.id] : []),
           ...(uiContext?.selectedEdge?.from ? [uiContext.selectedEdge.from] : []),
           ...(uiContext?.selectedEdge?.to ? [uiContext.selectedEdge.to] : []),
+          ...(uiContext?.selectedPair?.fromId ? [uiContext.selectedPair.fromId] : []),
+          ...(uiContext?.selectedPair?.toId ? [uiContext.selectedPair.toId] : []),
+          ...(uiContext?.selectedDataflow?.targetId ? [uiContext.selectedDataflow.targetId] : []),
           ...((uiContext?.items || []).flatMap((item) => item?.kind === 'node' && item.id
             ? [item.id]
-            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean) : [])),
+            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean)
+            : item?.kind === 'pair' ? [item.fromId, item.toId].filter(Boolean)
+            : item?.kind === 'dataflow' && item.targetId ? [item.targetId]
+            : [])),
         ]);
         const context = {
           projectName: PROJECT.name,
@@ -4783,6 +5788,18 @@ export const server = http.createServer(async (req, res) => {
           executeTool: executeAiTool,
           onEvent: sendEvent,
           signal: abort.signal,
+          beforeDone: async ({ onEvent }) => {
+            const extra = {};
+            if (turnChangeset && turnWriteOps.size) {
+              turnChangeset.ops = [...turnWriteOps];
+              saveAiChangeset(turnChangeset);
+              const cs = { id: turnChangeset.id, ops: turnChangeset.ops };
+              onEvent({ type: 'changeset', changesetId: cs.id, ops: cs.ops });
+              extra.changeset = cs;
+            }
+            if (collectedSubagents.length) extra.subagents = collectedSubagents;
+            return extra;
+          },
         });
       } catch (err) {
         sendEvent({ type: 'error', error: String(err?.message || err) });
@@ -4910,6 +5927,7 @@ export const server = http.createServer(async (req, res) => {
         Connection: 'keep-alive',
       });
       res.write('retry: 2000\n\n'); // 断开后浏览器自动重连的间隔
+      res._clientId = String(u.searchParams.get('clientId') || req.headers['x-callgraph-client'] || '').slice(0, 128);
       sseClients.add(res);
       res.on('close', () => sseClients.delete(res));
       return;

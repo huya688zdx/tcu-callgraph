@@ -119,6 +119,7 @@ function renderDataflowResult(error = '') {
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
     <div class="df-actions"><button class="primary" data-df="toggle">${t('common.relAdd')}</button>
+      ${window.__EXPORT ? '' : '<button type="button" data-df="askAi" title="将数据流分析结果明确加入 AI 对话上下文">✨ 加入对话</button>'}
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -273,9 +274,55 @@ document.addEventListener('dblclick', (e) => {
   void toggleSelectedRelation();
 });
 
+function buildDataflowAiDetail() {
+  const res = df.result;
+  if (!res?.fn) return null;
+  const rows = relations(res);
+  const vars = [];
+  const readers = new Set();
+  const writers = new Set();
+  const edges = [];
+  for (const r of rows) {
+    vars.push(r.v.name);
+    if (r.v.mode === 'read') writers.add(r.peer.name);
+    else readers.add(r.peer.name);
+    if (edges.length < 16) {
+      edges.push(`${r.v.mode === 'read' ? r.peer.name + ' → ' + r.v.name + ' → ' + res.fn.name : res.fn.name + ' → ' + r.v.name + ' → ' + r.peer.name}`);
+    }
+  }
+  const chosen = rows[df.selected];
+  return {
+    kind: 'dataflow',
+    id: `dataflow:${res.fn.id}`,
+    fnId: res.fn.id,
+    fnName: res.fn.name,
+    file: res.fn.file || '',
+    line: res.fn.line || 0,
+    label: `数据流 · ${res.fn.name} (${rows.length})`,
+    relationCount: rows.length,
+    vars: [...new Set(vars)].slice(0, 12),
+    writers: [...writers].slice(0, 10),
+    readers: [...readers].slice(0, 10),
+    edges,
+    ...(chosen ? {
+      focused: {
+        varId: chosen.v.id,
+        varName: chosen.v.name,
+        mode: chosen.v.mode,
+        peerId: chosen.peer.id,
+        peerName: chosen.peer.name,
+      },
+    } : {}),
+  };
+}
+
 document.addEventListener('click', (e) => {
   const button = e.target.closest?.('#secDataflow [data-df]');
   if (!button || button.disabled) return;
   if (button.dataset.df === 'toggle') void toggleSelectedRelation();
   if (button.dataset.df === 'close') clearDataflow();
+  if (button.dataset.df === 'askAi') {
+    const detail = buildDataflowAiDetail();
+    if (detail) document.dispatchEvent(new CustomEvent('cg:ask-ai', { detail }));
+  }
 });

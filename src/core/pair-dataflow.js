@@ -90,8 +90,10 @@ export async function comparisonPairDataflow(comparison, a, b) {
     for (const n of result.nodes) nodes.set(n.id, n);
     for (const p of result.paths) {
       const key = JSON.stringify(p.nodes);
-      if (!paths.has(key)) paths.set(key, { ...p, versions: [] });
-      paths.get(key).versions.push(version);
+      if (!paths.has(key)) paths.set(key, { ...p, versions: [], evidenceByVersion: {} });
+      const entry = paths.get(key);
+      entry.versions.push(version);
+      entry.evidenceByVersion[version] = p.edges;
     }
   }
   return { ok: true, a, b, paths: [...paths.values()], nodes: [...nodes.values()], truncated, partial,

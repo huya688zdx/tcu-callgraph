@@ -178,8 +178,13 @@ export const api = {
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir), { timeout: ANALYSIS_TIMEOUT }),
-  pairDataflow: (a, b) => post('/api/dataflow/pair', { a, b, projectId: state.view?.projectId,
-    comparisonId: state.view?.comparison?.id }, { timeout: ANALYSIS_TIMEOUT }),
+  pairDataflow: (a, b, { signal } = {}) => post('/api/dataflow/pair', {
+    a,
+    b,
+    projectId: state.view?.projectId,
+    comparisonId: state.view?.comparison?.id,
+    sessionRevision: state.view?.sessionRevision,
+  }, { timeout: ANALYSIS_TIMEOUT, signal }),
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
@@ -201,6 +206,7 @@ export const api = {
     return write;
   },
   compactChat: (body, signal) => post('/api/ai/compact', body, { timeout: MODEL_TIMEOUT, signal }),
+  aiUndoChangeset: (changesetId) => post('/api/ai/undo-changeset', { changesetId }),
   aiModels: (body, signal) => post('/api/ai/models', body, { timeout: MODEL_TIMEOUT, signal }),
   aiTest: (body) => post('/api/ai/test', body, { timeout: MODEL_TIMEOUT }),
   aiChat: (body, signal) =>

@@ -1158,6 +1158,15 @@ window.__cg = {
       label: state.selectedLabel,
     };
   },
+  get aiOverlay() {
+    return state.aiOverlay;
+  },
+  get presentation() {
+    return state.presentation;
+  },
+  get aiHover() {
+    return state.aiHover;
+  },
   /** 连线标签：位置由画布算出，测试用它检查避让与「贴线」约束（一线可多条） */
   labels() {
     const v = state.view;

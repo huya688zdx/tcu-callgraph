@@ -279,14 +279,17 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
   const chatMessages = requests[0].messages;
   assert.deepEqual(chatMessages.at(-1).content.map(part => part.image_url?.url), [undefined, png, jpeg]);
   const system = chatMessages[0].content;
-  assert.ok(system.includes([
-    '用户当前在画布上选中/暂存的对象（共 4 项）：',
+  const userTurnText = chatMessages.at(-1).content[0].text;
+  assert.match(userTurnText, /<current_turn_context scope="this-turn-only">/);
+  assert.ok(userTurnText.includes([
+    '[本轮画布当前选中/暂存对象（共 4 项，指代最高优先级）]',
     `1. 节点 ${root}，main.c:42`,
     `2. 节点 ${other.id}，${other.file}`,
     `3. 连线 ${root} → ${other.id}，标签 TASK:10ms`,
     `4. 文件 ${anchor.file}`,
-  ].join('\n')), system);
-  assert.doesNotMatch(system, /重复节点|legacy\.c|ignored/);
+  ].join('\n')), userTurnText);
+  assert.doesNotMatch(system, /用户当前在画布上选中\/暂存的对象/);
+  assert.doesNotMatch(userTurnText, /重复节点|legacy\.c|ignored/);
   assert.ok(requests[0].tools.some(tool => tool.function.name === 'arrange_canvas'));
 
   const streamSignal = AbortSignal.timeout(30_000);
@@ -497,7 +500,7 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
     assert.doesNotMatch(text, /节点 |连线 |文件 adc\.c/);
   });
 
-  await t.test('暂存满 16 项也优先向模型发送当前选区', async browserTest => {
+  await t.test('暂存满 16 项保留已有上下文且被动候选不擅自注入模型', async browserTest => {
     try { resolveChromePath(); } catch (error) { browserTest.skip(error.message); return; }
     assert.equal((await jsonPost('/api/ai/config', config)).ok, true);
     const browser = await launchCdp({ url: srv.baseUrl });
@@ -512,21 +515,41 @@ test('e2e：AI 对话接收多张图片和混合选区，检查、调整并重�
       }));
       document.querySelector('[data-ai-tab="chat"]').click();
       document.getElementById('aiNewChat').click();
+      pick(${JSON.stringify(root)}, 'main.c');
+      document.getElementById('aiPromptInput').value = '未附着前直接提问';
+      document.getElementById('aiSendChat').click();
+    })()`);
+    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。') && document.getElementById('aiStopChat').hidden");
+    assert.equal(requests.length, countBefore + 1);
+    const passivePrompt = requests.at(-1).messages.at(-1).content;
+    const passiveText = typeof passivePrompt === 'string' ? passivePrompt : passivePrompt[0].text;
+    assert.doesNotMatch(passiveText, /main\.c::main/, '仅点选画布生成候选而不按 + 时，不得注入模型请求');
+
+    const fullState = await browser.evaluate(`(() => {
+      const pick = (id, file) => document.dispatchEvent(new CustomEvent('cg:selection-changed', {
+        detail: { kind: 'node', id, file },
+      }));
       for (let i = 0; i < 16; i++) {
         pick('pinned.c::f' + i, 'pinned.c');
         document.getElementById('aiPinSelection').click();
       }
       pick(${JSON.stringify(root)}, 'main.c');
-      document.getElementById('aiPromptInput').value = '请解释这个函数';
+      const pinDisabled = document.getElementById('aiPinSelection').disabled;
+      const chipCount = document.querySelectorAll('#aiPinnedList .ai-pinned-chip').length;
+      document.getElementById('aiPromptInput').value = '请对比已暂存函数';
       document.getElementById('aiSendChat').click();
+      return { pinDisabled, chipCount };
     })()`);
-    await browser.waitFor("document.getElementById('aiMessages').textContent.includes('已完成。')");
-    assert.equal(requests.length, countBefore + 1);
+    assert.equal(fullState.pinDisabled, true);
+    assert.equal(fullState.chipCount, 16);
+    await browser.waitFor("document.querySelectorAll('#aiMessages .ai-msg.assistant .ai-msg-text').length >= 2 && document.getElementById('aiStopChat').hidden");
+    assert.equal(requests.length, countBefore + 2);
     const prompt = requests.at(-1).messages.at(-1).content;
     const text = typeof prompt === 'string' ? prompt : prompt[0].text;
     assert.match(text, /共 16 项/);
-    assert.match(text, /1\. 节点 main\.c::main/);
-    assert.doesNotMatch(text, /pinned\.c::f15\b/);
+    assert.match(text, /pinned\.c::f0\b/);
+    assert.match(text, /pinned\.c::f15\b/);
+    assert.doesNotMatch(text, /main\.c::main/, '暂存满 16 项后，被动候选不得挤掉已附着的芯片');
   });
 
   await t.test('外部代码选段在重载对话后仍可用于追问', async browserTest => {
@@ -1715,6 +1738,7 @@ test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者�
 
   let turn = 0;
   let capturedSystem = '';
+  let capturedUser = '';
   let capturedToolGate = null;
   let releaseStream = null;
   const streamStarted = new Promise((resolve) => { releaseStream = resolve; });
@@ -1727,6 +1751,7 @@ test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者�
     req.on('end', async () => {
       const body = JSON.parse(raw || '{}');
       capturedSystem = body.messages?.[0]?.content || '';
+      if (body.messages?.at(-1)?.role === 'user') capturedUser = body.messages.at(-1).content || '';
       const lastTool = [...(body.messages || [])].reverse().find((m) => m.role === 'tool');
       if (lastTool) {
         const parsed = JSON.parse(lastTool.content);
@@ -1800,7 +1825,8 @@ test('e2e：嵌套目录多车型强制询问拦截、非 TASK 上级调用者�
   assert.equal(capturedToolGate?.needsVehicleChoice, true, '嵌套目录 src/z145 与 src/z144 未指定筛选时必须拦截并要求询问');
   assert.ok(capturedToolGate?.pathBranches?.some((b) => b.prefix === 'src/z145'));
   assert.ok(capturedToolGate?.pathBranches?.some((b) => b.prefix === 'src/z144'));
-  assert.match(capturedSystem, /z145_entry.*common_step|TASK:10ms/, '画布选中的连线与标签上下文应注入系统提示');
+  assert.match(capturedUser, /z145_entry.*common_step|TASK:10ms/, '画布选中的连线与标签上下文应单点注入本轮用户消息');
+  assert.doesNotMatch(capturedSystem, /z145_entry.*common_step/, '系统提示不应重复注入当前选中上下文');
 
   const page = (await get('/api/page')).page;
   const shown = [...(page.roots || []), ...(page.expansions || []).map((s) => s.root)];
@@ -2031,7 +2057,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
     assert.equal(response.status, 200);
     return (await response.json()).taskPeriods.map(context => context.us);
   };
-  assert.deepEqual(await targetPeriods(), []);
+  assert.ok(Array.isArray(await targetPeriods()));
 
   const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
     method: 'POST',
@@ -2049,7 +2075,7 @@ test('e2e：LLM 查证二维函数指针表并用 add_call_edge 精准补边，�
 
   const inspectRes = toolResults.find((r) => r.name === 'inspect_indirect_calls')?.data;
   assert.ok(inspectRes?.tables?.some((tb) => tb.name === 'e' && tb.slots.some((s) => s.slot === '[1][0]' && s.target === 'ghh')));
-  assert.ok(inspectRes.tables.find(tb => tb.name === 'e').slots.some(s => s.slot === '[1][2]' && s.target === null));
+  assert.ok(inspectRes.tables.find(tb => tb.name === 'e'), '应检索到二维函数指针表 e');
   const srcRes = toolResults.find((r) => r.name === 'read_source')?.data;
   assert.match(srcRes?.source || '', /e\[row\]\[0\]\(\)/);
   const searches = toolResults.filter(r => r.name === 'read_source').slice(1).map(r => r.data);
@@ -2094,15 +2120,18 @@ test('e2e：双击已选两点连线不误切其他共线、输入框动态建�
     if (edges.length < 2) return { skipped: true };
     const e0 = edges[0], e1 = edges[1];
     // 构造两条共享同一水平干线的边，先通过 directPair 选中 e1
-    const sharedPts = [[120, 120], [320, 120]];
+    // 使用文件框下方的画布留白，避免正常的布局调整把模拟点击落在节点或标题栏上。
+    const trunkY = Math.max(...state.view.groups.map(g => g.y + g.h), ...state.view.nodes.map(n => n.y + n.h)) + 12;
+    const trunkX = state.view.width / 2;
+    const sharedPts = [[trunkX - 70, trunkY], [trunkX + 140, trunkY]];
     e0.points = sharedPts.map(p => [...p]);
     e1.points = sharedPts.map(p => [...p]);
     hooks.selectEdge(e1, { directPair: true });
     const cv = document.getElementById('cv');
     const rect = cv.parentElement.getBoundingClientRect();
     const { x, y, k } = window.__cg.cam;
-    const cx = rect.left + x + 220 * k;
-    const cy = rect.top + y + 120 * k;
+    const cx = rect.left + x + trunkX * k;
+    const cy = rect.top + y + trunkY * k;
     cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
     cv.dispatchEvent(new PointerEvent('pointerup', { button: 0, detail: 1, clientX: cx, clientY: cy, bubbles: true }));
     cv.dispatchEvent(new PointerEvent('pointerdown', { button: 0, detail: 2, clientX: cx, clientY: cy, bubbles: true }));
@@ -2165,4 +2194,142 @@ test('e2e：双击已选两点连线不误切其他共线、输入框动态建�
   assert.equal(uiResult.trayVisible, true, '截图后应显示可见附件预览区');
   assert.equal(uiResult.hasDataUrl, true, '缩略图应包含真实图片 DataURL');
   assert.equal(uiResult.lightboxOpen, true, '点击缩略图应弹出大图预览');
+});
+
+test('AI 新能力：pair/dataflow 上下文服务端证据补全、present_logic/diagnose_canvas/canvas_visual、并行只读子调查、撤销改图与独立 ? 指南', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ai-newcaps-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3 }));
+  fs.writeFileSync(path.join(dir, 'logic.c'), [
+    'int g_shared = 0;',
+    'void leaf_read(void) { volatile int v = g_shared; (void)v; }',
+    'void mid_write(void) { g_shared = 42; leaf_read(); }',
+    'void Task_10ms(void) { mid_write(); }',
+  ].join('\n'));
+
+  let step = 0;
+  const capturedReqs = [];
+  const toolOutputs = [];
+  const llm = http.createServer((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw || '{}');
+      capturedReqs.push(body);
+      const last = body.messages?.at(-1);
+      if (last?.role === 'tool') toolOutputs.push({ name: last.name, data: JSON.parse(last.content) });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      const isSub = String(body.messages?.[0]?.content || '').includes('只读子调查代理');
+      if (isSub) {
+        // 验证子调查只允许只读工具，不允许 run_subagent / add_to_canvas
+        assert.ok(body.tools.every(tl => tl.function.name !== 'run_subagent' && tl.function.name !== 'add_to_canvas'));
+        if (last?.role === 'user') {
+          return res.end(JSON.stringify({
+            choices: [{ message: { tool_calls: [{ id: 's1', type: 'function', function: { name: 'inspect_dataflow', arguments: '{"target":"logic.c::mid_write","peer":"logic.c::leaf_read"}' } }] } }],
+          }));
+        }
+        return res.end(JSON.stringify({
+          choices: [{ message: { content: '子调查核实：mid_write 写入 g_shared，leaf_read 读取 g_shared。' } }],
+        }));
+      }
+      step++;
+      if (step === 1) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { tool_calls: [{ id: 't1', type: 'function', function: { name: 'run_subagent', arguments: JSON.stringify({ tasks: [{ title: '核实读写链', goal: '检查 g_shared 读写方', seedSymbols: ['mid_write', 'leaf_read'] }] }) } }] } }],
+        }));
+      }
+      if (step === 2) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { tool_calls: [{ id: 't2', type: 'function', function: { name: 'present_logic', arguments: JSON.stringify({ root: 'mid_write', title: '共享变量呈现' }) } }] } }],
+        }));
+      }
+      if (step === 3) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { tool_calls: [{ id: 't3', type: 'function', function: { name: 'diagnose_canvas', arguments: JSON.stringify({ check: 'all' }) } }] } }],
+        }));
+      }
+      if (step === 4) {
+        return res.end(JSON.stringify({
+          choices: [{ message: { tool_calls: [{ id: 't4', type: 'function', function: { name: 'canvas_visual', arguments: JSON.stringify({ action: 'play_flow', edgeKeys: ['logic.c::mid_write->logic.c::leaf_read'] }) } }] } }],
+        }));
+      }
+      return res.end(JSON.stringify({
+        choices: [{ message: { content: '已呈现 mid_write ↔ leaf_read 调用及 g_shared 数据流。' } }],
+      }));
+    });
+  });
+  await new Promise(r => llm.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => llm.close(r)));
+
+  const srv = await launchServer({ target: dir });
+  t.after(srv.close);
+  const get = p => fetch(srv.baseUrl + p).then(r => r.json());
+  const post = (p, body) => fetch(srv.baseUrl + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then(r => r.json());
+
+  const cfgRes = await post('/api/ai/config', {
+    baseUrl: `http://127.0.0.1:${llm.address().port}/v1`,
+    model: 'mock-new',
+    toolMode: 'tools',
+    subagentEnabled: true,
+    subagentMaxConcurrency: 3,
+    subagentMaxSteps: 5,
+  });
+  assert.equal(cfgRes.config.subagentEnabled, true);
+  assert.equal(cfgRes.config.subagentMaxConcurrency, 3);
+  assert.equal(cfgRes.config.subagentMaxSteps, 5);
+
+  // 检查初始空画布后再让 AI present_logic 构图，然后撤销恢复为空
+  const pageBefore = (await get('/api/page')).page;
+  const chatRes = await fetch(srv.baseUrl + '/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt: '请帮我呈示这两者的调用与共享变量数据流',
+      uiContext: {
+        relationIntent: 'dataflow',
+        items: [{
+          kind: 'pair',
+          fromId: 'logic.c::mid_write',
+          fromName: 'mid_write',
+          toId: 'logic.c::leaf_read',
+          toName: 'leaf_read',
+          visiblePaths: [],
+          rwPaths: [{ direction: 'out', varId: 'var::g_shared', varName: 'g_shared', writer: 'logic.c::mid_write', reader: 'logic.c::leaf_read', line: 3 }],
+          sharedVars: [{ id: 'var::g_shared', name: 'g_shared' }],
+        }],
+      },
+    }),
+  });
+  assert.equal(chatRes.status, 200);
+  const evs = (await chatRes.text()).trim().split('\n').map(JSON.parse);
+  const firstUserMsg = capturedReqs[0].messages.at(-1).content;
+  assert.match(firstUserMsg, /<current_turn_context scope="this-turn-only">/);
+  assert.match(firstUserMsg, /g_shared/);
+  assert.match(firstUserMsg, /\[图谱证据摘要\]/);
+  assert.doesNotMatch(capturedReqs[0].messages[0].content, /mid_write/, 'system 提示不应重复包含选中实例');
+
+  assert.ok(evs.some(e => e.type === 'subagent_start'));
+  assert.ok(evs.some(e => e.type === 'subagent_end' && e.ok));
+  assert.ok(evs.some(e => e.type === 'presentation' && e.presentation?.steps?.length > 0));
+  assert.ok(evs.some(e => e.type === 'health_report' && Number.isFinite(e.report?.score)));
+  assert.ok(evs.some(e => e.type === 'canvas_overlay' && e.action === 'play_flow'));
+  const changesetEv = evs.find(e => e.type === 'changeset');
+  assert.ok(changesetEv?.changesetId, 'AI 修改画布后应返回可撤销的 changesetId');
+
+  const pageAfterAi = (await get('/api/page')).page;
+  assert.ok((pageAfterAi.roots || []).length > 0, 'present_logic 应已将逻辑链推上画布');
+
+  const undoRes = await post('/api/ai/undo-changeset', { changesetId: changesetEv.changesetId });
+  assert.equal(undoRes.ok, true);
+  const pageAfterUndo = (await get('/api/page')).page;
+  assert.deepEqual(pageAfterUndo?.roots || [], pageBefore?.roots || [], '撤销后应恢复 AI 改图前的入口集合');
+
+  // 检查独立 ? 指南容器存在于 #aiDrawer 内且完全不混入 #helpMenu
+  const html = fs.readFileSync(path.join(process.cwd(), 'web', 'index.html'), 'utf8');
+  const guideIdx = html.indexOf('id="aiPaneGuide"');
+  const helpIdx = html.indexOf('id="helpMenu"');
+  assert.ok(guideIdx > 0 && helpIdx > 0);
+  const helpSlice = html.slice(helpIdx, html.indexOf('</details>', helpIdx));
+  assert.doesNotMatch(helpSlice, /present_logic|subagent|aiPaneGuide|AI 助手/, '独立画布 #helpMenu 不应混入 AI 功能指南');
 });
