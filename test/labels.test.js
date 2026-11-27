@@ -14,8 +14,10 @@ import {
   freeConnNumbers,
   estimateTextWidth,
   labelBoxSize,
+  labelSvg,
   normalizeLabels,
   placeEdgeLabels,
+  viewHeaderObstacles,
   clampLabelCenter,
   labelSize,
   labelText,
@@ -349,4 +351,89 @@ test('SVG 标签布局：同边的 TASK、コール順和結合点互相避让�
     for (const node of nodes) assert.ok(!rectsOverlap(rect, node, 5));
     for (const earlier of placed.slice(0, index)) assert.ok(!rectsOverlap(rect, earlier.rect, 4));
   }
+});
+
+test('free 自由框标签：套用默认边框并剥离 note，支持自定义颜色与无框', () => {
+  const def = normalizeLabel({ preset: 'free' });
+  assert.equal(def.preset, 'free');
+  assert.equal(def.text, LABEL_PRESETS.free.text);
+  assert.equal(def.border, LABEL_PRESETS.free.border);
+  assert.equal(def.color, LABEL_PRESETS.free.color);
+  assert.equal(def.note, undefined);
+
+  const styled = normalizeLabel({
+    preset: 'free',
+    text: '重要支路',
+    note: '不应附带注释',
+    border: '#185FA5',
+    color: '#185FA5',
+  });
+  assert.equal(styled.text, '重要支路');
+  assert.equal(styled.border, '#185FA5');
+  assert.equal(styled.color, '#185FA5');
+  assert.equal(styled.note, undefined);
+
+  const noBorder = normalizeLabel({ preset: 'free', text: '无框自由', border: null });
+  assert.equal(noBorder.border, null);
+});
+
+test('标签不显示注释内容：labelBoxSize 与 labelSvg 仅包含主文字', () => {
+  const plain = { preset: 'task', text: 'TASK:10ms', border: '#2C2C2A', color: '#2C2C2A' };
+  const withNote = { ...plain, note: '非常长的注释说明不应该显示在标签上' };
+  const sizePlain = labelBoxSize(plain, measure);
+  const sizeNote = labelBoxSize(withNote, measure);
+  assert.deepEqual(sizeNote, sizePlain);
+  const svg = labelSvg(withNote, { x: 10, y: 20, w: sizeNote.w, h: sizeNote.h });
+  assert.ok(svg.includes('TASK:10ms'));
+  assert.ok(!svg.includes('非常长的注释说明'));
+});
+
+test('placeEdgeLabels：避开文件框标题栏与目录标题胶囊', () => {
+  const groups = [{ id: 'a.c', label: 'a.c', x: 0, y: 0, w: 200, h: 120 }];
+  const containers = [{ id: 'app', label: 'app', x: -10, y: -32, w: 240, h: 170 }];
+  const headers = viewHeaderObstacles({ groups, containers });
+  const pts = [[120, 12], [280, 12], [280, 120]];
+  const [rect] = placeEdgeLabels({
+    items: [{ label: { preset: 'free', text: '跨文件调用' }, size: { w: 74, h: 20 } }],
+    pts,
+    nodes: [],
+    headers,
+  });
+  assert.ok(rect);
+  for (const h of headers) assert.ok(!rectsOverlap(rect, h, 3), `标签压住标题框 ${JSON.stringify(h)}`);
+
+  const exported = layoutExportEdgeLabels({
+    nodes: [],
+    groups,
+    containers,
+    edges: [{ from: 'a', to: 'b', points: pts, labels: [{ preset: 'free', text: '跨文件调用' }] }],
+  });
+  assert.equal(exported.length, 1);
+  for (const h of headers) assert.ok(!rectsOverlap(exported[0].rect, h, 3));
+});
+
+test('placeEdgeLabels：优先选择宽敞竖直段，避免挂在过短水平端口引线上', () => {
+  const pts = [[0, 100], [16, 100], [16, 260], [180, 260]];
+  const [rect] = placeEdgeLabels({
+    items: [{ label: { preset: 'call', text: 'コール順1' }, size: { w: 60, h: 20 } }],
+    pts,
+    nodes: [],
+  });
+  assert.ok(rect);
+  const near = nearestOnPolyline({ x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 }, pts);
+  assert.equal(Math.round(near.x), 16);
+  assert.ok(near.y > 110 && near.y < 250, `应避开 16px 短引线而选在竖直段，got y=${near.y}`);
+});
+
+test('placeEdgeLabels：避开附近平行边，优先翻转到无遮挡一侧', () => {
+  const pts = [[0, 100], [200, 100]];
+  const parallelAbove = [[0, 82], [200, 82]];
+  const [rect] = placeEdgeLabels({
+    items: [{ label: { preset: 'free', text: '主链路' }, size: { w: 60, h: 20 } }],
+    pts,
+    nodes: [],
+    otherPaths: [parallelAbove],
+  });
+  assert.ok(rect);
+  assert.ok(rect.y >= 100, `上方有平行边时应翻转到下方，got y=${rect.y}`);
 });

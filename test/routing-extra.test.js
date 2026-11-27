@@ -1,6 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { routeEdges, pathBlockedByNodes } from '../src/core/routing.js';
+import { routeEdges, pathBlockedByNodes, pathCrossesBody, routeOverlapConflicts } from '../src/core/routing.js';
+import { mergeSharedRoutes } from '../src/core/layout-metrics.js';
+
+test('共线中点可以推翻旧面提示和旧折线，手工钉面及第三方框仍有效', () => {
+  const nodes = [{ id: 'a', x: 0, y: 80, w: 80, h: 40 }, { id: 'b', x: 320, y: 70, w: 100, h: 60 }];
+  const e = { from: 'a', to: 'b', kind: 'direct' };
+  routeEdges(nodes, [e], { faceHints: new Map([[e, { from: 'top', to: 'bottom' }]]) });
+  assert.deepEqual(e.points, [[80, 100], [320, 100]]);
+  const detour = [[40, 80], [40, 30], [370, 30], [370, 70]];
+  e.points = structuredClone(detour);
+  mergeSharedRoutes({ nodes, edges: [e] });
+  assert.deepEqual(e.points, [[80, 100], [320, 100]]);
+  const box = { id: 'third.c', x: 150, y: 60, w: 70, h: 100 };
+  e.points = structuredClone(detour);
+  mergeSharedRoutes({ nodes, edges: [e], groups: [box] });
+  assert.deepEqual(e.points, detour);
+  e.fromSide = 'top';
+  routeEdges(nodes, [e]);
+  assert.deepEqual(e.points[0], [40, 80]);
+});
+
+test('十三种线型同时钉在同一对中点，分叉后的走廊独立且重复路由不漂移', () => {
+  const nodes = [{ id: 'a', x: 10, y: 80, w: 120, h: 40 }, { id: 'b', x: 330, y: 80, w: 120, h: 40 }];
+  const edges = Array.from({ length: 13 }, (_, i) => ({ from: 'a', to: 'b', fromSide: 'right', toSide: 'left',
+    kind: i ? 'df-' + i : 'direct' }));
+  routeEdges(nodes, edges);
+  assert.equal(routeOverlapConflicts(edges).length, 0);
+  for (const e of edges) {
+    assert.deepEqual([e.points[0], e.points.at(-1)], [[130,100], [330,100]]);
+    assert.ok(!e.blocked && nodes.every(n => !pathCrossesBody(e.points, n)));
+    assert.ok(e.points.slice(1).every(([x,y], i) => x === e.points[i][0] || y === e.points[i][1]));
+  }
+  const once = edges.map(e => structuredClone(e.points));
+  routeEdges(nodes, edges);
+  assert.deepEqual(edges.map(e => e.points), once);
+});
 
 const EPS = 0.5;
 

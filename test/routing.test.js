@@ -1,9 +1,93 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { routeEdges, routeOverlapConflicts, pathBlockedByNodes } from '../src/core/routing.js';
+import { routeEdges, routeOverlapConflicts, incompatibleOverlap, pathBlockedByNodes } from '../src/core/routing.js';
 import { improveEdgeRoutes, mergeSharedRoutes, routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { exportSvg } from '../src/core/export-svg.js';
 import { buildSVGFromLayout } from '../src/core/export.js';
+import { launchServer } from '../scripts/lib/server.mjs';
+import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
+
+test('所有异样式冲突都重布，第 13 对及之后的边也与手工实线分道', () => {
+  const nodes = [], calls = [], refs = [];
+  for (let i = 0; i < 17; i++) {
+    const y = i * 100 + 40;
+    const a = { id: 's' + i, x: 40, y, w: 80, h: 40 };
+    const b = { id: 't' + i, x: 380, y, w: 80, h: 40 };
+    nodes.push(a, b);
+    const call = { from: a.id, to: b.id, kind: 'direct', custom: true, points: [[120, y+20], [380, y+20]] };
+    calls.push(call);
+    refs.push({ ...structuredClone(call), kind: ['var', 'dataflow', 'df-signal'][i % 3], custom: false });
+  }
+  const view = { nodes, edges: [...calls, ...refs] };
+  const saved = structuredClone(calls);
+  improveEdgeRoutes(view, refs, () => false);
+  mergeSharedRoutes(view, refs);
+  assert.deepEqual(calls, saved);
+  assert.equal(routeOverlapConflicts(view.edges).length, 0);
+  for (const [i, e] of refs.entries()) {
+    assert.equal(incompatibleOverlap(e, calls[i]), 0);
+    assert.ok(!pathBlockedByNodes(e.points, nodes, new Set([e.from, e.to])));
+  }
+});
+
+test('SVG 虚线按世界坐标递增描画，负坐标、反向线段和读写双箭头一致', () => {
+  const e = { from: 'reader', to: 'state', kind: 'var', via: '读写',
+    points: [[39, 22], [-3.5, 22], [-3.5, 22], [-3.5, -8]] };
+  for (const build of [exportSvg, buildSVGFromLayout]) {
+    const svg = build({ width: 100, height: 100, nodes: [], edges: [e] });
+    const paths = svg.match(/<path[^>]*data-from="reader"[^>]*>/g);
+    assert.equal(paths.length, 2);
+    assert.match(paths[0], /d="M -3.5 22 L 39 22"/);
+    assert.match(paths[0], /stroke-dasharray="7 4" stroke-dashoffset="7.5"/);
+    assert.match(paths[0], /marker-end=/);
+    assert.doesNotMatch(paths[0], /marker-start=/);
+    assert.match(paths[1], /d="M -3.5 -8 L -3.5 22"/);
+    assert.match(paths[1], /stroke-dashoffset="3"/);
+    assert.match(paths[1], /marker-start=/);
+    assert.doesNotMatch(paths[1], /marker-end=/);
+  }
+});
+
+test('浏览器画布缩小淡化、选中和高亮时，反向叠画的横竖虚线仍留有透明间隔', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const server = await launchServer();
+  t.after(() => server.close());
+  const chrome = await launchCdp({ url: server.baseUrl });
+  t.after(() => chrome.close());
+  await chrome.waitFor("document.querySelector('#cv')");
+  const sample = await chrome.evaluate(`(async () => {
+    const { drawEdge } = await import('/lib/render.js');
+    const { buildSVG } = await import('/lib/svg.js');
+    const { cam, state, edgeKey } = await import('/lib/state.js');
+    const edges = [{ from: 'a', to: 'v', kind: 'var', points: [[5,21],[94,21],[94,94]] },
+      { from: 'v', to: 'b', kind: 'df-signal', points: [[94,83],[94,21],[12,21]] }];
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 120;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    cam.k = 0.25;
+    ctx.scale(4 * cam.k, 4 * cam.k);
+    const results = [];
+    for (const mode of ['dim', 'selected', 'related', 'recent']) {
+      ctx.clearRect(0, 0, 120, 120);
+      state.recent = mode === 'recent' ? { edges: new Set(edges.map(edgeKey)) } : null;
+      for (const e of edges) drawEdge(ctx, e, mode === 'related', mode === 'selected', null, false, mode === 'dim',
+        mode === 'related' ? { role: 'in', emphasized: true } : null);
+      const pixels = ctx.getImageData(0, 0, 120, 120).data;
+      for (let pos = 44; pos < 77; pos++) {
+        const alpha = (x, y) => pixels[(120*y+x)*4+3];
+        // 宽线抗锯齿在间隔边缘可留下 1/255 的覆盖；实心像素明显高于它。
+        if ((alpha(pos, 21) > 2) !== (pos % 11 < 7) || (alpha(94, pos) > 2) !== (pos % 11 < 7)) {
+          results.push([mode, pos, alpha(pos, 21), alpha(94, pos)]);
+        }
+      }
+    }
+    state.view = { width: 120, height: 120, nodes: [], groups: [], containers: [], edges };
+    const doc = new DOMParser().parseFromString(buildSVG(), 'image/svg+xml');
+    return { results, offsets: [...doc.querySelectorAll('path[data-ei]')].map(p => p.getAttribute('stroke-dashoffset')) };
+  })()`);
+  assert.deepEqual(sample.results, [], '每个周期应有 7 个着色像素和 4 个透明像素');
+  assert.deepEqual(sample.offsets, ['5', '10', '10', '1']);
+});
 
 test('不同样式只豁免同端口的短引线，远处的短重叠也要计入', () => {
   const call = { from: 's', to: 'a', points: [[0, 0], [0, 40], [40, 40], [40, 80]] };

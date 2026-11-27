@@ -1,6 +1,6 @@
 // ELK 节点尺寸与连线度量工具。
-import { callEndpoints, semanticFaces, nearestSide, edgeStyleKey, canShareTrunk, routeBounds, boundsMeet, routeOverlapConflicts, routeEdges, collectSegments,
-  pathBlockedByNodes, pathCrossesBody, collapse, STUB } from './routing.js';
+import { callEndpoints, semanticFaces, nearFacing, straightConnection, shortPortDeficit, nearestSide, edgeStyleKey, canShareTrunk,
+  routeBounds, boundsMeet, routeOverlapConflicts, routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody, collapse, STUB } from './routing.js';
 
 export function textWidth(s) {
   let w = 0;
@@ -15,6 +15,7 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
   const vertical = [];
   const pathKeys = new Set();
   let bends = 0;
+  let shortPorts = 0;
   let rawLength = 0;
   for (const e of edges) {
     const pts = e.points || [];
@@ -22,6 +23,7 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
     if (signature && !pathKeys.has(signature)) {
       pathKeys.add(signature);
       bends += Math.max(0, pts.length - 2);
+      shortPorts += shortPortDeficit(pts);
       let pathLength = 0;
       for (let i = 0; i < pts.length - 1; i++) pathLength += Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
       rawLength += pathLength;
@@ -86,7 +88,7 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
       }
     }
   }
-  return { length, rawLength, crossings: intersections.size, bends };
+  return { length, rawLength, crossings: intersections.size, bends, shortPorts };
 }
 
 export function routeLengthAndCrossings(edges, geometryOnly = false) {
@@ -103,7 +105,7 @@ function layoutMetrics(edges) {
 }
 
 function scoreMetrics(m) {
-  return m.crossings * 40 + m.styleOverlapLength / 20 + m.bends * 2 + m.length / 50 + m.rawLength / 200;
+  return m.crossings * 40 + m.styleOverlapLength / 20 + m.shortPorts + m.bends * 2 + m.length / 50 + m.rawLength / 200;
 }
 
 export const routeScore = (edges) => scoreMetrics(layoutMetrics(edges));
@@ -151,17 +153,20 @@ export function improveEdgeRoutes(view, subset, simplify = () => true, crossingP
   const byId = new Map(view.nodes.map((n) => [n.id, n]));
   const callNodes = callEndpoints(view.edges);
   const groupDirections = new Map(view.groups?.map(g => [g.id, g.layoutDirection]));
-  const facePenalty = (e) => {
+  const facePenalty = (e, pinned = e) => {
     const a = byId.get(e.from), b = byId.get(e.to);
-    const roles = semanticFaces(e, a, b, view.layoutDirection, callNodes, groupDirections);
+    const facing = nearFacing(a, b);
+    const roles = semanticFaces(e, a, b, view.layoutDirection, callNodes, groupDirections) || facing;
     const side = (node, [x, y]) => nearestSide(node, { x, y });
-    return roles ? 24 * (Number(side(a, e.points[0]) !== roles[0]) +
-      Number(side(b, e.points.at(-1)) !== roles[1])) : 0;
+    return roles ? (facing ? 16 : 24) * (Number(!pinned.fromSide && side(a, e.points[0]) !== roles[0]) +
+      Number(!pinned.toSide && side(b, e.points.at(-1)) !== roles[1])) : 0;
   };
-  const ranked = subset.filter((e) => !e.custom && !e.fromSide && !e.toSide && e.from !== e.to && e.points?.length >= 2)
+  const ranked = subset.filter((e) => !e.custom && e.from !== e.to && e.points?.length >= 2 &&
+      ((!e.fromSide && !e.toSide) || byEdge.has(e) || e.blocked))
     .map((edge) => ({ edge, overlap: byEdge.get(edge) || 0, detour: detour(edge) }))
-    .filter(({ edge, overlap, detour }) => crossingPass || overlap || facePenalty(edge) || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))
-    .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour).slice(0, 12);
+    .filter(({ edge, overlap, detour }) => edge.blocked || overlap || (edge.points.length > 2 &&
+      (crossingPass || facePenalty(edge) || shortPortDeficit(edge.points) || (simplify(edge) && (detour > 0.5 || edge.points.length > 4)))))
+    .sort((a, b) => b.overlap - a.overlap || b.detour - a.detour);
   if (!ranked.length) return;
   const bounds = new Map(view.edges.map((e) => [e, routeBounds(e.points)]));
   for (const { edge } of ranked) {
@@ -171,13 +176,18 @@ export function improveEdgeRoutes(view, subset, simplify = () => true, crossingP
     const vertical = [below ? 'bottom' : 'top', below ? 'top' : 'bottom'];
     const others = view.edges.filter((e) => e !== edge);
     const existing = collectSegments(others);
-    const barriers = crossingPass ? [...(view.groups || []), ...(view.containers || [])].filter(box =>
-      !box.root && ![a.group,b.group].some(id => id === box.id || id?.startsWith(box.id + '/'))) : [];
+    const barriers = [...(view.groups || []), ...(view.containers || [])].filter(box =>
+      !box.root && ![a.group,b.group].some(id => id === box.id || id?.startsWith(box.id + '/')));
     const candidates = [];
     const faces = crossingPass
       ? [...horizontal, ...vertical].flatMap(from => [...horizontal, ...vertical].map(to => [from, to]))
       : [[vertical[0], horizontal[1]], [horizontal[0], vertical[1]], vertical, horizontal];
-    for (const [fromSide, toSide] of faces) {
+    const tried = new Set();
+    for (const [from, to] of faces) {
+      const fromSide = edge.fromSide || from, toSide = edge.toSide || to;
+      const key = fromSide + '/' + toSide;
+      if (tried.has(key)) continue;
+      tried.add(key);
       const candidate = { ...edge, fromSide, toSide };
       routeEdges(view.nodes, [candidate], { existing, layoutDirection: view.layoutDirection, callNodes, groupDirections });
       const diagonal = candidate.points.some(([x, y], i) => i && Math.abs(x-candidate.points[i-1][0]) > 1e-6 &&
@@ -194,14 +204,15 @@ export function improveEdgeRoutes(view, subset, simplify = () => true, crossingP
     let best = scoreMetrics(current) + facePenalty(edge), bestStyleOverlap = current.styleOverlapLength;
     for (const candidate of candidates) {
       const next = layoutMetrics([...nearby, candidate]);
-      // 只为解开重线允许一个新的交点，避免从拥挤的公共通道中逐条抽线穿过整图。
+      // 不同线型的遮盖优先解决；其余优化不增加交点。
       if (crossingPass && next.crossings >= current.crossings) continue;
       const fewerConflicts = next.styleOverlapLength < current.styleOverlapLength - 0.5;
-      if (next.styleOverlapLength > bestStyleOverlap + 0.5 || next.crossings > current.crossings + Number(fewerConflicts)) continue;
-      const score = scoreMetrics(next) + facePenalty(candidate);
+      if (next.styleOverlapLength > bestStyleOverlap || (!fewerConflicts && next.crossings > current.crossings)) continue;
+      const score = scoreMetrics(next) + facePenalty(candidate, edge);
       // 坐标变换会带来浮点尾差；等价路径保留原线，避免 GUI 与离线拖动选出不同连接面。
-      if (next.styleOverlapLength < bestStyleOverlap - 0.5 || score < best - 1e-6) {
+      if (edge.blocked || next.styleOverlapLength < bestStyleOverlap || score < best - 1e-6) {
         edge.points = candidate.points;
+        if (edge.blocked) edge.blocked = false;
         best = score;
         bestStyleOverlap = next.styleOverlapLength;
       }
@@ -253,12 +264,12 @@ export function mergeSharedRoutes(view, subset = view.edges) {
   const clearsBoxes = (edge, points) => {
     if (!barriers.has(edge)) {
       const owners = [nodes.get(edge.from)?.group, nodes.get(edge.to)?.group];
-      barriers.set(edge, boxes.filter(b => !b.root && !owners.some(id => id === b.id || id?.startsWith(b.id + '/')) &&
-        !pathCrossesBody(edge.points, b)));
+      barriers.set(edge, boxes.filter(b => !b.root && !owners.some(id => id === b.id || id?.startsWith(b.id + '/'))));
     }
     return !barriers.get(edge).some(b => pathCrossesBody(points, b));
   };
-  const clearsNodes = (edge, points) => clearsBoxes(edge, points) && !pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) &&
+  const clearsNodes = (edge, points) => shortPortDeficit(points) <= shortPortDeficit(edge.points) &&
+    clearsBoxes(edge, points) && !pathBlockedByNodes(points, view.nodes, new Set([edge.from, edge.to])) &&
     !pathCrossesBody(points, nodes.get(edge.from)) && !pathCrossesBody(points, nodes.get(edge.to));
   const addsConflict = (edge) => {
     // 每条原线路的冲突只计算一次，其他边在其候选比较期间保持不变。
@@ -280,7 +291,13 @@ export function mergeSharedRoutes(view, subset = view.edges) {
   // 先消除 ELK 跨容器边界产生的阶梯折弯与 U 型回头弯，拉直后再做干线汇流。
   const straighten = () => {
     for (const edge of automatic) {
-      if (!affected.has(edge) || edge.points.length < 4) continue;
+      if (!affected.has(edge) || edge.points.length < 3) continue;
+      const direct = straightConnection(edge, nodes.get(edge.from), nodes.get(edge.to));
+      if (direct && clearsNodes(edge, direct.points) && !addsConflict(edge)(direct.points)) {
+        edge.points = direct.points;
+        bounds.set(edge, routeBounds(edge.points));
+        continue;
+      }
       let changed = true;
       while (changed && edge.points.length >= 4) {
         changed = false;
@@ -328,7 +345,7 @@ export function mergeSharedRoutes(view, subset = view.edges) {
     for (const edges of groups.values()) {
       if (edges.length < 2 || !edges.some((e) => affected.has(e))) continue;
       let groupCost = cost(edges);
-      for (const edge of edges.filter((e) => affected.has(e)).sort((a, b) => b.points.length - a.points.length)) {
+      for (const edge of edges.filter((e) => affected.has(e) && e.points.length > 2).sort((a, b) => b.points.length - a.points.length)) {
         const q = role === 'from' ? edge.points : edge.points.slice().reverse();
         const roles = semanticFaces(edge, nodes.get(edge.from), nodes.get(edge.to), view.layoutDirection, callNodes, groupDirections);
         const keepPort = roles && nearestSide(nodes.get(edge[role]), { x: q[0][0], y: q[0][1] }) === roles[role === 'from' ? 0 : 1];
@@ -353,7 +370,9 @@ export function mergeSharedRoutes(view, subset = view.edges) {
             let points = collapse([...p.slice(0, i), at, ...q.slice(j)]);
             if (role === 'to') points.reverse();
             const next = before - cost([donor, { ...edge, points }]);
-            if (next <= gain + 0.5 || length(points) > originalLength + Math.max(96, next * 1.25) ||
+            // 简洁分支增加折弯时，只有实际省下足够长的公共走廊才值得接入。
+            const addedBends = Math.max(0, points.length - q.length);
+            if (next <= Math.max(gain + 0.5, STUB * 2 * addedBends) || length(points) > originalLength + Math.max(96, next * 1.25) ||
                 !clearsNodes(edge, points) || conflicts(points)) continue;
             best = points; gain = next;
           }

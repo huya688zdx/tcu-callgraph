@@ -236,3 +236,42 @@ test('コール順：嵌套实参调用不强行给出线性执行顺序', async
   assert.equal(result.suggestions.filter((s) => s.kind === 'call').length, 0);
   assert.ok(result.skipped.some((s) => s.from === 'order.c::Nested' && s.reason.includes('嵌套')));
 });
+
+test('自由框标签：支持 /api/overlay 与 /api/mcp-task-labels 同边多条持久化且不保存注释', async (t) => {
+  const srv = await launchServer({ target: 'samples/tcu' });
+  t.after(() => srv.close());
+  const base = srv.baseUrl;
+  const [k1] = await firstEdges(base, 1);
+
+  const w = await jsonPost(base, '/api/overlay', {
+    edgeKey: k1,
+    data: {
+      labels: [
+        { preset: 'free', text: '安全校验路径', note: '不应留存', border: '#185FA5', color: '#185FA5' },
+        { preset: 'free', text: '热路径' },
+      ],
+    },
+  });
+  assert.equal(w.ok, true);
+
+  let v = await (await fetch(`${base}/api/view?root=main.c::main`)).json();
+  let edge = v.edges.find((e) => edgeKeyOf(e) === k1);
+  assert.equal(edge.labels.length, 2);
+  assert.equal(edge.labels[0].preset, 'free');
+  assert.equal(edge.labels[0].text, '安全校验路径');
+  assert.equal(edge.labels[0].border, '#185FA5');
+  assert.equal(edge.labels[0].note, undefined);
+  assert.equal(edge.labels[1].border, '#4A5568');
+
+  await jsonPost(base, '/api/mcp-config', { level: 'readwrite' });
+  const mcpRes = await jsonPost(base, '/api/mcp-task-labels', {
+    items: [{ edgeKey: k1, preset: 'free', text: '额外自由标签', note: '忽略' }],
+    merge: true,
+  });
+  assert.equal(mcpRes.ok, true);
+  v = await (await fetch(`${base}/api/view?root=main.c::main`)).json();
+  edge = v.edges.find((e) => edgeKeyOf(e) === k1);
+  assert.equal(edge.labels.length, 3);
+  assert.equal(edge.labels[2].text, '额外自由标签');
+  assert.equal(edge.labels[2].note, undefined);
+});

@@ -103,7 +103,7 @@ async function downloadTo(ctx, pathAndQuery, outPath, fallbackExt) {
 const labelSchema = {
   type: 'object', required: ['preset'], additionalProperties: false,
   properties: {
-    preset: { enum: ['task', 'conn', 'call'] }, text: { type: 'string', maxLength: 40 },
+    preset: { enum: ['task', 'conn', 'call', 'free'] }, text: { type: 'string', maxLength: 40 },
     note: { type: 'string', maxLength: 80 }, order: { type: 'integer', minimum: 1 },
     num: { type: 'integer', minimum: 1 }, id: { type: 'string' }, dx: { type: 'number' }, dy: { type: 'number' },
   },
@@ -380,7 +380,7 @@ const TOOLS = [
             required: ['edgeKey', 'preset'],
             properties: {
               edgeKey: { type: 'string', description: '实际调用边 from->to:line，省略行号时使用画布代表边' },
-              preset: { type: 'string', enum: ['task', 'call', 'conn'] },
+              preset: { type: 'string', enum: ['task', 'call', 'conn', 'free'] },
               text: { type: 'string', maxLength: 40 },
               order: { type: 'integer', minimum: 1, description: 'call 的编号，也可用 コール順N 文字' },
               note: { type: 'string', maxLength: 80 },

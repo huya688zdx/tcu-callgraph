@@ -1,6 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { routeEdges, SPACING } from '../src/core/routing.js';
+import { collectSegments, incompatibleOverlap, routeEdges, SPACING } from '../src/core/routing.js';
+
+test('多源汇流避开已布虚线，保留水平直连和手工分支', () => {
+  const nodes = [0, 100, 200, 300, 400].map((y, i) => ({ id: 's' + i, x: 40, y, w: 80, h: 40 }));
+  const target = { id: 't', x: 640, y: 200, w: 80, h: 40 };
+  const edges = nodes.map(n => ({ from: n.id, to: 't', kind: 'direct' }));
+  const saved = edges[0];
+  saved.custom = true;
+  const points = [[120, 20], [180, 20], [180, 220], [640, 220]];
+  saved.points = structuredClone(points);
+  const data = [1, 2].map(k => ({ from: 'external' + k, to: 'var' + k, kind: 'df-write',
+    points: [[640 - k * SPACING, 45], [640 - k * SPACING, 395]] }));
+  const route = () => routeEdges([...nodes, target], edges, { existing: collectSegments(data) });
+  route();
+  assert.deepEqual(saved.points, points);
+  assert.deepEqual(edges[2].points, [[120, 220], [640, 220]]);
+  for (const e of edges) for (const d of data) assert.equal(incompatibleOverlap(e, d), 0);
+  assertNoNodePenetration(edges, [...nodes, target]);
+  const once = edges.map(e => structuredClone(e.points));
+  route();
+  assert.deepEqual(edges.map(e => e.points), once);
+});
 
 const EPS = 0.5;
 

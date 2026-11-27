@@ -83,3 +83,77 @@ test('共享边位于不同分段时，所有路径的方向中断仍有颜色�
     assert.equal(colors.get(previous.edge) === colors.get(current.edge), previous.forward === current.forward);
   }
 });
+
+test('深层有向链路不被较短的共同调用者或无向混向近路掩盖', () => {
+  const layers = Array.from({ length: 10 }, (_, i) => `L${i + 1}`);
+  const pairs = layers.slice(1).map((id, i) => [layers[i], id]);
+  pairs.push(['L1', 'helper'], ['L10', 'helper']);
+  const view = graph([...layers, 'helper'], pairs);
+  const forward = traceVisiblePaths(view, 'L1', 'L10');
+  assert.equal(forward.paths.length, 1);
+  assert.deepEqual(forward.paths[0].nodes, layers);
+  assert.equal(forward.paths[0].mixed, false);
+  assert.equal(forward.flowEdgeIndices.length, 9);
+  const reverse = traceVisiblePaths(view, 'L10', 'L1');
+  assert.equal(reverse.paths.length, 1);
+  assert.deepEqual(reverse.paths[0].nodes, layers.toReversed());
+  assert.equal(reverse.paths[0].mixed, false);
+  assert.ok(reverse.paths[0].steps.every(s => !s.forward));
+  assert.equal(reverse.flowEdgeIndices.length, 9);
+});
+
+test('经由变量读写及双向读写的深层链路不被更短无向旁路截断', () => {
+  const nodes = ['f1', 'v1', 'f2', 'v2', 'f3', 'v3', 'f4', 'shared'];
+  const view = {
+    nodes: nodes.map(id => ({ id, name: id, kind: id.startsWith('v') || id === 'shared' ? 'var' : 'fn' })),
+    edges: [
+      { from: 'f1', to: 'v1', kind: 'var', via: '写', points: [[0, 0], [0, 20]] },
+      { from: 'f2', to: 'v1', kind: 'var', via: '读', points: [[0, 0], [0, 20]] },
+      { from: 'f2', to: 'v2', kind: 'var', via: '读写', points: [[0, 0], [0, 20]] },
+      { from: 'f3', to: 'v2', kind: 'var', via: '读', points: [[0, 0], [0, 20]] },
+      { from: 'f3', to: 'v3', kind: 'var', via: '写', points: [[0, 0], [0, 20]] },
+      { from: 'f4', to: 'v3', kind: 'var', via: '读', points: [[0, 0], [0, 20]] },
+      { from: 'f1', to: 'shared', kind: 'var', via: '读', points: [[0, 0], [0, 20]] },
+      { from: 'f4', to: 'shared', kind: 'var', via: '读', points: [[0, 0], [0, 20]] },
+    ],
+  };
+  const result = traceVisiblePaths(view, 'f1', 'f4');
+  assert.equal(result.paths.length, 1);
+  assert.deepEqual(result.paths[0].nodes, ['f1', 'v1', 'f2', 'v2', 'f3', 'v3', 'f4']);
+  assert.equal(result.paths[0].mixed, false);
+  assert.deepEqual(result.flowEdgeIndices, [0, 1, 2, 3, 4, 5]);
+});
+
+test('大量同长静态混向分支不会把真实单向流挤出上限', () => {
+  const pairs = [];
+  const mixedNodes = [];
+  for (let i = 0; i < 30; i++) {
+    const id = `mix${i}`;
+    mixedNodes.push(id);
+    pairs.push([id, 'a'], [id, 'b']);
+  }
+  pairs.push(['a', 'dir'], ['dir', 'b']);
+  const view = graph(['a', 'b', 'dir', ...mixedNodes], pairs);
+  const result = traceVisiblePaths(view, 'a', 'b');
+  assert.equal(result.paths.length, 24);
+  assert.equal(result.truncated, true);
+  assert.equal(result.paths[0].mixed, false);
+  assert.deepEqual(result.paths[0].nodes, ['a', 'dir', 'b']);
+  assert.deepEqual(result.flowEdgeIndices, [60, 61]);
+});
+
+test('比较图中同版本长单向流不被跨版本短路径掩盖', () => {
+  const view = graph(['a', 'x', 'c', 'd', 'b'], [['a', 'x'], ['x', 'b'], ['a', 'c'], ['c', 'd'], ['d', 'b']]);
+  view.comparison = { id: 'comparison' };
+  view.edges[0].versions = ['before'];
+  view.edges[1].versions = ['after'];
+  view.edges[2].versions = ['after'];
+  view.edges[3].versions = ['after'];
+  view.edges[4].versions = ['after'];
+  const result = traceVisiblePaths(view, 'a', 'b');
+  assert.equal(result.paths.length, 1);
+  assert.deepEqual(result.paths[0].nodes, ['a', 'c', 'd', 'b']);
+  assert.deepEqual(result.paths[0].versions, ['after']);
+  assert.equal(result.paths[0].mixed, false);
+  assert.deepEqual(result.flowEdgeIndices, [2, 3, 4]);
+});

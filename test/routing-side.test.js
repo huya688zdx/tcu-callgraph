@@ -1,6 +1,54 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { routeEdges } from '../src/core/routing.js';
+import { routeEdges, pathCrossesBody, shortPortDeficit } from '../src/core/routing.js';
+import { improveEdgeRoutes, mergeSharedRoutes } from '../src/core/layout-metrics.js';
+
+test('截图中的高低错位矩形从相向侧面连接，局部优化也会消除 3px 顶部折钩', () => {
+  const nodes = [{ id: 'left', x: 52, y: 120, w: 260, h: 122 }, { id: 'right', x: 452, y: 56, w: 360, h: 122 }];
+  for (const reverse of [false, true]) {
+    const hook = [[182, 120], [182, 117], [452, 117]];
+    const e = { from: reverse ? 'right' : 'left', to: reverse ? 'left' : 'right', kind: 'direct',
+      points: reverse ? hook.reverse() : hook };
+    const ends = reverse ? [[452, 117], [312, 181]] : [[312, 181], [452, 117]];
+    const view = { nodes, edges: [e], layoutDirection: 'DOWN' };
+    const assertFacing = () => {
+      assert.deepEqual([e.points[0], e.points.at(-1)], ends);
+      assert.equal(e.points.length, 4);
+      assert.equal(shortPortDeficit(e.points), 0);
+      assert.ok(nodes.every(n => !pathCrossesBody(e.points, n)));
+    };
+    improveEdgeRoutes(view, [e]);
+    assertFacing();
+    routeEdges(nodes, [e], { layoutDirection: 'DOWN' });
+    mergeSharedRoutes(view);
+    assertFacing();
+  }
+});
+
+test('钉住混合出入面时两端都有完整引线，相反方向亦然', () => {
+  const nodes = [{ id: 'a', x: 52, y: 120, w: 260, h: 122 }, { id: 'b', x: 452, y: 56, w: 360, h: 122 }];
+  for (const e of [{ from: 'a', to: 'b', fromSide: 'top', toSide: 'left' },
+    { from: 'b', to: 'a', fromSide: 'left', toSide: 'top' }]) {
+    routeEdges(nodes, [e]);
+    const points = e.from === 'a' ? e.points : e.points.toReversed();
+    assert.deepEqual([points[0], points.at(-1)], [[182, 120], [452, 117]]);
+    assert.ok(points[1][1] <= 105 && points.at(-2)[0] <= 437);
+    assert.ok(nodes.every(n => !pathCrossesBody(points, n)));
+  }
+});
+
+test('仅低 2px 的远侧目标使用左右面；上侧多数扇出保留同高分支的侧出口', () => {
+  const a = { id: 'a', x: 0, y: 120, w: 100, h: 44 };
+  const b = { id: 'b', x: 480, y: 166, w: 100, h: 44 };
+  const lateral = { from: 'a', to: 'b', kind: 'direct' };
+  routeEdges([a, b], [lateral], { layoutDirection: 'DOWN' });
+  assert.deepEqual([lateral.points[0], lateral.points.at(-1)], [[100, 142], [480, 188]]);
+
+  b.y = 95;
+  const upper = [-140, 0, 140].map((x, i) => ({ id: 'up' + i, x, y: -210, w: 100, h: 44 }));
+  routeEdges([a, b, ...upper], [...upper.map(n => ({ from: 'a', to: n.id, kind: 'direct' })), lateral]);
+  assert.deepEqual([lateral.points[0], lateral.points.at(-1)], [[100, 142], [480, 117]]);
+});
 
 // 出线面统一：源 4 条出边，3 条几何朝右、1 条几何朝下（目标在其右下方），
 // 统一后应全部并到右面同一个出口；折线不得穿过任何节点。
