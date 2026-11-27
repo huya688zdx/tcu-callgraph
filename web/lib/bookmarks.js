@@ -6,7 +6,7 @@
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { currentViewScope, isBookmarkDirty, scopeFingerprint, state } from './state.js';
+import { isBookmarkDirty, state } from './state.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
 
@@ -255,6 +255,7 @@ async function write(button, errorKey, action) {
   feedback('');
   try {
     const message = await action();
+    if (message === undefined) return false;
     if (projectId === state.view?.projectId && modal?.classList.contains('show')) {
       feedback(message);
       refreshPending = true;
@@ -273,12 +274,12 @@ async function write(button, errorKey, action) {
 async function saveUpdateByBookmark(bookmark, button) {
   if (!state.roots.length) return feedback(t('bookmark.noRoot'), true);
   return write(button, 'bookmark.failed', async () => {
-    const scope = currentViewScope();
-    const result = await api.updateBookmark({
+    const reply = await hooks.requestBookmarkSave(api.updateBookmark, {
       id: bookmark.id,
       expectedRevision: state.activeBookmark?.id === bookmark.id ? state.activeBookmark.revision : bookmark.revision,
-      ...scope,
     });
+    if (!reply?.isCurrent()) return;
+    const { result, fingerprint } = reply;
     if (result?.conflict) {
       refreshPending = true;
       throw new Error(t('bookmark.conflict'));
@@ -290,7 +291,7 @@ async function saveUpdateByBookmark(bookmark, button) {
       id: bm.id,
       name: bm.name,
       revision: bm.revision || 1,
-      baseFingerprint: scopeFingerprint(scope),
+      baseFingerprint: fingerprint,
     };
     state.bookmarkDrafts.delete(String(bm.id));
     hooks.syncBookmarkBadge?.();
@@ -305,11 +306,9 @@ function save(name, button) {
   if (!name) return feedback(t('bookmark.needName'), true);
   if (!state.roots.length) return feedback(t('bookmark.noRoot'), true);
   return write(button, 'bookmark.failed', async () => {
-    const scope = currentViewScope();
-    const result = await api.saveBookmark({
-      name,
-      ...scope,
-    });
+    const reply = await hooks.requestBookmarkSave(api.saveBookmark, { name });
+    if (!reply?.isCurrent()) return;
+    const { result, fingerprint } = reply;
     if (!result?.ok) throw new Error(result?.error);
     if (result.bookmark) {
       const bm = result.bookmark;
@@ -318,7 +317,7 @@ function save(name, button) {
         id: bm.id,
         name: bm.name,
         revision: bm.revision || 1,
-        baseFingerprint: scopeFingerprint(scope),
+        baseFingerprint: fingerprint,
       };
       state.bookmarkDrafts.delete('__unnamed__');
       state.bookmarkDrafts.delete(String(bm.id));

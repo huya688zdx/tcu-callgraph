@@ -119,16 +119,51 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     }
   }
 
+  const irregularSwitches = new Set();
+  const isCase = n => n?.kind === 'CaseStmt' || n?.kind === 'DefaultStmt';
+  function endsCase(n) {
+    while (n?.kind === 'CompoundStmt') n = children(n).at(-1);
+    return ['BreakStmt','ReturnStmt','ContinueStmt'].includes(n?.kind);
+  }
+  function visitSwitch(node, guards, loop) {
+    const parts = children(node), body = parts.at(-1);
+    for (const expr of parts.slice(0, -1)) visit(expr, guards, loop);
+    let section = 0, arm = null;
+    for (let statement of body?.kind === 'CompoundStmt' ? children(body) : [body]) {
+      if (isCase(statement)) {
+        arm = { section };
+        while (isCase(statement)) statement = children(statement).at(-1);
+      }
+      visit(statement, new Map(guards).set(node, arm), loop);
+      if (endsCase(statement)) section++;
+    }
+  }
+  // true 为同一必经分支，false 为互斥，null 为可能（包括 case 贯穿或难以判定的标签）。
+  function sameArm(guard, arm, point, at) {
+    if (!at.guards.has(guard)) return null;
+    const other = at.guards.get(guard);
+    if (guard.kind === 'SwitchStmt') {
+      if (!arm || !other || irregularSwitches.has(guard)) return null;
+      if (arm !== other && arm.section === other.section) return null;
+    }
+    if (arm === other) return true;
+    return point.loop && point.loop === at.loop ? null : false;
+  }
   function visit(node, guards, loop) {
     if (!node?.kind || (node.kind === 'UnaryExprOrTypeTraitExpr' && !node.argType)) return;
+    if (node.kind === 'SwitchStmt') return visitSwitch(node, guards, loop);
+    if (isCase(node)) {
+      // 嵌入其他控制流的标签允许直接跳入块内；不要把该处的条件当成必经写入。
+      const parent = [...guards.keys()].findLast(g => g.kind === 'SwitchStmt');
+      if (parent) irregularSwitches.add(parent);
+    }
     if (node.kind === 'GotoStmt' || node.kind === 'IndirectGotoStmt') hasGoto = true;
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
     const iteration = ['ForStmt', 'WhileStmt', 'DoStmt'].includes(node.kind);
-    const optional = iteration || node.kind === 'SwitchStmt';
     const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
     const nested = node.array_filler ? [...children(node), ...node.array_filler] : children(node);
     nested.forEach((child, i) => {
-      const guarded = optional || (i > 0 && (branch || shortCircuit));
+      const guarded = iteration || (i > 0 && (branch || shortCircuit));
       const next = guarded ? new Map(guards).set(node, branch ? i : true) : guards;
       visit(child, next, iteration ? (loop || node) : loop);
     });
@@ -161,7 +196,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     if (!at) return false;
     if (point.order >= at.order) return at.loop && at.loop === point.loop;
     for (const [guard, arm] of point.guards) {
-      if (at.guards.has(guard) && at.guards.get(guard) !== arm) return false;
+      if (sameArm(guard, arm, point, at) === false) return false;
     }
     return true;
   }
@@ -256,9 +291,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         if (!match) continue;
         let mandatory = !previousIteration, excluded = false;
         for (const [guard, arm] of point.guards) {
-          if (guard.kind === 'SwitchStmt' && at.guards.has(guard)) return;
-          if (!at.guards.has(guard)) mandatory = false;
-          else if (!previousIteration && at.guards.get(guard) !== arm) excluded = true;
+          const same = sameArm(guard, arm, point, at);
+          if (same !== true) mandatory = false;
+          if (same === false && !previousIteration) excluded = true;
         }
         if (excluded) continue;
         if (effect) {

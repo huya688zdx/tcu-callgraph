@@ -560,3 +560,77 @@ test('内置分派按翻译单元隔离头文件 static 回调写入，保留公
     });
   }
 });
+
+test('builtin 分派按成员声明区分同名记录并保留共享别名', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-identity-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const put = (name, source) => fs.writeFileSync(path.join(dir, name), source);
+  put('shared.h', `typedef struct Shared { void (*run)(void); } Shared;
+typedef Shared Common; typedef Common Alias;
+typedef struct { Alias inner; } Box;`);
+  put('opaque.h', 'typedef struct Forward ForwardAlias;');
+  put('forward.c', `#include "opaque.h"
+typedef int (*IntCb)(int);
+struct Forward { void (*run)(void); }; static void actual(void) {} static int stray(int x) { return x; }
+static const ForwardAlias shared = { .run=actual };
+void forwarded(void *arg) {
+  struct Forward { IntCb run; }; static const struct Forward local = { .run=stray };
+  ForwardAlias *outer=arg; struct Forward *inner=arg;
+  outer->run(); inner->run(1);
+}
+typedef struct Later LaterAlias; struct Later { void (*run)(void); };
+static const LaterAlias later = { .run=actual }; void later_call(LaterAlias *p) { p->run(); }`);
+  put('a.c', `#include "shared.h"
+typedef struct { void (*run)(void); } Ops;
+typedef int (*IntCb)(int);
+static void fa(void) {} static void shared_a(void) {} static int block(int x) { return x; }
+static const Ops obj = { .run=fa }; static const Common common = { .run=shared_a };
+void direct_a(void) { obj.run(); }
+void ptr_a(Ops *p) { p->run(); }
+void shadow(Ops *outer,void *in) { {
+  typedef struct { IntCb run; } Ops;
+  typedef Ops Local; static const Local local = { .run=block }; Local *p=in;
+  p->run(1); outer->run();
+} outer->run(); }`);
+  put('b.c', `#include "shared.h"
+typedef struct { int (*run)(int); } Ops;
+static int fb(int x) { return x; } static void shared_b(void) {}
+static const Ops obj = { .run=fb }; static const struct Shared common = { .run=shared_b };
+int direct_b(void) { return obj.run(2); } int ptr_b(Ops *p) { return p->run(2); }`);
+  put('client.c', `#include "shared.h"
+static void nested(void) {} static void outer(void) {}
+static const Box box = { .inner.run=nested };
+typedef struct { void (*run)(void); } LocalShared;
+static const LocalShared collision = { .run=outer };
+void shared_alias(Alias *p) { p->run(); }
+void shared_tag(struct Shared *p) { p->run(); }
+void shared_nested(Box *p) { p->inner.run(); }
+void separate_tag(LocalShared *p) { p->run(); }`);
+  put('tags.c', `struct T { void (*run)(void); }; typedef struct { int (*run)(int); } T;
+static void tagged(void) {} static int aliased(int x) { return x; }
+static const struct T tag = { .run=tagged }; static const T alias = { .run=aliased };
+void tag_call(struct T *p) { p->run(); } int alias_call(T *p) { return p->run(9); }`);
+  const targets = (m, fn) => (m._index.outAdj.get(fn) || []).filter(e => e.kind === 'fnptr' && !e.to.startsWith('ext::')).map(e => e.to).sort();
+  const model = loadModel(dir), shared = ['a.c::shared_a','b.c::shared_b','client.c::nested'];
+  for (const [caller, expected] of Object.entries({
+    'forward.c::later_call':['forward.c::actual'],
+    'a.c::direct_a':['a.c::fa'], 'a.c::ptr_a':['a.c::fa'], 'b.c::direct_b':['b.c::fb'], 'b.c::ptr_b':['b.c::fb'],
+    'client.c::shared_alias':shared, 'client.c::shared_tag':shared, 'client.c::shared_nested':shared,
+    'client.c::separate_tag':['client.c::outer'], 'tags.c::tag_call':['tags.c::tagged'], 'tags.c::alias_call':['tags.c::aliased'],
+  })) await t.test(caller, () => assert.deepEqual(targets(model, caller), expected));
+  await t.test('块内同名类型不能改变已声明的外层参数', () => {
+    const sites = model.indirectCalls.filter(s => s.caller === 'a.c::shadow');
+    assert.deepEqual(sites.map(s => [...new Set(s.candidates.map(c => c.id))].sort()), [['a.c::block'],['a.c::fa'],['a.c::fa']]);
+  });
+  await t.test('不完整的头文件标签只能由文件作用域中的定义补全', () => {
+    const sites = model.indirectCalls.filter(s => s.caller === 'forward.c::forwarded');
+    assert.deepEqual(sites.map(s => s.candidates.map(c => c.id)), [['forward.c::actual'], ['forward.c::stray']]);
+  });
+  await t.test('strict 仍仅接受具体的确定槽位', () => {
+    const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+    assert.deepEqual(targets(strict, 'a.c::direct_a'), ['a.c::fa']);
+    assert.deepEqual(targets(strict, 'b.c::direct_b'), ['b.c::fb']);
+    assert.deepEqual(targets(strict, 'a.c::ptr_a'), []);
+    assert.deepEqual(targets(strict, 'client.c::shared_tag'), []);
+  });
+});

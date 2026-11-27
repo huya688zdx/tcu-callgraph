@@ -1124,7 +1124,8 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       map: {},
       slotLines: {},
       slots: new Map(),
-      ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
+      declaration: nameTok,
+      ...(functionId && { functionId, scope: scopes.at(-1) }),
     };
     const fill = (lookup, isFunction = localFunction) => {
       const status = {

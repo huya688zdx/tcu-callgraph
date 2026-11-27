@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
@@ -206,4 +208,130 @@ test('浏览器悬停 AI 链路节点时只为对应画布节点描边，离开�
     document.getElementById('projectOpen').click();`);
   await br.waitFor('window.__cg.view?.projectId === ' + next.project.id + ' && window.__cg.view.nodes.some(n => n.id === ' + JSON.stringify(main) + ')');
   assert.deepEqual(await outlines(main), [false], '新工程中同 ID 节点使用普通描边');
+});
+
+test('浏览器延迟书签保存回复时保留当前画布绑定', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const modes = ['快速保存', '版本冲突', '切换工程', '面板更新', '另存书签', '重开同一书签', '原绑定的版本冲突'];
+  for (const mode of modes) await t.test(mode, async t => {
+    const conflict = mode.includes('冲突');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bookmark-reply-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const [one, two] = ['one','two'].map(name => {
+      const root = path.join(dir, name);
+      fs.mkdirSync(root);
+      fs.writeFileSync(path.join(root, 'main.c'), ['a','a_edit','b','b_edit'].map(n => 'void ' + n + '(void) {}').join('\n'));
+      return root;
+    });
+    const srv = await launchServer({ target: one }); t.after(srv.close);
+    const get = route => fetch(srv.baseUrl + route).then(r => r.json());
+    const post = (route, data) => fetch(srv.baseUrl + route, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data) }).then(r => r.json());
+    const scope = n => ({ roots: ['main.c::' + n], up: 0, down: 0 });
+    const create = (name, n) => post('/api/bookmarks', { name, ...scope(n) }).then(r => r.bookmark);
+    const find = async name => (await get('/api/bookmarks')).list.find(b => b.name === name);
+    const a = await create('A','a');
+    let b = mode === '切换工程' ? null : await create('B','b');
+    await post('/api/page', scope('a'));
+    const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+    await br.waitFor('window.__cg?.root === "main.c::a"');
+    await br.evaluate("(async () => { window.bmState = (await import('/lib/state.js')).state; })()");
+    const row = name => `[...document.querySelectorAll('.bm')].find(r => r.querySelector('.nm').firstChild.textContent.trim() === ${JSON.stringify(name)})`;
+    const open = async bookmark => {
+      await br.evaluate("document.getElementById('bookmarkBtn').click()");
+      await br.waitFor(`Boolean(${row(bookmark.name)})`);
+      await br.evaluate(`${row(bookmark.name)}.querySelector('.bm-open').click()`);
+      await br.waitFor(`window.bmState.activeBookmark?.id === ${bookmark.id} && !document.querySelector('.modal.show')`);
+    };
+    const navigate = async n => {
+      await br.evaluate(`(async () => { await (await import('/lib/hooks.js')).hooks.openFunctionAlone(${JSON.stringify(scope(n).roots[0])}); })()`);
+      await br.waitFor(`window.__cg.root === ${JSON.stringify(scope(n).roots[0])}`);
+    };
+    const quick = () => br.pressKey({ key: 's', code: 'KeyS', vk: 83, modifiers: 2 });
+    const project = async root => {
+      const previous = await br.evaluate('window.__cg.view.projectId');
+      await br.evaluate(`document.getElementById('projectBtn').click(); document.getElementById('projectPath').value = ${JSON.stringify(root)}; document.getElementById('projectOpen').click()`);
+      await br.waitFor(`window.__cg?.view?.projectId && window.__cg.view.projectId !== ${previous} && !document.querySelector('.modal.show')`);
+    };
+    await open(a);
+    await navigate('a_edit');
+    if (conflict) {
+      await br.evaluate("window.addEventListener('cg:bookmark-changed', e => { if (e.detail.remote) window.remoteUpdate = true; })");
+      const result = await post('/api/bookmarks/update', { id:a.id, expectedRevision:a.revision, ...scope('a') });
+      assert.ok(result.ok, result.error);
+      await br.waitFor('window.remoteUpdate');
+    }
+    await br.evaluate(`(async () => {
+      const { api } = await import('/lib/api.js');
+      const key = ${JSON.stringify(mode === '另存书签' ? 'saveBookmark' : 'updateBookmark')};
+      const save = api[key];
+      const gate = new Promise(resolve => { window.releaseSave = resolve; });
+      window.alerts = []; window.alert = text => window.alerts.push(text);
+      api[key] = async (...args) => {
+        api[key] = save;
+        const response = await save(...args);
+        window.heldSave = { ok: response.ok, conflict: !!response.conflict };
+        await gate;
+        return response;
+      };
+    })()`);
+    if (mode === '面板更新' || mode === '另存书签') {
+      await br.evaluate("document.getElementById('bookmarkBtn').click()");
+      await br.waitFor(`Boolean(${row('B')})`);
+      if (mode === '面板更新') await br.evaluate(`${row('A')}.querySelector('.bm-update').click()`);
+      else await br.evaluate("document.getElementById('bookmarkName').value = 'C'; document.getElementById('bookmarkSave').click()");
+    } else await quick();
+    await br.waitFor('Boolean(window.heldSave)');
+    assert.equal(await br.evaluate('window.heldSave.conflict'), conflict);
+    const savedName = mode === '另存书签' ? 'C' : 'A';
+    const submitted = await find(savedName);
+    assert.deepEqual(submitted.roots, scope(conflict ? 'a' : 'a_edit').roots);
+    if (mode === '原绑定的版本冲突') {
+      await br.evaluate('window.releaseSave()');
+      await br.waitFor("window.alerts.length === 1 && document.querySelector('#bookmarkModal.show')");
+      assert.equal(await br.evaluate('window.bmState.activeBookmark.id'), a.id);
+      assert.deepEqual(await find('A'), submitted);
+      return;
+    }
+    if (mode === '切换工程') { await project(two); b = await create('B','b'); }
+    if (mode === '面板更新' || mode === '另存书签') {
+      await br.evaluate(`${row('B')}.querySelector('.bm-open').click()`);
+      await br.waitFor(`window.bmState.activeBookmark?.id === ${b.id} && !document.querySelector('.modal.show')`);
+    } else await open(b);
+    if (mode === '重开同一书签') { await open(submitted); b = submitted; }
+    await navigate('b_edit');
+    await br.evaluate(`window.bindingBeforeRelease = window.bmState.activeBookmark; window.followUpPages = []; window.followUpBookmarkEvents = [];
+      window.addEventListener('cg:bookmark-changed', e => window.followUpBookmarkEvents.push(e.detail?.bookmark?.name));
+      (async () => {
+        const { api } = await import('/lib/api.js'), report = api.reportPage;
+        api.reportPage = page => { window.followUpPages.push(page.activeBookmark?.id); return report(page); };
+        window.releaseSave(); await new Promise(resolve => setTimeout(resolve, 0));
+      })()`);
+    const received = await br.evaluate(`({ id: window.bmState.activeBookmark?.id, revision: window.bmState.activeBookmark?.revision,
+      alerts: window.alerts.slice(), panel: !!document.querySelector('#bookmarkModal.show'),
+      events: window.followUpBookmarkEvents.slice(), unchangedBinding: window.bmState.activeBookmark === window.bindingBeforeRelease,
+      reports: window.followUpPages.slice() })`);
+    assert.deepEqual(received.alerts, [], '过期冲突不能触发当前画布的警告');
+    assert.equal(received.panel, false, '过期冲突不能打开当前画布的书签面板');
+    await br.evaluate(`(async () => {
+      const { api } = await import('/lib/api.js'), update = api.updateBookmark;
+      api.updateBookmark = async body => { const res = await update(body); window.nextSaveId = body.id; return res; };
+    })()`);
+    await quick();
+    // 真实后续 Ctrl+S 写入完成后再读取目标书签。
+    await br.waitFor('Boolean(window.nextSaveId)');
+    const finalB = await find(b.name);
+    if (mode === '切换工程') await project(one);
+    const finalA = await find(savedName);
+    if (mode !== '重开同一书签') {
+      assert.deepEqual({ savedRoots: finalA.roots, nextRoots: finalB.roots },
+        { savedRoots: submitted.roots, nextRoots: scope('b_edit').roots }, '两次保存应分别落到各自的书签');
+      assert.deepEqual(finalA, submitted);
+      assert.ok(!received.reports.includes(a.id), '旧回复不能把新的范围以 A 的绑定上报');
+    }
+    assert.deepEqual(finalB.roots, scope('b_edit').roots);
+    assert.equal(finalB.revision, b.revision + 1);
+    assert.deepEqual([received.id, received.revision, received.events], [b.id, b.revision, []]);
+    assert.ok(received.unchangedBinding, '过期回复不能重新绑定同一 ID 的新视图');
+  });
 });

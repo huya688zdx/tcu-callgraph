@@ -494,3 +494,37 @@ void recovered(void) { unknown_code(); cb = first; cb(); }`);
     });
   }
 });
+
+test('Clang 保留 switch 内可达的回调赋值', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+void first(void) {} void second(void) {} void third(void) {}
+void same(int n) { Fn cb=first; switch(n) { case 0: cb=second; cb(); break; default: break; } }
+void separate(int n) { Fn cb=first; switch(n) { case 0: cb=second; break; case 1: cb(); break; } }
+void falls(int n) { Fn cb=first; switch(n) { case 0: cb=second; default: cb(); break; } }
+void defaults(int n) { Fn cb=first; switch(n) { default: {cb=third; break;} case 1: cb(); break; } }
+void stacked(int n) { Fn cb=first; switch(n) { case 0: case 1: { cb=second; cb(); } break; } }
+void optional(int n,int flag) { Fn cb=first; switch(n) { case 0: if(flag) cb=second; cb(); break; } }
+void post(int n) { Fn cb=first; switch(n) { case 0: cb=second; break; case 1: cb=third; break; } cb(); }
+void reset(int n) { Fn cb=first; switch(n) { case 0: cb=second; break; } cb=third; cb(); }
+void nested(int a,int b) { Fn cb=first; switch(a) { case 0: cb=second; switch(b) {case 1: cb=third; break;}
+  cb(); break; default: cb(); } }
+void loop(int n,int *m) { Fn cb=first; while(n--) { switch(m[n]) { case 0: cb=second; break; case 1: cb(); } } }
+void repeated_branch(int n,int *m) { Fn cb=first; while(n--) { switch(0) {case 0: if(m[n]) cb=second; else cb();} } }
+void unusual(int n,int flag) { Fn cb=first; switch(n) { if(flag) { case 0: cb=second; } case 1: cb(); } }`);
+  for (const policy of ['strict','expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const expected = { same: [['second']], separate: [['first']], falls: [['first','second']],
+      defaults: [['first']], stacked: [['second']], optional: [['first','second']],
+      post: [['first','second','third']], reset: [['third']], nested: [['second','third'], ['first']],
+      loop: [['first','second']], repeated_branch: [['first','second']], unusual: [['first','second']] };
+    for (const [name, targets] of Object.entries(expected)) await t.test(policy + ' ' + name, () => {
+      const caller = 'main.c::' + name;
+      const sites = model.indirectCalls.filter(s => s.caller === caller);
+      assert.deepEqual(sites.map(s => s.candidates.map(c => c.name).sort()), targets);
+      assert.ok(sites.every(s => s.resolution === (policy === 'expand' ? 'possible' : 'unresolved')));
+      const edges = model.edges.filter(e => e.from === caller && e.kind === 'fnptr');
+      assert.deepEqual(sites.map(s => edges.filter(e => e.siteId === s.siteId).map(e => e.callee).sort()),
+        policy === 'expand' ? targets : targets.map(() => []));
+    });
+  }
+});

@@ -342,6 +342,21 @@ function syncBookmarkBadge() {
 }
 hooks.syncBookmarkBadge = syncBookmarkBadge;
 
+// 保存只属于提交时的画布。即使重新打开同一 ID，也不能把旧响应应用到新的绑定。
+async function requestBookmarkSave(request, details) {
+  const seq = viewSeq, view = state.view, at = state.at, bookmark = state.activeBookmark;
+  const scope = currentViewScope(), fingerprint = scopeFingerprint(scope);
+  const isCurrent = (expected = bookmark) => seq === viewSeq && state.view === view && state.at === at &&
+    state.activeBookmark === expected && scopeFingerprint(currentViewScope()) === fingerprint;
+  try {
+    const result = await request({ ...details, ...scope, projectId: view?.projectId });
+    return { result, fingerprint, isCurrent };
+  } catch (error) {
+    if (isCurrent()) throw error;
+  }
+}
+hooks.requestBookmarkSave = requestBookmarkSave;
+
 async function saveActiveBookmark({ saveAs = false } = {}) {
   if (state.at || state.view?.comparison || !state.roots.length) return;
   const bm = state.activeBookmark;
@@ -349,12 +364,9 @@ async function saveActiveBookmark({ saveAs = false } = {}) {
     bookmarkBtn?.click();
     return;
   }
-  const scope = currentViewScope();
-  const result = await api.updateBookmark({
-    id: bm.id,
-    expectedRevision: bm.revision,
-    ...scope,
-  });
+  const reply = await requestBookmarkSave(api.updateBookmark, { id: bm.id, expectedRevision: bm.revision });
+  if (!reply?.isCurrent()) return;
+  const { result, fingerprint, isCurrent } = reply;
   if (result?.conflict) {
     alert(t('bookmark.conflict'));
     bookmarkBtn?.click();
@@ -362,16 +374,17 @@ async function saveActiveBookmark({ saveAs = false } = {}) {
   }
   if (!result?.ok || !result.bookmark) throw new Error(result?.error || t('bookmark.failed'));
   const saved = result.bookmark;
-  state.activeBookmark = {
+  const active = {
     id: saved.id,
     name: saved.name,
     revision: saved.revision || 1,
-    baseFingerprint: scopeFingerprint(scope),
+    baseFingerprint: fingerprint,
   };
+  state.activeBookmark = active;
   state.bookmarkDrafts.delete(String(saved.id));
   syncBookmarkBadge();
   await savePage(true).catch(() => {});
-  void reloadTimeline();
+  if (isCurrent(active)) void reloadTimeline();
 }
 
 bookmarkQuickSave?.addEventListener('click', () => {
