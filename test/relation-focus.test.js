@@ -6,8 +6,21 @@ import {
   BIDIR_COLOR,
   mixHex,
   roleColor,
+  visibleCallEdge,
   classifySelectionRelations,
 } from '../web/lib/relation-focus.js';
+
+test('详情中的每次调用都映射到实际可见的连线，独立调用点优先，歧义不猜测', () => {
+  const first = { from: 'main.c::task', to: 'adc.c::get', line: 37, col: 11, kind: 'direct' };
+  const second = { ...first, line: 39, col: 15 };
+  const aggregate = { ...first, calls: [first, second] };
+  assert.equal(visibleCallEdge(second, [aggregate]), aggregate);
+  assert.equal(visibleCallEdge(second, [aggregate, second]), second);
+  assert.equal(visibleCallEdge(second, [{ ...aggregate, calls: [{ line: 39, kind: 'direct' }] }])?.line, 37);
+  assert.equal(visibleCallEdge({ ...second, from: 'other.c::task' }, [aggregate]), null);
+  assert.equal(visibleCallEdge({ ...second, col: 18 }, [aggregate]), null);
+  assert.equal(visibleCallEdge(second, [aggregate, { ...aggregate, line: 52 }]), null);
+});
 
 test('mixHex 按比例线性混色并在非法颜色时安全回退', () => {
   assert.equal(mixHex('#F7F6F2', '#2C2C2A', 0), '#f7f6f2');

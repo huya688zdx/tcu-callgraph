@@ -4,6 +4,7 @@
 import { t } from '../i18n.js';
 import { els, state, esc, shortFile, edgeKey, nodeById } from './state.js';
 import { edgeCaption, isDataEdge } from './edge-flow.js';
+import { visibleCallEdge } from './relation-focus.js';
 import { formatPeriod, nodePeriodBadge, periodCaption } from './period-text.js';
 import { api } from './api.js';
 import { hooks } from './hooks.js';
@@ -1078,6 +1079,13 @@ async function renderDetail(id, boxDetail = null) {
 
   const inE = (d.inEdges || []).filter(e => !isDataEdge(e));
   const outE = (d.outEdges || []).filter(e => !isDataEdge(e));
+  const callsByPeer = new Map();
+  for (const edge of state.view.edges) {
+    if (isDataEdge(edge) || (edge.from !== id && edge.to !== id)) continue;
+    const peer = edge.from === id ? edge.to : edge.from;
+    if (!callsByPeer.has(peer)) callsByPeer.set(peer, []);
+    callsByPeer.get(peer).push(edge);
+  }
   const item = (e, dir) => {
     const other = dir === 'in' ? e.from : e.to;
     const nm = e.callee || other.split('::')[1] || other;
@@ -1089,7 +1097,10 @@ async function renderDetail(id, boxDetail = null) {
     const cond = e.cond ? `<span class="chip">${esc(e.cond)}</span>` : '';
     const status = e.change && e.change !== 'existing' ? ` · ${statusLabel(e.change)}` : '';
     const arrow = `<span class="rel-dir ${dir}">${dir === 'in' ? '←' : '→'}</span>`;
-    return `<div class="edge-item call-relation${inView ? ' in-view' : ''}"${inView ? ` data-peer-id="${esc(other)}" data-rel-dir="${dir}" data-edge-key="${esc(edgeKey(e))}" title="${t('common.locateCanvas')}"` : ''}><span>${arrow} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9">:${e.line}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
+    const route = visibleCallEdge(e, callsByPeer.get(other) || []);
+    const file = dir === 'out' ? n.file : nodeById(other)?.file;
+    const location = file && e.line > 0 ? ` title="${esc(file)}:${esc(e.line)}${e.col > 0 ? ':' + esc(e.col) : ''}"` : '';
+    return `<div class="edge-item call-relation${inView ? ' in-view' : ''}"${inView ? ` data-peer-id="${esc(other)}" data-rel-dir="${dir}" data-edge-key="${esc(edgeKey(route || e))}" title="${t('common.locateCanvas')}"` : ''}><span>${arrow} <b>${esc(dir === 'in' ? other.split('::').pop() : nm)}</b> <span style="color:#B4B2A9"${location}>:${esc(e.line)}</span>${status} ${chip}${cond}</span>${addFunctionButton(other)}</div>`;
   };
 
   els.edges.innerHTML =

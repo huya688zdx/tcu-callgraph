@@ -26,6 +26,20 @@ export function roleColor(role) {
   return CALLEE_COLOR;
 }
 
+/** 详情行是一处真实调用；画布可能将同一对端点的多处调用收在一条线上。 */
+export function visibleCallEdge(call, edges) {
+  const pair = edges.filter(edge => edge.from === call.from && edge.to === call.to &&
+    (!call.change || !edge.change || call.change === edge.change));
+  const sameSite = site => site.line === call.line && (!site.kind || !call.kind || site.kind === call.kind) &&
+    (!site.col || !call.col || site.col === call.col) &&
+    (!site.cond || !call.cond || site.cond === call.cond) &&
+    (!site.siteId || !call.siteId || site.siteId === call.siteId);
+  const direct = pair.filter(sameSite);
+  if (direct.length) return direct.length === 1 ? direct[0] : null;
+  const grouped = pair.filter(edge => Array.isArray(edge.calls) && edge.calls.some(sameSite));
+  return grouped.length === 1 ? grouped[0] : null;
+}
+
 /**
  * 基于当前可见边，计算与选中节点直接相连的边角色、邻居角色与关联容器集合。
  * 方向语义严格复用 edgeDirection：

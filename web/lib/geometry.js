@@ -3,7 +3,7 @@
  * 不涉及 DOM 绘制，方便单独测试
  */
 import { state } from './state.js';
-import { routeEdges, collectSegments, pathBlockedByNodes, pathCrossesBody } from '/core/routing.js';
+import { routeEdges, collectSegments, canShareTrunk, pathBlockedByNodes, pathCrossesBody } from '/core/routing.js';
 import { improveEdgeRoutes, mergeSharedRoutes } from '/core/layout-metrics.js';
 import { placeNodeInHierarchy } from './hierarchy.js';
 
@@ -89,7 +89,7 @@ function moveNodeNoOverlap(drag, tx, ty, { tolerance = 0, connected = new Set(),
   return node.x !== oldX || node.y !== oldY;
 }
 
-function segmentSnapTargets(view, edge, axis, across, endpoints) {
+function segmentSnapTargets(view, edge, axis, across, endpoints, a, b) {
   const horizontal = axis === 1;
   const key = horizontal ? 'y' : 'x';
   const direction = horizontal ? 'x' : 'y';
@@ -98,9 +98,18 @@ function segmentSnapTargets(view, edge, axis, across, endpoints) {
   const targets = endpoints.map((n) => ({
     at: n[key] + n[size] / 2, from: n[direction], to: n[direction] + n[span], priority: 0,
   }));
-  const corridors = collectSegments(view.edges.filter((other) => other !== edge));
-  for (const s of horizontal ? corridors.h : corridors.v) {
-    targets.push({ at: s[key], from: s[direction + '1'], to: s[direction + '2'], priority: 1 });
+  const lo = Math.min(a[across], b[across]), hi = Math.max(a[across], b[across]);
+  const occupied = new Set();
+  for (const other of view.edges) {
+    if (other === edge) continue;
+    const related = ((edge.from && other.from === edge.from) || (edge.to && other.to === edge.to)) &&
+      other.kind === edge.kind && (edge.kind !== 'var' || other.via === edge.via) && canShareTrunk(edge, other);
+    const corridors = collectSegments([other]);
+    for (const s of horizontal ? corridors.h : corridors.v) {
+      const from = s[direction + '1'], to = s[direction + '2'];
+      if (!related && Math.min(hi, to) - Math.max(lo, from) > 0.5) occupied.add(s[key]);
+      else targets.push({ at: s[key], from, to, priority: 1 });
+    }
   }
   const start = edge.points[0], end = edge.points.at(-1);
   targets.push({
@@ -108,7 +117,7 @@ function segmentSnapTargets(view, edge, axis, across, endpoints) {
     from: Math.min(start[across], end[across]), to: Math.max(start[across], end[across]),
     priority: 2,
   });
-  return targets;
+  return { targets, occupied: [...occupied] };
 }
 
 /** 移动正交线段，先试安全的吸附位置，再试原始指针位置。 */
@@ -130,8 +139,11 @@ function moveEdgeSegment(view, seg, x, y, tolerance = 0) {
   const oldA = work[i][axis], oldB = work[i + 1][axis];
   const skip = new Set([edge.from, edge.to]);
   const endpoints = seg.endpoints ??= view.nodes.filter((n) => skip.has(n.id));
-  const targets = tolerance > 0 ? (seg.snapTargets ??= segmentSnapTargets(view, edge, axis, across, endpoints))
-    .filter(({ at }) => Math.abs(at - desired) <= tolerance)
+  const snap = tolerance > 0 && (seg.snapTargets ??= segmentSnapTargets(view, edge, axis, across, endpoints, work[i], work[i + 1]));
+  // 端点或共用分支的辅助线也不能把手柄吸到无关走线上。原始指针位置仍可自由落下。
+  const occupied = snap ? snap.occupied.filter(at => Math.abs(at - desired) < 2 * tolerance) : [];
+  const targets = snap ? snap.targets
+    .filter(({ at }) => Math.abs(at - desired) <= tolerance && !occupied.some(value => Math.abs(value - at) < tolerance))
     .sort((a, b) => Math.abs(a.at - desired) - Math.abs(b.at - desired) || a.priority - b.priority) : [];
   const checked = new Set();
   seg.guides = [];

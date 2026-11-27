@@ -190,7 +190,7 @@ function edgeFixture() {
 
 test('水平折线可吸附到端点中心、平行走廊和两端口中点，Shift 关闭吸附', () => {
   const { view, seg } = edgeFixture();
-  view.edges.push({ points: [[160, 146], [370, 146]] });
+  view.edges.push({ from: 'from', to: 'branch', points: [[160, 146], [370, 146]] });
   assert.equal(moveEdgeSegment(view, seg, 160, 94, 8), true);
   assert.deepEqual(seg.edge.points.slice(1, 4), [[96, 90], [96, 90], [270, 90]]);
   assert.deepEqual(seg.guides, [{ axis: 'y', at: 90, from: 0, to: 270 }]);
@@ -209,7 +209,7 @@ test('竖直折线跳过被节点挡住的吸附位置，改试下一个走廊�
   seg.edge.points = seg.edge.points.map(([x, y]) => [y, x]);
   seg.orient = 'v';
   view.nodes.push({ id: 'obstacle', x: 79, y: 175, w: 9, h: 25 });
-  view.edges.push({ points: [[98, 165], [98, 265]] });
+  view.edges.push({ from: 'branch', to: 'to', points: [[98, 165], [98, 265]] });
   assert.equal(moveEdgeSegment(view, seg, 93, 160, 8), true);
   assert.deepEqual(seg.guides, [{ axis: 'x', at: 98, from: 96, to: 270 }]);
   assert.equal(moveEdgeSegment(view, seg, 90, 160, 0), false);
@@ -227,4 +227,27 @@ test('直线拖动保留端口，无法移动时不会留下占位点', () => {
   assert.deepEqual(seg.edge.points, [[60, 90], [300, 90]]);
   assert.equal(moveEdgeSegment(view, seg, 150, 99), true);
   assert.deepEqual(seg.edge.points, [[60, 90], [120, 90], [120, 99], [240, 99], [240, 90], [300, 90]]);
+});
+
+test('线段只吸附到共享调用方或被调用方且未被无关边占用的走廊', () => {
+  for (const other of [
+    { from: 'x', to: 'y' },
+    { from: 'to', to: 'x' },
+    { from: 'from', to: 'x', change: 'added' },
+  ]) {
+    const { view, seg } = edgeFixture();
+    view.edges.push({ from: 'from', to: 'sibling', points: [[400, 145], [440, 145]] });
+    view.edges.push({ ...other, points: [[160, 146], [260, 146]] });
+    assert.equal(moveEdgeSegment(view, seg, 175, 143, 8), true);
+    assert.equal(seg.edge.points[seg.index][1], 143);
+    assert.deepEqual(seg.guides, []);
+  }
+
+  const { view, seg } = edgeFixture();
+  view.edges.push({ from: 'from', to: 'branch', points: [[160, 146], [370, 146]] });
+  view.edges.push({ from: 'x', to: 'y', points: [[185, 146], [260, 146]] });
+  moveEdgeSegment(view, seg, 170, 143, 8);
+  assert.equal(seg.edge.points[seg.index][1], 143, '同一走廊另有无关调用，不能默认吸附');
+  moveEdgeSegment(view, seg, 170, 146, 0);
+  assert.equal(seg.edge.points[seg.index][1], 146, '仍允许手动放到指定坐标');
 });
