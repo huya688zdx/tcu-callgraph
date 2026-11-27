@@ -138,7 +138,7 @@ function describe(e) {
     case 'manual.variable.bind':
       return t('op.manual.variable.bind');
     case 'bookmark.save': {
-      const act = e.ctx?.action === 'update' ? '更新书签' : e.ctx?.action === 'rename' ? '重命名书签' : t('op.bookmark.save');
+      const act = e.ctx?.action === 'update' ? t('timeline.updateBookmark') : e.ctx?.action === 'rename' ? t('timeline.renameBookmark') : t('op.bookmark.save');
       return [
         act,
         e.ctx?.diffSummary || '',
@@ -154,12 +154,12 @@ function describe(e) {
     }
     case 'view.checkpoint':
       return [
-        e.ctx?.bookmarkName ? `书签「${e.ctx.bookmarkName}」` : '',
+        e.ctx?.bookmarkName ? t('timeline.namedBookmark', { name: e.ctx.bookmarkName }) : '',
         e.ctx?.diffSummary || (b.count != null ? t('timeline.canvasCount', { n: b.count }) : ''),
       ].filter(Boolean).join(' · ');
     case 'view.snapshot':
       return [
-        e.ctx?.bookmarkName ? `书签「${e.ctx.bookmarkName}」` : '',
+        e.ctx?.bookmarkName ? t('timeline.namedBookmark', { name: e.ctx.bookmarkName }) : '',
         e.ctx?.diffSummary || t('timeline.canvasCount', { n: b.count ?? 0 }),
         b.label,
       ].filter(Boolean).join(' · ');
@@ -415,7 +415,7 @@ restoreBtn?.addEventListener('click', async () => {
   try {
     // 非破坏性恢复：若当前恢复前工作区有节点且曾偏离书签，先自动记录安全检查点
     if (preReview && (preReview.roots?.length || preReview.expansions?.length) && !state.view?.comparison) {
-      await api.saveCheckpoint('恢复前自动快照', {
+      await api.saveCheckpoint(t('timeline.preRestore'), {
         roots: preReview.roots,
         expansions: preReview.expansions,
         up: preReview.up,
@@ -478,16 +478,16 @@ scopeBookmarkCheck?.addEventListener('change', () => {
 async function submitCheckpoint() {
   if (state.at > 0 || state.view?.comparison || !state.roots.length || !checkpointBtn) return;
   checkpointBtn.disabled = true;
-  const name = checkpointInput?.value.trim() || `检查点 ${hhmm(Date.now())}`;
+  const name = checkpointInput?.value.trim() || t('timeline.defaultCheckpoint', { time: hhmm(Date.now()) });
   try {
     const r = await api.saveCheckpoint(name, currentViewScope(), state.activeBookmark
       ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name }
       : {});
-    if (!r?.ok) throw new Error(r?.error || '记录检查点失败');
+    if (!r?.ok) throw new Error(r?.error || t('timeline.checkpointFailed'));
     if (checkpointInput) checkpointInput.value = '';
     await load();
   } catch (err) {
-    alert(err.message || '记录检查点失败');
+    alert(err.message || t('timeline.checkpointFailed'));
   } finally {
     syncTimelineControls();
   }

@@ -585,7 +585,7 @@ function openTreeMenu(ev, kind, payload) {
     else if (!window.__EXPORT && payload.fnIds?.length) items.push({ value: 'alone', label: t('common.openAlone') });
     if (items.length) sections.push({ items });
   }
-  if (!window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: '✨ 问 AI' }] });
+  if (!window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: 'ai.ask' }] });
   if (!sections.length) return;
   showMenuSections(
     ev.clientX,
@@ -989,18 +989,18 @@ function periodDetail(node) {
   </details>`;
 }
 
-async function renderDetail(id, boxDetail = null) {
+async function renderDetail(id, boxDetail = null, { notifySelection = true } = {}) {
   clearDataflow();
   state.hoverRelation = null;
   const my = ++detailSeq;
   const target = id ? nodeById(id) : null;
-  if (target || !state.selectedEdge) publishAiSelection(target ? nodeAiDetail(target) : boxDetail);
+  if (notifySelection && (target || !state.selectedEdge)) publishAiSelection(target ? nodeAiDetail(target) : boxDetail);
   const isFn = !!target && target.kind !== 'var';
   const comparison = state.compareInfo?.active ? state.compareInfo : state.view?.comparison;
   syncDetailSections(isFn);
   if (!target && comparison && showEdgeDetails(state.selectedEdge)) return;
   const askAiButton = target && !window.__EXPORT
-    ? `<button class="flowchart-detail" type="button" data-node-ask-ai="${esc(target.id)}">✨ 问 AI</button>`
+    ? `<button class="flowchart-detail" type="button" data-node-ask-ai="${esc(target.id)}">${t('ai.ask')}</button>`
     : '';
   const inViewIds = new Set((state.view?.nodes || []).map((n) => n.id));
   const dataEdges = target ? state.view.edges.filter(e => isDataEdge(e) && (e.from === id || e.to === id)) : [];

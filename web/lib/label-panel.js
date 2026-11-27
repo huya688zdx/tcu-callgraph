@@ -354,7 +354,7 @@ function taskDetection() {
     </div>`;
 }
 
-export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
+export function renderLabelPanel({ scrollToTrunkBranch = false, notifySelection = true } = {}) {
   const sec = els.secLabel;
   const box = els.labelPanel;
   if (!sec || !box) return;
@@ -392,7 +392,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
     aiDetail.trunkActiveIndex = trunkHits.indexOf(edge);
     aiDetail.trunkAll = allTrunk;
   }
-  document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: aiDetail }));
+  if (notifySelection) document.dispatchEvent(new CustomEvent('cg:selection-changed', { detail: aiDetail }));
   if (connPick !== edge || connMode !== 'fixed' || selLabel) connPick = null;
   if (detectResult && (detectResult.edge !== edge || detectResult.labelId !== selLabel?.id)) detectResult = null;
   const focusName = trunkHits && state.trunkFocusNode ? nodeName(state.trunkFocusNode) : null;
@@ -402,7 +402,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
   const trunkScrollTop = trunkHits === displayedTrunk ? box.querySelector('.trunk-list')?.scrollTop || 0 : 0;
   displayedTrunk = trunkHits;
   const navigator = trunkHits ? trunkNavigator(trunkHits, activeBranches, allTrunk, edge) : '';
-  const askAiButton = window.__EXPORT ? '' : '<button type="button" class="lbl-add" data-edge-ask-ai>✨ 问 AI</button>';
+  const askAiButton = window.__EXPORT ? '' : `<button type="button" class="lbl-add" data-edge-ask-ai>${t('ai.ask')}</button>`;
   const head = navigator + `<div class="lbl-head" title="${esc(caption)}">${esc(caption)}</div>${askAiButton}${statusControl(edge, true)}`;
 
   if (state.view?.comparison) {

@@ -60,7 +60,7 @@ async function render() {
     summaryEl.replaceChildren();
     const info = document.createElement('span');
     info.textContent = bm
-      ? `${baseText} · 当前：${bm.name}${dirty ? '（有未保存改动 ●）' : ''}`
+      ? `${baseText} · ${t('bookmark.currentName', { name: bm.name })}${dirty ? t('bookmark.unsaved') : ''}`
       : `${baseText} · ${t('bookmark.unnamed')}`;
     summaryEl.append(info);
     if (bm) {
@@ -70,7 +70,7 @@ async function render() {
         const updateCurrentBtn = document.createElement('button');
         updateCurrentBtn.type = 'button';
         updateCurrentBtn.className = 'primary';
-        updateCurrentBtn.textContent = '更新当前书签';
+        updateCurrentBtn.textContent = t('bookmark.updateCurrent');
         updateCurrentBtn.addEventListener('click', () => {
           void saveUpdateByBookmark({ ...bm }, updateCurrentBtn);
         });

@@ -137,22 +137,22 @@ function renderFloatBar(pair, names) {
   }
   floatBar.hidden = false;
   if (pair.ids.length === 1) {
-    floatBar.innerHTML = `<span class="pair-float-txt">已选起点 <strong>${names[0]}</strong>，按住 <kbd>Ctrl</kbd> 点击第二个函数查两点链路</span>` +
-      `<button type="button" data-pair-clear title="取消两点选择">取消</button>`;
+    floatBar.innerHTML = `<span class="pair-float-txt">${t('pair.startHint', { name: `<strong>${names[0]}</strong>`, key: '<kbd>Ctrl</kbd>' })}</span>` +
+      `<button type="button" data-pair-clear title="${t('pair.cancelSelection')}">${t('common.cancel')}</button>`;
     return;
   }
   const n = pair.result?.paths?.length || 0;
   const rwCount = pair.rwResult?.paths?.length || 0;
-  const rwTag = pair.rwLoading ? ' · 数据流查询中…' : rwCount ? ` · ${rwCount} 条读写链` : '';
+  const rwTag = pair.rwLoading ? t('pair.readWriteQuery') : rwCount ? t('pair.readWrites', { n: rwCount }) : '';
   const summary = n
-    ? `${names[0]} ↔ ${names[1]}（${n} 条画布路${rwTag}）`
+    ? `${names[0]} ↔ ${names[1]} · ${[t('pair.canvasPaths', { n }), rwTag].filter(Boolean).join(' · ')}`
     : rwCount
-      ? `${names[0]} ↔ ${names[1]}（${rwCount} 条源码读写链）`
-      : `${names[0]} ↔ ${names[1]}（${pair.rwLoading ? '正在分析源码读写…' : '暂无直连路径'}）`;
+      ? `${names[0]} ↔ ${names[1]} · ${t('pair.sourcePaths', { n: rwCount })}`
+      : `${names[0]} ↔ ${names[1]} · ${pair.rwLoading ? t('pair.sourceLoading') : t('pair.noDirectPath')}`;
   floatBar.innerHTML = `<span class="pair-float-txt"><strong>${summary}</strong></span>` +
-    (n ? `<button type="button" data-pair-focus>聚焦</button>` : '') +
-    (window.__EXPORT ? '' : `<button type="button" class="primary" data-pair-ai>✨ 加入对话</button>`) +
-    `<button type="button" data-pair-clear title="退出两点链路">×</button>`;
+    (n ? `<button type="button" data-pair-focus>${t('pair.focusShort')}</button>` : '') +
+    (window.__EXPORT ? '' : `<button type="button" class="primary" data-pair-ai>${t('ai.addToChat')}</button>`) +
+    `<button type="button" data-pair-clear title="${t('pair.exit')}">×</button>`;
 }
 function focusPath(force = false) {
   const result = state.pairFlow?.result, view = state.view;
@@ -214,21 +214,21 @@ function renderPanel() {
       names.join(' ↔ '),
       r.paths.length ? t('pair.directed', { n: directed }) : t('pair.empty'),
       related ? t('pair.static', { n: related }) : '',
-      pair.rwLoading ? '读写流分析中…' : rwCount ? `源码读写 ${rwCount} 条` : '',
+      pair.rwLoading ? t('pair.rwLoading') : rwCount ? t('pair.rwCount', { n: rwCount }) : '',
     ].filter(Boolean).join(' · ');
     details = `<div class="pair-flow-hint">${r.paths.length ? t('pair.colorHint') : t('pair.scopeHint')}${r.truncated ? t('pair.truncated') : ''}</div>`;
-    if (r.paths.length) details += `<details open><summary>${t('pair.show')}</summary>${r.paths.map((p, index) => `<div class="pair-flow-path" data-pair-path-idx="${index}" title="点击聚焦并高亮此路径" style="cursor:pointer"><strong>${t('pair.number', { n: index + 1 })}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${stepArrow(p.steps[i - 1])}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? t('pair.staticHint') : t('pair.directedHint')}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? t('compare.version.before') : t('compare.version.after')).join(' / ') : t('pair.crossVersion')}</small>` : ''}</div>`).join('')}</details>`;
+    if (r.paths.length) details += `<details open><summary>${t('pair.show')}</summary>${r.paths.map((p, index) => `<div class="pair-flow-path" data-pair-path-idx="${index}" title="${t('pair.highlightPath')}" style="cursor:pointer"><strong>${t('pair.number', { n: index + 1 })}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${stepArrow(p.steps[i - 1])}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? t('pair.staticHint') : t('pair.directedHint')}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? t('compare.version.before') : t('compare.version.after')).join(' / ') : t('pair.crossVersion')}</small>` : ''}</div>`).join('')}</details>`;
     if (pair.rwLoading) {
-      details += `<div class="pair-flow-hint">正在后台检索全工程变量读写路径…</div>`;
+      details += `<div class="pair-flow-hint">${t('pair.searchingSource')}</div>`;
     } else if (pair.rwError) {
-      details += `<div class="pair-flow-hint">源码读写检索未完成：${esc(pair.rwError)}</div>`;
+      details += `<div class="pair-flow-hint">${esc(t('pair.sourceError', { error: pair.rwError }))}</div>`;
     } else if (pair.rwResult?.paths?.length) {
       const { rwPaths } = summarizeRwPaths(pair);
-      details += `<details open><summary>源码变量读写链（${pair.rwResult.paths.length}）</summary>${rwPaths.map((line, i) => `<div class="pair-flow-path"><strong>读写 #${i + 1}</strong><div>${esc(line)}</div></div>`).join('')}</details>`;
+      details += `<details open><summary>${t('pair.sourceChains', { n: pair.rwResult.paths.length })}</summary>${rwPaths.map((line, i) => `<div class="pair-flow-path"><strong>${t('pair.rwNumber', { n: i + 1 })}</strong><div>${esc(line)}</div></div>`).join('')}</details>`;
     }
   }
   const aiBtn = !window.__EXPORT && pair.ids.length === 2
-    ? `<button type="button" data-pair-ai>✨ 加入对话</button>`
+    ? `<button type="button" data-pair-ai>${t('ai.addToChat')}</button>`
     : '';
   panel.innerHTML = `<h3>${t('pair.title')}</h3><div class="pair-flow-heading">${message}</div><div class="pair-flow-actions">${pair.result?.paths.length ? `<button type="button" data-pair-focus>${t('pair.focus')}</button>` : ''}${aiBtn}<button type="button" data-pair-clear>${t('pair.clear')} <kbd>Esc</kbd></button></div>${details}`;
   renderFloatBar(pair, names);
@@ -270,7 +270,7 @@ async function fetchRwDataflow(pair) {
   } catch (err) {
     if (err?.name === 'AbortError' || seq !== rwSeq || state.pairFlow !== pair) return;
     pair.rwLoading = false;
-    pair.rwError = err?.message || '请求失败';
+    pair.rwError = err?.message || t('common.requestFailed');
   }
   if (state.pairFlow !== pair) return;
   renderPanel();

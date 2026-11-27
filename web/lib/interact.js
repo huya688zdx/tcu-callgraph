@@ -462,7 +462,7 @@ function selectBox(hit) {
   draw();
 }
 
-const askNodeItem = { value: 'askAi', label: '✨ 问 AI（关于此函数/变量）' };
+const askNodeItem = { value: 'askAi', label: 'ai.askNode' };
 
 function addNodeAiAction(node) {
   const menu = els.ctxMenu;
@@ -471,7 +471,7 @@ function addNodeAiAction(node) {
   const button = document.createElement('button');
   button.type = 'button';
   button.dataset.askAi = '';
-  button.textContent = askNodeItem.label;
+  button.textContent = t(askNodeItem.label);
   button.addEventListener('click', (event) => {
     event.stopPropagation();
     hideMenu();
@@ -488,7 +488,7 @@ function openEdgeMenu(e, edge, selection) {
   const comparing = Boolean(state.view?.comparison);
   const items = [...EDGE_ITEMS];
   if (comparing) items.unshift({ value: 'auto', label: 'status.auto' });
-  if (!window.__EXPORT) items.push({ value: 'askAi', label: '✨ 问 AI（关于此连线/标签）' });
+  if (!window.__EXPORT) items.push({ value: 'askAi', label: 'ai.askEdge' });
   const current = comparing && edge.statusSource !== 'manual' ? 'auto' : edge.change || 'existing';
   showMenu(e.clientX, e.clientY, t('menu.edge'), items, current, (v) =>
     v === 'askAi' ? askAi(edgeAiDetail(edge)) : setEdgeChange(edge, v));
@@ -590,7 +590,7 @@ els.cv.addEventListener('contextmenu', (e) => {
         },
       ],
     });
-    if (detail && !window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: '✨ 问 AI（关于此文件/目录）' }] });
+    if (detail && !window.__EXPORT) sections.push({ items: [{ value: 'askAi', label: 'ai.askFile' }] });
     showMenuSections(e.clientX, e.clientY, title, sections, (v) => {
       if (v === 'askAi') return askAi(detail);
       if (v === 'addFn') return openManualNodeDialog({ file: box.box.id, kind: 'fn' });

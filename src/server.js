@@ -34,6 +34,7 @@ import {
   sanitizeSuggestions,
   testConnection as testAiConnection,
 } from './core/ai-agent.js';
+import { aiTranslator } from './core/ai-messages.js';
 import { normalizeExpansions } from './core/expansion.js';
 import { routeEdges } from './core/routing.js';
 import { contentPadding, inside } from '../web/lib/hierarchy.js';
@@ -2617,7 +2618,7 @@ export const server = http.createServer(async (req, res) => {
       try {
         const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
         const cfg = normalizeAiConfig(p, saved);
-        return json(res, await listAiModels(cfg, { signal: responseSignal(res) }));
+        return json(res, await listAiModels(cfg, { language: p.language, signal: responseSignal(res) }));
       } catch (err) {
         return bad(res, err.message);
       }
@@ -2630,7 +2631,7 @@ export const server = http.createServer(async (req, res) => {
       try {
         const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
         const cfg = normalizeAiConfig(p, saved);
-        return json(res, await testAiConnection(cfg, { signal: responseSignal(res) }));
+        return json(res, await testAiConnection(cfg, { language: p.language, signal: responseSignal(res) }));
       } catch (err) {
         return bad(res, err.message);
       }
@@ -2640,15 +2641,16 @@ export const server = http.createServer(async (req, res) => {
       if (!guardWrite(req, res)) return;
       let p;
       try { p = await readJson(req, res); } catch { return; }
-      if (COMPARISON) return bad(res, '比较模式不支持撤销 AI 改图');
+      const tr = aiTranslator(p?.language);
+      if (COMPARISON) return bad(res, tr('undo.compare'));
       const changesetId = typeof p?.changesetId === 'string' ? p.changesetId.trim() : '';
-      if (!changesetId) return bad(res, '缺少 changesetId');
+      if (!changesetId) return bad(res, tr('undo.id'));
       const snap = aiChangesets.get(changesetId);
       if (!snap || snap.projectId !== PROJECT.id) {
-        return json(res, { ok: false, error: '未找到可撤销的本轮 AI 改动记录（可能已撤销或工程已切换）' }, 404);
+        return json(res, { ok: false, error: tr('undo.missing') }, 404);
       }
       if (snap.sessionRevision !== sessionRevision) {
-        return json(res, { ok: false, error: '画布已进入其他比较或刷新会话，无法撤销' }, 409);
+        return json(res, { ok: false, error: tr('undo.session') }, 409);
       }
       const nextPage = snap.page ? {
         ...snap.page,
@@ -2853,6 +2855,7 @@ export const server = http.createServer(async (req, res) => {
       try {
         const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
         const compacted = await compactConversation({
+          language: p?.language,
           config: saved,
           messages: Array.isArray(p?.messages) ? p.messages : [],
           signal: responseSignal(res),
@@ -2869,10 +2872,11 @@ export const server = http.createServer(async (req, res) => {
       try { p = await readJson(req, res, 8 * 1024 * 1024); } catch { return; }
       if (!currentSession(req)) return sessionConflict(res);
       const saved = normalizeAiConfig({}, store.getSetting('ai.llm.config', DEFAULT_AI_CONFIG));
+      const tr = aiTranslator(p.language);
       let cfg;
-      try { cfg = normalizeAiConfig(p.config || {}, saved); } catch (err) { return bad(res, err.message); }
+      try { cfg = normalizeAiConfig(p.config || {}, saved, tr); } catch (err) { return bad(res, err.message); }
       const prompt = String(p.prompt || '').trim();
-      if (!prompt) return bad(res, '请输入要执行的任务');
+      if (!prompt) return bad(res, tr('noPrompt'));
       const images = [];
       for (const item of Array.isArray(p.images) ? p.images : []) {
         const dataUrl = typeof item === 'string' ? item : item?.dataUrl;
@@ -4447,7 +4451,7 @@ export const server = http.createServer(async (req, res) => {
             return {
               ok: false,
               needsVehicleChoice: true,
-              error: '部分函数名存在重名，请先调用 ask_user 确认目标文件/车型或传入完整「文件::函数名」',
+              error: tr('ambiguousFn'),
               ambiguous,
             };
           }
@@ -4666,8 +4670,8 @@ export const server = http.createServer(async (req, res) => {
               ambiguous: allAmbiguous,
               notFound: [...fnRes.notFound, ...varRes.notFound],
               error: ambBranches.length > 1
-                ? `检测到重名函数/变量横跨多个车型或目录分支（${ambBranches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入完整「文件::函数名」、includePaths 或 includeAllBranches:true。`
-                : '检测到重名函数/变量，请先用 ask_user 向用户确认具体候选「文件::函数名」，再重试。',
+                ? tr('ambiguousBranches', { branches: ambBranches.map((b) => b.prefix).join(tr('itemSep')) })
+                : tr('ambiguousSymbols'),
             };
           }
           // 支持仅追加全局变量到已有画布
@@ -4699,7 +4703,7 @@ export const server = http.createServer(async (req, res) => {
                 ok: false,
                 needsVehicleChoice: true,
                 pathBranches: branches,
-                error: `检测到目标函数或上游调用链涉及 ${branches.length} 个不同车型/目录分支（${branches.map((b) => b.prefix).join('、')}），请先用 ask_user 询问用户需要保留哪些分支，再传入 includePaths / excludePaths 或 includeAllBranches:true 重试。`,
+                error: tr('chooseBranches', { n: branches.length, branches: branches.map((b) => b.prefix).join(tr('itemSep')) }),
               };
             }
           }
@@ -4910,10 +4914,10 @@ export const server = http.createServer(async (req, res) => {
             if (MODEL !== model) return { ok: false, error: '源码已刷新，请重新检测标签' };
             rawItems = labelCtx.suggestedLabels;
             if (!rawItems.length) {
-              return { ok: true, applied: 0, edgeKeys: [], note: '当前画布上没有缺失的 TASK 或 コール順 候选标签' };
+              return { ok: true, applied: 0, edgeKeys: [], note: tr('labels.complete') };
             }
           }
-          if (!rawItems.length) return { ok: false, error: 'items 不能为空（或传 autoDetect: true 自动补全当前画布标签）' };
+          if (!rawItems.length) return { ok: false, error: tr('labels.needItems') };
           const items = [];
           const seenEdgePreset = new Set();
           for (const item of rawItems) {
@@ -4922,7 +4926,7 @@ export const server = http.createServer(async (req, res) => {
             if (!from.resolved.length || !to.resolved.length) {
               return {
                 ok: false,
-                error: `无法解析连线端点：${item.from} -> ${item.to}`,
+                error: tr('labels.endpoints', { from: item.from, to: item.to }),
                 ambiguous: [...from.ambiguous, ...to.ambiguous],
                 notFound: [...from.notFound, ...to.notFound],
               };
@@ -4973,7 +4977,7 @@ export const server = http.createServer(async (req, res) => {
         };
         if (name === 'inspect_dataflow') {
           const rawTarget = String(args.target || '').trim();
-          if (!rawTarget) return { ok: false, error: '请提供要分析的数据流符号 target' };
+          if (!rawTarget) return { ok: false, error: tr('flow.target') };
           const maxPaths = Math.max(1, Math.min(20, Math.trunc(Number(args.maxPaths) || 10)));
           if (!COMPARISON && MODEL.source !== 'dot') {
             await ensureAnalysis(MODEL);
@@ -4983,7 +4987,7 @@ export const server = http.createServer(async (req, res) => {
           if (!tRes.resolved.length) {
             return {
               ok: false,
-              error: tRes.ambiguous.length ? '目标符号存在重名，请指定完整「文件::符号名」或 var::' : `未找到符号：${rawTarget}`,
+              error: tRes.ambiguous.length ? tr('flow.ambiguous') : tr('flow.missing', { name: rawTarget }),
               ambiguous: tRes.ambiguous,
               notFound: tRes.notFound,
             };
@@ -4996,13 +5000,13 @@ export const server = http.createServer(async (req, res) => {
             if (!pRes.resolved.length) {
               return {
                 ok: false,
-                error: pRes.ambiguous.length ? '对端符号存在重名，请指定完整「文件::符号名」' : `未找到对端符号：${rawPeer}`,
+                error: pRes.ambiguous.length ? tr('flow.ambiguousPeer') : tr('flow.noPeer', { peer: rawPeer }),
                 ambiguous: pRes.ambiguous,
                 notFound: pRes.notFound,
               };
             }
             const peerId = pRes.resolved[0];
-            if (peerId === targetId) return { ok: false, error: 'target 与 peer 不能相同' };
+            if (peerId === targetId) return { ok: false, error: tr('flow.same') };
             const peerNode = MODEL._index?.byId?.get(peerId);
             const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, targetId, peerId) : pairDataflow(MODEL, targetId, peerId));
             assertActive();
@@ -5072,7 +5076,7 @@ export const server = http.createServer(async (req, res) => {
           if (!rawTargets.length) {
             const cur = latestPage();
             seedIds = (cur?.roots || []).slice(0, 6);
-            if (!seedIds.length) return { ok: false, error: '当前画布为空，请提供 root 或 targets 函数/变量名' };
+            if (!seedIds.length) return { ok: false, error: tr('walk.empty') };
           } else {
             const fnRes = resolveSymbols(MODEL, rawTargets, 'fn');
             if (fnRes.ambiguous.length) {
@@ -5082,14 +5086,14 @@ export const server = http.createServer(async (req, res) => {
                 needsVehicleChoice: branches.length > 1,
                 ...(branches.length > 1 ? { pathBranches: branches } : {}),
                 ambiguous: fnRes.ambiguous,
-                error: '目标函数存在多处定义，请先明确具体「文件::函数名」或目录分支',
+                error: tr('walk.ambiguous'),
               };
             }
             seedIds = fnRes.resolved;
             if (!seedIds.length) {
               const varRes = resolveSymbols(MODEL, rawTargets, 'var');
               if (varRes.resolved.length) seedIds = varRes.resolved;
-              else return { ok: false, error: `未找到目标符号：${rawTargets.join(', ')}`, notFound: fnRes.notFound };
+              else return { ok: false, error: tr('walk.missing', { names: rawTargets.join(', ') }), notFound: fnRes.notFound };
             }
           }
           const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'both';
@@ -5189,7 +5193,7 @@ export const server = http.createServer(async (req, res) => {
                 vars: varSliceIds,
                 up: 0,
                 down: 0,
-                reason: String(args.title || 'AI 逻辑链智能呈现').slice(0, 120),
+                reason: String(args.title || tr('walk.reason')).slice(0, 120),
               }, { chatClientId });
             } catch {
               composedResult = null;
@@ -5203,16 +5207,16 @@ export const server = http.createServer(async (req, res) => {
             layers.get(d).push(id);
           }
           const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
-          const presTitle = String(args.title || `${toChainStep(seedIds[0]).name} 调用与数据流导览`).slice(0, 80);
+          const presTitle = String(args.title || tr('walk.title', { name: toChainStep(seedIds[0]).name })).slice(0, 80);
           const steps = sortedDepths.slice(0, 6).map((d, idx) => {
             const nids = layers.get(d).slice(0, 10);
             const names = nids.map(id => toChainStep(id).name);
             const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(edgeKeyOf);
-            const roleLabel = d < 0 ? '上游触发与调用者' : d === 0 ? '核心关注节点' : '下游执行链路';
+            const roleLabel = d < 0 ? tr('walk.up') : d === 0 ? tr('walk.core') : tr('walk.down');
             return {
               index: idx,
-              title: `${roleLabel} (${names.slice(0, 3).join('、')}${names.length > 3 ? '…' : ''})`,
-              summary: `涉及 ${nids.length} 个函数：${names.join('、')}`,
+              title: `${roleLabel} (${names.slice(0, 3).join(tr('itemSep'))}${names.length > 3 ? '…' : ''})`,
+              summary: tr('walk.functions', { n: nids.length, names: names.join(tr('itemSep')) }),
               nodeIds: nids,
               edgeKeys: stepEdges,
               focusNodeId: nids[0],
@@ -5221,8 +5225,8 @@ export const server = http.createServer(async (req, res) => {
           if (varSliceIds.length) {
             steps.push({
               index: steps.length,
-              title: `关联全局变量数据流 (${varSliceIds.length})`,
-              summary: `共享读写变量：${varSliceIds.map(v => toChainStep(v).name).join('、')}`,
+              title: tr('walk.globals', { n: varSliceIds.length }),
+              summary: tr('walk.rw', { names: varSliceIds.map(v => toChainStep(v).name).join(tr('itemSep')) }),
               nodeIds: varSliceIds,
               edgeKeys: [],
               focusNodeId: varSliceIds[0],
@@ -5280,7 +5284,7 @@ export const server = http.createServer(async (req, res) => {
               ok: true,
               healthReport: {
                 score: 100,
-                summary: '当前画布为空，暂无可诊断的节点。',
+                summary: tr('health.empty'),
                 issues: [],
               },
             };
@@ -5318,10 +5322,10 @@ export const server = http.createServer(async (req, res) => {
               id: 'missing_labels',
               category: 'labels',
               severity: 'medium',
-              title: `缺少 ${labelCtx.suggestedLabels.length} 条推荐标签 (TASK / コール順)`,
-              detail: sample.map(s => `${toChainStep(s.from).name}→${toChainStep(s.to).name}(${s.text})`).join('；'),
+              title: tr('health.labels', { n: labelCtx.suggestedLabels.length }),
+              detail: sample.map(s => `${toChainStep(s.from).name}→${toChainStep(s.to).name}(${s.text})`).join(tr('stepSep')),
               nodeIds: [...new Set(sample.flatMap(s => [s.from, s.to]))],
-              fixPrompt: '请调用 apply_labels({ autoDetect: true }) 自动补全当前画布缺失的 TASK 与调用顺序标签。',
+              fixPrompt: tr('health.fixLabels'),
             });
           }
           if (check === 'all' || check === 'indirect') {
@@ -5337,10 +5341,10 @@ export const server = http.createServer(async (req, res) => {
                 id: 'indirect_unexpanded',
                 category: 'indirect',
                 severity: 'high',
-                title: `画布函数包含 ${unexpanded.length} 处未展开或待核实的间接调用点`,
-                detail: unexpanded.slice(0, 4).map(({ ic }) => `${toChainStep(ic.caller).name} (${ic.expr || ic.table?.name || 'fnptr'})`).join('；'),
+                title: tr('health.indirect', { n: unexpanded.length }),
+                detail: unexpanded.slice(0, 4).map(({ ic }) => `${toChainStep(ic.caller).name} (${ic.expr || ic.table?.name || 'fnptr'})`).join(tr('stepSep')),
                 nodeIds: [...new Set(unexpanded.map(u => u.ic.caller))],
-                fixPrompt: '请用 inspect_indirect_calls 与 read_source 核实当前画布中未展开的间接调用点，并用 add_call_edge 补全确切调用边。',
+                fixPrompt: tr('health.fixIndirect'),
               });
             }
           }
@@ -5351,10 +5355,10 @@ export const server = http.createServer(async (req, res) => {
                 id: 'isolated_nodes',
                 category: 'orphans',
                 severity: 'low',
-                title: `当前视图存在 ${orphans.length} 个孤立节点`,
-                detail: orphans.slice(0, 6).map(id => toChainStep(id).name).join('、'),
+                title: tr('health.orphans', { n: orphans.length }),
+                detail: orphans.slice(0, 6).map(id => toChainStep(id).name).join(tr('itemSep')),
                 nodeIds: orphans.slice(0, 15),
-                fixPrompt: `请对孤立节点 ${orphans.slice(0, 3).map(id => toChainStep(id).name).join('、')} 追踪上游调用链并补充关系。`,
+                fixPrompt: tr('health.fixOrphans', { names: orphans.slice(0, 3).map(id => toChainStep(id).name).join(tr('itemSep')) }),
               });
             }
           }
@@ -5374,10 +5378,10 @@ export const server = http.createServer(async (req, res) => {
                 id: 'layout_overlaps',
                 category: 'layout',
                 severity: 'medium',
-                title: `检测到 ${overlaps.length} 对节点框存在位置重叠`,
-                detail: overlaps.slice(0, 4).map(([a, b]) => `${toChainStep(a).name} 与 ${toChainStep(b).name}`).join('；'),
+                title: tr('health.overlap', { n: overlaps.length }),
+                detail: overlaps.slice(0, 4).map(([a, b]) => tr('health.pair', { a: toChainStep(a).name, b: toChainStep(b).name })).join(tr('stepSep')),
                 nodeIds: [...new Set(overlaps.flat())].slice(0, 12),
-                fixPrompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 自动整理画布消除节点重叠。',
+                fixPrompt: tr('health.fixOverlap'),
               });
             }
           }
@@ -5387,7 +5391,7 @@ export const server = http.createServer(async (req, res) => {
             ok: true,
             healthReport: {
               score,
-              summary: issues.length ? `画布体检得分 ${score}/100，发现 ${issues.length} 类问题` : '画布体检 100/100：标注、调用链与排版均健康',
+              summary: issues.length ? tr('health.score', { score, n: issues.length }) : tr('health.passed'),
               issues,
             },
           };
@@ -5397,10 +5401,10 @@ export const server = http.createServer(async (req, res) => {
           if (action === 'list') {
             return { ok: true, action, bookmarks: store.listBookmarks(PROJECT.id) };
           }
-          if (COMPARISON) return { ok: false, error: '比较模式不支持修改书签' };
+          if (COMPARISON) return { ok: false, error: tr('bookmark.compare') };
           ensureTurnSnapshot('manage_bookmarks');
           if (action === 'checkpoint') {
-            const label = String(args.checkpointName || args.name || 'AI 检查点').trim().slice(0, 80);
+            const label = String(args.checkpointName || args.name || tr('bookmark.defaultCheckpoint')).trim().slice(0, 80);
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const eventId = store.appendEvent(PROJECT.id, {
               op: 'view.checkpoint',
@@ -5414,7 +5418,7 @@ export const server = http.createServer(async (req, res) => {
           }
           if (action === 'save') {
             const bmName = String(args.name || '').trim().slice(0, 60);
-            if (!bmName) return { ok: false, error: '保存书签需要提供 name' };
+            if (!bmName) return { ok: false, error: tr('bookmark.needName') };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const r = saveBookmarkWithEvent({ ...viewSnapshot(page), name: bmName }, 'ai', { isForeground: true });
             recordCreatedBookmark(r.bookmark?.id);
@@ -5423,16 +5427,16 @@ export const server = http.createServer(async (req, res) => {
           }
           if (action === 'update') {
             const id = Number(args.id);
-            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'update 需要提供有效的书签 id' };
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: tr('bookmark.updateId') };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const resUp = store.updateBookmarkById(PROJECT.id, id, viewSnapshot(page));
-            if (!resUp) return { ok: false, error: '找不到指定书签' };
+            if (!resUp) return { ok: false, error: tr('bookmark.missing') };
             broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
             return { ok: true, action, bookmark: resUp.bookmark };
           }
           if (action === 'delete') {
             const id = Number(args.id);
-            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'delete 需要提供有效的书签 id' };
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: tr('bookmark.deleteId') };
             const gone = store.listBookmarks(PROJECT.id).find(b => b.id === id);
             const okDel = store.deleteBookmark(PROJECT.id, id);
             if (okDel) {
@@ -5447,35 +5451,35 @@ export const server = http.createServer(async (req, res) => {
             }
             return { ok: okDel, action, removed: okDel ? 1 : 0 };
           }
-          return { ok: false, error: `未知书签操作：${action}` };
+          return { ok: false, error: tr('bookmark.action', { action }) };
         }
         if (name === 'run_subagent') {
           if (!cfg.subagentEnabled) {
-            return { ok: false, error: '只读子调查功能已在设置中关闭' };
+            return { ok: false, error: tr('sub.off') };
           }
           const rawTasks = Array.isArray(args.tasks) ? args.tasks.slice(0, 3) : [];
-          if (!rawTasks.length) return { ok: false, error: 'run_subagent 需要至少 1 个调查任务' };
+          if (!rawTasks.length) return { ok: false, error: tr('sub.tasks') };
           const maxConcurrency = Math.max(1, Math.min(3, Number(cfg.subagentMaxConcurrency) || 2));
           const subMaxSteps = Math.max(2, Math.min(12, Number(cfg.subagentMaxSteps) || 6));
           const readOnlyExecute = async (toolName, toolArgs) => {
             if (!SUBAGENT_READONLY_TOOLS.has(toolName)) {
-              return { ok: false, blocked: true, error: `只读子调查禁止调用：${toolName}` };
+              return { ok: false, blocked: true, error: tr('sub.denied', { toolName }) };
             }
             return await executeAiTool(toolName, toolArgs);
           };
           const subSystemPrompt = [
-            '你是 TCU C 调用图只读子调查代理（运行于隔离上下文，深度=1）。',
-            '只能调用只读工具（find_symbols / read_function / read_source / trace_upstream / inspect_indirect_calls / inspect_dataflow / inspect_build_config / get_git_changes / diagnose_canvas）核实源码与图谱事实，禁止改图或向用户提问。',
-            '完成核实后，用 3–5 句简明中文总结：关键发现、精确函数/变量 ID（文件::符号名）与关键位置行号。',
-            `当前工程：${PROJECT.name}（函数 ${MODEL.functions?.length || 0} / 变量 ${MODEL.variables?.length || 0}）`,
+            tr('subRole'),
+            tr('subRules'),
+            tr('subFinish'),
+            tr('project', { name: PROJECT.name, fn: MODEL.functions?.length || 0, vars: MODEL.variables?.length || 0 }),
           ].join('\n');
           const taskDefs = rawTasks.map((t, idx) => ({
             id: `sub_${Date.now().toString(36)}_${idx + 1}`,
-            title: String(t?.title || `子调查 #${idx + 1}`).trim().slice(0, 80) || `子调查 #${idx + 1}`,
+            title: String(t?.title || tr('subTitle', { n: idx + 1 })).trim().slice(0, 80) || tr('subTitle', { n: idx + 1 }),
             goal: String(t?.goal || '').trim().slice(0, 1200),
             seedSymbols: (Array.isArray(t?.seedSymbols) ? t.seedSymbols : []).slice(0, 8).map(s => String(s || '').trim()).filter(Boolean),
           })).filter(t => t.goal);
-          if (!taskDefs.length) return { ok: false, error: '子调查任务缺少明确目标 goal' };
+          if (!taskDefs.length) return { ok: false, error: tr('sub.noGoal') };
           const results = new Array(taskDefs.length);
           let cursor = 0;
           const runWorker = async () => {
@@ -5485,9 +5489,9 @@ export const server = http.createServer(async (req, res) => {
               assertActive();
               sendEvent({ type: 'subagent_start', id: task.id, index: myIdx, title: task.title, goal: task.goal, seedSymbols: task.seedSymbols });
               const subPrompt = [
-                `调查主题：${task.title}`,
-                `调查目标：${task.goal}`,
-                ...(task.seedSymbols.length ? [`参考起始符号：${task.seedSymbols.join(', ')}`] : []),
+                tr('subTopic', { title: task.title }),
+                tr('subGoal', { goal: task.goal }),
+                ...(task.seedSymbols.length ? [tr('subSeeds', { symbols: task.seedSymbols.join(', ') })] : []),
               ].join('\n');
               try {
                 const subRes = await runAiAgent({
@@ -5497,6 +5501,7 @@ export const server = http.createServer(async (req, res) => {
                   },
                   prompt: subPrompt,
                   context: {
+                    language: p.language,
                     projectName: PROJECT.name,
                     fnCount: MODEL.functions?.length || 0,
                     varCount: MODEL.variables?.length || 0,
@@ -5531,7 +5536,7 @@ export const server = http.createServer(async (req, res) => {
                   id: task.id,
                   title: task.title,
                   ok: false,
-                  summary: `子调查失败：${String(err?.message || err).slice(0, 200)}`,
+                  summary: tr('sub.failed', { error: String(err?.message || err).slice(0, 200) }),
                   chains: [],
                   steps: 0,
                 };
@@ -5550,7 +5555,7 @@ export const server = http.createServer(async (req, res) => {
             ...(mergedChains.length ? { chains: mergedChains } : {}),
           };
         }
-        return { ok: false, error: `未知工具：${name}` };
+        return { ok: false, error: tr('unknownTool', { name }) };
       };
 
       try {
@@ -5718,19 +5723,19 @@ export const server = http.createServer(async (req, res) => {
             const rev = fwd ? null : shortestCallPath(b, a);
             const path = fwd || rev;
             if (path) {
-              lines.push(`- 调用通路: ${path.map(shortName).join(' → ')}`);
+              lines.push(tr('graph.path', { path: path.map(shortName).join(' → ') }));
             } else {
-              lines.push(`- 调用通路: ${shortName(a)} 与 ${shortName(b)} 5 跳内无直接调用路径`);
+              lines.push(tr('graph.noPath', { a: shortName(a), b: shortName(b) }));
             }
             try {
               const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
               assertActive();
               if (df.sharedVars?.length) {
-                lines.push(`- 共享全局变量: ${df.sharedVars.slice(0, 8).map(v => `${v.name} (${v.id})`).join('、')}`);
+                lines.push(tr('graph.globals', { vars: df.sharedVars.slice(0, 8).map(v => `${v.name} (${v.id})`).join(tr('itemSep')) }));
               }
               for (const p of (df.paths || []).slice(0, 5)) {
                 const label = `${shortName(p.writer)} --W:${p.varName}--> ${shortName(p.reader)} (${p.direction || 'rw'}${p.line ? `, L${p.line}` : ''})`;
-                lines.push(`- 读写链路: ${label}`);
+                lines.push(tr('graph.flow', { label }));
               }
             } catch { /* ignore enrichment dataflow errors */ }
             try {
@@ -5739,15 +5744,15 @@ export const server = http.createServer(async (req, res) => {
               const setB = new Set((trB.upstreamTasks || []).map(t => t.id));
               const commonTasks = (trA.upstreamTasks || []).filter(t => setB.has(t.id)).slice(0, 4);
               if (commonTasks.length) {
-                lines.push(`- 公共上游 TASK/ISR: ${commonTasks.map(t => t.name).join('、')}`);
+                lines.push(tr('graph.common', { tasks: commonTasks.map(t => t.name).join(tr('itemSep')) }));
               }
             } catch { /* ignore */ }
           }
           if (!pairs.length && nodeIds.length === 1 && model._index.byId.get(nodeIds[0])?.kind !== 'var') {
             try {
-              const tr = traceToTasks(model, nodeIds[0], { limit: 10 });
-              if (tr.upstreamTasks?.length) {
-                lines.push(`- 触发 TASK/ISR: ${tr.upstreamTasks.slice(0, 6).map(t => t.name).join('、')}`);
+              const trace = traceToTasks(model, nodeIds[0], { limit: 10 });
+              if (trace.upstreamTasks?.length) {
+                lines.push(tr('graph.tasks', { tasks: trace.upstreamTasks.slice(0, 6).map(t => t.name).join(tr('itemSep')) }));
               }
             } catch { /* ignore */ }
           }
@@ -5773,6 +5778,7 @@ export const server = http.createServer(async (req, res) => {
             : [])),
         ]);
         const context = {
+          language: p.language,
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
           varCount: MODEL.variables?.length || 0,
