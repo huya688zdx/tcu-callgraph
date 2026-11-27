@@ -236,3 +236,158 @@ void loop_step(void) {
   assert.ok(targets.includes('first_fn'), 'expand 模式应保留初始目标 first_fn');
   assert.ok(targets.includes('second_fn'), 'expand 模式应包含同函数内调用之后写入的 second_fn');
 });
+
+test('结构体成员数组在声明位置展开头文件宏，省略花括号时保留后续回调', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-width-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.h'), [
+    'typedef void (*Fn)(void);',
+    '#define WIDTH(n) (n)',
+    'typedef struct { Fn slots[WIDTH(2)]; Fn next; } Ops;',
+    '#undef WIDTH',
+    '#define WIDTH(n) (1)',
+  ].join('\n'));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    '#include "ops.h"',
+    'static void first(void) {} static void second(void) {} static void next(void) {}',
+    'static const Ops ops = {first, second, next};',
+    'void call(void) { ops.slots[0](); ops.slots[1](); ops.next(); }',
+  ].join('\n'));
+  for (const parserOptions of [{}, { buildProfileId: 'test' }]) {
+    const model = loadModel(dir, { parserId: 'builtin', parserOptions });
+    const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+    assert.deepEqual(edges.map(edge => edge.callee), ['first', 'second', 'next']);
+  }
+});
+
+test('覆盖整个结构体成员的初始化会清除被省略的旧回调', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-member-override-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { Fn a; Fn b; } Inner;',
+    'typedef struct { Inner inner; Inner other; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void baz(void) {}',
+    'static const Ops ops = { .inner = { .a = foo, .b = bar }, .other = { .b = bar }, .inner = { .a = baz } };',
+    'void call(void) { ops.inner.a(); ops.inner.b(); ops.other.b(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = model.fnptrTables.find(entry => entry.name === 'ops');
+  assert.deepEqual(table.map, { 'other.b': 'bar', 'inner.a': 'baz' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'bar']);
+});
+
+test('切换联合体成员会作废重叠的回调槽，保留同一成员的其他字段', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-union-override-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { struct { Fn x; Fn y; } pair; Fn single; } u; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void baz(void) {}',
+    'static const Ops switched = { .u.pair.x = foo, .u.pair.y = bar, .u.single = baz };',
+    'static const Ops unchanged = { .u.pair.x = foo, .u.pair.y = bar };',
+    'void call(void) { switched.u.pair.x(); switched.u.single(); unchanged.u.pair.x(); unchanged.u.pair.y(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = name => model.fnptrTables.find(entry => entry.name === name);
+  assert.deepEqual(table('switched').map, { 'u.single': 'baz' });
+  assert.deepEqual(table('unchanged').map, { 'u.pair.x': 'foo', 'u.pair.y': 'bar' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['baz', 'foo', 'bar']);
+});
+
+test('匿名聚合的初始化保持不确定，不将回调错分给后续字段', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-anonymous-member-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { Fn first; Fn alternate; }; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops implicit = { foo };',
+    'static const Ops explicit = { .alternate = foo, .next = bar };',
+    'void call(void) { if (implicit.next) implicit.next(); explicit.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const table = name => model.fnptrTables.find(entry => entry.name === name);
+  assert.equal(table('implicit').incomplete, true);
+  assert.equal(table('implicit').map.next, undefined);
+  assert.equal(table('explicit').map.next, 'bar');
+  assert.ok(!model.edges.some(edge => edge.from === 'ops.c::call' && edge.to === 'ops.c::foo'));
+  const explicitCall = model.indirectCalls.find(call => call.receiver === 'explicit');
+  assert.deepEqual(explicitCall.candidates.map(candidate => candidate.name), ['bar']);
+});
+
+test('运行时写入联合体其他成员会作废重叠槽，独立实例和字段不受影响', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-overlapping-write-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { union { Fn a; Fn b; } u; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void keep(void) {}',
+    'static Ops rows[2] = { { .u = { .a = foo }, .next = keep }, { .u = { .a = foo } } };',
+    'void call(void) { rows[0].u.b = bar; rows[0].u.a(); rows[1].u.a(); rows[0].next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'keep']);
+  assert.equal(model.indirectCalls.filter(call => call.caller === 'ops.c::call').length, 1);
+});
+
+test('宽字符串及其拼接占用整个字符数组，后续回调保持原位置', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-wide-string-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef int wchar_t;',
+    'typedef void (*Fn)(void);',
+    'typedef struct { wchar_t label[2]; Fn run; Fn next; } Ops;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops ops = { L"x" L"", foo, bar };',
+    'void call(void) { ops.run(); ops.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  assert.deepEqual(model.fnptrTables.find(table => table.name === 'ops').map, { run: 'foo', next: 'bar' });
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar']);
+});
+
+test('无名位域不消耗初始化位置，命名位域仍消耗一个位置', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-bit-field-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef unsigned U;',
+    'typedef void (*Fn)(void);',
+    '#define BITS 3',
+    'typedef struct { U : 0; Fn run; Fn next; } Ops;',
+    'typedef struct { U : 0; U flag : BITS; Fn run; Fn next; } FlagOps;',
+    'static void foo(void) {} static void bar(void) {}',
+    'static const Ops ops = { foo, bar };',
+    'static const FlagOps flags = { 1, foo, bar };',
+    'void call(void) { ops.run(); ops.next(); flags.run(); flags.next(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  for (const name of ['ops', 'flags']) {
+    assert.deepEqual(model.fnptrTables.find(table => table.name === name).map, { run: 'foo', next: 'bar' });
+  }
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['foo', 'bar', 'foo', 'bar']);
+});
+
+test('回调数组成员退化为指针传出时，只作废该数组的初始目标', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'callgraph-nested-array-escape-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'ops.c'), [
+    'typedef void (*Fn)(void);',
+    'typedef struct { Fn handlers[1]; Fn intact; } Ops;',
+    'static void foo(void) {} static void bar(void) {} static void keep(void) {}',
+    'static Ops ops = { { foo }, keep };',
+    'static void mutate(Fn *p) { p[0] = bar; }',
+    'void call(void) { mutate(ops.handlers); ops.handlers[0](); ops.intact(); }',
+  ].join('\n'));
+  const model = loadModel(dir);
+  const edges = model._index.outAdj.get('ops.c::call').filter(edge => edge.kind === 'fnptr');
+  assert.deepEqual(edges.map(edge => edge.callee), ['keep']);
+  const escapedCall = model.indirectCalls.find(call => call.caller === 'ops.c::call' && call.member === 'handlers');
+  assert.ok(escapedCall);
+  assert.deepEqual(escapedCall.candidates, []);
+});

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from './build-config.js';
 
 export function selectedBuildProfile(root, options) {
@@ -17,9 +18,14 @@ export function resolveBuildProfileOptions(root, parserId, options = {}, files =
   } else if (parserId === 'builtin') {
     resolved.activeFiles = selectProfileSourceFiles(profile, files);
     resolved.defines = profile.defines || [];
+    resolved.macroArgs = profile.macroArgs;
     resolved.compilationUnits = profile.compilationUnits || {};
     resolved.includeDirs = profile.includeDirs || [];
+    resolved.includeOptions = profile.includeOptions;
+    resolved.languageStandard = profile.languageStandard;
+    resolved.workingDirectory = profile.workingDirectory || path.resolve(root, profile.dir || '.');
     resolved.forcedIncludes = profile.forcedIncludes || [];
+    resolved.macroIncludes = profile.macroIncludes || [];
   }
   return resolved;
 }

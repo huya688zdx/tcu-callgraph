@@ -15,6 +15,7 @@ import { scanBuildConfig } from './build-inspect.js';
 const MAX_INCLUDE_DEPTH = 12;
 const MAX_RSP_DEPTH = 6;
 const MAX_CONFIG_FILE_BYTES = 8 * 1024 * 1024;
+export const COMPILER_DEFINE = /^([A-Za-z_]\w*)(?:\([\w.,\s]*\))?(?:=.*)?$/;
 
 const toPosix = (p) => String(p || '').replace(/\\/g, '/');
 const fileKey = (rel) => (process.platform === 'win32' ? rel.toLowerCase() : rel);
@@ -115,28 +116,107 @@ function tokenizeArgs(line) {
   const out = [];
   let cur = '';
   let quote = '';
+  let started = false;
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
-    if (ch === '\\' && quote !== "'" && line[i + 1] === '"') {
-      cur += '"';
+    const next = line[i + 1] || '';
+    if (ch === '\\' && ((quote !== "'" && next === '"') || (!quote &&
+        (next === '#' || (process.platform !== 'win32' && /\s/.test(next)))))) {
+      cur += line[i + 1];
+      started = true;
       i++;
       continue;
     }
     if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
       quote = quote ? '' : ch;
+      started = true;
       continue;
     }
     if (!quote && /\s/.test(ch)) {
-      if (cur) { out.push(cur); cur = ''; }
+      if (started) { out.push(cur); cur = ''; started = false; }
       continue;
     }
     cur += ch;
+    started = true;
   }
-  if (cur) out.push(cur);
+  if (started) out.push(cur);
   return out;
 }
 
-/** 从一段编译参数（含 @rsp / -f 响应文件）提取 -I、-D、-U、-include 与 .c 源路径。 */
+function splitRecipeCommands(line) {
+  const commands = [];
+  let start = 0;
+  let quote = '';
+  let inWord = false;
+  let ambiguous = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '\\' && quote !== "'" && /[\\'"&|;#\s]/.test(line[i + 1] || '')) {
+      inWord = true;
+      i++;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && (!quote || quote === ch)) {
+      quote = quote ? '' : ch;
+      inWord = true;
+      continue;
+    }
+    if (quote) continue;
+    if (ch === '#' && !inWord) {
+      commands.push(line.slice(start, i).trim());
+      return { commands, ambiguous };
+    }
+    if (!';&|'.includes(ch)) {
+      inWord = !/\s/.test(ch);
+      continue;
+    }
+    commands.push(line.slice(start, i).trim());
+    const andThen = ch === '&' && line[i + 1] === '&';
+    if (ch !== ';' && !andThen) ambiguous = true;
+    if (ch !== ';' && line[i + 1] === ch) i++;
+    start = i + 1;
+    inWord = false;
+  }
+  commands.push(line.slice(start).trim());
+  return { commands, ambiguous };
+}
+
+function compilerConfig() {
+  return { includeDirs: new Set(), includeOptions: new Map(), defines: new Set(),
+    forcedIncludes: new Set(), macroIncludes: [], sourceFiles: new Set() };
+}
+
+function addInclude(out, flag, dir) {
+  out.includeDirs.add(dir);
+  out.includeOptions.set(fileKey(flag + '\0' + dir), [flag, dir]);
+}
+
+function addDefine(out, value) {
+  const name = COMPILER_DEFINE.exec(value)?.[1];
+  if (!name) return;
+  (out.macroArgs ||= []).push('-D', value);
+  for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
+  out.defines.add(value);
+}
+
+function extractedOptions(config) {
+  return {
+    includeDirs: [...config.includeDirs],
+    includeOptions: [...config.includeOptions.values()],
+    defines: [...config.defines],
+    macroArgs: config.macroArgs || [],
+    forcedIncludes: [...config.forcedIncludes],
+    macroIncludes: [...config.macroIncludes],
+    ...(config.languageStandard ? { languageStandard: config.languageStandard } : {}),
+    ...(config.workingDirectory ? { workingDirectory: config.workingDirectory } : {}),
+  };
+}
+
+export function profileIncludeOptions(config) {
+  return config.includeOptions ?? (config.includeDirs || []).map(dir => ['-I', dir]);
+}
+
+/** 从编译参数及响应文件读取预处理选项、语言标准和源路径。 */
 function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Set(), depth = 0) {
   if (depth > MAX_RSP_DEPTH) return;
   for (let i = 0; i < rawTokens.length; i++) {
@@ -162,17 +242,24 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       continue;
     }
 
-    // -I / -I= / -isystem / -i (部分 GHS / QAC 风格)
-    if (/^(?:-I|-isystem|-iquote|-i)(?:=|$)/.test(tok) || (/^-[Ii]/.test(tok) && tok.length > 2 && !/^-(?:include|imacros|isystem|iquote|idirafter|inline|ir|iso)/.test(tok))) {
-      let val = '';
-      if (/^(?:-I|-isystem|-iquote|-i)=?$/.test(tok)) {
-        val = stripQuotes(rawTokens[++i] || '');
-      } else {
-        val = stripQuotes(tok.replace(/^(?:-I|-isystem|-iquote|-i)=?/, ''));
-      }
+    // -i 是部分 GHS / QAC 工具链中表示普通包含目录的选项。
+    const includeFlag = /^(?:-isystem|-iquote|-idirafter|-I|-i(?!nclude|macros|nline|r|so|sysroot))/.exec(tok)?.[0];
+    if (includeFlag) {
+      const joined = tok.slice(includeFlag.length).replace(/^=/, '');
+      const val = stripQuotes(joined || rawTokens[i + 1]);
+      if (!joined && val && !val.startsWith('-')) i++;
       if (val && !val.startsWith('-') && !/\$\(/.test(val)) {
         const abs = path.isAbsolute(val) ? path.normalize(val) : path.resolve(baseDir, val);
-        out.includeDirs.add(abs);
+        addInclude(out, includeFlag === '-i' ? '-I' : includeFlag, abs);
+      }
+      continue;
+    }
+
+    if (tok === '-std' || tok.startsWith('-std=')) {
+      const standard = tok === '-std' ? stripQuotes(rawTokens[i + 1]) : tok.slice(5);
+      if (/^[A-Za-z0-9][\w.+:-]*$/.test(standard)) {
+        out.languageStandard = standard;
+        if (tok === '-std') i++;
       }
       continue;
     }
@@ -182,11 +269,7 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       let val = '';
       if (/^-[Dd]=?$/.test(tok)) val = stripQuotes(rawTokens[++i] || '');
       else val = stripQuotes(tok.replace(/^-[Dd]=?/, ''));
-      if (val && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(val)) {
-        (out.macroArgs ||= []).push('-D', val);
-        for (const old of out.defines) if (old.split('=')[0] === val.split('=')[0]) out.defines.delete(old);
-        out.defines.add(val);
-      }
+      addDefine(out, val);
       continue;
     }
 
@@ -194,19 +277,21 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
       const name = tok === '-U' ? stripQuotes(rawTokens[++i] || '') : tok.slice(2);
       if (/^[A-Za-z_]\w*$/.test(name)) {
         (out.macroArgs ||= []).push('-U', name);
-        for (const old of out.defines) if (old.split('=')[0] === name) out.defines.delete(old);
+        for (const old of out.defines) if (old.split(/[=(]/, 1)[0] === name) out.defines.delete(old);
       }
       continue;
     }
 
-    // -include / -preinclude / -fi (QAC forced include)
-    if (/^(?:-include|-preinclude|--preinclude|-fi)=?$/.test(tok) || /^(?:-include|-preinclude|--preinclude)=/.test(tok)) {
+    // -imacros 只导入宏；-preinclude 和 -fi 是其他工具链的强制包含选项。
+    if (/^(?:-include|-imacros|-preinclude|--preinclude|-fi)(?:=|$)/.test(tok)) {
       let val = '';
       if (tok.includes('=')) val = stripQuotes(tok.slice(tok.indexOf('=') + 1));
       else val = stripQuotes(rawTokens[++i] || '');
       if (val && !val.startsWith('-')) {
         const abs = path.isAbsolute(val) ? path.normalize(val) : path.resolve(baseDir, val);
-        out.forcedIncludes.add(fs.existsSync(abs) ? abs : val);
+        const include = fs.existsSync(abs) ? abs : val;
+        if (tok.startsWith('-imacros')) out.macroIncludes.push(include);
+        else out.forcedIncludes.add(include);
       }
       continue;
     }
@@ -226,18 +311,24 @@ function extractCompilerFlags(rawTokens, baseDir, rootDir, out, seenRsp = new Se
   }
 }
 
-function expandMakeVars(str, vars, depth = 0) {
-  if (!str || depth > 8 || !str.includes('$')) return str;
-  return str.replace(/\$\(([\w.-]+)\)|\$\{([\w.-]+)\}/g, (_, a, b) => {
-    const variable = vars.get(a || b);
-    if (!variable) return '';
-    return variable.simple ? variable.value : expandMakeVars(variable.value, vars, depth + 1);
-  });
+function requireResolvedMake(text) {
+  if (/\$[({?%|*@<^+]/.test(text.replaceAll('$$', ''))) throw new Error('暂不支持未解析的 Make 表达式');
+  return text;
 }
 
 /** 递归解析 .mak / .mac / Makefile（支持 !include、include、-include、$(CDIR) 与 @rsp）。 */
 export function parseMakefileTree(entryAbs, rootDir) {
   const entryDir = path.dirname(entryAbs);
+  function expandMakeVars(str, vars, depth = 0) {
+    if (!str || depth > 8 || !str.includes('$')) return str;
+    const expanded = str.replace(/\$\(([\w.-]+)\)|\$\{([\w.-]+)\}/g, (_, a, b) => {
+      const variable = vars.get(a || b);
+      if (!variable) return '';
+      return variable.simple ? variable.value : expandMakeVars(variable.value, vars, depth + 1);
+    });
+    return expanded.replace(/\$\(wildcard[ \t]+([^()]*)\)|\$\{wildcard[ \t]+([^{}]*)\}/g, (_, a, b) =>
+      tokenizeArgs(a ?? b).flatMap(pattern => fs.globSync(pattern, { cwd: entryDir }).sort()).join(' '));
+  }
   const defaults = {
     CC: 'cc',
     CXX: 'g++',
@@ -249,28 +340,28 @@ export function parseMakefileTree(entryAbs, rootDir) {
     PROJECT_DIR: entryDir,
   };
   const vars = new Map(Object.entries(defaults).map(([name, value]) => [name, { value, simple: true }]));
+  vars.set('COMPILE.c', { value: '$(CC) $(CFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c', simple: false });
+  vars.set('COMPILE.cc', { value: '$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(TARGET_ARCH) -c', simple: false });
+  for (const suffix of ['.C', '.cpp']) vars.set('COMPILE' + suffix, { value: '$(COMPILE.cc)', simple: false });
+  vars.set('OUTPUT_OPTION', { value: '-o $@', simple: true });
   const recipes = [];
   const rules = new Map();
+  const suffixes = new Set(['.o', '.c', '.cc', '.C', '.cpp']);
   const targetVariables = new Map();
   let defaultGoal;
-  const collected = {
-    includeDirs: new Set(),
-    defines: new Set(),
-    forcedIncludes: new Set(),
-    sourceFiles: new Set(),
-    includedFiles: [],
-  };
-  const visited = new Set();
+  const collected = compilerConfig();
+  const includedFiles = new Set();
+  const includeStack = new Set();
 
   const processFile = (absPath, depth) => {
     if (depth > MAX_INCLUDE_DEPTH) return;
     const key = fileKey(absPath);
-    if (visited.has(key)) return;
-    visited.add(key);
+    if (includeStack.has(key)) return;
     const text = safeReadText(absPath);
     if (!text) return;
+    includeStack.add(key);
     const dir = path.dirname(absPath);
-    collected.includedFiles.push(toPosix(path.relative(rootDir, absPath)));
+    includedFiles.add(toPosix(path.relative(rootDir, absPath)));
 
     // 合并反斜杠续行
     const rawLines = text.split(/\r\n|\r|\n/);
@@ -304,7 +395,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       if (pair.length !== 2) throw new Error(`不支持的 Make 条件: ${kind} ${operand}`);
       return kind === 'ifeq' ? pair[0] === pair[1] : pair[0] !== pair[1];
     };
-    let prerequisites = '';
+    let ruleDeps;
     let targets = [];
     for (const rawLine of lines) {
       const line = rawLine.replace(/^\s*#.*$/, '').trim();
@@ -332,7 +423,7 @@ export function parseMakefileTree(entryAbs, rootDir) {
       }
       if (!active()) continue;
       if (rawLine.startsWith('\t')) {
-        recipes.push({ command: line, prerequisites, targets });
+        recipes.push({ command: line, ruleDeps, targets });
         continue;
       }
 
@@ -382,25 +473,77 @@ export function parseMakefileTree(entryAbs, rootDir) {
         // 尚未实例化模式规则的目标，拒绝该候选，避免发布含 %.c 的空配置。
         if (line.slice(0, line.indexOf(':')).includes('%')) throw new Error('暂不支持 Make 模式规则');
         // 普通规则的依赖在读入时展开；命令（包括分号后的内联命令）等所有定义收齐。
-        prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
-        targets = tokenizeArgs(expandMakeVars(line.slice(0, line.indexOf(':')), vars));
+        const colon = line.indexOf(':');
+        const prerequisites = expandMakeVars(rule[1].replace(/\s+#.*$/, '').trim(), vars);
+        const [normal, orderOnly = []] = prerequisites.split('|', 2).map(tokenizeArgs);
+        ruleDeps = { normal, orderOnly, separate: line[colon + 1] === ':' };
+        targets = tokenizeArgs(expandMakeVars(line.slice(0, colon), vars));
         for (const target of targets) {
+          if (target === '.SUFFIXES') {
+            if (!normal.length) suffixes.clear();
+            else for (const suffix of normal) suffixes.add(suffix);
+          }
           if (!target.startsWith('.')) defaultGoal ??= target;
           if (!rules.has(target)) rules.set(target, []);
-          rules.get(target).push(...tokenizeArgs(prerequisites.replace('|', ' ')));
+          rules.get(target).push(ruleDeps);
         }
-        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), prerequisites, targets });
+        if (rule[2]?.trim()) recipes.push({ command: rule[2].trim(), ruleDeps, targets });
       } else if (/^ +\S/.test(rawLine)) {
         // 一些 NMAKE 工程以空格缩进命令。
-        recipes.push({ command: line, prerequisites, targets });
+        recipes.push({ command: line, ruleDeps, targets });
       }
     }
+    includeStack.delete(key);
   };
 
   processFile(entryAbs, 0);
   const compilers = new Set();
   const compilationUnits = {};
   const reachable = new Map();
+  const lastRecipeRule = new Map();
+  for (const { targets, ruleDeps } of recipes) {
+    if (!ruleDeps?.separate) for (const target of targets) lastRecipeRule.set(target, ruleDeps);
+  }
+  const activeRecipes = recipes.flatMap(recipe => {
+    if (recipe.ruleDeps?.separate || !recipe.targets.length) return [recipe];
+    const targets = recipe.targets.filter(target => lastRecipeRule.get(target) === recipe.ruleDeps);
+    return targets.length ? [{ ...recipe, targets }] : [];
+  });
+  const explicitRecipes = new Set(activeRecipes.flatMap(recipe => recipe.targets));
+  const suffixRecipes = new Map();
+  for (const recipe of activeRecipes) {
+    const name = recipe.targets[0];
+    if (recipe.targets.length !== 1 || !recipe.ruleDeps || recipe.ruleDeps.separate ||
+        recipe.ruleDeps.normal.length || recipe.ruleDeps.orderOnly.length) continue;
+    const [, from, to] = /^(\.[^.]+)(\.[^.]+)$/.exec(name) || [];
+    if (!suffixes.has(from) || !suffixes.has(to) || !SRC_EXT.test(from)) continue;
+    if (!suffixRecipes.has(name)) suffixRecipes.set(name, []);
+    suffixRecipes.get(name).push(recipe);
+  }
+  const instantiated = [];
+  const builtInRules = !tokenizeArgs(expandMakeVars('$(MAKEFLAGS)', vars)).some(flag =>
+    /^-?[a-z]*[rR][a-z]*$/i.test(flag) || ['--no-builtin-rules', '--no-builtin-variables'].includes(flag));
+  const findSuffixRule = target => {
+    const extension = path.extname(target);
+    if (!suffixes.has(extension) || explicitRecipes.has(target)) return;
+    const stem = target.slice(0, -extension.length);
+    let fallback;
+    for (const suffix of suffixes) {
+      if (!SRC_EXT.test(suffix)) continue;
+      const selected = suffixRecipes.get(suffix + extension);
+      if (!selected && (fallback || extension !== '.o' || !builtInRules || !vars.has('COMPILE' + suffix))) continue;
+      const source = stem + suffix;
+      if (rules.has(source) || fs.statSync(path.resolve(entryDir, source), { throwIfNoEntry: false })?.isFile()) {
+        // 用户定义的后缀规则优先于 Make 自带的 C/C++ 对象文件规则。
+        if (selected) return { source, stem, selected };
+        fallback = {
+          source, stem,
+          selected: [{ command: '$(COMPILE' + suffix + ') $(OUTPUT_OPTION) $<', builtIn: true }],
+        };
+      }
+    }
+    return fallback;
+  };
   const visitTarget = (target, inherited = vars) => {
     if (reachable.has(target)) return;
     const environment = new Map(inherited);
@@ -413,47 +556,73 @@ export function parseMakefileTree(entryAbs, rootDir) {
       environment.set(name, { value, simple });
     }
     reachable.set(target, environment);
-    for (const dependency of rules.get(target) || []) visitTarget(dependency, environment);
+    const suffixRule = findSuffixRule(target);
+    if (suffixRule) {
+      const { source, stem, selected } = suffixRule;
+      const ruleDeps = { normal: [source], orderOnly: [] };
+      for (const { command, builtIn } of selected) instantiated.push({ command, builtIn, ruleDeps, stem, targets: [target] });
+      visitTarget(source, environment);
+    }
+    for (const { normal, orderOnly } of rules.get(target) || []) {
+      for (const dependency of [...normal, ...orderOnly]) visitTarget(dependency, environment);
+    }
   };
   const goal = expandMakeVars('$(.DEFAULT_GOAL)', vars).trim() || defaultGoal;
   if (goal) visitTarget(goal);
-  for (const { command, prerequisites, targets } of recipes) {
-    if (goal && !targets.some(target => reachable.has(target))) continue;
-    const deps = prerequisites.split('|')[0];
-    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(targets.find(target => reachable.has(target))) || vars)
-      .replace(/\$[<^+]/g, ref => ref === '$<' ? `"${tokenizeArgs(deps)[0] || ''}"` : deps);
-    const args = tokenizeArgs(expanded);
-    const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
-    const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');
-    // 兼容工程自定义的 CC 名称，同时避免将 echo、清理等命令的参数计入配置。
-    const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER)\)|\$\{(?:CC|CXX|C_COMPILER)\})(?:\s|$)/i;
-    if (!compilerVar.test(command) &&
-        !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
-    if (args.length) compilers.add(compiler);
-    const unit = { includeDirs: new Set(), defines: new Set(), forcedIncludes: new Set(), sourceFiles: new Set() };
-    extractCompilerFlags(args, entryDir, rootDir, unit);
-    for (const rel of unit.sourceFiles) compilationUnits[rel] = {
-      includeDirs: [...unit.includeDirs], defines: [...unit.defines],
-      forcedIncludes: [...unit.forcedIncludes], macroArgs: unit.macroArgs || [],
-    };
-    extractCompilerFlags(args, entryDir, rootDir, collected);
+  const collectRecipe = ({ command, ruleDeps, stem, builtIn }, target) => {
+    // GNU Make 将有命令的规则的依赖放在同一目标的其他依赖之前。
+    const deps = [...(ruleDeps?.normal || []), ...(ruleDeps?.separate
+      ? [] : (rules.get(target) || []).filter(rule => rule !== ruleDeps).flatMap(rule => rule.normal))];
+    const expanded = expandMakeVars(command.replace(/^[@+-]+/, ''), reachable.get(target) || vars)
+      .replace(/\$\$|\$[@*<^+]/g, ref => {
+        if (ref === '$$') return ref;
+        if (ref === '$*' && stem === undefined) return ref;
+        const paths = ref === '$@' ? [target || ''] : ref === '$*' ? [stem] : ref === '$<' ? deps.slice(0, 1)
+          : ref === '$^' ? [...new Set(deps)] : deps;
+        return paths.map(dep => /\s/.test(dep) ? '"' + dep.replaceAll('"', '\\"') + '"' : dep).join(' ');
+      });
+    const { commands, ambiguous } = splitRecipeCommands(expanded);
+    const original = commands.length === 1 ? [command] : splitRecipeCommands(command).commands;
+    const compilerVar = /^[@+-]*(?:\$\((?:CC|CXX|C_COMPILER|COMPILE\.(?:c|cc|cpp))\)|\$\{(?:CC|CXX|C_COMPILER|COMPILE\.(?:c|cc|cpp))\})(?:\s|$)/i;
+    let changedDirectory = false;
+    for (const [index, invocation] of commands.entries()) {
+      const args = tokenizeArgs(invocation);
+      const wrapper = /^(?:ccache|sccache|distcc)(?:\.exe)?$/i.test(path.posix.basename(toPosix(args[0])));
+      const compiler = path.posix.basename(toPosix(args[wrapper ? 1 : 0])).replace(/\.exe$/i, '');
+      if (/^(?:cd|pushd|popd)$/i.test(compiler)) changedDirectory = true;
+      // 兼容工程自定义的 CC 名称，同时避免将 echo、清理等命令的参数计入配置。
+      if (!(original.length === commands.length && compilerVar.test(original[index])) &&
+          !/(?:^|-)(?:gcc|g\+\+|clang(?:\+\+)?|cc|c\+\+|ccrh(?:850)?|ccv850|cxv850|ccarm|ctc|cctc|iccarm|iccrh850|dcc)(?:-\d+(?:\.\d+)*)?$/i.test(compiler)) continue;
+      if (ambiguous || changedDirectory) throw new Error('暂不支持含管道、替代分支或切换目录的 Make 编译命令');
+      requireResolvedMake(invocation);
+      if (args.length) compilers.add(compiler);
+      const unit = { ...compilerConfig(), workingDirectory: entryDir };
+      extractCompilerFlags(args, entryDir, rootDir, unit);
+      // 同一源文件已有明确配方时，隐式规则只用于补齐其他编译单元。
+      const sources = [...unit.sourceFiles].filter(rel => !builtIn || !Object.hasOwn(compilationUnits, rel));
+      if (builtIn && !sources.length) continue;
+      for (const rel of sources) compilationUnits[rel] = extractedOptions(unit);
+      extractCompilerFlags(args, entryDir, rootDir, collected);
+    }
+  };
+  for (const recipe of [...activeRecipes, ...instantiated]) {
+    const targets = goal ? recipe.targets.filter(target => reachable.has(target)) : recipe.targets;
+    for (const target of targets) collectRecipe(recipe, target);
+    if (!goal && !recipe.targets.length) collectRecipe(recipe);
   }
-  if (!recipes.length) {
+  if (!recipes.length && !instantiated.length) {
     // 仅含变量的 .mak/.mac 配置片段没有命令，按常用编译变量的最终值恢复。
     compilers.add(expandMakeVars('$(CC) $(CXX)', vars));
     for (const key of ['CPPFLAGS', 'CFLAGS', 'CXXFLAGS', 'INCLUDES', 'DEFINES', 'SRCS', 'C_SRCS', 'SOURCES']) {
-      extractCompilerFlags(tokenizeArgs(expandMakeVars(`$(${key})`, vars)), entryDir, rootDir, collected);
+      extractCompilerFlags(tokenizeArgs(requireResolvedMake(expandMakeVars(`$(${key})`, vars))), entryDir, rootDir, collected);
     }
   }
   const meta = detectArchAndCompiler([...compilers].join('\n'));
   return {
     ...meta,
-    includeDirs: [...collected.includeDirs],
-    defines: [...collected.defines],
-    macroArgs: collected.macroArgs || [],
-    forcedIncludes: [...collected.forcedIncludes],
+    ...extractedOptions(collected),
     sourceFiles: [...collected.sourceFiles],
-    includedFiles: collected.includedFiles,
+    includedFiles: [...includedFiles],
     compilationUnits,
   };
 }
@@ -505,47 +674,69 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
     if (!cfgName || seenNames.has(cfgName)) continue;
     seenNames.add(cfgName);
 
-    const includeDirs = new Set();
-    const defines = new Set();
-    const forcedIncludes = new Set();
+    const config = compilerConfig();
     const exclusions = [];
     const sourceRoots = [];
     const sourceEntries = [];
 
-    for (const m of block.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?)(?<!\/)>([\s\S]*?)<\/option>/gi)) {
-      const attrs = m[1];
-      const body = m[2];
-      const vt = extractXmlAttr(attrs, 'valueType');
-      const sc = extractXmlAttr(attrs, 'superClass');
-      const values = [...body.matchAll(/<listOptionValue\b[^>]*\bvalue="([^"]*)"/gi)].map((x) => x[1]);
-      if (!values.length) continue;
-      if (/includePath/i.test(vt) || /include\.?paths?/i.test(sc)) {
-        for (const raw of values) {
-          const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) includeDirs.add(abs);
-        }
-      } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
-        for (const raw of values) {
-          const clean = stripQuotes(raw).replace(/^-D/, '');
-          if (clean && /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(clean)) defines.add(clean);
-        }
-      } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
-        for (const raw of values) {
-          const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
-          if (abs) forcedIncludes.add(abs);
+    const readOptions = (scope, config) => {
+      for (const m of scope.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?)(?<!\/)>([\s\S]*?)<\/option>/gi)) {
+        const attrs = m[1];
+        const body = m[2];
+        const vt = extractXmlAttr(attrs, 'valueType');
+        const sc = extractXmlAttr(attrs, 'superClass');
+        const values = [...body.matchAll(/<listOptionValue\b[^>]*\bvalue="([^"]*)"/gi)].map((x) => x[1]);
+        if (!values.length) continue;
+        if (/includePath/i.test(vt) || /include\.?paths?/i.test(sc)) {
+          for (const raw of values) {
+            const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
+            if (abs) addInclude(config, '-I', abs);
+          }
+        } else if (/definedSymbols/i.test(vt) || /symbols?|macros?|def/i.test(sc)) {
+          for (const raw of values) {
+            const clean = stripQuotes(raw).replace(/^-D/, '');
+            addDefine(config, clean);
+          }
+        } else if (/includeFiles/i.test(vt) || /include\.?files?/i.test(sc)) {
+          for (const raw of values) {
+            const abs = resolveEclipsePath(raw, { rootDir, projectDir, configName: cfgName, projectName });
+            if (abs) config.forcedIncludes.add(abs);
+          }
         }
       }
-    }
 
-    // 兜底：部分厂商 CDT 插件把额外参数写在 valueType="string" 的 misc/flags 选项里
-    for (const m of block.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?\bvalue="([^"]+)"(?:[^>"']|"[^"]*"|'[^']*')*?)\/?>/gi)) {
-      const attrs = m[1];
-      const val = stripQuotes(m[2]);
-      const sc = extractXmlAttr(attrs, 'superClass');
-      if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[ID]|@|-f\s)/.test(val)) {
-        const tmp = { includeDirs, defines, forcedIncludes, sourceFiles: new Set() };
-        extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, tmp);
+      // 兜底：部分厂商 CDT 插件把额外参数写在 valueType="string" 的 misc/flags 选项里
+      for (const m of scope.matchAll(/<option\b((?:[^>"']|"[^"]*"|'[^']*')*?\bvalue="([^"]+)"(?:[^>"']|"[^"]*"|'[^']*')*?)\/?>/gi)) {
+        const attrs = m[1];
+        const val = stripQuotes(m[2]);
+        const sc = extractXmlAttr(attrs, 'superClass');
+        if (/(?:flag|misc|other|option|cmd)/i.test(sc) && /(?:^|\s)(?:-[IDU]|-i(?:system|quote|dirafter|macros)|@|-f\s)/.test(val)) {
+          extractCompilerFlags(tokenizeArgs(val), projectDir, rootDir, config);
+        }
       }
+    };
+
+    const resources = new Map();
+    const projectScope = block.replace(/<fileInfo\b([^>]*?)(?<!\/)>([\s\S]*?)<\/fileInfo>/gi, (_, attrs, body) => {
+      const resource = toPosix(stripQuotes(extractXmlAttr(attrs, 'resourcePath')));
+      if (!SRC_EXT.test(resource)) return '';
+      const abs = path.resolve(projectDir, resource);
+      const projectRel = path.relative(projectDir, abs);
+      if (projectRel === '..' || projectRel.startsWith('..' + path.sep) || path.isAbsolute(projectRel)) return '';
+      resources.set(toPosix(path.relative(rootDir, abs)), body);
+      return '';
+    });
+    readOptions(projectScope, config);
+    const compilationUnits = {};
+    for (const [rel, body] of resources) {
+      const unit = {
+        ...compilerConfig(), includeDirs: new Set(config.includeDirs), includeOptions: new Map(config.includeOptions),
+        defines: new Set(config.defines), macroArgs: [...(config.macroArgs || [])],
+        forcedIncludes: new Set(config.forcedIncludes), macroIncludes: [...config.macroIncludes],
+        languageStandard: config.languageStandard,
+      };
+      readOptions(body, unit);
+      compilationUnits[rel] = extractedOptions(unit);
     }
 
     for (const m of block.matchAll(/<entry\b[^>]*\bkind="sourcePath"[^>]*>/gi)) {
@@ -573,9 +764,8 @@ function parseCprojectProfiles(rootDir, cprojectRel, cprojectAbs) {
       dir: projectRelDir,
       arch,
       compiler,
-      includeDirs: [...includeDirs],
-      defines: [...defines],
-      forcedIncludes: [...forcedIncludes],
+      ...extractedOptions(config),
+      compilationUnits,
       sourceRoots,
       sourceEntries,
       exclusions,
@@ -590,13 +780,13 @@ function parseQacProfile(rootDir, rel, abs) {
   const text = safeReadText(abs);
   if (!text) return null;
   const dir = path.dirname(abs);
-  const collected = { includeDirs: new Set(), defines: new Set(), forcedIncludes: new Set(), sourceFiles: new Set() };
+  const collected = compilerConfig();
   for (const rawLine of text.split(/\r\n|\r|\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#') || line.startsWith(';')) continue;
     extractCompilerFlags(tokenizeArgs(line), dir, rootDir, collected);
   }
-  if (!collected.includeDirs.size && !collected.defines.size && !collected.sourceFiles.size) return null;
+  if (!collected.includeDirs.size && !collected.defines.size && !collected.sourceFiles.size && !collected.languageStandard) return null;
   const meta = detectArchAndCompiler(text);
   return {
     id: `qac::${rel}`,
@@ -605,10 +795,7 @@ function parseQacProfile(rootDir, rel, abs) {
     configFile: rel,
     dir: toPosix(path.relative(rootDir, dir)) || '.',
     ...meta,
-    includeDirs: [...collected.includeDirs],
-    defines: [...collected.defines],
-    macroArgs: collected.macroArgs || [],
-    forcedIncludes: [...collected.forcedIncludes],
+    ...extractedOptions(collected),
     sourceRoots: [],
     exclusions: [],
     sourceFiles: [...collected.sourceFiles],
@@ -650,10 +837,12 @@ export function discoverBuildProfiles(rootDir) {
       arch: item.parsed.arch,
       compiler: item.parsed.compiler,
       includeDirs: item.parsed.includeDirs,
+      includeOptions: item.parsed.includeOptions,
       defines: item.parsed.defines,
       macroArgs: item.parsed.macroArgs,
       compilationUnits: item.parsed.compilationUnits,
       forcedIncludes: item.parsed.forcedIncludes,
+      macroIncludes: item.parsed.macroIncludes,
       sourceRoots: [],
       exclusions: [],
       sourceFiles: item.parsed.sourceFiles,
@@ -844,26 +1033,33 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
       .filter((f) => f.isHeader && (!scopeDir || fileKey(f.rel).startsWith(fileKey(scopeDir) + '/')))
       .map((f) => path.dirname(f.abs)),
   )];
-  const allIncludeDirs = [];
-  const seenInc = new Set();
-  const fallbackDirs = (profile.includeDirs || []).length ? scopedHeaderDirs : [absRoot, ...scopedHeaderDirs];
-  for (const dir of [...(profile.includeDirs || []), ...fallbackDirs]) {
-    if (!dir) continue;
-    const norm = path.normalize(dir);
-    const k = fileKey(norm);
-    if (seenInc.has(k)) continue;
-    if (fs.statSync(norm, { throwIfNoEntry: false })?.isDirectory()) {
-      seenInc.add(k);
-      allIncludeDirs.push(norm);
-    }
+  const includeOptions = profileIncludeOptions(profile);
+  const seenInc = new Set(includeOptions.map(([, dir]) => fileKey(path.normalize(dir))));
+  const fallbackDirs = includeOptions.length ? scopedHeaderDirs : [absRoot, ...scopedHeaderDirs];
+  const fallbackOptions = [];
+  const fallbackFlag = includeOptions.some(([flag]) => flag !== '-I') ? '-idirafter' : '-I';
+  for (const dir of fallbackDirs) {
+    const key = fileKey(dir);
+    if (seenInc.has(key) || !fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) continue;
+    seenInc.add(key);
+    fallbackOptions.push([fallbackFlag, dir]);
   }
 
   const baseArgs = ['clang', '-fsyntax-only', '-fms-extensions', '-fgnu-keywords', '-Wno-unknown-pragmas', '-Wno-attributes'];
   const argsFor = config => {
     const args = [...baseArgs];
-    for (const dir of config === profile ? allIncludeDirs : config.includeDirs || []) args.push('-I', dir);
+    const configured = config === profile ? includeOptions : profileIncludeOptions(config);
+    for (const entry of configured) args.push(...entry);
+    if (config === profile) {
+      for (const entry of fallbackOptions) args.push(...entry);
+    } else if (profile.source === 'cproject') {
+      const configuredDirs = new Set(configured.map(([, dir]) => fileKey(path.normalize(dir))));
+      for (const entry of fallbackOptions) if (!configuredDirs.has(fileKey(entry[1]))) args.push(...entry);
+    }
+    if (config.languageStandard) args.push('-std=' + config.languageStandard);
     if (config.macroArgs?.length) args.push(...config.macroArgs);
     else for (const def of config.defines || []) args.push('-D', def);
+    for (const inc of config.macroIncludes || []) args.push('-imacros', inc);
     if (shimPath) args.push('-include', shimPath);
     for (const inc of config.forcedIncludes || []) args.push('-include', inc);
     return args;
@@ -872,10 +1068,11 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
   const cwd = profile.dir && profile.dir !== '.' ? path.resolve(absRoot, profile.dir) : absRoot;
   const entries = activeRels.map((rel) => {
     const absFile = path.resolve(absRoot, rel);
+    const config = profile.compilationUnits?.[rel] || profile;
     return {
-      directory: cwd,
+      directory: config.workingDirectory || cwd,
       file: absFile,
-      arguments: [...argsFor(profile.compilationUnits?.[rel] || profile), absFile],
+      arguments: [...argsFor(config), absFile],
     };
   });
 
@@ -886,7 +1083,7 @@ export function materializeCompileCommands(rootDir, profile, { files = [], cache
     compileCommandsPath,
     shimPath,
     unitCount: entries.length,
-    includeCount: allIncludeDirs.length,
+    includeCount: seenInc.size,
     defineCount: (profile.defines || []).length,
     activeFiles: activeRels,
   };

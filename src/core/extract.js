@@ -473,17 +473,23 @@ function declarationType(tokens) {
 }
 
 /** 保留初始化器需要的声明形状，包括声明顺序、数组维度和指针。 */
-function initializerDeclarations(statement, enumValues = null) {
+function initializerDeclarations(statement, macros, enumValues = null) {
   const parts = splitAtTopLevel(statement);
   const first = parts[0] || [];
-  const base = declarationType(first.slice(0, Math.max(0, first.indexOf(declarationName(first)))));
+  const splitBitField = part => part.some(token => token.v === ':') ? splitAtTopLevel(part, ':') : [part];
+  const firstParts = splitBitField(first);
+  const firstDeclarator = firstParts[0] || [];
+  const base = declarationType(firstDeclarator.slice(0, firstDeclarator.indexOf(declarationName(firstDeclarator))));
   const open = first.findIndex(t => t.v === '{');
-  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), enumValues) : null;
+  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), macros, enumValues) : null;
   const shapes = new Map();
   for (const part of parts) {
-    const token = declarationName(part);
+    const [declarator = [], bitWidth] = part === first ? firstParts : splitBitField(part);
+    const token = declarationName(declarator);
     if (!token) continue;
-    const name = part.indexOf(token);
+    const name = declarator.indexOf(token);
+    if (bitWidth && part === first && (['enum', 'struct', 'union'].includes(declarator[name - 1]?.v) ||
+        declarator.slice(0, name).every(t => ['const', 'volatile', 'restrict'].includes(t.v) || ANNOTATIONS.has(t.v)))) continue;
     let j = name + 1;
     const extents = [];
     while (part[j]?.v === '[') {
@@ -493,7 +499,7 @@ function initializerDeclarations(statement, enumValues = null) {
         if (part[j].v === '[') depth++;
         if (part[j].v === ']') depth--;
       }
-      extents.push(parseConstIndex(part.slice(start, j - 1), null, enumValues));
+      extents.push(parseConstIndex(part.slice(start, j - 1), macros, enumValues));
     }
     let before = name - 1;
     while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
@@ -502,16 +508,21 @@ function initializerDeclarations(statement, enumValues = null) {
   return shapes;
 }
 
-function initializerMembers(body) {
+function initializerMembers(body, macros, enumValues = null) {
   const fields = new Map();
   for (const part of splitAtTopLevel(body, ';')) {
-    for (const [name, shape] of initializerDeclarations(part)) fields.set(name, shape);
+    if (['struct', 'union'].includes(part[0]?.v) && part[1]?.v === '{' && matchBrace(part, 1) === part.length - 1) {
+      fields.set('@anonymous:' + part[0].s, { anonymous: true });
+      continue;
+    }
+    for (const [name, shape] of initializerDeclarations(part, macros, enumValues)) fields.set(name, shape);
   }
   return fields;
 }
 
 /** 收集类型声明及作用域；成员声明帮助区分标量与只初始化了一项的数组。 */
-export function findTypedefs(tokens) {
+export function findTypedefs(tokens, macros) {
+  const { enumValues } = collectEnumValues(tokens, macros);
   const aliases = new Map();
   const scopes = [{ end: null }];
   const record = (name, declaration, shape) => {
@@ -524,7 +535,9 @@ export function findTypedefs(tokens) {
     if (token.v === '}' && scopes.length > 1) { scopes.pop().end = token; continue; }
     if ((token.v === 'struct' || token.v === 'union') && tokens[i + 1]?.t === 'id' && tokens[i + 2]?.v === '{') {
       const close = matchBrace(tokens, i + 2);
-      record(token.v + ' ' + tokens[i + 1].v, token, { union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close)) });
+      record(token.v + ' ' + tokens[i + 1].v, token, {
+        union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close), macros, enumValues),
+      });
       i = close;
       continue;
     }
@@ -537,7 +550,7 @@ export function findTypedefs(tokens) {
       if ([')', ']', '}'].includes(value)) depth--;
     }
     if (tokens[end]?.v !== ';') continue;
-    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end))) {
+    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end), macros, enumValues)) {
       record(name, shape.token, shape);
       if (shape.fields && shape.type && !aliases.get(shape.type)?.some(entry => entry.declaration === token)) {
         record(shape.type, token, { fields: shape.fields, union: shape.union });
@@ -731,11 +744,14 @@ function formatInitIndex(index) {
   return `[?${index.expr}${index.offset ? '+' + index.offset : ''}]`;
 }
 
+const anonymousInitLayout = { anonymous: true };
+
 /** 延迟展开成员类型，遇到指针就停止，递归结构体不会无限展开。 */
 function initializerLayout(root, file, lookup) {
   const cache = new Map();
   const resolve = (declaration, source) => {
     if (!declaration) return null;
+    if (declaration.anonymous) return anonymousInitLayout;
     if (cache.has(declaration)) return cache.get(declaration);
     const extents = [];
     const seen = new Set();
@@ -756,7 +772,7 @@ function initializerLayout(root, file, lookup) {
     }
     const fields = shape?.pointer ? null : shape?.fields;
     let layout = fields ? {
-      names: [...fields.keys()], union: !!shape.union,
+      names: [...fields.keys()], union: !!shape.union, hasAnonymous: [...fields.values()].some(field => field.anonymous),
       field: name => resolve(fields.get(name), source),
     } : { pointer: !!shape?.pointer };
     for (let i = extents.length - 1; i >= 0; i--) layout = { element: layout, length: extents[i] };
@@ -767,7 +783,9 @@ function initializerLayout(root, file, lookup) {
 }
 
 function initChild(layout, part) {
-  return typeof part === 'string' ? layout?.field?.(part) : layout?.element;
+  if (layout?.anonymous) return layout;
+  if (typeof part !== 'string') return layout?.element;
+  return layout?.field?.(part) ?? (layout?.hasAnonymous ? anonymousInitLayout : undefined);
 }
 
 /** 消耗一个子对象，将游标进位到下一个成员或数组元素。 */
@@ -791,8 +809,35 @@ function nextInitPath(path, root) {
   return null;
 }
 
+function appendInitSlot(slot, part) {
+  return slot + (typeof part === 'string' ? (slot ? '.' : '') + part : formatInitIndex(part));
+}
+
+function clearInitSlot(slot, table, status) {
+  delete table.map[slot];
+  delete table.slotLines[slot];
+  table.slots.delete(slot);
+  status.unresolvedSlots.delete(slot);
+}
+
+function clearAggregateSlots(slot, table, status) {
+  clearInitSlot(slot, table, status);
+  if (!status.initializedAggregates.delete(slot)) return;
+  for (const key of table.slots.keys()) {
+    if (key.startsWith(slot + '.') || key.startsWith(slot + '[')) clearInitSlot(key, table, status);
+  }
+}
+
+function isStringInitializer(tokens) {
+  for (let i = 0; i < tokens.length; i++) {
+    if (['L', 'u', 'U', 'u8'].includes(tokens[i].v)) i++;
+    if (tokens[i]?.t !== 'str' || !tokens[i].v.startsWith('"')) return false;
+  }
+  return true;
+}
+
 /** 每一对花括号都有独立的游标。数组按维度进位，结构体按字段声明顺序进位。 */
-function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false) {
+function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = false, designatedParent = false, parentUnions = []) {
   const items = splitAtTopLevel(inner);
   let cursor = layout?.names?.length ? [layout.names[0]] : scalarBrace && items.length === 1 ? [] : [0];
   for (const item of items) {
@@ -818,10 +863,11 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     if (!val.length) continue;
     const braced = val[0].v === '{' && val.at(-1).v === '}';
     const path = designated ? designators : cursor?.slice();
-    const unknownPosition = !path;
+    let unknownPosition = !path;
     const parts = path ?? [{ expr: `@${item[0].line}:${item[0].col}`, offset: 0 }];
     if (parts.some(p => typeof p === 'object')) status.incomplete = true;
     const operand = braced ? null : simpleInitializerOperand(val);
+    const stringInitializer = !braced && isStringInitializer(val);
     let child = parts.reduce(initChild, layout);
     let descended;
     // 省略聚合括号时，已知标量继续下沉。未知表达式可能复制整个结构体。
@@ -829,12 +875,12 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
       if (child?.element) {
         // 字符串消耗整个字符数组，仍需下沉多维数组的外层。
         if (!child.element.element && !child.element.pointer && !child.element.names &&
-            val.every(t => t.t === 'str' && t.v.startsWith('"'))) break;
+            stringInitializer) break;
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
           (operand?.t === 'id' && (status.isFunction(operand) || status.enumNames.has(operand.v))) ||
-          (val[0].t === 'str' || val[0].v === 'sizeof'))) {
+          (stringInitializer || val[0].t === 'str' || val[0].v === 'sizeof'))) {
         descended ??= new Set();
         if (descended.has(child)) { status.incomplete = true; break; }
         descended.add(child);
@@ -843,14 +889,42 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         child = child.field(first);
       } else break;
     }
+    if (child?.anonymous) {
+      // 匿名聚合会提升字段名，无法确定布局时不将值误分配给后续字段。
+      status.incomplete = true;
+      unknownPosition = true;
+      parts.splice(0, parts.length, { expr: '@' + item[0].line + ':' + item[0].col, offset: 0 });
+      child = null;
+    }
     const slotPath = [...prefix, ...parts];
+    let slot = '';
+    let parent = layout;
+    let unions = parentUnions;
+    for (let i = 0; i < slotPath.length; i++) {
+      const part = slotPath[i];
+      if (i >= prefix.length) {
+        if (parent?.union && typeof part === 'string') {
+          unions = [...unions, i];
+          // union 成员重叠。切换成员后，前一个成员的值不再能确定调用目标。
+          clearInitSlot(slot, table, status);
+          const previous = status.activeUnionMembers.get(slot);
+          if (previous !== undefined && previous !== part) {
+            clearAggregateSlots(appendInitSlot(slot, previous), table, status);
+          }
+          status.activeUnionMembers.set(slot, part);
+        }
+        parent = initChild(parent, part);
+      }
+      slot = appendInitSlot(slot, part);
+      if (i < slotPath.length - 1) status.initializedAggregates.add(slot);
+    }
+    // 新的聚合初始化覆盖整个子对象，包括没有显式列出的成员。
+    if (braced || child?.names) clearAggregateSlots(slot, table, status);
     if (braced) {
       const scalar = !child?.element && !child?.names &&
         (child?.pointer || (typeof parts.at(-1) !== 'string' && (!!layout?.element || scalarBrace)));
-      collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated);
+      collectInitSlots(val.slice(1, -1), slotPath, child, table, status, scalar, designatedParent || designated, unions);
     } else {
-      let slot = '';
-      for (const p of slotPath) slot += typeof p === 'string' ? (slot ? '.' : '') + p : formatInitIndex(p);
       // 同一槽位的后一个初始化覆盖前一个。未知的整个结构体可能提供任一成员。
       status.unresolvedSlots.delete(slot);
       if (table.candidateMap) delete table.candidateMap[slot];
@@ -876,8 +950,9 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
           parts: slotPath.map(p => typeof p === 'object' ? null : p),
           unknownPosition: slotPath.some(p => typeof p === 'object' && p.expr.startsWith('@')),
           designated: designatedParent || designated,
+          ...(unions.length ? { unions } : {}),
         });
-      }
+      } else table.slots.delete(slot);
     }
     // 无法判定是聚合复制还是标量时，后续位置保持不确定，避免生成错误确定边。
     cursor = unknownPosition || (!braced && child?.names) ? null : nextInitPath(parts, layout);
@@ -903,7 +978,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     return localFunctions.has(token.v);
   };
   const localLookup = (_, name, at) => {
-    localTypes ??= findTypedefs(tokens);
+    localTypes ??= findTypedefs(tokens, macros);
     const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     return entry && { file, shape: entry.shape };
   };
@@ -967,8 +1042,10 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         if (tokens[open].v === '}') depth++;
         if (tokens[open].v === '{') depth--;
       }
-      if (['struct', 'union'].includes(tokens[open]?.v) || ['struct', 'union'].includes(tokens[open - 1]?.v)) {
-        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration));
+      const kind = ['struct', 'union'].includes(tokens[open]?.v) ? tokens[open].v : tokens[open - 1]?.v;
+      if (['struct', 'union'].includes(kind)) {
+        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration), macros, enumValues);
+        rootShape.union = kind === 'union';
         for (let j = open; j >= 0 && ![';', '{', '}'].includes(tokens[j].v); j--) {
           if (['static', 'STATIC'].includes(tokens[j].v)) isStatic = true;
           if (['const', 'CONST'].includes(tokens[j].v)) isConst = true;
@@ -994,6 +1071,8 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         enumNames,
         enumValues,
         unresolvedSlots: new Set(),
+        initializedAggregates: new Set(),
+        activeUnionMembers: new Map(),
         isFunction: token => isFunction(token, file, functionId),
       };
       const layout = initializerLayout(rootShape, file, lookup);

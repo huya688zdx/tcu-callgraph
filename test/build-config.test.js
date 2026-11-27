@@ -7,10 +7,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseMakefileTree, discoverBuildProfiles, materializeCompileCommands, selectProfileSourceFiles } from '../src/core/build-config.js';
+import { resolveBuildProfileOptions } from '../src/core/build-profile-options.js';
 import { loadModel, scanSources } from '../src/core/index.js';
 import { builtinParser } from '../src/core/parsers/builtin-parser.js';
 import { readCompileCommands } from '../src/core/parsers/clang-parser.js';
-import { externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
+import { detectClang, externalDependenciesCurrent } from '../src/core/parsers/clang-config.js';
 
 const cores = ['core0', 'core1'];
 const vehicles = ['z111', 'z115'];
@@ -544,4 +545,429 @@ test('GNU Make 嵌套 include 使用构建目录', t => {
   const result = parseMakefileTree(path.join(root, 'Makefile'), root);
   assert.deepEqual(result.defines, ['FEATURE=1']);
   assert.deepEqual(result.includedFiles, ['Makefile', 'build/flags.mk', 'common.mk']);
+});
+
+test('构建配置保留每个编译单元的头文件搜索顺序和 C 标准', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all:',
+    '\tcc -std=c11 @angle.rsp -c angle.c',
+    '\tcc -std=gnu11 -iquote private -Ipublic -c quote.c',
+  ].join('\n'));
+  write(root, 'angle.rsp', '-idirafter after -isystemsystem -iquote "private" -Ipublic -std=c99');
+  for (const [dir, feature] of [['private', 1], ['public', 2], ['system', 3], ['after', 4]]) {
+    write(root, dir + '/config.h', '#define FEATURE ' + feature);
+  }
+  for (const [name, include, feature, standard] of [
+    ['angle', '<config.h>', 2, '199901L'],
+    ['quote', '"config.h"', 1, '201112L'],
+  ]) {
+    write(root, name + '.c', [
+      '#include ' + include,
+      '#if FEATURE == ' + feature + ' && __STDC__ == 1 && __STDC_VERSION__ == ' + standard,
+      'void ' + name + '_correct(void) {}',
+      '#else',
+      'void ' + name + '_wrong(void) {}',
+      '#endif',
+    ].join('\n'));
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  const builtin = loadModel(root, { parserId: 'builtin',
+    parserOptions: resolveBuildProfileOptions(root, 'builtin', options, files, profile) });
+  const expected = ['angle_correct', 'quote_correct'];
+  assert.deepEqual(sorted(builtin.functions.map(f => f.name)), expected);
+
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const units = new Map(readCompileCommands(root, compileCommandsPath).map(unit => [unit.rel, unit.args]));
+  for (const [flag, dir] of [['-idirafter', 'after'], ['-isystem', 'system'], ['-iquote', 'private'], ['-I', 'public']]) {
+    const args = units.get('angle.c');
+    assert.equal(args[args.indexOf(flag) + 1], path.join(root, dir));
+  }
+  assert.ok(units.get('angle.c').includes('-std=c99'));
+  assert.ok(units.get('quote.c').includes('-std=gnu11'));
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(sorted(clang.functions.map(f => f.name)), expected);
+  }
+});
+
+test('Make 在每个 include 位置重新计算变量并按名称处理函数式宏的重定义', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'MODE = 1', 'include flags.mk', 'MODE = 2', 'include flags.mk',
+    'all:', "\tcc $(CFLAGS) '-DREMOVED(x)=x' -UREMOVED '-DENABLED(x)=0' -UENABLED '-DENABLED(x)=x' -U__STDC__ -c main.c",
+  ].join('\n'));
+  write(root, 'flags.mk', 'CFLAGS := -DMODE=$(MODE)\n');
+  write(root, 'main.c', [
+    '#if MODE == 2 && !defined(__STDC__) && !defined(REMOVED) && ENABLED(1)',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles.find(p => p.configFile === 'Makefile');
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['MODE=2', 'ENABLED(x)=x']);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [{ args }] = readCompileCommands(root, compileCommandsPath);
+  assert.deepEqual(args.slice(args.indexOf('-D')), [
+    '-D', 'MODE=2', '-D', 'REMOVED(x)=x', '-U', 'REMOVED', '-D', 'ENABLED(x)=0', '-U', 'ENABLED', '-D', 'ENABLED(x)=x',
+    '-U', '__STDC__',
+  ]);
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(clang.functions.map(fn => fn.name), ['correct']);
+  }
+});
+
+test('流程图接口读取构建配置选中的外部 SDK 头与嵌套头', async t => {
+  const root = temporaryProject(t);
+  const sdk = path.join(path.dirname(root), 'sdk');
+  write(sdk, 'config.h', '#include "nested.h"\n');
+  write(sdk, 'nested.h', '#define RUN() selected()\n');
+  write(root, 'config.h', '#define RUN() wrong()\n');
+  write(root, 'Makefile', 'all:\n\tcc -I../sdk -c main.c\n');
+  write(root, 'main.c', [
+    '#include <config.h>', 'static void selected(void) {}', 'void run(void) { RUN(); }',
+  ].join('\n'));
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId: 'make::Makefile' });
+  for (const expandMacros of [0, 1]) {
+    const query = new URLSearchParams({ id: 'main.c::run', expandMacros });
+    const result = await request('/api/flowchart?' + query);
+    assert.ok(result.ok);
+    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === '../sdk/nested.h'));
+    assert.ok(result.nodes.some(node => node.callees?.some(callee => callee.name === 'selected')));
+  }
+});
+
+test('构建配置在强制包含前处理 -imacros，且丢弃宏文件子树的声明', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -include startup.h -I flags -imacros options.h -c main.c\n');
+  write(root, 'flags/options.h', '#include "nested.h"\nstatic void ignored(void) {}\n');
+  write(root, 'flags/nested.h', '#define FEATURE 1\nstatic void also_ignored(void) {}\n');
+  write(root, 'startup.h', '#if FEATURE\n#define ACTIVE 1\n#endif\nstatic void startup(void) {}\n');
+  write(root, 'main.c', '#if ACTIVE\nvoid correct(void) {}\n#else\nvoid wrong(void) {}\n#endif\n');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  const builtin = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(sorted(builtin.functions.map(fn => fn.name)), ['correct', 'startup']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [{ args }] = readCompileCommands(root, compileCommandsPath);
+  assert.deepEqual(args.slice(args.indexOf('-imacros')), ['-imacros', 'options.h', '-include', path.join(root, 'startup.h')]);
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: { compileCommandsPath, strictCompileCommands: true } });
+    assert.deepEqual(sorted(clang.functions.map(fn => fn.name)), ['correct', 'startup']);
+  }
+});
+
+test('Make 自动变量合并同一目标的多个规则，保持配方依赖优先并排除顺序依赖', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o other.o',
+    'main.o: main.c | order.c',
+    'main.o:',
+    '\tcc -DMAIN -c $<',
+    'other.o: before.c shared.c',
+    'other.o: other.c shared.c',
+    '\tcc -DFIRST=$< -DUNIQUE="$^" -DALL="$+" -c $<',
+    'other.o: last.c',
+  ].join('\n'));
+  for (const file of ['main', 'order', 'before', 'shared', 'other', 'last']) write(root, file + '.c', 'int value;');
+  const profile = parseMakefileTree(makefile, root);
+  assert.deepEqual(profile.sourceFiles, ['main.c', 'other.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['MAIN']);
+  assert.deepEqual(profile.compilationUnits['other.c'].defines, [
+    'FIRST=other.c', 'UNIQUE=other.c shared.c before.c last.c', 'ALL=other.c shared.c before.c shared.c last.c',
+  ]);
+});
+
+test('流程图按编译单元展开构建宏，并绑定 .inc 中可见的静态函数', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all:', '\tcc -DSELECTED=helper -c a.c', '\tcc -DRUN=other -c b.c',
+  ].join('\n'));
+  write(root, 'helper.inc', '#if MODE\n#define RUN SELECTED\n#endif\nstatic inline void helper(void) {}\n');
+  write(root, 'a.c', '#define MODE 1\n#include "helper.inc"\n#undef MODE\nvoid runA(void) { RUN(); }\n');
+  write(root, 'b.c', 'static void other(void) {}\nvoid runB(void) { RUN(); }\n');
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId: 'make::Makefile' });
+  for (const [id, calleeId, name, macroFile] of [
+    ['a.c::runA', 'helper.inc::helper', 'helper', 'helper.inc'],
+    ['b.c::runB', 'b.c::other', 'other', '<build-config>'],
+  ]) {
+    const query = new URLSearchParams({ id, expandMacros: 1 });
+    const result = await request('/api/flowchart?' + query);
+    const invocation = result.nodes.find(node => node.kind === 'call');
+    assert.match(invocation.text, new RegExp(name + '\\(\\)'));
+    assert.ok(invocation.callees.some(callee => callee.id === calleeId));
+    assert.ok(result.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === macroFile));
+  }
+});
+
+test('构建配置从找到包装头的目录之后解析 include_next', async t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -Iwrap -Isdk -c main.c');
+  write(root, 'wrap/pkg/config.h', '#pragma once\n#include_next <pkg/config.h>\n');
+  write(root, 'sdk/pkg/config.h', '#define FEATURE 1\n');
+  write(root, 'main.c', [
+    '#include <pkg/config.h>', '#if FEATURE',
+    'void wrapped(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  const builtin = loadModel(root, { parserId: 'builtin',
+    parserOptions: resolveBuildProfileOptions(root, 'builtin', options, files, profile) });
+  assert.deepEqual(builtin.functions.map(fn => fn.name), ['wrapped']);
+  assert.ok(builtin.includes.some(inc => inc.file === 'wrap/pkg/config.h' && inc.resolved === 'sdk/pkg/config.h'));
+  if (detectClang().ok) {
+    const clang = await loadModel(root, { parserId: 'clang-ast',
+      parserOptions: resolveBuildProfileOptions(root, 'clang-ast', options, files, profile, path.dirname(root)) });
+    assert.deepEqual(clang.functions.map(fn => fn.name), ['wrapped']);
+  }
+});
+
+test('include_next 跳过与本地包装头目录重复的 -I 路径', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -I. -Isdk -c main.c');
+  write(root, 'config.h', '#pragma once\n#include_next <config.h>\n');
+  write(root, 'sdk/config.h', '#define FEATURE 1\n');
+  write(root, 'main.c', [
+    '#include "config.h"', '#if FEATURE',
+    'void wrapped(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, scanSources(root), profile);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.functions.map(fn => fn.name), ['wrapped']);
+});
+
+test('Make 引号条件保留空操作数并选择正确的编译参数', t => {
+  const root = temporaryProject(t);
+  const file = write(root, 'Makefile', [
+    'MODE =', 'ifeq "$(MODE)" ""', 'CFLAGS = -DEMPTY', 'else', 'CFLAGS = -DWRONG', 'endif',
+    "ifneq 'on' ''", 'CFLAGS += -DENABLED', 'endif', 'all:', '\tcc $(CFLAGS) -c main.c',
+  ].join('\n'));
+  write(root, 'main.c', 'int value;');
+  assert.deepEqual(parseMakefileTree(file, root).compilationUnits['main.c'].defines, ['EMPTY', 'ENABLED']);
+});
+
+test('Make 复合配方的每个编译调用独立收集参数，引号中的分号保持为数据', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'CC = vendor-cc-custom', 'all:',
+    '\t$(CC) -DFEATURE=1 -DMESSAGE="a;b" -c first.c; $(CC) -DFEATURE=0 -c second.c && echo -DIGNORED',
+  ].join('\n'));
+  for (const [rel, mode] of [['first', 1], ['second', 0]]) {
+    write(root, rel + '.c', '#if FEATURE == ' + mode + '\nvoid ' + rel + '_correct(void) {}\n#endif');
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.compilationUnits['first.c'].defines, ['FEATURE=1', 'MESSAGE=a;b']);
+  assert.deepEqual(profile.compilationUnits['second.c'].defines, ['FEATURE=0']);
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
+    ['first_correct', 'second_correct']);
+});
+
+test('Make 将 .c.o 后缀规则应用到可达目标，并保留显式编译规则', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'all: main.o custom.o',
+    'CFLAGS = -DFEATURE=1',
+    'main.o: types.h',
+    '.c.o:',
+    '\t$(CC) $(CFLAGS) -DSTEM=$* -c $< -o $@',
+    'custom.o: custom.c',
+    '\t$(CC) -DFEATURE=0 -c $<',
+  ].join('\n'));
+  write(root, 'types.h', 'typedef int Value;');
+  for (const [rel, feature] of [['main', 1], ['custom', 0]]) {
+    write(root, rel + '.c', '#if FEATURE == ' + feature + '\nvoid ' + rel + '_correct(void) {}\n#endif');
+  }
+  write(root, 'debug.c', 'void unused(void) {}');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(sorted(profile.sourceFiles), ['custom.c', 'main.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['FEATURE=1', 'STEM=main']);
+  assert.deepEqual(profile.compilationUnits['custom.c'].defines, ['FEATURE=0']);
+  const files = scanSources(root);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(sorted(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name)),
+    ['custom_correct', 'main_correct']);
+});
+
+test('Make 展开编译用 wildcard，并隔离仍含不支持表达式的候选配置', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'SRC_DIR = src', 'SOURCES := $(wildcard $(SRC_DIR)/*.c)', 'all:', '\tcc -DFEATURE=1 -c $(SOURCES)',
+  ].join('\n'));
+  write(root, 'other.mak', 'INPUT = $(filter %.c,src/main.c)\nall:\n\tcc -c $(INPUT)');
+  write(root, 'src/main.c', '#if FEATURE\nvoid active(void) {}\n#endif');
+  write(root, 'debug.c', 'void debug_only(void) {}');
+  const profiles = discoverBuildProfiles(root).profiles;
+  assert.deepEqual(profiles.map(p => p.configFile), ['Makefile']);
+  assert.deepEqual(profiles[0].sourceFiles, ['src/main.c']);
+});
+
+test('CDT 的 fileInfo 编译选项只作用于对应源码', async t => {
+  const root = temporaryProject(t);
+  write(root, '.cproject', [
+    '<cproject><cconfiguration><configuration name="target">',
+    '<folderInfo resourcePath=""><tool><option valueType="definedSymbols">',
+    '<listOptionValue value="FEATURE=0"/></option></tool></folderInfo>',
+    '<fileInfo resourcePath="b.c"><tool><option valueType="definedSymbols">',
+    '<listOptionValue value="FEATURE=1"/></option></tool></fileInfo>',
+    '</configuration></cconfiguration></cproject>',
+  ].join('\n'));
+  for (const name of ['a', 'b']) {
+    write(root, name + '.c', [
+      '#if FEATURE', 'void ' + name + '_on(void) {}',
+      '#else', 'void ' + name + '_off(void) {}', '#endif',
+    ].join('\n'));
+  }
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const files = scanSources(root);
+  assert.deepEqual(profile.defines, ['FEATURE=0']);
+  assert.deepEqual(profile.compilationUnits['b.c'].defines, ['FEATURE=1']);
+  const options = { buildProfileId: profile.id };
+  for (const parserId of detectClang().ok ? ['builtin', 'clang-ast'] : ['builtin']) {
+    const parserOptions = resolveBuildProfileOptions(root, parserId, options, files, profile, path.dirname(root));
+    const model = await loadModel(root, { parserId, parserOptions });
+    assert.deepEqual(sorted(model.functions.map(fn => fn.name)), ['a_off', 'b_on']);
+  }
+});
+
+test('Make 配方忽略词边界的 shell 注释并保留字面井号', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all:',
+    "\tcc -DFEATURE=1 -DMID=a#b '-DQUOTED=#quoted' -DESCAPED=\\#escaped -c main.c # -DFEATURE=0; cc old.c",
+  ].join('\n'));
+  write(root, 'main.c', 'int value;');
+  write(root, 'old.c', 'int unused;');
+  const parsed = parseMakefileTree(makefile, root);
+  assert.deepEqual(parsed.sourceFiles, ['main.c']);
+  assert.deepEqual(parsed.compilationUnits['main.c'].defines, [
+    'FEATURE=1', 'MID=a#b', 'QUOTED=#quoted', 'ESCAPED=#escaped',
+  ]);
+});
+
+test('Make 单冒号目标只采用最后一个配方，双冒号规则独立收集', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o multiple',
+    'main.o: shared.h',
+    'main.o: old.c',
+    '\tcc -DOLD -c old.c',
+    'include late.mk',
+    'multiple:: a.c',
+    '\tcc -DA -c $<',
+    'multiple:: b.c',
+    '\tcc -DB -c $<',
+  ].join('\n'));
+  write(root, 'late.mk', 'main.o: main.c\n\tcc -DNEW -DDEPS="$^" -c $<');
+  for (const file of ['main.c', 'a.c', 'b.c', 'old.c', 'shared.h']) write(root, file, 'int value;');
+  const parsed = parseMakefileTree(makefile, root);
+  assert.deepEqual(sorted(parsed.sourceFiles), ['a.c', 'b.c', 'main.c']);
+  assert.deepEqual(parsed.compilationUnits['main.c'].defines, ['NEW', 'DEPS=main.c shared.h old.c']);
+  assert.deepEqual(parsed.compilationUnits['a.c'].defines, ['A']);
+  assert.deepEqual(parsed.compilationUnits['b.c'].defines, ['B']);
+});
+
+test('QAC 配置保留语言标准，内置解析和导出的编译命令选择同一分支', async t => {
+  const root = temporaryProject(t);
+  write(root, 'analysis.via', '-std=c99 -DFEATURE=1 main.c\n');
+  write(root, 'main.c', [
+    '#if FEATURE && __STDC_VERSION__ == 199901L',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  const profile = discoverBuildProfiles(root).profiles.find(item => item.source === 'qac');
+  const files = scanSources(root);
+  const options = { buildProfileId: profile.id };
+  assert.equal(profile.languageStandard, 'c99');
+  const build = parserId => loadModel(root, { parserId,
+    parserOptions: resolveBuildProfileOptions(root, parserId, options, files, profile, path.dirname(root)) });
+  assert.deepEqual((await build('builtin')).functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  assert.ok(readCompileCommands(root, compileCommandsPath)[0].args.includes('-std=c99'));
+  if (detectClang().ok) assert.deepEqual((await build('clang-ast')).functions.map(fn => fn.name), ['correct']);
+});
+
+test('Make 只有链接配方时从内置规则恢复实际编译单元', t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', [
+    'CFLAGS = -DFEATURE=1', 'CPPFLAGS = -DEXTRA=1',
+    'app: main.o', '\t$(CC) -o $@ $^', 'main.o: CFLAGS += -DUNIT',
+  ].join('\n'));
+  write(root, 'main.c', [
+    '#if FEATURE && EXTRA && UNIT',
+    'void correct(void) {}', '#else', 'void wrong(void) {}', '#endif',
+  ].join('\n'));
+  write(root, 'debug.c', 'void unused(void) {}');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.sourceFiles, ['main.c']);
+  assert.deepEqual(profile.compilationUnits['main.c'].defines, ['FEATURE=1', 'UNIT', 'EXTRA=1']);
+  const files = scanSources(root);
+  const parserOptions = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  assert.deepEqual(loadModel(root, { parserId: 'builtin', parserOptions }).functions.map(fn => fn.name), ['correct']);
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  const [unit] = readCompileCommands(root, compileCommandsPath);
+  assert.equal(unit.rel, 'main.c');
+  assert.deepEqual(unit.args.slice(unit.args.indexOf('-D')), ['-D', 'FEATURE=1', '-D', 'UNIT', '-D', 'EXTRA=1']);
+});
+
+test('嵌套 Make 配置从实际编译目录搜索强制头，流程图采用同一配置', async t => {
+  const root = temporaryProject(t);
+  write(root, 'build/Makefile', 'all:\n\tcc -I../sdk -include config.h -c ../main.c');
+  write(root, 'config.h', '#define FEATURE 0\n#define RUN wrong\n');
+  write(root, 'sdk/config.h', '#define FEATURE 1\n#define RUN selected\n');
+  write(root, 'main.c', [
+    '#if FEATURE', 'static void selected(void) {}', 'void enabled(void) { RUN(); }',
+    '#else', 'void disabled(void) {}', '#endif',
+  ].join('\n'));
+  const profileId = 'make::build/Makefile';
+  const profile = discoverBuildProfiles(root).profiles.find(item => item.id === profileId);
+  const files = scanSources(root);
+  assert.equal(profile.compilationUnits['main.c'].workingDirectory, path.join(root, 'build'));
+  const { compileCommandsPath } = materializeCompileCommands(root, profile, { files, exportPath: 'compile_commands.json' });
+  assert.equal(readCompileCommands(root, compileCommandsPath)[0].cwd, path.join(root, 'build'));
+  const { request, close } = await startServer(root);
+  t.after(close);
+  await request('/api/build-configs', { profileId });
+  const query = new URLSearchParams({ id: 'main.c::enabled', expandMacros: 1 });
+  const graph = await request('/api/flowchart?' + query);
+  assert.ok(graph.nodes.some(node => node.kind === 'call' && node.text.includes('selected()')));
+  assert.ok(graph.macrosUsed.some(macro => macro.name === 'RUN' && macro.file === 'sdk/config.h'));
+});
+
+test('POSIX Make 配方的转义空格保留真实源码和包含路径', { skip: process.platform === 'win32' }, t => {
+  const root = temporaryProject(t);
+  write(root, 'Makefile', 'all:\n\tcc -Iinclude\\ flags -c main\\ app.c');
+  write(root, 'include flags/config.h', '#define FEATURE 1');
+  write(root, 'main app.c', '#include <config.h>\n#if FEATURE\nvoid active(void) {}\n#endif');
+  const profile = discoverBuildProfiles(root).profiles[0];
+  assert.deepEqual(profile.sourceFiles, ['main app.c']);
+  assert.deepEqual(profile.includeDirs, [path.join(root, 'include flags')]);
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, scanSources(root), profile);
+  assert.deepEqual(loadModel(root, { parserId: 'builtin', parserOptions: options }).functions.map(fn => fn.name), ['active']);
+});
+
+test('Make 配方的未解析自动变量不会发布为全工程配置', t => {
+  const root = temporaryProject(t);
+  const makefile = write(root, 'Makefile', [
+    'all: main.o', 'main.o: main.c', '\tcc -DFEATURE=1 -c $? -o $@',
+  ].join('\n'));
+  write(root, 'main.c', 'void active(void) {}');
+  write(root, 'debug.c', 'void unused(void) {}');
+  assert.throws(() => parseMakefileTree(makefile, root), /未解析的 Make 表达式/);
+  assert.deepEqual(discoverBuildProfiles(root).profiles, []);
 });

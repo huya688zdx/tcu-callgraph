@@ -204,7 +204,7 @@ export function completeCompileUnits(entries, files, fallbackArgs) {
 export function dependencyStamp(file) {
   try {
     const stat = fs.statSync(file);
-    return stat.isFile() ? { file, size: stat.size, mtimeMs: stat.mtimeMs } : null;
+    return stat.isFile() ? { file, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } : null;
   } catch {
     return null;
   }
@@ -224,6 +224,7 @@ export function externalDependenciesCurrent(model) {
   }
   return (model.externalDeps || []).every(dep => {
     const current = dependencyStamp(dep.file);
-    return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs;
+    return current && current.size === dep.size && current.mtimeMs === dep.mtimeMs &&
+      (dep.ctimeMs === undefined || current.ctimeMs === dep.ctimeMs);
   });
 }

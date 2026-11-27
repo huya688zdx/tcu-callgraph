@@ -100,13 +100,15 @@ export function analysisSources(model, { keepOriginal = true } = {}) {
     if (!keepOriginal) delete f.src;
   };
   if (model.pruneInactive) {
-    if (keepOriginal) preprocessProfile(model.root, sources, {
+    const profile = {
       compilationUnits: model.compilationUnits, defines: model.buildDefines,
-      includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
-    }, loadInput, (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)), false);
-    preprocessProfile(model.root, sources, {
-      compilationUnits: model.compilationUnits, defines: model.buildDefines, includeDirs: model.includeDirs, forcedIncludes: model.forcedIncludes,
-    }, loadInput, saveExpanded, true);
+      includeDirs: model.includeDirs, includeOptions: model.includeOptions, forcedIncludes: model.forcedIncludes,
+      macroArgs: model.macroArgs, macroIncludes: model.macroIncludes, languageStandard: model.languageStandard,
+      workingDirectory: model.workingDirectory,
+    };
+    if (keepOriginal) preprocessProfile(model.root, sources, profile, loadInput,
+      (f, input, result) => rawSources.set(f.rel, renderTokens(result.tokens)));
+    preprocessProfile(model.root, sources, profile, loadInput, saveExpanded, true);
   } else {
     const macros = new Map();
     for (const f of sources.filter(f => f.isHeader)) preprocess(lex(f.src, f.rel), macros, f.rel);

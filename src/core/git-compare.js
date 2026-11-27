@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { compareProjects, fingerprint } from './compare.js';
 import { selectedBuildProfile } from './build-profile-options.js';
 import { decodeSource, listSourceFiles } from './index.js';
+import { externalDependenciesCurrent } from './parsers/clang-config.js';
 import { addScheduleBytes, isScheduleFile, listScheduleFiles } from './tcu-schedule.js';
 
 const run = promisify(execFile);
@@ -725,6 +726,19 @@ function retainSnapshot(model, buffers) {
   model.files = model.files.map(file => ({ ...file, abs: path.join(model.root, file.rel) }));
 }
 
+function comparisonIncludeDependencies(comparison) {
+  const externalDeps = [];
+  const missingIncludes = new Set();
+  for (const model of [comparison.beforeModel, comparison.afterModel]) {
+    const externalPaths = new Set([...(model.externalHeaders?.keys() || [])].map(file => path.resolve(model.root, file)));
+    if (externalPaths.size) {
+      for (const dep of model.externalDeps || []) if (externalPaths.has(dep.file)) externalDeps.push(dep);
+    }
+    for (const file of model.missingIncludes || []) missingIncludes.add(file);
+  }
+  return { externalDeps, missingIncludes };
+}
+
 export async function compareGitProject(projectPath, gitOptions = {}, compareOptions = {}) {
   const baseRef = validatedRef(gitOptions.baseRef, 'HEAD');
   const targetRef = validatedRef(gitOptions.targetRef, worktreeRef);
@@ -769,18 +783,15 @@ export async function compareGitProject(projectPath, gitOptions = {}, compareOpt
     const validation = JSON.stringify([targetRef === indexRef ? [...after].sort() : null, changes,
       metadata.baseLabel, metadata.targetLabel]);
     const entry = analyzedComparisons.get(key);
-    let cached;
-    if (entry?.validation === validation) {
-      cached = entry.result;
-    } else {
-      cached = await analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
-    }
+    const cached = entry?.validation === validation && externalDependenciesCurrent(entry.dependencies)
+      ? entry : null;
+    const result = cached?.result ?? await analyzeGitSnapshot(repo, before, after, metadata, compareOptions, hint);
     analyzedComparisons.delete(key);
-    analyzedComparisons.set(key, { validation, result: cached });
+    analyzedComparisons.set(key, cached ?? { validation, result, dependencies: comparisonIncludeDependencies(result) });
     if (analyzedComparisons.size > analyzedComparisonLimit) {
       analyzedComparisons.delete(analyzedComparisons.keys().next().value);
     }
-    return { ...cached, git: { ...cached.git } };
+    return { ...result, git: { ...result.git } };
   };
   if (!changes.length && !compareOptions.allowEmptyRefresh) {
     return { projectPath: repo.root, git: metadata, summary: emptySummary(), roots: [], candidates: [],

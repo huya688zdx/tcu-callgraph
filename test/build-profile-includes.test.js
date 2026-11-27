@@ -260,3 +260,76 @@ test('原始比较定义只包含活动分支并保留宏调用', t => {
   assert.ok(file.src.includes('VALUE'));
   assert.ok(file.expanded.includes('42'));
 });
+
+test('快照配置允许活动源文件包含非独立编译的 C 文件', t => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-unity-snapshot-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const root = path.join(base, 'worktree');
+  const snapshot = path.join(base, 'snapshot');
+  fs.mkdirSync(root);
+  fs.mkdirSync(snapshot);
+  fs.writeFileSync(path.join(root, 'impl.c'), 'static void diskOnly(void) {}');
+  const sources = new Map(Object.entries({
+    'main.c': '#include "impl.c"\nvoid run(void) { helper(); }',
+    'impl.c': 'static void helper(void) {}',
+    'unused.c': 'void unused(void) {}',
+  }).map(([rel, text]) => {
+    const file = path.join(snapshot, rel);
+    fs.writeFileSync(file, text);
+    return [rel, file];
+  }));
+  for (const activeFiles of [['main.c'], ['main.c', 'impl.c']]) {
+    const model = buildIndex(root, sources, null, { parserId: 'builtin',
+      parserOptions: { buildProfileId: 'unity', activeFiles } });
+    assert.deepEqual(model.functions.map(fn => fn.name).sort(), ['helper', 'run']);
+    assert.deepEqual(model.edges.filter(edge => edge.from === 'main.c::run').map(edge => edge.to), ['impl.c::helper']);
+    assert.deepEqual(model.files.map(file => file.rel).sort(), ['impl.c', 'main.c']);
+    assert.ok(analysisSources(model).sources.find(file => file.rel === 'impl.c').src.includes('helper'));
+  }
+});
+
+test('共用头文件按各翻译单元保留不同的宏调用目标', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-header-invocations-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'common.h'), 'static inline void invoke(void) { TARGET(); }\n');
+  fs.writeFileSync(path.join(root, 'Makefile'), 'all:\n\tcc -DTARGET=foo -c a.c\n\tcc -DTARGET=bar -c b.c\n');
+  for (const [file, callee] of [['a', 'foo'], ['b', 'bar']]) {
+    fs.writeFileSync(path.join(root, file + '.c'),
+      'static void ' + callee + '(void) {}\n#include "common.h"\nvoid ' + file + '_caller(void) { invoke(); }');
+  }
+  const files = scanSources(root);
+  const profile = discoverBuildProfiles(root).profiles[0];
+  const options = resolveBuildProfileOptions(root, 'builtin', { buildProfileId: profile.id }, files, profile);
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: options });
+  assert.deepEqual(model.edges.filter(edge => edge.from === 'common.h::invoke').map(edge => edge.to).sort(),
+    ['a.c::foo', 'b.c::bar']);
+  assert.deepEqual(model.edges.filter(edge => edge.to === 'common.h::invoke').map(edge => edge.from).sort(),
+    ['a.c::a_caller', 'b.c::b_caller']);
+});
+
+test('未解析的系统头使未知宏的分支保持可见，已知构建宏仍能裁剪', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-system-header-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), [
+    '#include <limits.h>',
+    '#if CHAR_BIT == 8', 'void narrow(void) {}', '#else', 'void wide(void) {}', '#endif',
+    '#if defined(OPTIONAL_MACRO)', 'void present(void) {}', '#else', 'void absent(void) {}', '#endif',
+    '#if BUILD == 1', 'void enabled(void) {}', '#else', 'void disabled(void) {}', '#endif',
+  ].join('\n'));
+  const model = loadModel(root, { parserId: 'builtin', parserOptions: { buildProfileId: 'system', defines: ['BUILD=1'] } });
+  assert.deepEqual(model.functions.map(fn => fn.name).sort(), ['absent', 'enabled', 'narrow', 'present', 'wide']);
+});
+
+test('未知编译器内建宏保留可能分支，显式 -U 仍确定删除该宏', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compiler-define-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.c'), [
+    '#ifdef __GNUC__', 'void gcc_path(void) {}', '#else', 'void fallback_path(void) {}', '#endif',
+    '#if LOCAL_DEBUG', 'void disabled(void) {}', '#endif',
+  ].join('\n'));
+  const parse = macroArgs => loadModel(root, { parserId: 'builtin', parserOptions: {
+    buildProfileId: 'compiler', compilationUnits: { 'main.c': { defines: [], macroArgs } },
+  } }).functions.map(fn => fn.name).sort();
+  assert.deepEqual(parse([]), ['fallback_path', 'gcc_path']);
+  assert.deepEqual(parse(['-U', '__GNUC__']), ['fallback_path']);
+});

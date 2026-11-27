@@ -1610,7 +1610,7 @@ export async function runAiAgent({
   const hasProblemReport = /(?:有点问题|有问题|不对|错了|漏了|少了|缺了|没连上|没加上|乱了|重了|重叠|挤在一起)/u.test(userText);
   const readOnlyQuestion = explaining && !hasEditIntent;
   const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
-  const unanchoredDeictic = !hasSelectionContext && !hasProblemReport &&
+  const unanchoredDeictic = !hasSelectionContext &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
     !/[A-Za-z_][A-Za-z0-9_]{2,}/u.test(userText);
   const isCanvasWriteTool = (call) =>

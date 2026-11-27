@@ -1,4 +1,5 @@
 import { dependencyStamp } from './clang-config.js';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { preprocessProfile } from './builtin-includes.js';
@@ -7,7 +8,7 @@ import { applyStaticSchedule, staticSchedule } from '../tcu-schedule.js';
 import { assignCallGroups } from '../call-sequence.js';
 import { taskDeclarations } from '../task-declarations.js';
 import { lex } from '../lexer.js';
-import { fileMacroScope, preprocess } from '../preproc.js';
+import { expandSeq, fileMacroScope, preprocess } from '../preproc.js';
 import { collectDispatchDeclarations, collectEnumValues, findDispatchWrites, findFunctions, findFnPtrTables, findTypedefs, scanCalls } from '../extract.js';
 import { headerSymbols } from '../header-symbols.js';
 import { callNestingTokens, hasNestedCall } from '../detect-tasks.js';
@@ -26,8 +27,7 @@ function sharedDirectoryDepth(directory, file) {
   return depth;
 }
 
-function includedHeaders(headers, includes) {
-  const paths = new Set(headers.map(({ rel }) => rel));
+function includedHeaders(paths, includes) {
   const suffixes = new Map();
   for (const rel of paths) {
     for (let slash = rel.indexOf('/'); slash !== -1; slash = rel.indexOf('/', slash + 1)) {
@@ -243,6 +243,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const includes = [];
   const warnings = [...(scan?.warnings ?? [])];
   const externalDeps = new Map();
+  const externalHeaders = new Map();
   const missingIncludes = new Set();
   const macros = new Map();
   // 宏清单：同名后定义覆盖前定义，与「全局宏表」旧口径一致
@@ -252,6 +253,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const functions = [];
   const functionRecords = [];
   const deferredTypedefCalls = [];
+  const headerVariants = new Map();
   const typedefsByFile = new Map();
   const typedefHeadersByName = new Map();
   const fnptrTablesList = [];
@@ -290,8 +292,33 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     record.taskEvidence = collectTaskEvidence(fn, body, fileMacros, calls);
   };
 
-  const loadInput = ({ rel, abs, bytes }) => {
+  const recordHeaderContext = (file, input, tokens, macros, source) => {
+    // 大多数头文件只声明符号；只有包含函数定义的头才需要比对宏展开后的调用。
+    input.hasHeaderFunctions ??= findFunctions(input.tokens.filter(token => token.t !== 'preproc'), file.rel).length > 0;
+    if (!input.hasHeaderFunctions) return;
+    const expanded = expandSeq(tokens, macros);
+    const key = createHash('sha256')
+      .update(JSON.stringify(expanded.map(token => [token.v, token.line, token.col]))).digest('hex');
+    if (!headerVariants.has(file.rel)) headerVariants.set(file.rel, new Map());
+    const variants = headerVariants.get(file.rel);
+    let variant = variants.get(key);
+    if (!variant) {
+      variant = { callsByName: new Map(), sources: new Set() };
+      variants.set(key, variant);
+      for (const fn of findFunctions(tokens, file.rel)) {
+        const body = tokens.slice(fn.bodyStart + 1, fn.bodyEnd);
+        const calls = [];
+        scanCalls(body, { macros }, calls);
+        recordFunctionCalls({ fn, calls }, body, macros);
+        if (!variant.callsByName.has(fn.name)) variant.callsByName.set(fn.name, calls.filter(call => call.callee));
+      }
+    }
+    variant.sources.add(source);
+  };
+
+  const loadInput = ({ rel, abs, bytes, isHeader }) => {
     let buf;
+    let externalHeader;
     try {
       const size = bytes ?? fs.statSync(abs).size;
       if (size > MAX_FILE_BYTES) {
@@ -299,7 +326,8 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         return;
       }
       const stamp = dependencyStamp(abs);
-      buf = fs.readFileSync(abs);
+      if (isHeader && (rel.startsWith('../') || path.isAbsolute(rel))) externalHeader = fs.realpathSync(abs);
+      buf = fs.readFileSync(externalHeader || abs);
       if (stamp) externalDeps.set(abs, stamp);
       if (buf.length > MAX_FILE_BYTES) {
         warnings.push({ file: rel, error: `文件过大（${(buf.length / 1048576).toFixed(1)} MB），已跳过` });
@@ -318,6 +346,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       warnings.push({ file: rel, error: '疑似二进制文件（含 \\0），已跳过' });
       return;
     }
+    if (externalHeader) externalHeaders.set(rel, externalHeader);
     const src = decodeSource(buf);
     const original = lex(src, rel);
     const taskDefs = taskDeclarations(src, original);
@@ -325,7 +354,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     return { tokens: input, taskDefs, bytes: src.length };
   };
   const recordFile = ({ rel, isHeader }, { taskDefs, bytes }, { tokens, includes: inc }, fileMacros) => {
-    const typedefs = findTypedefs(tokens);
+    const typedefs = findTypedefs(tokens, fileMacros);
     if (typedefs.size) typedefsByFile.set(rel, typedefs);
     if (isHeader) for (const [name, entries] of typedefs) {
       if (!entries.some(entry => entry.fileScope)) continue;
@@ -405,7 +434,11 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
 
   // 构建配置按翻译单元处理 include，普通扫描沿用先头文件后源文件的顺序。
   if (pruneInactive) {
-    preprocessProfile(root, files, { ...parserOptions, allowLocalIncludes: !sourceFiles, onMissingInclude: file => missingIncludes.add(file) }, loadInput, recordFile);
+    preprocessProfile(root, files, {
+      ...parserOptions, availableFiles: rawFiles, allowLocalIncludes: !sourceFiles,
+      onMissingInclude: file => missingIncludes.add(file),
+      onHeaderContext: recordHeaderContext,
+    }, loadInput, recordFile);
   } else {
     for (const file of [...headers, ...sources]) {
       const input = loadInput(file);
@@ -414,7 +447,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       recordFile(file, input, preprocess(input.tokens, scope, file.rel), scope);
     }
   }
-  const includesHeader = includedHeaders(headers, includes);
+  const headerPaths = new Set(parsed.filter(file => file.isHeader).map(file => file.rel));
+  for (const { resolved } of includes) if (resolved) headerPaths.add(resolved);
+  const includesHeader = includedHeaders(headerPaths, includes);
   const lookupInitializerType = (file, name, at) => {
     const local = typedefsByFile.get(file)?.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     if (local) return { file, shape: local.shape };
@@ -456,12 +491,16 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
 
   const callCounts = new Map(functionRecords.filter(({ fn }) => byName.get(fn.name).length > 1)
     .map(({ fn, calls }) => [fn.id, calls.length]));
-  const resolveCallee = (name, fromFile) => {
+  const resolveCallee = (name, fromFile, sourceFile) => {
     const all = byName.get(name);
     if (!all) return `ext::${name}`;
     const local = all.find((f) => f.file === fromFile);
     if (local) return local.id;
-    const visibleStatic = f => f.isStatic && HDR_EXT.test(f.file) && includesHeader(fromFile, f.file);
+    if (sourceFile && sourceFile !== fromFile) {
+      const inSource = all.find(f => f.file === sourceFile);
+      if (inSource) return inSource.id;
+    }
+    const visibleStatic = f => f.isStatic && headerPaths.has(f.file) && includesHeader(fromFile, f.file);
     if (all.length === 1) return !all[0].isStatic || visibleStatic(all[0]) ? all[0].id : `ext::${name}`;
     const visibleStatics = all.filter(visibleStatic);
     let candidates = visibleStatics.length ? visibleStatics : all.filter(f => !f.isStatic);
@@ -640,7 +679,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     } else if (entry.isStatic) {
       if (!staticTablesByFile.has(entry.file)) staticTablesByFile.set(entry.file, new Map());
       staticTablesByFile.get(entry.file).set(entry.name, entry);
-      if (HDR_EXT.test(entry.file)) {
+      if (headerPaths.has(entry.file)) {
         if (!headerTablesByName.has(entry.name)) headerTablesByName.set(entry.name, []);
         headerTablesByName.get(entry.name).push(entry);
       }
@@ -666,6 +705,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     if (visible?.length) return visible.length === 1 ? visible[0] : null;
     return globalTablesByName.get(name) || null;
   };
+  // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
+  const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
+    part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
   const writtenSlots = new Map();
   const tableNames = new Set([
     ...cleanedTables.map(table => table.name),
@@ -679,7 +721,9 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       // 声明名本身已进入其局部作用域，不能把局部指针的初始化算到外层同名表。
       const table = lookupTable(fn, { ...write, col: write.col + 1 });
       if (!table || (write.escape && table.isConst)) continue;
-      if (write.escape === 'array' && (write.member || write.indices.length >= table.dims)) continue;
+      if (write.escape === 'array' && !parsedSlots.get(table).some(({ parts }) =>
+        parts.length > write.path.length && typeof parts[write.path.length] !== 'string' &&
+        compatiblePaths(parts, write.path))) continue;
       if (!writtenSlots.has(table)) writtenSlots.set(table, []);
       writtenSlots.get(table).push({ ...write, file: fn.file, fnId: fn.id });
     }
@@ -763,12 +807,13 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     return [...out.values()];
   };
   // null 仅匹配数组下标。成员与下标交错时，每个分量仍在原来的位置。
-  const compatiblePaths = (a, b) => a.slice(0, b.length).every((part, i) =>
-    part === b[i] || (typeof part !== 'string' && typeof b[i] !== 'string' && (part === null || b[i] === null)));
-  const possiblyWritten = (writes, path) => writes?.some(w => w.escape || compatiblePaths(w.path, path));
+  const possiblyWritten = (writes, path, unions = []) => writes?.some(w =>
+    w.escape === 'address' || compatiblePaths(w.path, path) || unions.some(depth =>
+      typeof w.path[depth] === 'string' && w.path[depth] !== path[depth] &&
+      compatiblePaths(w.path.slice(0, depth), path.slice(0, depth))));
   const matchTableSlots = (table, path, writes) => {
     const matched = [];
-    for (const { slot, target, parts, unknownPosition } of parsedSlots.get(table)) {
+    for (const { slot, target, parts, unknownPosition, unions } of parsedSlots.get(table)) {
       // 整个聚合值未知时，其后续成员也未知。省略括号且维度未知时可能跨行。
       const prefix = parts.length < path.length && (target === null || unknownPosition);
       if ((parts.length === path.length || prefix) && compatiblePaths(parts, path)) {
@@ -777,7 +822,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
           slot,
           rawTarget: target,
           candidateTargets,
-          target: possiblyWritten(writes, parts) ? null : target,
+          target: possiblyWritten(writes, parts, unions) ? null : target,
         });
       }
     }
@@ -802,10 +847,31 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
   const MAX_FNPTR_EDGES_PER_SITE = 32;
   const MAX_FNPTR_EDGES_PER_MODEL = 50000;
   let totalExpandedFnptrEdges = 0;
+  const headerCalls = (fn, calls) => {
+    const variants = headerVariants.get(fn.file);
+    if (!variants) return calls;
+    const direct = new Map();
+    let found = false;
+    for (const { callsByName, sources } of variants.values()) {
+      const fromVariant = callsByName.get(fn.name);
+      if (!fromVariant) continue;
+      found = true;
+      for (const call of fromVariant) {
+        if (skipTypeDependentCall(fn.file, call, fn.params)) continue;
+        for (const source of sources) {
+          const resolvedTarget = resolveCallee(call.callee, fn.file, source);
+          const key = JSON.stringify([call.line, call.col, call.kind, resolvedTarget]);
+          if (!direct.has(key)) direct.set(key, { ...call, resolvedTarget });
+        }
+      }
+    }
+    return found ? [...calls.filter(call => !call.callee), ...direct.values()] : calls;
+  };
+
   const indirectCalls = [];
   for (const { fn, calls, nesting, mentions, taskEvidence } of functionRecords) {
     const edgeStart = edges.length;
-    for (const call of calls) {
+    for (const call of headerCalls(fn, calls)) {
       if (call.callee) {
         if (dispatchPolicy === 'expand' && !byName.has(call.callee)) {
           const scalarRef = { callee: null, receiver: call.callee, path: [], indexExprs: [], member: null, firstOp: null, via: call.callee, line: call.line, col: call.col };
@@ -872,7 +938,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
         }
         edges.push({
           from: fn.id,
-          to: resolveCallee(call.callee, fn.file),
+          to: call.resolvedTarget ?? resolveCallee(call.callee, fn.file),
           callee: call.callee,
           kind: call.kind,
           line: call.line, col: call.col, orderGroup: call.orderGroup,
@@ -898,7 +964,7 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
       for (const source of sources) {
         if (!source.table) continue;
         let writes = writtenSlots.get(source.table);
-        if (writes && source.table.isStatic && HDR_EXT.test(source.table.file) && !HDR_EXT.test(fn.file)) {
+        if (writes && source.table.isStatic && headerPaths.has(source.table.file) && !headerPaths.has(fn.file)) {
           // 头文件里的 static 对象在每个翻译单元有独立实例。
           writes = writes.filter(write => write.file === fn.file || includesHeader(fn.file, write.file));
         }
@@ -1117,10 +1183,16 @@ function buildBuiltinIndex(root, sourceFiles = null, scan = null, parserOptions 
     includes,
     warnings,
     externalDeps: [...externalDeps.values()],
+    ...(externalHeaders.size ? { externalHeaders } : {}),
     missingIncludes: [...missingIncludes],
     compilationUnits: parserOptions?.compilationUnits || {},
     ...(Array.isArray(parserOptions?.defines) && parserOptions.defines.length ? { buildDefines: [...parserOptions.defines] } : {}),
-    ...(pruneInactive ? { pruneInactive: true, includeDirs: parserOptions.includeDirs || [], forcedIncludes: parserOptions.forcedIncludes || [] } : {}),
+    ...(pruneInactive ? {
+      pruneInactive: true, includeDirs: parserOptions.includeDirs || [], includeOptions: parserOptions.includeOptions,
+      forcedIncludes: parserOptions.forcedIncludes || [], macroIncludes: parserOptions.macroIncludes,
+      macroArgs: parserOptions.macroArgs, languageStandard: parserOptions.languageStandard,
+      workingDirectory: parserOptions.workingDirectory,
+    } : {}),
   };
 
   return model;
@@ -1135,13 +1207,14 @@ export const builtinParser = {
     const hasProfile = Boolean(options?.buildProfileId);
     const hasActive = Array.isArray(options?.activeFiles);
     const hasDefines = Array.isArray(options?.defines) && options.defines.length > 0;
-    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:5';
+    if (!hasProfile && !hasActive && !hasDefines && policy === 'expand') return 'builtin:13';
     return JSON.stringify([
-      'builtin:10',
+      'builtin:25',
       policy,
       options?.buildProfileId || null,
       hasActive ? options.activeFiles : null,
       hasDefines ? options.defines : [], options.includeDirs || [], options.forcedIncludes || [], options.compilationUnits || {},
+      options.includeOptions, options.macroArgs, options.macroIncludes, options.languageStandard, options.workingDirectory,
     ]);
   },
   parse: (root, { sourceFiles, scan, parserOptions }) => buildBuiltinIndex(root, sourceFiles, scan, parserOptions),
