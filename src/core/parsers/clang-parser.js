@@ -25,6 +25,16 @@ function hasConstSlots(node) {
   return pointer ? /\bconst\b/.test(pointer[1]) : /^const\b/.test(type);
 }
 
+// slot 由 AST 生成，只有方括号中的运行时下标可以匹配另一侧的下标。
+function matchingSlot(a, b) {
+  if (a === b) return true;
+  if (!a.includes('[*]') && !b.includes('[*]')) return false;
+  const indices = /(\[(?:\*|-?\d+)\])/;
+  const left = a.split(indices), right = b.split(indices);
+  return left.length === right.length && left.every((part, i) => part === right[i] ||
+    (i % 2 === 1 && (part === '[*]' || right[i] === '[*]')));
+}
+
 function resolveDecl(ref, context, byDecl, exported) {
   const declaration = context.declarations.get(ref?.id);
   return byDecl.get(context)?.get(ref?.id)
@@ -75,17 +85,26 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   // 局部变量即使与全局同名也不能从名字回退到全局定义。
   const resolveVariable = (ref, unit) => ref?.kind === 'VarDecl' ? varDecls.get(unit).get(ref.id) : undefined;
 
+  // AST 地址只在单个编译单元内唯一。局部对象用声明节点本身作为键。
+  const objectKey = (decl, unit) => resolveVariable(decl, unit) ?? unit.declarations.get(decl?.id)?.node;
   const tables = new Map(), addressTaken = new Map(), calls = [], byRecordField = new Map(), declWrites = new Map();
   // 同一头文件声明在不同编译单元有不同 AST id，但共享源码位置。
   const fieldKey = (unit, id) => {
     const field = unit.declarations.get(id);
     return field?.position?.file && `${field.position.file}:${field.position.offset}:${field.node.name}`;
   };
-  const indexField = (unit, id, target) => {
+  // 字段声明不携带外层对象路径，但字段自身的数组下标仍约束候选。
+  const memberIndices = slot => {
+    const start = slot.indexOf('[', slot.lastIndexOf('.') + 1);
+    return start < 0 ? '' : slot.slice(start);
+  };
+  const indexField = (fields, unit, id, slot, target) => {
     const key = fieldKey(unit, id);
     if (!key) return;
-    if (!byRecordField.has(key)) byRecordField.set(key, new Set());
-    byRecordField.get(key).add(target);
+    if (!fields.has(key)) fields.set(key, new Map());
+    const indices = memberIndices(slot), slots = fields.get(key);
+    if (!slots.has(indices)) slots.set(indices, new Set());
+    slots.get(indices).add(target);
   };
   const noteAddress = (ref, unit) => {
     const target = resolveFunction(ref.referencedDecl, unit);
@@ -93,15 +112,23 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     if (!addressTaken.has(sig)) addressTaken.set(sig, new Set());
     addressTaken.get(sig).add(target);
   };
+  const localFields = new WeakMap();
+  const fieldsFor = (unit, node) => {
+    const scope = unit.scopeOf.get(node);
+    if (!localFields.has(scope)) localFields.set(scope, new Map());
+    return localFields.get(scope);
+  };
+  const indexTable = (node, unit, fields) => {
+    const candidateSlots = new Map();
+    const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
+      (id, slot, target) => indexField(fields, unit, id, slot, target));
+    if (slots.size || candidateSlots.size) {
+      tables.set(objectKey(node, unit), { slots, candidateSlots, constant: hasConstSlots(node) });
+    }
+  };
   for (const unit of units) {
     for (const node of unit.globals) {
-      const candidateSlots = new Map();
-      const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
-        (id, target) => indexField(unit, id, target));
-      if (slots.size || candidateSlots.size) {
-        const id = varDecls.get(unit).get(node.id);
-        tables.set(id, { slots, candidateSlots, constant: hasConstSlots(node) });
-      }
+      if (node.init) indexTable(node, unit, byRecordField);
       const init = node.init && children(node).find((n) => !n.kind.endsWith('Attr'));
       if (init) for (const child of walk(init)) {
         if (child.kind === 'DeclRefExpr' && child.referencedDecl?.kind === 'FunctionDecl') noteAddress(child, unit);
@@ -110,6 +137,9 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     for (const record of unit.functions) {
       const direct = new Set();
       for (const node of walk(record.body)) {
+        if (node.kind === 'VarDecl' && node.init && node.storageClass !== 'extern') {
+          indexTable(node, unit, fieldsFor(unit, node));
+        }
         if (node.kind === 'CallExpr' && node.inner?.length) {
           const [callee] = node.inner, ref = fnRef(callee);
           if (ref) direct.add(ref);
@@ -118,10 +148,13 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         if (node.kind === 'DeclRefExpr' && node.referencedDecl?.kind === 'FunctionDecl' && !direct.has(node)) noteAddress(node, unit);
       }
       for (const w of collectAssignmentWrites(record.body, unit, resolveFunction)) {
-        const declKey = resolveVariable(w.decl, unit) || w.decl.id;
+        const declKey = objectKey(w.decl, unit);
         if (!declWrites.has(declKey)) declWrites.set(declKey, []);
         declWrites.get(declKey).push(w);
-        if (w.fieldId) for (const target of w.targets) indexField(unit, w.fieldId, target);
+        if (w.fieldId) {
+          const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
+          for (const target of w.targets) indexField(fields, unit, w.fieldId, w.slot, target);
+        }
       }
     }
   }
@@ -145,32 +178,39 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       const pointer = pointerExpression(callee, context);
       const expression = context.loc.text(callee) || pointer?.decl?.name || '<间接调用>';
       const signature = functionSignature(typeOf(callee), context);
-      const varKey = resolveVariable(pointer?.decl, context) || pointer?.decl?.id;
+      const varKey = objectKey(pointer?.decl, context);
       const table = tables.get(varKey);
       const exact = pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const slotRegex = table && pointer?.slot.includes('[*]')
-        ? new RegExp('^' + pointer.slot.split('[*]').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\[\\d+\\]') + '$') : null;
       const matchingSlots = [];
       if (table) {
-        if (table.slots.get(pointer?.slot)) matchingSlots.push(table.slots.get(pointer.slot));
-        for (const ct of (table.candidateSlots?.get(pointer?.slot) || [])) matchingSlots.push(ct);
-        if (slotRegex) {
-          for (const [slot, to] of table.slots) if (slotRegex.test(slot) && (!targets?.size || targets.has(to))) matchingSlots.push(to);
-          for (const [slot, tos] of (table.candidateSlots || [])) {
-            if (slotRegex.test(slot)) for (const to of tos) if (!targets?.size || targets.has(to)) matchingSlots.push(to);
-          }
+        if (pointer.slot.includes('[*]')) {
+          for (const [slot, to] of table.slots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(to);
+          for (const [slot, tos] of table.candidateSlots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(...tos);
+        } else {
+          if (table.slots.has(pointer.slot)) matchingSlots.push(table.slots.get(pointer.slot));
+          matchingSlots.push(...(table.candidateSlots.get(pointer.slot) || []));
         }
       }
-      const writesForVar = (declWrites.get(varKey) || []).filter(w => {
-        if (!pointer?.slot) return !w.slot;
-        if (w.slot === pointer.slot) return true;
-        return slotRegex ? slotRegex.test(w.slot) : false;
-      });
+      const objectWrites = declWrites.get(varKey) || [];
+      const writesForVar = objectWrites.filter(w => matchingSlot(w.slot, pointer.slot));
       const writtenTargets = writesForVar.flatMap(w => w.targets);
-      const fieldCandidates = byRecordField.get(fieldKey(context, pointer?.fieldId)) || new Set();
+      const field = fieldKey(context, pointer?.fieldId);
+      const fieldCandidates = new Set();
+      const knownObject = table || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
+        (pointer.member || objectWrites.length || /\[[^\]]*\]$/.test(typeOf(pointer.decl))));
+      if (field && !knownObject) {
+        const indices = memberIndices(pointer.slot);
+        const collect = fields => {
+          for (const [slot, ids] of fields?.get(field) || []) {
+            if (matchingSlot(slot, indices)) for (const id of ids) fieldCandidates.add(id);
+          }
+        };
+        collect(byRecordField);
+        for (let scope = context.scopeOf.get(node); scope; scope = context.scopeOf.get(scope)) collect(localFields.get(scope));
+      }
       if (dispatchPolicy === 'strict') {
-        if (exact && !writtenTargets.length) {
+        if (exact && !writesForVar.length) {
           candidates = [exact];
           resolution = 'exact';
           via = `${expression}（初始化槽位）`;
@@ -187,8 +227,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
       } else {
         const combinedSlots = [...new Set([...matchingSlots, ...writtenTargets])];
-        const hasMemberType = Boolean(pointer?.member && pointer?.baseType);
-        if (exact && !writtenTargets.length) {
+        const signatureTargets = !knownObject && !(pointer?.member && pointer.baseType) ? targets : null;
+        if (exact && !writesForVar.length) {
           candidates = [exact];
           resolution = 'exact';
           via = `${expression}（初始化槽位）`;
@@ -202,8 +242,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           resolution = 'possible';
           dynamicDispatch = true;
           via = `${expression}（结构体字段 ${pointer.baseType}.${pointer.member}）`;
-        } else if (!hasMemberType && targets?.size) {
-          candidates = [...targets].slice(0, 32);
+        } else if (signatureTargets?.size) {
+          candidates = [...signatureTargets].slice(0, 32);
           resolution = 'possible';
           dynamicDispatch = true;
           via = `${expression}（类型签名 ${signature} + 已取地址函数）`;
@@ -221,7 +261,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           indirectCalls.push({
             caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
             expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
-            resolution, truncated: (combinedSlots.length || fieldCandidates.size || targets?.size || 0) > 32,
+            resolution, truncated: (combinedSlots.length || fieldCandidates.size || signatureTargets?.size || 0) > 32,
             matchedSlots: icCands.length, candidates: icCands,
           });
         }
@@ -259,7 +299,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
     edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings, indirectCalls,
     enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
-    fnptrTables: [...tables].map(([id, { slots }]) => ({
+    fnptrTables: [...tables].filter(([id]) => defs.has(id)).map(([id, { slots }]) => ({
       id, name: defs.get(id).name, file: defs.get(id).file,
       map: Object.fromEntries([...slots].map(([slot, to]) => [slot, (functions.get(to) || externals.get(to)).name])),
     })),

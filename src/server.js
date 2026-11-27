@@ -2708,7 +2708,8 @@ export const server = http.createServer(async (req, res) => {
           saveInferredEdges(PROJECT.id, canvas.before.inferredEdges);
         }
         const currentPage = latestPage();
-        nextPage = restorePage ? canvas.before.page && { ...canvas.before.page, reviewing: false, at: 0, ts: Date.now() } : currentPage;
+        nextPage = restorePage ? { ...(canvas.before.page ?? { ...viewSnapshot({ empty: true }), projectId: PROJECT.id }),
+          reviewing: false, at: 0, ts: Date.now() } : currentPage;
         if (restorePage && nextPage && currentPage) {
           for (const key of ['cam', 'ctxBox', 'selected', 'selectedEdge', 'activeBookmark']) {
             if (!isDeepStrictEqual(currentPage[key], canvas.after.page?.[key])) nextPage[key] = currentPage[key];
@@ -2735,7 +2736,7 @@ export const server = http.createServer(async (req, res) => {
       aiChangesets.delete(changesetId);
       for (const [op, detail] of bookmarkEvents) broadcastChange(op, 'user', { projectId: PROJECT.id, ...detail });
       broadcastChange('restore_point', 'user', { projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
-      return json(res, { ok: true, eventId, undoneOps: snap.ops || [] });
+      return json(res, { ok: true, eventId, canvasChanged: Boolean(canvas), scopeChanged: Boolean(restorePage), undoneOps: snap.ops || [] });
     }
 
     if (u.pathname === '/api/ai/chats') {
@@ -7111,12 +7112,11 @@ export const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then(async (p) => {
           const at = Number(p.eventId);
-          if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
-          const latest = store.latestEventId(PROJECT.id);
-          if (at > latest) return bad(res, 'eventId 超出范围');
+          if (!Number.isSafeInteger(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
+          if (!store.hasEvent(PROJECT.id, at)) return bad(res, '当前工程没有此历史事件');
           let restored = store.overlayAt(PROJECT.id, at);
           let restoredView = store.viewAt(PROJECT.id, at);
-          let restoredPage;
+          let restoredPage, checkpointId;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
           let restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
@@ -7125,6 +7125,16 @@ export const server = http.createServer(async (req, res) => {
             if (!currentSession(req)) return sessionConflict(res);
           }
           const eventId = store.transaction(() => {
+            // 在覆盖前读取同一事务中的最新工作区，含回看期间其他客户端的写入。
+            const live = latestPage();
+            const view = viewSnapshot(live ?? { empty: true });
+            const label = '恢复前自动快照';
+            checkpointId = store.appendEvent(PROJECT.id, {
+              op: 'view.checkpoint', target: label, actor: p.actor === 'ai' ? 'ai' : 'user',
+              after: { ...store.loadOverlay(PROJECT.id), manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)), view },
+              ctx: { milestone: 1, checkpointName: label, ...(live?.activeBookmark ?
+                { bookmarkId: live.activeBookmark.id, bookmarkName: live.activeBookmark.name } : {}) },
+            });
             store.replaceOverlay(PROJECT.id, restored);
             saveManualNodes(PROJECT.id, restoredManualList);
             const reconciled = reconcileManualVariables(MODEL, PROJECT.id, restoredManualList, restoredView);
@@ -7155,7 +7165,7 @@ export const server = http.createServer(async (req, res) => {
           overlay.deleted = restored.deleted;
           overlay.layout = restored.layout;
           broadcastChange('restore_point', p.actor === 'ai' ? 'ai' : 'user');
-          json(res, { ok: true, eventId, ...(restoredView ? { restoredView } : {}) });
+          json(res, { ok: true, eventId, checkpointId, ...(restoredView ? { restoredView } : {}) });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);

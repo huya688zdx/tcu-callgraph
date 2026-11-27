@@ -88,6 +88,7 @@ async function flushReload() {
         up: page.up ?? 0, down: page.down ?? 0, group: page.group, groupMode: page.groupMode, empty: !!page.empty,
         vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
+      if (page.revision <= pageRevision) return; // 等待加载期间，撤销可能已安装更新的页面。
       if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
       state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
@@ -139,6 +140,7 @@ async function flushReload() {
     void loadStats().catch(() => {});
     void reloadTimeline(); // 时间轴面板开着时同步新事件
   } catch {
+    if (compose && compose.page.revision <= pageRevision) return;
     // 刷新失败（服务重启中等）：稍后重试，连续失败则放弃并提示手动刷新
     failures++;
     if (failures <= 3) {
@@ -279,6 +281,28 @@ export function acceptRestoredRevision(revision) {
   if (pendingCompose && pendingCompose.page.projectId === state.view?.projectId && pendingCompose.page.revision <= pageRevision) {
     pendingCompose = null;
   }
+}
+
+// AI 撤销已在服务端提交。以最新保存范围刷新，保留本窗口的镜头、书签和回看位置。
+export async function refreshAfterAiUndo({ canvasChanged, scopeChanged, eventId }, projectId) {
+  void reloadTimeline();
+  if (!canvasChanged || state.view?.projectId !== projectId || state.view?.comparison) return;
+  if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+  let view;
+  if (scopeChanged) {
+    const latest = await api.savedPage();
+    if (latest.ok === false) throw new Error(latest.error);
+    if (state.view?.projectId !== projectId || latest.project?.id !== projectId || latest.comparisonId) return;
+    if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+    const page = latest.page;
+    if (!page) throw new Error(t('app.viewFailed'));
+    acceptRestoredRevision(Math.max(eventId, page.revision));
+    view = await hooks.loadView(page.roots, { ...page, nav: false, incremental: true, keepViewport: true });
+  } else {
+    view = await hooks.reloadKeepCam({ keepViewport: true });
+  }
+  if (!view && state.view?.projectId === projectId && !state.at) throw new Error(t('app.viewFailed'));
+  void loadStats().catch(() => {});
 }
 
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */

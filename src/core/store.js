@@ -332,6 +332,7 @@ function applyEvent(ov, e) {
   const after = e.after || {};
   switch (e.op) {
     // 携带全量状态的节点：直接整体替换
+    case 'view.checkpoint': // 普通检查点只记范围；恢复前的检查点还携带完整现场。
     case 'baseline':
     case 'restore_point':
     case 'manual.variable.bind':
@@ -646,6 +647,7 @@ export function openStore({ dbPath, userData } = {}) {
        WHERE project_id = ? AND id <= ? AND json_type(after, '$.view') = 'object' ORDER BY id ASC`
     ),
     eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
+    eventExists: db.prepare('SELECT 1 FROM event WHERE project_id = ? AND id = ?'),
     canvasEventMax: db.prepare(`SELECT MAX(id) AS id FROM event WHERE project_id = ?
       AND op NOT IN ('bookmark.save', 'bookmark.delete', 'view.checkpoint', 'view.snapshot')
       AND (op != 'restore_point' OR COALESCE(json_extract(ctx, '$.canvasChanged'), 1) != 0)`),
@@ -928,6 +930,10 @@ export function openStore({ dbPath, userData } = {}) {
     /** 时间轴回放用：按 id 升序取到某个事件为止 */
     eventsUpTo(projectId, eventId) {
       return q.eventUpTo.all(projectId, eventId).map(toEvent);
+    },
+
+    hasEvent(projectId, eventId) {
+      return !!q.eventExists.get(projectId, eventId);
     },
 
     latestCanvasEventId(projectId) {

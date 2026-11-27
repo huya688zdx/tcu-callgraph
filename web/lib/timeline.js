@@ -208,7 +208,7 @@ function renderAll() {
     const target = e.target || '';
     const codeTarget = ['Node', 'Edge', 'Delete', 'Layout', 'Compose'].includes(kind);
     const displayTarget = kind === 'Canvas' || kind === 'ClearCanvas' ? ''
-      : kind === 'Checkpoint' ? (e.ctx?.checkpointName || b.label || target || t('timeline.kindCheckpoint'))
+      : kind === 'Checkpoint' ? (e.ctx?.checkpointName || e.brief?.label || target || t('timeline.kindCheckpoint'))
       : kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
       : kind === 'Compose' && !target.includes('::') ? '' : target;
     const { title, meta } = codeTarget
@@ -413,19 +413,6 @@ restoreBtn?.addEventListener('click', async () => {
   restoringSnapshot = true;
   syncReviewControls();
   try {
-    // 非破坏性恢复：若当前恢复前工作区有节点且曾偏离书签，先自动记录安全检查点
-    if (preReview && (preReview.roots?.length || preReview.expansions?.length) && !state.view?.comparison) {
-      await api.saveCheckpoint('恢复前自动快照', {
-        roots: preReview.roots,
-        expansions: preReview.expansions,
-        up: preReview.up,
-        down: preReview.down,
-        group: preReview.group,
-        groupMode: preReview.groupMode,
-        vars: preReview.vars,
-        hiddenVars: preReview.hiddenVars,
-      }, state.activeBookmark ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name } : {}).catch(() => {});
-    }
     const r = await api.restore(state.at);
     if (seq !== reviewSeq) return;
     if (!r?.ok) throw new Error(r?.error || t('timeline.restoreFailed'));

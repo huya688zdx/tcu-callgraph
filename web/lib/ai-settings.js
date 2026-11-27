@@ -9,6 +9,7 @@ import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachment
 import { api, clientId } from './api.js';
 import { focusBox } from './camera.js';
 import { hooks } from './hooks.js';
+import { refreshAfterAiUndo } from './live.js';
 import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
 import { runSearch } from './panels.js';
@@ -1972,16 +1973,24 @@ function renderChangesetUndo(box, changeset) {
   btnUndo.addEventListener('click', async () => {
     btnUndo.disabled = true;
     btnUndo.textContent = '正在撤销…';
+    const projectId = state.view?.projectId;
+    let res;
     try {
-      const res = await api.aiUndoChangeset(changeset.id);
+      res = await api.aiUndoChangeset(changeset.id);
       if (!res?.ok) throw new Error(res?.error || '撤销失败');
-      btnUndo.textContent = '✓ 已撤销本轮 AI 改动';
-      setChatStatus('已回退到本轮 AI 改图前状态');
-      await hooks.reload?.();
     } catch (err) {
       btnUndo.disabled = false;
       btnUndo.textContent = `↶ 撤销本轮改图`;
       setChatStatus(`撤销失败：${err.message || err}`, true);
+      return;
+    }
+    try {
+      await refreshAfterAiUndo(res, projectId);
+      btnUndo.textContent = '✓ 已撤销本轮 AI 改动';
+      setChatStatus(state.at ? '已撤销最新画布的改动，当前仍在回看历史' : '已回退到本轮 AI 改图前状态');
+    } catch (err) {
+      btnUndo.textContent = '已撤销，画布待刷新';
+      setChatStatus(`撤销已完成，刷新画布失败：${err.message || err}`, true);
     }
   });
   bar.appendChild(btnUndo);

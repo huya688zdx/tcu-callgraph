@@ -164,3 +164,70 @@ test('Clang 下标只采信整个表达式的常量值，保留窄化转换', re
     }
   }
 });
+
+test('Clang 下标写入与调用对称匹配，保留不同层级、字段和对象的边界', requiresClang, async t => {
+  const dir = project(t, [
+    'typedef void (*Fn)(void); typedef struct { Fn fn[2]; Fn spare; } Row;',
+    'void a(void) {} void b(void) {} void c(void) {} void d(void) {}',
+    'static Row rows[2] = { {{a,b}, d}, {{b,b}, d} };',
+    'static Row other[1] = { {{d,d}, d} }; static Fn bare[2];',
+    'void change(int i) { rows[i].fn[0] = c; bare[i] = c; }',
+    'void constant(void) { rows[0].fn[0](); } void dynamic(int j) { rows[1].fn[j](); }',
+    'void apart(void) { rows[0].fn[1](); } void sibling(void) { rows[1].spare(); }',
+    'void separate(void) { other[0].fn[0](); } void uninitialized(void) { bare[0](); }',
+    'void bare_other(void) { bare[1](); } void parameter(Row *p) { p->fn[1](); }',
+  ].join('\n'));
+  for (const policy of ['strict', 'expand']) {
+    const model = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [name, expected] of [['constant', ['a','c']], ['dynamic', ['b','c']], ['apart', ['b']],
+      ['sibling', ['d']], ['separate', ['d']], ['uninitialized', ['c']], ['bare_other', ['c']], ['parameter', ['b','d']]]) {
+      const caller = 'main.c::' + name;
+      const site = model.indirectCalls.find(s => s.caller === caller);
+      assert.deepEqual(site?.candidates.map(c => c.name).sort(), expected, policy + ' ' + name);
+      assert.equal((model._index.outAdj.get(caller) || []).some(e => e.kind === 'fnptr' && e.resolution === 'exact'), false);
+    }
+  }
+});
+
+test('Clang 局部回调表采用声明身份和词法作用域，同名对象、类型和函数互不串线', requiresClang, async t => {
+  const dir = project(t, [
+    'typedef void (*Fn)(void); struct Ops { Fn run; };',
+    'void a(void) {} void b(void) {} void c(void) {} void unused(void) {}',
+    'static const struct Ops global = { unused };',
+    'void one(int i) {',
+    '  struct Ops row = {a}; row.run();',
+    '  { struct Ops { Fn other; Fn run; }; const struct Ops row = {unused, b}; row.run(); }',
+    '  row.run(); const Fn slots[] = {a, b}; slots[1](); slots[i]();',
+    '}',
+    'void two(void) { struct Ops row = {c}; row.run(); }',
+    'void typed(void) { typedef struct { Fn run; } Local; Local local = {b}; Local *p = &local; p->run(); }',
+    'void untouched(void) { struct Blank { Fn run; }; struct Blank *p = 0; if (p) p->run(); }',
+    'void empty_table(void) { Fn slots[2] = {0}; if (slots[0]) slots[0](); }',
+    'void empty_row(void) { struct Ops row = {0}; if (row.run) row.run(); }',
+    'void caller_a(struct Ops *p) { struct Ops local = {a}; p->run(); }',
+    'void caller_b(struct Ops *p) { struct Ops local = {b}; p->run(); }',
+    'void blocks(struct Ops *p) { { struct Ops local = {a}; p->run(); } { struct Ops local = {b}; p->run(); } }',
+  ].join('\n'));
+  for (const policy of ['strict', 'expand']) {
+    const model = await buildIndex(dir, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const calls = name => {
+      const id = 'main.c::' + name;
+      const exact = (model._index.outAdj.get(id) || []).filter(e => e.kind === 'fnptr' && e.resolution === 'exact')
+        .map(e => ({ line: e.line, col: e.col, targets: [e.callee], resolution: 'exact' }));
+      return [...exact, ...model.indirectCalls.filter(s => s.caller === id)
+        .map(s => ({ line: s.line, col: s.col, targets: s.candidates.map(c => c.name).sort(), resolution: s.resolution }))]
+        .sort((a,b) => a.line-b.line || a.col-b.col);
+    };
+    assert.deepEqual(calls('one').map(c => c.targets), [['a'], ['b'], ['a'], ['b'], ['a','b']], policy);
+    assert.deepEqual(calls('one').map(c => c.resolution === 'exact'), [false, true, false, true, false]);
+    assert.deepEqual(calls('two').map(c => c.targets), [['c']]);
+    assert.deepEqual(calls('typed').map(c => c.targets), [['b']]);
+    for (const name of ['untouched', 'empty_table', 'empty_row']) {
+      assert.deepEqual(calls(name).map(c => c.targets), [[]], name);
+    }
+    assert.deepEqual(calls('caller_a').map(c => c.targets), [['a','unused']]);
+    assert.deepEqual(calls('caller_b').map(c => c.targets), [['b','unused']]);
+    assert.deepEqual(calls('blocks').map(c => c.targets), [['a','unused'], ['b','unused']]);
+    assert.ok(model.fnptrTables.every(table => table.name !== 'row' && table.name !== 'slots'));
+  }
+});

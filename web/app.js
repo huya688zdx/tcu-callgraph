@@ -190,9 +190,9 @@ async function loadView(rootId, opts = {}) {
   const oldEdges = new Set((keepCam ? priorView.edges : []).map(edgeKey));
   const addedNodes = keepCam || opts.selectAdded ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   const addedEdges = keepCam ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  if (!keepCam) {
+  if (!keepCam && !opts.keepViewport) {
     fit({ paint: false });
-  } else {
+  } else if (keepCam && !opts.keepViewport) {
     // 先按共同节点的位移锚定当前镜头起点，避免重排瞬间旧节点在屏幕上跳变，再平滑移向新增节点。
     const common = data.nodes.filter((n) => oldNodes.has(n.id));
     if (common.length) {
@@ -592,8 +592,8 @@ async function navigateBack() {
 }
 
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
-async function reloadKeepCam() {
-  return loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true });
+async function reloadKeepCam({ keepViewport = false } = {}) {
+  return loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true, keepViewport });
 }
 
 async function deleteSelection() {

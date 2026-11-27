@@ -173,17 +173,25 @@ export function readTranslationUnit(ast, root, unit, files) {
   const loc = sourceLocations(root, unit, files);
   loc.record(ast);
   const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map(),
-    declaratorSources: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
+    declaratorSources: new WeakMap(), initializerRecords: new WeakMap(), scopeOf: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
   const recordsById = new Map();
-  const aliasRecords = new Map();
-  function collect(node, insideFunction) {
+  const recordScopes = [context.records], typedefRecords = new Map();
+  function collect(node, insideFunction, parentScope) {
     const position = loc.loc(node);
     const { id, kind, name } = node;
+    const newScope = ['FunctionDecl', 'CompoundStmt', 'ForStmt'].includes(kind);
+    if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator'].includes(kind))) {
+      context.scopeOf.set(node, parentScope);
+    }
+    if (newScope) recordScopes.push(new Map());
+    const scope = recordScopes.at(-1);
     if (id && kind?.endsWith('Decl')) context.declarations.set(id, { node, position });
     if (kind === 'EnumDecl') collectEnum(node, context, insideFunction);
-    if (kind === 'RecordDecl' && node.completeDefinition && !insideFunction) {
-      recordsById.set(id, node);
-      if (name) context.records.set(`${node.tagUsed} ${name}`, node);
+    if (kind === 'RecordDecl' && node.completeDefinition) {
+      for (let decl = node; decl && !recordsById.has(decl.id); decl = context.declarations.get(decl.previousDecl)?.node) {
+        recordsById.set(decl.id, node);
+      }
+      if (name) scope.set(`${node.tagUsed} ${name}`, node);
       // 内嵌匿名记录的 FieldDecl 与定义从同一源位置开始。保留 Clang 的完整类型名。
       const anonymous = new Map();
       for (const child of children(node)) {
@@ -192,14 +200,25 @@ export function readTranslationUnit(ast, root, unit, files) {
         const key = `${start.abs}:${start.offset}`;
         if (child.kind === 'RecordDecl' && !child.name && child.completeDefinition) anonymous.set(key, child);
         if (child.kind === 'FieldDecl' && anonymous.has(key)) {
-          context.records.set(typeOf(child).replace(/\s*\[[^\]]*\]/g, ''), anonymous.get(key));
+          scope.set(typeOf(child).replace(/\s*\[[^\]]*\]/g, ''), anonymous.get(key));
         }
       }
     }
     if (kind === 'TypedefDecl' && name && !node.isImplicit) {
       context.aliases.set(name, typeOf(node));
       const tag = [...walk(node)].find((child) => child.ownedTagDecl || child.decl?.kind === 'RecordDecl');
-      if (tag && !insideFunction) aliasRecords.set(name, (tag.ownedTagDecl || tag.decl).id);
+      if (tag) {
+        const decl = tag.ownedTagDecl || tag.decl;
+        typedefRecords.set(id, decl);
+        scope.set(name, decl);
+      }
+    }
+    if (kind === 'InitListExpr') {
+      // Clang 的 typedef id 优先；同名结构标签按初始化器所在块查找。
+      let decl = typedefRecords.get(node.type?.typeAliasDeclId);
+      const type = typeOf(node).replace(/\b(const|volatile|restrict)\b/g, '').trim();
+      for (let i = recordScopes.length - 1; !decl && i >= 0; i--) decl = recordScopes[i].get(type);
+      if (decl) context.initializerRecords.set(node, recordsById.get(decl.id) || decl);
     }
     if (position?.file && name && !node.isImplicit) {
       if (kind === 'FunctionDecl') {
@@ -225,11 +244,14 @@ export function readTranslationUnit(ast, root, unit, files) {
         }
         previousEnd = end;
       }
-      collect(child, insideFunction || kind === 'FunctionDecl');
+      collect(child, insideFunction || kind === 'FunctionDecl', newScope ? node : parentScope);
     }
+    if (newScope) recordScopes.pop();
   }
   collect(ast, false);
-  for (const [name, id] of aliasRecords) if (recordsById.has(id)) context.records.set(name, recordsById.get(id));
+  for (const [name, decl] of context.records) {
+    if (recordsById.has(decl.id)) context.records.set(name, recordsById.get(decl.id));
+  }
   return context;
 }
 
@@ -319,16 +341,16 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots, ind
     if (ref) {
       const target = resolveFunction(ref.referencedDecl, context);
       slots.set(slot, target);
-      if (fieldId) indexField(fieldId, target);
+      if (fieldId) indexField(fieldId, slot, target);
     } else if (value.kind === 'ConditionalOperator' && candidateSlots) {
       const cands = [];
       collectRhsRefs(value, cands);
       if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
-      if (fieldId) for (const target of cands) indexField(fieldId, target);
+      if (fieldId) for (const target of cands) indexField(fieldId, slot, target);
     } else if (value.kind === 'InitListExpr') {
       const type = typeOf(value);
       const isArray = /\[[^\]]*\]$/.test(type);
-      const fields = children(recordType(type, context)).filter((field) => field.kind === 'FieldDecl');
+      const fields = children(context.initializerRecords.get(value)).filter(field => field.kind === 'FieldDecl');
       initializers(value).forEach((child, i) => {
         const field = value.field || fields[i];
         const childSlot = field?.name ? `${slot}.${field.name}` : isArray ? `${slot}[${i}]` : slot;
@@ -383,13 +405,18 @@ export function pointerExpression(node, context = null) {
     return {
       ...base,
       slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      throughPointer: base.throughPointer || node.isArrow ||
+        (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay'),
       fieldId: node.kind === 'MemberExpr' ? node.referencedMemberDecl : base.fieldId,
       member: node.kind === 'MemberExpr' ? node.name : base.member,
       baseType: rawBaseType || base.baseType,
       exact: base.exact && !node.isArrow && (node.kind !== 'ArraySubscriptExpr' || constant !== null),
     };
   }
-  if (node.kind === 'UnaryOperator' && node.opcode === '*') return pointerExpression(children(node)[0], context);
+  if (node.kind === 'UnaryOperator' && node.opcode === '*') {
+    const base = pointerExpression(children(node)[0], context);
+    return base && { ...base, throughPointer: true };
+  }
   return null;
 }
 
@@ -411,10 +438,11 @@ export function collectAssignmentWrites(body, context, resolveFunction) {
     if (!lhs?.decl) continue;
     const targets = [];
     collectRhs(children(node)[1], targets);
-    if (!targets.length) continue;
+    // 赋入未知回调同样可能覆盖初始槽，不能仅凭没有已知 RHS 就认定精确。
+    if (!targets.length && !/\(\s*\*/.test(typeOf(children(node)[0]))) continue;
     const pos = context.loc.begin(node);
     writes.push({
-      decl: lhs.decl,
+      node, decl: lhs.decl,
       slot: lhs.slot,
       fieldId: lhs.fieldId,
       line: pos?.line ?? 0,

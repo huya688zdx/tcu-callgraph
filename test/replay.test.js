@@ -11,6 +11,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { openStore } from '../src/core/store.js';
 import { diffViewScopes } from '../src/core/view-scope.js';
@@ -296,4 +298,111 @@ test('diffViewScopes 能识别同一函数的局部展开层数变化', () => {
   assert.equal(diff.changed, true);
   assert.equal(diff.expansionDepthChanged, true);
   assert.match(diff.summary, /局部展开/);
+});
+
+test('恢复历史时原子保存最新工作区检查点，空画布和局部展开均可恢复', async t => {
+  const old = { roots: ['gear.c::Gear_Init'], up: 0, down: 0 };
+  const id = 'main.c::main';
+  for (const [name, scope] of [['空画布', { roots: [], expansions: [], empty: true }],
+    ['只有局部展开', { roots: [], expansions: [{ root: id, up: 1, down: 0 }], empty: false }]]) {
+    await t.test(name, async t => {
+      const srv = await launchServer(); t.after(srv.close);
+      const post = (url, p) => jsonPost(srv.baseUrl, url, p);
+      const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+      const { eventId } = await post('/api/view-event', { op: 'view.snapshot', view: old });
+      await post('/api/page', { ...scope, groupMode: 'flat', up: 0, down: 0 });
+      await post('/api/overlay', { nodeId: id, data: { note: '最新工作' } });
+      await post('/api/page', { ...old, at: eventId });
+      const result = await post('/api/restore', { eventId });
+      assert.ok(result.ok, result.error);
+      const events = (await get('/api/events?detail=1')).events;
+      const cp = events.find(e => e.id === result.checkpointId);
+      assert.equal(cp?.op, 'view.checkpoint');
+      assert.equal(cp.target, '恢复前自动快照');
+      assert.deepEqual(cp.after.view.expansions, scope.expansions);
+      assert.deepEqual(cp.after.view.roots, []);
+      assert.equal(cp.after.view.empty, scope.empty);
+      assert.equal(cp.after.view.groupMode, 'flat');
+      assert.deepEqual((await get('/api/page?saved=1')).page.roots, old.roots);
+      const recovered = await post('/api/restore', { eventId: cp.id });
+      assert.equal(recovered.ok, true, recovered.error);
+      assert.deepEqual(recovered.restoredView, cp.after.view);
+      assert.equal((await get('/api/session/export')).overlay.nodes[id].note, '最新工作');
+    });
+  }
+  await t.test('尚未打开画布时检查点为空，错误的目标不会产生事件', async t => {
+    const srv = await launchServer(); t.after(srv.close);
+    const post = (url, p) => jsonPost(srv.baseUrl, url, p);
+    const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+    const target = await post('/api/view-event', { op: 'view.snapshot', view: old });
+    const latest = (await get('/api/events?limit=1')).latest;
+    assert.equal((await post('/api/restore', { eventId: latest + 1 })).ok, false);
+    assert.equal((await get('/api/events?limit=1')).latest, latest);
+    const restored = await post('/api/restore', { eventId: target.eventId });
+    const cp = (await get('/api/events?detail=1')).events.find(e => e.id === restored.checkpointId);
+    assert.deepEqual(cp?.after.view.roots, []);
+    assert.equal(cp.after.view.empty, true);
+  });
+  for (const op of ['view.checkpoint', 'restore_point']) {
+    await t.test(op + ' 写入失败时保留页面、标注和历史', async t => {
+      const srv = await launchServer(); t.after(srv.close);
+      const post = (url, p) => jsonPost(srv.baseUrl, url, p);
+      const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+      const { eventId } = await post('/api/view-event', { op: 'view.snapshot', view: old });
+      await post('/api/page', { roots: [id], up: 0, down: 1 });
+      await post('/api/overlay', { nodeId: id, data: { note: '保留' } });
+      const latest = (await get('/api/events?limit=1')).latest;
+      const db = new DatabaseSync((await get('/api/project')).db);
+      t.after(() => db.close());
+      db.exec("CREATE TRIGGER fail_restore BEFORE INSERT ON event WHEN NEW.op = '" + op
+        + "' BEGIN SELECT RAISE(ABORT, 'checkpoint test failure'); END");
+      const response = await post('/api/restore', { eventId });
+      assert.equal(response.ok, false);
+      assert.match(response.error, /checkpoint test failure/);
+      assert.deepEqual((await get('/api/page?saved=1')).page.roots, [id]);
+      assert.equal((await get('/api/session/export')).overlay.nodes[id].note, '保留');
+      assert.equal((await get('/api/events?limit=1')).latest, latest);
+    });
+  }
+});
+
+test('浏览器从回看恢复时保留另一窗口后来保存的画布，检查点失败可重试', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer(); t.after(srv.close);
+  const post = (url,p) => jsonPost(srv.baseUrl, url,p);
+  const get = url => fetch(srv.baseUrl + url).then(r=>r.json());
+  const historical = 'gear.c::Gear_Init', latest = 'gear.c::Gear_Apply';
+  const { eventId } = await post('/api/view-event', { op: 'view.checkpoint', ctx: { checkpointName: '历史基线' }, view: { roots: [historical], up: 0, down: 0 } });
+  await post('/api/page', { roots: ['main.c::main'], up: 0, down: 0 });
+  const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+  const review = async id => {
+    await br.evaluate("document.getElementById('timelineBtn').click()");
+    const entry = '.ev[data-id="' + id + '"] .ev-review';
+    await br.waitFor('Boolean(document.querySelector(' + JSON.stringify(entry) + '))');
+    await br.evaluate('document.querySelector(' + JSON.stringify(entry) + ').click()');
+    await br.waitFor('window.__cg?.at === ' + id + ' && !document.getElementById("reviewRestore").disabled');
+  };
+  await br.waitFor('window.__cg?.root === "main.c::main"');
+  await review(eventId);
+  await br.waitFor('window.__cg.root === ' + JSON.stringify(historical));
+  const blocked = await br.evaluate("(async () => (await import('/lib/api.js')).api.saveCheckpoint('禁用的手动写入', { roots: [] }))()");
+  assert.equal(blocked.ok, false);
+  await post('/api/page', { roots: [], expansions: [{ root: latest, up: 0, down: 0 }], up: 0, down: 0 });
+  const db = new DatabaseSync((await get('/api/project')).db); t.after(() => db.close());
+  db.exec("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON event WHEN NEW.op='view.checkpoint' BEGIN SELECT RAISE(ABORT,'checkpoint unavailable'); END");
+  await br.evaluate("window.alert = text => window.restoreError = text; document.getElementById('reviewRestore').click()");
+  await br.waitFor('Boolean(window.restoreError) || window.__cg.at === 0');
+  assert.match(await br.evaluate("String(window.restoreError)"), /checkpoint unavailable/);
+  assert.equal(await br.evaluate('window.__cg.at'), eventId);
+  db.exec('DROP TRIGGER fail_checkpoint');
+  await br.evaluate("document.getElementById('reviewRestore').click()");
+  await br.waitFor('window.__cg.at === 0 && window.__cg.root === ' + JSON.stringify(historical));
+  const cp = (await get('/api/events?detail=1')).events.find(e => e.target === '恢复前自动快照');
+  assert.deepEqual(cp?.after.view.expansions, [{ root: latest, up: 0, down: 0 }]);
+  await review(cp.id);
+  await br.evaluate("document.getElementById('reviewRestore').click()");
+  await br.waitFor('window.__cg.at === 0 && window.__cg.view.nodes.some(n => n.id === ' + JSON.stringify(latest) + ')');
+  assert.deepEqual((await get('/api/page?saved=1')).page.expansions, cp.after.view.expansions);
+  const unnamed = await post('/api/view-event', { op: 'view.checkpoint', view: cp.after.view });
+  await review(unnamed.eventId);
 });

@@ -2827,3 +2827,120 @@ test('浏览器在发起 AI 删除的窗口解除书签，再用 Ctrl+S 另存�
   assert.deepEqual(list.map(b => [b.name, b.roots]), [['新书签', [root]]]);
   assert.notEqual(list[0].id, id);
 });
+
+test('浏览器成功撤销 AI 标签和范围后立即刷新，保留视口、书签和回看位置', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  for (const mode of ['仅标签', '标签及范围', '历史回看', '刷新失败']) {
+    await t.test(mode, async t => {
+      const srv = await launchServer(); t.after(srv.close);
+      const from = 'main.c::main', to = 'main.c::Task_10ms', extra = 'gear.c::Gear_Apply';
+      const calls = [['apply_labels', { items: [{ from, to, preset: 'task', text: 'TASK:10ms' }] }]];
+      if (mode !== '仅标签') calls.unshift(['add_to_canvas', { functions: [extra], includeTasks: false }]);
+      const { post, run } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ? calls : []);
+      const jsonPost = (url, p) => post(url,p).then(r=>r.json());
+      const { eventId: at } = await jsonPost('/api/view-event', { op: 'view.checkpoint', ctx: { checkpointName: '历史基线' }, view: { roots: [extra], down: 0 } });
+      const page = { roots: [from], up: 0, down: 1, groupMode: 'flat' };
+      const { bookmark } = await jsonPost('/api/bookmarks', { ...page, name: '保留绑定' });
+      await jsonPost('/api/page', { ...page, activeBookmark: bookmark });
+      const events = await run('请应用周期标签并按要求组图');
+      const change = events.find(e=>e.type === 'changeset');
+      assert.ok(change);
+      await jsonPost('/api/ai/chats', { activeId: 'undo', threads: [{ id: 'undo', messages: [
+        { role: 'assistant', text: '已完成。', changeset: { id: change.changesetId, ops: change.ops } },
+      ] }] });
+      const saved = (await (await fetch(srv.baseUrl + '/api/page?saved=1')).json()).page;
+      await jsonPost('/api/page', { ...saved, activeBookmark: bookmark });
+      const br = await launchCdp({ url: srv.baseUrl }); t.after(()=>br.close());
+      const labeled = 'window.__cg?.view?.edges.some(e => e.labels?.some(l => l.text === "TASK:10ms"))';
+      await br.waitFor(labeled);
+      const hasExtra = 'window.__cg.view.nodes.some(n => n.id === ' + JSON.stringify(extra) + ')';
+      assert.equal(await br.evaluate(hasExtra), mode !== '仅标签');
+      if (mode === '历史回看') {
+        await br.evaluate("document.getElementById('timelineBtn').click()");
+        const row = '.ev[data-id="' + at + '"] .ev-review';
+        await br.waitFor('Boolean(document.querySelector(' + JSON.stringify(row) + '))');
+        await br.evaluate('document.querySelector(' + JSON.stringify(row) + ').click()');
+        await br.waitFor('window.__cg.at === ' + at + ' && window.__cg.root === ' + JSON.stringify(extra));
+      }
+      await br.evaluate("document.getElementById('aiBtn').click()");
+      await br.waitFor("Boolean(document.querySelector('.ai-undo-btn'))");
+      const cam = await br.evaluate("(async () => { const { cam } = await import('/lib/state.js'); Object.assign(cam, {x:31,y:49,k:.85}); return window.__cg.cam; })()");
+      if (mode === '刷新失败') await br.evaluate("(async () => { const { api } = await import('/lib/api.js'); api.view = async () => { throw new Error('view unavailable'); }; })()");
+      await br.evaluate("document.querySelector('.ai-undo-btn').click()");
+      if (mode === '刷新失败') {
+        await br.waitFor("document.querySelector('.ai-undo-btn').textContent.includes('已撤销')");
+        assert.match(await br.evaluate("document.getElementById('aiChatStatus').textContent"), /撤销已完成.*刷新.*失败/);
+        assert.equal(await br.evaluate("document.querySelector('.ai-undo-btn').disabled"), true);
+        const session = await (await fetch(srv.baseUrl + '/api/session/export')).json();
+        assert.ok(!Object.values(session.overlay.edges).some(e => e.labels?.some(l => l.text === 'TASK:10ms')));
+        return;
+      }
+      await br.waitFor("document.querySelector('.ai-undo-btn').textContent.includes('已撤销')");
+      if (mode === '历史回看') {
+        assert.equal(await br.evaluate('window.__cg.at'), at);
+        assert.equal(await br.evaluate('window.__cg.root'), extra);
+        await br.evaluate("document.getElementById('reviewExit').click()");
+        await br.waitFor('window.__cg.at === 0 && window.__cg.root === ' + JSON.stringify(from));
+      } else assert.deepEqual(await br.evaluate('window.__cg.cam'), cam);
+      assert.equal(await br.evaluate(labeled), false);
+      assert.equal(await br.evaluate(hasExtra), false);
+      assert.equal(await br.evaluate("(async () => (await import('/lib/state.js')).state.activeBookmark?.id)()"), bookmark.id);
+      const session = await (await fetch(srv.baseUrl + '/api/session/export')).json();
+      assert.ok(!Object.values(session.overlay.edges).some(e => e.labels?.some(l => l.text === 'TASK:10ms')));
+    });
+  }
+});
+
+test('成功撤销 AI 首次组图时空画布的新版本也能回看', async t => {
+  const srv = await launchServer(); t.after(srv.close);
+  const { run, post } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ?
+    [['add_to_canvas', { functions: ['gear.c::Gear_Init'], includeTasks: false }]] : []);
+  const get = route => fetch(srv.baseUrl + route).then(r => r.json());
+  assert.equal((await get('/api/page?saved=1')).page == null, true);
+  const events = await run('将 Gear_Init 加入空画布');
+  const composed = (await get('/api/page?saved=1')).page;
+  const result = await (await post('/api/ai/undo-changeset', { changesetId: events.find(e => e.type === 'changeset').changesetId })).json();
+  assert.equal(result.ok, true);
+  const page = (await get('/api/page?saved=1')).page;
+  assert.equal(page?.empty, true);
+  assert.equal(page.revision, result.eventId);
+  const history = await get('/api/view?at=' + result.eventId + '&useSnapshot=1');
+  assert.deepEqual(history.nodes, []);
+  assert.equal((await post('/api/page', { ...composed, roots: ['main.c::main'] })).status, 409);
+});
+
+test('成功撤销 AI 组图后，较早发出的组图请求不能再覆盖页面', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer(); t.after(srv.close);
+  const root = 'main.c::main', extra = 'gear.c::Gear_Apply';
+  const { post } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ?
+    [['add_to_canvas', { functions: [extra], includeTasks: false }]] : []);
+  await post('/api/page', { roots: [root], up: 0, down: 0 });
+  const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+  await br.waitFor('window.__cg?.root === ' + JSON.stringify(root));
+  await br.evaluate(`(async () => {
+    const { api } = await import('/lib/api.js');
+    const view = api.view;
+    window.oldViewRequests = 0;
+    api.view = async opts => {
+      if (opts.expansions?.some(s => s.root === ${JSON.stringify(extra)}) && ++window.oldViewRequests === 1) {
+        await new Promise(resolve => { window.releaseOldView = resolve; });
+      }
+      return view(opts);
+    };
+    document.getElementById('aiBtn').click();
+  })()`);
+  await br.waitFor("document.getElementById('aiModel').value === 'mock'");
+  await br.evaluate(`(() => {
+    const prompt = document.getElementById('aiPromptInput');
+    prompt.value = '请把 Gear_Apply 加入当前画布';
+    prompt.dispatchEvent(new Event('input', { bubbles: true }));
+    document.getElementById('aiSendChat').click();
+  })()`);
+  await br.waitFor("Boolean(window.releaseOldView && document.querySelector('.ai-undo-btn'))");
+  await br.evaluate("document.querySelector('.ai-undo-btn').click()");
+  await br.waitFor("document.querySelector('.ai-undo-btn').textContent.includes('已撤销')");
+  await br.evaluate("window.releaseOldView(); new Promise(resolve => setTimeout(resolve, 2400))");
+  assert.equal(await br.evaluate('window.oldViewRequests'), 1);
+  assert.equal(await br.evaluate('window.__cg.view.nodes.some(n=>n.id === ' + JSON.stringify(extra) + ')'), false);
+});
