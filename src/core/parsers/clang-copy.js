@@ -55,7 +55,7 @@ function hasCaseEntry(node) {
   return isCase(node) || (node.kind !== 'SwitchStmt' && children(node).some(hasCaseEntry));
 }
 
-// 以声明身份和调用点读取聚合成员。复制读取当时的源值；传址写入只作为可能值。
+// 以声明身份和调用点读取聚合成员。复制读取当时的源值，传址写入按覆盖范围合并。
 export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
   const designators = new WeakMap();
@@ -129,10 +129,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return { key: obj.key, slot: obj.slot + (decay ? '[0]' : ''), region: obj.slot };
   }
 
-  function noteEscape(expr, point, call, index) {
+  function noteEscape(expr, point, call, index, conditional = false) {
     const addr = unwrap(expr);
     if (addr?.kind === 'ConditionalOperator') {
-      for (const alt of children(addr).slice(1)) noteEscape(alt, point, call, index);
+      for (const alt of children(addr).slice(1)) noteEscape(alt, point, call, index, true);
       return;
     }
     const base = addressOf(expr);
@@ -142,7 +142,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (!effect && readOnly) continue;
       const slot = effect ? argumentSlot(base.slot, effect) : base.region;
       if (slot == null) continue;
-      const entry = { slot, point, effect, call };
+      const definite = effect?.replacesPointee && !conditional && addr?.kind === 'UnaryOperator' && addr.opcode === '&';
+      const entry = { slot, point, effect, call, definite };
       if (!escapes.has(base.key)) escapes.set(base.key, []);
       escapes.get(base.key).push(entry);
       if (effect) {
@@ -307,8 +308,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return slots;
   }
 
-  function resolve(pointer, value, at) {
-    const targets = new Set(), parameters = new Set();
+  function resolve(pointer, value, at, valueSlot = '') {
+    const targets = new Set(), parameters = [];
     let budget = 512, unknown = false, uncertainLayout = false;
     function merge(result) {
       for (const id of result.targets) targets.add(id);
@@ -320,8 +321,14 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (!value) return;
       if (rest === '.?') uncertainLayout = true;
       if (--budget < 0 || depth > 32) { unknown = true; return; }
+      if (value.kind === 'ImplicitValueInitExpr' || value.kind === 'GNUNullExpr' ||
+          (value.kind === 'IntegerLiteral' && value.value === '0')) return;
       if (value.kind === 'ConditionalOperator') {
         for (const alt of children(value).slice(1)) evaluate(alt, rest, point, depth + 1, fieldId, unionId);
+        return;
+      }
+      if (value.kind === 'BinaryOperator' && value.opcode === ',') {
+        evaluate(children(value)[1], rest, point, depth + 1, fieldId, unionId);
         return;
       }
       if (value.kind === 'CompoundLiteralExpr') {
@@ -338,23 +345,25 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (value.kind === 'BinaryOperator' && value.opcode === '=') value = children(value)[0];
       const direct = fnRef(value);
       if (direct && (!rest || rest === '.?')) { targets.add(resolveFunction(direct.referencedDecl, unit)); return; }
-      const src = objectSlot(pointerExpression(value, unit));
+      const pointer = pointerExpression(value, unit);
+      const src = objectSlot(pointer);
       if (src) {
         for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId, rest ? unionId : src.unionId);
-      } else if ((!rest || value.kind === 'CallExpr' || unstructuredJump) && value.kind !== 'ImplicitValueInitExpr' && value.kind !== 'GNUNullExpr' &&
-          !(value.kind === 'IntegerLiteral' && value.value === '0')) {
+      } else if (!rest || value.kind === 'CallExpr' || unstructuredJump ||
+          (valueSlot && (pointer?.throughPointer || unit.valueRecords.has(value)))) {
         unknown = true;
       }
     }
-    function evaluateWrite(effect, call, point, depth) {
-      const result = writeValue(effect);
+    function evaluateWrite(effect, rest, call, point, depth) {
+      const result = writeValue(effect, rest);
       merge(result);
       if (!result.parameters.length) return;
       const formals = children(effect.record.node).filter(n => n.kind === 'ParmVarDecl');
-      for (const param of result.parameters) {
-        const index = formals.indexOf(param);
-        const arg = call && index >= 0 && children(call)[index + 1];
-        if (arg) evaluate(arg, '', point, depth + 1);
+      for (const { decl, slot, pointee } of result.parameters) {
+        const index = formals.indexOf(decl);
+        const arg = unwrap(call && index >= 0 && children(call)[index + 1]);
+        if (arg && !pointee) evaluate(arg, slot, point, depth + 1);
+        else if (pointee && arg?.kind === 'UnaryOperator' && arg.opcode === '&') evaluate(children(arg)[0], slot, point, depth + 1);
         else unknown = true;
       }
     }
@@ -375,13 +384,15 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
           const effects = globalWritesFrom(action.call, unit, source, path);
           unknown ||= effects.unknown;
           uncertainLayout ||= effects.uncertainLayout;
-          for (const w of effects.writes) evaluateWrite(w, w.record === effects.direct ? action.call : null, action, depth);
+          for (const { write, rest } of effects.writes) {
+            evaluateWrite(write, rest, write.record === effects.direct ? action.call : null, action, depth);
+          }
         }
       }
       const history = writes.get(source) || [];
       // 大数组或未知长度保留符号下标。某个具体槽一旦被必经赋值覆盖，就不再取它更早的值。
       const shadowed = path.includes('[*]') ? new Set() : null;
-      for (const { slot, value, point, effect, call } of writesAt(history, at)) {
+      for (const { slot, value, point, effect, call, definite } of writesAt(history, at)) {
         if (shadowed?.has(slot)) continue;
         const match = relativeSlot(slot, path);
         if (!match) continue;
@@ -395,33 +406,38 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         if (excluded) continue;
         uncertainLayout ||= match.rest === '.?';
         if (effect) {
-          evaluateWrite(effect, call, point, depth);
-        } else {
-          evaluate(value, match.rest, point, depth, fieldId);
-          if (mandatory && !slot.includes('[*]')) shadowed?.add(slot);
-          if ((mandatory && match.covers) || budget < 0) {
-            possibleAliasWrite(point);
-            mergeInterveningCalls(point);
-            // 块内 static 初始化只执行一次。前次调用留下的写入同样可达。
-            if (source?.storageClass === 'static' && point.declaration === source) merge(ambient(source, path));
-            return;
-          }
+          evaluateWrite(effect, match.rest, call, point, depth);
+          if (!definite) continue;
+        } else evaluate(value, match.rest, point, depth, fieldId);
+        if (mandatory && !slot.includes('[*]')) shadowed?.add(slot);
+        if ((mandatory && match.covers) || budget < 0) {
+          possibleAliasWrite(point);
+          mergeInterveningCalls(point);
+          // 块内 static 初始化只执行一次。前次调用留下的写入同样可达。
+          if (source?.storageClass === 'static' && point.declaration === source) merge(ambient(source, path));
+          return;
         }
       }
       possibleAliasWrite();
       if (unstructuredJump) mergeInterveningCalls();
-      if (source?.kind === 'ParmVarDecl' && !path) parameters.add(source);
-      else merge(ambient(source, path));
+      if (source?.kind === 'ParmVarDecl') {
+        if (!parameters.some(p => p.decl === source && p.slot === path)) parameters.push({ decl: source, slot: path });
+      } else merge(ambient(source, path));
     }
     if (!at) return { targets: [], parameters: [], unknown: true };
     if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId, pointer.unionId);
-    else evaluate(value, '', at, 0);
-    return { targets: [...targets], unknown, uncertainLayout, parameters: [...parameters] };
+    else evaluate(value, valueSlot, at, 0);
+    return { targets: [...targets], unknown, uncertainLayout, parameters };
   }
   return {
     calls: indirectActions.filter(p => p.call).map(p => p.call),
     isEvaluated: node => points.has(node),
-    addressWrites: (key, slot) => (escapes.get(key) || []).filter(w => relativeSlot(w.slot, slot)),
+    *addressWrites(key, slot) {
+      for (const entry of escapes.get(key) || []) {
+        const match = relativeSlot(entry.slot, slot);
+        if (match) yield { write: entry.effect, rest: match.rest };
+      }
+    },
     atCall(pointer, call) {
       const src = objectSlot(pointer), at = designators.get(call) || points.get(call);
       if (!src) return null;
@@ -429,6 +445,16 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const escaped = escapes.get(src.key)?.some(w => relativeSlot(w.slot, src.slot) && reaches(w.point, at));
       return src.throughPointer || changed || escaped ? resolve(src, null, at) : null;
     },
-    atAssignment(write) { return resolve(null, write.value, points.get(write.node)); },
+    atAssignment(write, slot) {
+      const value = unwrap(write.value);
+      // 在单条 *dst = *src 里，源成员来自调用者传入的对象，缓存中只保存形参和路径。
+      if (slot && write.replacesPointee && value?.kind === 'UnaryOperator' && value.opcode === '*') {
+        const ref = unwrap(children(value)[0])?.referencedDecl;
+        if (ref?.kind === 'ParmVarDecl') {
+          return { targets: [], unknown: false, parameters: [{ decl: objectKey(ref, unit), slot, pointee: true }] };
+        }
+      }
+      return resolve(null, value, points.get(write.node), slot);
+    },
   };
 }

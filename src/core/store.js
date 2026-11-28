@@ -349,7 +349,10 @@ function applyEvent(ov, e) {
         edges: { ...((after.deleted || {}).edges || {}) },
       };
       ov.layout = { ...(after.layout || {}) };
-      ov.manualNodes = after.manualNodes && typeof after.manualNodes === 'object' ? { ...after.manualNodes } : {};
+      // 旧版 AI 撤销不修改手工定义，但快照漏记了它们，须沿用此前回放到的定义。
+      const legacyUndo = e.op === 'restore_point' && e.target?.startsWith('ai-undo#') && !Object.hasOwn(after, 'manualNodes');
+      const definitions = legacyUndo ? ov.manualNodes : after.manualNodes;
+      ov.manualNodes = definitions && typeof definitions === 'object' ? { ...definitions } : {};
       return;
     }
     case 'node.annotate':

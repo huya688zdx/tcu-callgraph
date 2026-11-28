@@ -3484,3 +3484,113 @@ test('浏览器分步导览按当前步骤绘制，退出后可独立播放动�
   await br.waitFor("window.__cg.aiOverlay?.action === 'play_flow' && document.getElementById('aiStopChat').hidden");
   await stage('独立动画', ids[2], null, [false, true], 'play_flow');
 });
+
+test('AI 撤销点保留工程内手工节点的实时、回看及持久化定义', async t => {
+  for (const canvas of [true, false]) await t.test(canvas ? '画布撤销' : '仅书签撤销后回看独立新增与删除', async t => {
+    const srv = await launchServer(); t.after(srv.close);
+    const main = 'main.c::main';
+    const { post, run } = await mockAiTurn(t, srv.baseUrl, last => last.role !== 'user' ? [] : canvas
+      ? [['add_to_canvas', { functions: ['gear.c::Gear_Init'], includeTasks: false }]]
+      : [['manage_bookmarks', { action: 'save', name: '本轮临时入口' }]]);
+    const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+    const write = async (url, body) => {
+      const response = await post(url, body);
+      const result = await response.json();
+      assert.ok(response.ok, url + ' ' + JSON.stringify(result));
+      return result;
+    };
+    const fn = { id: 'main.c::Planned', file: 'main.c', kind: 'fn', name: 'Planned', typeText: '' };
+    const variable = { id: 'var::main.c::planned', file: 'main.c', kind: 'var', name: 'planned', typeText: 'unsigned long' };
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-other-manual-'));
+    t.after(() => fs.rmSync(other, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(other, 'main.c'), 'int main(void) { return 0; }');
+    await write('/api/switch', { path: other });
+    await write('/api/manual-nodes', { ...variable, typeText: 'short' });
+    await write('/api/switch', { path: path.resolve('samples/tcu') });
+    await write('/api/manual-nodes', fn);
+    const removed = { kind: 'fn', file: 'main.c', name: 'Removed' };
+    await write('/api/manual-nodes', canvas ? variable : removed);
+    const page = { roots: [main, fn.id], vars: [variable.id], up: 0, down: 0, groupMode: 'flat' };
+    await write('/api/page', page);
+    const events = await run(canvas ? '将 Gear_Init 加入画布' : '保存当前书签');
+    const changesetId = events.find(e => e.type === 'changeset')?.changesetId;
+    assert.ok(changesetId, JSON.stringify(events));
+    if (!canvas) {
+      await write('/api/manual-nodes/delete', { id: 'main.c::Removed' });
+      await write('/api/manual-nodes', variable);
+    }
+    const undone = await write('/api/ai/undo-changeset', { changesetId });
+    assert.equal(undone.canvasChanged, canvas);
+    const expected = { [fn.id]: fn, [variable.id]: variable };
+    const definitions = async () => Object.fromEntries((await get('/api/session/export')).manualNodes.map(n => [n.id, n]));
+    assert.deepEqual(await definitions(), expected);
+    const marker = (await get('/api/events?detail=1')).events.find(e => e.id === undone.eventId);
+    assert.equal(marker.op, 'restore_point');
+    await t.test('事件明细包含完整定义', () => assert.deepEqual(marker.after.manualNodes, expected));
+    assert.deepEqual((await get('/api/bookmarks')).list, []);
+    const review = () => write('/api/view?at=' + undone.eventId, { useSnapshot: true });
+    await write('/api/manual-nodes/delete', { id: variable.id });
+    await write('/api/manual-nodes', { ...variable, typeText: 'int' });
+    await t.test('同 ID 变量重新定义后仍显示历史类型', async () => {
+      assert.equal((await definitions())[variable.id].typeText, 'int');
+      assert.equal((await review()).nodes.find(n => n.id === variable.id)?.typeText, variable.typeText);
+    });
+    for (const n of [fn, variable]) await write('/api/manual-nodes/delete', { id: n.id });
+    await write('/api/page', { roots: [main], up: 0, down: 0 });
+    await t.test('回看已删除定义', async () => {
+      const historical = await review();
+      assert.deepEqual(historical.nodes.filter(n => n.manual).map(n => n.id).sort(), Object.keys(expected).sort());
+      assert.equal(historical.nodes.find(n => n.id === variable.id).typeText, variable.typeText);
+    });
+    if (!canvas) await t.test('浏览器回看并恢复已删除的手工函数和变量', async t => {
+      try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+      const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+      await br.waitFor('window.__cg?.root === "main.c::main"');
+      const manuals = 'window.__cg.view.nodes.filter(n => n.manual).map(n => n.id).sort()';
+      assert.deepEqual(await br.evaluate(manuals), []);
+      await br.evaluate("document.getElementById('timelineBtn').click()");
+      const row = JSON.stringify('.ev[data-id="' + undone.eventId + '"] .ev-review');
+      await br.waitFor('Boolean(document.querySelector(' + row + '))');
+      await br.evaluate('document.querySelector(' + row + ').click()');
+      await br.waitFor('window.__cg.at === ' + undone.eventId + ' && !document.getElementById("reviewRestore").disabled');
+      assert.deepEqual(await br.evaluate(manuals), Object.keys(expected).sort());
+      await br.evaluate("document.getElementById('reviewRestore').click()");
+      await br.waitFor('window.__cg.at === 0 && ' + manuals + '.length === 2');
+      assert.deepEqual(await br.evaluate(manuals), Object.keys(expected).sort());
+    });
+    await write('/api/restore', { eventId: undone.eventId });
+    assert.deepEqual(await definitions(), expected);
+    await write('/api/switch', { path: other });
+    assert.deepEqual(await definitions(), { [variable.id]: { ...variable, typeText: 'short' } });
+    await write('/api/switch', { path: path.resolve('samples/tcu') });
+    assert.deepEqual(await definitions(), expected);
+  });
+});
+
+test('AI 撤销点保留无页面时的定义，画布冲突时保留独立新增节点', async t => {
+  const srv = await launchServer(); t.after(srv.close);
+  let tool = ['manage_bookmarks', { action: 'save', name: '临时书签' }];
+  const { post, run } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ? [tool] : []);
+  const get = route => fetch(srv.baseUrl + route).then(r => r.json());
+  const definition = name => ({ id: 'main.c::' + name, file: 'main.c', name, kind: 'fn', typeText: '' });
+  const add = async n => assert.equal((await post('/api/manual-nodes', n)).status, 200);
+  const changeset = async () => (await run('按请求修改')).find(e => e.type === 'changeset').changesetId;
+  const undo = changesetId => post('/api/ai/undo-changeset', { changesetId });
+  const first = definition('BeforeUndo'), later = definition('AfterCanvas');
+  await add(first);
+  assert.equal((await get('/api/page?saved=1')).page == null, true);
+  const result = await (await undo(await changeset())).json();
+  assert.equal(result.ok, true);
+  const { after } = (await get('/api/events?detail=1')).events.find(e => e.id === result.eventId);
+  await t.test('首次打开工程尚未保存页面', () => {
+    assert.equal(Object.hasOwn(after, 'view'), false);
+    assert.deepEqual(after.manualNodes, { [first.id]: first });
+  });
+  tool = ['add_to_canvas', { functions: ['gear.c::Gear_Init'], includeTasks: false }];
+  const id = await changeset();
+  await add(later);
+  const head = (await get('/api/events')).latest;
+  assert.equal((await undo(id)).status, 409);
+  assert.equal((await get('/api/events')).latest, head);
+  assert.deepEqual((await get('/api/session/export')).manualNodes, [first, later]);
+});

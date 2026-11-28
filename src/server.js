@@ -2387,9 +2387,9 @@ async function buildView(
       const indexed = model._index.byId.get(id);
       const histManual = viewOverlay !== overlay ? viewOverlay.manualNodes?.[id] : null;
       const rawDef = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
-      const def = (viewOverlay !== overlay && rawDef?.manual && !histManual)
-        ? null
-        : rawDef || (histManual?.kind === 'var' ? toManualModelNode(histManual) : null);
+      const def = viewOverlay !== overlay && (!rawDef || rawDef.manual)
+        ? (histManual?.kind === 'var' ? toManualModelNode(histManual) : null)
+        : rawDef;
       if (!def) continue;
       clean.push({
         ...(COMPARISON ? def : {}),
@@ -2785,9 +2785,11 @@ export const server = http.createServer(async (req, res) => {
             if (!isDeepStrictEqual(currentPage[key], canvas.after.page?.[key])) nextPage[key] = currentPage[key];
           }
         }
+        const snapshot = { ...restored, manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)) };
+        if (nextPage) snapshot.view = viewSnapshot(nextPage);
         const evId = store.appendEvent(PROJECT.id, {
           op: 'restore_point', target: `ai-undo#${changesetId.slice(0, 8)}`,
-          after: nextPage ? { ...restored, view: viewSnapshot(nextPage) } : restored, actor: 'user',
+          after: snapshot, actor: 'user',
           ctx: { canvasChanged: Boolean(canvas) },
         });
         if (restorePage) {

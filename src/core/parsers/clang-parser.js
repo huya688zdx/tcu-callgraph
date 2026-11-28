@@ -188,17 +188,19 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
 
   const readers = new WeakMap(), writeValues = new WeakMap();
   let writeDepth = 0;
-  function writeValue(write) {
-    if (!writeValues.has(write)) {
+  function writeValue(write, slot = '') {
+    if (!writeValues.has(write)) writeValues.set(write, new Map());
+    const slots = writeValues.get(write);
+    if (!slots.has(slot)) {
       // 跨对象或跨函数的循环依赖只提供未知值，不用已经过期的初始化器填补。
       const incomplete = { targets: [], unknown: true, parameters: [] };
       if (writeDepth >= 32) return incomplete;
-      writeValues.set(write, incomplete);
+      slots.set(slot, incomplete);
       writeDepth++;
-      try { writeValues.set(write, readerFor(write.record).atAssignment(write)); }
+      try { slots.set(slot, readerFor(write.record).atAssignment(write, slot)); }
       finally { writeDepth--; }
     }
-    return writeValues.get(write);
+    return slots.get(slot);
   }
   function fieldValues(fields, [key, indices]) {
     const targets = new Set();
@@ -242,22 +244,22 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     const direct = targetOfCall(call, unit);
     if (!reachable.has(direct)) reachable.set(direct, reachableCallees(direct));
     const records = reachable.get(direct), opaque = records.has(null);
-    const writes = new Set();
+    const writes = [];
     const mutable = !tables.get(key)?.constant;
     let unknown = opaque && mutable, uncertainLayout = false;
     for (const w of declWrites.get(key) || []) {
       if (!opaque && !records.has(w.record)) continue;
       const match = matchingSlot(w.slot, slot);
       if (!match || !readerFor(w.record).isEvaluated(w.node)) continue;
-      writes.add(w);
+      writes.push({ write: w, rest: '' });
       uncertainLayout ||= match === 'overlap';
     }
     for (const record of records) {
       if (!record) continue;
       for (const entry of readerFor(record).addressWrites(key, slot)) {
-        if (entry.effect) {
-          writes.add(entry.effect);
-          uncertainLayout ||= matchingSlot(entry.slot, slot) === 'overlap';
+        if (entry.write) {
+          writes.push(entry);
+          uncertainLayout ||= entry.rest === '.?';
         } else if (mutable) unknown = true;
       }
     }
@@ -359,7 +361,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       }
       const objectWrites = varKey == null ? [] : declWrites.get(varKey) || [];
       const writesForVar = tracked === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
-      const writtenValues = writesForVar.map(writeValue);
+      const writtenValues = writesForVar.map(w => writeValue(w));
       for (const [i, value] of writtenValues.entries()) {
         const uncertain = value.uncertainLayout || matchingSlot(writesForVar[i].slot, pointer.slot) === 'overlap';
         slotTargets.push(...(uncertain ? value.targets.filter(compatible) : value.targets));

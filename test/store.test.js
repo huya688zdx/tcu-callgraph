@@ -466,3 +466,21 @@ test('store：v6 书签支持 hiddenVars / revision 乐观锁与 milestone / boo
   assert.equal(scoped.length, 1);
   assert.equal(s.countEvents(p.id, { level: 'milestone', bookmarkId: r1.bookmark.id }), 1);
 });
+
+test('旧 AI 撤销点继承本工程当时的手工定义，显式空快照仍会清空', t => {
+  const store = tmpStore(t);
+  for (const [path, typeText] of [[PROJ_A, 'long'], [PROJ_B, 'short']]) {
+    const project = store.upsertProject({ path });
+    const definition = { id: 'var::main.c::planned', file: 'main.c', kind: 'var', name: 'planned', typeText };
+    const append = (op, target, after) => store.appendEvent(project.id, { op, target, after, actor: 'user' });
+    append('manual.node.add', definition.id, definition);
+    const snapshot = { nodes: {}, edges: {}, layout: {}, deleted: { nodes: {}, edges: {} } };
+    const legacy = append('restore_point', 'ai-undo#12345678', snapshot);
+    assert.deepEqual(store.overlayAt(project.id, legacy).manualNodes, { [definition.id]: definition });
+    const empty = append('restore_point', 'ai-undo#87654321', { ...snapshot, manualNodes: {} });
+    assert.deepEqual(store.overlayAt(project.id, empty).manualNodes, {});
+    append('manual.node.add', definition.id, definition);
+    const normal = append('restore_point', 'event#1', snapshot);
+    assert.deepEqual(store.overlayAt(project.id, normal).manualNodes, {});
+  }
+});

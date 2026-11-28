@@ -771,3 +771,52 @@ int snapshot(void){arg=a1;WithArg saved=arg;return saved(choose());}`);
     short_order: [first], exclusive: [first], outer: [first], reset: [first], designator: [['a1', 'a2']], snapshot: [['a1']],
   }));
 });
+
+test('Clang 间接整结构赋值按调用者读取的成员求值', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run; Fn slots[2]; } Ops;
+typedef struct { Ops rows[2]; Fn tail; } Box;
+void first(void) {} void second(void) {} void third(void) {} void spare(void) {}
+void install(Ops *p) { *p=(Ops){second,{third,0}}; }
+void part(Box *p, int flag) { if(flag) p->rows[1]=(Ops){third,{0,second}}; }
+void choose(Ops *p, int flag) { *p=flag?(Ops){.run=second}:(Ops){.run=third}; }
+void copy(Ops *p, Ops value) { *p=value; }
+void clear(Ops *p) { *p=(Ops){0}; }
+void clone(Ops *p, const Ops *src) { *p=*src; }
+Ops unknown_value(void);
+void from_external(Ops *p) { *p=unknown_value(); }
+void from_comma(Ops *p) { *p=(first(), (Ops){.run=third}); }
+void direct(void) { Ops x={first}; install(&x); x.run(); x.slots[0](); if(x.slots[1]) x.slots[1](); }
+void reversed(void) { Ops x={0}; install(&x); x.slots[0](); x.run(); }
+void nested(int flag) { Box b={.rows={{first},{first}},.tail=spare}; part(&b,flag);
+  b.rows[1].run(); b.rows[1].slots[1](); b.rows[0].run(); b.tail(); }
+void alternatives(int n) { Ops x={0}; choose(&x,n); x.run(); if(x.slots[0]) x.slots[0](); }
+void copied(void) { Ops x={0}, src={third,{second,spare}}; copy(&x,src);
+  src.run=first; x.run(); x.slots[0](); x.slots[1](); }
+void cleared(void) { Ops x={0}; clear(&x); if(x.run) x.run(); if(x.slots[0]) x.slots[0](); }
+void clear_existing(void) { Ops x={first,{second,third}}; clear(&x); if(x.run) x.run(); if(x.slots[1]) x.slots[1](); }
+void maybe_destination(int n) { Ops x={first}, y={spare}; install(n?&x:&y); x.run(); y.run(); }
+void pointer_source(void) { Ops x={0}, y={second,{third,spare}}; clone(&x,&y); y.run=first; x.run(); x.slots[0](); }
+void unknown_pointer(Ops *source) { Ops x={0}; clone(&x,source); x.run(); }
+void opaque(void) { Ops x={0}; from_external(&x); x.run(); }
+void sequenced(void) { Ops x={0}; from_comma(&x); x.run(); if(x.slots[0]) x.slots[0](); }
+void overwritten(void) { Ops x={0}; install(&x); x=(Ops){.run=first}; x.run(); if(x.slots[0]) x.slots[0](); }
+void neighbors(void) { Ops rows[2]={{first},{spare}}; install(rows+1); rows[0].run(); rows[1].run(); }
+static Ops shared;
+void configure(void) { install(&shared); }
+void global_run(void) { shared=(Ops){.run=first}; configure(); shared.run(); }
+void global_slot(void) { shared=(Ops){.run=first}; configure(); shared.slots[0](); }`);
+  const updated = previous => ({ required: ['second'], allowed: [previous, 'second'] });
+  const unresolved = { required: ['second'], allowed: ['first','second','spare','third'] };
+  await checkCallbackFlow(t, root, policy => ({
+    direct: [['second'], ['third'], []], reversed: [['third'], ['second']],
+    nested: [['first','third'], ['second'], ['first'], ['spare']],
+    alternatives: [['second','third'], []], copied: [['third'], ['second'], ['spare']],
+    cleared: [[], []], clear_existing: [[], []], overwritten: [['first'], []],
+    maybe_destination: [['first','second'], ['second','spare']],
+    pointer_source: [['second'], ['third']],
+    unknown_pointer: [policy === 'strict' ? [] : unresolved], opaque: [policy === 'strict' ? [] : unresolved],
+    sequenced: [['third'], []],
+    neighbors: [['first'], updated('spare')], global_run: [updated('first')], global_slot: [['third']],
+  }));
+});
