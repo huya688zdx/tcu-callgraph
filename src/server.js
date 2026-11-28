@@ -9,7 +9,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { loadModel, stats, subgraph, search, dataflowOf, rebuildIndex } from './core/index.js';
 import { decodeSource, sourceDecoder } from './core/source-files.js';
 import { isFlowchartFunction } from './core/flowchart.js';
-import { dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
+import { dataflowAttachment, dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
 import { comparisonDataflow, comparisonGlobals } from './core/compare.js';
 import { compareGitProject, inspectGitRepo, quickGitDirtySummary, watchGitProject } from './core/git-compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
@@ -266,7 +266,7 @@ function broadcastChange(op, actor, extra = {}) {
 /** 向指定浏览器客户端（或全员）推送非持久化的轻量视觉叠加事件（如 AI 导览高亮 / 数据流动画）。 */
 function sendClientEvent(clientId, event, data = {}) {
   if (!sseClients.size) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, ts: Date.now() })}\n\n`;
+  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, sessionRevision, ts: Date.now() })}\n\n`;
   for (const res of sseClients) {
     if (clientId && res._clientId !== clientId) continue;
     try {
@@ -277,7 +277,27 @@ function sendClientEvent(clientId, event, data = {}) {
   }
 }
 
+// 普通页面上报和推断边写入不一定产生时间轴事件。只对实际内容变化计数。
+let canvasEditRevision = 0;
+function savedCanvasState() {
+  return { page: latestPage(), overlay: store.loadOverlay(PROJECT.id), inferredEdges: loadInferredEdges(PROJECT.id),
+    eventId: store.latestCanvasEventId(PROJECT.id), editRevision: canvasEditRevision };
+}
+
+function sameCanvasPage(a, b) {
+  if (!a || !b) return a === b;
+  return (a.revision ?? 0) === (b.revision ?? 0) && isDeepStrictEqual(viewSnapshot(a), viewSnapshot(b));
+}
+
+function sameSavedCanvas(a, b) {
+  return a.eventId === b.eventId && a.editRevision === b.editRevision && sameCanvasPage(a.page, b.page) &&
+    isDeepStrictEqual(a.overlay, b.overlay) &&
+    isDeepStrictEqual(a.inferredEdges, b.inferredEdges);
+}
+
 const aiChangesets = new Map();
+const activeAiTurns = new Map();
+const validTurnId = id => typeof id === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id);
 function saveAiChangeset(entry) {
   if (!entry?.id) return;
   if (aiChangesets.has(entry.id)) aiChangesets.delete(entry.id);
@@ -543,6 +563,7 @@ function loadInferredEdges(projectId) {
 }
 
 function saveInferredEdges(projectId, list) {
+  if (!isDeepStrictEqual(list, loadInferredEdges(projectId))) canvasEditRevision++;
   store.setSetting(inferredEdgesKey(projectId), list);
 }
 
@@ -973,6 +994,11 @@ const hasAnnotationValue = (value) => Array.isArray(value) ? value.length > 0 :
 
 const stringArray = (value) => Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [];
 
+function variablesOnPaths(result, paths) {
+  const ids = new Set(paths.flatMap(p => p.edges.map(e => e.variable)));
+  return result.nodes.filter(n => n.kind === 'var' && ids.has(n.id));
+}
+
 function viewSnapshot(view) {
   const groupMode = resolveGroupMode(view.groupMode, view.group);
   return {
@@ -1214,6 +1240,52 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
   if (requestId !== undefined) readSnapshots.set(MODEL, snapshot);
   return { ok: true, source: !forceGit && COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
     comparisonId: !forceGit ? (COMPARISON?.id ?? null) : null, ...result };
+}
+
+function callEvidenceSides(model, comparison) {
+  return comparison ? [['before', comparison.beforeModel], ['after', comparison.afterModel]] : [['current', model]];
+}
+
+function isCallEvidence(edge) {
+  return (CALL_KINDS.has(edge.kind) || edge.kind === 'manual') && !edge.headerReference && edge.resolution !== 'unresolved';
+}
+
+// 比较画布把同一条件下的多个调用点画为一条边。证据来自源版本，着色使用画布实际的键。
+function evidenceEdgeKey(edge, version, comparison) {
+  if (!comparison) return edgeKeyOf(edge);
+  const visible = comparison.model._index.outAdj.get(edge.from)?.find(e => e.to === edge.to && e.kind !== 'var' &&
+    e[version + 'Calls']?.some(call => call.line === edge.line && call.kind === edge.kind && call.cond === edge.cond));
+  return edgeKeyOf(visible || edge);
+}
+
+function possibleCall(edge) {
+  return edge.inferred || edge.dynamicDispatch || (edge.kind === 'fnptr' && edge.resolution !== 'exact');
+}
+
+function taskCallEvidence(model, id, limit) {
+  const { upstreamTasks, upstreamChains } = traceToTasks(model, id, { limit });
+  return new Map(upstreamTasks.map((task, i) => [task.id, {
+    name: task.name, possible: upstreamChains[i].edges.some(possibleCall),
+  }]));
+}
+
+function shortestCallPath(model, from, to, version, comparison) {
+  if (overlay.deleted.nodes[from] || overlay.deleted.nodes[to]) return null;
+  const queue = [{ id: from, path: [from], possible: false }], seen = new Set([from]);
+  const deletedEdges = Object.keys(overlay.deleted.edges).length > 0;
+  for (let i = 0; i < queue.length; i++) {
+    const { id, path, possible } = queue[i];
+    if (path.length > 5) continue;
+    for (const edge of model._index.outAdj.get(id) || []) {
+      if (!isCallEvidence(edge) || overlay.deleted.nodes[edge.to] ||
+          (deletedEdges && overlay.deleted.edges[evidenceEdgeKey(edge, version, comparison)]) || seen.has(edge.to)) continue;
+      const next = { id: edge.to, path: [...path, edge.to], possible: Boolean(possible || possibleCall(edge)) };
+      if (edge.to === to) return next;
+      seen.add(edge.to);
+      queue.push(next);
+    }
+  }
+  return null;
 }
 
 // 比较的合并图含两个版本的边；在一个确定版本内回溯，防止拼出从未存在的路径。
@@ -1760,6 +1832,30 @@ function saveBookmarkWithEvent(data, actor = 'user', { isForeground = true, acti
         ...(diff?.changed ? { diffSummary: diff.summary } : {}),
       },
     });
+    return { ...result, prev };
+  });
+}
+
+function updateBookmarkWithEvent(id, patch, actor, expectedRevision) {
+  return store.transaction(() => {
+    const result = store.updateBookmarkById(PROJECT.id, id, patch, expectedRevision);
+    if (!result || result.conflict) return result;
+    const bm = result.bookmark;
+    const diff = diffViewScopes(result.prev, bm);
+    store.appendEvent(PROJECT.id, {
+      op: 'bookmark.save',
+      actor,
+      target: bm.name,
+      before: bookmarkEventPayload(result.prev),
+      after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
+      ctx: {
+        bookmarkId: bm.id,
+        bookmarkName: bm.name,
+        action: 'update',
+        milestone: true,
+        ...(diff.changed ? { diffSummary: diff.summary } : {}),
+      },
+    });
     return result;
   });
 }
@@ -2294,9 +2390,9 @@ async function buildView(
       const indexed = model._index.byId.get(id);
       const histManual = viewOverlay !== overlay ? viewOverlay.manualNodes?.[id] : null;
       const rawDef = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
-      const def = (viewOverlay !== overlay && rawDef?.manual && !histManual)
-        ? null
-        : rawDef || (histManual?.kind === 'var' ? toManualModelNode(histManual) : null);
+      const def = viewOverlay !== overlay && (!rawDef || rawDef.manual)
+        ? (histManual?.kind === 'var' ? toManualModelNode(histManual) : null)
+        : rawDef;
       if (!def) continue;
       clean.push({
         ...(COMPARISON ? def : {}),
@@ -2637,6 +2733,16 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (u.pathname === '/api/ai/changeset' && req.method === 'GET') {
+      const id = u.searchParams.get('turnId'), projectId = Number(u.searchParams.get('projectId'));
+      const pending = activeAiTurns.get(id);
+      if (projectId === PROJECT.id && pending?.projectId === projectId) await pending.finished;
+      const snap = aiChangesets.get(id);
+      const available = !switching && projectId === PROJECT.id && snap?.projectId === projectId && snap.sessionRevision === sessionRevision;
+      return json(res, { ok: true, changeset: available ? { id: snap.id, ops: snap.ops } : null,
+        ...(available && { interrupted: snap.interrupted }) });
+    }
+
     if (u.pathname === '/api/ai/undo-changeset' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       let p;
@@ -2652,44 +2758,71 @@ export const server = http.createServer(async (req, res) => {
       if (snap.sessionRevision !== sessionRevision) {
         return json(res, { ok: false, error: tr('undo.session') }, 409);
       }
-      const nextPage = snap.page ? {
-        ...snap.page,
-        projectId: PROJECT.id,
-        reviewing: false,
-        at: 0,
-        ts: Date.now(),
-      } : null;
-      const restoredOverlay = structuredClone(snap.overlay || { nodes: {}, edges: {}, deleted: { nodes: {}, edges: {} }, layout: {} });
+      const canvas = snap.canvas;
+      const restorePage = canvas && !sameCanvasPage(canvas.before.page, canvas.after.page);
+      const bookmarkEvents = [];
+      let nextPage;
       const eventId = store.transaction(() => {
-        store.replaceOverlay(PROJECT.id, restoredOverlay);
-        saveInferredEdges(PROJECT.id, snap.inferredEdges || []);
-        for (const bmId of snap.createdBookmarkIds || []) {
-          try { store.deleteBookmark(PROJECT.id, bmId); } catch { /* ignore */ }
+        if (canvas && (canvas.stale || !sameSavedCanvas(canvas.after, savedCanvasState()))) return null;
+        const restoredNames = new Set();
+        for (const [id, change] of snap.bookmarks) {
+          if ((store.getBookmark(PROJECT.id, id)?.revision ?? null) !== change.revision) return null;
+          if (change.before) {
+            if (restoredNames.has(change.before.name)) return null;
+            restoredNames.add(change.before.name);
+            const occupant = store.findBookmark(PROJECT.id, change.before.name);
+            if (occupant && occupant.id !== id && snap.bookmarks.get(occupant.id)?.before !== null) return null;
+          }
         }
+        // 同名重建会获得新 ID。先移除本轮新建的记录，为原 ID 释放名字。
+        for (const [id, { before }] of snap.bookmarks) {
+          if (before) continue;
+          store.deleteBookmark(PROJECT.id, id);
+          bookmarkEvents.push(['bookmark.delete', { bookmarkId: id }]);
+        }
+        for (const [id, { before, revision, lastRevision }] of snap.bookmarks) {
+          if (!before) continue;
+          const bookmark = revision === null ? store.restoreDeletedBookmark(PROJECT.id, before, lastRevision)
+            : store.updateBookmarkById(PROJECT.id, id, before).bookmark;
+          bookmarkEvents.push(['bookmark.save', { bookmark }]);
+        }
+        const restored = canvas ? canvas.before.overlay : store.loadOverlay(PROJECT.id);
+        if (canvas) {
+          store.replaceOverlay(PROJECT.id, restored);
+          saveInferredEdges(PROJECT.id, canvas.before.inferredEdges);
+        }
+        const currentPage = latestPage();
+        nextPage = restorePage ? { ...(canvas.before.page ?? { ...viewSnapshot({ empty: true }), projectId: PROJECT.id }),
+          reviewing: false, at: 0, ts: Date.now() } : currentPage;
+        if (restorePage && nextPage && currentPage) {
+          for (const key of ['cam', 'ctxBox', 'selected', 'selectedEdge', 'activeBookmark']) {
+            if (!isDeepStrictEqual(currentPage[key], canvas.after.page?.[key])) nextPage[key] = currentPage[key];
+          }
+        }
+        const snapshot = { ...restored, manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)) };
+        if (nextPage) snapshot.view = viewSnapshot(nextPage);
         const evId = store.appendEvent(PROJECT.id, {
-          op: 'restore_point',
-          target: `ai-undo#${changesetId.slice(0, 8)}`,
-          after: nextPage ? { ...restoredOverlay, view: viewSnapshot(nextPage) } : restoredOverlay,
-          actor: 'user',
+          op: 'restore_point', target: `ai-undo#${changesetId.slice(0, 8)}`,
+          after: snapshot, actor: 'user',
+          ctx: { canvasChanged: Boolean(canvas) },
         });
-        if (nextPage) {
-          nextPage.revision = evId;
+        if (restorePage) {
+          if (nextPage) nextPage.revision = evId;
           store.setSetting(savedViewKey(), nextPage);
-        } else if (!COMPARISON) {
-          store.setSetting(savedViewKey(), null);
         }
         return evId;
       });
-      applyInferredEdges(MODEL, PROJECT.id, snap.inferredEdges || []);
-      S = stats(MODEL);
-      pageState = nextPage;
-      overlay.nodes = restoredOverlay.nodes || {};
-      overlay.edges = restoredOverlay.edges || {};
-      overlay.deleted = restoredOverlay.deleted || { nodes: {}, edges: {} };
-      overlay.layout = restoredOverlay.layout || {};
+      if (eventId === null) return json(res, { ok: false, conflict: true, error: tr('undo.conflict') }, 409);
+      if (canvas) {
+        applyInferredEdges(MODEL, PROJECT.id, canvas.before.inferredEdges);
+        S = stats(MODEL);
+        Object.assign(overlay, canvas.before.overlay);
+        if (restorePage) pageState = nextPage;
+      }
       aiChangesets.delete(changesetId);
+      for (const [op, detail] of bookmarkEvents) broadcastChange(op, 'user', { projectId: PROJECT.id, ...detail });
       broadcastChange('restore_point', 'user', { projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
-      return json(res, { ok: true, eventId, undoneOps: snap.ops || [] });
+      return json(res, { ok: true, eventId, canvasChanged: Boolean(canvas), scopeChanged: Boolean(restorePage), undoneOps: snap.ops || [] });
     }
 
     if (u.pathname === '/api/ai/chats') {
@@ -2698,6 +2831,7 @@ export const server = http.createServer(async (req, res) => {
         id: String(ch?.id || '').slice(0, 120),
         title: String(ch?.title || '').slice(0, 120),
         kind: ['call', 'dataflow', 'mixed'].includes(ch?.kind) ? ch.kind : 'call',
+        ...(Array.isArray(ch?.edgeKeys) && { edgeKeys: ch.edgeKeys.slice(0, 19).map(k => String(k).slice(0, 512)) }),
         steps: (Array.isArray(ch?.steps) ? ch.steps : []).slice(0, 20).map((s) => ({
           id: String(s?.id || '').slice(0, 200),
           name: String(s?.name || '').slice(0, 120),
@@ -2771,6 +2905,7 @@ export const server = http.createServer(async (req, res) => {
               } : null;
               return {
                 role: m.role,
+                ...(m.role === 'user' && validTurnId(m.pendingTurn) ? { pendingTurn: m.pendingTurn } : {}),
                 text: String(m.text || '').slice(0, 8000),
                 ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                   ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
@@ -2895,6 +3030,11 @@ export const server = http.createServer(async (req, res) => {
       if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
       const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
       let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
+      const turnId = p.turnId ?? randomUUID();
+      if (!validTurnId(turnId)) return bad(res, '无效的 AI 请求编号');
+      if (activeAiTurns.has(turnId) || aiChangesets.has(turnId)) return json(res, { ok: false, error: '本轮 AI 请求已存在' }, 409);
+      const finished = Promise.withResolvers();
+      activeAiTurns.set(turnId, { projectId: PROJECT.id, finished: finished.promise });
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -2907,7 +3047,7 @@ export const server = http.createServer(async (req, res) => {
       req.on('close', cancel);
       res.on('close', cancel);
       const sendEvent = (ev) => {
-        if (res.writableEnded || res.destroyed) return;
+        if (abort.signal.aborted || res.writableEnded || res.destroyed) return;
         if (res.writableLength > 1024 * 1024) {
           cancel();
           res.destroy();
@@ -2923,7 +3063,7 @@ export const server = http.createServer(async (req, res) => {
       const assertActive = () => {
         if (abort.signal.aborted) throw new Error('已取消');
         if (!sameSession()) {
-          throw new Error('工程或比较会话已切换，请重试');
+          throw new Error(tr('sessionChanged'));
         }
       };
 
@@ -3006,6 +3146,10 @@ export const server = http.createServer(async (req, res) => {
             if (!edgeMap.has(k)) edgeMap.set(k, e);
           }
         }
+        return canvasLabelsForEdges(model, nodeIds, edgeMap, overlay);
+      };
+
+      const canvasLabelsForEdges = async (model, nodeIds, edgeMap, viewOverlay) => {
         if (!nodeIds.size) {
           return { canvasNodeCount: 0, canvasEdges: [], suggestedLabels: [], commentTasks: [] };
         }
@@ -3013,8 +3157,8 @@ export const server = http.createServer(async (req, res) => {
           : await analyzeTasks(model, { onlyIds: nodeIds });
         assertActive();
         const canvasEdges = [...edgeMap.values()].slice(0, 60).map((e) => {
-          const key = annotationEdgeKey(overlay.edges, e, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, e, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           return {
             from: e.from,
             to: e.to,
@@ -3025,8 +3169,8 @@ export const server = http.createServer(async (req, res) => {
         const suggestedLabels = [];
         for (const s of detected.suggestions || []) {
           if (!edgeMap.has(s.edgeKey)) continue;
-          const key = annotationEdgeKey(overlay.edges, { from: s.from, to: s.to, line: s.line }, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, { from: s.from, to: s.to, line: s.line }, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           if (existing.some((l) => l.preset === s.preset)) continue;
           const orderMatch = s.preset === 'call' ? /^コール順(\d+)$/.exec(s.text) : null;
           suggestedLabels.push({
@@ -3846,7 +3990,7 @@ export const server = http.createServer(async (req, res) => {
           if (error) return fail(error);
         }
         const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
-        const slot = store.transaction(() => {
+        const slot = withCanvasWrite('arrange_canvas', () => store.transaction(() => {
           const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
           const resetPositions = clear ? groupMode : undefined;
           const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, resetPositions });
@@ -3856,7 +4000,7 @@ export const server = http.createServer(async (req, res) => {
             after: { nodes: patch, resetPositions, reason, view: activeView },
           });
           return savedSlot;
-        });
+        }));
         overlay.layout[key] = slot;
         if (live && !clear) {
           snapshotSlot = slot;
@@ -3873,33 +4017,46 @@ export const server = http.createServer(async (req, res) => {
 
       const chatClientId = String(req.headers['x-callgraph-client'] || '').slice(0, 128);
       const collectedSubagents = [];
-      let turnChangeset = null;
+      let turnChangeset = null, savedChangeset = null;
       const turnWriteOps = new Set();
-      const ensureTurnSnapshot = (opName) => {
-        if (opName) turnWriteOps.add(opName);
-        if (COMPARISON || turnChangeset) return;
-        turnChangeset = {
-          id: randomUUID(),
-          projectId: PROJECT.id,
-          sessionRevision: expectedSession,
-          page: structuredClone(latestPage() || null),
-          overlay: store.loadOverlay(PROJECT.id),
-          inferredEdges: loadInferredEdges(PROJECT.id),
-          createdBookmarkIds: [],
-          ops: [],
-          createdAt: Date.now(),
-        };
+      const ensureTurnSnapshot = op => {
+        turnWriteOps.add(op);
+        turnChangeset ??= { id: turnId, projectId: chatProjectId, sessionRevision: expectedSession,
+          bookmarks: new Map(), ops: [], createdAt: Date.now() };
+        return turnChangeset;
       };
-      const recordCreatedBookmark = (bmId) => {
-        if (turnChangeset && Number.isInteger(bmId) && bmId > 0) {
-          turnChangeset.createdBookmarkIds.push(bmId);
+
+      // 仅在同步写入两侧取样。模型等待、布局计算或其他工具运行期间的独立编辑不能算作本轮写入。
+      const withCanvasWrite = (op, write) => {
+        if (COMPARISON) return write();
+        const { result, before, after } = store.transaction(() => {
+          const before = savedCanvasState();
+          const result = write();
+          return { result, before, after: COMPARISON ? null : savedCanvasState() };
+        });
+        if (after && !sameSavedCanvas(before, after)) {
+          const change = ensureTurnSnapshot(op);
+          if (change.canvas) {
+            if (!sameSavedCanvas(change.canvas.after, before)) change.canvas.stale = true;
+            change.canvas.after = after;
+          } else change.canvas = { before, after, stale: false };
         }
+        return result;
+      };
+      const recordBookmarkWrite = ({ prev = null, bookmark = null }, op = 'manage_bookmarks') => {
+        const changes = ensureTurnSnapshot(op).bookmarks;
+        const id = (bookmark || prev).id;
+        const last = changes.get(id);
+        const before = last && last.revision === prev?.revision ? last.before : prev;
+        if (!before && !bookmark) changes.delete(id);
+        else changes.set(id, { before, revision: bookmark?.revision ?? null, lastRevision: (bookmark || prev).revision });
       };
 
       const executeAiTool = async (name, args) => {
+        const write = operation => withCanvasWrite(name, operation);
+        const compose = (...params) => write(() => composeMcpView(...params));
         assertActive();
         if (name === 'arrange_canvas') {
-          if (args?.action && args.action !== 'inspect') ensureTurnSnapshot('arrange_canvas');
           return arrangeCanvas(args);
         }
         if (name === 'get_git_changes') {
@@ -3976,9 +4133,9 @@ export const server = http.createServer(async (req, res) => {
           const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'up';
           const depth = Math.max(1, Math.min(6, Math.trunc(Number(args.depth) || 4)));
           const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
-          const toChainStep = (id, edgeKind) => {
+          const toChainStep = (side, id, edgeKind) => {
             const cleanId = String(id || '');
-            const node = MODEL._index?.byId?.get(cleanId);
+            const node = side._index?.byId?.get(cleanId);
             return {
               id: cleanId,
               name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
@@ -3987,36 +4144,56 @@ export const server = http.createServer(async (req, res) => {
               ...(edgeKind ? { edgeKind } : {}),
             };
           };
-          const traces = resolved.slice(0, 15).map((id) => {
+          const structuredChains = [];
+          const addChain = (side, version, direction, path, edgeKeys, possible) => {
+            if (path.length < 2 || structuredChains.length >= 8) return;
+            const first = toChainStep(side, path[0]), last = toChainStep(side, path.at(-1));
+            const label = COMPARISON ? '[' + version + '] ' : '';
+            structuredChains.push({
+              id: `${direction}:${first.id}->${last.id}:${structuredChains.length}`,
+              title: label + (possible ? tr('chain.possible') : '') + (direction === 'down' ? tr('chain.down') : '') + `${first.name} → ${last.name}`,
+              kind: 'call', ...(COMPARISON ? { traceVersion: version } : {}), ...(possible ? { possible: true } : {}),
+              steps: path.map((nid, i) => toChainStep(side, nid, i ? 'call' : undefined)), edgeKeys,
+            });
+          };
+          const trace = (side, version, id) => {
             const tr = direction === 'down' ? { upstreamTasks: [], upstreamChains: [], totalTasks: 0 }
-              : traceToTasks(MODEL, id, { limit });
-            const directCallers = (MODEL._index?.inAdj?.get(id) || [])
-              .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
+              : traceToTasks(side, id, { limit });
+            const keyFor = edge => evidenceEdgeKey(edge, version, COMPARISON);
+            for (const chain of tr.upstreamChains.slice(0, 4)) {
+              addChain(side, version, 'up', chain.path, chain.edges.map(keyFor), chain.edges.some(possibleCall));
+            }
+            const directCallers = (side._index?.inAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.from])
               .slice(0, 20)
-              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
-            const directCallees = direction === 'up' ? [] : (MODEL._index?.outAdj?.get(id) || [])
-              .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to])
+              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
+            const directCallees = direction === 'up' ? [] : (side._index?.outAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to])
               .slice(0, 20)
-              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
+              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
             const downstreamPaths = [];
             if (direction === 'down' || direction === 'both') {
-              const stack = [{ node: id, path: [id] }];
+              const stack = [{ node: id, path: [id], edgeKeys: [], possible: false }];
               while (stack.length && downstreamPaths.length < 12) {
                 const cur = stack.shift();
-                const outs = (MODEL._index?.outAdj?.get(cur.node) || [])
-                  .filter((e) => e.kind !== 'var' && !e.headerReference && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[edgeKeyOf(e)]);
+                const outs = (side._index?.outAdj?.get(cur.node) || [])
+                  .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[keyFor(e)] && !cur.path.includes(e.to));
                 if (!outs.length || cur.path.length > depth) {
-                  if (cur.path.length > 1) downstreamPaths.push(cur.path);
+                  if (cur.path.length > 1) {
+                    downstreamPaths.push(cur.path);
+                    if (downstreamPaths.length <= 4) addChain(side, version, 'down', cur.path, cur.edgeKeys, cur.possible);
+                  }
                   continue;
                 }
                 for (const e of outs.slice(0, 6)) {
-                  if (cur.path.includes(e.to)) continue;
-                  stack.push({ node: e.to, path: [...cur.path, e.to] });
+                  stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, keyFor(e)],
+                    possible: cur.possible || possibleCall(e) });
                 }
               }
             }
             return {
               id,
+              ...(COMPARISON ? { traceVersion: version } : {}),
               upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
               chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
               downstreamPaths,
@@ -4024,36 +4201,18 @@ export const server = http.createServer(async (req, res) => {
               ...(directCallees.length ? { directCallees } : {}),
               totalTasks: tr.totalTasks || 0,
             };
-          });
-          const structuredChains = [];
-          for (const tr of traces) {
-            for (const c of tr.chains.slice(0, 4)) {
-              const p = Array.isArray(c.path) ? c.path : [];
-              if (p.length >= 2) {
-                structuredChains.push({
-                  id: `up:${p[0]}->${p[p.length - 1]}:${structuredChains.length}`,
-                  title: `${toChainStep(p[0]).name} → ${toChainStep(p[p.length - 1]).name}`,
-                  kind: 'call',
-                  steps: p.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
-                });
-              }
-            }
-            for (const dp of (tr.downstreamPaths || []).slice(0, 4)) {
-              structuredChains.push({
-                id: `down:${dp[0]}->${dp[dp.length - 1]}:${structuredChains.length}`,
-                title: `下游 ${toChainStep(dp[0]).name} → ${toChainStep(dp[dp.length - 1]).name}`,
-                kind: 'call',
-                steps: dp.map((nid, idx) => toChainStep(nid, idx > 0 ? 'call' : undefined)),
-              });
-            }
-          }
-          const pathBranches = summarizeVehicleBranches(MODEL, resolved);
+          };
+          const sides = callEvidenceSides(MODEL, COMPARISON);
+          const traces = sides.flatMap(([version, side]) => resolved.slice(0, 15)
+            .filter(id => side._index.byId.has(id)).map(id => trace(side, version, id)));
+          const pathBranches = sides.flatMap(([version, side]) => summarizeVehicleBranches(side, resolved)
+            .map(branch => COMPARISON ? { ...branch, traceVersion: version } : branch));
           return {
             ok: true,
             direction,
             functions: resolved,
             traces,
-            ...(structuredChains.length ? { chains: structuredChains.slice(0, 8) } : {}),
+            ...(structuredChains.length ? { chains: structuredChains } : {}),
             ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ambiguous,
             notFound,
@@ -4061,7 +4220,6 @@ export const server = http.createServer(async (req, res) => {
         }
         if (name === 'remove_from_canvas') {
           if (COMPARISON) return { ok: false, error: '当前处于比较视图（只读），退出比较后才能局部移除节点' };
-          ensureTurnSnapshot('remove_from_canvas');
           const excludePaths = normalizePathPrefixes(args.excludePaths);
           const rawFns = Array.isArray(args.functions) ? args.functions : [];
           if (!excludePaths.length && !rawFns.length) {
@@ -4132,7 +4290,7 @@ export const server = http.createServer(async (req, res) => {
             reviewing: false,
             ts: Date.now(),
           };
-          store.transaction(() => {
+          write(() => store.transaction(() => {
             nextPage.revision = store.appendEvent(PROJECT.id, {
               op: 'view.compose',
               actor: 'ai',
@@ -4141,7 +4299,7 @@ export const server = http.createServer(async (req, res) => {
               after: { ...nextPage, count: keptIds.length, rootCount: nextRoots.length, reason, view: viewSnapshot(nextPage) },
             });
             store.setSetting(key, nextPage);
-          });
+          }));
           const review = reviewWriteResult();
           if (!review.updatedWhileReviewing) pageState = nextPage;
           broadcastChange('view.compose', 'ai', { page: nextPage, reason });
@@ -4458,7 +4616,6 @@ export const server = http.createServer(async (req, res) => {
           if (!resolvedEdges.length) {
             return { ok: false, error: '未解析到有效的调用边端点', notFound };
           }
-          ensureTurnSnapshot('add_call_edge');
           const currentList = loadInferredEdges(PROJECT.id);
           let nextList;
           let newlyAddedCount = 0;
@@ -4476,7 +4633,7 @@ export const server = http.createServer(async (req, res) => {
             }
             nextList = [...byPair.values()];
           }
-          saveInferredEdges(PROJECT.id, nextList);
+          write(() => saveInferredEdges(PROJECT.id, nextList));
           applyInferredEdges(MODEL, PROJECT.id, nextList);
           S = stats(MODEL);
 
@@ -4498,7 +4655,7 @@ export const server = http.createServer(async (req, res) => {
               let composed = null;
               if (includeTasks && aliveFrom.length) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: aliveFrom,
                     functionIds: aliveTo.filter((id) => !aliveFrom.includes(id)),
@@ -4513,7 +4670,7 @@ export const server = http.createServer(async (req, res) => {
               }
               if (!composed) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: [],
                     functionIds: endpointIds,
@@ -4751,13 +4908,12 @@ export const server = http.createServer(async (req, res) => {
           let composed;
           let fallbackNote = '';
           const composeOptions = { chatClientId };
-          ensureTurnSnapshot('add_to_canvas');
           try {
-            composed = composeMcpView(composePayload, composeOptions);
+            composed = compose(composePayload, composeOptions);
           } catch (err) {
             if (includeTasks && !pureVars && /80|入口过多/.test(err.message)) {
               actualFnIds = activeFnsForCanvas.slice(0, 40);
-              composed = composeMcpView({
+              composed = compose({
                 mode,
                 ...(snapshotId ? { snapshotId } : {}),
                 roots: actualFnIds,
@@ -4775,6 +4931,7 @@ export const server = http.createServer(async (req, res) => {
           if (snapshotId && COMPARISON?.id === snapshotId) expectedSession = sessionRevision;
           // 多个相互隔离的改动自动拆分为多个书签视图（或用户显式指定 bookmarkName 时保存书签）
           const createdBookmarks = [];
+          const bookmarkWrites = [];
           const allGroupCanvasIds = new Set([
             ...(composed.page.roots || []),
             ...(composed.page.expansions || []).map((s) => s.root),
@@ -4799,7 +4956,7 @@ export const server = http.createServer(async (req, res) => {
                   vars: bmVars,
                   expansions: bmExpansions,
                 }, 'ai', { isForeground: false });
-                recordCreatedBookmark(savedBm.bookmark?.id);
+                bookmarkWrites.push(savedBm);
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -4822,15 +4979,16 @@ export const server = http.createServer(async (req, res) => {
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
               }, 'ai', { isForeground: false });
-              recordCreatedBookmark(savedBm.bookmark?.id);
+              bookmarkWrites.push(savedBm);
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
+          bookmarkWrites.forEach(saved => recordBookmarkWrite(saved, 'add_to_canvas'));
           if (createdBookmarks.length) broadcastChange('bookmark.save', 'ai', { projectId: PROJECT.id });
           // 组图成功后再仅对本次选入画布/书签的变更节点与新增连线写入变更分类（避免未选节点或报错时误写标注）。
           if (!COMPARISON && args.fromGit && (detectedNodeChanges.size || detectedAddedEdges.length)) {
             const scopedNodeIds = new Set([...allGroupCanvasIds, ...actualFnIds, ...scopes.flatMap(g => g.varIds), ...(composed.page.vars || [])]);
-            store.transaction(() => {
+            write(() => store.transaction(() => {
               overlay.nodes = overlay.nodes || {};
               overlay.edges = overlay.edges || {};
               for (const [id, ch] of detectedNodeChanges) {
@@ -4849,7 +5007,7 @@ export const server = http.createServer(async (req, res) => {
                 const merged = writeAnnotation('edge', key, { change: 'added' }, 'ai');
                 if (merged) overlay.edges[key] = merged;
               }
-            });
+            }));
           }
           // 自动将画布上可达的 TASK 周期（含函数头注释中的周期）以线段标签（TASK:xms）形式标出，替代函数左上角角标。
           let autoTaskLabels = 0;
@@ -4869,7 +5027,7 @@ export const server = http.createServer(async (req, res) => {
                 taskItems.push({ edgeKey: s.edgeKey, preset: 'task', text: s.text });
               }
               if (taskItems.length && MODEL === labelModel) {
-                const applied = applyMcpTaskLabels({ items: taskItems, merge: true });
+                const applied = write(() => applyMcpTaskLabels({ items: taskItems, merge: true }));
                 autoTaskLabels = applied.edgeKeys?.length || 0;
               }
             } catch { /* 自动 TASK 线段标签不影响主组图结果 */ }
@@ -4949,8 +5107,7 @@ export const server = http.createServer(async (req, res) => {
             });
           }
           assertActive();
-          ensureTurnSnapshot('apply_labels');
-          const applied = applyMcpTaskLabels({ items, merge: true });
+          const applied = write(() => applyMcpTaskLabels({ items, merge: true }));
           return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [], ...reviewWriteResult() };
         }
         const toChainStep = (id, edgeKind) => {
@@ -5011,13 +5168,12 @@ export const server = http.createServer(async (req, res) => {
             const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, targetId, peerId) : pairDataflow(MODEL, targetId, peerId));
             assertActive();
             const rwPaths = (df.paths || []).slice(0, maxPaths);
-            const sharedVars = (df.sharedVars || []).slice(0, 20);
+            const sharedVars = variablesOnPaths(df, rwPaths).slice(0, 20);
             const chains = rwPaths.slice(0, 6).map((p, idx) => ({
               id: `dfpair:${targetId}:${peerId}:${idx}`,
-              title: `${targetNode?.name || targetId} ↔ ${peerNode?.name || peerId} (${p.direction || 'rw'})`,
+              title: `${toChainStep(p.nodes[0]).name} → ${toChainStep(p.nodes.at(-1)).name}`,
               kind: 'dataflow',
-              steps: (Array.isArray(p.nodes) && p.nodes.length ? p.nodes : [p.writer, p.varId, p.reader].filter(Boolean))
-                .map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
+              steps: p.nodes.map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
             }));
             return {
               ok: true,
@@ -5078,37 +5234,42 @@ export const server = http.createServer(async (req, res) => {
             seedIds = (cur?.roots || []).slice(0, 6);
             if (!seedIds.length) return { ok: false, error: tr('walk.empty') };
           } else {
-            const fnRes = resolveSymbols(MODEL, rawTargets, 'fn');
-            if (fnRes.ambiguous.length) {
-              const branches = branchesFromIds(MODEL, fnRes.ambiguous.flatMap(a => a.candidates || []));
-              return {
-                ok: false,
-                needsVehicleChoice: branches.length > 1,
-                ...(branches.length > 1 ? { pathBranches: branches } : {}),
-                ambiguous: fnRes.ambiguous,
-                error: tr('walk.ambiguous'),
-              };
+            let matches = rawTargets.map(resolveFnOrVar);
+            if (matches.some(m => m.notFound.length) && !COMPARISON && MODEL.source !== 'dot') {
+              // 暂定全局定义可能要到数据流索引建立后才成为图节点。
+              await ensureAnalysis(MODEL);
+              assertActive();
+              matches = rawTargets.map(resolveFnOrVar);
             }
-            seedIds = fnRes.resolved;
-            if (!seedIds.length) {
-              const varRes = resolveSymbols(MODEL, rawTargets, 'var');
-              if (varRes.resolved.length) seedIds = varRes.resolved;
-              else return { ok: false, error: tr('walk.missing', { names: rawTargets.join(', ') }), notFound: fnRes.notFound };
+            const ambiguous = matches.flatMap(m => m.ambiguous);
+            if (ambiguous.length) {
+              const branches = branchesFromIds(MODEL, ambiguous.flatMap(a => a.candidates || []));
+              return { ok: false, needsVehicleChoice: branches.length > 1,
+                ...(branches.length > 1 ? { pathBranches: branches } : {}), ambiguous,
+                error: tr('walk.ambiguous') };
             }
+            const notFound = matches.flatMap(m => m.notFound);
+            if (notFound.length) return { ok: false, error: tr('walk.missing', { names: notFound.join(', ') }), notFound };
+            seedIds = [...new Set(matches.flatMap(m => m.resolved))];
           }
           const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'both';
           const depth = Math.max(1, Math.min(5, Math.trunc(Number(args.depth) || 2)));
           const focusFilter = normalizePathPrefixes(args.focusFilter);
           const includeDataflow = args.includeDataflow !== false;
           const addToCanvas = args.addToCanvas !== false;
-          const sliceNodes = new Map(); // id -> { depthSigned, order }
+          if (addToCanvas && COMPARISON) return { ok: false, error: tr('walk.compare') };
+          // 一份导览只能讲述一个版本。优先修改后，删除的根可回到修改前。
+          const side = callEvidenceSides(MODEL, COMPARISON).reverse().find(([, m]) => !COMPARISON || seedIds.every(id => m._index.byId.has(id)));
+          if (!side) return { ok: false, error: tr('walk.versions') };
+          const [traceVersion, source] = side;
+          const sliceNodes = new Map(); // 节点 ID → 相对根的有向层级
           const sliceEdges = [];
           const seenEdge = new Set();
           const allowId = (id) => {
-            const n = MODEL._index?.byId?.get(id);
-            if (!n || n.external || overlay.deleted.nodes[id]) return false;
+            const n = source._index?.byId?.get(id);
+            if (!n || n.external || n.headerSymbol || overlay.deleted.nodes[id]) return false;
             if (focusFilter.length && n.kind !== 'var') {
-              const file = fileOfNodeId(MODEL, id);
+              const file = fileOfNodeId(source, id);
               if (!focusFilter.some(pref => fileMatchesPathPrefix(file, pref)) && !seedIds.includes(id)) return false;
             }
             return true;
@@ -5116,44 +5277,49 @@ export const server = http.createServer(async (req, res) => {
           for (const sid of seedIds) {
             if (allowId(sid) && !sliceNodes.has(sid)) sliceNodes.set(sid, 0);
           }
-          if (direction === 'up' || direction === 'both') {
-            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
-            while (q.length && sliceNodes.size < 40) {
-              const cur = q.shift();
-              if (cur.d >= depth) continue;
-              for (const e of MODEL._index?.inAdj?.get(cur.id) || []) {
-                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                if (!allowId(e.from)) continue;
-                const ek = edgeKeyOf(e);
-                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
-                if (!sliceNodes.has(e.from)) {
-                  sliceNodes.set(e.from, -(cur.d + 1));
-                  q.push({ id: e.from, d: cur.d + 1 });
-                }
-                if (sliceNodes.size >= 40) break;
-              }
+          // 数据流按「写者 → 变量 → 读者」讲解，画布则将读写合为「函数 → 变量」一条边。
+          const presentationEdgeKey = e => {
+            if (!e.df) return evidenceEdgeKey(e, traceVersion, COMPARISON);
+            const writer = e.kind === 'df-write';
+            const fn = writer ? e.from : e.to, variable = writer ? e.to : e.from;
+            if (COMPARISON) {
+              const edge = MODEL._index.outAdj.get(fn)?.find(edge => edge.kind === 'var' && edge.to === variable &&
+                edge.versions?.includes(traceVersion) && (edge.via === '读写' || edge.via === (writer ? '写' : '读')));
+              if (edge) return edgeKeyOf(edge);
             }
-          }
-          if (direction === 'down' || direction === 'both') {
-            const q = [...seedIds.filter(id => sliceNodes.has(id)).map(id => ({ id, d: 0 }))];
-            while (q.length && sliceNodes.size < 40) {
-              const cur = q.shift();
-              if (cur.d >= depth) continue;
-              for (const e of MODEL._index?.outAdj?.get(cur.id) || []) {
-                if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                if (!allowId(e.to)) continue;
-                const ek = edgeKeyOf(e);
-                if (!seenEdge.has(ek)) { seenEdge.add(ek); sliceEdges.push(e); }
-                if (!sliceNodes.has(e.to)) {
-                  sliceNodes.set(e.to, cur.d + 1);
-                  q.push({ id: e.to, d: cur.d + 1 });
-                }
+            return canvasEdgeKey({ from: fn, to: variable, kind: 'var' });
+          };
+          for (const upstream of [true, false]) {
+            if (upstream ? direction === 'down' : direction === 'up') continue;
+            const visited = new Set(seedIds.filter(id => sliceNodes.has(id)));
+            const queue = [...visited].map(id => ({ id, d: 0 }));
+            while (queue.length && sliceNodes.size < 40) {
+              const { id, d } = queue.shift();
+              if (d >= depth) continue;
+              let edges;
+              if (source._index.byId.get(id)?.kind === 'var') {
+                const dir = upstream ? 'in' : 'out';
+                const flow = await dataflowFor(source, id, dir);
+                assertActive();
+                edges = flow.edges;
+              } else {
+                const adj = upstream ? source._index.inAdj : source._index.outAdj;
+                edges = (adj.get(id) || []).filter(isCallEvidence);
+              }
+              for (const e of edges) {
+                const peer = upstream ? e.from : e.to;
+                const key = presentationEdgeKey(e);
+                if (!allowId(peer) || overlay.deleted.edges[key]) continue;
+                const relation = e.df ? e.kind + ':' + key : key;
+                if (!seenEdge.has(relation)) { seenEdge.add(relation); sliceEdges.push(e); }
+                if (!sliceNodes.has(peer)) sliceNodes.set(peer, (upstream ? -1 : 1) * (d + 1));
+                if (!visited.has(peer)) { visited.add(peer); queue.push({ id: peer, d: d + 1 }); }
                 if (sliceNodes.size >= 40) break;
               }
             }
           }
           const fnSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind !== 'var');
-          let varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
+          const varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
           if (includeDataflow && !COMPARISON && MODEL.source !== 'dot') {
             await ensureAnalysis(MODEL);
             assertActive();
@@ -5179,13 +5345,14 @@ export const server = http.createServer(async (req, res) => {
             }
           }
           let composedResult = null;
-          if (addToCanvas && !COMPARISON && fnSliceIds.length) {
-            ensureTurnSnapshot('present_logic');
+          if (!sliceNodes.size) return { ok: false, error: tr('walk.noVisible') };
+          if (addToCanvas) {
+            if (!fnSliceIds.length) return { ok: false, error: tr('walk.noFunctions'), addedToCanvas: false };
             const minLayer = Math.min(...fnSliceIds.map(id => sliceNodes.get(id) ?? 0));
             const topRoots = fnSliceIds.filter(id => (sliceNodes.get(id) ?? 0) === minLayer);
             const restFns = fnSliceIds.filter(id => !topRoots.includes(id));
             try {
-              composedResult = composeMcpView({
+              composedResult = compose({
                 mode: args.mode === 'replace' ? 'replace' : 'add',
                 roots: topRoots.length ? topRoots : fnSliceIds.slice(0, 4),
                 functionIds: restFns,
@@ -5195,8 +5362,8 @@ export const server = http.createServer(async (req, res) => {
                 down: 0,
                 reason: String(args.title || tr('walk.reason')).slice(0, 120),
               }, { chatClientId });
-            } catch {
-              composedResult = null;
+            } catch (error) {
+              return { ok: false, error: error.message, addedToCanvas: false };
             }
           }
           // 构建按执行层级排序的 Walkthrough 步骤
@@ -5207,11 +5374,11 @@ export const server = http.createServer(async (req, res) => {
             layers.get(d).push(id);
           }
           const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
-          const presTitle = String(args.title || tr('walk.title', { name: toChainStep(seedIds[0]).name })).slice(0, 80);
+          const presTitle = (COMPARISON ? '[' + traceVersion + '] ' : '') + String(args.title || tr('walk.title', { name: toChainStep(seedIds[0]).name })).slice(0, 80);
           const steps = sortedDepths.slice(0, 6).map((d, idx) => {
             const nids = layers.get(d).slice(0, 10);
             const names = nids.map(id => toChainStep(id).name);
-            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(edgeKeyOf);
+            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(presentationEdgeKey);
             const roleLabel = d < 0 ? tr('walk.up') : d === 0 ? tr('walk.core') : tr('walk.down');
             return {
               index: idx,
@@ -5228,7 +5395,7 @@ export const server = http.createServer(async (req, res) => {
               title: tr('walk.globals', { n: varSliceIds.length }),
               summary: tr('walk.rw', { names: varSliceIds.map(v => toChainStep(v).name).join(tr('itemSep')) }),
               nodeIds: varSliceIds,
-              edgeKeys: [],
+              edgeKeys: [...new Set(sliceEdges.filter(e => e.df).map(presentationEdgeKey))],
               focusNodeId: varSliceIds[0],
             });
           }
@@ -5239,38 +5406,43 @@ export const server = http.createServer(async (req, res) => {
           };
           const chains = [];
           for (const e of sliceEdges.slice(0, 6)) {
+            const label = COMPARISON ? '[' + traceVersion + '] ' : '';
             chains.push({
-              id: `pres_edge:${edgeKeyOf(e)}`,
-              title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
-              kind: 'call',
+              id: `pres_edge:${e.kind}:${presentationEdgeKey(e)}`,
+              title: label + (possibleCall(e) ? tr('chain.possible') : '') + `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              kind: e.df ? 'dataflow' : 'call',
+              edgeKeys: [presentationEdgeKey(e)],
               steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
             });
           }
           const canvasOverlay = {
             action: 'highlight',
             nodeIds: [...fnSliceIds, ...varSliceIds].slice(0, 60),
-            edgeKeys: sliceEdges.map(edgeKeyOf).slice(0, 80),
+            edgeKeys: [...new Set(sliceEdges.map(presentationEdgeKey))].slice(0, 80),
             label: presTitle,
           };
-          sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
+          // 浏览器会从对话流启动逐步导览。无浏览器发起的请求仍向观察画布广播全图摘要。
+          if (composedResult && !chatClientId) sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
           return {
             ok: true,
             title: presTitle,
+            ...(COMPARISON ? { traceVersion } : {}),
             nodeCount: fnSliceIds.length + varSliceIds.length,
             edgeCount: sliceEdges.length,
             presentation,
             chains,
-            canvasOverlay,
+            addedToCanvas: Boolean(composedResult),
+            ...(composedResult ? { canvasOverlay } : {}),
             ...(composedResult?.updatedWhileReviewing ? { updatedWhileReviewing: true, reviewNote: composedResult.reviewNote } : {}),
           };
         }
         if (name === 'canvas_visual') {
-          const action = ['highlight', 'play_flow', 'lens', 'clear'].includes(args.action) ? args.action : 'highlight';
+          const action = args.action || 'highlight';
+          if (!['highlight', 'play_flow', 'clear'].includes(action)) return { ok: false, error: tr('visual.unsupported') };
           const payload = {
             action,
             nodeIds: (Array.isArray(args.nodeIds) ? args.nodeIds : []).slice(0, 80).map(String),
             edgeKeys: (Array.isArray(args.edgeKeys) ? args.edgeKeys : []).slice(0, 120).map(String),
-            ...(args.lens ? { lens: ['default', 'dataflow', 'indirect', 'changes'].includes(args.lens) ? args.lens : 'default' } : {}),
             ...(typeof args.label === 'string' && args.label.trim() ? { label: args.label.trim().slice(0, 80) } : {}),
           };
           sendClientEvent(chatClientId, 'canvas_overlay', payload);
@@ -5278,8 +5450,20 @@ export const server = http.createServer(async (req, res) => {
         }
         if (name === 'diagnose_canvas') {
           const check = ['all', 'orphans', 'indirect', 'labels', 'layout'].includes(args.check) ? args.check : 'all';
-          const page = latestPage();
-          if (!page || (!(page.roots?.length) && !(page.expansions?.length))) {
+          const page = pageState?.projectId === PROJECT.id && (pageState.comparisonId ?? null) === (COMPARISON?.id ?? null)
+            ? pageState : latestPage();
+          const at = !COMPARISON && page?.at > 0 ? page.at : 0;
+          const historical = at ? store.viewAt(PROJECT.id, at) : null;
+          const viewOverlay = at ? store.overlayAt(PROJECT.id, at) : overlay;
+          const scope = viewSnapshot(historical || page || {});
+          const roots = historical?.empty ? [] : scope.roots;
+          const expansions = historical?.empty ? [] : scope.expansions;
+          const fallback = COMPARISON && !roots.length && !(scope.empty && !expansions.length && !scope.vars.length);
+          const view = await buildView(fallback ? COMPARISON.roots : roots, fallback ? 0 : scope.up, fallback ? 0 : scope.down,
+            scope.group, null, { want: scope.vars, skip: scope.hiddenVars, expansions, groupMode: scope.groupMode,
+              preview: true, signal: abort.signal }, viewOverlay);
+          assertActive();
+          if (!view.nodes.length) {
             return {
               ok: true,
               healthReport: {
@@ -5290,33 +5474,15 @@ export const server = http.createServer(async (req, res) => {
             };
           }
           const issues = [];
-          const labelCtx = await collectCanvasLabelContext(MODEL, page);
-          assertActive();
-          const activeView = viewSnapshot(page);
-          const visRoots = (activeView.roots || []).map(id => remapLegacyExt(id, MODEL)).filter(id => MODEL._index.byId.has(id));
-          const visExps = normalizeExpansions((activeView.expansions || [])
-            .map(s => ({ ...s, root: remapLegacyExt(s.root, MODEL) }))
-            .filter(s => MODEL._index.byId.has(s.root)));
-          const visNodes = new Set();
-          const visAdjCount = new Map();
-          for (const sc of [...visRoots.map(r => ({ root: r, up: activeView.up || 0, down: activeView.down || 0 })), ...visExps]) {
-            const sub = subgraph(MODEL, sc.root, { up: sc.up, down: sc.down, maxNodes: 200, includeVariables: true });
-            for (const n of sub.nodes) if (!overlay.deleted.nodes[n.id]) visNodes.add(n.id);
-            for (const e of sub.edges) {
-              if (!overlay.deleted.edges[edgeKeyOf(e)]) {
-                visAdjCount.set(e.from, (visAdjCount.get(e.from) || 0) + 1);
-                visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
-              }
-            }
+          const visNodes = new Set(view.nodes.map(n => n.id));
+          const connected = new Set(view.edges.flatMap(e => [e.from, e.to]));
+          let labelCtx;
+          if (check === 'all' || check === 'labels') {
+            const functions = new Set(view.nodes.filter(n => n.kind !== 'var').map(n => n.id));
+            const edges = new Map(view.edges.filter(e => functions.has(e.from) && functions.has(e.to)).map(e => [edgeKeyOf(e), e]));
+            labelCtx = await canvasLabelsForEdges(MODEL, functions, edges, viewOverlay);
           }
-          for (const id of visNodes) {
-            for (const e of MODEL._index?.outAdj?.get(id) || []) {
-              if (e.headerReference || !visNodes.has(e.to) || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-              visAdjCount.set(id, (visAdjCount.get(id) || 0) + 1);
-              visAdjCount.set(e.to, (visAdjCount.get(e.to) || 0) + 1);
-            }
-          }
-          if ((check === 'all' || check === 'labels') && labelCtx.suggestedLabels.length) {
+          if (labelCtx?.suggestedLabels.length) {
             const sample = labelCtx.suggestedLabels.slice(0, 6);
             issues.push({
               id: 'missing_labels',
@@ -5332,8 +5498,8 @@ export const server = http.createServer(async (req, res) => {
             const unexpanded = [];
             for (const ic of MODEL.indirectCalls || []) {
               if (!visNodes.has(ic.caller)) continue;
-              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !overlay.deleted.nodes[c.id]);
-              if (missing.length || ic.unresolved) unexpanded.push({ ic, missing });
+              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !viewOverlay.deleted.nodes[c.id]);
+              if (missing.length || ic.resolution === 'unresolved') unexpanded.push({ ic, missing });
               if (unexpanded.length >= 12) break;
             }
             if (unexpanded.length) {
@@ -5349,7 +5515,7 @@ export const server = http.createServer(async (req, res) => {
             }
           }
           if ((check === 'all' || check === 'orphans') && visNodes.size >= 2) {
-            const orphans = [...visNodes].filter(id => (visAdjCount.get(id) || 0) === 0);
+            const orphans = [...visNodes].filter(id => !connected.has(id));
             if (orphans.length) {
               issues.push({
                 id: 'isolated_nodes',
@@ -5402,7 +5568,6 @@ export const server = http.createServer(async (req, res) => {
             return { ok: true, action, bookmarks: store.listBookmarks(PROJECT.id) };
           }
           if (COMPARISON) return { ok: false, error: tr('bookmark.compare') };
-          ensureTurnSnapshot('manage_bookmarks');
           if (action === 'checkpoint') {
             const label = String(args.checkpointName || args.name || tr('bookmark.defaultCheckpoint')).trim().slice(0, 80);
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
@@ -5421,7 +5586,7 @@ export const server = http.createServer(async (req, res) => {
             if (!bmName) return { ok: false, error: tr('bookmark.needName') };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
             const r = saveBookmarkWithEvent({ ...viewSnapshot(page), name: bmName }, 'ai', { isForeground: true });
-            recordCreatedBookmark(r.bookmark?.id);
+            recordBookmarkWrite(r);
             broadcastChange('bookmark.save', 'ai', { bookmark: r.bookmark, projectId: PROJECT.id, clientId: chatClientId });
             return { ok: true, action, bookmark: r.bookmark };
           }
@@ -5429,27 +5594,29 @@ export const server = http.createServer(async (req, res) => {
             const id = Number(args.id);
             if (!Number.isFinite(id) || id <= 0) return { ok: false, error: tr('bookmark.updateId') };
             const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
-            const resUp = store.updateBookmarkById(PROJECT.id, id, viewSnapshot(page));
+            const resUp = updateBookmarkWithEvent(id, viewSnapshot(page), 'ai');
             if (!resUp) return { ok: false, error: tr('bookmark.missing') };
+            recordBookmarkWrite(resUp);
             broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
             return { ok: true, action, bookmark: resUp.bookmark };
           }
           if (action === 'delete') {
             const id = Number(args.id);
             if (!Number.isFinite(id) || id <= 0) return { ok: false, error: tr('bookmark.deleteId') };
-            const gone = store.listBookmarks(PROJECT.id).find(b => b.id === id);
-            const okDel = store.deleteBookmark(PROJECT.id, id);
-            if (okDel) {
+            const removed = store.transaction(() => {
+              const before = store.getBookmark(PROJECT.id, id);
+              if (!before || !store.deleteBookmark(PROJECT.id, id)) return null;
               store.appendEvent(PROJECT.id, {
-                op: 'bookmark.delete',
-                actor: 'ai',
-                target: gone?.name || `#${id}`,
-                before: gone ? bookmarkEventPayload(gone) : null,
-                ctx: { ...(gone?.id && { bookmarkId: gone.id }), bookmarkName: gone?.name || `#${id}`, action: 'delete', milestone: true },
+                op: 'bookmark.delete', actor: 'ai', target: before.name, before: bookmarkEventPayload(before),
+                ctx: { bookmarkId: id, bookmarkName: before.name, action: 'delete', milestone: true },
               });
-              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: gone?.name || null, projectId: PROJECT.id, clientId: chatClientId });
+              return before;
+            });
+            if (removed) {
+              recordBookmarkWrite({ prev: removed });
+              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: removed.name, projectId: PROJECT.id, clientId: chatClientId });
             }
-            return { ok: okDel, action, removed: okDel ? 1 : 0 };
+            return { ok: Boolean(removed), action, removed: removed ? 1 : 0 };
           }
           return { ok: false, error: tr('bookmark.action', { action }) };
         }
@@ -5562,7 +5729,7 @@ export const server = http.createServer(async (req, res) => {
         const gitInfo = MODEL.parserId === 'dot' ? null : await quickGitDirtySummary(COMPARISON?.projectPath || root).catch(() => null);
         assertActive();
         const tasks = MODEL.parserId === 'dot' ? [] : projectTasks(MODEL).slice(0, 10).map(t => t.name);
-        const sanitizeUiContext = (raw) => {
+        const sanitizeUiContext = async (raw) => {
           if (!raw || typeof raw !== 'object') return null;
           const sanitizeNode = (n) => (!n || typeof n !== 'object' ? null : {
             kind: 'node',
@@ -5606,7 +5773,7 @@ export const server = http.createServer(async (req, res) => {
               edgeKeys: (Array.isArray(vp?.edgeKeys) ? vp.edgeKeys : []).slice(0, 20).map(k => String(k).slice(0, 320)),
               names: (Array.isArray(vp?.names) ? vp.names : []).slice(0, 20).map(s => String(s).slice(0, 120)),
             })),
-            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => ({
+            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => typeof rp === 'string' ? rp.slice(0, 600) : ({
               direction: String(rp?.direction || '').slice(0, 16),
               varId: String(rp?.varId || '').slice(0, 200),
               varName: String(rp?.varName || '').slice(0, 120),
@@ -5619,20 +5786,26 @@ export const server = http.createServer(async (req, res) => {
               name: String(v?.name || v || '').slice(0, 120),
             })),
           });
-          const sanitizeDataflow = (df) => (!df || typeof df !== 'object' ? null : {
-            kind: 'dataflow',
-            targetId: String(df.targetId || df.id || '').slice(0, 200),
-            targetName: String(df.targetName || df.name || '').slice(0, 120),
-            dir: ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out',
-            vars: (Array.isArray(df.vars) ? df.vars : []).slice(0, 16).map(v => ({
-              id: String(v?.id || v || '').slice(0, 200),
-              name: String(v?.name || v || '').slice(0, 120),
-            })),
-            peers: (Array.isArray(df.peers) ? df.peers : []).slice(0, 16).map(peer => ({
-              id: String(peer?.id || peer || '').slice(0, 200),
-              name: String(peer?.name || peer || '').slice(0, 120),
-            })),
-          });
+          const flows = new Map();
+          const sanitizeDataflow = async (df) => {
+            if (!df || typeof df !== 'object' || (df.projectId != null && df.projectId !== chatProjectId) ||
+                (df.sessionRevision != null && df.sessionRevision !== expectedSession) ||
+                (Object.hasOwn(df, 'comparisonId') && df.comparisonId !== (COMPARISON?.id ?? null))) return null;
+            const id = df.targetId || df.fnId || df.id;
+            if (typeof id !== 'string' || !id || id.length > 200 || !MODEL._index) return null;
+            const dir = ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out';
+            const key = JSON.stringify([id, dir]);
+            if (!flows.has(key)) {
+              if (!COMPARISON) await ensureAnalysis(MODEL);
+              assertActive();
+              if (!MODEL._index.byId.has(id)) return null;
+              const result = await (COMPARISON ? comparisonDataflow(COMPARISON, id, dir) : dataflowFor(MODEL, id, dir));
+              assertActive();
+              flows.set(key, result);
+            }
+            const result = flows.get(key);
+            return result.fn ? dataflowAttachment(result, dir, df.focused) : null;
+          };
           const out = {};
           const types = [
             ['node', 'selectedNode', sanitizeNode],
@@ -5644,9 +5817,12 @@ export const server = http.createServer(async (req, res) => {
           const flat = types.find(([kind]) => raw.kind === kind);
           for (const [, key, sanitize] of flat ? [flat] : types) {
             if (flat) {
-              const item = sanitize(raw);
-              Object.assign(out, item, { [key]: item });
-            } else if (raw[key]) out[key] = sanitize(raw[key]);
+              const item = await sanitize(raw);
+              if (item) Object.assign(out, item, { [key]: item });
+            } else if (raw[key]) {
+              const item = await sanitize(raw[key]);
+              if (item) out[key] = item;
+            }
           }
           if (typeof raw.relationIntent === 'string' && ['auto', 'compare', 'path', 'dataflow', 'common_callers'].includes(raw.relationIntent)) {
             out.relationIntent = raw.relationIntent;
@@ -5665,8 +5841,8 @@ export const server = http.createServer(async (req, res) => {
                 item = sanitizePair(entry);
                 id = item?.fromId && item?.toId && [item.fromId, item.toId].sort().join('<->');
               } else if (entry?.kind === 'dataflow') {
-                item = sanitizeDataflow(entry);
-                id = item?.targetId && `${item.targetId}:${item.dir}`;
+                item = await sanitizeDataflow(entry);
+                id = item && JSON.stringify([item.targetId, item.dir, item.focused?.path]);
               } else if (entry?.kind === 'file') {
                 item = sanitizeFile(entry);
                 id = item?.path;
@@ -5702,63 +5878,61 @@ export const server = http.createServer(async (req, res) => {
           }
           const lines = [];
           const shortName = (id) => model._index.byId.get(id)?.name || String(id).replace(/^var::/, '').split('::').pop();
+          const sides = callEvidenceSides(model, COMPARISON);
           for (const [a, b] of pairs.slice(0, 2)) {
             if (!model._index.byId.has(a) || !model._index.byId.has(b) || a === b) continue;
-            const shortestCallPath = (src, dst, maxDepth = 5) => {
-              const q = [[src]];
-              const seen = new Set([src]);
-              while (q.length) {
-                const path = q.shift();
-                if (path.length > maxDepth) continue;
-                const tail = path[path.length - 1];
-                for (const e of model._index.outAdj.get(tail) || []) {
-                  if (e.kind === 'var' || e.headerReference || overlay.deleted.edges[edgeKeyOf(e)]) continue;
-                  if (e.to === dst) return [...path, dst];
-                  if (!seen.has(e.to)) { seen.add(e.to); q.push([...path, e.to]); }
-                }
+            for (const [version, side] of sides) {
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              const byId = side._index.byId;
+              if (!byId.has(a) || !byId.has(b)) {
+                lines.push(tr('graph.missingEndpoint', { version: label }));
+                continue;
               }
-              return null;
-            };
-            const fwd = shortestCallPath(a, b);
-            const rev = fwd ? null : shortestCallPath(b, a);
-            const path = fwd || rev;
-            if (path) {
-              lines.push(tr('graph.path', { path: path.map(shortName).join(' → ') }));
-            } else {
-              lines.push(tr('graph.noPath', { a: shortName(a), b: shortName(b) }));
+              const found = shortestCallPath(side, a, b, version, COMPARISON) || shortestCallPath(side, b, a, version, COMPARISON);
+              if (found) {
+                const path = found.path.map(id => byId.get(id)?.name || id).join(' → ') + (found.possible ? tr('graph.possiblePath') : '');
+                lines.push(tr('graph.path', { version: label, path }));
+              } else {
+                lines.push(tr('graph.noPath', { version: label, a: shortName(a), b: shortName(b) }));
+              }
+              const tasksA = taskCallEvidence(side, a, 20), tasksB = taskCallEvidence(side, b, 20);
+              const common = [];
+              for (const [id, task] of tasksA) {
+                const other = tasksB.get(id);
+                if (other) common.push(task.name + (task.possible || other.possible ? tr('graph.possible') : ''));
+              }
+              if (common.length) lines.push(tr('graph.common', { version: label, tasks: common.slice(0, 4).join(tr('itemSep')) }));
             }
             try {
               const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
               assertActive();
-              if (df.sharedVars?.length) {
-                lines.push(tr('graph.globals', { vars: df.sharedVars.slice(0, 8).map(v => `${v.name} (${v.id})`).join(tr('itemSep')) }));
-              }
-              for (const p of (df.paths || []).slice(0, 5)) {
-                const label = `${shortName(p.writer)} --W:${p.varName}--> ${shortName(p.reader)} (${p.direction || 'rw'}${p.line ? `, L${p.line}` : ''})`;
-                lines.push(tr('graph.flow', { label }));
+              const variables = variablesOnPaths(df, df.paths);
+              if (variables.length) lines.push(tr('graph.globals', { vars: variables.slice(0, 8).map(v => v.name + ' (' + v.id + ')').join(tr('itemSep')) }));
+              const nodes = new Map(df.nodes.map(n => [n.id, n]));
+              for (const p of df.paths.slice(0, 5)) {
+                for (const [version, edges] of Object.entries(p.evidenceByVersion || { '': p.edges })) {
+                  const parts = [nodes.get(p.nodes[0])?.name || p.nodes[0]];
+                  for (const e of edges) {
+                    const write = e.kind === 'df-write';
+                    const file = nodes.get(write ? e.from : e.to)?.file;
+                    const loc = e.line ? ' ' + (file ? file + ':' : 'L') + e.line : '';
+                    parts.push('--' + (write ? 'W' : 'R') + loc + '-->', nodes.get(e.to)?.name || e.to);
+                  }
+                  lines.push(tr('graph.flow', { version: version ? ' [' + version + ']' : '', label: parts.join(' ') }));
+                }
               }
             } catch { /* ignore enrichment dataflow errors */ }
-            try {
-              const trA = traceToTasks(model, a, { limit: 20 });
-              const trB = traceToTasks(model, b, { limit: 20 });
-              const setB = new Set((trB.upstreamTasks || []).map(t => t.id));
-              const commonTasks = (trA.upstreamTasks || []).filter(t => setB.has(t.id)).slice(0, 4);
-              if (commonTasks.length) {
-                lines.push(tr('graph.common', { tasks: commonTasks.map(t => t.name).join(tr('itemSep')) }));
-              }
-            } catch { /* ignore */ }
           }
-          if (!pairs.length && nodeIds.length === 1 && model._index.byId.get(nodeIds[0])?.kind !== 'var') {
-            try {
-              const trace = traceToTasks(model, nodeIds[0], { limit: 10 });
-              if (trace.upstreamTasks?.length) {
-                lines.push(tr('graph.tasks', { tasks: trace.upstreamTasks.slice(0, 6).map(t => t.name).join(tr('itemSep')) }));
-              }
-            } catch { /* ignore */ }
+          if (!pairs.length && nodeIds.length === 1) {
+            for (const [version, side] of sides) {
+              const tasks = [...taskCallEvidence(side, nodeIds[0], 10).values()];
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              if (tasks.length) lines.push(tr('graph.tasks', { version: label, tasks: tasks.slice(0, 6).map(t => t.name + (t.possible ? tr('graph.possible') : '')).join(tr('itemSep')) }));
+            }
           }
           return lines.slice(0, 28).join('\n');
         };
-        const uiContext = sanitizeUiContext(p.uiContext);
+        const uiContext = await sanitizeUiContext(p.uiContext);
         if (uiContext) {
           const enrichment = await enrichTurnContext(MODEL, uiContext);
           if (enrichment) uiContext.enrichment = enrichment;
@@ -5798,22 +5972,29 @@ export const server = http.createServer(async (req, res) => {
           executeTool: executeAiTool,
           onEvent: sendEvent,
           signal: abort.signal,
-          beforeDone: async ({ onEvent }) => {
+          beforeDone: ({ onEvent, interrupted }) => {
             const extra = {};
-            if (turnChangeset && turnWriteOps.size) {
+            if (turnChangeset && (turnChangeset.canvas || turnChangeset.bookmarks.size)) {
+              turnChangeset.interrupted = interrupted || !sessionCurrent();
               turnChangeset.ops = [...turnWriteOps];
               saveAiChangeset(turnChangeset);
-              const cs = { id: turnChangeset.id, ops: turnChangeset.ops };
-              onEvent({ type: 'changeset', changesetId: cs.id, ops: cs.ops });
-              extra.changeset = cs;
+              savedChangeset = { id: turnId, ops: turnChangeset.ops };
+              if (sessionCurrent()) {
+                onEvent({ type: 'changeset', changesetId: turnId, ops: savedChangeset.ops });
+                extra.changeset = savedChangeset;
+              }
             }
+            if (!sameSession()) assertActive();
             if (collectedSubagents.length) extra.subagents = collectedSubagents;
             return extra;
           },
         });
       } catch (err) {
-        sendEvent({ type: 'error', error: String(err?.message || err) });
+        sendEvent({ type: 'error', error: String(err?.message || err),
+          ...(savedChangeset && sessionCurrent() ? { changeset: savedChangeset } : {}) });
       } finally {
+        activeAiTurns.delete(turnId);
+        finished.resolve();
         req.off('close', cancel);
         res.off('close', cancel);
         if (!res.writableEnded) res.end();
@@ -5953,7 +6134,8 @@ export const server = http.createServer(async (req, res) => {
             if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
             if (p.comparisonId !== undefined && p.comparisonId !== (COMPARISON?.id ?? null)) return sessionConflict(res);
             const key = 'ui.last-view.' + PROJECT.id;
-            const revision = COMPARISON ? COMPARISON.composedPage?.revision ?? 0 : store.getSetting(key)?.revision ?? 0;
+            const previous = COMPARISON ? COMPARISON.composedPage : store.getSetting(key);
+            const revision = previous?.revision ?? 0;
             const reviewing = Number(p.at) > 0;
             if (!reviewing && (!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
@@ -5984,8 +6166,10 @@ export const server = http.createServer(async (req, res) => {
               const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
               const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
               const saved = { ...pageState, cam, ctxBox };
-              if (!COMPARISON) store.setSetting(key, saved);
-              else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
+              if (!COMPARISON) {
+                store.setSetting(key, saved);
+                if (!sameCanvasPage(previous, saved)) canvasEditRevision++;
+              } else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
             }
             json(res, { ok: true });
           })
@@ -6689,7 +6873,7 @@ export const server = http.createServer(async (req, res) => {
                 projectId: PROJECT.id,
                 clientId: req.headers['x-callgraph-client'],
               });
-              json(res, { ok: true, ...r });
+              json(res, { ok: true, bookmark: r.bookmark, overwritten: r.overwritten });
             } catch (err) {
               bad(res, String(err.message || err));
             }
@@ -6708,29 +6892,8 @@ export const server = http.createServer(async (req, res) => {
           const id = Number(p.id);
           if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
           try {
-            const out = store.transaction(() => {
-              const resUpdate = store.updateBookmarkById(PROJECT.id, id, p, p.expectedRevision);
-              if (!resUpdate) return { notFound: true };
-              if (resUpdate.conflict) return { conflict: true, current: resUpdate.current };
-              const bm = resUpdate.bookmark;
-              const diff = diffViewScopes(resUpdate.prev, bm);
-              store.appendEvent(PROJECT.id, {
-                op: 'bookmark.save',
-                actor: 'user',
-                target: bm.name,
-                before: bookmarkEventPayload(resUpdate.prev),
-                after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
-                ctx: {
-                  bookmarkId: bm.id,
-                  bookmarkName: bm.name,
-                  action: 'update',
-                  milestone: true,
-                  ...(diff.changed ? { diffSummary: diff.summary } : {}),
-                },
-              });
-              return { bookmark: bm };
-            });
-            if (out.notFound) return json(res, { ok: false, error: '找不到该书签' }, 404);
+            const out = updateBookmarkWithEvent(id, p, 'user', p.expectedRevision);
+            if (!out) return json(res, { ok: false, error: '找不到该书签' }, 404);
             if (out.conflict) {
               return json(res, { ok: false, conflict: true, bookmark: out.current, error: '该书签已被其他窗口修改' }, 409);
             }
@@ -7046,12 +7209,11 @@ export const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then(async (p) => {
           const at = Number(p.eventId);
-          if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
-          const latest = store.latestEventId(PROJECT.id);
-          if (at > latest) return bad(res, 'eventId 超出范围');
+          if (!Number.isSafeInteger(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
+          if (!store.hasEvent(PROJECT.id, at)) return bad(res, '当前工程没有此历史事件');
           let restored = store.overlayAt(PROJECT.id, at);
           let restoredView = store.viewAt(PROJECT.id, at);
-          let restoredPage;
+          let restoredPage, checkpointId;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
           let restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
@@ -7060,6 +7222,16 @@ export const server = http.createServer(async (req, res) => {
             if (!currentSession(req)) return sessionConflict(res);
           }
           const eventId = store.transaction(() => {
+            // 在覆盖前读取同一事务中的最新工作区，含回看期间其他客户端的写入。
+            const live = latestPage();
+            const view = viewSnapshot(live ?? { empty: true });
+            const label = '恢复前自动快照';
+            checkpointId = store.appendEvent(PROJECT.id, {
+              op: 'view.checkpoint', target: label, actor: p.actor === 'ai' ? 'ai' : 'user',
+              after: { ...store.loadOverlay(PROJECT.id), manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)), view },
+              ctx: { milestone: 1, beforeRestore: true, checkpointName: label, ...(live?.activeBookmark ?
+                { bookmarkId: live.activeBookmark.id, bookmarkName: live.activeBookmark.name } : {}) },
+            });
             store.replaceOverlay(PROJECT.id, restored);
             saveManualNodes(PROJECT.id, restoredManualList);
             const reconciled = reconcileManualVariables(MODEL, PROJECT.id, restoredManualList, restoredView);
@@ -7090,7 +7262,7 @@ export const server = http.createServer(async (req, res) => {
           overlay.deleted = restored.deleted;
           overlay.layout = restored.layout;
           broadcastChange('restore_point', p.actor === 'ai' ? 'ai' : 'user');
-          json(res, { ok: true, eventId, ...(restoredView ? { restoredView } : {}) });
+          json(res, { ok: true, eventId, checkpointId, ...(restoredView ? { restoredView } : {}) });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
@@ -7312,7 +7484,7 @@ export const server = http.createServer(async (req, res) => {
         .then((r) => {
           if (!currentSession(req)) return sessionConflict(res);
           if (!comparison && r.fn) r.fn.taskPeriods = taskPeriods(model).get(r.fn.id) || [];
-          return json(res, r);
+          return json(res, { ...r, projectId: PROJECT.id, comparisonId: comparison?.id ?? null, sessionRevision });
         })
         .catch((err) => {
           console.error('[数据流]', err);

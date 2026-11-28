@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import { getLang, setLang, SUPPORTED_LANGS, t as translate } from '../web/i18n.js';
 import { aiTranslator } from '../src/core/ai-messages.js';
-import { compactConversation, runAiAgent } from '../src/core/ai-agent.js';
+import { compactConversation, runAiAgent, SUBAGENT_READONLY_TOOLS } from '../src/core/ai-agent.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
@@ -164,7 +165,7 @@ test('AI 侧栏切换三语后保留候选、已附加上下文与草稿，窄�
     aiPromptInput.dispatchEvent(new Event('input'));
     aiBaseUrl.value = 'https://draft.example/v1';
   })()`);
-  for (const [width, drawerWidth] of [[320, 296], [575, 551], [1024, 340]]) {
+  for (const [width, drawerWidth] of [[320, 296], [390, 366], [575, 551], [1024, 340]]) {
     await browser.send('Emulation.setDeviceMetricsOverride', { width, height: 840, deviceScaleFactor: 1, mobile: false });
     await browser.evaluate('aiDrawer.style.width = ' + JSON.stringify(drawerWidth + 'px'));
     for (const lang of ['ja', 'en', 'zh-CN']) {
@@ -199,4 +200,100 @@ test('AI 侧栏切换三语后保留候选、已附加上下文与草稿，窄�
       assert.ok(await browser.evaluate("document.querySelectorAll('#aiPaneGuide [data-i18n-rich] code').length > 0"));
     }
   }
+});
+
+test('浏览器三语输入、快捷指令、只读子调查、压缩和错误后的撤销共用本轮语言', async t => {
+  try { resolveChromePath(); } catch (err) { return t.skip(err.message); }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const requests = [];
+  const replies = [];
+  const mock = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'GET') return res.end(JSON.stringify({ data: [{ id: 'local' }] }));
+    let raw = '';
+    for await (const part of req) raw += part;
+    requests.push(JSON.parse(raw));
+    const reply = replies.shift();
+    res.statusCode = reply?.status ?? (reply ? 200 : 500);
+    res.end(JSON.stringify(reply?.error ? { error: { message: reply.error } } : { choices: [{ message: reply?.message }] }));
+  });
+  await new Promise(resolve => mock.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => mock.close(resolve)));
+  const post = (route, data) => fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+  });
+  assert.ok((await post('/api/ai/config', { baseUrl: 'http://127.0.0.1:' + mock.address().port, model: 'local', toolMode: 'auto', subagentEnabled: true })).ok);
+  const browser = await launchCdp({ url: srv.baseUrl });
+  t.after(() => browser.close());
+  await browser.waitFor('Boolean(window.__cg?.view?.projectId)');
+  await browser.evaluate('aiBtn.click()');
+  await browser.waitFor("aiModel.value === 'local' && aiChatSelect.options.length > 0");
+  const answer = content => ({ message: { content } });
+  const tool = (name, args) => ({ message: { tool_calls: [{
+    id: 'read-or-save', type: 'function', function: { name, arguments: JSON.stringify(args) },
+  }] } });
+  const input = text => browser.evaluate("aiPromptInput.value = " + JSON.stringify(text) +
+    "; aiPromptInput.dispatchEvent(new Event('input', {bubbles:true})); aiSendChat.click()");
+  const finished = text => browser.waitFor("!aiSendChat.classList.contains('steering') && document.querySelector('.ai-msg.assistant:last-child .ai-msg-text')?.textContent.includes(" + JSON.stringify(text) + ")");
+  for (const language of SUPPORTED_LANGS) await t.test(language, async () => {
+    const tr = aiTranslator(language);
+    await browser.evaluate('styleBtn.click()');
+    await browser.waitFor("document.querySelector('#styleModal.show [data-language]')");
+    await browser.evaluate("document.querySelector('[data-language=\"" + language + "\"]').click(); document.querySelector('[data-close=\"styleModal\"]').click(); aiNewChat.click()");
+    assert.equal(await browser.evaluate('document.documentElement.lang'), language);
+    const prompt = { 'zh-CN': '请查看 gear.c::Gear_Init 的调用者。', ja: 'gear.c::Gear_Init の呼び出し元を確認してください。', en: 'Check the callers of gear.c::Gear_Init.' }[language];
+    const goal = 'Read gear.c::Gear_Init';
+    const result = 'Result ' + language;
+    replies.push(tool('run_subagent', { tasks: [{ title: 'Gear', goal }] }), { status: 400, error: 'tools not supported' }, answer('Gear OK'), answer(result));
+    await input(prompt);
+    await finished(result);
+    assert.equal(requests.length, 4);
+    const [main, sub, legacy, resumed] = requests.splice(0);
+    assert.ok(main.messages[0].content.includes(tr('language')));
+    assert.equal(main.messages.at(-1).content, prompt);
+    const schema = main.tools.find(item => item.function.name === 'present_logic').function;
+    assert.equal(schema.parameters.properties.direction.description, tr('tool.present_logic.direction'));
+    assert.equal(resumed.messages.at(-1).role, 'tool');
+    assert.ok(sub.messages[0].content.includes(tr('subRole')));
+    assert.ok(sub.messages.at(-1).content.includes(goal));
+    assert.deepEqual(sub.tools.map(item => item.function.name).sort(), [...SUBAGENT_READONLY_TOOLS].sort());
+    assert.ok(legacy.messages[0].content.includes(tr('subRole')) && legacy.messages[0].content.includes(tr('toolFormat')));
+    assert.ok(legacy.messages[0].content.includes(tr('tool.read_source')));
+    assert.ok(!legacy.messages[0].content.includes(tr('tool.manage_bookmarks')));
+    assert.equal(legacy.tools, undefined);
+
+    replies.push(answer('Quick ' + language));
+    await browser.evaluate("document.querySelector('[data-ai-quick=\"build\"]').click()");
+    await finished('Quick ' + language);
+    assert.equal(requests.length, 1);
+    const [quick] = requests.splice(0);
+    assert.equal(quick.messages.at(-1).content, await browser.evaluate("import('/i18n.js').then(m => m.t('ai.quickPrompt.build'))"));
+    replies.push(answer('Follow-up ' + language));
+    await input('gear.c?');
+    await finished('Follow-up ' + language);
+    requests.splice(0);
+    replies.push(answer('Summary ' + language));
+    await browser.evaluate('aiCompactChat.click()');
+    await browser.waitFor("document.querySelector('#aiMessages')?.textContent.includes(" + JSON.stringify('Summary ' + language) + ")");
+    assert.equal(requests.length, 1);
+    const [compact] = requests.splice(0);
+    assert.equal(compact.messages[0].content, tr('compact'));
+    assert.ok(compact.messages.at(-1).content.includes(prompt));
+
+    const name = 'Gear-' + language;
+    replies.push(tool('manage_bookmarks', { action: 'save', name }), { status: 500, error: 'fixture model error' });
+    await input({ 'zh-CN': '请保存书签 ', ja: '次のブックマークを保存してください：', en: 'Save bookmark ' }[language] + name);
+    await finished('500');
+    assert.equal(requests.splice(0).length, 2);
+    const list = () => fetch(srv.baseUrl + '/api/bookmarks').then(r => r.json()).then(r => r.list);
+    const bookmark = (await list()).find(b => b.name === name);
+    assert.ok(bookmark);
+    assert.ok((await post('/api/bookmarks/update', { id: bookmark.id, expectedRevision: bookmark.revision, down: 7 })).ok);
+    const edited = await list();
+    await browser.evaluate("document.querySelector('.ai-msg.error:last-child .ai-undo-btn').click()");
+    await browser.waitFor("aiChatStatus.textContent.includes(" + JSON.stringify(tr('undo.conflict')) + ")");
+    assert.deepEqual(await list(), edited);
+    assert.equal(replies.length, 0);
+  });
 });

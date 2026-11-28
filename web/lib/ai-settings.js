@@ -7,8 +7,9 @@
 import { applyI18n, getLang, t } from '../i18n.js';
 import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
-import { focusBox } from './camera.js';
+import { focusBox, stopCamAnim } from './camera.js';
 import { hooks } from './hooks.js';
+import { refreshAfterAiUndo } from './live.js';
 import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
 import { runSearch } from './panels.js';
@@ -401,7 +402,7 @@ function messageContext(message) {
 }
 
 function chatHistory(messages) {
-  const history = messages.filter((m) => !m.error).slice(-16).map((m) => ({
+  const history = messages.filter(m => !m.error || m.tools?.some(t => t.ok)).slice(-16).map((m) => ({
     role: m.role,
     content: messageContext(m),
     ...(m.attachedFiles?.length ? { attachedFiles: m.attachedFiles } : {}),
@@ -998,7 +999,9 @@ function selectionKey(selection) {
     if (a && b) return `pair:${a}|${b}`;
   }
   if (selection?.kind === 'dataflow' && (selection.targetId || selection.id)) {
-    return `df:${selection.targetId || selection.id}:${selection.dir || 'out'}`;
+    const f = selection.focused;
+    return 'df:' + JSON.stringify([selection.projectId, selection.comparisonId, selection.sessionRevision,
+      selection.targetId || selection.id, selection.dir || 'out', f?.varId, f?.mode, f?.peerId, f?.version]);
   }
   return '';
 }
@@ -1711,6 +1714,10 @@ function openAttachMenu() {
 }
 
 const emptyChatEl = messagesEl.querySelector('.empty');
+function showEmptyChat() {
+  applyI18n(emptyChatEl);
+  messagesEl.replaceChildren(emptyChatEl);
+}
 
 function syncPresentationHud() {
   if (!presHudEl) return;
@@ -1810,6 +1817,23 @@ function renderSubagentCards(box, subagents, before = null) {
   }
 }
 
+function chainEdgeKeys(chain, nodeIds) {
+  if (chain.edgeKeys?.length) return chain.edgeKeys;
+  // 旧版单边导览卡把完整调用点键存在 id 中，其他旧链路只保留了端点。
+  if (chain.id?.startsWith('pres_edge:')) return [chain.id.slice('pres_edge:'.length)];
+  return nodeIds.slice(1).map((to, i) => {
+    const from = nodeIds[i];
+    return chain.kind === 'dataflow' && from.startsWith('var::') ? `${to}->${from}` : `${from}->${to}`;
+  });
+}
+
+function clearChainHover(nodeId) {
+  if (nodeId && state.aiHover?.nodeId === nodeId) {
+    state.aiHover = null;
+    draw();
+  }
+}
+
 function renderChainCards(box, chains) {
   if (!Array.isArray(chains) || !chains.length) return;
   const txtEl = box.querySelector('.ai-msg-text');
@@ -1828,8 +1852,7 @@ function renderChainCards(box, chains) {
     actions.className = 'ai-chain-actions';
 
     const nodeIds = steps.map((s) => s.id).filter(Boolean);
-    const edgeKeys = [];
-    for (let i = 0; i + 1 < nodeIds.length; i++) edgeKeys.push(`${nodeIds[i]}->${nodeIds[i + 1]}`);
+    const edgeKeys = chainEdgeKeys(chain, nodeIds);
 
     const hlBtn = document.createElement('button');
     hlBtn.type = 'button';
@@ -1884,15 +1907,11 @@ function renderChainCards(box, chains) {
         locateSymbolFromChat(step.id || step.name);
       });
       nodeBtn.addEventListener('mouseenter', () => {
+        if (!step.id) return;
         state.aiHover = { nodeId: step.id };
         draw();
       });
-      nodeBtn.addEventListener('mouseleave', () => {
-        if (state.aiHover?.nodeId === step.id) {
-          state.aiHover = null;
-          draw();
-        }
-      });
+      nodeBtn.addEventListener('mouseleave', () => clearChainHover(step.id));
       body.appendChild(nodeBtn);
     });
     card.append(head, body);
@@ -1982,16 +2001,24 @@ function renderChangesetUndo(box, changeset) {
   btnUndo.addEventListener('click', async () => {
     btnUndo.disabled = true;
     btnUndo.textContent = t('ai.undoing');
+    const projectId = state.view?.projectId;
+    let res;
     try {
-      const res = await api.aiUndoChangeset(changeset.id, getLang());
+      res = await api.aiUndoChangeset(changeset.id, getLang());
       if (!res?.ok) throw new Error(res?.error || t('ai.undoFailed'));
-      btnUndo.textContent = t('ai.undone');
-      setChatStatus(() => t('ai.restored'));
-      await hooks.reload?.();
     } catch (err) {
       btnUndo.disabled = false;
       btnUndo.textContent = t('ai.undo');
       setChatStatus(() => t('ai.undoError', { error: err.message || err }), true);
+      return;
+    }
+    try {
+      await refreshAfterAiUndo(res, projectId);
+      btnUndo.textContent = t('ai.undone');
+      setChatStatus(() => t(state.at ? 'ai.undoWhileReviewing' : 'ai.restored'));
+    } catch (err) {
+      btnUndo.textContent = t('ai.undoneRefreshPending');
+      setChatStatus(() => t('ai.undoRefreshError', { error: err.message || err }), true);
     }
   });
   bar.appendChild(btnUndo);
@@ -2000,13 +2027,13 @@ function renderChangesetUndo(box, changeset) {
 
 function renderThreadMessages({ preserveStatus = false } = {}) {
   if (!messagesEl) return;
+  clearChainHover(state.aiHover?.nodeId); // 替换消息 DOM 不会触发旧芯片的 mouseleave。
   const th = activeThread();
   renderTelemetry(th);
   updateChatControls();
   if (!preserveStatus) setChatStatus();
   if (!th.messages.length) {
-    applyI18n(emptyChatEl);
-    messagesEl.replaceChildren(emptyChatEl);
+    showEmptyChat();
     return;
   }
   const scrollTop = messagesEl.scrollTop;
@@ -2048,6 +2075,32 @@ function renderThreadMessages({ preserveStatus = false } = {}) {
   followChatScroll();
 }
 
+// 页面或流关闭时，撤销记录可能在原响应结束以后才就绪。
+async function readTurnChangeset(id, projectId) {
+  try {
+    const result = await api.aiTurnChangeset(id, projectId);
+    if (result?.ok) return result;
+  } catch { /* 保留请求编号，重开同一工程时可再次恢复。 */ }
+}
+
+async function recoverInterruptedChat(thread, projectId, gen) {
+  for (const user of thread.messages.filter(m => m.pendingTurn)) {
+    const result = await readTurnChangeset(user.pendingTurn, projectId);
+    if (gen !== chatGeneration || projectId !== chatProjectId || !chatThreads.includes(thread)) return;
+    const index = thread.messages.indexOf(user), next = thread.messages[index + 1];
+    if (!result || index < 0 || !user.pendingTurn || (next?.role === 'assistant' && !next.error)) continue;
+    delete user.pendingTurn;
+    if (!result.changeset) continue;
+    if (next?.role === 'assistant') next.changeset = result.changeset;
+    else thread.messages.splice(index + 1, 0, {
+      role: 'assistant', text: t(result.interrupted ? 'ai.interruptedUndo' : 'ai.availableUndo'),
+      error: Boolean(result.interrupted), changeset: result.changeset,
+    });
+    // 加载历史时只补充本窗口的副本，保留其他窗口可能已经保存的完整回复。
+    if (thread.id === activeChatId) renderThreadMessages();
+  }
+}
+
 async function loadProjectChats({ force = false } = {}) {
   const currentId = state.view?.projectId ?? null;
   if ((!force || activeAbort) && chatProjectId !== null && currentId === chatProjectId && chatThreads.length) {
@@ -2086,6 +2139,7 @@ async function loadProjectChats({ force = false } = {}) {
       }
     }
     setActiveChat(res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id);
+    for (const thread of chatThreads) void recoverInterruptedChat(thread, projectId, gen);
     renderChatBar();
     renderThreadMessages();
   } catch {
@@ -2603,13 +2657,15 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   }));
   renderAttachments();
   const selectionSummary = summarizeUiContext(uiContext);
-  thread.messages.push({
-    role: 'user',
+  const turnId = crypto.randomUUID();
+  const userEntry = {
+    role: 'user', pendingTurn: turnId,
     text: rawInput,
     ...(selectionSummary ? { selectionSummary } : {}),
     ...(images.length ? { attachedImages: images } : {}),
     ...(attachments.length ? { attachedFiles: attachments } : {}),
-  });
+  };
+  thread.messages.push(userEntry);
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
@@ -2686,7 +2742,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     const wait = Math.max(16, 48 - (performance.now() - lastPaintAt));
     paintTimer = setTimeout(() => flushStreamPaint(false), wait);
   };
-  activeStreamFlush = () => flushStreamPaint(true);
+  const flushThisStream = () => flushStreamPaint(true);
+  activeStreamFlush = flushThisStream;
   const stopThinking = () => {
     dirtyThinking = false;
     if (thinkingSince !== null) {
@@ -2721,31 +2778,39 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     pendingSteer && pendingSteer.threadId === threadId &&
     pendingSteer.projectId === myProjectId && pendingSteer.gen === myGen
   );
+  const recoverDisconnected = async () => {
+    if (!isCurrent()) return;
+    if (collectedChangeset) { delete userEntry.pendingTurn; return; }
+    const recovered = await readTurnChangeset(turnId, myProjectId);
+    if (recovered !== undefined && isCurrent()) {
+      delete userEntry.pendingTurn;
+      collectedChangeset = recovered.changeset;
+    }
+  };
   const finishInterrupted = (message, stopped = false) => {
+    if (!isCurrent()) return;
     stopThinking();
     for (const { row, name } of pendingSteps) {
       finishStep(row, { name, ok: false, summary: t('ai.interrupted') });
     }
     const steeringNow = stopped && isSteerQueuedForThisTurn();
-    if (collectedTools.length || streamedText) {
-      ui.text.innerHTML = formatAssistantText(streamedText);
-      commitAssistantMsg({ text: streamedText });
-    } else if (steeringNow) {
+    if (!collectedChangeset && !collectedTools.length && !streamedText && steeringNow) {
       // 中途引导且本轮尚未产生工具结果或正文时，直接移除空占位，避免插入多余报错气泡。
       ui.box.remove();
       return;
-    } else {
-      ui.box.classList.toggle('error', !stopped);
-      ui.text.textContent = message;
-      commitAssistantMsg({ text: message, error: true });
     }
+    const text = [streamedText, message].filter(Boolean).join('\n\n');
+    ui.box.classList.toggle('error', !stopped);
+    ui.text.innerHTML = formatAssistantText(text);
+    if (collectedChangeset) renderChangesetUndo(ui.box, collectedChangeset);
+    commitAssistantMsg({ text, error: true, ...(collectedChangeset && { changeset: collectedChangeset }) });
     if (isVisible()) {
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
       if (!steeringNow && (collectedTools.length || streamedText)) setChatStatus(message, !stopped);
     }
   };
   const handleLine = (line) => {
-    if (terminalReceived || !line.trim()) return;
+    if (!isCurrent() || terminalReceived || !line.trim()) return;
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
     if (ev.type === 'status') {
@@ -2845,7 +2910,6 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         action: ev.action || 'highlight',
         nodeIds: ev.nodeIds || [],
         edgeKeys: ev.edgeKeys || [],
-        lens: ev.lens,
         label: ev.label,
       };
       draw();
@@ -2856,6 +2920,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       dirtyMetrics = true;
       scheduleStreamPaint();
     } else if (ev.type === 'done' || ev.type === 'question') {
+      delete userEntry.pendingTurn;
       terminalReceived = true;
       flushStreamPaint(true);
       if (ev.thinking) {
@@ -2904,6 +2969,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         followChatScroll();
       }
     } else if (ev.type === 'error') {
+      delete userEntry.pendingTurn;
+      collectedChangeset = ev.changeset || collectedChangeset;
       terminalReceived = true;
       flushStreamPaint(true);
       finishInterrupted(ev.error || t('ai.failed'));
@@ -2915,7 +2982,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let reader;
   try {
     const res = await api.aiChat({
-      language: getLang(), prompt: text,
+      turnId, language: getLang(), prompt: text,
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -2928,7 +2995,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    consumeUnpinnedStagedSelections(uiContext);
+    if (isCurrent()) consumeUnpinnedStagedSelections(uiContext);
     reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -2944,9 +3011,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     buffer += decoder.decode();
     if (buffer.trim()) handleLine(buffer);
-    if (!terminalReceived) finishInterrupted(t('ai.disconnected'));
+    if (!terminalReceived) {
+      await recoverDisconnected();
+      finishInterrupted(t('ai.disconnected'));
+    }
   } catch (err) {
     if (!terminalReceived) {
+      await recoverDisconnected();
       const stopped = err.name === 'AbortError';
       finishInterrupted(stopped ? t('ai.stopped') : (err.message || String(err)), stopped);
     }
@@ -2955,7 +3026,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       clearTimeout(paintTimer);
       paintTimer = 0;
     }
-    activeStreamFlush = null;
+    if (activeStreamFlush === flushThisStream) activeStreamFlush = null;
     clearTimeout(streamTimer);
     if (reader) {
       void reader.cancel().catch(() => {});
@@ -3317,6 +3388,10 @@ messagesEl.addEventListener('scroll', () => {
 
 // 切换工程时自动隔离并切换到目标工程的独立对话列表
 document.addEventListener('cg:project-changed', () => {
+  state.aiHover = null;
+  stopCamAnim();
+  activatePresentation(null);
+  showEmptyChat();
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
   pinnedSelections.length = 0;

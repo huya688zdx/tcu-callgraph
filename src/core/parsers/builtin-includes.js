@@ -149,7 +149,7 @@ export function preprocessProfile(root, files, options, load, visit, expand = fa
         hasUnresolvedIncludes: () => unresolvedIncludes, onUnresolvedInclude: markUnresolved,
       });
       if (file.isHeader) {
-        if (!macroOnly) options.onHeaderContext?.(file, input, result.tokens, scope, source.rel);
+        if (!macroOnly) options.onHeaderContext?.(file, input, result.tokens, scope, source.rel, result.includes);
         rememberHeader(file, input, macroOnly ? { ...result, tokens: [] } : result, scope);
       }
       else {

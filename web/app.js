@@ -23,7 +23,7 @@ import { clearDataflow } from './lib/df.js';
 // 工程切换与时间轴面板同样自带事件注册
 import './lib/projects.js';
 import { hideBar, reloadTimeline } from './lib/timeline.js';
-import './lib/bookmarks.js';
+import { bookmarkBinding, reviseBookmark } from './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
 import { acceptRestoredRevision, restorePage, savePage } from './lib/live.js';
@@ -190,9 +190,9 @@ async function loadView(rootId, opts = {}) {
   const oldEdges = new Set((keepCam ? priorView.edges : []).map(edgeKey));
   const addedNodes = keepCam || opts.selectAdded ? data.nodes.filter((n) => !oldNodes.has(n.id)) : [];
   const addedEdges = keepCam ? data.edges.filter((e) => !oldEdges.has(edgeKey(e))) : [];
-  if (!keepCam) {
+  if (!keepCam && !opts.keepViewport) {
     fit({ paint: false });
-  } else {
+  } else if (keepCam && !opts.keepViewport) {
     // 先按共同节点的位移锚定当前镜头起点，避免重排瞬间旧节点在屏幕上跳变，再平滑移向新增节点。
     const common = data.nodes.filter((n) => oldNodes.has(n.id));
     if (common.length) {
@@ -259,7 +259,7 @@ hooks.restoreTimelineView = async (snapshot, revision) => {
   deleteStack.length = 0;
   const view = await loadView(snapshot.roots, { ...snapshot, nav: false, empty: !!snapshot.empty });
   if (!view) throw new Error(t('app.viewFailed'));
-  await loadStats();
+  void loadStats().catch(error => console.warn(error));
 };
 hooks.renderDetail = renderDetail;
 hooks.syncComparison = syncComparison;
@@ -342,36 +342,74 @@ function syncBookmarkBadge() {
 }
 hooks.syncBookmarkBadge = syncBookmarkBadge;
 
+// 保存只属于提交时的画布。即使重新打开同一 ID，也不能把旧响应应用到新的绑定。
+async function requestBookmarkSave(request, details) {
+  const seq = viewSeq, view = state.view, at = state.at, bookmark = state.activeBookmark;
+  const scope = currentViewScope(), fingerprint = scopeFingerprint(scope);
+  const isCurrent = (expected = bookmark) => seq === viewSeq && state.view === view && state.at === at &&
+    state.activeBookmark === expected && scopeFingerprint(currentViewScope()) === fingerprint;
+  try {
+    const result = await request({ ...details, ...scope, projectId: view?.projectId });
+    return { result, fingerprint, isCurrent };
+  } catch (error) {
+    if (isCurrent()) throw error;
+  }
+}
+hooks.requestBookmarkSave = requestBookmarkSave;
+
+let bookmarkUpdates, bookmarkEpoch = 0;
+function updateActiveBookmark() {
+  const bookmark = state.activeBookmark, binding = bookmarkBinding(bookmark), projectId = state.view?.projectId;
+  const epoch = bookmarkEpoch, scope = structuredClone(currentViewScope()), fingerprint = scopeFingerprint(scope);
+  const isCurrent = () => epoch === bookmarkEpoch && state.view?.projectId === projectId &&
+    !state.at && !state.view?.comparison && bookmarkBinding(state.activeBookmark) === binding;
+  if (!bookmarkUpdates || bookmarkUpdates.binding !== binding || bookmarkUpdates.epoch !== epoch || bookmarkUpdates.failed) {
+    bookmarkUpdates = { binding, epoch, tail: Promise.resolve() };
+  }
+  const queue = bookmarkUpdates;
+  // 每次按键保留当时的范围；同一绑定的下次写入使用上次成功确认的版本。
+  const save = async () => {
+    if (queue.failed || !isCurrent()) return;
+    let result;
+    try {
+      result = await api.updateBookmark({ id: bookmark.id, expectedRevision: state.activeBookmark.revision, ...scope, projectId });
+    } catch (error) {
+      queue.failed = true;
+      if (isCurrent()) throw error;
+      return;
+    }
+    if (!isCurrent()) return;
+    if (!result?.ok || !result.bookmark) queue.failed = true;
+    else if (result.bookmark.revision >= state.activeBookmark.revision) {
+      state.activeBookmark = reviseBookmark(state.activeBookmark, { revision: result.bookmark.revision, baseFingerprint: fingerprint });
+      state.bookmarkDrafts.delete(String(bookmark.id));
+      syncBookmarkBadge();
+      await savePage(true).catch(() => {});
+      if (isCurrent()) void reloadTimeline();
+    }
+    return { result, isCurrent };
+  };
+  const response = queue.tail.then(save);
+  queue.tail = response.catch(() => {});
+  return response;
+}
+hooks.updateActiveBookmark = updateActiveBookmark;
+
 async function saveActiveBookmark({ saveAs = false } = {}) {
   if (state.at || state.view?.comparison || !state.roots.length) return;
-  const bm = state.activeBookmark;
-  if (saveAs || !bm?.id) {
+  if (saveAs || !state.activeBookmark?.id) {
     bookmarkBtn?.click();
     return;
   }
-  const scope = currentViewScope();
-  const result = await api.updateBookmark({
-    id: bm.id,
-    expectedRevision: bm.revision,
-    ...scope,
-  });
+  const reply = await updateActiveBookmark();
+  if (!reply?.isCurrent()) return;
+  const { result } = reply;
   if (result?.conflict) {
     alert(t('bookmark.conflict'));
     bookmarkBtn?.click();
     return;
   }
   if (!result?.ok || !result.bookmark) throw new Error(result?.error || t('bookmark.failed'));
-  const saved = result.bookmark;
-  state.activeBookmark = {
-    id: saved.id,
-    name: saved.name,
-    revision: saved.revision || 1,
-    baseFingerprint: scopeFingerprint(scope),
-  };
-  state.bookmarkDrafts.delete(String(saved.id));
-  syncBookmarkBadge();
-  await savePage(true).catch(() => {});
-  void reloadTimeline();
 }
 
 bookmarkQuickSave?.addEventListener('click', () => {
@@ -382,6 +420,7 @@ document.addEventListener('callgraph:langchange', syncBookmarkBadge);
 /** 应用书签：先暂存未保存草稿、以参数请求 loadView，成功后再切 activeBookmark 并派发事件 */
 hooks.applyBookmark = async (b) => {
   if (state.at || canvasAction) return;
+  bookmarkEpoch++;
   pendingVarChoices.clear();
   const prev = state.activeBookmark;
   if (prev ? isBookmarkDirty() : (state.roots.length > 0 || state.expansions.length > 0)) {
@@ -416,6 +455,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
+  bookmarkEpoch++;
   const epoch = ++reloadEpoch;
   pendingVarChoices.clear();
   comparisonPage = null;
@@ -592,8 +632,8 @@ async function navigateBack() {
 }
 
 /** 重新拉取视图但保留当前视角，避免删除后画面突然跳走 */
-async function reloadKeepCam() {
-  return loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true });
+async function reloadKeepCam({ keepViewport = false } = {}) {
+  return loadView(state.roots.length ? state.roots : state.root, { nav: false, incremental: true, keepViewport });
 }
 
 async function deleteSelection() {

@@ -505,12 +505,12 @@ function draw({ geometryUnchanged = false } = {}) {
   const trunkHits = state.trunkHits;
   const trunkNodes = trunkHits?.length > 1 && trunkHits.includes(focusedEdge)
     ? new Set(trunkHits.flatMap((e) => [e.from, e.to])) : null;
-  const aiStep = state.presentation?.steps?.[state.presentation.activeStep ?? 0] || null;
+  const aiStep = state.presentation?.steps?.[state.presentation.activeIndex ?? 0] || null;
   const aiOverlayAction = state.aiOverlay?.action || '';
   const aiFlowActive = aiOverlayAction === 'play_flow';
   const aiActiveNodes = new Set([...(aiStep?.nodeIds || []), ...(state.aiOverlay?.nodeIds || [])]);
   const aiActiveEdges = new Set([...(aiStep?.edgeKeys || []), ...(state.aiOverlay?.edgeKeys || [])]);
-  const aiHoverNodes = new Set(state.aiHover?.nodeIds || []);
+  const hoverNodeId = state.aiHover?.nodeId;
   const aiHoverEdges = new Set(state.aiHover?.edgeKeys || []);
   const aiOrderMap = new Map();
   if (aiStep || aiOverlayAction === 'spotlight' || aiOverlayAction === 'walkthrough') {
@@ -545,7 +545,8 @@ function draw({ geometryUnchanged = false } = {}) {
     if (peer !== hoverRel.peerId) return false;
     return !hoverRel.dir || hoverRel.dir === role || role === 'both' || e.from === e.to;
   };
-  const isAiEdge = (e, ek) => aiActiveEdges.has(ek) || (aiFlowActive && !aiActiveEdges.size && aiActiveNodes.has(e.from) && aiActiveNodes.has(e.to));
+  const isAiEdge = (e, ek) => aiActiveEdges.has(ek) || aiActiveEdges.has(`${e.from}->${e.to}`) ||
+    (aiFlowActive && !aiActiveEdges.size && aiActiveNodes.has(e.from) && aiActiveNodes.has(e.to));
   const related = [];
   const emphasized = [];
   const aiEdges = [];
@@ -617,8 +618,8 @@ function draw({ geometryUnchanged = false } = {}) {
   }
 
   const nb = neighborSet();
-  const aiCtx = (aiActiveNodes.size || aiHoverNodes.size || hasAiDim)
-    ? { activeNodes: aiActiveNodes, hoverNodes: aiHoverNodes, orderMap: aiOrderMap, dimOthers: hasAiDim && !dim && !selectedNodes?.size }
+  const aiCtx = (aiActiveNodes.size || hoverNodeId || hasAiDim)
+    ? { activeNodes: aiActiveNodes, hoverNodeId, orderMap: aiOrderMap, dimOthers: hasAiDim && !dim && !selectedNodes?.size }
     : null;
   for (const n of v.nodes) {
     if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null, trunkNodes?.has(n.id), aiCtx);
@@ -991,7 +992,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const role = !selected && nodeRoles?.get(n.id);
   const isHoverPeer = state.hoverRelation?.peerId === n.id;
   const aiActive = Boolean(aiCtx?.activeNodes?.has(n.id));
-  const aiHovered = Boolean(aiCtx?.hoverNodes?.has(n.id));
+  const aiHovered = aiCtx?.hoverNodeId === n.id;
   const aiDimmed = Boolean(aiCtx?.dimOthers && !selected && !edgeRelated && !aiActive && !aiHovered);
   const invK = Math.max(1, 1 / cam.k);
   const comparing = Boolean(state.view?.comparison);

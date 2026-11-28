@@ -332,6 +332,7 @@ function applyEvent(ov, e) {
   const after = e.after || {};
   switch (e.op) {
     // 携带全量状态的节点：直接整体替换
+    case 'view.checkpoint': // 普通检查点只记范围；恢复前的检查点还携带完整现场。
     case 'baseline':
     case 'restore_point':
     case 'manual.variable.bind':
@@ -348,7 +349,10 @@ function applyEvent(ov, e) {
         edges: { ...((after.deleted || {}).edges || {}) },
       };
       ov.layout = { ...(after.layout || {}) };
-      ov.manualNodes = after.manualNodes && typeof after.manualNodes === 'object' ? { ...after.manualNodes } : {};
+      // 旧版 AI 撤销不修改手工定义，但快照漏记了它们，须沿用此前回放到的定义。
+      const legacyUndo = e.op === 'restore_point' && e.target?.startsWith('ai-undo#') && !Object.hasOwn(after, 'manualNodes');
+      const definitions = legacyUndo ? ov.manualNodes : after.manualNodes;
+      ov.manualNodes = definitions && typeof definitions === 'object' ? { ...definitions } : {};
       return;
     }
     case 'node.annotate':
@@ -646,6 +650,10 @@ export function openStore({ dbPath, userData } = {}) {
        WHERE project_id = ? AND id <= ? AND json_type(after, '$.view') = 'object' ORDER BY id ASC`
     ),
     eventMax: db.prepare('SELECT MAX(id) AS id FROM event WHERE project_id = ?'),
+    eventExists: db.prepare('SELECT 1 FROM event WHERE project_id = ? AND id = ?'),
+    canvasEventMax: db.prepare(`SELECT MAX(id) AS id FROM event WHERE project_id = ?
+      AND op NOT IN ('bookmark.save', 'bookmark.delete', 'view.checkpoint', 'view.snapshot')
+      AND (op != 'restore_point' OR COALESCE(json_extract(ctx, '$.canvasChanged'), 1) != 0)`),
     eventAnchor: db.prepare("SELECT id FROM event WHERE project_id = ? AND op = 'baseline' LIMIT 1"),
     eventDump: db.prepare('SELECT * FROM event WHERE project_id = ? ORDER BY id ASC LIMIT ?'),
 
@@ -656,12 +664,12 @@ export function openStore({ dbPath, userData } = {}) {
 
     cacheGet: db.prepare('SELECT model FROM parse_cache WHERE fingerprint = ?'),
     cachePut: db.prepare(
-      `INSERT INTO parse_cache (fingerprint, created_at, stats, model) VALUES (?, ?, ?, ?)
-       ON CONFLICT(fingerprint) DO UPDATE SET created_at = excluded.created_at, stats = excluded.stats, model = excluded.model`
+      // 同毫秒内刷新同一份缓存也获得新的 rowid，供裁剪按实际写入先后排序。
+      'INSERT OR REPLACE INTO parse_cache (fingerprint, created_at, stats, model) VALUES (?, ?, ?, ?)'
     ),
     cacheDel: db.prepare('DELETE FROM parse_cache WHERE fingerprint = ?'),
     cachePrune: db.prepare(
-      'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC LIMIT ?)'
+      'DELETE FROM parse_cache WHERE fingerprint NOT IN (SELECT fingerprint FROM parse_cache ORDER BY created_at DESC, rowid DESC LIMIT ?)'
     ),
 
     bmList: db.prepare('SELECT * FROM bookmark WHERE project_id = ? ORDER BY updated_at DESC'),
@@ -675,6 +683,10 @@ export function openStore({ dbPath, userData } = {}) {
          grouped = excluded.grouped, group_mode = excluded.group_mode, vars = excluded.vars,
          hidden_vars = excluded.hidden_vars, expansions = excluded.expansions,
          revision = bookmark.revision + 1, updated_at = excluded.updated_at`
+    ),
+    bmRestore: db.prepare(
+      `INSERT INTO bookmark (id, project_id, name, roots, up, down, grouped, group_mode, vars, hidden_vars,
+        expansions, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
     ),
     bmUpdateById: db.prepare(
       `UPDATE bookmark
@@ -923,6 +935,14 @@ export function openStore({ dbPath, userData } = {}) {
       return q.eventUpTo.all(projectId, eventId).map(toEvent);
     },
 
+    hasEvent(projectId, eventId) {
+      return !!q.eventExists.get(projectId, eventId);
+    },
+
+    latestCanvasEventId(projectId) {
+      return Number(q.canvasEventMax.get(projectId).id || 0);
+    },
+
     latestEventId(projectId) {
       const r = q.eventMax.get(projectId);
       return Number(r?.id || 0);
@@ -1086,6 +1106,13 @@ export function openStore({ dbPath, userData } = {}) {
         if (err.errcode === 2067) throw new Error('已存在同名书签，请换一个名称');
         throw err;
       }
+    },
+
+    restoreDeletedBookmark(projectId, before, lastRevision) {
+      const row = q.bmRestore.get(before.id, projectId, before.name, str(before.roots), before.up, before.down,
+        before.group ? 1 : 0, before.groupMode, str(before.vars), str(before.hiddenVars), str(before.expansions),
+        lastRevision + 1, before.createdAt, nowMs());
+      return toBookmark(row);
     },
 
     renameBookmark(projectId, id, newName) {

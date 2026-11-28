@@ -20,7 +20,7 @@ import { draw, pulseAdded } from './render.js';
 import { constrainCam, focusBox } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { markReviewUpdated, reloadTimeline, reviewTransition } from './timeline.js';
-import { reloadBookmarks } from './bookmarks.js';
+import { bookmarkMetadata, reloadBookmarks } from './bookmarks.js';
 import { closeModal } from './modal.js';
 import { syncProjectLabel } from './projects.js';
 import { notifyGitChanged } from './git-compare.js';
@@ -88,6 +88,7 @@ async function flushReload() {
         up: page.up ?? 0, down: page.down ?? 0, group: page.group, groupMode: page.groupMode, empty: !!page.empty,
         vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
+      if (page.revision <= pageRevision) return; // 等待加载期间，撤销可能已安装更新的页面。
       if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
       state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
@@ -139,6 +140,7 @@ async function flushReload() {
     void loadStats().catch(() => {});
     void reloadTimeline(); // 时间轴面板开着时同步新事件
   } catch {
+    if (compose && compose.page.revision <= pageRevision) return;
     // 刷新失败（服务重启中等）：稍后重试，连续失败则放弃并提示手动刷新
     failures++;
     if (failures <= 3) {
@@ -203,27 +205,21 @@ if (es) {
     const projectId = m.projectId ?? m.page?.projectId;
     if (projectId != null && projectId !== state.view?.projectId) return;
     if (m.op.startsWith('bookmark.')) {
-      if (m.clientId !== clientId && m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
-        state.activeBookmark = {
-          ...state.activeBookmark,
-          name: m.bookmark.name,
-          revision: m.op === 'bookmark.rename'
-            ? (m.bookmark.revision || state.activeBookmark.revision)
-            : state.activeBookmark.revision,
-        };
+      // AI 工具的请求来自同一个窗口，但没有执行书签面板的本地更新。
+      if (m.actor !== 'ai' && m.clientId === clientId) return;
+      if (m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
+        state.activeBookmark = bookmarkMetadata(state.activeBookmark, m.bookmark, m.op === 'bookmark.rename');
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
-      } else if (m.clientId !== clientId && m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
+      } else if (m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
         const prev = state.activeBookmark;
         state.activeBookmark = null;
         hooks.syncBookmarkBadge?.();
         window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: null, prev, remote: true } }));
       }
-      if (m.actor === 'ai' || m.clientId !== clientId) {
-        reloadBookmarks();
-        void reloadTimeline();
-        if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
-      }
+      reloadBookmarks();
+      void reloadTimeline();
+      if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
       return;
     }
     if (m.actor !== 'ai') return;
@@ -238,7 +234,8 @@ if (es) {
   es.addEventListener('canvas_overlay', (ev) => {
     let m = null;
     try { m = JSON.parse(ev.data || '{}'); } catch { return; }
-    if (!m || typeof m !== 'object') return;
+    if (!m || m.projectId == null || m.projectId !== state.view?.projectId ||
+        (m.sessionRevision != null && m.sessionRevision !== state.view.sessionRevision)) return;
     if (m.action === 'clear') {
       state.aiOverlay = null;
       state.presentation = null;
@@ -285,6 +282,28 @@ export function acceptRestoredRevision(revision) {
   if (pendingCompose && pendingCompose.page.projectId === state.view?.projectId && pendingCompose.page.revision <= pageRevision) {
     pendingCompose = null;
   }
+}
+
+// AI 撤销已在服务端提交。以最新保存范围刷新，保留本窗口的镜头、书签和回看位置。
+export async function refreshAfterAiUndo({ canvasChanged, scopeChanged, eventId }, projectId) {
+  void reloadTimeline();
+  if (!canvasChanged || state.view?.projectId !== projectId || state.view?.comparison) return;
+  if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+  let view;
+  if (scopeChanged) {
+    const latest = await api.savedPage();
+    if (latest.ok === false) throw new Error(latest.error);
+    if (state.view?.projectId !== projectId || latest.project?.id !== projectId || latest.comparisonId) return;
+    if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+    const page = latest.page;
+    if (!page) throw new Error(t('app.viewFailed'));
+    acceptRestoredRevision(Math.max(eventId, page.revision));
+    view = await hooks.loadView(page.roots, { ...page, nav: false, incremental: true, keepViewport: true });
+  } else {
+    view = await hooks.reloadKeepCam({ keepViewport: true });
+  }
+  if (!view && state.view?.projectId === projectId && !state.at) throw new Error(t('app.viewFailed'));
+  void loadStats().catch(() => {});
 }
 
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */

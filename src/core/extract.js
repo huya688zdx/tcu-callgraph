@@ -521,8 +521,7 @@ function initializerMembers(body, macros, enumValues = null) {
 }
 
 /** 收集类型声明及作用域；成员声明帮助区分标量与只初始化了一项的数组。 */
-export function findTypedefs(tokens, macros) {
-  const { enumValues } = collectEnumValues(tokens, macros);
+export function findTypedefs(tokens, macros, enumValues = collectEnumValues(tokens, macros).enumValues) {
   const aliases = new Map();
   const scopes = [{ end: null }];
   const record = (name, declaration, shape) => {
@@ -562,46 +561,96 @@ export function findTypedefs(tokens, macros) {
 }
 
 function parseSingleIntLiteral(v) {
-  if (/^'(?:[^'\\]|\\[abfnrtv\\'"0?])'$/.test(v)) {
-    const ch = v.slice(1, -1);
-    const esc = { '\\0': 0, '\\a': 7, '\\b': 8, '\\t': 9, '\\n': 10, '\\v': 11, '\\f': 12, '\\r': 13, '\\\\': 92, "\\'": 39, '\\"': 34 };
-    return ch.length === 1 ? ch.charCodeAt(0) : (esc[ch] ?? null);
+  if (v.startsWith("'")) {
+    // 普通字符及命名转义依赖目标执行字符集。仅小数值转义可不依赖字符集求值。
+    const esc = /^'\\(?:([0-7]{1,3})|x([0-9a-fA-F]+))'$/.exec(v);
+    if (!esc) return null;
+    const code = Number.parseInt(esc[1] || esc[2], esc[1] ? 8 : 16);
+    return code <= 127 ? code : null;
   }
-  const s = v.replace(/[uUlL]+$/, '');
-  if (/^0[xX][0-9a-fA-F]+$/.test(s)) return Number(s);
-  if (/^0[bB][01]+$/.test(s)) return Number.parseInt(s.slice(2), 2);
-  if (/^0[0-7]*$/.test(s)) return Number.parseInt(s, 8);
-  if (/^[1-9]\d*$/.test(s)) return Number(s);
-  return null;
+  const literal = /^(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9]\d*)(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?$/.exec(v);
+  if (!literal) return null;
+  const digits = literal[1];
+  return Number(/^0[0-7]+$/.test(digits) ? '0o' + digits.slice(1) : digits);
 }
 
-/** 从枚举定义提取枚举常量值映射。未指定值的枚举成员从 0 起依次递增。 */
-export function collectEnumValues(tokens, macros = null, seedValues = null) {
-  const enumNames = new Set();
-  const enumValues = new Map(seedValues || []);
+/** 枚举成员从声明处可见，离开声明所在块后恢复外层同名绑定。 */
+export function collectEnumValues(tokens, macros = null, imports = []) {
+  const bindings = new Map(), fileValues = new Map();
+  const scopes = [{ end: null }];
+  const compare = (a, b) => a.line - b.line || a.col - b.col;
+  const braces = [];
+  let objects;
+  const bindingAt = (name, at) => {
+    const entry = bindings.get(name)?.findLast(({ token, scope }) =>
+      compare(token, at) <= 0 && (!scope.end || compare(at, scope.end) < 0));
+    if (!entry) return null;
+    // 普通标识符和枚举成员共享命名空间。复用分派声明器识别参数和块内对象。
+    if (!objects) {
+      objects = new Map();
+      const bodies = new Set(findFunctions(tokens, '').map(fn => tokens[fn.bodyStart]));
+      collectDispatchDeclarations(tokens, bodies, b => {
+        if (b.fileScope || b.isFunction) return;
+        const key = b.declaration.v;
+        if (!objects.has(key)) objects.set(key, []);
+        objects.get(key).push(b);
+      }, macros);
+    }
+    const masked = objects.get(name)?.some(({ declaration, scope }) => compare(entry.token, declaration) < 0 &&
+      compare(declaration, at) <= 0 && (!scope.end || compare(at, scope.end) < 0));
+    return masked ? null : entry;
+  };
+  const enumValues = {
+    get: (name, at) => at ? bindingAt(name, at)?.value : fileValues.get(name),
+    has: (name, at) => at ? !!bindingAt(name, at) : fileValues.has(name),
+  };
+  const bind = (name, value, token) => {
+    if (!bindings.has(name)) bindings.set(name, []);
+    bindings.get(name).push({ token, scope: scopes.at(-1), value });
+    if (scopes.length === 1) fileValues.set(name, value);
+  };
+  if (imports instanceof Map) imports = [{ line: 0, values: imports }];
+  let include = 0;
+  const importBefore = line => {
+    while (include < imports.length && imports[include].line < line) {
+      const { line: at, values } = imports[include++];
+      for (const [name, value] of values) bind(name, value, { line: at, col: 1 });
+    }
+  };
   for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].v !== 'enum') continue;
+    const token = tokens[i];
+    importBefore(token.line);
+    while (scopes.at(-1).stop === i) scopes.pop().end = token;
+    if (token.v === 'for') scopes.push({ stop: statementEnd(tokens, i), end: null });
+    if (token.v === '{') {
+      const prev = tokens[i - 1];
+      const isRecord = ['struct', 'union'].includes(prev?.v) ||
+        (prev?.t === 'id' && ['struct', 'union'].includes(tokens[i - 2]?.v));
+      braces.push(!isRecord);
+      if (!isRecord) scopes.push({ end: null });
+      continue;
+    }
+    if (token.v === '}') {
+      if (braces.pop()) scopes.pop().end = token;
+      continue;
+    }
+    if (token.v !== 'enum') continue;
     const open = tokens[i + 1]?.v === '{' ? i + 1 : tokens[i + 2]?.v === '{' ? i + 2 : -1;
     if (open < 0) continue;
     const close = matchBrace(tokens, open);
-    let nextVal = 0;
+    let next = 0;
     for (const part of splitAtTopLevel(tokens.slice(open + 1, close))) {
-      const nameTok = part[0];
-      if (!nameTok || nameTok.t !== 'id') continue;
-      enumNames.add(nameTok.v);
-      const eqIdx = part.findIndex(t => t.v === '=');
-      let val;
-      if (eqIdx >= 0) {
-        val = parseConstIndex(part.slice(eqIdx + 1), macros, enumValues);
-        if (val !== null) nextVal = val + 1;
-      } else {
-        val = nextVal++;
-      }
-      if (val !== null && Number.isSafeInteger(val)) enumValues.set(nameTok.v, val);
+      const member = part[0];
+      if (member?.t !== 'id') continue;
+      const eq = part.findIndex(t => t.v === '=');
+      const value = eq < 0 ? next : parseConstIndex(part.slice(eq + 1), macros, enumValues);
+      next = Number.isSafeInteger(value) && Number.isSafeInteger(value + 1) ? value + 1 : null;
+      bind(member.v, value, member);
     }
     i = close;
   }
-  return { enumNames, enumValues };
+  importBefore(Infinity);
+  return { enumValues, fileValues };
 }
 
 /** 解析常量整数索引（如 0, 0x02, ENUM_A + 1, A << 1），含未知运行时符号则返回 null */
@@ -616,12 +665,17 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
       const val = parseSingleIntLiteral(tk.v);
       return Number.isSafeInteger(val) ? val : null;
     }
-    if (tk.t === 'id' && enumValues?.has(tk.v)) {
-      const val = enumValues.get(tk.v);
+    if (tk.t === 'id' && enumValues?.has(tk.v, tk)) {
+      const val = enumValues.get(tk.v, tk);
       return Number.isSafeInteger(val) ? val : null;
     }
     return null;
   }
+  // 没有目标 ABI 时，仅在整数提升、符号转换和溢出都不影响结果时折叠。
+  // 非负操作数转换至公共类型保持其值。小有符号常量组成的表达式也可安全产生负值。
+  const smallSigned = tokens.every(t => t.t !== 'id' && (t.t !== 'num' ||
+    (!/[uU]/.test(t.v) && (parseSingleIntLiteral(t.v) ?? Infinity) <= 32767)));
+  const portable = n => n >= (smallSigned ? -32767 : 0) && n <= 32767 ? n : null;
   let pos = 0;
   const peek = () => tokens[pos];
   const parsePrimary = () => {
@@ -636,11 +690,13 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
     }
     if (tk.t === 'num' || tk.t === 'str') {
       pos++;
-      return parseSingleIntLiteral(tk.v);
+      const n = parseSingleIntLiteral(tk.v);
+      return Number.isSafeInteger(n) ? n : null;
     }
-    if (tk.t === 'id' && enumValues?.has(tk.v)) {
+    if (tk.t === 'id' && enumValues?.has(tk.v, tk)) {
       pos++;
-      return enumValues.get(tk.v);
+      const n = enumValues.get(tk.v, tk);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
     }
     return null;
   };
@@ -651,8 +707,8 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
       const sub = parseUnary();
       if (sub === null) return null;
       if (v === '+') return +sub;
-      if (v === '-') return -sub;
-      if (v === '~') return ~sub;
+      if (v === '-') return portable(-sub);
+      if (v === '~') return null; // 取反的值依赖提升后的宽度和符号表示。
       return sub ? 0 : 1;
     }
     return parsePrimary();
@@ -669,18 +725,22 @@ export function parseConstIndex(tokens, macros, enumValues = null) {
     return left;
   };
   const parseMul = () => parseBin(parseUnary, ['*', '/', '%'], (a, op, b) => {
-    if (op === '*') return a * b;
+    if (op === '*') return portable(a * b);
     if (b === 0) return null;
-    return op === '/' ? Math.trunc(a / b) : a % b;
+    return Number(op === '/' ? BigInt(a) / BigInt(b) : BigInt(a) % BigInt(b));
   });
-  const parseAdd = () => parseBin(parseMul, ['+', '-'], (a, op, b) => (op === '+' ? a + b : a - b));
-  const parseShift = () => parseBin(parseAdd, ['<<', '>>'], (a, op, b) => (op === '<<' ? a << b : a >> b));
+  const parseAdd = () => parseBin(parseMul, ['+', '-'], (a, op, b) => portable(op === '+' ? a + b : a - b));
+  const parseShift = () => parseBin(parseAdd, ['<<', '>>'], (a, op, b) => {
+    // 整数提升后至少 16 位，左值本身也给出位宽下限。其余移位计数依赖目标类型。
+    if (a < 0 || b < 0 || b >= Math.max(16, a.toString(2).length)) return null;
+    return op === '>>' ? Number(BigInt(a) >> BigInt(b)) : portable(Number(BigInt(a) << BigInt(b)));
+  });
   const parseRel = () => parseBin(parseShift, ['<', '<=', '>', '>='], (a, op, b) =>
     (op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : a >= b) ? 1 : 0);
   const parseEq = () => parseBin(parseRel, ['==', '!='], (a, op, b) => ((op === '==' ? a === b : a !== b) ? 1 : 0));
-  const parseBitAnd = () => parseBin(parseEq, ['&'], (a, _, b) => a & b);
-  const parseBitXor = () => parseBin(parseBitAnd, ['^'], (a, _, b) => a ^ b);
-  const parseBitOr = () => parseBin(parseBitXor, ['|'], (a, _, b) => a | b);
+  const parseBitAnd = () => parseBin(parseEq, ['&'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) & BigInt(b)));
+  const parseBitXor = () => parseBin(parseBitAnd, ['^'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) ^ BigInt(b)));
+  const parseBitOr = () => parseBin(parseBitXor, ['|'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) | BigInt(b)));
   const parseLogAnd = () => parseBin(parseBitOr, ['&&'], (a, _, b) => (a && b ? 1 : 0));
   const parseLogOr = () => parseBin(parseLogAnd, ['||'], (a, _, b) => (a || b ? 1 : 0));
   const parseTernary = () => {
@@ -879,7 +939,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
-          (operand?.t === 'id' && (status.isFunction(operand) || status.enumNames.has(operand.v))) ||
+          (operand?.t === 'id' && (status.isFunction(operand) || status.enumValues.has(operand.v, operand))) ||
           (stringInitializer || val[0].t === 'str' || val[0].v === 'sizeof'))) {
         descended ??= new Set();
         if (descended.has(child)) { status.incomplete = true; break; }
@@ -970,7 +1030,8 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
 export function findFnPtrTables(tokens, file = '', { functionId = null, macros, pendingFields, enumValues: inheritedEnums = null } = {}) {
   const tables = new Map();
   const scopes = [{ end: null }];
-  const { enumNames, enumValues } = collectEnumValues(tokens, macros, inheritedEnums);
+  const enumValues = !inheritedEnums || inheritedEnums instanceof Map
+    ? collectEnumValues(tokens, macros, inheritedEnums || []).enumValues : inheritedEnums;
   let localTypes;
   let localFunctions;
   const localFunction = token => {
@@ -978,7 +1039,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     return localFunctions.has(token.v);
   };
   const localLookup = (_, name, at) => {
-    localTypes ??= findTypedefs(tokens, macros);
+    localTypes ??= findTypedefs(tokens, macros, enumValues);
     const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     return entry && { file, shape: entry.shape };
   };
@@ -1063,12 +1124,12 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       map: {},
       slotLines: {},
       slots: new Map(),
-      ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
+      declaration: nameTok,
+      ...(functionId && { functionId, scope: scopes.at(-1) }),
     };
     const fill = (lookup, isFunction = localFunction) => {
       const status = {
         incomplete: false,
-        enumNames,
         enumValues,
         unresolvedSlots: new Set(),
         initializedAggregates: new Set(),

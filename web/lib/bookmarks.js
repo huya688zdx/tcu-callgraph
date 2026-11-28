@@ -6,7 +6,7 @@
  */
 import { t } from '../i18n.js';
 import { api } from './api.js';
-import { currentViewScope, isBookmarkDirty, scopeFingerprint, state } from './state.js';
+import { isBookmarkDirty, state } from './state.js';
 import { hooks } from './hooks.js';
 import { openModal, closeModal, wireModals, esc } from './modal.js';
 
@@ -22,6 +22,22 @@ let refreshPending = false;
 let renderSeq = 0;
 
 const modeLabel = (group) => t(group ? 'bookmark.grouped' : 'bookmark.flat');
+
+// 元数据刷新继承原绑定；重新打开同一 ID 或另存书签会得到独立绑定。
+const bookmarkBindings = new WeakMap();
+export const bookmarkBinding = bookmark => bookmarkBindings.get(bookmark) || bookmark;
+export function reviseBookmark(active, changes) {
+  const next = { ...active, ...changes };
+  bookmarkBindings.set(next, bookmarkBinding(active));
+  return next;
+}
+
+export function bookmarkMetadata(active, incoming, renamed) {
+  if (incoming.revision < active.revision) return active;
+  // 只跨过已知基线上的一次纯改名；跳号意味着可能漏掉了作用域更新。
+  const revision = renamed && incoming.revision === active.revision + 1 ? incoming.revision : active.revision;
+  return reviseBookmark(active, { name: incoming.name, revision });
+}
 
 function meta(b) {
   const roots = (b.roots || []).filter(Boolean);
@@ -219,11 +235,7 @@ function editName(row, bookmark, renameButton) {
         if (!result?.ok) throw new Error(result?.error);
         if (state.activeBookmark?.id === bookmark.id && result.bookmark) {
           const prev = state.activeBookmark;
-          state.activeBookmark = {
-            ...state.activeBookmark,
-            name: result.bookmark.name,
-            revision: result.bookmark.revision || state.activeBookmark.revision,
-          };
+          state.activeBookmark = bookmarkMetadata(prev, result.bookmark, true);
           hooks.syncBookmarkBadge?.();
           window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev } }));
         }
@@ -252,6 +264,7 @@ async function write(button, errorKey, action) {
   feedback('');
   try {
     const message = await action();
+    if (message === undefined) return false;
     if (projectId === state.view?.projectId && modal?.classList.contains('show')) {
       feedback(message);
       refreshPending = true;
@@ -270,24 +283,24 @@ async function write(button, errorKey, action) {
 async function saveUpdateByBookmark(bookmark, button) {
   if (!state.roots.length) return feedback(t('bookmark.noRoot'), true);
   return write(button, 'bookmark.failed', async () => {
-    const scope = currentViewScope();
-    const result = await api.updateBookmark({
-      id: bookmark.id,
-      expectedRevision: bookmark.revision,
-      ...scope,
-    });
+    const active = state.activeBookmark?.id === bookmark.id;
+    const reply = active ? await hooks.updateActiveBookmark() : await hooks.requestBookmarkSave(api.updateBookmark,
+      { id: bookmark.id, expectedRevision: bookmark.revision });
+    if (!reply?.isCurrent()) return;
+    const { result, fingerprint } = reply;
     if (result?.conflict) {
       refreshPending = true;
       throw new Error(t('bookmark.conflict'));
     }
     if (!result?.ok || !result.bookmark) throw new Error(result?.error || t('bookmark.failed'));
+    if (active) return t('bookmark.updated');
     const bm = result.bookmark;
     const prev = state.activeBookmark;
     state.activeBookmark = {
       id: bm.id,
       name: bm.name,
       revision: bm.revision || 1,
-      baseFingerprint: scopeFingerprint(scope),
+      baseFingerprint: fingerprint,
     };
     state.bookmarkDrafts.delete(String(bm.id));
     hooks.syncBookmarkBadge?.();
@@ -302,11 +315,9 @@ function save(name, button) {
   if (!name) return feedback(t('bookmark.needName'), true);
   if (!state.roots.length) return feedback(t('bookmark.noRoot'), true);
   return write(button, 'bookmark.failed', async () => {
-    const scope = currentViewScope();
-    const result = await api.saveBookmark({
-      name,
-      ...scope,
-    });
+    const reply = await hooks.requestBookmarkSave(api.saveBookmark, { name });
+    if (!reply?.isCurrent()) return;
+    const { result, fingerprint } = reply;
     if (!result?.ok) throw new Error(result?.error);
     if (result.bookmark) {
       const bm = result.bookmark;
@@ -315,7 +326,7 @@ function save(name, button) {
         id: bm.id,
         name: bm.name,
         revision: bm.revision || 1,
-        baseFingerprint: scopeFingerprint(scope),
+        baseFingerprint: fingerprint,
       };
       state.bookmarkDrafts.delete('__unnamed__');
       state.bookmarkDrafts.delete(String(bm.id));

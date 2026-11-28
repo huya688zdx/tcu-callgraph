@@ -208,7 +208,8 @@ function renderAll() {
     const target = e.target || '';
     const codeTarget = ['Node', 'Edge', 'Delete', 'Layout', 'Compose'].includes(kind);
     const displayTarget = kind === 'Canvas' || kind === 'ClearCanvas' ? ''
-      : kind === 'Checkpoint' ? (e.ctx?.checkpointName || b.label || target || t('timeline.kindCheckpoint'))
+      : kind === 'Checkpoint' && e.ctx?.beforeRestore ? t('timeline.preRestore')
+      : kind === 'Checkpoint' ? (e.ctx?.checkpointName || e.brief?.label || target || t('timeline.kindCheckpoint'))
       : kind === 'Layout' ? target.replace(/::(?:group|flat)$/, '')
       : kind === 'Compose' && !target.includes('::') ? '' : target;
     const { title, meta } = codeTarget
@@ -288,6 +289,7 @@ let reviewTime = 0;
 let reviewSeq = 0;
 let changingReview = false;
 let restoringSnapshot = false;
+let reviewAfterRestore = null;
 let latestUpdated = false;
 let reviewSessionChanged = false;
 
@@ -318,6 +320,7 @@ function showBar() {
 
 function hideBar() {
   ++reviewSeq;
+  reviewAfterRestore = null;
   preReview = null;
   reviewTime = 0;
   changingReview = false;
@@ -329,7 +332,14 @@ function hideBar() {
 
 /** 进入回看：把 state.at 指到某个事件，重新拉一次视图 */
 async function reviewAt(eventId, ts) {
-  if (reviewTransition() || reviewSessionChanged || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (reviewSessionChanged || state.view?.comparison || !eventId || hooks.canReview?.() === false) return;
+  if (restoringSnapshot && !state.at && state.view) {
+    // 恢复已提交；在新画布上进入用户最后选中的历史条目。
+    reviewAfterRestore = { eventId, ts };
+    closeModal();
+    return;
+  }
+  if (reviewTransition()) return;
   if (!state.at) {
     preReview = { roots: [...state.roots], expansions: structuredClone(state.expansions),
       up: state.up, down: state.down, group: state.group, groupMode: state.groupMode, vars: [...state.vars], hiddenVars: [...state.hiddenVars],
@@ -413,19 +423,6 @@ restoreBtn?.addEventListener('click', async () => {
   restoringSnapshot = true;
   syncReviewControls();
   try {
-    // 非破坏性恢复：若当前恢复前工作区有节点且曾偏离书签，先自动记录安全检查点
-    if (preReview && (preReview.roots?.length || preReview.expansions?.length) && !state.view?.comparison) {
-      await api.saveCheckpoint(t('timeline.preRestore'), {
-        roots: preReview.roots,
-        expansions: preReview.expansions,
-        up: preReview.up,
-        down: preReview.down,
-        group: preReview.group,
-        groupMode: preReview.groupMode,
-        vars: preReview.vars,
-        hiddenVars: preReview.hiddenVars,
-      }, state.activeBookmark ? { bookmarkId: state.activeBookmark.id, bookmarkName: state.activeBookmark.name } : {}).catch(() => {});
-    }
     const r = await api.restore(state.at);
     if (seq !== reviewSeq) return;
     if (!r?.ok) throw new Error(r?.error || t('timeline.restoreFailed'));
@@ -434,10 +431,16 @@ restoreBtn?.addEventListener('click', async () => {
     if (r.restoredView) await hooks.restoreTimelineView(r.restoredView, r.eventId);
     else await hooks.reloadAll();
   } catch (error) {
+    reviewAfterRestore = null;
     alert(error.message || t('timeline.restoreFailed'));
   } finally {
     restoringSnapshot = false;
     syncReviewControls();
+  }
+  if (reviewAfterRestore) {
+    const { eventId, ts } = reviewAfterRestore;
+    reviewAfterRestore = null;
+    await reviewAt(eventId, ts);
   }
 });
 

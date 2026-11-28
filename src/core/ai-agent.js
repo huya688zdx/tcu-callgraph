@@ -486,10 +486,9 @@ const buildToolDefinitions = tr => [
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['highlight', 'play_flow', 'lens', 'clear'], description: tr('tool.canvas_visual.action') },
+        action: { type: 'string', enum: ['highlight', 'play_flow', 'clear'], description: tr('tool.canvas_visual.action') },
         nodeIds: { type: 'array', items: { type: 'string' }, description: tr('tool.canvas_visual.nodeIds') },
         edgeKeys: { type: 'array', items: { type: 'string' }, description: tr('tool.canvas_visual.edgeKeys') },
-        lens: { type: 'string', enum: ['default', 'dataflow', 'indirect', 'changes'], description: tr('tool.canvas_visual.lens') },
         label: { type: 'string', description: tr('tool.canvas_visual.label') },
       },
       required: ['action'],
@@ -679,6 +678,20 @@ function formatUiContextSelections(ui, tr) {
       if (!target) return '';
       const dirText = item.dir === 'in' ? tr('directionIn') : item.dir === 'both' ? tr('directionBoth') : tr('directionOut');
       const parts = [tr('flow', { target, dir: dirText })];
+      if (typeof item.focused?.path === 'string') parts.push(tr('flow.focused') + ' ' + item.focused.path.slice(0, 640));
+      const addSummary = (label, values, budget) => {
+        const kept = [];
+        for (const value of (Array.isArray(values) ? values : []).slice(0, 16)) {
+          if (typeof value !== 'string' || !value) continue;
+          if (value.length > budget) break;
+          kept.push(value);
+          budget -= value.length + 1;
+        }
+        if (kept.length) parts.push(label + ' ' + kept.join(tr('itemSep')));
+      };
+      addSummary(tr('flow.writers'), item.writers, 500);
+      addSummary(tr('flow.readers'), item.readers, 500);
+      addSummary(tr('flow.edges'), item.edges, 1200);
       if (Array.isArray(item.vars) && item.vars.length) {
         parts.push(tr('relatedVars', { vars: item.vars.slice(0, 6).map(v => v.name || v).join(tr('itemSep')) }));
       }
@@ -761,8 +774,7 @@ function buildTurnUserText(userText, uiContext, attachments, tr) {
   return sections.join('\n');
 }
 
-function buildSystemPrompt(context, promptToolMode, toolDefs = AGENT_TOOLS) {
-  const tr = aiTranslator(context.language);
+function canvasSystemPrompt(context, tr) {
   const ctxLines = [
     tr('project', { name: context.projectName || tr('unnamed'), fn: context.fnCount ?? 0, vars: context.varCount ?? 0 }),
     tr('roots', { roots: context.canvasRoots?.join(', ') || tr('empty') }),
@@ -776,7 +788,7 @@ function buildSystemPrompt(context, promptToolMode, toolDefs = AGENT_TOOLS) {
     ctxLines.push(tr('tasks', { tasks: context.tasks.slice(0, 10).join(', ') }));
   }
 
-  const base = context.systemPromptOverride ? [context.systemPromptOverride] : [
+  const base = [
     tr('role'),
     tr('language'),
     tr('principles'),
@@ -795,16 +807,18 @@ function buildSystemPrompt(context, promptToolMode, toolDefs = AGENT_TOOLS) {
     ...ctxLines,
   ];
 
-  if (promptToolMode) {
-    base.push(
-      '',
-      tr('toolFormat'),
-      tr('toolExample'),
-      tr('available'),
-      ...toolDefs.map(t => `- ${t.name}: ${t.description} ${tr('parameters')}: ${JSON.stringify(t.parameters.properties)}`),
-    );
-  }
   return base.join('\n');
+}
+
+function buildSystemPrompt(role, promptToolMode, toolDefs, tr) {
+  if (!promptToolMode) return role;
+  return [
+    role, '',
+    tr('toolFormat'),
+    tr('toolExample'),
+    tr('available'),
+    ...toolDefs.map(t => `- ${t.name}: ${t.description} ${tr('parameters')}: ${JSON.stringify(t.parameters)}`),
+  ].join('\n');
 }
 
 function flattenContent(content, thoughts) {
@@ -903,9 +917,8 @@ function buildReasoningPayload(effort) {
 }
 
 /** 把已包含 tool_calls / role:tool / role:function 的会话无损转为纯 system/user/assistant，避免回退时重跑写工具。 */
-function convertMessagesToPromptMode(messages, context, toolDefs = AGENT_TOOLS) {
-  const tr = aiTranslator(context.language);
-  const out = [{ role: 'system', content: buildSystemPrompt(context, true, toolDefs) }];
+function convertMessagesToPromptMode(messages, role, toolDefs, tr) {
+  const out = [{ role: 'system', content: buildSystemPrompt(role, true, toolDefs, tr) }];
   let pendingToolTexts = [];
   const flushTools = () => {
     if (!pendingToolTexts.length) return;
@@ -1366,7 +1379,6 @@ function summarizeToolResult(name, result, tr) {
   if (name === 'canvas_visual') {
     if (result.action === 'clear') return tr('highlightClear');
     if (result.action === 'play_flow') return tr('flowPlaying', { n: result.edgeKeys?.length || 0 });
-    if (result.action === 'lens') return tr('lensSwitched', { lens: result.lens || 'default' });
     return tr('highlightCount', { n: result.nodeIds?.length || 0 });
   }
   if (name === 'diagnose_canvas') {
@@ -1563,7 +1575,21 @@ export async function compactConversation({ config, messages, language, fetchImp
 }
 
 /** 运行直连模型的工具调用闭环，支持自动从标准 tools 平滑降级到旧版纯对话模式。 */
-export async function runAiAgent({
+export async function runAiAgent(options) {
+  const toolLog = [];
+  const onEvent = event => { if (!options.signal?.aborted) options.onEvent?.(event); };
+  // 工具写入可以先于错误或取消发生。收尾只运行一次，已断开的流不再发布事件。
+  let finalization;
+  const finalize = (interrupted = false) => finalization ??= Promise.resolve().then(() => options.beforeDone?.({ toolLog, onEvent, interrupted }));
+  try {
+    return await runTurn({ ...options, onEvent }, toolLog, finalize);
+  } catch (error) {
+    await finalize(true);
+    throw error;
+  }
+}
+
+async function runTurn({
   config,
   prompt,
   images = [],
@@ -1578,8 +1604,7 @@ export async function runAiAgent({
   allowedTools = null,
   systemPromptOverride = '',
   isSubagent = false,
-  beforeDone = null,
-}) {
+}, toolLog, finalize) {
   signal?.throwIfAborted();
   const tr = aiTranslator(context.language);
   const { chatUrl } = normalizeBaseUrl(config?.baseUrl, tr);
@@ -1597,7 +1622,7 @@ export async function runAiAgent({
     allowedTools ?? (isSubagent ? SUBAGENT_READONLY_TOOLS : null), context.language,
   );
   const activeToolNames = new Set(activeToolDefs.map(t => t.name));
-  const promptContext = systemPromptOverride ? { ...context, systemPromptOverride } : context;
+  const rolePrompt = systemPromptOverride || canvasSystemPrompt(context, tr);
 
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
   const historyBudget = Math.floor(config.contextWindow * 0.65);
@@ -1648,12 +1673,11 @@ export async function runAiAgent({
     return true;
   };
   let messages = [
-    { role: 'system', content: buildSystemPrompt(promptContext, activeMode === 'prompt', activeToolDefs) },
+    { role: 'system', content: buildSystemPrompt(rolePrompt, activeMode === 'prompt', activeToolDefs, tr) },
     ...cleanHistory,
     userMessage,
   ];
   const allThoughts = [];
-  const toolLog = [];
   const collectedChains = [];
   const seenChainIds = new Set();
   let latestPresentation = null;
@@ -1679,12 +1703,16 @@ export async function runAiAgent({
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
     ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
   };
-  const finish = async (answer, suggestions = []) => {
+  let terminalResult;
+  const finish = (...args) => terminalResult ??= finishTurn(...args);
+  async function finishTurn(answer, suggestions = [], question = null) {
     signal?.throwIfAborted();
-    const extra = typeof beforeDone === 'function' ? (await beforeDone({ toolLog, onEvent })) || {} : {};
+    const extra = await finalize() || {};
+    signal?.throwIfAborted();
     const result = {
       ok: true,
       answer: normalizeLineBreaks(answer).trim(),
+      ...(question ? { awaitingUser: true, ...question } : {}),
       ...(suggestions.length ? { suggestions } : {}),
       ...(collectedChains.length ? { chains: collectedChains.slice(0, 12) } : {}),
       ...(latestPresentation ? { presentation: latestPresentation } : {}),
@@ -1696,9 +1724,9 @@ export async function runAiAgent({
       modeUsed: activeMode,
       ...(lastMetrics ? { metrics: lastMetrics } : {}),
     };
-    onEvent({ type: 'done', ...result });
+    onEvent({ type: question ? 'question' : 'done', ...result });
     return result;
-  };
+  }
 
   let step = 0;
   for (; step < maxSteps; step++) {
@@ -1765,7 +1793,7 @@ export async function runAiAgent({
         switchedToPrompt = true;
         activeMode = 'prompt';
         // 保留已执行的工具结果并转换为纯对话格式，绝不丢弃历史导致重复执行写工具。
-        messages = convertMessagesToPromptMode(messages, promptContext, activeToolDefs);
+        messages = convertMessagesToPromptMode(messages, rolePrompt, activeToolDefs, tr);
         onEvent({ type: 'fallback', text: tr('fallbackTools') });
         step--;
         continue;
@@ -1870,20 +1898,7 @@ export async function runAiAgent({
         : [];
       const options = parsedOptions.some(option => KEEP_ALL_LABELS.has(option.label)) ? parsedOptions : parsedOptions.slice(0, 6);
       const allowCustom = ask.arguments?.allowCustom !== false;
-      const thinking = allThoughts.join('\n\n');
-      onEvent({ type: 'question', question, options, allowCustom, thinking, ...(lastMetrics ? { metrics: lastMetrics } : {}) });
-      return {
-        ok: true,
-        awaitingUser: true,
-        question,
-        options,
-        allowCustom,
-        answer: question,
-        thinking,
-        toolLog,
-        modeUsed: activeMode,
-        ...(lastMetrics ? { metrics: lastMetrics } : {}),
-      };
+      return await finish(question, [], { question, options, allowCustom });
     }
 
     // 把模型本轮输出加入历史（确保 tool_calls 数量与后续 role:tool 回复一一对应）
@@ -1944,7 +1959,7 @@ export async function runAiAgent({
           latestHealthReport = output.healthReport;
           if (!isSubagent) onEvent({ type: 'health_report', report: output.healthReport });
         }
-        if (output.canvasOverlay && typeof output.canvasOverlay === 'object' && !isSubagent) {
+        if (output.canvasOverlay && typeof output.canvasOverlay === 'object' && !output.presentation?.steps?.length && !isSubagent) {
           onEvent({ type: 'canvas_overlay', ...output.canvasOverlay });
         }
         if (Array.isArray(output._events)) {
