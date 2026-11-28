@@ -153,7 +153,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const indirectFieldWrites = new Map(), forwardedParams = new Set();
   const localFields = new WeakMap();
   const fieldsFor = (unit, node) => {
-    const scope = unit.scopeOf.get(node.atomicEffect || node);
+    const scope = unit.scopeOf.get(node.effectOf || node);
     if (!localFields.has(scope)) localFields.set(scope, new Map());
     return localFields.get(scope);
   };

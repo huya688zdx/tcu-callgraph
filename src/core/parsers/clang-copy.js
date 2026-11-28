@@ -1,4 +1,4 @@
-import { callbackChildren, children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
+import { asmMemoryOperands, callbackChildren, children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, pointerMove, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
@@ -47,6 +47,11 @@ function offsetSlot(base, index) {
   if (!last) return index == null ? base : null;
   const offset = index == null || last[1] === '*' ? '*' : BigInt(last[1]) + BigInt(index);
   return base.slice(0, last.index) + '[' + offset + ']';
+}
+
+function shiftedAddress(base, offset) {
+  const slot = offsetSlot(base.slot, offset);
+  return slot == null ? null : { ...base, slot, region: base.region === base.slot ? slot : base.region };
 }
 
 function argumentSlot(base, write) {
@@ -105,7 +110,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       }
     }
     if (n.kind === 'IndirectGotoStmt' || (n.kind === 'GotoStmt' && !forwardJumps.has(n))) unstructuredJump = true;
-    if (n.kind === 'CompoundAssignOperator' || (n.kind === 'UnaryOperator' && ['&', '++', '--'].includes(n.opcode))) {
+    if (n.kind === 'UnaryOperator' && n.opcode === '&') {
       mayRebind(children(n)[0]);
     }
     for (const value of transferredValues(n)) {
@@ -129,7 +134,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         const full = store.path + item.path, match = relativeSlot(path, full);
         if (!match || shadowed.some(p => relativeSlot(p, full)?.covers)) continue;
         const mutable = [...(rebound.get(key) || [])].some(p => relativeSlot(p, full));
-        entries.push({ ...item, path: match.rest, unknown: item.unknown || mutable,
+        // 地址仍来自同一数组，而确切下标可能已改变；只放宽这一层。
+        const address = mutable || item.unknown ? shiftedAddress(item, null) : item;
+        entries.push({ ...address, path: match.rest, unknown: item.unknown || mutable,
           weak: item.weak || !match.covers || !mandatory || mutable || possible.some(p => relativeSlot(p, full)) });
       }
       trace.active.delete(store);
@@ -206,7 +213,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return result;
   }
   function addressValues(expr, at, trace) {
-    const addr = unwrap(expr);
+    const addr = unwrap(expr), move = pointerMove(addr);
+    if (move) return carried(children(move)[addr.isPostfix ? 0 : 1], points.get(move), trace);
+    if (addr.kind === 'UnknownWrite') return children(addr).flatMap(arg => carried(arg, at, trace)
+      .map(base => ({ ...shiftedAddress(base, null), weak: true, unknown: true })));
     if (addr.kind === 'CompoundLiteralExpr') return carried(children(addr)[0], at, trace);
     if (addr.kind === 'InitListExpr') return initializerMembers(addr, unit).flatMap(({ child, suffix }) =>
       carried(child, at, trace).map(item => ({ ...item, path: suffix + item.path })));
@@ -217,10 +227,11 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const [left, right] = children(addr);
       const leftPointer = typeOf(left).includes('*');
       const n = constIndexValue(leftPointer ? right : left, unit);
-      return carried(leftPointer ? left : right, at, trace).flatMap(base => {
-        const slot = offsetSlot(base.slot, n == null ? null : addr.opcode === '-' ? -n : n);
-        return slot == null ? [] : [{ ...base, slot }];
-      });
+      const cycles = trace.cycles;
+      const bases = carried(leftPointer ? left : right, at, trace);
+      // 同一游标沿回边重复移动时，单次步长不能界定总偏移。
+      const offset = n == null || (n !== 0 && trace.cycles !== cycles) ? null : addr.opcode === '-' ? -n : n;
+      return bases.map(base => shiftedAddress(base, offset)).filter(Boolean);
     }
     const decay = typeOf(addr).endsWith(']') && typeOf(expr) !== typeOf(addr) && typeOf(expr).includes('*');
     const takes = addr.kind === 'UnaryOperator' && addr.opcode === '&';
@@ -255,9 +266,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         const prefix = effect?.indirection?.prefix || '';
         if (effect && !matchingSlot(prefix, base.path)) continue;
         const tail = effect && { slot: effect.slot.slice(prefix.length), pointerIndex: effect.indirection?.index };
-        const slot = effect ? argumentSlot(base.slot, tail) : base.region;
+        const origin = effect?.unknownOffset ? shiftedAddress(base, null) : base;
+        const slot = effect ? argumentSlot(origin.slot, tail) : offsetSlot(base.region, null);
         if (slot == null) continue;
-        const definite = effect?.replacesPointee && !base.weak && !base.path && unwrap(expr)?.opcode === '&';
+        const definite = effect?.replacesPointee && !effect.unknownOffset && !base.weak && !base.path && unwrap(expr)?.opcode === '&';
         // 跨调用读取时用传址调用的实际参数绑定形参。
         noteAddressWrite(base.key, slot, effect && { record, node: call, effect, aggregate: effect.aggregate });
         const entry = { slot, point, effect, call, definite, viaMember: !!base.path };
@@ -350,7 +362,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     }
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
     const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
-    const items = callbackChildren(node);
+    const items = callbackChildren(node, unit);
     const nested = node.array_filler ? [...items, ...node.array_filler] : items;
     const call = node.kind === 'CallExpr' && node;
     const siblings = call && nested.length > 1;
@@ -379,7 +391,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const [target, value] = children(node), lhs = pointerExpression(target, unit);
       if (lhs && !lhs.throughPointer) remember(objectKey(lhs.decl, unit), lhs.slot, value, point, node.weak);
       events.push({ node, lhs, value, point });
-    } else if (call || node.kind === 'ReturnStmt') events.push({ node, call, point });
+    } else if (call || node.kind === 'ReturnStmt' || node.kind === 'GCCAsmStmt') events.push({ node, call, point });
   }
   visit(record.body, new Map(), null);
   // 先取得完整程序点，再按真实写入顺序投影。循环回边和同一调用的兄弟实参可读到源码靠后的地址。
@@ -400,6 +412,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       }
       if (lhs?.throughPointer && (!destinations.length || destinations.some(d => d.unknown))) indirectActions.push(point);
       if (!destinations.length || destinations.some(d => d.unknown || hasStaticStorage(d.key))) noteEscape(value, point);
+    } else if (node.kind === 'GCCAsmStmt') {
+      for (const arg of asmMemoryOperands(node, unit)) noteEscape(arg, point);
     } else transferredValues(node).forEach((arg, index) => noteEscape(arg, point, call, index));
   }
 
@@ -455,7 +469,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       value = unwrap(value);
       if (!value) return;
       if (rest === '.?') uncertainLayout = true;
-      if (--budget < 0 || depth > 32 || value.kind === 'UnknownAtomicValue') { unknown = true; return; }
+      if (--budget < 0 || depth > 32 || value.kind === 'UnknownWrite') { unknown = true; return; }
       if (value.kind === 'ImplicitValueInitExpr' || value.kind === 'GNUNullExpr' ||
           (value.kind === 'IntegerLiteral' && value.value === '0')) return;
       if (value.kind === 'ConditionalOperator') {

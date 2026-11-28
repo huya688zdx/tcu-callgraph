@@ -268,7 +268,7 @@ export function readTranslationUnit(ast, root, unit, files) {
     const { id, kind, name } = node;
     if (kind === 'GenericSelectionExpr' && !genericResult(node)) unknownSelections.add(node);
     const newScope = ['FunctionDecl', 'CompoundStmt', 'ForStmt'].includes(kind);
-    if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator', 'AtomicExpr'].includes(kind))) {
+    if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator', 'AtomicExpr', 'GCCAsmStmt', 'CompoundAssignOperator', 'UnaryOperator'].includes(kind))) {
       context.scopeOf.set(node, parentScope);
     }
     if (newScope) recordScopes.push(new Map());
@@ -501,6 +501,66 @@ export function normalizeRecordBaseType(type, context) {
   return cleaned;
 }
 
+// 将编译器可见的写入交给同一套槽位分析，原始操作数只求值一次。
+function writeEffect(origin, target, value, weak = false) {
+  return { kind: 'BinaryOperator', opcode: '=', effectOf: origin, weak, inner: [target, value] };
+}
+
+const pointerMoves = new WeakMap();
+export function pointerMove(node) {
+  if (!node || !(node.kind === 'CompoundAssignOperator' && ['+=', '-='].includes(node.opcode) ||
+      node.kind === 'UnaryOperator' && ['++', '--'].includes(node.opcode)) || !typeOf(node).includes('*')) return null;
+  if (!pointerMoves.has(node)) {
+    const [target, delta] = children(node);
+    const amount = delta || { kind: 'IntegerLiteral', type: { qualType: 'int' }, value: '1' };
+    const value = { kind: 'BinaryOperator', opcode: node.opcode[0], type: node.type, inner: [target, amount] };
+    pointerMoves.set(node, writeEffect(node, target, value));
+  }
+  return pointerMoves.get(node);
+}
+
+// GCCAsmStmt 的 JSON 依次列出输出、输入，但 Clang 19 不提供分界。普通内存输入也可以是左值。
+// 只在本地源码能核对输出列表时使用分界；源码不完整时，首个纯右值之前的左值都是可能输出。
+const asmModels = new WeakMap();
+function asmOperands(node, context) {
+  if (asmModels.has(node)) return asmModels.get(node);
+  const args = children(node), loc = context.loc;
+  const begin = loc.begin(node), end = loc.end(node);
+  const source = begin?.macro || end?.macro ? loc.slice(begin?.spelling, end?.spelling) : loc.text(node);
+  const tokens = lex(source);
+  const open = tokens.findIndex(t => t.v === '(');
+  let section = 0, depth = 0, named = false, memory = false, knownInputs = true;
+  let valid = /^(?:asm|__asm(?:__)?)$/.test(tokens[0]?.v) && open > 0 && tokens.at(-1)?.v === ')';
+  let emptyTemplate = valid;
+  const counts = [0, 0, 0];
+  for (const { t, v } of tokens.slice(open + 1, -1)) {
+    if (v === '(') { if (!depth++ && (section === 1 || section === 2)) counts[section]++; }
+    else if (v === ')') depth--;
+    else if (!depth) {
+      if (v === ':') section++;
+      else if (!section) {
+        emptyTemplate &&= t === 'str' && v === '""';
+        if (t !== 'str') valid = false;
+      } else if (section === 3 && (v === '"memory"' || (t !== 'str' && v !== ','))) memory = true;
+      else if (section <= 2 && v === '[') named = true;
+      else if (section <= 2 && v === ']') named = false;
+      else if (!named && t !== 'str' && v !== ',') {
+        if (section === 1) valid = false;
+        if (section === 2) knownInputs = false;
+      }
+    }
+  }
+  const firstInput = args.findIndex(a => a.valueCategory === 'prvalue');
+  valid &&= depth === 0 && !named && counts[1] <= (firstInput < 0 ? args.length : firstInput) &&
+    (!knownInputs || counts[1] + counts[2] === args.length);
+  const outputs = valid ? counts[1] : firstInput < 0 ? args.length : firstInput;
+  const effects = args.slice(0, outputs).map(target => writeEffect(node, target,
+    { kind: 'UnknownWrite', type: target.type, inner: args }, true));
+  const model = { effects, memory: !emptyTemplate && (!valid || !knownInputs || memory) };
+  asmModels.set(node, model);
+  return model;
+}
+
 // Clang 的 AtomicExpr 按 AST 顺序放置内存序、期望值和新值。只给回调分析投影读写；
 // 原始操作数仍各求值一次。exchange 的结果和比较失败时回写的值都来自更新前的槽。
 const atomicModels = new WeakMap();
@@ -517,12 +577,12 @@ function atomicModel(node) {
   }
   const slot = pointee(address);
   function previous() {
-    const temp = { kind: 'CompoundLiteralExpr', type: slot.type, atomicEffect: node, inner: [slot] };
+    const temp = { kind: 'CompoundLiteralExpr', type: slot.type, effectOf: node, inner: [slot] };
     model.effects.push(temp);
     return { kind: 'DeclRefExpr', referencedDecl: temp, type: slot.type };
   }
   function write(target, source, weak = false) {
-    model.effects.push({ kind: 'BinaryOperator', opcode: '=', atomicEffect: node, weak, inner: [target, source] });
+    model.effects.push(writeEffect(node, target, source, weak));
   }
   switch (node.name + '/' + args.length) {
     case '__c11_atomic_init/2': write(slot, second); break;
@@ -548,15 +608,22 @@ function atomicModel(node) {
     default:
       // 旧 AST 可能缺少操作名；涉及的可写对象保留未知值，不能把初始化器当作完整证据。
       for (const arg of args) if (typeOf(arg).includes('*') && !fnRef(arg)) {
-        write(pointee(arg), { kind: 'UnknownAtomicValue' }, true);
+        write(pointee(arg), { kind: 'UnknownWrite' }, true);
       }
   }
   return model;
 }
-export function callbackChildren(node) {
-  if (node.atomicEffect) return [];
+export function callbackChildren(node, context) {
+  if (node.effectOf) return [];
   const items = evaluatedChildren(node);
-  return node.kind === 'AtomicExpr' ? [...items, ...atomicModel(node).effects] : items;
+  if (node.kind === 'AtomicExpr') return [...items, ...atomicModel(node).effects];
+  if (node.kind === 'GCCAsmStmt') return [...items, ...asmOperands(node, context).effects];
+  const move = pointerMove(node);
+  return move ? [...items, move] : items;
+}
+
+export function asmMemoryOperands(node, context) {
+  return asmOperands(node, context).memory ? children(node) : [];
 }
 
 export function pointerExpression(node, context = null) {
@@ -569,13 +636,13 @@ export function pointerExpression(node, context = null) {
   if (!node) return null;
   if (node.kind === 'MemberExpr' || node.kind === 'ArraySubscriptExpr') {
     const baseNode = children(node)[0];
-    const base = pointerExpression(baseNode, context);
+    const dereference = node.isArrow || (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay');
+    const base = pointerExpression(baseNode, context) || (dereference && { decl: node, slot: '', sourceSlot: '', exact: false });
     if (!base) return null;
     const rawIndex = children(node)[1];
     const constant = node.kind === 'ArraySubscriptExpr' ? constIndexValue(rawIndex, context) : null;
     const rawBaseType = node.kind === 'MemberExpr' ? normalizeRecordBaseType(typeOf(baseNode), context) : base.baseType;
     const sourceSuffix = node.kind === 'MemberExpr' ? (node.name ? '.' + node.name : '') : `[${constant ?? '*'}]`;
-    const dereference = node.isArrow || (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay');
     return {
       ...base,
       slot: base.slot + (context?.storageFields?.slots.get(node.referencedMemberDecl) ?? sourceSuffix),
@@ -594,29 +661,38 @@ export function pointerExpression(node, context = null) {
   if (node.kind === 'UnaryOperator' && node.opcode === '*') {
     const operand = children(node)[0], base = pointerExpression(operand, context);
     // (*cb)() 对函数指示符的解引用等价于 cb()，而 (*slot)() 仍需读取另一个对象。
-    if (node.atomicPointee && !base) return { decl: node, slot: '', sourceSlot: '', throughPointer: true,
+    if (!base) return { decl: node, slot: '', sourceSlot: '', throughPointer: true,
       indirection: { operand, prefix: '', index: null } };
     if (!node.atomicPointee && context && cleanType(typeOf(node), context.aliases) === functionSignature(typeOf(operand), context)) return base;
-    return base && { ...base, throughPointer: true, indirection: { operand, prefix: base.slot, index: null } };
+    return { ...base, throughPointer: true, indirection: { operand, prefix: base.slot, index: null } };
   }
   return null;
 }
 
 export function collectAssignmentWrites(body, context) {
   const writes = [];
-  for (const node of walk(body, callbackChildren)) {
+  const reboundParams = new Map();
+  for (const node of walk(body, n => callbackChildren(n, context))) {
     if (node.kind !== 'BinaryOperator' || node.opcode !== '=') continue;
     const [target, value] = children(node);
     const dest = unwrap(target);
-    const callback = /\(\s*\*/.test(cleanType(typeOf(target), context.aliases));
-    if (!callback && (typeOf(dest).includes('*') || !context.valueRecords.has(dest))) continue;
     const lhs = pointerExpression(target, context);
     if (!lhs?.decl) continue;
+    if (lhs.decl.kind === 'ParmVarDecl' && !lhs.throughPointer && typeOf(target).includes('*')) {
+      if (!reboundParams.has(lhs.decl.id)) reboundParams.set(lhs.decl.id, new Set());
+      reboundParams.get(lhs.decl.id).add(lhs.slot);
+    }
+    const callback = /\(\s*\*/.test(cleanType(typeOf(target), context.aliases));
+    if (!callback && (typeOf(dest).includes('*') || !context.valueRecords.has(dest))) continue;
     // 只有整个函数就是 *p = value 时，直接传入的确定对象一定被替换。
     const replacesPointee = !callback && children(body).length === 1 && children(body)[0] === node &&
       dest.kind === 'UnaryOperator' && dest.opcode === '*' && unwrap(children(dest)[0])?.kind === 'DeclRefExpr';
     writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, indirection: lhs.indirection,
       slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, aggregate: !callback, replacesPointee });
+  }
+  // 跨函数摘要没有形参在每个程序点的地址。移动过的游标只能约束到实参的相应数组区域。
+  for (const write of writes) if (write.throughPointer && reboundParams.get(write.decl.id)?.has(write.indirection.prefix)) {
+    write.unknownOffset = true;
   }
   return writes;
 }

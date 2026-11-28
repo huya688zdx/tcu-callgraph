@@ -1239,3 +1239,157 @@ test('Clang 按存储位置识别原子操作，缺少操作名时保留目标�
     assert.ok(!model.edges.some(e=>e.from === 'main.c::nested' && e.kind === 'fnptr' && e.resolution === 'exact'));
   });
 });
+
+const cursorAsmSource = `typedef int (*Fn)(void);
+typedef struct { Fn run, keep; } Ops;
+typedef struct { Fn slots[3], other[2]; } Group;
+typedef struct { Fn *cursor; } Cursor;
+int initial(void) { return 1; }
+int updated(void) { return 2; }
+int alternate(void) { return 3; }
+int independent(void) { return 4; }
+int increment(void) {
+  Fn a[2] = {initial, initial}, separate = independent; Fn *p = a;
+  ++p; *p = updated;
+  return a[0]()*100 + a[1]()*10 + separate();
+}
+int decrement(void) {
+  Fn a[] = {initial, alternate}; Fn *p = &a[1]; p--; *p = updated;
+  return a[0]()*10 + a[1]();
+}
+int adjustments(void) {
+  Fn a[] = {initial, alternate, initial}; Fn *p = a;
+  p += 2; *p = updated; p -= 1; *p = updated;
+  return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int variable(int i) {
+  Group g = {{initial, alternate, initial}, {independent, independent}};
+  Fn *p = g.slots; p += i; *p = updated;
+  return g.slots[0]()*1000 + g.slots[1]()*100 + g.slots[2]()*10 + g.other[1]();
+}
+int branch(int flag) {
+  Fn a[] = {initial, alternate, independent}; Fn *p = a;
+  if (flag) ++p;
+  *p = updated; return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int before_and_reset(void) {
+  Fn a[] = {initial, alternate, independent}; Fn *p = a;
+  *p = updated; ++p; p = &a[2]; *p = updated;
+  return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int copied(void) {
+  Fn a[] = {initial, alternate, independent}; Fn *p = a; ++p; Fn *q = p;
+  p = &a[2]; *q = updated; return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int embedded(void) {
+  Fn a[] = {initial, alternate, initial}; Fn *p = a;
+  *p++ = updated; *++p = updated; return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int compound_result(void) {
+  Fn a[] = {initial, alternate, initial}; Fn *p = a;
+  *(p += 2) = updated; return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int reassigned(int i) {
+  Fn a[] = {initial, alternate}; Fn separate = independent; Fn *p = a;
+  p = p + i; *p = updated; return a[0]()*100 + a[1]()*10 + separate();
+}
+int member_cursor(void) {
+  Ops rows[] = {{initial, independent}, {alternate, independent}}; Ops *p = rows;
+  ++p; p->run = updated; return rows[0].run()*100 + rows[1].run()*10 + rows[1].keep();
+}
+int nested_cursor(void) {
+  Fn a[] = {initial, alternate}; Cursor h = {a}; ++h.cursor; *h.cursor = updated;
+  return a[0]()*10 + a[1]();
+}
+int repeat(int n) {
+  Fn slots[] = {initial, initial, initial}; Fn separate = independent; Fn *p = slots;
+  while (n--) ++p;
+  *p = updated; return slots[0]()*1000 + slots[1]()*100 + slots[2]()*10 + separate();
+}
+void move_write(Fn *p) { ++p; *p = updated; }
+int helper(void) {
+  Fn slots[] = {initial, alternate}; Fn separate = independent; move_write(slots);
+  return slots[0]()*100 + slots[1]()*10 + separate();
+}
+int tied(void) {
+  Fn cb = initial; __asm__ ("" : "=r"(cb) : "0"(updated)); return cb();
+}
+int named(void) {
+  Ops target = {initial, alternate}, other = {independent, independent};
+  __asm__ volatile ("" : [out] "=r"(target.run) : "[out]"(updated));
+  return target.run()*100 + target.keep()*10 + other.run();
+}
+int read_only(void) {
+  Fn cb = initial; __asm__ volatile ("" : : "r"(cb), "m"(cb), "r"(updated));
+  return cb();
+}
+int inout(void) {
+  Fn cb = initial, separate = independent; __asm__ volatile ("" : "+r"(cb) : "r"(updated));
+  return cb()*10 + separate();
+}
+int multiple(void) {
+  Fn a=initial, b=alternate; __asm__("" : "=r"(a), "=r"(b) : "0"(updated), "1"(independent));
+  return a()*10+b();
+}
+int via_pointer(void) {
+  Fn slots[]={initial,alternate}; Fn *p=&slots[1]; __asm__("" : "=r"(*p) : "0"(updated));
+  return slots[0]()*10+slots[1]();
+}
+int after(void) {
+  Fn cb=initial; int before=cb(); __asm__("" : "=r"(cb) : "0"(updated)); cb=alternate;
+  return before*10+cb();
+}
+#define ASM_COPY(dst, src) __asm__ ("" : "=r"(dst) : "0"(src))
+#define ASM_READ(src) __asm__ volatile ("" : : "m"(src))
+int wrapped(void) {
+  Fn cb=initial, keep=independent; ASM_COPY(cb,updated); ASM_READ(keep); return cb()*10+keep();
+}
+#define OUT_OPERAND(x) "=r"(x)
+#define MEM_OPERAND(x) "m"(x)
+int hidden_boundary(void) {
+  Fn cb=initial, keep=independent; __asm__("" : OUT_OPERAND(cb) : "0"(updated));
+  return cb()*10+keep();
+}
+int known_empty_outputs(void) {
+  Fn cb=initial; __asm__ volatile ("" : : MEM_OPERAND(cb), "r"(updated) : "memory"); return cb();
+}
+int pointer_out(void) {
+  Fn a[]={initial,alternate}, b[]={initial,alternate}; Fn separate=independent; Fn *p=a;
+  __asm__("" : "=r"(p) : "0"(&b[1])); *p=updated;
+  return b[1]()*10+separate();
+}
+static Fn global_cb=initial;
+void assembly_writer(void) { __asm__("" : "=r"(global_cb) : "0"(updated)); }
+int global_site(void) { global_cb=initial; assembly_writer(); return global_cb(); }
+`;
+
+test('Clang 游标改写只影响可达的回调数组和成员', requiresClang, async t => {
+  const root = project(t, cursorAsmSource);
+  const a = ['initial'], b = ['alternate'], u = ['updated'], i = ['independent'];
+  const au = ['initial','updated'], bu = ['alternate','updated'];
+  await checkCallbackFlow(t, root, () => ({
+    increment: [a,u,i], decrement: [u,b], adjustments: [a,u,u],
+    variable: [au,bu,au,i], branch: [au,bu,i], before_and_reset: [u,b,u],
+    copied: [a,u,i], embedded: [u,b,u], compound_result: [a,b,u],
+    reassigned: [au,bu,i], member_cursor: [a,u,i], nested_cursor: [a,u],
+    repeat: [au,au,au,i], helper: [
+      { required: [], allowed: ['initial','updated'] }, { required: u, allowed: bu }, i,
+    ],
+  }));
+});
+
+test('Clang GNU 汇编输出恢复候选，输入和独立槽保持原值', requiresClang, async t => {
+  const root = project(t, cursorAsmSource);
+  const a = ['initial'], b = ['alternate'], i = ['independent'];
+  const possible = (policy, actual) => ({ required: policy === 'expand' ? [actual] : [],
+    allowed: ['alternate','independent','initial','updated'] });
+  await checkCallbackFlow(t, root, policy => ({
+    tied: [possible(policy,'updated')], named: [possible(policy,'updated'),b,i],
+    read_only: [a], inout: [possible(policy,'initial'),i],
+    multiple: [possible(policy,'updated'),possible(policy,'independent')],
+    via_pointer: [a,possible(policy,'updated')], after: [a,b],
+    wrapped: [possible(policy,'updated'),i], hidden_boundary: [possible(policy,'updated'),i],
+    known_empty_outputs: [a], pointer_out: [possible(policy,'updated'),i],
+    global_site: [possible(policy,'updated')],
+  }));
+});
