@@ -5953,6 +5953,7 @@ export const server = http.createServer(async (req, res) => {
         ]);
         const context = {
           language: p.language,
+          readOnly: p.readOnly === true,
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
           varCount: MODEL.variables?.length || 0,

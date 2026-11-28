@@ -153,40 +153,40 @@ const FOLLOWUPS = new Map([
   ]],
   ['get_git_changes', [
     { label: 'ai.follow.split', prompt: 'ai.action.split' },
-    { label: 'ai.follow.variants', prompt: 'ai.action.variants' },
+    { label: 'ai.follow.variants', prompt: 'ai.action.variants', readOnly: true },
   ]],
   ['apply_labels', [
     { label: 'ai.follow.shared', prompt: 'ai.action.shared' },
-    { label: 'ai.follow.git', prompt: 'ai.action.git' },
+    { label: 'ai.follow.git', prompt: 'ai.action.git', readOnly: true },
   ]],
   ['remove_from_canvas', [
     LABELS_FOLLOWUP,
     { label: 'ai.follow.filtered', draft: BOOKMARK_COMMAND + ' ' },
   ]],
   ['read_function', [
-    { label: 'ai.follow.tasks', prompt: 'ai.action.tasks' },
-    { label: 'ai.follow.indirect', prompt: 'ai.action.indirect' },
+    { label: 'ai.follow.tasks', prompt: 'ai.action.tasks', readOnly: true },
+    { label: 'ai.follow.indirect', prompt: 'ai.action.indirect', readOnly: true },
     { label: 'ai.follow.functions', prompt: 'ai.action.functions' },
   ]],
   ['read_source', [
     { label: 'ai.follow.verifyEdges', prompt: 'ai.action.verifyEdges' },
-    { label: 'ai.follow.callers', prompt: 'ai.action.callers' },
+    { label: 'ai.follow.callers', prompt: 'ai.action.callers', readOnly: true },
   ]],
   ['inspect_indirect_calls', [
     { label: 'ai.follow.addEdges', prompt: 'ai.action.addEdges' },
-    { label: 'ai.follow.dispatch', prompt: 'ai.action.dispatch' },
+    { label: 'ai.follow.dispatch', prompt: 'ai.action.dispatch', readOnly: true },
   ]],
   ['add_call_edge', [
-    { label: 'ai.follow.retrace', prompt: 'ai.action.retrace' },
+    { label: 'ai.follow.retrace', prompt: 'ai.action.retrace', readOnly: true },
     { label: 'ai.follow.layout', prompt: 'ai.action.layout' },
   ]],
   ['trace_upstream', [
     { label: 'ai.follow.addChain', prompt: 'ai.action.addChain' },
-    { label: 'ai.follow.missing', prompt: 'ai.action.missing' },
+    { label: 'ai.follow.missing', prompt: 'ai.action.missing', readOnly: true },
   ]],
   ['find_symbols', [
     { label: 'ai.follow.matches', prompt: 'ai.action.matches' },
-    { label: 'ai.follow.source', prompt: 'ai.action.source' },
+    { label: 'ai.follow.source', prompt: 'ai.action.source', readOnly: true },
   ]],
   ['arrange_canvas', [
     { label: 'ai.follow.vertical', prompt: 'ai.action.vertical' },
@@ -212,7 +212,8 @@ const EFFORT_KEYS = {
 const QUICK_CONFIG_ACTION = '__ai_open_config__';
 const MAX_PENDING_IMAGES = 2;
 const MAX_PENDING_FILES = MAX_CODE_ATTACHMENTS;
-let currentGhostSuggestion = '';
+let currentGhostSuggestion = null;
+let readOnlyDraft = null;
 const pendingImages = []; // [{ id, dataUrl, label, width, height }]
 const pendingFiles = [];  // [{ id, name, lines, startLine, endLine }]
 let llmConfig = {
@@ -563,37 +564,36 @@ const setChatStatus = bindStatus(chatStatusEl);
 const setApiStatus = bindStatus(apiStatusEl);
 
 function computeInputSuggestion() {
-  if (activeAbort) return '';
+  if (activeAbort) return null;
   const thread = chatThreads.find((item) => item.id === activeChatId);
   const latest = thread?.messages?.at(-1);
   if (latest?.role === 'assistant' && !latest.error && !Array.isArray(latest.questionOptions)) {
     const dynamic = sanitizeSuggestions(latest.suggestions);
     const first = dynamic[0] || buildFallbackFollowups(latest)[0];
-    if (first?.prompt) return first.prompt;
-    if (first?.draft) return first.draft;
+    if (first?.prompt || first?.draft) return first;
   }
   if (canvasSelection) {
     const { questions } = describeSelection(canvasSelection);
-    if (questions?.[0]?.[1]) return questions[0][1];
+    if (questions.length) return questions[0];
   }
   const nodes = state.view?.nodes || [];
   if (nodes.length) {
     const root = nodes.find((n) => n.id === state.roots?.[0]) || nodes[0];
-    if (root?.name) return t('ai.suggest.root', { name: root.name });
+    if (root?.name) return { prompt: t('ai.suggest.root', { name: root.name }), readOnly: true };
   }
-  return t('ai.suggest.git');
+  return { prompt: t('ai.suggest.git'), readOnly: true };
 }
 
 function syncInputSuggestion() {
   if (!inputEl) return;
   if (activeAbort) {
-    currentGhostSuggestion = '';
+    currentGhostSuggestion = null;
     inputEl.placeholder = t('ai.steerPlaceholder');
     if (ghostTabHintEl) ghostTabHintEl.hidden = true;
     return;
   }
   currentGhostSuggestion = computeInputSuggestion();
-  inputEl.placeholder = currentGhostSuggestion || '';
+  inputEl.placeholder = currentGhostSuggestion?.prompt || currentGhostSuggestion?.draft || '';
   if (ghostTabHintEl) {
     ghostTabHintEl.hidden = !currentGhostSuggestion || Boolean(inputEl.value);
   }
@@ -601,10 +601,7 @@ function syncInputSuggestion() {
 
 function acceptGhostSuggestion() {
   if (!inputEl || inputEl.value || !currentGhostSuggestion) return false;
-  inputEl.value = currentGhostSuggestion;
-  inputEl.focus();
-  inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
-  syncInputSuggestion();
+  prefillPrompt(currentGhostSuggestion.prompt || currentGhostSuggestion.draft, currentGhostSuggestion.readOnly);
   return true;
 }
 
@@ -891,7 +888,8 @@ function renderQuestion(text, message, thread) {
   }
 }
 
-function prefillPrompt(draft) {
+function prefillPrompt(draft, readOnly = false) {
+  readOnlyDraft = readOnly ? draft : null;
   inputEl.value = draft;
   inputEl.focus();
   inputEl.setSelectionRange(draft.length, draft.length);
@@ -917,7 +915,7 @@ function sanitizeSuggestions(raw) {
 
 function translateFollowup(option) {
   return option.draft ? { label: t(option.label), draft: option.draft }
-    : { label: t(option.label), prompt: t(option.prompt) };
+    : { ...option, label: t(option.label), prompt: t(option.prompt) };
 }
 
 function buildFallbackFollowups(message) {
@@ -931,8 +929,8 @@ function buildFallbackFollowups(message) {
     const { questions } = describeSelection(canvasSelection);
     if (questions?.length) {
       return [
-        ...questions.slice(0, 2).map(([label, prompt]) => ({ label: `🔍 ${label}`, prompt })),
-        { label: t('ai.follow.indirect'), prompt: t('ai.inspectSelection') },
+        ...questions.slice(0, 2).map(option => ({ ...option, label: `🔍 ${option.label}` })),
+        { label: t('ai.follow.indirect'), prompt: t('ai.inspectSelection'), readOnly: true },
       ];
     }
   }
@@ -940,11 +938,11 @@ function buildFallbackFollowups(message) {
     return [
       translateFollowup(LABELS_FOLLOWUP),
       { label: t('ai.follow.tidy'), prompt: t('ai.action.tidy') },
-      { label: t('ai.follow.git'), prompt: t('ai.reviewFiles') },
+      { label: t('ai.follow.git'), prompt: t('ai.reviewFiles'), readOnly: true },
     ];
   }
   return [
-    { label: t('ai.follow.git'), prompt: t('ai.action.git') },
+    { label: t('ai.follow.git'), prompt: t('ai.action.git'), readOnly: true },
     { label: t('ai.findFunctions'), draft: t('ai.findDraft') },
   ];
 }
@@ -980,7 +978,7 @@ function renderFollowups(box, message, thread) {
         prefillPrompt(option.draft);
         if (option.draft.startsWith(BOOKMARK_COMMAND)) setChatStatus(() => t('ai.bookmarkEnter'));
       } else {
-        void sendPrompt(option.prompt);
+        void sendPrompt(option.prompt, { readOnly: option.readOnly });
       }
     });
     chips.appendChild(button);
@@ -1041,11 +1039,11 @@ function describeSelection(selection) {
     return {
       caption,
       questions: (n || rwCount) ? [
-        [t('ai.question.pair'), t('ai.prompt.pair', { idA, idB })],
-        [t('ai.question.paths'), t('ai.prompt.paths', { idA, idB })],
+        { label: t('ai.question.pair'), prompt: t('ai.prompt.pair', { idA, idB }), readOnly: true },
+        { label: t('ai.question.paths'), prompt: t('ai.prompt.paths', { idA, idB }), readOnly: true },
       ] : [
-        [t('ai.question.noPath'), t('ai.prompt.noPath', { idA, idB })],
-        [t('ai.question.findRelation'), t('ai.prompt.findRelation', { idA, idB })],
+        { label: t('ai.question.noPath'), prompt: t('ai.prompt.noPath', { idA, idB }), readOnly: true },
+        { label: t('ai.question.findRelation'), prompt: t('ai.prompt.findRelation', { idA, idB }) },
       ],
     };
   }
@@ -1056,8 +1054,8 @@ function describeSelection(selection) {
     return {
       caption: t('ai.selection.flow', { dirLabel, name }),
       questions: [
-        [t('ai.question.flow'), t('ai.prompt.flowSelection', { id, dirLabel })],
-        [t('ai.question.present'), t('ai.prompt.presentFlow', { id })],
+        { label: t('ai.question.flow'), prompt: t('ai.prompt.flowSelection', { id, dirLabel }), readOnly: true },
+        { label: t('ai.question.present'), prompt: t('ai.prompt.presentFlow', { id }) },
       ],
     };
   }
@@ -1068,11 +1066,11 @@ function describeSelection(selection) {
     return {
       caption: t('ai.selection.caption', { kind: variable ? t('manual.kindVar') : t('manual.kindFn'), name: (name || id) + location }),
       questions: variable ? [
-        [t('ai.question.variable'), t('ai.prompt.variable', { id })],
-        [t('ai.question.readWrite'), t('ai.prompt.readWrite', { id })],
+        { label: t('ai.question.variable'), prompt: t('ai.prompt.variable', { id }), readOnly: true },
+        { label: t('ai.question.readWrite'), prompt: t('ai.prompt.readWrite', { id }), readOnly: true },
       ] : [
-        [t('ai.question.function'), t('ai.prompt.function', { id })],
-        [t('ai.question.upstream'), t('ai.prompt.upstream', { id })],
+        { label: t('ai.question.function'), prompt: t('ai.prompt.function', { id }), readOnly: true },
+        { label: t('ai.question.upstream'), prompt: t('ai.prompt.upstream', { id }), readOnly: true },
       ],
     };
   }
@@ -1084,8 +1082,8 @@ function describeSelection(selection) {
     return {
       caption: t('ai.selection.edge', { tagText: tag ? ` [${tag}]` : '', endpoints }),
       questions: [
-        [t('ai.question.edge'), t('ai.prompt.edge', { edgeRef })],
-        [t('ai.question.period'), t('ai.prompt.period', { edgeRef })],
+        { label: t('ai.question.edge'), prompt: t('ai.prompt.edge', { edgeRef }), readOnly: true },
+        { label: t('ai.question.period'), prompt: t('ai.prompt.period', { edgeRef }), readOnly: true },
       ],
     };
   }
@@ -1095,8 +1093,8 @@ function describeSelection(selection) {
   return {
     caption: t('ai.selection.caption', { kind, name: selection.path || selection.label || path }),
     questions: [
-      [directory ? t('ai.question.dir') : t('ai.question.file'), t('ai.prompt.fileFunctions', { kind, path })],
-      [t('ai.question.impact'), t('ai.prompt.fileImpact', { kind, path })],
+      { label: directory ? t('ai.question.dir') : t('ai.question.file'), prompt: t('ai.prompt.fileFunctions', { kind, path }), readOnly: true },
+      { label: t('ai.question.impact'), prompt: t('ai.prompt.fileImpact', { kind, path }), readOnly: true },
     ],
   };
 }
@@ -1216,7 +1214,7 @@ function renderSelectionBar() {
           ? t('ai.pin.limit', { n: MAX_PINNED_SELECTIONS })
           : t('ai.pin.previewHint');
     }
-    for (const [label, prompt] of questions) {
+    for (const { label, prompt, readOnly } of questions) {
       const chip = document.createElement('button');
       chip.type = 'button';
       chip.className = 'ai-followup-chip';
@@ -1228,7 +1226,7 @@ function renderSelectionBar() {
         if (!stagedOk && pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
           setChatStatus(() => t('ai.pin.full', { n: MAX_PINNED_SELECTIONS }), false);
         }
-        void sendPrompt(prompt, frozenCtx);
+        void sendPrompt(prompt, { uiContext: frozenCtx, readOnly });
       });
       selectionQuestions.appendChild(chip);
     }
@@ -2552,8 +2550,9 @@ async function saveViewBookmark(name) {
   }
 }
 
-async function sendPrompt(rawText, uiContext = currentUiContext()) {
+async function sendPrompt(rawText, { uiContext = currentUiContext(), readOnly = false } = {}) {
   const rawInput = String(rawText ?? inputEl.value).trim();
+  if (rawText == null && rawInput === readOnlyDraft) readOnly = true;
   if (!rawInput) return;
   closeSlashMenu();
   if (rawInput === '/new' || rawInput === '/clear') {
@@ -2588,6 +2587,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   if (slashMatch) {
     const cmd = slashMatch[1].toLowerCase();
     const rest = (slashMatch[2] || '').trim();
+    // 带自定义参数的指令可以同时要求操作，保留用户写下的意图。
+    if (!rest && ['check', 'flow', 'impact', 'subagent'].includes(cmd)) readOnly = true;
     if (cmd === 'check') {
       text = rest ? t('ai.slash.check', { rest }) : t('ai.slash.checkAll');
     } else if (cmd === 'present') {
@@ -2608,6 +2609,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     pendingSteer = {
       text,
       uiContext,
+      readOnly,
       threadId: activeChatId,
       projectId: chatProjectId,
       gen: chatGeneration,
@@ -2670,6 +2672,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   renderChatBar();
   persistChats(myProjectId);
 
+  readOnlyDraft = null;
   inputEl.value = '';
   stickToBottom = true;
   appendUserMessage(rawInput, images, attachments);
@@ -2983,6 +2986,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   try {
     const res = await api.aiChat({
       turnId, language: getLang(), prompt: text,
+      ...(readOnly ? { readOnly: true } : {}),
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -3040,7 +3044,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       updateChatControls();
     }
     if (isVisible()) followChatScroll();
-    if (steer) void sendPrompt(steer.text, steer.uiContext);
+    if (steer) void sendPrompt(steer.text, { uiContext: steer.uiContext, readOnly: steer.readOnly });
   }
 }
 
@@ -3091,7 +3095,7 @@ document.addEventListener('cg:ask-ai', async (event) => {
   if (activeAbort || compacting || !llmConfig.baseUrl || !llmConfig.model) {
     prefillPrompt(prompt);
   } else {
-    await sendPrompt(prompt, uiContext);
+    await sendPrompt(prompt, { uiContext });
   }
 });
 if (relationBarEl) {
@@ -3508,7 +3512,7 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
     } else if (kind === 'labels') {
       sendPrompt(t('ai.quickPrompt.labels'));
     } else if (kind === 'build') {
-      sendPrompt(t('ai.quickPrompt.build'));
+      sendPrompt(t('ai.quickPrompt.build'), { readOnly: true });
     }
   });
 }
@@ -3537,6 +3541,7 @@ if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
 });
 if (inputEl) {
   inputEl.addEventListener('input', () => {
+    readOnlyDraft = null;
     syncInputSuggestion();
     updateAutocompletePopover();
   });

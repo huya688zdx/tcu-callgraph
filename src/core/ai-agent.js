@@ -791,6 +791,7 @@ function canvasSystemPrompt(context, tr) {
   const base = [
     tr('role'),
     tr('language'),
+    ...(context.readOnly === true ? [tr('readOnlyTurn')] : []),
     tr('principles'),
     tr('verify'),
     tr('git'),
@@ -1640,7 +1641,7 @@ async function runTurn({
       editVerb.test(clause) && !/不要|别|无需|不用/u.test(clause))
     : editVerb.test(userText);
   const hasProblemReport = /(?:有点问题|有问题|不对|错了|漏了|少了|缺了|没连上|没加上|乱了|重了|重叠|挤在一起)/u.test(userText);
-  const readOnlyQuestion = explaining && !hasEditIntent;
+  const readOnlyQuestion = context.readOnly === true || (explaining && !hasEditIntent);
   const hasSelectionContext = formatUiContextSelections(context.uiContext, tr).selections.length > 0;
   const unanchoredDeictic = !hasSelectionContext &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
