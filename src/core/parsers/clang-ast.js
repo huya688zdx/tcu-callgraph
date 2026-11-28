@@ -8,9 +8,26 @@ import { fileKey, relativeFile } from './clang-config.js';
 
 export const children = (node) => node?.inner ?? [];
 export const typeOf = (node) => node?.type?.desugaredQualType || node?.type?.qualType || '';
+// Clang 的关联记录没有 kind。case 先列类型再列结果，default 只列结果。
+function genericResult(node) {
+  const selected = children(node).filter(a => a.selected === true);
+  if (selected.length !== 1) return null;
+  const [association] = selected, items = children(association);
+  const length = { case: 2, default: 1 }[association.associationKind];
+  const result = items.at(-1);
+  return items.length === length && result?.valueCategory && result.kind ? result : null;
+}
+
 export const unwrap = (node) => {
-  while (node && ['ImplicitCastExpr', 'CStyleCastExpr', 'ParenExpr', 'ConstantExpr', 'ExprWithCleanups'].includes(node.kind)
-      && children(node).length === 1) node = node.inner[0];
+  while (node) {
+    if (node.kind === 'GenericSelectionExpr') {
+      const result = genericResult(node);
+      if (!result) break;
+      node = result;
+    } else if (['ImplicitCastExpr', 'CStyleCastExpr', 'ParenExpr', 'ConstantExpr', 'ExprWithCleanups'].includes(node.kind)
+        && children(node).length === 1) node = node.inner[0];
+    else break;
+  }
   return node;
 };
 export const fnRef = (node) => {
@@ -29,11 +46,30 @@ export function transferredValues(node) {
   return node.kind === 'ReturnStmt' ? children(node) : [];
 }
 
-export function* walk(node) {
+export function* walk(node, childrenOf = children) {
   yield node;
-  for (const child of children(node)) yield* walk(child);
-  if (node.array_filler) for (const child of node.array_filler) yield* walk(child);
+  for (const child of childrenOf(node)) yield* walk(child, childrenOf);
+  if (node.array_filler) for (const child of node.array_filler) yield* walk(child, childrenOf);
 }
+
+// 源码位置、声明及指纹仍使用原始树。运行时效果只遍历实际参与求值的操作数。
+export function evaluatedChildren(node) {
+  const items = children(node);
+  if (node.kind === 'GenericSelectionExpr') {
+    const result = genericResult(node);
+    return result ? [result] : [];
+  }
+  if (node.kind !== 'UnaryExprOrTypeTraitExpr') return items;
+  if (node.name !== 'sizeof') return [];
+  if (node.argType) return items; // Clang 将运行时求值的 VLA 类型边界列为子表达式。
+  const operand = items[0];
+  if (typeOf(operand).endsWith(']')) {
+    // 对 VLA 表达式取 sizeof 时操作数会执行；普通数组的引用被 Clang 标为 unevaluated。
+    for (const n of walk(operand)) if (n.kind === 'DeclRefExpr' && !n.nonOdrUseReason) return items;
+  }
+  return [];
+}
+export const walkEvaluated = node => walk(node, evaluatedChildren);
 
 function sourceLocations(root, unit, files) {
   const locations = new WeakMap();
@@ -226,10 +262,11 @@ export function readTranslationUnit(ast, root, unit, files) {
   const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map(),
     declaratorSources: new WeakMap(), valueRecords: new WeakMap(), scopeOf: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
   const recordsById = new Map(), anonymousAt = new Map();
-  const recordScopes = [context.records], typedefRecords = new Map();
+  const recordScopes = [context.records], typedefRecords = new Map(), unknownSelections = new Set();
   function collect(node, insideFunction, parentScope) {
     const position = loc.loc(node);
     const { id, kind, name } = node;
+    if (kind === 'GenericSelectionExpr' && !genericResult(node)) unknownSelections.add(node);
     const newScope = ['FunctionDecl', 'CompoundStmt', 'ForStmt'].includes(kind);
     if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator'].includes(kind))) {
       context.scopeOf.set(node, parentScope);
@@ -306,6 +343,14 @@ export function readTranslationUnit(ast, root, unit, files) {
     if (newScope) recordScopes.pop();
   }
   collect(ast, false);
+  if (unknownSelections.size) {
+    // 只报告可能执行的未知选择，通过既有编译单元诊断保留其他文件的图。
+    for (const root of [...context.functions.map(f => f.body), ...context.globals]) {
+      for (const n of walkEvaluated(root)) if (unknownSelections.has(n)) {
+        throw new Error(`无法确定 _Generic 的选中结果（${loc.begin(n)?.file || unit.rel}:${loc.begin(n)?.line ?? '?'}）`);
+      }
+    }
+  }
   context.storageFields = storageFields(recordsById, context);
   for (const [name, decl] of context.records) {
     if (recordsById.has(decl.id)) context.records.set(name, recordsById.get(decl.id));
@@ -354,8 +399,10 @@ function recordType(type, context) {
 export function constIndexValue(node, context) {
   // 只有整个下标或不改变数值的包装层可以提供精确值。窄化转换不能剥除。
   let u = node;
-  while (u && (u.kind === 'ParenExpr' || (u.kind === 'ImplicitCastExpr' && u.castKind === 'NoOp'))) {
-    u = children(u)[0];
+  while (u) {
+    if (u.kind === 'GenericSelectionExpr') u = genericResult(u);
+    else if (u.kind === 'ParenExpr' || (u.kind === 'ImplicitCastExpr' && u.castKind === 'NoOp')) u = children(u)[0];
+    else break;
   }
   if (u?.kind === 'ConstantExpr' && /^-?\d+$/.test(String(u.value))) {
     const v = Number(u.value);
@@ -496,7 +543,7 @@ export function pointerExpression(node, context = null) {
 
 export function collectAssignmentWrites(body, context) {
   const writes = [];
-  for (const node of walk(body)) {
+  for (const node of walkEvaluated(body)) {
     if (node.kind !== 'BinaryOperator' || node.opcode !== '=') continue;
     const [target, value] = children(node);
     const dest = unwrap(target);

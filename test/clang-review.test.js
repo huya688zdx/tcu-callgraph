@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { compareProjects } from '../src/core/compare.js';
@@ -950,4 +951,117 @@ void put(Fn *p, Fn value) { *p=value; }`);
         new Set(policy === 'expand' ? sites.flatMap(s => s.candidates.map(c => c.name)) : []));
     });
   }
+});
+
+const genericSource = `typedef int (*Fn)(void);
+int control_hits, unused_hits, vla_hits, live_data, dead_data;
+int control(void) { ++control_hits; return 0; }
+int first(void) { return 1; }
+int chosen(void) { return 2; }
+int unused(void) { ++unused_hits; return 3; }
+int phantom(void) { ++unused_hits; return 4; }
+int return_target(void) { return 5; }
+int put(Fn *p, Fn value) { *p=value; return 0; }
+int selected_write(void) { Fn cb=first; _Generic(0,int:(cb=chosen),default:(cb=unused)); return cb(); }
+int default_write(void) { Fn cb=first; _Generic((double)control(),int:(cb=unused),default:(cb=chosen)); return cb(); }
+int nested(void) { Fn cb=first; _Generic(0,int:_Generic(0L,int:(cb=unused),default:(cb=chosen)),default:(cb=unused)); return cb(); }
+int cleared(void) { Fn cb=chosen; _Generic(0,int:(cb=0),default:(cb=unused)); return cb ? cb() : 0; }
+int only_control(void) { Fn cb=first; (void)_Generic((cb=unused),Fn:0,default:0); return cb(); }
+int argument(void) { Fn cb=first; put(&cb,_Generic(control(),int:chosen,default:unused)); return cb(); }
+int address(void) { Fn cb=first, other=first; put(_Generic(0,int:&cb,default:&other),chosen); return cb()+other(); }
+int assign_value(void) { Fn cb=_Generic(control(),int:chosen,default:phantom); return cb(); }
+int lvalue(void) { Fn cb=first, other=first; _Generic(0,int:cb,default:other)=chosen; return cb()+other(); }
+int helper(void) { Fn cb=first; _Generic(put(&cb,unused),int:put(&cb,chosen),default:put(&cb,unused)); return cb(); }
+void update(Fn *p) { _Generic(0,int:(*p=chosen),default:(*p=unused)); }
+int updated(void) { Fn cb=first; update(&cb); return cb(); }
+Fn shared=first;
+void update_global(void) { _Generic(0,int:(shared=chosen),default:(shared=unused)); }
+int global_effect(void) { shared=first; update_global(); return shared(); }
+int direct_result(void) { return _Generic(control(),int:chosen(),default:unused()); }
+int direct_designator(void) { return _Generic(control(),int:chosen,default:phantom)(); }
+int return_site(void) { Fn cb=chosen; return _Generic(control(),int:cb(),default:unused()); }
+Fn factory(void) { return _Generic(control(),int:return_target,default:phantom); }
+int returned(void) { return factory()(); }
+int plain(Fn cb) { return cb(); }
+static Fn const fixed=_Generic(0,int:chosen,default:phantom);
+static Fn const table[]={first,chosen};
+int fixed_value(void) { return fixed(); }
+int fixed_index(void) { return table[_Generic(control(),int:1,default:0)](); }
+static Fn exposed=first, sibling=first;
+Fn *published=_Generic(0,int:&exposed,default:&sibling);
+void apply_external(void);
+int published_value(void) { exposed=first; sibling=first; apply_external(); return exposed()+sibling(); }
+int data(void) { _Generic(dead_data,int:live_data,default:dead_data)=2; return _Generic(control(),int:live_data,default:dead_data); }
+int unevaluated(void) { Fn cb=first; (void)sizeof _Generic(control(),int:(put(&cb,chosen),cb()),default:unused()); return cb(); }
+int alignment(void) { (void)_Alignof(int[_Generic(0,int:unused(),default:control())]); return 1; }
+int vla_type(void) { return (int)(sizeof(int[_Generic(control(),int:chosen(),default:unused())])/sizeof(int)); }
+void *buffer(void *p) { ++vla_hits; return p; }
+int vla_expr(int n) { int row[n]; return (int)(sizeof *(int (*)[n])_Generic(control(),int:buffer(row),default:(void*)0)/sizeof(int)); }
+int fixed_expr(void) { int row[3]; return (int)(sizeof *(int (*)[3])_Generic(control(),int:buffer(row),default:(void*)0)/sizeof(int)); }`;
+
+test('Clang _Generic 仅执行选中表达式并保留其值和调用点', requiresClang, async t => {
+  const root = project(t, genericSource);
+  const updated = { required: ['chosen'], allowed: ['first','chosen'] };
+  await checkCallbackFlow(t, root, policy => ({
+    selected_write: [['chosen']], default_write: [['chosen']], nested: [['chosen']], only_control: [['first']], cleared: [[]],
+    argument: [updated], address: [updated,['first']], assign_value: [['chosen']], lvalue: [['chosen'],['first']],
+    helper: [updated], updated: [updated], global_effect: [updated], return_site: [['chosen']], unevaluated: [['first']],
+    published_value: [policy === 'expand' ? { required: ['return_target'], allowed: ['first','chosen','return_target'] } : ['first'], ['first']],
+  }));
+  for (const policy of ['strict','expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const outgoing = name => model.edges.filter(e => e.from === 'main.c::' + name);
+    const direct = {
+      direct_result: ['chosen'], direct_designator: ['chosen'], argument: ['put'], helper: ['put'], returned: ['factory'],
+      update_global: [], global_effect: ['update_global'], return_site: [], factory: [], data: [],
+      unevaluated: [], alignment: [], vla_type: ['chosen'], vla_expr: ['buffer'], fixed_expr: [],
+    };
+    for (const [name, expected] of Object.entries(direct)) await t.test(policy + ' evaluated calls ' + name, () => {
+      assert.deepEqual(outgoing(name).filter(e => e.kind === 'direct').map(e => e.callee).sort(), expected);
+    });
+    for (const name of ['fixed_value','fixed_index']) await t.test(policy + ' constant ' + name, () => {
+      assert.deepEqual(outgoing(name).filter(e => e.kind === 'fnptr').map(e => [e.callee,e.resolution]), [['chosen','exact']]);
+    });
+    await t.test(policy + ' selected variable', () => {
+      const access = model._df.fnAccess.get('main.c::data');
+      for (const bucket of [access.reads,access.writes]) assert.deepEqual([...bucket.keys()], ['var::live_data']);
+    });
+    await t.test(policy + ' returned value and address evidence', () => {
+      const candidates = name => model.indirectCalls.find(c => c.caller === 'main.c::' + name).candidates.map(c => c.name);
+      assert.deepEqual(candidates('returned').sort(), candidates('plain').sort());
+      if (policy === 'expand') assert.ok(candidates('returned').includes('return_target'));
+      assert.ok(!candidates('returned').includes('phantom'));
+      assert.ok(!model.edges.some(e => e.callee === 'phantom' || e.callee === 'control' || e.callee === 'unused'));
+    });
+  }
+});
+
+test('Clang _Generic 未知关联明确报告受影响文件，保留其他文件', requiresClang, async t => {
+  const root = project(t, 'int first(void); int chosen(void); typedef int (*Fn)(void);\n' +
+    'int broken(void){ Fn cb=first; _Generic(0,int:(cb=chosen),default:(cb=first)); return cb(); }');
+  fs.writeFileSync(path.join(root, 'good.c'), `int chosen(void){return 2;}
+int good(void){ (void)sizeof _Generic(42,int:chosen(),default:0);
+  return _Generic(_Generic(42,int:0,default:0),int:chosen(),default:_Generic(42,int:chosen(),default:0)); }`);
+  for (const shape of ['missing','ambiguous','missing result']) await t.test(shape, async () => {
+    const execClang = (file, args, { cwd }) => {
+      const ast = JSON.parse(execFileSync(clang.bin, args, { cwd, encoding: 'utf8' }));
+      function alter(n) {
+        // good.c 中 42 只用在控制表达式、未选分支和 sizeof 之内。
+        if (n.kind === 'GenericSelectionExpr' && (path.basename(file) === 'main.c' || n.inner[0].value === '42')) {
+          const associations = n.inner.filter(a => a.associationKind);
+          if (shape === 'missing') for (const a of associations) delete a.selected;
+          if (shape === 'ambiguous') for (const a of associations) a.selected = true;
+          if (shape === 'missing result') associations.find(a => a.selected).inner.pop();
+        }
+        for (const child of n.inner || []) alter(child);
+      }
+      alter(ast);
+      return ast;
+    };
+    const model = await buildIndex(root, { ...options, parserOptions: { execClang } });
+    assert.deepEqual(model.warnings.map(w => w.file), ['main.c']);
+    assert.match(model.warnings[0].error, /_Generic/);
+    assert.ok(!model.edges.some(e => e.from === 'main.c::broken'));
+    assert.deepEqual(model.edges.filter(e => e.from === 'good.c::good').map(e => e.callee), ['chosen']);
+  });
 });

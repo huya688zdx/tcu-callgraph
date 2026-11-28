@@ -1,4 +1,4 @@
-import { children, constIndexValue, fnRef, initializer, initializerMembers, pointerExpression, transferredValues, typeOf, unwrap, walk } from './clang-ast.js';
+import { children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
@@ -70,7 +70,7 @@ export function argumentSource(callee, call, parameter) {
 const isCase = node => node?.kind === 'CaseStmt' || node?.kind === 'DefaultStmt';
 // 内层 switch 的标签只从该 switch 进入，外层 case 则可能跳进将被略过的语句。
 function hasCaseEntry(node) {
-  return isCase(node) || (node.kind !== 'SwitchStmt' && children(node).some(hasCaseEntry));
+  return isCase(node) || (node.kind !== 'SwitchStmt' && evaluatedChildren(node).some(hasCaseEntry));
 }
 
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值，传址写入按覆盖范围合并。
@@ -87,7 +87,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
   const forwardJumps = new Map();
   let unstructuredJump = false;
   // 只绑定初始化后既不改写、也不按地址传出的局部指针。其他别名保持保守。
-  for (const n of walk(record.body)) {
+  for (const n of walkEvaluated(record.body)) {
     if (n.kind === 'CompoundStmt' && children(n).some(s => s.kind === 'GotoStmt') && !hasCaseEntry(n)) {
       const statements = children(n), labels = new Map();
       for (let i = statements.length - 1; i >= 0; i--) {
@@ -238,7 +238,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return false;
   }
   function visit(node, guards, loop) {
-    if (!node?.kind || (node.kind === 'UnaryExprOrTypeTraitExpr' && !node.argType)) return;
+    if (!node?.kind) return;
     if (node.kind === 'SwitchStmt') return visitSwitch(node, guards, loop);
     if (['ForStmt', 'WhileStmt', 'DoStmt'].includes(node.kind)) return visitLoop(node, guards, loop);
     if (loop && node.kind === 'ContinueStmt') loop.continued = true;
@@ -257,7 +257,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     }
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
     const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
-    const nested = node.array_filler ? [...children(node), ...node.array_filler] : children(node);
+    const items = evaluatedChildren(node);
+    const nested = node.array_filler ? [...items, ...node.array_filler] : items;
     const call = node.kind === 'CallExpr' && node;
     const siblings = call && nested.length > 1;
     const parent = operand;
