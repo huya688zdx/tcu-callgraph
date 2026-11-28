@@ -6,8 +6,9 @@ import { promisify } from 'node:util';
 import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
-import { children, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
-  readTranslationUnit, typeOf, variableModel, walk } from './clang-ast.js';
+import { children, collectAssignmentWrites, conditionalValues, evaluatedChildren, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
+  readTranslationUnit, transferredValues, typeOf, unwrap, variableModel, walk, walkEvaluated } from './clang-ast.js';
+import { argumentSource, callbackSlotReader, hasStaticStorage, matchingSlot, relativeSlot, writeProjection } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
 import { lex } from '../lexer.js';
@@ -31,7 +32,7 @@ function resolveDecl(ref, context, byDecl, exported) {
     || (declaration && declaration.node.storageClass !== 'static' ? exported.get(ref.name) : undefined);
 }
 
-function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
+function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispatchPolicy = 'expand') {
   const functions = new Map(), defs = new Map(), externals = new Map();
   const fnDecls = new Map(), varDecls = new Map(), publicFns = new Map();
   const functionRecords = [], recordsById = new Map();
@@ -55,6 +56,12 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
     }
     for (const node of unit.globals) {
       const def = variableModel(node, unit);
+      // extern 重声明继承此前在同一编译单元内可见的内部链接。
+      const prior = defs.get(localVars.get(node.previousDecl));
+      if (prior?.isStatic) {
+        def.id = prior.id;
+        def.isStatic = true;
+      }
       const prev = defs.get(def.id);
       if (!prev || (prev.isExtern && !def.isExtern)) defs.set(def.id, def);
       localVars.set(node.id, def.id);
@@ -75,28 +82,123 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
   // 局部变量即使与全局同名也不能从名字回退到全局定义。
   const resolveVariable = (ref, unit) => ref?.kind === 'VarDecl' ? varDecls.get(unit).get(ref.id) : undefined;
 
-  const tables = new Map(), addressTaken = new Map(), calls = [];
+  // AST 地址只在单个编译单元内唯一。局部对象用声明节点本身作为键。
+  const objectKey = (decl, unit) => {
+    if (decl?.kind === 'CompoundLiteralExpr') return decl;
+    const id = resolveVariable(decl, unit);
+    if (!id) return unit.declarations.get(decl?.id)?.node;
+    const def = defs.get(id);
+    // 头文件里的 static 只有一个源码声明，每个编译单元却分别分配存储。
+    return def.isStatic && def.file !== unit.unit.rel ? JSON.stringify([unit.unit.rel, id]) : id;
+  };
+  const tables = new Map(), addressTaken = new Map(), calls = [], byRecordField = new Map(), declWrites = new Map();
+  const addressUsers = new Map(), initialEscapes = new Map(), writesByNode = new WeakMap();
+  function storageAddress(node, unit) {
+    if (!(node.kind === 'UnaryOperator' && node.opcode === '&') && node.castKind !== 'ArrayToPointerDecay') return null;
+    const p = pointerExpression(children(node)[0], unit);
+    if (p?.decl?.kind !== 'VarDecl' || p.throughPointer) return null;
+    const key = objectKey(p.decl, unit);
+    return hasStaticStorage(key) ? { key, slot: p.slot } : null;
+  }
+  function noteInitialAddresses(node, unit) {
+    if (!node?.kind) return;
+    const addr = storageAddress(node, unit);
+    if (addr) {
+      if (!initialEscapes.has(addr.key)) initialEscapes.set(addr.key, new Set());
+      // 指向某个数组元素的地址可在本数组内移动，结构体成员地址则不跨到兄弟成员。
+      initialEscapes.get(addr.key).add(addr.slot.replace(/\[-?\d+\]$/, '[*]'));
+      return;
+    }
+    const items = children(node);
+    let values = conditionalValues(node);
+    if (node.kind === 'GenericSelectionExpr') values = evaluatedChildren(node);
+    else if (node.kind === 'InitListExpr') values = node.array_filler || items;
+    else if (node.kind.endsWith('CastExpr') || ['ParenExpr','CompoundLiteralExpr','ConstantExpr'].includes(node.kind) ||
+        (node.kind === 'BinaryOperator' && typeOf(node).includes('*'))) values = items;
+    for (const value of values || []) noteInitialAddresses(value, unit);
+  }
+  // 同一头文件声明在不同编译单元有不同 AST id，但共享源码位置。
+  const fieldKey = (unit, id) => {
+    const field = unit.declarations.get(id);
+    return field?.position?.file && `${field.position.file}:${field.position.offset}:${field.node.name}`;
+  };
+  // 字段声明不携带外层对象路径，但字段自身的数组下标仍约束候选。
+  const memberIndices = slot => {
+    const start = slot.indexOf('[', slot.lastIndexOf('.') + 1);
+    return start < 0 ? '' : slot.slice(start);
+  };
+  // 未知接收对象从声明归集；含联合体的访问还须限定联合体声明及其内部槽位。
+  const fieldLocation = (unit, id, slot, unionId) => {
+    const arm = slot.lastIndexOf('.|');
+    return unionId && arm >= 0 ? [fieldKey(unit, unionId), slot.slice(arm)] : [fieldKey(unit, id), memberIndices(slot)];
+  };
+  const indexField = (fields, unit, id, slot, target, unionId) => {
+    const put = ([key, path]) => {
+      if (!key) return;
+      if (!fields.has(key)) fields.set(key, new Map());
+      const slots = fields.get(key);
+      if (!slots.has(path)) slots.set(path, new Set());
+      slots.get(path).add(target);
+    };
+    put(fieldLocation(unit, id, slot));
+    if (unionId) put(fieldLocation(unit, id, slot, unionId));
+  };
   const noteAddress = (ref, unit) => {
     const target = resolveFunction(ref.referencedDecl, unit);
     const sig = functionSignature(typeOf(ref.referencedDecl) || typeOf(ref), unit);
     if (!addressTaken.has(sig)) addressTaken.set(sig, new Set());
     addressTaken.get(sig).add(target);
   };
+  const indirectFieldWrites = new Map(), forwardedParams = new Set();
+  const localFields = new WeakMap();
+  const fieldsFor = (unit, node) => {
+    const scope = unit.scopeOf.get(node.effectOf || node);
+    if (!localFields.has(scope)) localFields.set(scope, new Map());
+    return localFields.get(scope);
+  };
+  const indexTable = (node, unit, fields) => {
+    const candidateSlots = new Map(), sourceSlots = new Map();
+    const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
+      (id, slot, target, unionId) => indexField(fields, unit, id, slot, target, unionId), sourceSlots);
+    if (slots.size || candidateSlots.size) {
+      const key = objectKey(node, unit), id = resolveVariable(node, unit);
+      tables.set(key, { slots, candidateSlots, sourceSlots, constant: hasConstSlots(node), def: defs.get(id),
+        translationUnit: id && key !== id ? unit.unit.rel : null });
+    }
+  };
+  const definitionOf = (ref, unit) => {
+    const definitions = recordsById.get(resolveDecl(ref?.referencedDecl, unit, fnDecls, publicFns));
+    return definitions?.find(r => r.context === unit) || definitions?.[0] || null;
+  };
   for (const unit of units) {
     for (const node of unit.globals) {
-      const slots = pointerSlots(node, unit, resolveFunction);
-      if (slots.size) {
-        const id = varDecls.get(unit).get(node.id);
-        tables.set(id, { slots, constant: hasConstSlots(node) });
-      }
+      if (node.init) indexTable(node, unit, byRecordField);
       const init = node.init && children(node).find((n) => !n.kind.endsWith('Attr'));
-      if (init) for (const child of walk(init)) {
-        if (child.kind === 'DeclRefExpr' && child.referencedDecl?.kind === 'FunctionDecl') noteAddress(child, unit);
+      if (init) {
+        noteInitialAddresses(init, unit);
+        for (const child of walkEvaluated(init)) {
+          if (child.kind === 'DeclRefExpr' && child.referencedDecl?.kind === 'FunctionDecl') noteAddress(child, unit);
+        }
       }
     }
     for (const record of unit.functions) {
       const direct = new Set();
-      for (const node of walk(record.body)) {
+      for (const node of walkEvaluated(record.body)) {
+        const addr = storageAddress(node, unit);
+        if (addr) {
+          if (!addressUsers.has(addr.key)) addressUsers.set(addr.key, new Set());
+          addressUsers.get(addr.key).add(record);
+        }
+        for (const value of transferredValues(node)) {
+          if (!typeOf(value).includes('*') && !unit.valueRecords.has(unwrap(value))) continue;
+          for (const use of walkEvaluated(value)) {
+            const ref = use.referencedDecl;
+            if (ref?.kind === 'ParmVarDecl') forwardedParams.add(objectKey(ref, unit));
+          }
+        }
+        if (node.kind === 'VarDecl' && node.init && node.storageClass !== 'extern') {
+          indexTable(node, unit, fieldsFor(unit, node));
+        }
         if (node.kind === 'CallExpr' && node.inner?.length) {
           const [callee] = node.inner, ref = fnRef(callee);
           if (ref) direct.add(ref);
@@ -104,17 +206,195 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
         }
         if (node.kind === 'DeclRefExpr' && node.referencedDecl?.kind === 'FunctionDecl' && !direct.has(node)) noteAddress(node, unit);
       }
+      for (const w of collectAssignmentWrites(record.body, unit)) {
+        const declKey = objectKey(w.decl, unit);
+        w.record = record;
+        writesByNode.set(w.node, w);
+        // 普通局部聚合体由调用点读取器追踪。跨调用只索引实际存储或形参所指对象。
+        if (w.aggregate && (w.throughPointer ? w.decl.kind !== 'ParmVarDecl' :
+          !hasStaticStorage(declKey))) continue;
+        if (!declWrites.has(declKey)) declWrites.set(declKey, []);
+        declWrites.get(declKey).push(w);
+        if (w.fieldId && !w.aggregate) {
+          const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
+          indexField(fields, unit, w.fieldId, w.slot, w, w.unionId);
+          if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, w, w.unionId);
+        }
+      }
     }
   }
 
-  const edges = new Map(), callTargets = new WeakMap();
+  const readers = new WeakMap(), writeValues = new WeakMap();
+  let writeDepth = 0;
+  function writeValue(write, slot = '') {
+    if (!writeValues.has(write)) writeValues.set(write, new Map());
+    const slots = writeValues.get(write);
+    if (!slots.has(slot)) {
+      // 跨对象或跨函数的循环依赖只提供未知值，不用已经过期的初始化器填补。
+      const incomplete = { targets: [], unknown: true, parameters: [] };
+      if (writeDepth >= 32) return incomplete;
+      slots.set(slot, incomplete);
+      writeDepth++;
+      try { slots.set(slot, readerFor(write.record).atAssignment(write, slot)); }
+      finally { writeDepth--; }
+    }
+    return slots.get(slot);
+  }
+  function fieldValues(fields, [key, indices]) {
+    const targets = new Set();
+    let unknown = false, uncertainLayout = false;
+    for (const [slot, entries] of fields?.get(key) || []) {
+      const match = matchingSlot(slot, indices);
+      if (!match) continue;
+      uncertainLayout ||= match === 'overlap';
+      for (const entry of entries) {
+        if (typeof entry === 'string') targets.add(entry);
+        else {
+          const value = writeValue(entry);
+          for (const id of value.targets) targets.add(id);
+          unknown ||= value.unknown || value.parameters.length > 0;
+          uncertainLayout ||= value.uncertainLayout;
+        }
+      }
+    }
+    return { targets: [...targets], unknown, uncertainLayout };
+  }
+  // 已知函数只引入自身及其被调函数在同一静态存储槽位上的写入。
+  const reachable = new Map(), argumentWrites = new WeakMap();
+  const targetOfCall = (call, unit) => definitionOf(fnRef(children(call)[0]), unit);
+  function reachableCallees(direct) {
+    const records = new Set([direct]), callers = new Map();
+    for (const record of records) {
+      if (!record) continue;
+      for (const nested of readerFor(record).calls) {
+        const target = targetOfCall(nested, record.context);
+        if (target) {
+          if (!callers.has(target)) callers.set(target, []);
+          callers.get(target).push({ record, call: nested });
+        }
+        if (records.has(target)) continue;
+        if (records.size >= 128) {
+          records.add(null);
+          return { records, callers };
+        }
+        records.add(target);
+      }
+    }
+    return { records, callers };
+  }
+  function initiallyEscaped(key, slot) {
+    return !tables.get(key)?.constant && [...(initialEscapes.get(key) || [])].some(prefix => relativeSlot(prefix, slot));
+  }
+  function* storageWrites(key, slot, records) {
+    if (!records && initiallyEscaped(key, slot)) yield { write: null, rest: '' };
+    for (const w of declWrites.get(key) || []) {
+      if (records && !records.has(w.record)) continue;
+      const match = writeProjection(w, w.slot, slot);
+      if (!match || !readerFor(w.record).isEvaluated(w.node)) continue;
+      yield { write: w, rest: match.rest };
+    }
+    for (const record of addressUsers.get(key) || []) {
+      if (!records || records.has(record)) yield* readerFor(record).addressWrites(key, slot);
+    }
+  }
+  function callWrites(call, unit, key, slot) {
+    const direct = targetOfCall(call, unit);
+    if (!reachable.has(direct)) reachable.set(direct, reachableCallees(direct));
+    const { records, callers } = reachable.get(direct), opaque = records.has(null);
+    const targets = new Set(), pending = [], parameters = [];
+    const mutable = !tables.get(key)?.constant;
+    // 外部代码可以按名改写外部链接对象。私有对象只能经本项目可见的写入或传址改变。
+    let unknown = opaque && mutable && defs.get(key)?.isStatic === false, uncertainLayout = false;
+    function collect(value, record) {
+      for (const id of value.targets) targets.add(id);
+      unknown ||= value.unknown;
+      uncertainLayout ||= value.uncertainLayout;
+      for (const p of value.parameters) {
+        if (!records.has(record)) { unknown = true; continue; }
+        if (pending.some(({ parameter: q }) => p.decl === q.decl && p.slot === q.slot && p.pointee === q.pointee)) continue;
+        pending.push({ record, parameter: p });
+        if (record === direct) parameters.push(p);
+      }
+    }
+    for (const { write, rest } of storageWrites(key, slot, opaque ? null : records)) {
+      if (write) {
+        collect(writeValue(write, rest), write.record);
+        uncertainLayout ||= rest === '.?';
+      } else if (mutable) unknown = true;
+    }
+    // 仅沿本次调用可达的实参回溯未绑定形参，同一声明/路径只展开一次。
+    let budget = 128;
+    bindings: for (const { record, parameter } of pending) {
+      for (const site of callers.get(record) || []) {
+        if (--budget < 0) { unknown = true; break bindings; }
+        const arg = argumentSource(record, site.call, parameter);
+        if (!arg) { unknown = true; continue; }
+        if (!argumentWrites.has(arg)) argumentWrites.set(arg, { record: site.record, node: site.call, value: arg });
+        collect(writeValue(argumentWrites.get(arg), parameter.slot), site.record);
+      }
+    }
+    return { targets, direct, parameters, unknown, uncertainLayout };
+  }
+  function readerFor(record) {
+    if (!readers.has(record)) {
+      const ambient = (key, slot) => {
+        if (!hasStaticStorage(key)) return { targets: [], unknown: false };
+        const ids = [];
+        let unknown = !!defs.get(key)?.isExtern && !slot, uncertainLayout = false;
+        const matches = path => {
+          const match = matchingSlot(path, slot);
+          uncertainLayout ||= match === 'overlap';
+          return match;
+        };
+        const table = tables.get(key);
+        for (const [path, id] of table?.slots || []) if (matches(path)) ids.push(id);
+        for (const [path, targets] of table?.candidateSlots || []) if (matches(path)) ids.push(...targets);
+        for (const { write, rest } of storageWrites(key, slot)) {
+          if (!write) { unknown = true; continue; }
+          uncertainLayout ||= rest === '.?';
+          const value = writeValue(write, rest);
+          ids.push(...value.targets);
+          unknown ||= value.unknown || value.parameters.length > 0;
+          uncertainLayout ||= value.uncertainLayout;
+        }
+        return { targets: ids, unknown, uncertainLayout };
+      };
+      const parameterWrites = (callee, index) => {
+        const unit = record.context;
+        const target = definitionOf(fnRef(callee), unit);
+        const param = children(target?.node).filter(n => n.kind === 'ParmVarDecl')[index];
+        if (!param) return [null];
+        const writes = (declWrites.get(param) || []).filter(w => w.throughPointer);
+        if (forwardedParams.has(param)) writes.push(null);
+        return writes;
+      };
+      const fieldWrites = (id, slot, unionId) => fieldValues(indirectFieldWrites, fieldLocation(record.context, id, slot, unionId));
+      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode, initiallyEscaped }));
+    }
+    return readers.get(record);
+  }
+  const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
   for (const unit of units) for (const entry of unit.loc.includes) includes.set(...entry);
-  for (const { record, node, callee, ref } of calls) {
+  const sourceSite = (fn, pos) => `${fn.id}@${pos?.line ?? fn.line}:${pos?.col ?? 0}`;
+  const fixedTarget = (pointer, table) => pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+  // 头文件函数的各实例在图中共用一个源码调用点。仅当各实例一致时才把它标为精确。
+  const headerSites = new Map();
+  for (const call of calls) {
+    const { context, fn } = call.record;
+    if (call.ref || fn.file === context.unit.rel || recordsById.get(fn.id).length < 2) continue;
+    const id = sourceSite(fn, context.loc.begin(call.node));
+    if (!headerSites.has(id)) headerSites.set(id, new Set());
+    call.headerTargets = headerSites.get(id);
+    call.pointer = pointerExpression(call.callee, context);
+    const table = tables.get(objectKey(call.pointer?.decl, context));
+    call.headerTargets.add(fixedTarget(call.pointer, table) || null);
+  }
+  for (const { record, node, callee, ref, headerTargets, pointer: headerPointer } of calls) {
     const { context, fn } = record;
     const pos = context.loc.begin(node);
     const line = pos?.line ?? fn.line;
-    let candidates, kind, via;
+    let candidates, kind, via, siteId, resolution, dynamicDispatch = false;
     if (ref) {
       candidates = [resolveFunction(ref.referencedDecl, context)];
       const macro = [pos, context.loc.end(node), context.loc.begin(ref)].find((p) => p?.macro && !p.macroArgument);
@@ -122,21 +402,117 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
       if (macro) via = context.loc.token(macro) || ref.referencedDecl.name;
     } else {
       kind = 'fnptr';
-      const pointer = pointerExpression(callee);
+      siteId = sourceSite(fn, pos);
+      const pointer = headerTargets ? headerPointer : pointerExpression(callee, context);
+      const provenance = headerTargets ? { translationUnit: context.unit.rel } : {};
       const expression = context.loc.text(callee) || pointer?.decl?.name || '<间接调用>';
       const signature = functionSignature(typeOf(callee), context);
-      const table = tables.get(resolveVariable(pointer?.decl, context));
-      const exact = pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+      const varKey = objectKey(pointer?.decl, context);
+      const table = tables.get(varKey);
+      const tracked = pointer?.decl ? readerFor(record).atCall(pointer, node) : null;
+      // 空数组表示追踪过该成员，但目前的值未知；不能重新引入旧初始化值。
+      const exact = tracked === null && (headerTargets?.size ?? 1) === 1 && fixedTarget(pointer, table);
       const targets = addressTaken.get(signature);
-      const slotPattern = table?.constant && pointer?.slot.includes('[*]')
-        ? new RegExp('^' + pointer.slot.split('[*]').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\[\\d+\\]') + '$') : null;
-      const matchingSlots = slotPattern ? [...table.slots].filter(([slot, to]) => slotPattern.test(slot) && targets?.has(to))
-        .map(([, to]) => to) : [];
-      candidates = exact ? [exact] : matchingSlots.length ? [...new Set(matchingSlots)] : [...(targets || [])];
-      if (!candidates.length) candidates = [addExternal(`ext::fnptr::${fn.file}::${expression}::${signature}`, expression)];
-      via = `${expression}（${exact ? '初始化槽位' : targets?.size
-        ? `类型签名 ${signature} + 已取地址函数${matchingSlots.length ? ' + 表字段' : ''}`
-        : `未解析，类型 ${signature || '未知'}`}）`;
+      // C 的旧式无原型函数也可能与调用签名兼容。已证明同一槽位的值不需要这个回退筛选。
+      const resultType = signature.split('(')[0], oldStyle = resultType + '()';
+      const compatible = id => targets?.has(id) || addressTaken.get(oldStyle)?.has(id) ||
+        (signature === oldStyle && [...addressTaken].some(([sig, ids]) => sig.startsWith(resultType + '(') && ids.has(id)));
+      const slotTargets = tracked?.uncertainLayout ? tracked.targets.filter(compatible) : [...(tracked?.targets || [])];
+      if (tracked === null && table) {
+        if (pointer.slot.includes('[*]') || pointer.slot.includes('.|')) {
+          const add = (slot, ids) => {
+            const match = matchingSlot(slot, pointer.slot);
+            if (match) slotTargets.push(...(match === 'overlap' ? ids.filter(compatible) : ids));
+          };
+          for (const [slot, to] of table.slots) add(slot, [to]);
+          for (const [slot, tos] of table.candidateSlots) add(slot, tos);
+        } else {
+          if (table.slots.has(pointer.slot)) slotTargets.push(table.slots.get(pointer.slot));
+          slotTargets.push(...(table.candidateSlots.get(pointer.slot) || []));
+        }
+      }
+      const objectWrites = varKey == null ? [] : declWrites.get(varKey) || [];
+      let hasWrite = false, unknownValue = tracked?.unknown || tracked?.parameters.length > 0;
+      if (tracked === null && varKey != null) for (const { write, rest } of storageWrites(varKey, pointer.slot)) {
+        hasWrite = true;
+        if (!write) { unknownValue = true; continue; }
+        const value = writeValue(write, rest);
+        unknownValue ||= value.unknown || value.parameters.length > 0;
+        const uncertain = value.uncertainLayout || rest === '.?';
+        slotTargets.push(...(uncertain ? value.targets.filter(compatible) : value.targets));
+      }
+      const fieldCandidates = new Set();
+      const variable = defs.get(resolveVariable(pointer?.decl, context));
+      const knownObject = tracked || table || (!pointer?.throughPointer && variable && !variable.isExtern) || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
+        (pointer.member || objectWrites.length || /\[[^\]]*\]$/.test(typeOf(pointer.decl))));
+      if (pointer?.fieldId && !knownObject) {
+        const location = fieldLocation(context, pointer.fieldId, pointer.slot, pointer.unionId);
+        const collect = fields => {
+          const value = fieldValues(fields, location);
+          for (const id of value.targets) if (!value.uncertainLayout || compatible(id)) fieldCandidates.add(id);
+          unknownValue ||= value.unknown;
+        };
+        collect(byRecordField);
+        for (let scope = context.scopeOf.get(node); scope; scope = context.scopeOf.get(scope)) collect(localFields.get(scope));
+      }
+      if (dispatchPolicy === 'strict') {
+        if (exact && !hasWrite) {
+          candidates = [exact];
+          resolution = 'exact';
+          via = `${expression}（初始化槽位）`;
+        } else {
+          candidates = [];
+          resolution = 'unresolved';
+          const fallbackList = [...new Set([...slotTargets, ...fieldCandidates])];
+          indirectCalls.push({
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId, ...provenance,
+            expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
+            resolution, truncated: false, matchedSlots: fallbackList.length,
+            candidates: fallbackList.map(id => ({ slot: pointer?.sourceSlot || '', name: (functions.get(id) || externals.get(id))?.name || id, id })),
+          });
+        }
+      } else {
+        const combinedSlots = [...new Set([...slotTargets,
+          ...(unknownValue ? [...fieldCandidates, ...(targets || [])] : [])])];
+        const signatureTargets = !knownObject && !(pointer?.member && pointer.baseType) ? targets : null;
+        if (exact && !hasWrite) {
+          candidates = [exact];
+          resolution = 'exact';
+          via = `${expression}（初始化槽位）`;
+        } else if (combinedSlots.length) {
+          candidates = combinedSlots.slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = unknownValue && targets?.size ? `${expression}（槽位与同签名的已取地址函数）` : `${expression}（静态槽位展开）`;
+        } else if (fieldCandidates.size) {
+          candidates = [...fieldCandidates].slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = `${expression}（结构体字段 ${pointer.baseType}.${pointer.member}）`;
+        } else if (signatureTargets?.size) {
+          candidates = [...signatureTargets].slice(0, 32);
+          resolution = 'possible';
+          dynamicDispatch = true;
+          via = `${expression}（类型签名 ${signature} + 已取地址函数）`;
+        } else {
+          candidates = [addExternal(`ext::fnptr::${fn.file}::${expression}::${signature}`, expression)];
+          resolution = 'unresolved';
+          via = `${expression}（未解析，类型 ${signature || '未知'}）`;
+        }
+        if (resolution !== 'exact') {
+          const icCands = candidates.filter(id => !id.startsWith('ext::fnptr::')).map(id => ({
+            slot: pointer?.sourceSlot || '',
+            name: (functions.get(id) || externals.get(id))?.name || id,
+            id,
+          }));
+          indirectCalls.push({
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId, ...provenance,
+            expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
+            resolution, truncated: (combinedSlots.length || fieldCandidates.size || signatureTargets?.size || 0) > 32,
+            matchedSlots: icCands.length, candidates: icCands,
+          });
+        }
+      }
     }
     callTargets.set(node, candidates.flatMap((id) => {
       const records = recordsById.get(id);
@@ -144,7 +520,10 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
       return [records.find((r) => r.context === context) || records[0]];
     }));
     for (const to of candidates) {
-      const edge = { from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, col: pos?.col, via };
+      const edge = {
+        from: fn.id, to, callee: (functions.get(to) || externals.get(to)).name, kind, line, col: pos?.col, via,
+        ...(siteId ? { siteId, resolution, ...(dynamicDispatch ? { dynamicDispatch: true } : {}) } : {}),
+      };
       edges.set(JSON.stringify([edge.from, to, line, kind, via, pos?.offset]), edge);
     }
   }
@@ -165,11 +544,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths) {
     for (const item of unit.enumDeclarations) enumDeclarations.set(JSON.stringify([item.file, item.hash]), item);
   }
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
-    edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings,
+    edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings, indirectCalls,
     enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
-    fnptrTables: [...tables].map(([id, { slots }]) => ({
-      id, name: defs.get(id).name, file: defs.get(id).file,
-      map: Object.fromEntries([...slots].map(([slot, to]) => [slot, (functions.get(to) || externals.get(to)).name])),
+    fnptrTables: [...tables.values()].filter(t => t.def).map(({ def, slots, sourceSlots, translationUnit }) => ({
+      id: def.id, name: def.name, file: def.file, ...(translationUnit ? { translationUnit } : {}),
+      map: Object.fromEntries([...slots].map(([slot, to]) => [sourceSlots.get(slot) ?? slot, (functions.get(to) || externals.get(to)).name])),
     })),
   };
   applyDataflow(model, df);
@@ -317,7 +696,7 @@ async function parseClang(root, { sourceFiles, scan, parserOptions: options }) {
     }
     if (!parsed.length) throw new Error(warnings.map((w) => `${w.file}：${w.error}`).join('；'));
     const files = found.filter((f) => f.isHeader || selected.has(f.rel)).map(({ abs, ...f }) => f);
-    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs]))),
+    return { ...assemble(root, files, parsed, warnings, failedFiles, new Map(found.map(f => [f.rel, f.abs])), options.dispatchPolicy === 'strict' ? 'strict' : 'expand'),
       ...(responseFiles.size && { responseFiles: [...responseFiles] }), elapsedMs: Date.now() - started };
   } finally {
     if (dependenciesDir) fs.rmSync(dependenciesDir, { recursive: true, force: true });

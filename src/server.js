@@ -9,7 +9,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { loadModel, stats, subgraph, search, dataflowOf, rebuildIndex } from './core/index.js';
 import { decodeSource, sourceDecoder } from './core/source-files.js';
 import { isFlowchartFunction } from './core/flowchart.js';
-import { dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
+import { dataflowAttachment, dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
 import { comparisonDataflow, comparisonGlobals } from './core/compare.js';
 import { compareGitProject, inspectGitRepo, quickGitDirtySummary, watchGitProject } from './core/git-compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
@@ -25,6 +25,7 @@ import { analysisJob, analysisModel } from './core/analysis-jobs.js';
 import { createMcpServer } from './mcp.js';
 import {
   DEFAULT_AI_CONFIG,
+  SUBAGENT_READONLY_TOOLS,
   compactConversation,
   listModels as listAiModels,
   normalizeAiConfig,
@@ -38,6 +39,7 @@ import { routeEdges } from './core/routing.js';
 import { contentPadding, inside } from '../web/lib/hierarchy.js';
 import { boundSavedCodeAttachments, sanitizeCodeAttachments } from '../web/lib/ai-code-attachments.js';
 import { openStore, fingerprintFiles, importLegacyOverlay, cacheKey, resolveGroupMode } from './core/store.js';
+import { diffViewScopes } from './core/view-scope.js';
 import { collectOrphans as collectOrphansOf, countOrphans } from './core/orphans.js';
 import { getParser, listParsers, resolveParserForTarget } from './core/parsers/registry.js';
 import { detectClang, fileKey, findCompileCommands } from './core/parsers/clang-config.js';
@@ -129,22 +131,26 @@ const compileCommandsKey = scanRoot => 'parser.compileCommandsPath.' + fileKey(p
 const clangBinKey = 'parser.clangBin';
 const buildProfileKey = scanRoot => 'parser.buildProfile.' + fileKey(path.resolve(scanRoot));
 const strictCompileCommandsKey = scanRoot => 'parser.strictCompileCommands.' + fileKey(path.resolve(scanRoot));
+const dispatchPolicyKey = scanRoot => 'parser.dispatchPolicy.' + fileKey(path.resolve(scanRoot));
 const configuredClangBin = () => String(store.getSetting(clangBinKey) || '').trim();
 const configuredBuildProfile = scanRoot => store.getSetting(buildProfileKey(scanRoot)) || null;
 const configuredStrictCompile = scanRoot => store.getSetting(strictCompileCommandsKey(scanRoot));
+const configuredDispatchPolicy = scanRoot => store.getSetting(dispatchPolicyKey(scanRoot)) === 'strict' ? 'strict' : 'expand';
 const parserOptionsFor = (id, scanRoot = scanRootFor(root)) => {
   const buildProfileId = configuredBuildProfile(scanRoot) || undefined;
+  const dispatchPolicy = configuredDispatchPolicy(scanRoot);
   if (id === 'clang-ast') {
     const clangBin = configuredClangBin() || undefined;
     const strictSaved = configuredStrictCompile(scanRoot);
     return {
       compileCommandsPath: store.getSetting(compileCommandsKey(scanRoot)),
+      dispatchPolicy,
       ...(clangBin ? { clangBin } : {}),
       ...(buildProfileId ? { buildProfileId } : {}),
       ...(strictSaved !== undefined && strictSaved !== null ? { strictCompileCommands: Boolean(strictSaved) } : {}),
     };
   }
-  return buildProfileId ? { buildProfileId } : {};
+  return { dispatchPolicy, ...(buildProfileId ? { buildProfileId } : {}) };
 };
 const parserInfo = () => ({ id: MODEL.parserId, name: MODEL.parserName });
 let parserFallback = null;
@@ -253,6 +259,51 @@ function broadcastChange(op, actor, extra = {}) {
     } catch {
       sseClients.delete(res);
     }
+  }
+}
+
+/** 向指定浏览器客户端（或全员）推送非持久化的轻量视觉叠加事件（如 AI 导览高亮 / 数据流动画）。 */
+function sendClientEvent(clientId, event, data = {}) {
+  if (!sseClients.size) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify({ ...data, projectId: PROJECT?.id, sessionRevision, ts: Date.now() })}\n\n`;
+  for (const res of sseClients) {
+    if (clientId && res._clientId !== clientId) continue;
+    try {
+      writeSse(res, payload);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
+// 普通页面上报和推断边写入不一定产生时间轴事件。只对实际内容变化计数。
+let canvasEditRevision = 0;
+function savedCanvasState() {
+  return { page: latestPage(), overlay: store.loadOverlay(PROJECT.id), inferredEdges: loadInferredEdges(PROJECT.id),
+    eventId: store.latestCanvasEventId(PROJECT.id), editRevision: canvasEditRevision };
+}
+
+function sameCanvasPage(a, b) {
+  if (!a || !b) return a === b;
+  return (a.revision ?? 0) === (b.revision ?? 0) && isDeepStrictEqual(viewSnapshot(a), viewSnapshot(b));
+}
+
+function sameSavedCanvas(a, b) {
+  return a.eventId === b.eventId && a.editRevision === b.editRevision && sameCanvasPage(a.page, b.page) &&
+    isDeepStrictEqual(a.overlay, b.overlay) &&
+    isDeepStrictEqual(a.inferredEdges, b.inferredEdges);
+}
+
+const aiChangesets = new Map();
+const activeAiTurns = new Map();
+const validTurnId = id => typeof id === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id);
+function saveAiChangeset(entry) {
+  if (!entry?.id) return;
+  if (aiChangesets.has(entry.id)) aiChangesets.delete(entry.id);
+  aiChangesets.set(entry.id, entry);
+  while (aiChangesets.size > 20) {
+    const oldest = aiChangesets.keys().next().value;
+    aiChangesets.delete(oldest);
   }
 }
 
@@ -511,6 +562,7 @@ function loadInferredEdges(projectId) {
 }
 
 function saveInferredEdges(projectId, list) {
+  if (!isDeepStrictEqual(list, loadInferredEdges(projectId))) canvasEditRevision++;
   store.setSetting(inferredEdgesKey(projectId), list);
 }
 
@@ -834,6 +886,7 @@ async function openTarget(targetPath, { first = false, selection, refreshCurrent
       if (cfg.buildProfileId !== undefined) store.setSetting(buildProfileKey(model.root), cfg.buildProfileId || null);
       if (cfg.strictCompileCommands !== undefined) store.setSetting(strictCompileCommandsKey(model.root), Boolean(cfg.strictCompileCommands));
       if (cfg.compileCommandsPath !== undefined) store.setSetting(compileCommandsKey(model.root), cfg.compileCommandsPath || null);
+      if (cfg.dispatchPolicy !== undefined) store.setSetting(dispatchPolicyKey(model.root), cfg.dispatchPolicy === 'strict' ? 'strict' : 'expand');
     } else if (selection.parserId === 'clang-ast') {
       store.setSetting(compileCommandsKey(model.root), selection.parserOptions.compileCommandsPath);
     }
@@ -939,6 +992,11 @@ const hasAnnotationValue = (value) => Array.isArray(value) ? value.length > 0 :
   typeof value === 'string' ? value.trim().length > 0 : value != null;
 
 const stringArray = (value) => Array.isArray(value) ? value.filter((id) => typeof id === 'string') : [];
+
+function variablesOnPaths(result, paths) {
+  const ids = new Set(paths.flatMap(p => p.edges.map(e => e.variable)));
+  return result.nodes.filter(n => n.kind === 'var' && ids.has(n.id));
+}
 
 function viewSnapshot(view) {
   const groupMode = resolveGroupMode(view.groupMode, view.group);
@@ -1068,14 +1126,16 @@ function annotationEdgeKey(edges, edge, model) {
 }
 
 function normalizeAiLabel(raw) {
-  if (!isPlainObject(raw) || !['task', 'call', 'conn'].includes(raw.preset)) {
-    throw new Error('标签 preset 必须是 task / call / conn');
+  if (!isPlainObject(raw) || !['task', 'call', 'conn', 'free'].includes(raw.preset)) {
+    throw new Error('标签 preset 必须是 task / call / conn / free');
   }
   const { preset, order, note, num, id, dx, dy } = raw;
-  for (const key of ['border', 'color']) {
-    const supplied = typeof raw[key] === 'string' ? raw[key].toUpperCase() : raw[key];
-    if (supplied !== undefined && supplied !== LABEL_PRESETS[preset][key]) {
-      throw new Error(`${preset} 标签的 ${key} 由预设决定，请省略自定义配色`);
+  if (preset !== 'free') {
+    for (const key of ['border', 'color']) {
+      const supplied = typeof raw[key] === 'string' ? raw[key].toUpperCase() : raw[key];
+      if (supplied !== undefined && supplied !== LABEL_PRESETS[preset][key]) {
+        throw new Error(`${preset} 标签的 ${key} 由预设决定，请省略自定义配色`);
+      }
     }
   }
   let { text } = raw;
@@ -1086,6 +1146,7 @@ function normalizeAiLabel(raw) {
     throw new Error(`标签依据最多 ${LABEL_NOTE_MAX} 字`);
   }
   if (preset === 'task' && !text?.trim()) throw new Error('TASK 标签需要非空文字');
+  if (preset === 'free' && !text?.trim()) throw new Error('自由框标签需要非空文字');
   if (preset === 'call') {
     const textOrder = callLabelOrder(text?.trim());
     const n = order === undefined ? textOrder : order;
@@ -1094,9 +1155,15 @@ function normalizeAiLabel(raw) {
     }
     text = `コール順${n}`;
   }
-  // 复用预设配色，保留原有的标签标识和位置；コール順（call）标签不附带注释说明。
-  const cleanNote = preset === 'call' ? undefined : note;
-  return { preset, text, ...(cleanNote === undefined ? {} : { note: cleanNote }), ...(num === undefined ? {} : { num }), id, dx, dy };
+  // 复用预设配色，保留原有的标签标识和位置；コール順（call）和自由框（free）标签不附带注释说明。
+  const cleanNote = preset === 'call' || preset === 'free' ? undefined : note;
+  const style = preset === 'free'
+    ? {
+        ...(raw.border !== undefined ? { border: raw.border } : {}),
+        ...(raw.color !== undefined ? { color: raw.color } : {}),
+      }
+    : {};
+  return { preset, text, ...style, ...(cleanNote === undefined ? {} : { note: cleanNote }), ...(num === undefined ? {} : { num }), id, dx, dy };
 }
 
 function checkAiCallOrders(index, updates) {
@@ -1172,6 +1239,52 @@ async function readMcpChanges(q, req, { bypassMcpAccess = false, forceGit = fals
   if (requestId !== undefined) readSnapshots.set(MODEL, snapshot);
   return { ok: true, source: !forceGit && COMPARISON ? 'active-comparison' : 'git', snapshotId: snapshot.id,
     comparisonId: !forceGit ? (COMPARISON?.id ?? null) : null, ...result };
+}
+
+function callEvidenceSides(model, comparison) {
+  return comparison ? [['before', comparison.beforeModel], ['after', comparison.afterModel]] : [['current', model]];
+}
+
+function isCallEvidence(edge) {
+  return (CALL_KINDS.has(edge.kind) || edge.kind === 'manual') && !edge.headerReference && edge.resolution !== 'unresolved';
+}
+
+// 比较画布把同一条件下的多个调用点画为一条边。证据来自源版本，着色使用画布实际的键。
+function evidenceEdgeKey(edge, version, comparison) {
+  if (!comparison) return edgeKeyOf(edge);
+  const visible = comparison.model._index.outAdj.get(edge.from)?.find(e => e.to === edge.to && e.kind !== 'var' &&
+    e[version + 'Calls']?.some(call => call.line === edge.line && call.kind === edge.kind && call.cond === edge.cond));
+  return edgeKeyOf(visible || edge);
+}
+
+function possibleCall(edge) {
+  return edge.inferred || edge.dynamicDispatch || (edge.kind === 'fnptr' && edge.resolution !== 'exact');
+}
+
+function taskCallEvidence(model, id, limit) {
+  const { upstreamTasks, upstreamChains } = traceToTasks(model, id, { limit });
+  return new Map(upstreamTasks.map((task, i) => [task.id, {
+    name: task.name, possible: upstreamChains[i].edges.some(possibleCall),
+  }]));
+}
+
+function shortestCallPath(model, from, to, version, comparison) {
+  if (overlay.deleted.nodes[from] || overlay.deleted.nodes[to]) return null;
+  const queue = [{ id: from, path: [from], possible: false }], seen = new Set([from]);
+  const deletedEdges = Object.keys(overlay.deleted.edges).length > 0;
+  for (let i = 0; i < queue.length; i++) {
+    const { id, path, possible } = queue[i];
+    if (path.length > 5) continue;
+    for (const edge of model._index.outAdj.get(id) || []) {
+      if (!isCallEvidence(edge) || overlay.deleted.nodes[edge.to] ||
+          (deletedEdges && overlay.deleted.edges[evidenceEdgeKey(edge, version, comparison)]) || seen.has(edge.to)) continue;
+      const next = { id: edge.to, path: [...path, edge.to], possible: Boolean(possible || possibleCall(edge)) };
+      if (edge.to === to) return next;
+      seen.add(edge.to);
+      queue.push(next);
+    }
+  }
+  return null;
 }
 
 // 比较的合并图含两个版本的边；在一个确定版本内回溯，防止拼出从未存在的路径。
@@ -1569,17 +1682,23 @@ function applyMcpTaskLabels({ items, merge = true }) {
       presetsByEdge.set(key, new Set());
     }
     const touched = presetsByEdge.get(key);
-    if (touched.has(label.preset)) throw new Error(`同一连线不得重复提交 ${label.preset} 标签：${key}`);
+    if (label.preset !== 'free' && touched.has(label.preset)) {
+      throw new Error(`同一连线不得重复提交 ${label.preset} 标签：${key}`);
+    }
     touched.add(label.preset);
     const labels = updates.get(key);
     const current = overlay.edges[key];
-    const old = normalizeLabels(current?.labels ?? current?.label).find((entry) => entry.preset === label.preset);
-    const replacement = { ...label, id: old?.id, dx: old?.dx, dy: old?.dy };
+    const currentLabels = normalizeLabels(current?.labels ?? current?.label);
+    const old = label.preset === 'free'
+      ? currentLabels.find((entry) => entry.preset === 'free' &&
+          ((label.id && entry.id === label.id) || entry.text === label.text))
+      : currentLabels.find((entry) => entry.preset === label.preset);
+    const replacement = { ...label, id: label.id ?? old?.id, dx: label.dx ?? old?.dx, dy: label.dy ?? old?.dy };
     if (label.preset === 'conn') replacement.num = old?.num ?? nextConnNumber(occupied);
     const next = normalizeLabel(replacement);
     occupied.push(next);
-    const position = labels.findIndex((entry) => entry.preset === label.preset);
-    const remaining = labels.filter((entry) => entry.preset !== label.preset);
+    const position = old ? labels.findIndex((entry) => entry.id === old.id) : -1;
+    const remaining = old ? labels.filter((entry) => entry.id !== old.id) : labels.slice();
     remaining.splice(position < 0 ? remaining.length : position, 0, next);
     updates.set(key, remaining);
   }
@@ -1682,17 +1801,59 @@ const bookmarkEventPayload = (b) => ({
   group: !!b.group,
   ...(b.groupMode === 'period' && { groupMode: b.groupMode }),
   vars: b.vars || [],
+  ...(Array.isArray(b.hiddenVars) && b.hiddenVars.length && { hiddenVars: b.hiddenVars }),
   expansions: b.expansions || [],
 });
 
-function saveBookmarkWithEvent(data, actor = 'user') {
+function saveBookmarkWithEvent(data, actor = 'user', { isForeground = true, action } = {}) {
   return store.transaction(() => {
     const prev = store.findBookmark(PROJECT.id, data.name);
     const result = store.saveBookmark(PROJECT.id, data);
+    const bm = result.bookmark;
+    const afterPayload = bookmarkEventPayload(bm);
+    const diff = prev ? diffViewScopes(prev, bm) : null;
+    const resolvedAction = action || (prev ? 'update' : 'create');
     store.appendEvent(PROJECT.id, {
-      op: 'bookmark.save', actor, target: result.bookmark.name,
+      op: 'bookmark.save',
+      actor,
+      target: bm.name,
       before: prev ? bookmarkEventPayload(prev) : null,
-      after: bookmarkEventPayload(result.bookmark),
+      after: {
+        ...afterPayload,
+        ...(isForeground ? { view: viewSnapshot(bm) } : {}),
+      },
+      ctx: {
+        bookmarkId: bm.id,
+        bookmarkName: bm.name,
+        revision: bm.revision || 1,
+        action: resolvedAction,
+        milestone: true,
+        ...(diff?.changed ? { diffSummary: diff.summary } : {}),
+      },
+    });
+    return { ...result, prev };
+  });
+}
+
+function updateBookmarkWithEvent(id, patch, actor, expectedRevision) {
+  return store.transaction(() => {
+    const result = store.updateBookmarkById(PROJECT.id, id, patch, expectedRevision);
+    if (!result || result.conflict) return result;
+    const bm = result.bookmark;
+    const diff = diffViewScopes(result.prev, bm);
+    store.appendEvent(PROJECT.id, {
+      op: 'bookmark.save',
+      actor,
+      target: bm.name,
+      before: bookmarkEventPayload(result.prev),
+      after: { ...bookmarkEventPayload(bm), view: viewSnapshot(bm) },
+      ctx: {
+        bookmarkId: bm.id,
+        bookmarkName: bm.name,
+        action: 'update',
+        milestone: true,
+        ...(diff.changed ? { diffSummary: diff.summary } : {}),
+      },
     });
     return result;
   });
@@ -2228,9 +2389,9 @@ async function buildView(
       const indexed = model._index.byId.get(id);
       const histManual = viewOverlay !== overlay ? viewOverlay.manualNodes?.[id] : null;
       const rawDef = df?.byId.get(id) || (indexed?.kind === 'var' ? indexed : null);
-      const def = (viewOverlay !== overlay && rawDef?.manual && !histManual)
-        ? null
-        : rawDef || (histManual?.kind === 'var' ? toManualModelNode(histManual) : null);
+      const def = viewOverlay !== overlay && (!rawDef || rawDef.manual)
+        ? (histManual?.kind === 'var' ? toManualModelNode(histManual) : null)
+        : rawDef;
       if (!def) continue;
       clean.push({
         ...(COMPARISON ? def : {}),
@@ -2571,8 +2732,143 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (u.pathname === '/api/ai/changeset' && req.method === 'GET') {
+      const id = u.searchParams.get('turnId'), projectId = Number(u.searchParams.get('projectId'));
+      const pending = activeAiTurns.get(id);
+      if (projectId === PROJECT.id && pending?.projectId === projectId) await pending.finished;
+      const snap = aiChangesets.get(id);
+      const available = !switching && projectId === PROJECT.id && snap?.projectId === projectId && snap.sessionRevision === sessionRevision;
+      return json(res, { ok: true, changeset: available ? { id: snap.id, ops: snap.ops } : null,
+        ...(available && { interrupted: snap.interrupted }) });
+    }
+
+    if (u.pathname === '/api/ai/undo-changeset' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      if (COMPARISON) return bad(res, '比较模式不支持撤销 AI 改图');
+      const changesetId = typeof p?.changesetId === 'string' ? p.changesetId.trim() : '';
+      if (!changesetId) return bad(res, '缺少 changesetId');
+      const snap = aiChangesets.get(changesetId);
+      if (!snap || snap.projectId !== PROJECT.id) {
+        return json(res, { ok: false, error: '未找到可撤销的本轮 AI 改动记录（可能已撤销或工程已切换）' }, 404);
+      }
+      if (snap.sessionRevision !== sessionRevision) {
+        return json(res, { ok: false, error: '画布已进入其他比较或刷新会话，无法撤销' }, 409);
+      }
+      const canvas = snap.canvas;
+      const restorePage = canvas && !sameCanvasPage(canvas.before.page, canvas.after.page);
+      const bookmarkEvents = [];
+      let nextPage;
+      const eventId = store.transaction(() => {
+        if (canvas && (canvas.stale || !sameSavedCanvas(canvas.after, savedCanvasState()))) return null;
+        const restoredNames = new Set();
+        for (const [id, change] of snap.bookmarks) {
+          if ((store.getBookmark(PROJECT.id, id)?.revision ?? null) !== change.revision) return null;
+          if (change.before) {
+            if (restoredNames.has(change.before.name)) return null;
+            restoredNames.add(change.before.name);
+            const occupant = store.findBookmark(PROJECT.id, change.before.name);
+            if (occupant && occupant.id !== id && snap.bookmarks.get(occupant.id)?.before !== null) return null;
+          }
+        }
+        // 同名重建会获得新 ID。先移除本轮新建的记录，为原 ID 释放名字。
+        for (const [id, { before }] of snap.bookmarks) {
+          if (before) continue;
+          store.deleteBookmark(PROJECT.id, id);
+          bookmarkEvents.push(['bookmark.delete', { bookmarkId: id }]);
+        }
+        for (const [id, { before, revision, lastRevision }] of snap.bookmarks) {
+          if (!before) continue;
+          const bookmark = revision === null ? store.restoreDeletedBookmark(PROJECT.id, before, lastRevision)
+            : store.updateBookmarkById(PROJECT.id, id, before).bookmark;
+          bookmarkEvents.push(['bookmark.save', { bookmark }]);
+        }
+        const restored = canvas ? canvas.before.overlay : store.loadOverlay(PROJECT.id);
+        if (canvas) {
+          store.replaceOverlay(PROJECT.id, restored);
+          saveInferredEdges(PROJECT.id, canvas.before.inferredEdges);
+        }
+        const currentPage = latestPage();
+        nextPage = restorePage ? { ...(canvas.before.page ?? { ...viewSnapshot({ empty: true }), projectId: PROJECT.id }),
+          reviewing: false, at: 0, ts: Date.now() } : currentPage;
+        if (restorePage && nextPage && currentPage) {
+          for (const key of ['cam', 'ctxBox', 'selected', 'selectedEdge', 'activeBookmark']) {
+            if (!isDeepStrictEqual(currentPage[key], canvas.after.page?.[key])) nextPage[key] = currentPage[key];
+          }
+        }
+        const snapshot = { ...restored, manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)) };
+        if (nextPage) snapshot.view = viewSnapshot(nextPage);
+        const evId = store.appendEvent(PROJECT.id, {
+          op: 'restore_point', target: `ai-undo#${changesetId.slice(0, 8)}`,
+          after: snapshot, actor: 'user',
+          ctx: { canvasChanged: Boolean(canvas) },
+        });
+        if (restorePage) {
+          if (nextPage) nextPage.revision = evId;
+          store.setSetting(savedViewKey(), nextPage);
+        }
+        return evId;
+      });
+      if (eventId === null) return json(res, { ok: false, conflict: true, error: '画布或书签已有其他修改，无法撤销本轮改图' }, 409);
+      if (canvas) {
+        applyInferredEdges(MODEL, PROJECT.id, canvas.before.inferredEdges);
+        S = stats(MODEL);
+        Object.assign(overlay, canvas.before.overlay);
+        if (restorePage) pageState = nextPage;
+      }
+      aiChangesets.delete(changesetId);
+      for (const [op, detail] of bookmarkEvents) broadcastChange(op, 'user', { projectId: PROJECT.id, ...detail });
+      broadcastChange('restore_point', 'user', { projectId: PROJECT.id, clientId: req.headers['x-callgraph-client'] });
+      return json(res, { ok: true, eventId, canvasChanged: Boolean(canvas), scopeChanged: Boolean(restorePage), undoneOps: snap.ops || [] });
+    }
+
     if (u.pathname === '/api/ai/chats') {
       const chatKey = `ai.chats.${PROJECT.id}`;
+      const sanitizeChainList = (rawChains) => (Array.isArray(rawChains) ? rawChains : []).slice(0, 12).map((ch) => ({
+        id: String(ch?.id || '').slice(0, 120),
+        title: String(ch?.title || '').slice(0, 120),
+        kind: ['call', 'dataflow', 'mixed'].includes(ch?.kind) ? ch.kind : 'call',
+        ...(Array.isArray(ch?.edgeKeys) && { edgeKeys: ch.edgeKeys.slice(0, 19).map(k => String(k).slice(0, 512)) }),
+        steps: (Array.isArray(ch?.steps) ? ch.steps : []).slice(0, 20).map((s) => ({
+          id: String(s?.id || '').slice(0, 200),
+          name: String(s?.name || '').slice(0, 120),
+          file: String(s?.file || '').slice(0, 200),
+          line: Number(s?.line) || 0,
+          ...(s?.edgeKind ? { edgeKind: String(s.edgeKind).slice(0, 24) } : {}),
+        })).filter((s) => s.id),
+      })).filter((ch) => ch.steps.length);
+      const sanitizePresentation = (raw) => {
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.steps) || !raw.steps.length) return null;
+        return {
+          id: String(raw.id || '').slice(0, 120),
+          title: String(raw.title || '逻辑导览').slice(0, 120),
+          steps: raw.steps.slice(0, 12).map((s, idx) => ({
+            index: Number(s?.index) || idx,
+            title: String(s?.title || `步骤 ${idx + 1}`).slice(0, 120),
+            summary: String(s?.summary || '').slice(0, 400),
+            nodeIds: (Array.isArray(s?.nodeIds) ? s.nodeIds : []).slice(0, 40).map((id) => String(id).slice(0, 200)),
+            edgeKeys: (Array.isArray(s?.edgeKeys) ? s.edgeKeys : []).slice(0, 60).map((k) => String(k).slice(0, 320)),
+            ...(s?.focusNodeId ? { focusNodeId: String(s.focusNodeId).slice(0, 200) } : {}),
+          })),
+        };
+      };
+      const sanitizeHealthReport = (raw) => {
+        if (!raw || typeof raw !== 'object') return null;
+        return {
+          score: Math.max(0, Math.min(100, Number(raw.score) || 0)),
+          summary: String(raw.summary || '').slice(0, 300),
+          issues: (Array.isArray(raw.issues) ? raw.issues : []).slice(0, 20).map((it) => ({
+            id: String(it?.id || '').slice(0, 80),
+            category: String(it?.category || '').slice(0, 32),
+            severity: ['high', 'medium', 'low'].includes(it?.severity) ? it.severity : 'medium',
+            title: String(it?.title || '').slice(0, 120),
+            detail: String(it?.detail || '').slice(0, 300),
+            nodeIds: (Array.isArray(it?.nodeIds) ? it.nodeIds : []).slice(0, 20).map((id) => String(id).slice(0, 200)),
+            ...(it?.fixPrompt ? { fixPrompt: String(it.fixPrompt).slice(0, 300) } : {}),
+          })),
+        };
+      };
       const sanitizeChats = (raw) => {
         const list = Array.isArray(raw?.threads) ? raw.threads : [];
         const threads = [];
@@ -2585,49 +2881,82 @@ export const server = http.createServer(async (req, res) => {
           const title = String(item.title || '新对话').trim().slice(0, 80) || '新对话';
           const customTitle = Boolean(item.customTitle);
           const updatedAt = Number(item.updatedAt) || Date.now();
+          const bookmarkId = Number.isInteger(item.bookmarkId) && item.bookmarkId > 0 ? item.bookmarkId : null;
+          const bookmarkName = typeof item.bookmarkName === 'string' && item.bookmarkName.trim()
+            ? item.bookmarkName.trim().slice(0, 80) : '';
           const messages = (Array.isArray(item.messages) ? item.messages : []).slice(-80)
             .filter((m) => m && ['user', 'assistant'].includes(m.role))
-            .map((m) => ({
-              role: m.role,
-              text: String(m.text || '').slice(0, 8000),
-              ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
-                ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
-              ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
-              ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
-              ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
-              ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
-              ...(Array.isArray(m.tools) && m.tools.length ? {
-                tools: m.tools.slice(0, 20).map((tl) => ({
-                  name: String(tl?.name || '').slice(0, 64),
-                  ok: tl?.ok !== false,
-                  summary: String(tl?.summary || '').slice(0, 240),
-                  ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
-                })),
-              } : {}),
-              ...(Array.isArray(m.questionOptions) && m.questionOptions.length ? {
-                questionOptions: m.questionOptions.slice(0, 8).map((opt) => ({
-                  label: String(opt?.label || '').slice(0, 120),
-                  ...(opt?.description ? { description: String(opt.description).slice(0, 240) } : {}),
-                })).filter((opt) => opt.label),
-                ...(Number.isInteger(m.questionSelected) && m.questionSelected >= 0 ? { questionSelected: m.questionSelected } : {}),
-                ...(m.allowCustom === false ? { allowCustom: false } : {}),
-              } : {}),
-              ...(m.metrics && typeof m.metrics === 'object' ? {
-                metrics: {
-                  promptTokens: Number(m.metrics.promptTokens) || 0,
-                  completionTokens: Number(m.metrics.completionTokens) || 0,
-                  totalTokens: Number(m.metrics.totalTokens) || 0,
-                  contextEstTokens: Number(m.metrics.contextEstTokens) || 0,
-                  contextWindow: Number(m.metrics.contextWindow) || 32768,
-                  tokPerSec: Number(m.metrics.tokPerSec) || 0,
-                  elapsedMs: Number(m.metrics.elapsedMs) || 0,
-                  estimated: Boolean(m.metrics.estimated),
-                },
-              } : {}),
-              ...(m.isSummary ? { isSummary: true } : {}),
-              ...(m.error ? { error: true } : {}),
-            }));
-          threads.push({ id, title, ...(customTitle ? { customTitle: true } : {}), updatedAt, messages });
+            .map((m) => {
+              const chains = m.role === 'assistant' ? sanitizeChainList(m.chains) : [];
+              const presentation = m.role === 'assistant' ? sanitizePresentation(m.presentation) : null;
+              const healthReport = m.role === 'assistant' ? sanitizeHealthReport(m.healthReport) : null;
+              const subagents = m.role === 'assistant' && Array.isArray(m.subagents) ? m.subagents.slice(0, 4).map((sa) => ({
+                id: String(sa?.id || '').slice(0, 80),
+                title: String(sa?.title || '').slice(0, 80),
+                ok: sa?.ok !== false,
+                summary: String(sa?.summary || '').slice(0, 1200),
+                steps: Number(sa?.steps) || 0,
+              })) : [];
+              const changeset = m.role === 'assistant' && m.changeset?.id ? {
+                id: String(m.changeset.id).slice(0, 80),
+                ops: (Array.isArray(m.changeset.ops) ? m.changeset.ops : []).slice(0, 10).map((op) => String(op).slice(0, 40)),
+              } : null;
+              return {
+                role: m.role,
+                ...(m.role === 'user' && validTurnId(m.pendingTurn) ? { pendingTurn: m.pendingTurn } : {}),
+                text: String(m.text || '').slice(0, 8000),
+                ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
+                  ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
+                ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
+                ...(m.role === 'assistant' && Array.isArray(m.suggestions) ? { suggestions: sanitizeSuggestions(m.suggestions) } : {}),
+                ...(chains.length ? { chains } : {}),
+                ...(presentation ? { presentation } : {}),
+                ...(healthReport ? { healthReport } : {}),
+                ...(subagents.length ? { subagents } : {}),
+                ...(changeset ? { changeset } : {}),
+                ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
+                ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
+                ...(Array.isArray(m.tools) && m.tools.length ? {
+                  tools: m.tools.slice(0, 20).map((tl) => ({
+                    name: String(tl?.name || '').slice(0, 64),
+                    ok: tl?.ok !== false,
+                    summary: String(tl?.summary || '').slice(0, 240),
+                    ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
+                  })),
+                } : {}),
+                ...(Array.isArray(m.questionOptions) && m.questionOptions.length ? {
+                  questionOptions: m.questionOptions.slice(0, 8).map((opt) => ({
+                    label: String(opt?.label || '').slice(0, 120),
+                    ...(opt?.description ? { description: String(opt.description).slice(0, 240) } : {}),
+                  })).filter((opt) => opt.label),
+                  ...(Number.isInteger(m.questionSelected) && m.questionSelected >= 0 ? { questionSelected: m.questionSelected } : {}),
+                  ...(m.allowCustom === false ? { allowCustom: false } : {}),
+                } : {}),
+                ...(m.metrics && typeof m.metrics === 'object' ? {
+                  metrics: {
+                    promptTokens: Number(m.metrics.promptTokens) || 0,
+                    completionTokens: Number(m.metrics.completionTokens) || 0,
+                    totalTokens: Number(m.metrics.totalTokens) || 0,
+                    contextEstTokens: Number(m.metrics.contextEstTokens) || 0,
+                    contextWindow: Number(m.metrics.contextWindow) || 32768,
+                    tokPerSec: Number(m.metrics.tokPerSec) || 0,
+                    elapsedMs: Number(m.metrics.elapsedMs) || 0,
+                    estimated: Boolean(m.metrics.estimated),
+                  },
+                } : {}),
+                ...(m.isSummary ? { isSummary: true } : {}),
+                ...(m.error ? { error: true } : {}),
+              };
+            });
+          threads.push({
+            id,
+            title,
+            ...(customTitle ? { customTitle: true } : {}),
+            ...(bookmarkId ? { bookmarkId } : {}),
+            ...(bookmarkName ? { bookmarkName } : {}),
+            updatedAt,
+            messages,
+          });
         }
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
@@ -2697,6 +3026,11 @@ export const server = http.createServer(async (req, res) => {
       if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
       const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
       let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
+      const turnId = p.turnId ?? randomUUID();
+      if (!validTurnId(turnId)) return bad(res, '无效的 AI 请求编号');
+      if (activeAiTurns.has(turnId) || aiChangesets.has(turnId)) return json(res, { ok: false, error: '本轮 AI 请求已存在' }, 409);
+      const finished = Promise.withResolvers();
+      activeAiTurns.set(turnId, { projectId: PROJECT.id, finished: finished.promise });
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -2709,7 +3043,7 @@ export const server = http.createServer(async (req, res) => {
       req.on('close', cancel);
       res.on('close', cancel);
       const sendEvent = (ev) => {
-        if (res.writableEnded || res.destroyed) return;
+        if (abort.signal.aborted || res.writableEnded || res.destroyed) return;
         if (res.writableLength > 1024 * 1024) {
           cancel();
           res.destroy();
@@ -2808,6 +3142,10 @@ export const server = http.createServer(async (req, res) => {
             if (!edgeMap.has(k)) edgeMap.set(k, e);
           }
         }
+        return canvasLabelsForEdges(model, nodeIds, edgeMap, overlay);
+      };
+
+      const canvasLabelsForEdges = async (model, nodeIds, edgeMap, viewOverlay) => {
         if (!nodeIds.size) {
           return { canvasNodeCount: 0, canvasEdges: [], suggestedLabels: [], commentTasks: [] };
         }
@@ -2815,8 +3153,8 @@ export const server = http.createServer(async (req, res) => {
           : await analyzeTasks(model, { onlyIds: nodeIds });
         assertActive();
         const canvasEdges = [...edgeMap.values()].slice(0, 60).map((e) => {
-          const key = annotationEdgeKey(overlay.edges, e, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, e, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           return {
             from: e.from,
             to: e.to,
@@ -2827,8 +3165,8 @@ export const server = http.createServer(async (req, res) => {
         const suggestedLabels = [];
         for (const s of detected.suggestions || []) {
           if (!edgeMap.has(s.edgeKey)) continue;
-          const key = annotationEdgeKey(overlay.edges, { from: s.from, to: s.to, line: s.line }, model);
-          const existing = normalizeLabels(overlay.edges?.[key]?.labels ?? overlay.edges?.[key]?.label);
+          const key = annotationEdgeKey(viewOverlay.edges, { from: s.from, to: s.to, line: s.line }, model);
+          const existing = normalizeLabels(viewOverlay.edges?.[key]?.labels ?? viewOverlay.edges?.[key]?.label);
           if (existing.some((l) => l.preset === s.preset)) continue;
           const orderMatch = s.preset === 'call' ? /^コール順(\d+)$/.exec(s.text) : null;
           suggestedLabels.push({
@@ -3648,7 +3986,7 @@ export const server = http.createServer(async (req, res) => {
           if (error) return fail(error);
         }
         const reason = typeof args.reason === 'string' ? args.reason.trim().slice(0, 240) : '';
-        const slot = store.transaction(() => {
+        const slot = withCanvasWrite('arrange_canvas', () => store.transaction(() => {
           const before = store.getLayout(PROJECT.id, layoutRoot, layoutMode);
           const resetPositions = clear ? groupMode : undefined;
           const savedSlot = store.saveLayout(PROJECT.id, layoutRoot, layoutMode, { nodes: patch, resetPositions });
@@ -3658,7 +3996,7 @@ export const server = http.createServer(async (req, res) => {
             after: { nodes: patch, resetPositions, reason, view: activeView },
           });
           return savedSlot;
-        });
+        }));
         overlay.layout[key] = slot;
         if (live && !clear) {
           snapshotSlot = slot;
@@ -3673,9 +4011,50 @@ export const server = http.createServer(async (req, res) => {
         return { ok: true, action, root: layoutRoot, mode: layoutMode, updatedCount: positions.length, positions, ...reviewWriteResult() };
       };
 
+      const chatClientId = String(req.headers['x-callgraph-client'] || '').slice(0, 128);
+      const collectedSubagents = [];
+      let turnChangeset = null, savedChangeset = null;
+      const turnWriteOps = new Set();
+      const ensureTurnSnapshot = op => {
+        turnWriteOps.add(op);
+        turnChangeset ??= { id: turnId, projectId: chatProjectId, sessionRevision: expectedSession,
+          bookmarks: new Map(), ops: [], createdAt: Date.now() };
+        return turnChangeset;
+      };
+
+      // 仅在同步写入两侧取样。模型等待、布局计算或其他工具运行期间的独立编辑不能算作本轮写入。
+      const withCanvasWrite = (op, write) => {
+        if (COMPARISON) return write();
+        const { result, before, after } = store.transaction(() => {
+          const before = savedCanvasState();
+          const result = write();
+          return { result, before, after: COMPARISON ? null : savedCanvasState() };
+        });
+        if (after && !sameSavedCanvas(before, after)) {
+          const change = ensureTurnSnapshot(op);
+          if (change.canvas) {
+            if (!sameSavedCanvas(change.canvas.after, before)) change.canvas.stale = true;
+            change.canvas.after = after;
+          } else change.canvas = { before, after, stale: false };
+        }
+        return result;
+      };
+      const recordBookmarkWrite = ({ prev = null, bookmark = null }, op = 'manage_bookmarks') => {
+        const changes = ensureTurnSnapshot(op).bookmarks;
+        const id = (bookmark || prev).id;
+        const last = changes.get(id);
+        const before = last && last.revision === prev?.revision ? last.before : prev;
+        if (!before && !bookmark) changes.delete(id);
+        else changes.set(id, { before, revision: bookmark?.revision ?? null, lastRevision: (bookmark || prev).revision });
+      };
+
       const executeAiTool = async (name, args) => {
+        const write = operation => withCanvasWrite(name, operation);
+        const compose = (...params) => write(() => composeMcpView(...params));
         assertActive();
-        if (name === 'arrange_canvas') return arrangeCanvas(args);
+        if (name === 'arrange_canvas') {
+          return arrangeCanvas(args);
+        }
         if (name === 'get_git_changes') {
           const q = new URLSearchParams({ limit: '80' });
           if (args.baseRef) q.set('baseRef', String(args.baseRef));
@@ -3747,26 +4126,89 @@ export const server = http.createServer(async (req, res) => {
               notFound,
             };
           }
+          const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'up';
+          const depth = Math.max(1, Math.min(6, Math.trunc(Number(args.depth) || 4)));
           const limit = Math.max(1, Math.min(60, Number(args.limit) || 40));
-          const traces = resolved.slice(0, 15).map((id) => {
-            const tr = traceToTasks(MODEL, id, { limit });
-            const directCallers = (MODEL._index?.inAdj?.get(id) || [])
-              .filter((e) => e.kind !== 'var' && !overlay.deleted.nodes[e.from])
+          const toChainStep = (side, id, edgeKind) => {
+            const cleanId = String(id || '');
+            const node = side._index?.byId?.get(cleanId);
+            return {
+              id: cleanId,
+              name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
+              file: node?.file || '',
+              line: Number(node?.line) || 0,
+              ...(edgeKind ? { edgeKind } : {}),
+            };
+          };
+          const structuredChains = [];
+          const addChain = (side, version, direction, path, edgeKeys, possible) => {
+            if (path.length < 2 || structuredChains.length >= 8) return;
+            const first = toChainStep(side, path[0]), last = toChainStep(side, path.at(-1));
+            const label = COMPARISON ? '[' + version + '] ' : '';
+            structuredChains.push({
+              id: `${direction}:${first.id}->${last.id}:${structuredChains.length}`,
+              title: label + (possible ? '可能 ' : '') + (direction === 'down' ? '下游 ' : '') + `${first.name} → ${last.name}`,
+              kind: 'call', ...(COMPARISON ? { traceVersion: version } : {}), ...(possible ? { possible: true } : {}),
+              steps: path.map((nid, i) => toChainStep(side, nid, i ? 'call' : undefined)), edgeKeys,
+            });
+          };
+          const trace = (side, version, id) => {
+            const tr = direction === 'down' ? { upstreamTasks: [], upstreamChains: [], totalTasks: 0 }
+              : traceToTasks(side, id, { limit });
+            const keyFor = edge => evidenceEdgeKey(edge, version, COMPARISON);
+            for (const chain of tr.upstreamChains.slice(0, 4)) {
+              addChain(side, version, 'up', chain.path, chain.edges.map(keyFor), chain.edges.some(possibleCall));
+            }
+            const directCallers = (side._index?.inAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.from])
               .slice(0, 20)
-              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}) }));
+              .map((e) => ({ from: e.from, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
+            const directCallees = direction === 'up' ? [] : (side._index?.outAdj?.get(id) || [])
+              .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to])
+              .slice(0, 20)
+              .map((e) => ({ to: e.to, kind: e.kind, line: e.line, ...(e.via ? { via: e.via } : {}), ...(e.inferred ? { inferred: true } : {}), ...(e.resolution ? { resolution: e.resolution } : {}) }));
+            const downstreamPaths = [];
+            if (direction === 'down' || direction === 'both') {
+              const stack = [{ node: id, path: [id], edgeKeys: [], possible: false }];
+              while (stack.length && downstreamPaths.length < 12) {
+                const cur = stack.shift();
+                const outs = (side._index?.outAdj?.get(cur.node) || [])
+                  .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[keyFor(e)] && !cur.path.includes(e.to));
+                if (!outs.length || cur.path.length > depth) {
+                  if (cur.path.length > 1) {
+                    downstreamPaths.push(cur.path);
+                    if (downstreamPaths.length <= 4) addChain(side, version, 'down', cur.path, cur.edgeKeys, cur.possible);
+                  }
+                  continue;
+                }
+                for (const e of outs.slice(0, 6)) {
+                  stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, keyFor(e)],
+                    possible: cur.possible || possibleCall(e) });
+                }
+              }
+            }
             return {
               id,
+              ...(COMPARISON ? { traceVersion: version } : {}),
               upstreamTasks: (tr.upstreamTasks || []).slice(0, 20).map((t) => ({ id: t.id, name: t.name, file: t.file, kind: t.kind })),
               chains: (tr.upstreamChains || []).slice(0, 20).map((c) => ({ taskId: c.taskId, path: c.path })),
+              downstreamPaths,
               directCallers,
+              ...(directCallees.length ? { directCallees } : {}),
               totalTasks: tr.totalTasks || 0,
             };
-          });
-          const pathBranches = summarizeVehicleBranches(MODEL, resolved);
+          };
+          const sides = callEvidenceSides(MODEL, COMPARISON);
+          const traces = sides.flatMap(([version, side]) => resolved.slice(0, 15)
+            .filter(id => side._index.byId.has(id)).map(id => trace(side, version, id)));
+          const pathBranches = sides.flatMap(([version, side]) => summarizeVehicleBranches(side, resolved)
+            .map(branch => COMPARISON ? { ...branch, traceVersion: version } : branch));
           return {
             ok: true,
+            direction,
             functions: resolved,
             traces,
+            ...(structuredChains.length ? { chains: structuredChains } : {}),
             ...(pathBranches.length > 1 ? { pathBranches } : {}),
             ambiguous,
             notFound,
@@ -3844,7 +4286,7 @@ export const server = http.createServer(async (req, res) => {
             reviewing: false,
             ts: Date.now(),
           };
-          store.transaction(() => {
+          write(() => store.transaction(() => {
             nextPage.revision = store.appendEvent(PROJECT.id, {
               op: 'view.compose',
               actor: 'ai',
@@ -3853,7 +4295,7 @@ export const server = http.createServer(async (req, res) => {
               after: { ...nextPage, count: keptIds.length, rootCount: nextRoots.length, reason, view: viewSnapshot(nextPage) },
             });
             store.setSetting(key, nextPage);
-          });
+          }));
           const review = reviewWriteResult();
           if (!review.updatedWhileReviewing) pageState = nextPage;
           broadcastChange('view.compose', 'ai', { page: nextPage, reason });
@@ -3954,45 +4396,58 @@ export const server = http.createServer(async (req, res) => {
           return { ok: true, query, matches, total: matches.length };
         }
         if (name === 'read_function') {
-          const target = String(args.name || args.id || '').trim();
-          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, [target], 'fn');
-          if (!resolved.length) {
-            return { ok: false, error: ambiguous.length ? '函数名重名，请改用候选中的完整「文件::函数名」' : `未找到函数：${target}`, ambiguous, notFound };
-          }
-          const q = new URLSearchParams({ id: resolved[0] });
-          if (['auto', 'cp932', 'utf-8'].includes(args.encoding)) q.set('encoding', args.encoding);
-          const src = await readMcpSource(q);
-          assertActive();
-          const fnNode = MODEL._index.byId.get(resolved[0]);
-          const headerInfo = fnNode ? await analyzeTasks(MODEL, { headerId: fnNode.id }) : { comment: '', period: null };
-          assertActive();
-          const lines = String(src.source || '').split('\n');
-          const kept = [];
-          let chars = 0;
-          let clipped = false;
-          for (const line of lines) {
-            if (kept.length >= 120 || chars + line.length + 1 > 8000) { clipped = true; break; }
-            kept.push(line);
-            chars += line.length + 1;
-          }
-          return {
-            ok: true,
-            id: src.id,
-            name: src.name,
-            file: src.file,
-            startLine: src.startLine,
-            endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
-            truncated: Boolean(src.truncated || clipped),
-            sourceEncoding: src.sourceEncoding,
-            ...(headerInfo.comment ? { headerComment: headerInfo.comment.slice(0, 1200) } : {}),
-            ...(headerInfo.period ? { commentPeriod: headerInfo.period } : {}),
-            source: clipped ? kept.join('\n') + '\n/* ... */' : kept.join('\n'),
-            taskPeriods: src.taskPeriods,
-            upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
-            calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
-            indirectCalls: (MODEL.indirectCalls || []).filter(ic => ic.caller === src.id).slice(0, 15),
-            varAccess: (src.varAccess || []).slice(0, 25),
+          const readSingleFunction = async (fnId, encoding) => {
+            const q = new URLSearchParams({ id: fnId });
+            if (['auto', 'cp932', 'utf-8'].includes(encoding)) q.set('encoding', encoding);
+            const src = await readMcpSource(q);
+            assertActive();
+            const fnNode = MODEL._index.byId.get(fnId);
+            const headerInfo = fnNode ? await analyzeTasks(MODEL, { headerId: fnNode.id }) : { comment: '', period: null };
+            assertActive();
+            const lines = String(src.source || '').split('\n');
+            const kept = [];
+            let chars = 0;
+            let clipped = false;
+            for (const line of lines) {
+              if (kept.length >= 120 || chars + line.length + 1 > 8000) { clipped = true; break; }
+              kept.push(line);
+              chars += line.length + 1;
+            }
+            return {
+              ok: true,
+              id: src.id,
+              name: src.name,
+              file: src.file,
+              startLine: src.startLine,
+              endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
+              truncated: Boolean(src.truncated || clipped),
+              sourceEncoding: src.sourceEncoding,
+              ...(headerInfo.comment ? { headerComment: headerInfo.comment.slice(0, 1200) } : {}),
+              ...(headerInfo.period ? { commentPeriod: headerInfo.period } : {}),
+              source: clipped ? kept.join('\n') + '\n/* ... */' : kept.join('\n'),
+              taskPeriods: src.taskPeriods,
+              upstreamTasks: src.upstreamTasks?.slice(0, 12) || [],
+              calls: (src.calls || []).slice(0, 25).map(c => ({ to: c.to, callee: c.callee, line: c.line })),
+              indirectCalls: (MODEL.indirectCalls || []).filter(ic => ic.caller === src.id).slice(0, 15),
+              varAccess: (src.varAccess || []).slice(0, 25),
+            };
           };
+          const rawNames = Array.isArray(args.names) && args.names.length
+            ? args.names.slice(0, 6)
+            : [String(args.name || args.id || '').trim()].filter(Boolean);
+          if (!rawNames.length) return { ok: false, error: '请提供函数名 name 或批量 names 列表' };
+          const { resolved, ambiguous, notFound } = resolveSymbols(MODEL, rawNames, 'fn');
+          if (!resolved.length) {
+            return { ok: false, error: ambiguous.length ? '函数名重名，请改用候选中的完整「文件::函数名」' : `未找到函数：${rawNames[0]}`, ambiguous, notFound };
+          }
+          if (Array.isArray(args.names) && args.names.length) {
+            const items = [];
+            for (const id of resolved.slice(0, 6)) {
+              items.push(await readSingleFunction(id, args.encoding));
+            }
+            return { ok: true, batch: true, items, ambiguous, notFound };
+          }
+          return await readSingleFunction(resolved[0], args.encoding);
         }
         if (name === 'read_source') {
           const encoding = ['auto', 'cp932', 'utf-8'].includes(args.encoding) ? args.encoding : 'auto';
@@ -4174,7 +4629,7 @@ export const server = http.createServer(async (req, res) => {
             }
             nextList = [...byPair.values()];
           }
-          saveInferredEdges(PROJECT.id, nextList);
+          write(() => saveInferredEdges(PROJECT.id, nextList));
           applyInferredEdges(MODEL, PROJECT.id, nextList);
           S = stats(MODEL);
 
@@ -4196,7 +4651,7 @@ export const server = http.createServer(async (req, res) => {
               let composed = null;
               if (includeTasks && aliveFrom.length) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: aliveFrom,
                     functionIds: aliveTo.filter((id) => !aliveFrom.includes(id)),
@@ -4211,7 +4666,7 @@ export const server = http.createServer(async (req, res) => {
               }
               if (!composed) {
                 try {
-                  composed = composeMcpView({
+                  composed = compose({
                     mode: 'add',
                     changedFunctionIds: [],
                     functionIds: endpointIds,
@@ -4448,13 +4903,13 @@ export const server = http.createServer(async (req, res) => {
             };
           let composed;
           let fallbackNote = '';
-          const composeOptions = { chatClientId: req.headers['x-callgraph-client'] };
+          const composeOptions = { chatClientId };
           try {
-            composed = composeMcpView(composePayload, composeOptions);
+            composed = compose(composePayload, composeOptions);
           } catch (err) {
             if (includeTasks && !pureVars && /80|入口过多/.test(err.message)) {
               actualFnIds = activeFnsForCanvas.slice(0, 40);
-              composed = composeMcpView({
+              composed = compose({
                 mode,
                 ...(snapshotId ? { snapshotId } : {}),
                 roots: actualFnIds,
@@ -4472,6 +4927,7 @@ export const server = http.createServer(async (req, res) => {
           if (snapshotId && COMPARISON?.id === snapshotId) expectedSession = sessionRevision;
           // 多个相互隔离的改动自动拆分为多个书签视图（或用户显式指定 bookmarkName 时保存书签）
           const createdBookmarks = [];
+          const bookmarkWrites = [];
           const allGroupCanvasIds = new Set([
             ...(composed.page.roots || []),
             ...(composed.page.expansions || []).map((s) => s.root),
@@ -4495,7 +4951,8 @@ export const server = http.createServer(async (req, res) => {
                   groupMode,
                   vars: bmVars,
                   expansions: bmExpansions,
-                }, 'ai');
+                }, 'ai', { isForeground: false });
+                bookmarkWrites.push(savedBm);
                 createdBookmarks.push({
                   id: savedBm.bookmark?.id ?? null,
                   name: bmName,
@@ -4517,15 +4974,17 @@ export const server = http.createServer(async (req, res) => {
                 groupMode: composed.page.groupMode || 'file',
                 vars: composed.page.vars || [],
                 expansions: composed.page.expansions || [],
-              }, 'ai');
+              }, 'ai', { isForeground: false });
+              bookmarkWrites.push(savedBm);
               createdBookmarks.push({ id: savedBm.bookmark?.id ?? null, name: bmName });
             } catch { /* ignore */ }
           }
+          bookmarkWrites.forEach(saved => recordBookmarkWrite(saved, 'add_to_canvas'));
           if (createdBookmarks.length) broadcastChange('bookmark.save', 'ai', { projectId: PROJECT.id });
           // 组图成功后再仅对本次选入画布/书签的变更节点与新增连线写入变更分类（避免未选节点或报错时误写标注）。
           if (!COMPARISON && args.fromGit && (detectedNodeChanges.size || detectedAddedEdges.length)) {
             const scopedNodeIds = new Set([...allGroupCanvasIds, ...actualFnIds, ...scopes.flatMap(g => g.varIds), ...(composed.page.vars || [])]);
-            store.transaction(() => {
+            write(() => store.transaction(() => {
               overlay.nodes = overlay.nodes || {};
               overlay.edges = overlay.edges || {};
               for (const [id, ch] of detectedNodeChanges) {
@@ -4544,7 +5003,7 @@ export const server = http.createServer(async (req, res) => {
                 const merged = writeAnnotation('edge', key, { change: 'added' }, 'ai');
                 if (merged) overlay.edges[key] = merged;
               }
-            });
+            }));
           }
           // 自动将画布上可达的 TASK 周期（含函数头注释中的周期）以线段标签（TASK:xms）形式标出，替代函数左上角角标。
           let autoTaskLabels = 0;
@@ -4564,7 +5023,7 @@ export const server = http.createServer(async (req, res) => {
                 taskItems.push({ edgeKey: s.edgeKey, preset: 'task', text: s.text });
               }
               if (taskItems.length && MODEL === labelModel) {
-                const applied = applyMcpTaskLabels({ items: taskItems, merge: true });
+                const applied = write(() => applyMcpTaskLabels({ items: taskItems, merge: true }));
                 autoTaskLabels = applied.edgeKeys?.length || 0;
               }
             } catch { /* 自动 TASK 线段标签不影响主组图结果 */ }
@@ -4628,7 +5087,9 @@ export const server = http.createServer(async (req, res) => {
             }
             const lineSuffix = Number.isInteger(Number(item.line)) && Number(item.line) > 0 ? `:${Number(item.line)}` : '';
             const edgeKey = `${from.resolved[0]}->${to.resolved[0]}${lineSuffix}`;
-            const dedupeKey = `${edgeKey}|${item.preset}`;
+            const dedupeKey = item.preset === 'free'
+              ? `${edgeKey}|${item.preset}|${item.text ?? ''}`
+              : `${edgeKey}|${item.preset}`;
             if (seenEdgePreset.has(dedupeKey)) continue;
             seenEdgePreset.add(dedupeKey);
             items.push({
@@ -4636,12 +5097,625 @@ export const server = http.createServer(async (req, res) => {
               preset: item.preset,
               ...(item.text !== undefined ? { text: String(item.text) } : {}),
               ...(item.order !== undefined ? { order: Number(item.order) } : {}),
-              ...(item.preset !== 'call' && item.note !== undefined ? { note: String(item.note) } : {}),
+              ...(item.preset === 'free' && item.border !== undefined ? { border: item.border } : {}),
+              ...(item.preset === 'free' && item.color !== undefined ? { color: item.color } : {}),
+              ...(item.preset !== 'call' && item.preset !== 'free' && item.note !== undefined ? { note: String(item.note) } : {}),
             });
           }
           assertActive();
-          const applied = applyMcpTaskLabels({ items, merge: true });
+          const applied = write(() => applyMcpTaskLabels({ items, merge: true }));
           return { ok: true, applied: applied.edgeKeys?.length || 0, edgeKeys: applied.edgeKeys || [], ...reviewWriteResult() };
+        }
+        const toChainStep = (id, edgeKind) => {
+          const cleanId = String(id || '');
+          const node = MODEL._index?.byId?.get(cleanId);
+          return {
+            id: cleanId,
+            name: node?.name || cleanId.replace(/^var::/, '').split('::').pop() || cleanId,
+            file: node?.file || '',
+            line: Number(node?.line) || 0,
+            ...(edgeKind ? { edgeKind } : {}),
+          };
+        };
+        const resolveFnOrVar = (raw) => {
+          const text = String(raw || '').trim();
+          if (!text) return { resolved: [], ambiguous: [], notFound: [] };
+          const exact = MODEL._index?.byId?.get(text);
+          if (exact && !exact.external && !overlay.deleted.nodes[exact.id]) {
+            return { resolved: [exact.id], ambiguous: [], notFound: [] };
+          }
+          const fnRes = resolveSymbols(MODEL, [text], 'fn');
+          if (fnRes.resolved.length || fnRes.ambiguous.length) return fnRes;
+          return resolveSymbols(MODEL, [text], 'var');
+        };
+        if (name === 'inspect_dataflow') {
+          const rawTarget = String(args.target || '').trim();
+          if (!rawTarget) return { ok: false, error: '请提供要分析的数据流符号 target' };
+          const maxPaths = Math.max(1, Math.min(20, Math.trunc(Number(args.maxPaths) || 10)));
+          if (!COMPARISON && MODEL.source !== 'dot') {
+            await ensureAnalysis(MODEL);
+            assertActive();
+          }
+          const tRes = resolveFnOrVar(rawTarget);
+          if (!tRes.resolved.length) {
+            return {
+              ok: false,
+              error: tRes.ambiguous.length ? '目标符号存在重名，请指定完整「文件::符号名」或 var::' : `未找到符号：${rawTarget}`,
+              ambiguous: tRes.ambiguous,
+              notFound: tRes.notFound,
+            };
+          }
+          const targetId = tRes.resolved[0];
+          const targetNode = MODEL._index?.byId?.get(targetId);
+          const rawPeer = typeof args.peer === 'string' ? args.peer.trim() : '';
+          if (rawPeer) {
+            const pRes = resolveFnOrVar(rawPeer);
+            if (!pRes.resolved.length) {
+              return {
+                ok: false,
+                error: pRes.ambiguous.length ? '对端符号存在重名，请指定完整「文件::符号名」' : `未找到对端符号：${rawPeer}`,
+                ambiguous: pRes.ambiguous,
+                notFound: pRes.notFound,
+              };
+            }
+            const peerId = pRes.resolved[0];
+            if (peerId === targetId) return { ok: false, error: 'target 与 peer 不能相同' };
+            const peerNode = MODEL._index?.byId?.get(peerId);
+            const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, targetId, peerId) : pairDataflow(MODEL, targetId, peerId));
+            assertActive();
+            const rwPaths = (df.paths || []).slice(0, maxPaths);
+            const sharedVars = variablesOnPaths(df, rwPaths).slice(0, 20);
+            const chains = rwPaths.slice(0, 6).map((p, idx) => ({
+              id: `dfpair:${targetId}:${peerId}:${idx}`,
+              title: `${toChainStep(p.nodes[0]).name} → ${toChainStep(p.nodes.at(-1)).name}`,
+              kind: 'dataflow',
+              steps: p.nodes.map((nid, si) => toChainStep(nid, si > 0 ? 'var' : undefined)),
+            }));
+            return {
+              ok: true,
+              target: targetId,
+              targetName: targetNode?.name || targetId,
+              peer: peerId,
+              peerName: peerNode?.name || peerId,
+              rwPaths,
+              sharedVars,
+              ...(df.partial ? { partial: true } : {}),
+              chains,
+            };
+          }
+          const dir = ['in', 'out', 'both'].includes(args.dir) ? args.dir : 'both';
+          const dirs = dir === 'both' ? ['in', 'out'] : [dir];
+          const allEdges = [];
+          const touchedVarIds = new Set();
+          const touchedPeerIds = new Set();
+          for (const d of dirs) {
+            const resDf = await (COMPARISON ? comparisonDataflow(COMPARISON, targetId, d) : dataflowFor(MODEL, targetId, d));
+            assertActive();
+            for (const e of resDf.edges || []) allEdges.push({ ...e, dir: d });
+            for (const v of resDf.vars || []) if (v?.id) touchedVarIds.add(v.id);
+            for (const n of resDf.nodes || []) if (n?.id && n.id !== targetId) touchedPeerIds.add(n.id);
+          }
+          const chains = [];
+          const seenChain = new Set();
+          for (const e of allEdges.slice(0, maxPaths)) {
+            const k = `${e.from}->${e.to}`;
+            if (seenChain.has(k)) continue;
+            seenChain.add(k);
+            chains.push({
+              id: `df:${k}:${chains.length}`,
+              title: `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              kind: 'dataflow',
+              steps: [toChainStep(e.from), toChainStep(e.to, 'var')],
+            });
+          }
+          return {
+            ok: true,
+            target: targetId,
+            targetName: targetNode?.name || targetId,
+            dir,
+            vars: [...touchedVarIds].slice(0, 20).map((id) => toChainStep(id)),
+            peers: [...touchedPeerIds].slice(0, 20).map((id) => toChainStep(id)),
+            edges: allEdges.slice(0, 40),
+            chains: chains.slice(0, 8),
+          };
+        }
+        if (name === 'present_logic') {
+          const rawTargets = [
+            ...(typeof args.root === 'string' && args.root.trim() ? [args.root.trim()] : []),
+            ...(Array.isArray(args.targets) ? args.targets : []),
+          ].filter(Boolean);
+          let seedIds = [];
+          if (!rawTargets.length) {
+            const cur = latestPage();
+            seedIds = (cur?.roots || []).slice(0, 6);
+            if (!seedIds.length) return { ok: false, error: '当前画布为空，请提供 root 或 targets 函数/变量名' };
+          } else {
+            let matches = rawTargets.map(resolveFnOrVar);
+            if (matches.some(m => m.notFound.length) && !COMPARISON && MODEL.source !== 'dot') {
+              // 暂定全局定义可能要到数据流索引建立后才成为图节点。
+              await ensureAnalysis(MODEL);
+              assertActive();
+              matches = rawTargets.map(resolveFnOrVar);
+            }
+            const ambiguous = matches.flatMap(m => m.ambiguous);
+            if (ambiguous.length) {
+              const branches = branchesFromIds(MODEL, ambiguous.flatMap(a => a.candidates || []));
+              return { ok: false, needsVehicleChoice: branches.length > 1,
+                ...(branches.length > 1 ? { pathBranches: branches } : {}), ambiguous,
+                error: '目标符号存在多处定义，请先指定完整函数或变量 ID' };
+            }
+            const notFound = matches.flatMap(m => m.notFound);
+            if (notFound.length) return { ok: false, error: `未找到目标符号：${notFound.join(', ')}`, notFound };
+            seedIds = [...new Set(matches.flatMap(m => m.resolved))];
+          }
+          const direction = ['up', 'down', 'both'].includes(args.direction) ? args.direction : 'both';
+          const depth = Math.max(1, Math.min(5, Math.trunc(Number(args.depth) || 2)));
+          const focusFilter = normalizePathPrefixes(args.focusFilter);
+          const includeDataflow = args.includeDataflow !== false;
+          const addToCanvas = args.addToCanvas !== false;
+          if (addToCanvas && COMPARISON) return { ok: false, error: '比较模式下请用 addToCanvas: false 生成只读导览' };
+          // 一份导览只能讲述一个版本。优先修改后，删除的根可回到修改前。
+          const side = callEvidenceSides(MODEL, COMPARISON).reverse().find(([, m]) => !COMPARISON || seedIds.every(id => m._index.byId.has(id)));
+          if (!side) return { ok: false, error: '所选根不在同一版本中，无法生成单版本导览' };
+          const [traceVersion, source] = side;
+          const sliceNodes = new Map(); // 节点 ID → 相对根的有向层级
+          const sliceEdges = [];
+          const seenEdge = new Set();
+          const allowId = (id) => {
+            const n = source._index?.byId?.get(id);
+            if (!n || n.external || n.headerSymbol || overlay.deleted.nodes[id]) return false;
+            if (focusFilter.length && n.kind !== 'var') {
+              const file = fileOfNodeId(source, id);
+              if (!focusFilter.some(pref => fileMatchesPathPrefix(file, pref)) && !seedIds.includes(id)) return false;
+            }
+            return true;
+          };
+          for (const sid of seedIds) {
+            if (allowId(sid) && !sliceNodes.has(sid)) sliceNodes.set(sid, 0);
+          }
+          // 数据流按「写者 → 变量 → 读者」讲解，画布则将读写合为「函数 → 变量」一条边。
+          const presentationEdgeKey = e => {
+            if (!e.df) return evidenceEdgeKey(e, traceVersion, COMPARISON);
+            const writer = e.kind === 'df-write';
+            const fn = writer ? e.from : e.to, variable = writer ? e.to : e.from;
+            if (COMPARISON) {
+              const edge = MODEL._index.outAdj.get(fn)?.find(edge => edge.kind === 'var' && edge.to === variable &&
+                edge.versions?.includes(traceVersion) && (edge.via === '读写' || edge.via === (writer ? '写' : '读')));
+              if (edge) return edgeKeyOf(edge);
+            }
+            return canvasEdgeKey({ from: fn, to: variable, kind: 'var' });
+          };
+          for (const upstream of [true, false]) {
+            if (upstream ? direction === 'down' : direction === 'up') continue;
+            const visited = new Set(seedIds.filter(id => sliceNodes.has(id)));
+            const queue = [...visited].map(id => ({ id, d: 0 }));
+            while (queue.length && sliceNodes.size < 40) {
+              const { id, d } = queue.shift();
+              if (d >= depth) continue;
+              let edges;
+              if (source._index.byId.get(id)?.kind === 'var') {
+                const dir = upstream ? 'in' : 'out';
+                const flow = await dataflowFor(source, id, dir);
+                assertActive();
+                edges = flow.edges;
+              } else {
+                const adj = upstream ? source._index.inAdj : source._index.outAdj;
+                edges = (adj.get(id) || []).filter(isCallEvidence);
+              }
+              for (const e of edges) {
+                const peer = upstream ? e.from : e.to;
+                const key = presentationEdgeKey(e);
+                if (!allowId(peer) || overlay.deleted.edges[key]) continue;
+                const relation = e.df ? e.kind + ':' + key : key;
+                if (!seenEdge.has(relation)) { seenEdge.add(relation); sliceEdges.push(e); }
+                if (!sliceNodes.has(peer)) sliceNodes.set(peer, (upstream ? -1 : 1) * (d + 1));
+                if (!visited.has(peer)) { visited.add(peer); queue.push({ id: peer, d: d + 1 }); }
+                if (sliceNodes.size >= 40) break;
+              }
+            }
+          }
+          const fnSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind !== 'var');
+          const varSliceIds = [...sliceNodes.keys()].filter(id => MODEL._index?.byId?.get(id)?.kind === 'var');
+          if (includeDataflow && !COMPARISON && MODEL.source !== 'dot') {
+            await ensureAnalysis(MODEL);
+            assertActive();
+            const df = MODEL._df;
+            if (df?.fnAccess) {
+              const fnSet = new Set(fnSliceIds);
+              const varScore = new Map();
+              for (const fid of fnSliceIds) {
+                const acc = df.fnAccess.get(fid);
+                if (!acc) continue;
+                for (const vid of [...(acc.reads?.keys() || []), ...(acc.writes?.keys() || [])]) {
+                  if (overlay.deleted.nodes[vid]) continue;
+                  varScore.set(vid, (varScore.get(vid) || 0) + 1);
+                }
+              }
+              const topVars = [...varScore.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 6)
+                .map(([vid]) => vid);
+              for (const vid of topVars) {
+                if (!varSliceIds.includes(vid) && fnSet.size) varSliceIds.push(vid);
+              }
+            }
+          }
+          let composedResult = null;
+          if (!sliceNodes.size) return { ok: false, error: '没有可用于导览的可见目标' };
+          if (addToCanvas) {
+            if (!fnSliceIds.length) return { ok: false, error: '当前方向和筛选范围内没有读写函数可用于组图', addedToCanvas: false };
+            const minLayer = Math.min(...fnSliceIds.map(id => sliceNodes.get(id) ?? 0));
+            const topRoots = fnSliceIds.filter(id => (sliceNodes.get(id) ?? 0) === minLayer);
+            const restFns = fnSliceIds.filter(id => !topRoots.includes(id));
+            try {
+              composedResult = compose({
+                mode: args.mode === 'replace' ? 'replace' : 'add',
+                roots: topRoots.length ? topRoots : fnSliceIds.slice(0, 4),
+                functionIds: restFns,
+                changedFunctionIds: [],
+                vars: varSliceIds,
+                up: 0,
+                down: 0,
+                reason: String(args.title || 'AI 逻辑链智能呈现').slice(0, 120),
+              }, { chatClientId });
+            } catch (error) {
+              return { ok: false, error: error.message, addedToCanvas: false };
+            }
+          }
+          // 构建按执行层级排序的 Walkthrough 步骤
+          const layers = new Map();
+          for (const id of fnSliceIds) {
+            const d = sliceNodes.get(id) ?? 0;
+            if (!layers.has(d)) layers.set(d, []);
+            layers.get(d).push(id);
+          }
+          const sortedDepths = [...layers.keys()].sort((a, b) => a - b);
+          const presTitle = (COMPARISON ? '[' + traceVersion + '] ' : '') + String(args.title || `${toChainStep(seedIds[0]).name} 调用与数据流导览`).slice(0, 80);
+          const steps = sortedDepths.slice(0, 6).map((d, idx) => {
+            const nids = layers.get(d).slice(0, 10);
+            const names = nids.map(id => toChainStep(id).name);
+            const stepEdges = sliceEdges.filter(e => nids.includes(e.from) || nids.includes(e.to)).slice(0, 24).map(presentationEdgeKey);
+            const roleLabel = d < 0 ? '上游函数' : d === 0 ? '核心关注节点' : '下游函数';
+            return {
+              index: idx,
+              title: `${roleLabel} (${names.slice(0, 3).join('、')}${names.length > 3 ? '…' : ''})`,
+              summary: `涉及 ${nids.length} 个函数：${names.join('、')}`,
+              nodeIds: nids,
+              edgeKeys: stepEdges,
+              focusNodeId: nids[0],
+            };
+          });
+          if (varSliceIds.length) {
+            steps.push({
+              index: steps.length,
+              title: `全局变量 (${varSliceIds.length})`,
+              summary: `变量：${varSliceIds.map(v => toChainStep(v).name).join('、')}`,
+              nodeIds: varSliceIds,
+              edgeKeys: [...new Set(sliceEdges.filter(e => e.df).map(presentationEdgeKey))],
+              focusNodeId: varSliceIds[0],
+            });
+          }
+          const presentation = {
+            id: `pres_${Date.now().toString(36)}`,
+            title: presTitle,
+            steps,
+          };
+          const chains = [];
+          for (const e of sliceEdges.slice(0, 6)) {
+            const label = COMPARISON ? '[' + traceVersion + '] ' : '';
+            chains.push({
+              id: `pres_edge:${e.kind}:${presentationEdgeKey(e)}`,
+              title: label + (possibleCall(e) ? '可能 ' : '') + `${toChainStep(e.from).name} → ${toChainStep(e.to).name}`,
+              kind: e.df ? 'dataflow' : 'call',
+              edgeKeys: [presentationEdgeKey(e)],
+              steps: [toChainStep(e.from), toChainStep(e.to, e.kind || 'call')],
+            });
+          }
+          const canvasOverlay = {
+            action: 'highlight',
+            nodeIds: [...fnSliceIds, ...varSliceIds].slice(0, 60),
+            edgeKeys: [...new Set(sliceEdges.map(presentationEdgeKey))].slice(0, 80),
+            label: presTitle,
+          };
+          // 浏览器会从对话流启动逐步导览。无浏览器发起的请求仍向观察画布广播全图摘要。
+          if (composedResult && !chatClientId) sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
+          return {
+            ok: true,
+            title: presTitle,
+            ...(COMPARISON ? { traceVersion } : {}),
+            nodeCount: fnSliceIds.length + varSliceIds.length,
+            edgeCount: sliceEdges.length,
+            presentation,
+            chains,
+            addedToCanvas: Boolean(composedResult),
+            ...(composedResult ? { canvasOverlay } : {}),
+            ...(composedResult?.updatedWhileReviewing ? { updatedWhileReviewing: true, reviewNote: composedResult.reviewNote } : {}),
+          };
+        }
+        if (name === 'canvas_visual') {
+          const action = args.action || 'highlight';
+          if (!['highlight', 'play_flow', 'clear'].includes(action)) return { ok: false, error: '不支持此画布视觉操作' };
+          const payload = {
+            action,
+            nodeIds: (Array.isArray(args.nodeIds) ? args.nodeIds : []).slice(0, 80).map(String),
+            edgeKeys: (Array.isArray(args.edgeKeys) ? args.edgeKeys : []).slice(0, 120).map(String),
+            ...(typeof args.label === 'string' && args.label.trim() ? { label: args.label.trim().slice(0, 80) } : {}),
+          };
+          sendClientEvent(chatClientId, 'canvas_overlay', payload);
+          return { ok: true, ...payload, canvasOverlay: payload };
+        }
+        if (name === 'diagnose_canvas') {
+          const check = ['all', 'orphans', 'indirect', 'labels', 'layout'].includes(args.check) ? args.check : 'all';
+          const page = pageState?.projectId === PROJECT.id && (pageState.comparisonId ?? null) === (COMPARISON?.id ?? null)
+            ? pageState : latestPage();
+          const at = !COMPARISON && page?.at > 0 ? page.at : 0;
+          const historical = at ? store.viewAt(PROJECT.id, at) : null;
+          const viewOverlay = at ? store.overlayAt(PROJECT.id, at) : overlay;
+          const scope = viewSnapshot(historical || page || {});
+          const roots = historical?.empty ? [] : scope.roots;
+          const expansions = historical?.empty ? [] : scope.expansions;
+          const fallback = COMPARISON && !roots.length && !(scope.empty && !expansions.length && !scope.vars.length);
+          const view = await buildView(fallback ? COMPARISON.roots : roots, fallback ? 0 : scope.up, fallback ? 0 : scope.down,
+            scope.group, null, { want: scope.vars, skip: scope.hiddenVars, expansions, groupMode: scope.groupMode,
+              preview: true, signal: abort.signal }, viewOverlay);
+          assertActive();
+          if (!view.nodes.length) {
+            return {
+              ok: true,
+              healthReport: {
+                score: 100,
+                summary: '当前画布为空，暂无可诊断的节点。',
+                issues: [],
+              },
+            };
+          }
+          const issues = [];
+          const visNodes = new Set(view.nodes.map(n => n.id));
+          const connected = new Set(view.edges.flatMap(e => [e.from, e.to]));
+          let labelCtx;
+          if (check === 'all' || check === 'labels') {
+            const functions = new Set(view.nodes.filter(n => n.kind !== 'var').map(n => n.id));
+            const edges = new Map(view.edges.filter(e => functions.has(e.from) && functions.has(e.to)).map(e => [edgeKeyOf(e), e]));
+            labelCtx = await canvasLabelsForEdges(MODEL, functions, edges, viewOverlay);
+          }
+          if (labelCtx?.suggestedLabels.length) {
+            const sample = labelCtx.suggestedLabels.slice(0, 6);
+            issues.push({
+              id: 'missing_labels',
+              category: 'labels',
+              severity: 'medium',
+              title: `缺少 ${labelCtx.suggestedLabels.length} 条推荐标签 (TASK / コール順)`,
+              detail: sample.map(s => `${toChainStep(s.from).name}→${toChainStep(s.to).name}(${s.text})`).join('；'),
+              nodeIds: [...new Set(sample.flatMap(s => [s.from, s.to]))],
+              fixPrompt: '请调用 apply_labels({ autoDetect: true }) 自动补全当前画布缺失的 TASK 与调用顺序标签。',
+            });
+          }
+          if (check === 'all' || check === 'indirect') {
+            const unexpanded = [];
+            for (const ic of MODEL.indirectCalls || []) {
+              if (!visNodes.has(ic.caller)) continue;
+              const missing = (ic.candidates || []).filter(c => c?.id && !visNodes.has(c.id) && !viewOverlay.deleted.nodes[c.id]);
+              if (missing.length || ic.resolution === 'unresolved') unexpanded.push({ ic, missing });
+              if (unexpanded.length >= 12) break;
+            }
+            if (unexpanded.length) {
+              issues.push({
+                id: 'indirect_unexpanded',
+                category: 'indirect',
+                severity: 'high',
+                title: `画布函数包含 ${unexpanded.length} 处未展开或待核实的间接调用点`,
+                detail: unexpanded.slice(0, 4).map(({ ic }) => `${toChainStep(ic.caller).name} (${ic.expr || ic.table?.name || 'fnptr'})`).join('；'),
+                nodeIds: [...new Set(unexpanded.map(u => u.ic.caller))],
+                fixPrompt: '请用 inspect_indirect_calls 与 read_source 核实当前画布中未展开的间接调用点，并用 add_call_edge 补全确切调用边。',
+              });
+            }
+          }
+          if ((check === 'all' || check === 'orphans') && visNodes.size >= 2) {
+            const orphans = [...visNodes].filter(id => !connected.has(id));
+            if (orphans.length) {
+              issues.push({
+                id: 'isolated_nodes',
+                category: 'orphans',
+                severity: 'low',
+                title: `当前视图存在 ${orphans.length} 个孤立节点`,
+                detail: orphans.slice(0, 6).map(id => toChainStep(id).name).join('、'),
+                nodeIds: orphans.slice(0, 15),
+                fixPrompt: `请对孤立节点 ${orphans.slice(0, 3).map(id => toChainStep(id).name).join('、')} 追踪上游调用链并补充关系。`,
+              });
+            }
+          }
+          if ((check === 'all' || check === 'layout') && canvasSnapshot?.nodes?.size) {
+            const rects = [...canvasSnapshot.nodes.entries()].filter(([id]) => visNodes.has(id)).map(([id, r]) => ({ id, ...r }));
+            const overlaps = [];
+            for (let i = 0; i < rects.length && overlaps.length < 10; i++) {
+              for (let j = i + 1; j < rects.length; j++) {
+                const a = rects[i], b = rects[j];
+                if (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y) {
+                  overlaps.push([a.id, b.id]);
+                }
+              }
+            }
+            if (overlaps.length) {
+              issues.push({
+                id: 'layout_overlaps',
+                category: 'layout',
+                severity: 'medium',
+                title: `检测到 ${overlaps.length} 对节点框存在位置重叠`,
+                detail: overlaps.slice(0, 4).map(([a, b]) => `${toChainStep(a).name} 与 ${toChainStep(b).name}`).join('；'),
+                nodeIds: [...new Set(overlaps.flat())].slice(0, 12),
+                fixPrompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 自动整理画布消除节点重叠。',
+              });
+            }
+          }
+          const penalty = issues.reduce((sum, it) => sum + (it.severity === 'high' ? 25 : it.severity === 'medium' ? 15 : 8), 0);
+          const score = Math.max(20, 100 - penalty);
+          return {
+            ok: true,
+            healthReport: {
+              score,
+              summary: issues.length ? `画布体检得分 ${score}/100，发现 ${issues.length} 类问题` : '画布体检 100/100：标注、调用链与排版均健康',
+              issues,
+            },
+          };
+        }
+        if (name === 'manage_bookmarks') {
+          const action = String(args.action || '').trim();
+          if (action === 'list') {
+            return { ok: true, action, bookmarks: store.listBookmarks(PROJECT.id) };
+          }
+          if (COMPARISON) return { ok: false, error: '比较模式不支持修改书签' };
+          if (action === 'checkpoint') {
+            const label = String(args.checkpointName || args.name || 'AI 检查点').trim().slice(0, 80);
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const eventId = store.appendEvent(PROJECT.id, {
+              op: 'view.checkpoint',
+              actor: 'ai',
+              target: label,
+              after: { view: viewSnapshot(page) },
+              ctx: { milestone: true, action: 'checkpoint', checkpointName: label },
+            });
+            broadcastChange('view.checkpoint', 'ai', { eventId, target: label });
+            return { ok: true, action, checkpointName: label, eventId };
+          }
+          if (action === 'save') {
+            const bmName = String(args.name || '').trim().slice(0, 60);
+            if (!bmName) return { ok: false, error: '保存书签需要提供 name' };
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const r = saveBookmarkWithEvent({ ...viewSnapshot(page), name: bmName }, 'ai', { isForeground: true });
+            recordBookmarkWrite(r);
+            broadcastChange('bookmark.save', 'ai', { bookmark: r.bookmark, projectId: PROJECT.id, clientId: chatClientId });
+            return { ok: true, action, bookmark: r.bookmark };
+          }
+          if (action === 'update') {
+            const id = Number(args.id);
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'update 需要提供有效的书签 id' };
+            const page = latestPage() || { roots: [], expansions: [], up: 0, down: 0, group: true, groupMode: 'file', vars: [], hiddenVars: [], empty: true };
+            const resUp = updateBookmarkWithEvent(id, viewSnapshot(page), 'ai');
+            if (!resUp) return { ok: false, error: '找不到指定书签' };
+            recordBookmarkWrite(resUp);
+            broadcastChange('bookmark.save', 'ai', { bookmark: resUp.bookmark, projectId: PROJECT.id, clientId: chatClientId });
+            return { ok: true, action, bookmark: resUp.bookmark };
+          }
+          if (action === 'delete') {
+            const id = Number(args.id);
+            if (!Number.isFinite(id) || id <= 0) return { ok: false, error: 'delete 需要提供有效的书签 id' };
+            const removed = store.transaction(() => {
+              const before = store.getBookmark(PROJECT.id, id);
+              if (!before || !store.deleteBookmark(PROJECT.id, id)) return null;
+              store.appendEvent(PROJECT.id, {
+                op: 'bookmark.delete', actor: 'ai', target: before.name, before: bookmarkEventPayload(before),
+                ctx: { bookmarkId: id, bookmarkName: before.name, action: 'delete', milestone: true },
+              });
+              return before;
+            });
+            if (removed) {
+              recordBookmarkWrite({ prev: removed });
+              broadcastChange('bookmark.delete', 'ai', { bookmarkId: id, bookmarkName: removed.name, projectId: PROJECT.id, clientId: chatClientId });
+            }
+            return { ok: Boolean(removed), action, removed: removed ? 1 : 0 };
+          }
+          return { ok: false, error: `未知书签操作：${action}` };
+        }
+        if (name === 'run_subagent') {
+          if (!cfg.subagentEnabled) {
+            return { ok: false, error: '只读子调查功能已在设置中关闭' };
+          }
+          const rawTasks = Array.isArray(args.tasks) ? args.tasks.slice(0, 3) : [];
+          if (!rawTasks.length) return { ok: false, error: 'run_subagent 需要至少 1 个调查任务' };
+          const maxConcurrency = Math.max(1, Math.min(3, Number(cfg.subagentMaxConcurrency) || 2));
+          const subMaxSteps = Math.max(2, Math.min(12, Number(cfg.subagentMaxSteps) || 6));
+          const readOnlyExecute = async (toolName, toolArgs) => {
+            if (!SUBAGENT_READONLY_TOOLS.has(toolName)) {
+              return { ok: false, blocked: true, error: `只读子调查禁止调用：${toolName}` };
+            }
+            return await executeAiTool(toolName, toolArgs);
+          };
+          const subSystemPrompt = [
+            '你是 TCU C 调用图只读子调查代理（运行于隔离上下文，深度=1）。',
+            '只能调用只读工具（find_symbols / read_function / read_source / trace_upstream / inspect_indirect_calls / inspect_dataflow / inspect_build_config / get_git_changes / diagnose_canvas）核实源码与图谱事实，禁止改图或向用户提问。',
+            '完成核实后，用 3–5 句简明中文总结：关键发现、精确函数/变量 ID（文件::符号名）与关键位置行号。',
+            `当前工程：${PROJECT.name}（函数 ${MODEL.functions?.length || 0} / 变量 ${MODEL.variables?.length || 0}）`,
+          ].join('\n');
+          const taskDefs = rawTasks.map((t, idx) => ({
+            id: `sub_${Date.now().toString(36)}_${idx + 1}`,
+            title: String(t?.title || `子调查 #${idx + 1}`).trim().slice(0, 80) || `子调查 #${idx + 1}`,
+            goal: String(t?.goal || '').trim().slice(0, 1200),
+            seedSymbols: (Array.isArray(t?.seedSymbols) ? t.seedSymbols : []).slice(0, 8).map(s => String(s || '').trim()).filter(Boolean),
+          })).filter(t => t.goal);
+          if (!taskDefs.length) return { ok: false, error: '子调查任务缺少明确目标 goal' };
+          const results = new Array(taskDefs.length);
+          let cursor = 0;
+          const runWorker = async () => {
+            while (cursor < taskDefs.length) {
+              const myIdx = cursor++;
+              const task = taskDefs[myIdx];
+              assertActive();
+              sendEvent({ type: 'subagent_start', id: task.id, index: myIdx, title: task.title, goal: task.goal, seedSymbols: task.seedSymbols });
+              const subPrompt = [
+                `调查主题：${task.title}`,
+                `调查目标：${task.goal}`,
+                ...(task.seedSymbols.length ? [`参考起始符号：${task.seedSymbols.join(', ')}`] : []),
+              ].join('\n');
+              try {
+                const subRes = await runAiAgent({
+                  config: {
+                    ...cfg,
+                    reasoningEffort: cfg.reasoningEffort === 'high' ? 'medium' : cfg.reasoningEffort,
+                  },
+                  prompt: subPrompt,
+                  context: {
+                    projectName: PROJECT.name,
+                    fnCount: MODEL.functions?.length || 0,
+                    varCount: MODEL.variables?.length || 0,
+                    canvasRoots: (latestPage()?.roots || []).slice(0, 8),
+                  },
+                  executeTool: readOnlyExecute,
+                  onEvent: (ev) => {
+                    if (ev.type === 'tool_end') {
+                      sendEvent({ type: 'subagent_progress', id: task.id, title: task.title, tool: ev.name, ok: ev.ok, summary: ev.summary });
+                    }
+                  },
+                  allowedTools: SUBAGENT_READONLY_TOOLS,
+                  systemPromptOverride: subSystemPrompt,
+                  isSubagent: true,
+                  maxSteps: subMaxSteps,
+                  signal: abort.signal,
+                });
+                const item = {
+                  id: task.id,
+                  title: task.title,
+                  ok: true,
+                  summary: subRes.answer || '',
+                  chains: subRes.chains || [],
+                  steps: subRes.toolLog?.length || 0,
+                };
+                results[myIdx] = item;
+                collectedSubagents.push({ id: item.id, title: item.title, ok: true, summary: item.summary, steps: item.steps });
+                sendEvent({ type: 'subagent_end', ...item });
+              } catch (err) {
+                if (abort.signal.aborted) throw err;
+                const item = {
+                  id: task.id,
+                  title: task.title,
+                  ok: false,
+                  summary: `子调查失败：${String(err?.message || err).slice(0, 200)}`,
+                  chains: [],
+                  steps: 0,
+                };
+                results[myIdx] = item;
+                collectedSubagents.push({ id: item.id, title: item.title, ok: false, summary: item.summary, steps: 0 });
+                sendEvent({ type: 'subagent_end', ...item });
+              }
+            }
+          };
+          await Promise.all(Array.from({ length: Math.min(maxConcurrency, taskDefs.length) }, () => runWorker()));
+          const mergedChains = results.flatMap(r => Array.isArray(r?.chains) ? r.chains : []).slice(0, 8);
+          return {
+            ok: true,
+            count: results.length,
+            results: results.map(({ id, title, ok, summary, steps }) => ({ id, title, ok, summary, steps })),
+            ...(mergedChains.length ? { chains: mergedChains } : {}),
+          };
         }
         return { ok: false, error: `未知工具：${name}` };
       };
@@ -4650,7 +5724,7 @@ export const server = http.createServer(async (req, res) => {
         const gitInfo = MODEL.parserId === 'dot' ? null : await quickGitDirtySummary(COMPARISON?.projectPath || root).catch(() => null);
         assertActive();
         const tasks = MODEL.parserId === 'dot' ? [] : projectTasks(MODEL).slice(0, 10).map(t => t.name);
-        const sanitizeUiContext = (raw) => {
+        const sanitizeUiContext = async (raw) => {
           if (!raw || typeof raw !== 'object') return null;
           const sanitizeNode = (n) => (!n || typeof n !== 'object' ? null : {
             kind: 'node',
@@ -4683,15 +5757,70 @@ export const server = http.createServer(async (req, res) => {
             containerKind: f.containerKind === 'dir' ? 'dir' : 'file',
             label: String(f.label || '').slice(0, 120),
           });
+          const sanitizePair = (pr) => (!pr || typeof pr !== 'object' ? null : {
+            kind: 'pair',
+            fromId: String(pr.fromId || '').slice(0, 200),
+            fromName: String(pr.fromName || '').slice(0, 120),
+            toId: String(pr.toId || '').slice(0, 200),
+            toName: String(pr.toName || '').slice(0, 120),
+            visiblePaths: (Array.isArray(pr.visiblePaths) ? pr.visiblePaths : []).slice(0, 8).map(vp => ({
+              direction: String(vp?.direction || '').slice(0, 16),
+              edgeKeys: (Array.isArray(vp?.edgeKeys) ? vp.edgeKeys : []).slice(0, 20).map(k => String(k).slice(0, 320)),
+              names: (Array.isArray(vp?.names) ? vp.names : []).slice(0, 20).map(s => String(s).slice(0, 120)),
+            })),
+            rwPaths: (Array.isArray(pr.rwPaths) ? pr.rwPaths : []).slice(0, 10).map(rp => typeof rp === 'string' ? rp.slice(0, 600) : ({
+              direction: String(rp?.direction || '').slice(0, 16),
+              varId: String(rp?.varId || '').slice(0, 200),
+              varName: String(rp?.varName || '').slice(0, 120),
+              writer: String(rp?.writer || '').slice(0, 200),
+              reader: String(rp?.reader || '').slice(0, 200),
+              line: Number(rp?.line) || 0,
+            })),
+            sharedVars: (Array.isArray(pr.sharedVars) ? pr.sharedVars : []).slice(0, 16).map(v => ({
+              id: String(v?.id || v || '').slice(0, 200),
+              name: String(v?.name || v || '').slice(0, 120),
+            })),
+          });
+          const flows = new Map();
+          const sanitizeDataflow = async (df) => {
+            if (!df || typeof df !== 'object' || (df.projectId != null && df.projectId !== chatProjectId) ||
+                (df.sessionRevision != null && df.sessionRevision !== expectedSession) ||
+                (Object.hasOwn(df, 'comparisonId') && df.comparisonId !== (COMPARISON?.id ?? null))) return null;
+            const id = df.targetId || df.fnId || df.id;
+            if (typeof id !== 'string' || !id || id.length > 200 || !MODEL._index) return null;
+            const dir = ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out';
+            const key = JSON.stringify([id, dir]);
+            if (!flows.has(key)) {
+              if (!COMPARISON) await ensureAnalysis(MODEL);
+              assertActive();
+              if (!MODEL._index.byId.has(id)) return null;
+              const result = await (COMPARISON ? comparisonDataflow(COMPARISON, id, dir) : dataflowFor(MODEL, id, dir));
+              assertActive();
+              flows.set(key, result);
+            }
+            const result = flows.get(key);
+            return result.fn ? dataflowAttachment(result, dir, df.focused) : null;
+          };
           const out = {};
-          const types = [['node', 'selectedNode', sanitizeNode], ['edge', 'selectedEdge', sanitizeEdge],
-            ['file', 'selectedFile', sanitizeFile]];
+          const types = [
+            ['node', 'selectedNode', sanitizeNode],
+            ['edge', 'selectedEdge', sanitizeEdge],
+            ['file', 'selectedFile', sanitizeFile],
+            ['pair', 'selectedPair', sanitizePair],
+            ['dataflow', 'selectedDataflow', sanitizeDataflow],
+          ];
           const flat = types.find(([kind]) => raw.kind === kind);
           for (const [, key, sanitize] of flat ? [flat] : types) {
             if (flat) {
-              const item = sanitize(raw);
-              Object.assign(out, item, { [key]: item });
-            } else if (raw[key]) out[key] = sanitize(raw[key]);
+              const item = await sanitize(raw);
+              if (item) Object.assign(out, item, { [key]: item });
+            } else if (raw[key]) {
+              const item = await sanitize(raw[key]);
+              if (item) out[key] = item;
+            }
+          }
+          if (typeof raw.relationIntent === 'string' && ['auto', 'compare', 'path', 'dataflow', 'common_callers'].includes(raw.relationIntent)) {
+            out.relationIntent = raw.relationIntent;
           }
           if (Array.isArray(raw.items)) {
             const items = new Map();
@@ -4703,6 +5832,12 @@ export const server = http.createServer(async (req, res) => {
               } else if (entry?.kind === 'edge') {
                 item = sanitizeEdge(entry);
                 id = item?.edgeKey || (item?.from && item?.to && `${item.from}->${item.to}:${item.line}`);
+              } else if (entry?.kind === 'pair') {
+                item = sanitizePair(entry);
+                id = item?.fromId && item?.toId && [item.fromId, item.toId].sort().join('<->');
+              } else if (entry?.kind === 'dataflow') {
+                item = await sanitizeDataflow(entry);
+                id = item && JSON.stringify([item.targetId, item.dir, item.focused?.path]);
               } else if (entry?.kind === 'file') {
                 item = sanitizeFile(entry);
                 id = item?.path;
@@ -4715,14 +5850,98 @@ export const server = http.createServer(async (req, res) => {
           }
           return Object.keys(out).length ? out : null;
         };
-        const uiContext = sanitizeUiContext(p.uiContext);
+        const enrichTurnContext = async (model, ui) => {
+          if (!ui || !model?._index) return '';
+          const nodeIds = [];
+          const pushNode = (id) => {
+            if (id && model._index.byId.has(id) && !nodeIds.includes(id)) nodeIds.push(id);
+          };
+          const pairs = [];
+          if (ui.selectedPair?.fromId && ui.selectedPair?.toId) pairs.push([ui.selectedPair.fromId, ui.selectedPair.toId]);
+          if (ui.selectedNode?.id) pushNode(ui.selectedNode.id);
+          if (ui.selectedDataflow?.targetId) pushNode(ui.selectedDataflow.targetId);
+          for (const item of ui.items || []) {
+            if (item?.kind === 'node' && item.id) pushNode(item.id);
+            else if (item?.kind === 'pair' && item.fromId && item.toId) pairs.push([item.fromId, item.toId]);
+            else if (item?.kind === 'dataflow' && item.targetId) pushNode(item.targetId);
+          }
+          if (!pairs.length && nodeIds.length >= 2) pairs.push([nodeIds[0], nodeIds[1]]);
+          const needsAnalysis = Boolean(pairs.length || ui.selectedDataflow || (ui.items || []).some(i => i?.kind === 'dataflow') || ui.relationIntent === 'dataflow');
+          if (needsAnalysis && !COMPARISON && model.source !== 'dot') {
+            await ensureAnalysis(model);
+            assertActive();
+          }
+          const lines = [];
+          const shortName = (id) => model._index.byId.get(id)?.name || String(id).replace(/^var::/, '').split('::').pop();
+          const sides = callEvidenceSides(model, COMPARISON);
+          for (const [a, b] of pairs.slice(0, 2)) {
+            if (!model._index.byId.has(a) || !model._index.byId.has(b) || a === b) continue;
+            for (const [version, side] of sides) {
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              const byId = side._index.byId;
+              if (!byId.has(a) || !byId.has(b)) {
+                lines.push('- 调用通路' + label + ': 该版本缺少所选端点');
+                continue;
+              }
+              const found = shortestCallPath(side, a, b, version, COMPARISON) || shortestCallPath(side, b, a, version, COMPARISON);
+              const evidence = found ? found.path.map(id => byId.get(id)?.name || id).join(' → ') +
+                (found.possible ? '（含可能调用）' : '') : shortName(a) + ' 与 ' + shortName(b) + ' 5 跳内无调用路径';
+              lines.push('- 调用通路' + label + ': ' + evidence);
+              const tasksA = taskCallEvidence(side, a, 20), tasksB = taskCallEvidence(side, b, 20);
+              const common = [];
+              for (const [id, task] of tasksA) {
+                const other = tasksB.get(id);
+                if (other) common.push(task.name + (task.possible || other.possible ? '（可能）' : ''));
+              }
+              if (common.length) lines.push('- 公共上游 TASK/ISR' + label + ': ' + common.slice(0, 4).join('、'));
+            }
+            try {
+              const df = await (COMPARISON ? comparisonPairDataflow(COMPARISON, a, b) : pairDataflow(model, a, b));
+              assertActive();
+              const variables = variablesOnPaths(df, df.paths);
+              if (variables.length) lines.push('- 共享全局变量: ' + variables.slice(0, 8).map(v => v.name + ' (' + v.id + ')').join('、'));
+              const nodes = new Map(df.nodes.map(n => [n.id, n]));
+              for (const p of df.paths.slice(0, 5)) {
+                for (const [version, edges] of Object.entries(p.evidenceByVersion || { '': p.edges })) {
+                  const parts = [nodes.get(p.nodes[0])?.name || p.nodes[0]];
+                  for (const e of edges) {
+                    const write = e.kind === 'df-write';
+                    const file = nodes.get(write ? e.from : e.to)?.file;
+                    const loc = e.line ? ' ' + (file ? file + ':' : 'L') + e.line : '';
+                    parts.push('--' + (write ? 'W' : 'R') + loc + '-->', nodes.get(e.to)?.name || e.to);
+                  }
+                  lines.push('- 读写链路' + (version ? ' [' + version + ']' : '') + ': ' + parts.join(' '));
+                }
+              }
+            } catch { /* ignore enrichment dataflow errors */ }
+          }
+          if (!pairs.length && nodeIds.length === 1) {
+            for (const [version, side] of sides) {
+              const tasks = [...taskCallEvidence(side, nodeIds[0], 10).values()];
+              const label = version === 'current' ? '' : ' [' + version + ']';
+              if (tasks.length) lines.push('- 触发 TASK/ISR' + label + ': ' + tasks.slice(0, 6).map(t => t.name + (t.possible ? '（可能）' : '')).join('、'));
+            }
+          }
+          return lines.slice(0, 28).join('\n');
+        };
+        const uiContext = await sanitizeUiContext(p.uiContext);
+        if (uiContext) {
+          const enrichment = await enrichTurnContext(MODEL, uiContext);
+          if (enrichment) uiContext.enrichment = enrichment;
+        }
         uiSelectedIds = new Set([
           ...(uiContext?.selectedNode?.id ? [uiContext.selectedNode.id] : []),
           ...(uiContext?.selectedEdge?.from ? [uiContext.selectedEdge.from] : []),
           ...(uiContext?.selectedEdge?.to ? [uiContext.selectedEdge.to] : []),
+          ...(uiContext?.selectedPair?.fromId ? [uiContext.selectedPair.fromId] : []),
+          ...(uiContext?.selectedPair?.toId ? [uiContext.selectedPair.toId] : []),
+          ...(uiContext?.selectedDataflow?.targetId ? [uiContext.selectedDataflow.targetId] : []),
           ...((uiContext?.items || []).flatMap((item) => item?.kind === 'node' && item.id
             ? [item.id]
-            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean) : [])),
+            : item?.kind === 'edge' ? [item.from, item.to].filter(Boolean)
+            : item?.kind === 'pair' ? [item.fromId, item.toId].filter(Boolean)
+            : item?.kind === 'dataflow' && item.targetId ? [item.targetId]
+            : [])),
         ]);
         const context = {
           projectName: PROJECT.name,
@@ -4744,10 +5963,29 @@ export const server = http.createServer(async (req, res) => {
           executeTool: executeAiTool,
           onEvent: sendEvent,
           signal: abort.signal,
+          beforeDone: ({ onEvent, interrupted }) => {
+            const extra = {};
+            if (turnChangeset && (turnChangeset.canvas || turnChangeset.bookmarks.size)) {
+              turnChangeset.interrupted = interrupted || !sessionCurrent();
+              turnChangeset.ops = [...turnWriteOps];
+              saveAiChangeset(turnChangeset);
+              savedChangeset = { id: turnId, ops: turnChangeset.ops };
+              if (sessionCurrent()) {
+                onEvent({ type: 'changeset', changesetId: turnId, ops: savedChangeset.ops });
+                extra.changeset = savedChangeset;
+              }
+            }
+            if (!sameSession()) assertActive();
+            if (collectedSubagents.length) extra.subagents = collectedSubagents;
+            return extra;
+          },
         });
       } catch (err) {
-        sendEvent({ type: 'error', error: String(err?.message || err) });
+        sendEvent({ type: 'error', error: String(err?.message || err),
+          ...(savedChangeset && sessionCurrent() ? { changeset: savedChangeset } : {}) });
       } finally {
+        activeAiTurns.delete(turnId);
+        finished.resolve();
         req.off('close', cancel);
         res.off('close', cancel);
         if (!res.writableEnded) res.end();
@@ -4871,6 +6109,7 @@ export const server = http.createServer(async (req, res) => {
         Connection: 'keep-alive',
       });
       res.write('retry: 2000\n\n'); // 断开后浏览器自动重连的间隔
+      res._clientId = String(u.searchParams.get('clientId') || req.headers['x-callgraph-client'] || '').slice(0, 128);
       sseClients.add(res);
       res.on('close', () => sseClients.delete(res));
       return;
@@ -4886,16 +6125,27 @@ export const server = http.createServer(async (req, res) => {
             if (p.projectId != null && p.projectId !== PROJECT.id) return json(res, { ok: false, error: '工程已切换' }, 409);
             if (p.comparisonId !== undefined && p.comparisonId !== (COMPARISON?.id ?? null)) return sessionConflict(res);
             const key = 'ui.last-view.' + PROJECT.id;
-            const revision = COMPARISON ? COMPARISON.composedPage?.revision ?? 0 : store.getSetting(key)?.revision ?? 0;
+            const previous = COMPARISON ? COMPARISON.composedPage : store.getSetting(key);
+            const revision = previous?.revision ?? 0;
             const reviewing = Number(p.at) > 0;
             if (!reviewing && (!COMPARISON || COMPARISON.composedPage) && p.revision !== undefined && p.revision !== revision) {
               return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
             }
             const str = (v) => (typeof v === 'string' ? v : null);
+            const activeBookmark = isPlainObject(p.activeBookmark) && Number(p.activeBookmark.id) > 0
+              ? {
+                  id: Number(p.activeBookmark.id),
+                  name: String(p.activeBookmark.name || ''),
+                  revision: Number(p.activeBookmark.revision) || 1,
+                  ...(typeof p.activeBookmark.baseFingerprint === 'string'
+                    ? { baseFingerprint: p.activeBookmark.baseFingerprint } : {}),
+                }
+              : null;
             pageState = {
               ...viewSnapshot(p),
               projectId: PROJECT.id,
               ...(COMPARISON ? { comparisonId: COMPARISON.id } : {}),
+              activeBookmark,
               selected: str(p.selected),
               selectedEdge: str(p.selectedEdge),
               reviewing,
@@ -4907,8 +6157,10 @@ export const server = http.createServer(async (req, res) => {
               const cam = p.cam && [p.cam.x, p.cam.y, p.cam.k].every(Number.isFinite) && p.cam.k > 0 ? p.cam : null;
               const ctxBox = p.ctxBox && ['file', 'dir'].includes(p.ctxBox.kind) && typeof p.ctxBox.id === 'string' ? p.ctxBox : null;
               const saved = { ...pageState, cam, ctxBox };
-              if (!COMPARISON) store.setSetting(key, saved);
-              else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
+              if (!COMPARISON) {
+                store.setSetting(key, saved);
+                if (!sameCanvasPage(previous, saved)) canvasEditRevision++;
+              } else if (COMPARISON.composedPage) COMPARISON.composedPage = saved;
             }
             json(res, { ok: true });
           })
@@ -4935,22 +6187,39 @@ export const server = http.createServer(async (req, res) => {
       if (p.revision !== undefined && p.revision !== (store.getSetting('ui.last-view.' + PROJECT.id)?.revision ?? 0)) {
         return json(res, { ok: false, error: '已有新版画布，旧视图未保存' }, 409);
       }
-      if (!['view.snapshot', 'view.clear'].includes(p.op) || !isPlainObject(p.view)) {
-        return bad(res, '画布事件需要 view.snapshot 或 view.clear，以及视图参数');
+      if (!['view.snapshot', 'view.clear', 'view.checkpoint'].includes(p.op) || !isPlainObject(p.view)) {
+        return bad(res, '画布事件需要 view.snapshot / view.clear / view.checkpoint，以及视图参数');
       }
       let view;
       try { view = viewSnapshot(p.view); } catch (err) { return bad(res, err.message); }
       if (p.label !== undefined && typeof p.label !== 'string') return bad(res, 'label 必须是文字');
       const label = p.label?.trim() ?? '';
       const latest = store.latestEventId(PROJECT.id);
-      if (isDeepStrictEqual(view, store.viewAt(PROJECT.id, latest))) {
+      const prevView = store.viewAt(PROJECT.id, latest);
+      if (p.op !== 'view.checkpoint' && isDeepStrictEqual(view, prevView)) {
         return json(res, { ok: true, deduplicated: true });
       }
+      const rawCtx = isPlainObject(p.ctx) ? p.ctx : {};
+      const checkpointName = typeof rawCtx.checkpointName === 'string' ? rawCtx.checkpointName.trim().slice(0, 80) : '';
+      const diff = prevView ? diffViewScopes(prevView, view) : null;
+      const ctx = {
+        ...(label && { label }),
+        ...(Number(rawCtx.bookmarkId) > 0 && { bookmarkId: Number(rawCtx.bookmarkId) }),
+        ...(typeof rawCtx.bookmarkName === 'string' && rawCtx.bookmarkName.trim() && { bookmarkName: rawCtx.bookmarkName.trim().slice(0, 80) }),
+        ...(checkpointName && { checkpointName }),
+        ...(typeof rawCtx.diffSummary === 'string' && rawCtx.diffSummary.trim()
+          ? { diffSummary: rawCtx.diffSummary.trim().slice(0, 120) }
+          : (diff?.changed ? { diffSummary: diff.summary } : {})),
+        ...(p.op === 'view.checkpoint' || rawCtx.milestone ? { milestone: 1 } : {}),
+      };
       const eventId = store.appendEvent(PROJECT.id, {
-        op: p.op, actor: 'user', target: label || view.roots[0] || '', after: { view },
-        ctx: label ? { label } : null,
+        op: p.op,
+        actor: 'user',
+        target: checkpointName || label || ctx.bookmarkName || view.roots[0] || '',
+        after: { view },
+        ctx: Object.keys(ctx).length ? ctx : null,
       });
-      broadcastChange(p.op, 'user');
+      broadcastChange(p.op, 'user', { eventId, ...(ctx.bookmarkId ? { bookmarkId: ctx.bookmarkId } : {}) });
       return json(res, { ok: true, eventId });
     }
 
@@ -5041,6 +6310,7 @@ export const server = http.createServer(async (req, res) => {
         clangStatus,
         activeProfileId,
         strictCompileCommands,
+        dispatchPolicy: configuredDispatchPolicy(scanRoot),
         compileCommandsPath: customCompileCommandsPath,
         detectedCompileCommands,
         totalSourceFiles: scan.files.filter((f) => !f.isHeader).length,
@@ -5065,9 +6335,14 @@ export const server = http.createServer(async (req, res) => {
           clangBin,
           strictCompileCommands,
           compileCommandsPath,
+          dispatchPolicy,
           exportCompileCommands,
           exportPath,
         } = body || {};
+
+        if (dispatchPolicy !== undefined && !['expand', 'strict'].includes(dispatchPolicy)) {
+          return bad(res, 'dispatchPolicy 必须是 expand 或 strict');
+        }
 
         if (clangBin !== undefined && (typeof clangBin !== 'string' || clangBin.includes('\0'))) {
           return bad(res, 'clangBin 必须是有效的可执行文件路径');
@@ -5142,14 +6417,18 @@ export const server = http.createServer(async (req, res) => {
           return json(res, { ok: false, error: clangStatus.reason || 'Clang 不可用', clangStatus }, 400);
         }
 
+        const nextDispatchPolicy = dispatchPolicy !== undefined
+          ? (dispatchPolicy === 'strict' ? 'strict' : 'expand')
+          : configuredDispatchPolicy(scanRoot);
         const nextParserOptions = nextParserId === 'clang-ast'
           ? {
               compileCommandsPath: nextDbPath,
               strictCompileCommands: nextStrict,
+              dispatchPolicy: nextDispatchPolicy,
               ...(nextClangBin ? { clangBin: nextClangBin } : {}),
               ...(nextProfileId ? { buildProfileId: nextProfileId } : {}),
             }
-          : { ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
+          : { dispatchPolicy: nextDispatchPolicy, ...(nextProfileId ? { buildProfileId: nextProfileId } : {}) };
 
         const { stats: st } = await openTarget(root, {
           selection: {
@@ -5160,6 +6439,7 @@ export const server = http.createServer(async (req, res) => {
               buildProfileId: nextProfileId,
               strictCompileCommands: nextStrict,
               compileCommandsPath: nextDbPath,
+              dispatchPolicy: nextDispatchPolicy,
             },
           },
         });
@@ -5171,6 +6451,7 @@ export const server = http.createServer(async (req, res) => {
           activeParser: MODEL.parserId,
           activeProfileId: nextProfileId,
           strictCompileCommands: nextStrict,
+          dispatchPolicy: nextDispatchPolicy,
           clangBin: nextClangBin,
           clangStatus,
           parser: parserInfo(),
@@ -5574,10 +6855,16 @@ export const server = http.createServer(async (req, res) => {
         readJson(req, res)
           .then((p) => {
             try {
-              // 状态 + 事件同一个事务：崩溃时要么都进库、要么都不进，
-              // 不会出现「书签改了但时间轴没记」这种回放对不上的状态
-              const r = saveBookmarkWithEvent(p);
-              json(res, { ok: true, ...r });
+              if (p.createOnly && store.findBookmark(PROJECT.id, p.name)) {
+                return json(res, { ok: false, error: '已存在同名书签，请换个名称或选择更新已有书签' }, 409);
+              }
+              const r = saveBookmarkWithEvent(p, 'user', { isForeground: p.foreground !== false });
+              broadcastChange('bookmark.save', 'user', {
+                bookmark: r.bookmark,
+                projectId: PROJECT.id,
+                clientId: req.headers['x-callgraph-client'],
+              });
+              json(res, { ok: true, bookmark: r.bookmark, overwritten: r.overwritten });
             } catch (err) {
               bad(res, String(err.message || err));
             }
@@ -5587,6 +6874,34 @@ export const server = http.createServer(async (req, res) => {
           });
         return;
       }
+    }
+
+    if (u.pathname === '/api/bookmarks/update' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      readJson(req, res)
+        .then((p) => {
+          const id = Number(p.id);
+          if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          try {
+            const out = updateBookmarkWithEvent(id, p, 'user', p.expectedRevision);
+            if (!out) return json(res, { ok: false, error: '找不到该书签' }, 404);
+            if (out.conflict) {
+              return json(res, { ok: false, conflict: true, bookmark: out.current, error: '该书签已被其他窗口修改' }, 409);
+            }
+            broadcastChange('bookmark.save', 'user', {
+              bookmark: out.bookmark,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
+            });
+            json(res, { ok: true, bookmark: out.bookmark });
+          } catch (err) {
+            bad(res, String(err.message || err));
+          }
+        })
+        .catch((err) => {
+          if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
+        });
+      return;
     }
 
     if (u.pathname === '/api/bookmarks/rename' && req.method === 'POST') {
@@ -5605,8 +6920,14 @@ export const server = http.createServer(async (req, res) => {
                 target: bookmark.name,
                 before: prev ? bookmarkEventPayload(prev) : null,
                 after: bookmarkEventPayload(bookmark),
+                ctx: { bookmarkId: bookmark.id, bookmarkName: bookmark.name, action: 'rename', milestone: true },
               });
               return bookmark;
+            });
+            broadcastChange('bookmark.rename', 'user', {
+              bookmark: result,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
             });
             json(res, { ok: true, bookmark: result });
           } catch (err) {
@@ -5625,8 +6946,10 @@ export const server = http.createServer(async (req, res) => {
         .then((p) => {
           const id = Number(p.id);
           if (!Number.isFinite(id) || id <= 0) return bad(res, 'id 必须是正整数');
+          let deletedBm = null;
           const ok = store.transaction(() => {
             const gone = store.listBookmarks(PROJECT.id).find((b) => b.id === id);
+            deletedBm = gone || null;
             const ok = store.deleteBookmark(PROJECT.id, id);
             // 删掉的整份内容进 before，将来要按事件重建才不至于只剩个名字
             if (ok) {
@@ -5634,10 +6957,19 @@ export const server = http.createServer(async (req, res) => {
                 op: 'bookmark.delete',
                 target: gone?.name || `#${id}`,
                 before: gone ? bookmarkEventPayload(gone) : null,
+                ctx: { ...(gone?.id && { bookmarkId: gone.id }), bookmarkName: gone?.name || `#${id}`, action: 'delete', milestone: true },
               });
             }
             return ok;
           });
+          if (ok) {
+            broadcastChange('bookmark.delete', 'user', {
+              bookmarkId: id,
+              bookmarkName: deletedBm?.name || null,
+              projectId: PROJECT.id,
+              clientId: req.headers['x-callgraph-client'],
+            });
+          }
           json(res, { ok, removed: ok ? 1 : 0 });
         })
         .catch((err) => {
@@ -5650,6 +6982,7 @@ export const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/session/export') {
       const withEvents = u.searchParams.get('events') !== '0';
       const eventsTotal = store.countEvents(PROJECT.id);
+      const savedPage = store.getSetting('ui.last-view.' + PROJECT.id);
       const payload = {
         format: 'tcu-callgraph-session',
         version: 1,
@@ -5664,6 +6997,7 @@ export const server = http.createServer(async (req, res) => {
         overlay: store.loadOverlay(PROJECT.id),
         manualNodes: loadManualNodes(PROJECT.id),
         bookmarks: store.listBookmarks(PROJECT.id),
+        ...(savedPage ? { lastView: viewSnapshot(savedPage), activeBookmark: savedPage.activeBookmark || null } : {}),
         events: withEvents ? store.dumpEvents(PROJECT.id, 5000) : [],
         eventsTotal,
         eventsTruncated: withEvents && eventsTotal > 5000,
@@ -5800,6 +7134,7 @@ export const server = http.createServer(async (req, res) => {
             store.appendEvent(PROJECT.id, {
               op: 'session.import',
               target: p.project?.name || 'session',
+              ctx: { milestone: 1, action: 'import' },
               after: {
                 ...store.loadOverlay(PROJECT.id),
                 manualNodes: manualNodesMap(reconciled.list),
@@ -5843,13 +7178,17 @@ export const server = http.createServer(async (req, res) => {
       const beforeId = Number(u.searchParams.get('before') || 0) || 0;
       const ops = (u.searchParams.get('ops') || '').split(',').filter(Boolean);
       const query = (u.searchParams.get('q') || '').trim();
+      const level = (u.searchParams.get('level') || '').trim();
+      const bookmarkId = u.searchParams.get('bookmarkId');
       const withPayload = u.searchParams.get('detail') === '1';
       // 多取一条用来判断还有没有下一页，避免 count 和分页对不上
-      const rows = store.listEventsPage(PROJECT.id, { limit: limit + 1, beforeId, ops, q: query, withPayload: true });
+      const rows = store.listEventsPage(PROJECT.id, {
+        limit: limit + 1, beforeId, ops, q: query, level, bookmarkId, withPayload: true,
+      });
       const hasMore = rows.length > limit;
       return json(res, {
         latest: store.latestEventId(PROJECT.id),
-        total: store.countEvents(PROJECT.id, { ops, q: query }),
+        total: store.countEvents(PROJECT.id, { ops, q: query, level, bookmarkId }),
         hasMore,
         events: rows.slice(0, limit).map((event) => timelineEvent(event, withPayload)),
       });
@@ -5861,12 +7200,11 @@ export const server = http.createServer(async (req, res) => {
       readJson(req, res)
         .then(async (p) => {
           const at = Number(p.eventId);
-          if (!Number.isFinite(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
-          const latest = store.latestEventId(PROJECT.id);
-          if (at > latest) return bad(res, 'eventId 超出范围');
+          if (!Number.isSafeInteger(at) || at <= 0) return bad(res, 'eventId 必须是正整数');
+          if (!store.hasEvent(PROJECT.id, at)) return bad(res, '当前工程没有此历史事件');
           let restored = store.overlayAt(PROJECT.id, at);
           let restoredView = store.viewAt(PROJECT.id, at);
-          let restoredPage;
+          let restoredPage, checkpointId;
           // 覆盖状态与记 restore_point 必须同事务：否则中途崩溃会留下
           // 「状态已回退、时间轴上却看不出发生过恢复」的库，后续回放全乱
           let restoredManualList = Object.values(restored.manualNodes || {}).filter((item) => item && item.id && item.file && item.name);
@@ -5875,6 +7213,16 @@ export const server = http.createServer(async (req, res) => {
             if (!currentSession(req)) return sessionConflict(res);
           }
           const eventId = store.transaction(() => {
+            // 在覆盖前读取同一事务中的最新工作区，含回看期间其他客户端的写入。
+            const live = latestPage();
+            const view = viewSnapshot(live ?? { empty: true });
+            const label = '恢复前自动快照';
+            checkpointId = store.appendEvent(PROJECT.id, {
+              op: 'view.checkpoint', target: label, actor: p.actor === 'ai' ? 'ai' : 'user',
+              after: { ...store.loadOverlay(PROJECT.id), manualNodes: manualNodesMap(loadManualNodes(PROJECT.id)), view },
+              ctx: { milestone: 1, checkpointName: label, ...(live?.activeBookmark ?
+                { bookmarkId: live.activeBookmark.id, bookmarkName: live.activeBookmark.name } : {}) },
+            });
             store.replaceOverlay(PROJECT.id, restored);
             saveManualNodes(PROJECT.id, restoredManualList);
             const reconciled = reconcileManualVariables(MODEL, PROJECT.id, restoredManualList, restoredView);
@@ -5905,7 +7253,7 @@ export const server = http.createServer(async (req, res) => {
           overlay.deleted = restored.deleted;
           overlay.layout = restored.layout;
           broadcastChange('restore_point', p.actor === 'ai' ? 'ai' : 'user');
-          json(res, { ok: true, eventId, ...(restoredView ? { restoredView } : {}) });
+          json(res, { ok: true, eventId, checkpointId, ...(restoredView ? { restoredView } : {}) });
         })
         .catch((err) => {
           if (!res.headersSent) json(res, { ok: false, error: String(err.message || err) }, 500);
@@ -6127,7 +7475,7 @@ export const server = http.createServer(async (req, res) => {
         .then((r) => {
           if (!currentSession(req)) return sessionConflict(res);
           if (!comparison && r.fn) r.fn.taskPeriods = taskPeriods(model).get(r.fn.id) || [];
-          return json(res, r);
+          return json(res, { ...r, projectId: PROJECT.id, comparisonId: comparison?.id ?? null, sessionRevision });
         })
         .catch((err) => {
           console.error('[数据流]', err);

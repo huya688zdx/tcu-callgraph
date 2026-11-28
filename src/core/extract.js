@@ -300,9 +300,48 @@ function isStandardTypeName(name) {
   return standardTypeNames.has(name) || /^u?int(?:_least|_fast)?(?:8|16|32|64)_t$/.test(name);
 }
 
-/** 记录函数原型，以及分派表初始化或调用所在函数中的局部对象声明。 */
-export function collectDispatchDeclarations(tokens, dispatchScopes, record, macros) {
+/** 记录函数原型，以及分派表初始化、对象声明、函数指针声明和局部对象绑定。 */
+export function collectDispatchDeclarations(tokens, dispatchScopes, record, macros, enumValues = null) {
   const scopes = [{ end: null, trackObjects: false }];
+  const extractDeclaratorMeta = (declarator, eqPart, scope, fileScope, prefixEndTokens) => {
+    const name = declarationName(declarator);
+    if (!name) return null;
+    const nameIdx = declarator.indexOf(name);
+    const isFunctionDecl = declarator[nameIdx + 1]?.v === '(' && !pointerBefore(declarator, nameIdx);
+    const isFnPtr = !isFunctionDecl && declarator[nameIdx - 1]?.v === '*' &&
+      declarator.slice(0, nameIdx).some((t, idx) => t.v === '(' && declarator[idx + 1]?.v === '*');
+    const prefixLimit = isFnPtr ? declarator.findIndex((t, idx) => t.v === '(' && declarator[idx + 1]?.v === '*') : nameIdx;
+    const prefix = declarator.slice(0, Math.max(0, prefixLimit));
+    const recordType = declarationType(prefix);
+    let j = nameIdx + 1;
+    const extents = [];
+    while (declarator[j]?.v === '[') {
+      const s = j + 1;
+      let d = 1;
+      for (j++; j < declarator.length && d; j++) {
+        if (declarator[j].v === '[') d++;
+        if (declarator[j].v === ']') d--;
+      }
+      extents.push(parseConstIndex(declarator.slice(s, j - 1), macros, enumValues));
+    }
+    const isPointer = pointerBefore(declarator, nameIdx);
+    const isStatic = (prefixEndTokens || declarator).some(t => t.v === 'static' || t.v === 'STATIC');
+    const isConst = (prefixEndTokens || declarator).some(t => t.v === 'const' || t.v === 'CONST');
+    const isExtern = (prefixEndTokens || declarator).some(t => t.v === 'extern');
+    return {
+      name,
+      isFunction: isFunctionDecl,
+      isFnPtr,
+      pointer: isPointer,
+      recordType,
+      extents,
+      isStatic,
+      isConst,
+      isExtern,
+      scope,
+      fileScope,
+    };
+  };
   const recordStatement = (statement, scope, fileScope) => {
     const [first, second] = statement;
     const typePrefix = first?.t === 'id' && (TYPE_WORDS.has(first.v) || (!KEYWORDS.has(first.v) &&
@@ -310,18 +349,72 @@ export function collectDispatchDeclarations(tokens, dispatchScopes, record, macr
     if (!typePrefix) return;
     // 在块内，T *obj 同时也可能是乘法，等包含的头文件收齐后再确认 T 是否为类型。
     const typeToCheck = !fileScope && second?.v === '*' && !TYPE_WORDS.has(first.v) && !isStandardTypeName(first.v) ? first : null;
-    const isExtern = statement.some(t => t.v === 'extern');
-    for (const part of splitAtTopLevel(statement)) {
+    const parts = splitAtTopLevel(statement);
+    const firstDecl = parts[0] || [];
+    const firstEq = firstDecl.findIndex(t => t.v === '=');
+    const firstHead = firstEq < 0 ? firstDecl : firstDecl.slice(0, firstEq);
+    const sharedPrefix = firstHead.slice(0, Math.max(0, firstHead.indexOf(declarationName(firstHead))));
+    for (let pi = 0; pi < parts.length; pi++) {
+      const part = parts[pi];
       const eq = part.findIndex(t => t.v === '=');
       const declarator = eq < 0 ? part : part.slice(0, eq);
-      const name = declarationName(declarator);
-      if (!name || name === first) continue;
-      const isFunction = declarator[declarator.indexOf(name) + 1]?.v === '(';
-      if (isFunction || scope.trackObjects) {
-        const alias = scope.trackObjects && eq >= 0 && pointerBefore(declarator, declarator.indexOf(name))
-          ? aliasReference(part.slice(eq + 1), macros) : null;
-        record({ declaration: name, scope, fileScope, isFunction, typeToCheck, isExtern, alias });
+      const fullDeclarator = pi === 0 ? declarator : [...sharedPrefix, ...declarator];
+      const meta = extractDeclaratorMeta(fullDeclarator, part, scope, fileScope, firstHead);
+      if (!meta || meta.name === first) continue;
+      if (meta.isFunction || scope.trackObjects || fileScope) {
+        const rhsSlice = eq >= 0 ? part.slice(eq + 1) : null;
+        const braceInit = rhsSlice?.[0]?.v === '{';
+        const alias = (scope.trackObjects || fileScope) && !braceInit && rhsSlice && meta.pointer
+          ? aliasReference(rhsSlice, macros, enumValues) : null;
+        const rhsInit = (scope.trackObjects || fileScope) && !braceInit && rhsSlice && !meta.isFunction
+          ? extractWriteRhs(rhsSlice, macros, enumValues) : null;
+        record({
+          declaration: meta.name,
+          scope,
+          fileScope,
+          isFunction: meta.isFunction,
+          isFnPtr: meta.isFnPtr,
+          pointer: meta.pointer,
+          recordType: meta.recordType,
+          extents: meta.extents,
+          isStatic: meta.isStatic,
+          isConst: meta.isConst,
+          typeToCheck,
+          isExtern: meta.isExtern,
+          hasBraceInit: braceInit,
+          alias,
+          ...(rhsInit ? { rhsTargets: rhsInit.rhsTargets, rhsUnknown: rhsInit.rhsUnknown } : {}),
+        });
       }
+    }
+  };
+  const recordFuncParams = (headerEndIdx, childScope) => {
+    let p = headerEndIdx - 1;
+    for (let s; (s = annotationStartAt(tokens, p)) >= 0;) p = s - 1;
+    if (tokens[p]?.v !== ')') return;
+    const open = matchOpenBack(tokens, p);
+    if (open <= 0) return;
+    for (const paramTokens of splitAtTopLevel(tokens.slice(open + 1, p))) {
+      if (!paramTokens.length || (paramTokens.length === 1 && paramTokens[0].v === 'void')) continue;
+      const meta = extractDeclaratorMeta(paramTokens, null, childScope, false, paramTokens);
+      if (!meta || meta.isFunction) continue;
+      record({
+        declaration: meta.name,
+        scope: childScope,
+        fileScope: false,
+        isFunction: false,
+        isParam: true,
+        isFnPtr: meta.isFnPtr,
+        pointer: meta.pointer,
+        recordType: meta.recordType,
+        extents: meta.extents,
+        isStatic: false,
+        isConst: meta.isConst,
+        typeToCheck: null,
+        isExtern: false,
+        hasBraceInit: false,
+        alias: null,
+      });
     }
   };
   let start = 0, hasParen = false;
@@ -342,11 +435,15 @@ export function collectDispatchDeclarations(tokens, dispatchScopes, record, macr
     if (![';', '{', '}'].includes(token.v)) continue;
     const scope = scopes.at(-1);
     const fileScope = scopes.length === 1;
-    // 左花括号也可能开始初始化，此时声明名已经可见。
-    if ((token.v === ';' || (token.v === '{' && tokens[i - 1]?.v === '=')) && (hasParen || scope.trackObjects)) {
+    // 左花括号也可能开始初始化，此时声明名已经可见。文件作用域未初始化表/对象也需要捕获。
+    if ((token.v === ';' || (token.v === '{' && tokens[i - 1]?.v === '=')) && (hasParen || scope.trackObjects || fileScope)) {
       recordStatement(tokens.slice(start, i), scope, fileScope);
     }
-    if (token.v === '{') scopes.push({ end: null, trackObjects: scope.trackObjects || dispatchScopes.has(token) });
+    if (token.v === '{') {
+      const childScope = { end: null, trackObjects: scope.trackObjects || dispatchScopes.has(token) };
+      if (fileScope && hasParen && childScope.trackObjects) recordFuncParams(i, childScope);
+      scopes.push(childScope);
+    }
     if (token.v === '}' && !fileScope) scopes.pop().end = token;
     start = i + 1;
     hasParen = false;
@@ -372,11 +469,11 @@ function declarationName(part) {
 function declarationType(tokens) {
   const tag = tokens.findIndex(t => t.v === 'struct' || t.v === 'union');
   if (tag >= 0) return tokens[tag + 1]?.t === 'id' ? tokens[tag].v + ' ' + tokens[tag + 1].v : null;
-  return tokens.find(t => t.t === 'id' && !KEYWORDS.has(t.v))?.v ?? null;
+  return tokens.find(t => t.t === 'id' && !KEYWORDS.has(t.v) && !ANNOTATIONS.has(t.v))?.v ?? null;
 }
 
 /** 保留初始化器需要的声明形状，包括声明顺序、数组维度和指针。 */
-function initializerDeclarations(statement, macros) {
+function initializerDeclarations(statement, macros, enumValues = null) {
   const parts = splitAtTopLevel(statement);
   const first = parts[0] || [];
   const splitBitField = part => part.some(token => token.v === ':') ? splitAtTopLevel(part, ':') : [part];
@@ -384,7 +481,7 @@ function initializerDeclarations(statement, macros) {
   const firstDeclarator = firstParts[0] || [];
   const base = declarationType(firstDeclarator.slice(0, firstDeclarator.indexOf(declarationName(firstDeclarator))));
   const open = first.findIndex(t => t.v === '{');
-  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), macros) : null;
+  const fields = open >= 0 ? initializerMembers(first.slice(open + 1, matchBrace(first, open)), macros, enumValues) : null;
   const shapes = new Map();
   for (const part of parts) {
     const [declarator = [], bitWidth] = part === first ? firstParts : splitBitField(part);
@@ -402,7 +499,7 @@ function initializerDeclarations(statement, macros) {
         if (part[j].v === '[') depth++;
         if (part[j].v === ']') depth--;
       }
-      extents.push(parseConstIndex(part.slice(start, j - 1), macros));
+      extents.push(parseConstIndex(part.slice(start, j - 1), macros, enumValues));
     }
     let before = name - 1;
     while (['const', 'volatile', 'restrict'].includes(part[before]?.v)) before--;
@@ -411,20 +508,20 @@ function initializerDeclarations(statement, macros) {
   return shapes;
 }
 
-function initializerMembers(body, macros) {
+function initializerMembers(body, macros, enumValues = null) {
   const fields = new Map();
   for (const part of splitAtTopLevel(body, ';')) {
     if (['struct', 'union'].includes(part[0]?.v) && part[1]?.v === '{' && matchBrace(part, 1) === part.length - 1) {
       fields.set('@anonymous:' + part[0].s, { anonymous: true });
       continue;
     }
-    for (const [name, shape] of initializerDeclarations(part, macros)) fields.set(name, shape);
+    for (const [name, shape] of initializerDeclarations(part, macros, enumValues)) fields.set(name, shape);
   }
   return fields;
 }
 
 /** 收集类型声明及作用域；成员声明帮助区分标量与只初始化了一项的数组。 */
-export function findTypedefs(tokens, macros) {
+export function findTypedefs(tokens, macros, enumValues = collectEnumValues(tokens, macros).enumValues) {
   const aliases = new Map();
   const scopes = [{ end: null }];
   const record = (name, declaration, shape) => {
@@ -438,7 +535,7 @@ export function findTypedefs(tokens, macros) {
     if ((token.v === 'struct' || token.v === 'union') && tokens[i + 1]?.t === 'id' && tokens[i + 2]?.v === '{') {
       const close = matchBrace(tokens, i + 2);
       record(token.v + ' ' + tokens[i + 1].v, token, {
-        union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close), macros),
+        union: token.v === 'union', fields: initializerMembers(tokens.slice(i + 3, close), macros, enumValues),
       });
       i = close;
       continue;
@@ -452,7 +549,7 @@ export function findTypedefs(tokens, macros) {
       if ([')', ']', '}'].includes(value)) depth--;
     }
     if (tokens[end]?.v !== ';') continue;
-    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end), macros)) {
+    for (const [name, shape] of initializerDeclarations(tokens.slice(i + 1, end), macros, enumValues)) {
       record(name, shape.token, shape);
       if (shape.fields && shape.type && !aliases.get(shape.type)?.some(entry => entry.declaration === token)) {
         record(shape.type, token, { fields: shape.fields, union: shape.union });
@@ -463,17 +560,243 @@ export function findTypedefs(tokens, macros) {
   return aliases;
 }
 
-/** 解析常量整数索引（如 0, 1, 0x02），非常量返回 null */
-function parseConstIndex(tokens, macros) {
+function parseSingleIntLiteral(v) {
+  if (v.startsWith("'")) {
+    // 普通字符及命名转义依赖目标执行字符集。仅小数值转义可不依赖字符集求值。
+    const esc = /^'\\(?:([0-7]{1,3})|x([0-9a-fA-F]+))'$/.exec(v);
+    if (!esc) return null;
+    const code = Number.parseInt(esc[1] || esc[2], esc[1] ? 8 : 16);
+    return code <= 127 ? code : null;
+  }
+  const literal = /^(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9]\d*)(?:[uU](?:ll|LL|[lL])?|(?:ll|LL|[lL])[uU]?)?$/.exec(v);
+  if (!literal) return null;
+  const digits = literal[1];
+  return Number(/^0[0-7]+$/.test(digits) ? '0o' + digits.slice(1) : digits);
+}
+
+/** 枚举成员从声明处可见，离开声明所在块后恢复外层同名绑定。 */
+export function collectEnumValues(tokens, macros = null, imports = []) {
+  const bindings = new Map(), fileValues = new Map();
+  const scopes = [{ end: null }];
+  const compare = (a, b) => a.line - b.line || a.col - b.col;
+  const braces = [];
+  let objects;
+  const bindingAt = (name, at) => {
+    const entry = bindings.get(name)?.findLast(({ token, scope }) =>
+      compare(token, at) <= 0 && (!scope.end || compare(at, scope.end) < 0));
+    if (!entry) return null;
+    // 普通标识符和枚举成员共享命名空间。复用分派声明器识别参数和块内对象。
+    if (!objects) {
+      objects = new Map();
+      const bodies = new Set(findFunctions(tokens, '').map(fn => tokens[fn.bodyStart]));
+      collectDispatchDeclarations(tokens, bodies, b => {
+        if (b.fileScope || b.isFunction) return;
+        const key = b.declaration.v;
+        if (!objects.has(key)) objects.set(key, []);
+        objects.get(key).push(b);
+      }, macros);
+    }
+    const masked = objects.get(name)?.some(({ declaration, scope }) => compare(entry.token, declaration) < 0 &&
+      compare(declaration, at) <= 0 && (!scope.end || compare(at, scope.end) < 0));
+    return masked ? null : entry;
+  };
+  const enumValues = {
+    get: (name, at) => at ? bindingAt(name, at)?.value : fileValues.get(name),
+    has: (name, at) => at ? !!bindingAt(name, at) : fileValues.has(name),
+  };
+  const bind = (name, value, token) => {
+    if (!bindings.has(name)) bindings.set(name, []);
+    bindings.get(name).push({ token, scope: scopes.at(-1), value });
+    if (scopes.length === 1) fileValues.set(name, value);
+  };
+  if (imports instanceof Map) imports = [{ line: 0, values: imports }];
+  let include = 0;
+  const importBefore = line => {
+    while (include < imports.length && imports[include].line < line) {
+      const { line: at, values } = imports[include++];
+      for (const [name, value] of values) bind(name, value, { line: at, col: 1 });
+    }
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    importBefore(token.line);
+    while (scopes.at(-1).stop === i) scopes.pop().end = token;
+    if (token.v === 'for') scopes.push({ stop: statementEnd(tokens, i), end: null });
+    if (token.v === '{') {
+      const prev = tokens[i - 1];
+      const isRecord = ['struct', 'union'].includes(prev?.v) ||
+        (prev?.t === 'id' && ['struct', 'union'].includes(tokens[i - 2]?.v));
+      braces.push(!isRecord);
+      if (!isRecord) scopes.push({ end: null });
+      continue;
+    }
+    if (token.v === '}') {
+      if (braces.pop()) scopes.pop().end = token;
+      continue;
+    }
+    if (token.v !== 'enum') continue;
+    const open = tokens[i + 1]?.v === '{' ? i + 1 : tokens[i + 2]?.v === '{' ? i + 2 : -1;
+    if (open < 0) continue;
+    const close = matchBrace(tokens, open);
+    let next = 0;
+    for (const part of splitAtTopLevel(tokens.slice(open + 1, close))) {
+      const member = part[0];
+      if (member?.t !== 'id') continue;
+      const eq = part.findIndex(t => t.v === '=');
+      const value = eq < 0 ? next : parseConstIndex(part.slice(eq + 1), macros, enumValues);
+      next = Number.isSafeInteger(value) && Number.isSafeInteger(value + 1) ? value + 1 : null;
+      bind(member.v, value, member);
+    }
+    i = close;
+  }
+  importBefore(Infinity);
+  return { enumValues, fileValues };
+}
+
+/** 解析常量整数索引（如 0, 0x02, ENUM_A + 1, A << 1），含未知运行时符号则返回 null */
+export function parseConstIndex(tokens, macros, enumValues = null) {
+  if (!tokens?.length) return null;
   if (macros && tokens.some(t => t.t === 'id')) tokens = expandSeq(tokens, macros);
   tokens = stripOuterParens(tokens);
-  if (tokens.length !== 1 || tokens[0].t !== 'num') return null;
-  const s = tokens[0].v.replace(/[uUlL]+$/, '');
-  let value;
-  if (/^0[xX][0-9a-fA-F]+$/.test(s)) value = Number(s);
-  else if (/^0[0-7]*$/.test(s)) value = Number.parseInt(s, 8);
-  else if (/^[1-9]\d*$/.test(s)) value = Number(s);
-  return Number.isSafeInteger(value) ? value : null;
+  if (!tokens.length) return null;
+  if (tokens.length === 1) {
+    const tk = tokens[0];
+    if (tk.t === 'num' || tk.t === 'str') {
+      const val = parseSingleIntLiteral(tk.v);
+      return Number.isSafeInteger(val) ? val : null;
+    }
+    if (tk.t === 'id' && enumValues?.has(tk.v, tk)) {
+      const val = enumValues.get(tk.v, tk);
+      return Number.isSafeInteger(val) ? val : null;
+    }
+    return null;
+  }
+  // 没有目标 ABI 时，仅在整数提升、符号转换和溢出都不影响结果时折叠。
+  // 非负操作数转换至公共类型保持其值。小有符号常量组成的表达式也可安全产生负值。
+  const smallSigned = tokens.every(t => t.t !== 'id' && (t.t !== 'num' ||
+    (!/[uU]/.test(t.v) && (parseSingleIntLiteral(t.v) ?? Infinity) <= 32767)));
+  const portable = n => n >= (smallSigned ? -32767 : 0) && n <= 32767 ? n : null;
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const parsePrimary = () => {
+    const tk = tokens[pos];
+    if (!tk) return null;
+    if (tk.v === '(') {
+      pos++;
+      const v = parseTernary();
+      if (v === null || tokens[pos]?.v !== ')') return null;
+      pos++;
+      return v;
+    }
+    if (tk.t === 'num' || tk.t === 'str') {
+      pos++;
+      const n = parseSingleIntLiteral(tk.v);
+      return Number.isSafeInteger(n) ? n : null;
+    }
+    if (tk.t === 'id' && enumValues?.has(tk.v, tk)) {
+      pos++;
+      const n = enumValues.get(tk.v, tk);
+      return Number.isSafeInteger(n) && n >= 0 ? n : null;
+    }
+    return null;
+  };
+  const parseUnary = () => {
+    const v = peek()?.v;
+    if (v === '+' || v === '-' || v === '~' || v === '!') {
+      pos++;
+      const sub = parseUnary();
+      if (sub === null) return null;
+      if (v === '+') return +sub;
+      if (v === '-') return portable(-sub);
+      if (v === '~') return null; // 取反的值依赖提升后的宽度和符号表示。
+      return sub ? 0 : 1;
+    }
+    return parsePrimary();
+  };
+  const parseBin = (next, ops, calc) => {
+    let left = next();
+    while (left !== null && ops.includes(peek()?.v)) {
+      const op = tokens[pos++].v;
+      const right = next();
+      if (right === null) return null;
+      left = calc(left, op, right);
+      if (left === null || !Number.isSafeInteger(left)) return null;
+    }
+    return left;
+  };
+  const parseMul = () => parseBin(parseUnary, ['*', '/', '%'], (a, op, b) => {
+    if (op === '*') return portable(a * b);
+    if (b === 0) return null;
+    return Number(op === '/' ? BigInt(a) / BigInt(b) : BigInt(a) % BigInt(b));
+  });
+  const parseAdd = () => parseBin(parseMul, ['+', '-'], (a, op, b) => portable(op === '+' ? a + b : a - b));
+  const parseShift = () => parseBin(parseAdd, ['<<', '>>'], (a, op, b) => {
+    // 整数提升后至少 16 位，左值本身也给出位宽下限。其余移位计数依赖目标类型。
+    if (a < 0 || b < 0 || b >= Math.max(16, a.toString(2).length)) return null;
+    return op === '>>' ? Number(BigInt(a) >> BigInt(b)) : portable(Number(BigInt(a) << BigInt(b)));
+  });
+  const parseRel = () => parseBin(parseShift, ['<', '<=', '>', '>='], (a, op, b) =>
+    (op === '<' ? a < b : op === '<=' ? a <= b : op === '>' ? a > b : a >= b) ? 1 : 0);
+  const parseEq = () => parseBin(parseRel, ['==', '!='], (a, op, b) => ((op === '==' ? a === b : a !== b) ? 1 : 0));
+  const parseBitAnd = () => parseBin(parseEq, ['&'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) & BigInt(b)));
+  const parseBitXor = () => parseBin(parseBitAnd, ['^'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) ^ BigInt(b)));
+  const parseBitOr = () => parseBin(parseBitXor, ['|'], (a, _, b) => a < 0 || b < 0 ? null : Number(BigInt(a) | BigInt(b)));
+  const parseLogAnd = () => parseBin(parseBitOr, ['&&'], (a, _, b) => (a && b ? 1 : 0));
+  const parseLogOr = () => parseBin(parseLogAnd, ['||'], (a, _, b) => (a || b ? 1 : 0));
+  const parseTernary = () => {
+    const cond = parseLogOr();
+    if (cond === null) return null;
+    if (peek()?.v !== '?') return cond;
+    pos++;
+    const a = parseTernary();
+    if (a === null || peek()?.v !== ':') return null;
+    pos++;
+    const b = parseTernary();
+    if (b === null) return null;
+    return cond ? a : b;
+  };
+  const val = parseTernary();
+  return pos === tokens.length && Number.isSafeInteger(val) ? val : null;
+}
+
+/** 提取赋值或条件初始化表达式右侧可能的直接/条件函数指针候选 */
+function extractWriteRhs(rhsTokens, macros, enumValues = null) {
+  const expanded = stripOuterParens(macros ? expandSeq(rhsTokens, macros) : rhsTokens);
+  const targets = new Set();
+  let alias = null;
+  let unknown = false;
+  const visit = (toks) => {
+    const slice = stripOuterParens(toks);
+    if (!slice.length) { unknown = true; return; }
+    // 顶层条件运算符 cond ? a : b
+    let depth = 0, qIdx = -1, cIdx = -1;
+    for (let k = 0; k < slice.length; k++) {
+      const v = slice[k].v;
+      if (v === '(' || v === '[' || v === '{') depth++;
+      else if (v === ')' || v === ']' || v === '}') depth--;
+      else if (depth === 0) {
+        if (v === '?' && qIdx < 0) qIdx = k;
+        else if (v === ':' && qIdx >= 0 && cIdx < 0) { cIdx = k; break; }
+      }
+    }
+    if (qIdx >= 0 && cIdx > qIdx) {
+      visit(slice.slice(qIdx + 1, cIdx));
+      visit(slice.slice(cIdx + 1));
+      return;
+    }
+    const op = simpleInitializerOperand(slice);
+    if (op?.t === 'id' && !KEYWORDS.has(op.v)) {
+      if (NON_FN_IDENTS.has(op.v)) return;
+      targets.add(op.v);
+      return;
+    }
+    if (op?.t === 'num' && parseConstIndex([op], null, enumValues) === 0) return;
+    const ref = aliasReference(slice, macros, enumValues);
+    if (ref && !alias) { alias = ref; return; }
+    unknown = true;
+  };
+  visit(expanded);
+  return { rhsTargets: [...targets], rhsAlias: alias, rhsUnknown: unknown };
 }
 
 function formatInitIndex(index) {
@@ -592,7 +915,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
           if (item[k].v === ']') depth--;
         }
         const expr = item.slice(start, k - 1);
-        designators.push(parseConstIndex(expr) ?? { expr: expr.map(t => t.v).join(''), offset: 0 });
+        designators.push(parseConstIndex(expr, null, status.enumValues) ?? { expr: expr.map(t => t.v).join(''), offset: 0 });
       } else break;
     }
     const designated = designators.length && item[k]?.v === '=';
@@ -616,7 +939,7 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
         parts.push(0);
         child = child.element;
       } else if (child?.names?.length && (operand?.t === 'num' || val[0].v === '&' ||
-          (operand?.t === 'id' && (status.isFunction(operand) || status.enumNames.has(operand.v))) ||
+          (operand?.t === 'id' && (status.isFunction(operand) || status.enumValues.has(operand.v, operand))) ||
           (stringInitializer || val[0].t === 'str' || val[0].v === 'sizeof'))) {
         descended ??= new Set();
         if (descended.has(child)) { status.incomplete = true; break; }
@@ -664,12 +987,20 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
     } else {
       // 同一槽位的后一个初始化覆盖前一个。未知的整个结构体可能提供任一成员。
       status.unresolvedSlots.delete(slot);
+      if (table.candidateMap) delete table.candidateMap[slot];
       if (!child?.names && operand?.t === 'id' && !KEYWORDS.has(operand.v) && !NON_FN_IDENTS.has(operand.v)) {
         table.map[slot] = operand.v;
         table.slotLines[slot] = operand.line;
       } else {
         delete table.map[slot];
         delete table.slotLines[slot];
+        if (!child?.names) {
+          const rhs = extractWriteRhs(val, null, status.enumValues);
+          if (rhs.rhsTargets.length) {
+            table.candidateMap ??= {};
+            table.candidateMap[slot] = rhs.rhsTargets;
+          }
+        }
         if (child?.names || !operand || (operand.t === 'num' && val.length > 1 && parseConstIndex([operand]) !== 0)) {
           status.unresolvedSlots.add(slot);
         }
@@ -696,17 +1027,11 @@ function collectInitSlots(inner, prefix, layout, table, status, scalarBrace = fa
  *   const fn_t e[2][3] = { {vvv, ggg, jjj}, {ghh, jkk, kkk} };
  *   const Entry tbl[] = { { .enter = Enter_A, .run = Run_A }, ... };
  */
-export function findFnPtrTables(tokens, file = '', { functionId = null, macros, pendingFields } = {}) {
+export function findFnPtrTables(tokens, file = '', { functionId = null, macros, pendingFields, enumValues: inheritedEnums = null } = {}) {
   const tables = new Map();
   const scopes = [{ end: null }];
-  const enumNames = new Set();
-  for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i].v !== 'enum') continue;
-    const open = tokens[i + 1]?.v === '{' ? i + 1 : tokens[i + 2]?.v === '{' ? i + 2 : -1;
-    if (open < 0) continue;
-    const close = matchBrace(tokens, open);
-    for (const part of splitAtTopLevel(tokens.slice(open + 1, close))) if (part[0]?.t === 'id') enumNames.add(part[0].v);
-  }
+  const enumValues = !inheritedEnums || inheritedEnums instanceof Map
+    ? collectEnumValues(tokens, macros, inheritedEnums || []).enumValues : inheritedEnums;
   let localTypes;
   let localFunctions;
   const localFunction = token => {
@@ -714,7 +1039,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
     return localFunctions.has(token.v);
   };
   const localLookup = (_, name, at) => {
-    localTypes ??= findTypedefs(tokens, macros);
+    localTypes ??= findTypedefs(tokens, macros, enumValues);
     const entry = localTypes.get(name)?.findLast(e => e.declaration.s <= at.s && (!e.scope.end || e.scope.end.s > at.s));
     return entry && { file, shape: entry.shape };
   };
@@ -752,7 +1077,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
         else if (tokens[p].v === '[') depth--;
         p--;
       }
-      extents.unshift(parseConstIndex(tokens.slice(p + 2, close), macros));
+      extents.unshift(parseConstIndex(tokens.slice(p + 2, close), macros, enumValues));
     }
     const nameTok = tokens[p];
     if (nameTok?.t !== 'id' || TYPE_WORDS.has(nameTok.v)) continue;
@@ -780,7 +1105,7 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       }
       const kind = ['struct', 'union'].includes(tokens[open]?.v) ? tokens[open].v : tokens[open - 1]?.v;
       if (['struct', 'union'].includes(kind)) {
-        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration), macros);
+        rootShape.fields = initializerMembers(tokens.slice(open + 2, beforeDeclaration), macros, enumValues);
         rootShape.union = kind === 'union';
         for (let j = open; j >= 0 && ![';', '{', '}'].includes(tokens[j].v); j--) {
           if (['static', 'STATIC'].includes(tokens[j].v)) isStatic = true;
@@ -794,16 +1119,18 @@ export function findFnPtrTables(tokens, file = '', { functionId = null, macros, 
       line: nameTok.line,
       isStatic,
       isConst,
+      recordType: rootShape.type || null,
       dims: extents.length,
       map: {},
       slotLines: {},
       slots: new Map(),
-      ...(functionId && { functionId, declaration: nameTok, scope: scopes.at(-1) }),
+      declaration: nameTok,
+      ...(functionId && { functionId, scope: scopes.at(-1) }),
     };
     const fill = (lookup, isFunction = localFunction) => {
       const status = {
         incomplete: false,
-        enumNames,
+        enumValues,
         unresolvedSlots: new Set(),
         initializedAggregates: new Set(),
         activeUnionMembers: new Map(),
@@ -859,7 +1186,7 @@ function receiverBefore(tokens, end) {
 }
 
 /** 从调用位置回溯到根对象，保留下标与成员交错出现的顺序。 */
-function dispatchReference(tokens, end, macros) {
+function dispatchReference(tokens, end, macros, enumValues = null) {
   let j = end;
   const path = [];
   const indexExprs = [];
@@ -868,7 +1195,7 @@ function dispatchReference(tokens, end, macros) {
       const open = matchOpenBack(tokens, j);
       if (open < 0) return null;
       const expr = tokens.slice(open + 1, j);
-      path.unshift(parseConstIndex(expr, macros));
+      path.unshift(parseConstIndex(expr, macros, enumValues));
       indexExprs.unshift(expr.map(t => t.v).join(''));
       j = open - 1;
     } else if (tokens[j].t === 'id' && ['.', '->'].includes(tokens[j - 1]?.v)) {
@@ -891,23 +1218,25 @@ function pointerBefore(tokens, index) {
 }
 
 /** 只跟踪取址和裸数组退化，调用、算术及条件表达式都没有唯一的静态来源。 */
-function aliasReference(tokens, macros) {
+function aliasReference(tokens, macros, enumValues = null) {
   let value = stripOuterParens(macros ? expandSeq(tokens, macros) : tokens);
   const address = value[0]?.v === '&';
   if (address) value = stripOuterParens(value.slice(1));
   if (value[0]?.t !== 'id' || (!address && value.length !== 1)) return null;
-  const ref = dispatchReference(value, value.length - 1);
+  const ref = dispatchReference(value, value.length - 1, null, enumValues);
   if (!ref || ref.start !== 0 || ref.receiver !== value[0].v) return null;
   return { receiver: ref.receiver, path: ref.path, indexExprs: ref.indexExprs, address, line: value[0].line, col: value[0].col };
 }
 
-/** 收集可能改写分派表或改变局部指针绑定的位置，等作用域收齐后再绑定。 */
-export function findDispatchWrites(body, macros, aliasUses = []) {
+/** 收集可能改写分派表、结构体成员或改变局部/全局指针绑定的位置，等作用域收齐后再绑定。 */
+export function findDispatchWrites(body, macros, aliasUses = [], enumValues = null) {
   const tokens = expandSeq(body, macros);
   const writes = [];
   const pointerNames = new Set();
   for (let i = 1; i < tokens.length; i++) {
-    if (tokens[i].v === '=' && tokens[i - 1].t === 'id' && pointerBefore(tokens, i - 1)) pointerNames.add(tokens[i - 1].v);
+    if (tokens[i - 1].t === 'id' && pointerBefore(tokens, i - 1) && (tokens[i].v === '=' || tokens[i].v === ';')) {
+      pointerNames.add(tokens[i - 1].v);
+    }
   }
   for (let i = 0; i < tokens.length; i++) {
     const name = tokens[i];
@@ -918,7 +1247,7 @@ export function findDispatchWrites(body, macros, aliasUses = []) {
       if (tokens[i + 1]?.v === '=' && !pointerBefore(tokens, i)) {
         let end = i + 2;
         while (end < tokens.length && ![';', ',', '}'].includes(tokens[end].v)) end++;
-        alternative = aliasReference(tokens.slice(i + 2, end));
+        alternative = aliasReference(tokens.slice(i + 2, end), null, enumValues);
       }
       aliasUses.push({ name: name.v, line: name.line, col: name.col, alternative });
     }
@@ -934,7 +1263,7 @@ export function findDispatchWrites(body, macros, aliasUses = []) {
           if (tokens[end].v === ']') depth--;
           end++;
         }
-        const index = parseConstIndex(tokens.slice(first, end - 1));
+        const index = parseConstIndex(tokens.slice(first, end - 1), null, enumValues);
         indices.push(index);
         path.push(index);
       } else if (['.', '->'].includes(tokens[end]?.v) && tokens[end + 1]?.t === 'id') {
@@ -956,10 +1285,27 @@ export function findDispatchWrites(body, macros, aliasUses = []) {
     const addressed = prev === '&';
     const decayed = ['=', '(', ',', 'return'].includes(prev) && [')', ',', ';', '+'].includes(next) &&
       !(prev === '(' && CONTROL.has(tokens[start - 2]?.v));
-    if (assigned || addressed || decayed) writes.push({
-      receiver: name.v, line: name.line, col: name.col,
-      indices, member, path, escape: addressed ? 'address' : !assigned && decayed ? 'array' : null,
-    });
+    if (assigned || addressed || decayed) {
+      let rhs = null;
+      if (assigned) {
+        let rhsEnd = end + 1, rhsDepth = 0;
+        while (rhsEnd < tokens.length) {
+          const v = tokens[rhsEnd].v;
+          if (v === '(' || v === '[' || v === '{') rhsDepth++;
+          else if (v === ')' || v === ']' || v === '}') {
+            if (rhsDepth === 0) break;
+            rhsDepth--;
+          } else if (rhsDepth === 0 && (v === ';' || v === ',')) break;
+          rhsEnd++;
+        }
+        rhs = extractWriteRhs(tokens.slice(end + 1, rhsEnd), null, enumValues);
+      }
+      writes.push({
+        receiver: name.v, line: name.line, col: name.col, cond: name.cond,
+        indices, member, path, escape: addressed ? 'address' : !assigned && decayed ? 'array' : null,
+        ...(rhs ? { rhsTargets: rhs.rhsTargets, rhsAlias: rhs.rhsAlias, rhsUnknown: rhs.rhsUnknown } : {}),
+      });
+    }
   }
   return writes;
 }
@@ -1100,7 +1446,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
         }
         if (inner.length >= 2 && inner[0].v === '*') {
           const deref = stripOuterParens(inner.slice(1));
-          const ref = dispatchReference(deref, deref.length - 1, ctx.macros);
+          const ref = dispatchReference(deref, deref.length - 1, ctx.macros, ctx.enumValues);
           if (ref?.start === 0 && (ref.path.length || deref.length === 1)) {
             // 下标和复杂接收表达式本身也可能包含调用。
             scanCalls(deref, ctx, out, macroChain);
@@ -1116,7 +1462,7 @@ export function scanCalls(tokens, ctx, out, macroChain = []) {
     // 同一种路径表示覆盖 rows[i].sub.fn()、ops.slots[i]() 与纯数组调用。
     if (tokens[i + 1]?.v === '(' &&
         (tk.v === ']' || (tk.t === 'id' && ['.', '->'].includes(tokens[i - 1]?.v)))) {
-      const ref = dispatchReference(tokens, i, ctx.macros);
+      const ref = dispatchReference(tokens, i, ctx.macros, ctx.enumValues);
       if (ref) recordDispatch(ref, tk);
       continue;
     }

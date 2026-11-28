@@ -1,4 +1,4 @@
-import { edgeCaption, isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
+import { edgeCaption, isDataEdge, svgEdgeStroke } from '../../web/lib/edge-flow.js';
 /**
  * 导出：Excel 多 sheet / 单文件 HTML / SVG
  */
@@ -47,10 +47,7 @@ export function buildSVGFromLayout(laid) {
     const d = roundedPathD(e.points, 7);
     const style = e.change === 'added' ? 'added' : isDataEdge(e) ? 'var' : 'direct';
     const c = C[style];
-    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
-    out.push(
-      `<path d="${d}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
-    );
+    out.push(svgEdgeStroke(e, d, c, 1.3, `mk-${style}`, `data-from="${esc(e.from)}" data-to="${esc(e.to)}"`));
     if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 

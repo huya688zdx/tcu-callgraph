@@ -119,6 +119,7 @@ function renderDataflowResult(error = '') {
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
     <div class="df-actions"><button class="primary" data-df="toggle">${t('common.relAdd')}</button>
+      ${window.__EXPORT ? '' : '<button type="button" data-df="askAi" title="将数据流分析结果明确加入 AI 对话上下文">✨ 加入对话</button>'}
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -181,6 +182,7 @@ export async function analyseDataflow(fnId) {
     const res = await api.dataflow(fnId, 'both');
     if (seq !== querySeq || projectId !== state.view?.projectId) return;
     if (!res || res.error || res.ok === false) throw new Error(res?.error || t('df.unknownError'));
+    if (!currentDataflowScope(res)) return clearDataflow();
     df.result = res;
     renderDataflowResult();
   } catch (err) {
@@ -273,9 +275,50 @@ document.addEventListener('dblclick', (e) => {
   void toggleSelectedRelation();
 });
 
+function currentDataflowScope(res) {
+  return (res.projectId == null || res.projectId === state.view?.projectId) &&
+    (!Object.hasOwn(res, 'comparisonId') || res.comparisonId === (state.view?.comparison?.id ?? null)) &&
+    (res.sessionRevision == null || res.sessionRevision === state.view?.sessionRevision);
+}
+
+function buildDataflowAiDetail() {
+  const res = df.result;
+  if (!res?.fn || !currentDataflowScope(res)) return null;
+  const rows = relations(res);
+  const chosen = rows[df.selected];
+  return {
+    kind: 'dataflow',
+    id: `dataflow:${res.fn.id}`,
+    targetId: res.fn.id,
+    targetName: res.fn.name,
+    dir: 'both',
+    file: res.fn.file || '',
+    line: res.fn.line || 0,
+    label: `数据流 · ${res.fn.name} (${rows.length})`,
+    relationCount: rows.length,
+    projectId: res.projectId,
+    comparisonId: res.comparisonId,
+    sessionRevision: res.sessionRevision,
+    ...(chosen ? {
+      focused: {
+        varId: chosen.v.id,
+        varName: chosen.v.name,
+        mode: chosen.v.mode,
+        peerId: chosen.peer.id,
+        peerName: chosen.peer.name,
+        version: chosen.v.version,
+      },
+    } : {}),
+  };
+}
+
 document.addEventListener('click', (e) => {
   const button = e.target.closest?.('#secDataflow [data-df]');
   if (!button || button.disabled) return;
   if (button.dataset.df === 'toggle') void toggleSelectedRelation();
   if (button.dataset.df === 'close') clearDataflow();
+  if (button.dataset.df === 'askAi') {
+    const detail = buildDataflowAiDetail();
+    if (detail) document.dispatchEvent(new CustomEvent('cg:ask-ai', { detail }));
+  }
 });

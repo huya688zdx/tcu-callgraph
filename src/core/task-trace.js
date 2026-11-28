@@ -37,7 +37,9 @@ export function traceToTasks(model, id, { offset = 0, limit = 32 } = {}) {
     const path = [task.id], edges = [];
     for (let edge = next.get(task.id); edge; edge = next.get(edge.to)) {
       const { from, to, line, kind, via, macroDefinitions, cond } = edge;
-      edges.push({ from, to, line, kind, via, macroDefinitions, cond, edgeKey: `${from}->${to}:${line}` });
+      edges.push({ from, to, line, kind, via, macroDefinitions, cond,
+        ...(edge.resolution ? { resolution: edge.resolution } : {}), ...(edge.inferred ? { inferred: true } : {}),
+        edgeKey: `${from}->${to}:${line}` });
       path.push(to);
     }
     return { taskId: task.id, path, edges };

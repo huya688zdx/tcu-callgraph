@@ -20,7 +20,7 @@ import { draw, pulseAdded } from './render.js';
 import { constrainCam, focusBox } from './camera.js';
 import { renderLabelPanel } from './label-panel.js';
 import { markReviewUpdated, reloadTimeline, reviewTransition } from './timeline.js';
-import { reloadBookmarks } from './bookmarks.js';
+import { bookmarkMetadata, reloadBookmarks } from './bookmarks.js';
 import { closeModal } from './modal.js';
 import { syncProjectLabel } from './projects.js';
 import { notifyGitChanged } from './git-compare.js';
@@ -29,7 +29,7 @@ import { notifyGitChanged } from './git-compare.js';
 
 let es = null;
 try {
-  es = new EventSource('/api/stream');
+  es = new EventSource('/api/stream?clientId=' + encodeURIComponent(clientId));
 } catch {
   /* 环境不支持 SSE：退回「手动刷新可见」，不影响其他功能 */
 }
@@ -88,6 +88,7 @@ async function flushReload() {
         up: page.up ?? 0, down: page.down ?? 0, group: page.group, groupMode: page.groupMode, empty: !!page.empty,
         vars: page.vars || [], hiddenVars: page.hiddenVars || [],
       });
+      if (page.revision <= pageRevision) return; // 等待加载期间，撤销可能已安装更新的页面。
       if (!view) throw new Error(t('live.composeFailed'));
       pageRevision = page.revision;
       state.selected = view.nodes.some((node) => node.id === page.selected) ? page.selected : null;
@@ -139,6 +140,7 @@ async function flushReload() {
     void loadStats().catch(() => {});
     void reloadTimeline(); // 时间轴面板开着时同步新事件
   } catch {
+    if (compose && compose.page.revision <= pageRevision) return;
     // 刷新失败（服务重启中等）：稍后重试，连续失败则放弃并提示手动刷新
     failures++;
     if (failures <= 3) {
@@ -200,15 +202,27 @@ if (es) {
       toast(t('live.projectSwitched', { project: m.project || '' }));
       return;
     }
-    if (m.actor !== 'ai') return;
     const projectId = m.projectId ?? m.page?.projectId;
     if (projectId != null && projectId !== state.view?.projectId) return;
     if (m.op.startsWith('bookmark.')) {
+      // AI 工具的请求来自同一个窗口，但没有执行书签面板的本地更新。
+      if (m.actor !== 'ai' && m.clientId === clientId) return;
+      if (m.bookmark && state.activeBookmark?.id === m.bookmark.id) {
+        state.activeBookmark = bookmarkMetadata(state.activeBookmark, m.bookmark, m.op === 'bookmark.rename');
+        hooks.syncBookmarkBadge?.();
+        window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: state.activeBookmark, prev: null, remote: true } }));
+      } else if (m.op === 'bookmark.delete' && state.activeBookmark?.id === m.bookmarkId) {
+        const prev = state.activeBookmark;
+        state.activeBookmark = null;
+        hooks.syncBookmarkBadge?.();
+        window.dispatchEvent(new CustomEvent('cg:bookmark-changed', { detail: { bookmark: null, prev, remote: true } }));
+      }
       reloadBookmarks();
       void reloadTimeline();
-      if (state.at || reviewTransition()) markReviewUpdated();
+      if (m.actor === 'ai' && (state.at || reviewTransition())) markReviewUpdated();
       return;
     }
+    if (m.actor !== 'ai') return;
     if (m.op === 'view.compose' && m.page) {
       if (m.page.revision <= Math.max(pageRevision, pendingCompose?.page.revision ?? 0)) return;
       pendingCompose = m;
@@ -216,6 +230,39 @@ if (es) {
     lastAiOp = m.op || '';
     if (state.at || reviewTransition()) markReviewUpdated();
     scheduleReload();
+  });
+  es.addEventListener('canvas_overlay', (ev) => {
+    let m = null;
+    try { m = JSON.parse(ev.data || '{}'); } catch { return; }
+    if (!m || m.projectId == null || m.projectId !== state.view?.projectId ||
+        (m.sessionRevision != null && m.sessionRevision !== state.view.sessionRevision)) return;
+    if (m.action === 'clear') {
+      state.aiOverlay = null;
+      state.presentation = null;
+      document.dispatchEvent(new CustomEvent('cg:ai-overlay-cleared'));
+      draw({ geometryUnchanged: true });
+      return;
+    }
+    state.aiOverlay = {
+      action: m.action || 'spotlight',
+      nodeIds: Array.isArray(m.nodeIds) ? m.nodeIds.filter(Boolean) : [],
+      edgeKeys: Array.isArray(m.edgeKeys) ? m.edgeKeys.filter(Boolean) : [],
+      title: typeof m.title === 'string' ? m.title : '',
+      updatedAt: Date.now(),
+    };
+    if (m.focus && state.view && state.aiOverlay.nodeIds.length) {
+      const hit = new Set(state.aiOverlay.nodeIds);
+      const matched = (state.view.nodes || []).filter((n) => hit.has(n.id));
+      if (matched.length) {
+        const minX = Math.min(...matched.map((n) => n.x));
+        const minY = Math.min(...matched.map((n) => n.y));
+        const maxX = Math.max(...matched.map((n) => n.x + n.w));
+        const maxY = Math.max(...matched.map((n) => n.y + n.h));
+        focusBox({ x: minX, y: minY, w: maxX - minX, h: maxY - minY });
+        return;
+      }
+    }
+    draw({ geometryUnchanged: true });
   });
   // 断线由浏览器按服务端给的 retry 间隔自动重连，无需处理 onerror
 }
@@ -237,6 +284,28 @@ export function acceptRestoredRevision(revision) {
   }
 }
 
+// AI 撤销已在服务端提交。以最新保存范围刷新，保留本窗口的镜头、书签和回看位置。
+export async function refreshAfterAiUndo({ canvasChanged, scopeChanged, eventId }, projectId) {
+  void reloadTimeline();
+  if (!canvasChanged || state.view?.projectId !== projectId || state.view?.comparison) return;
+  if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+  let view;
+  if (scopeChanged) {
+    const latest = await api.savedPage();
+    if (latest.ok === false) throw new Error(latest.error);
+    if (state.view?.projectId !== projectId || latest.project?.id !== projectId || latest.comparisonId) return;
+    if (state.at || reviewTransition()) { markReviewUpdated(); return; }
+    const page = latest.page;
+    if (!page) throw new Error(t('app.viewFailed'));
+    acceptRestoredRevision(Math.max(eventId, page.revision));
+    view = await hooks.loadView(page.roots, { ...page, nav: false, incremental: true, keepViewport: true });
+  } else {
+    view = await hooks.reloadKeepCam({ keepViewport: true });
+  }
+  if (!view && state.view?.projectId === projectId && !state.at) throw new Error(t('app.viewFailed'));
+  void loadStats().catch(() => {});
+}
+
 /** 串行写入，退出时等待最后一次选择落盘，避免旧请求覆盖新状态。 */
 export function savePage(force = false) {
   if (restoring || reviewTransition() || applyingCompose || (pendingCompose && !state.at) || !state.view?.projectId ||
@@ -256,6 +325,7 @@ export function savePage(force = false) {
     groupMode: state.groupMode,
     vars: [...state.vars],
     hiddenVars: [...state.hiddenVars],
+    activeBookmark: state.activeBookmark,
     selected: state.selected,
     selectedEdge: state.selectedEdge ? edgeKey(state.selectedEdge) : null,
     ctxBox: state.ctxBox,
@@ -310,9 +380,11 @@ export async function restorePage({ root = null, isCurrent = () => true } = {}) 
       Object.assign(state, { up: saved.up, down: saved.down, groupMode, group: groupMode !== 'flat' });
       state.vars = new Set(saved.vars || []);
       state.hiddenVars = new Set(saved.hiddenVars || []);
+      state.activeBookmark = saved.activeBookmark || null;
       els.groupMode.checked = state.group;
       els.layoutGroupSelect.value = state.groupMode;
     }
+    hooks.syncBookmarkBadge?.();
     let empty = !!saved && (saved.empty || (!saved.roots?.length && !saved.expansions?.length));
     if (!root && !saved) {
       const project = await api.project().catch(() => null);

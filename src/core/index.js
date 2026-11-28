@@ -307,8 +307,23 @@ export function subgraph(model, rootId, {
       m.callee = e.callee;
       m.via = e.via;
       m.cond = e.cond;
+      m.siteId = e.siteId;
+      m.resolution = e.resolution;
+      m.dynamicDispatch = e.dynamicDispatch;
+    } else if (!m.resolution && e.resolution) {
+      m.resolution = e.resolution;
+      m.dynamicDispatch = e.dynamicDispatch;
+      m.siteId = e.siteId;
     }
-    m.calls.push({ line: e.line, kind: e.kind, cond: e.cond, via: e.via });
+    m.calls.push({
+      line: e.line,
+      col: e.col,
+      kind: e.kind,
+      cond: e.cond,
+      via: e.via,
+      ...(e.resolution && { resolution: e.resolution }),
+      ...(e.siteId && { siteId: e.siteId }),
+    });
   };
 
   const walk = (adj, depth) => {

@@ -16,8 +16,6 @@ import { t } from '../i18n.js';
 import { boundsMeet, routeBounds } from '/core/routing.js';
 import {
   LABEL_FONT,
-  LABEL_NOTE_FONT,
-  LABEL_PAD_Y,
   LABEL_MAX_DIST,
   LABEL_PRESETS,
   CONN_PREFIX,
@@ -28,6 +26,8 @@ import {
   displayEdgeLabels,
   labelBoxSize,
   placeEdgeLabels,
+  viewHeaderObstacles,
+  orderLabeledEdges,
   clampLabelCenter,
   midAnchor,
   nextConnNumber,
@@ -35,7 +35,6 @@ import {
 } from '/core/labels.js';
 
 const FONT_SPEC = (size) => `600 ${size}px ${FONT}`;
-const NOTE_SPEC = `400 ${LABEL_NOTE_FONT}px ${FONT}`;
 const labelSizes = new WeakMap();
 const layouts = new WeakMap();
 
@@ -62,9 +61,9 @@ function roundRectPath(ctx, x, y, w, h, r) {
 export function labelSizeOf(label) {
   const text = labelText(label);
   const saved = labelSizes.get(label);
-  if (saved && saved.text === text && saved.note === label.note) return saved.size;
+  if (saved && saved.text === text) return saved.size;
   const size = labelBoxSize(label, measure);
-  labelSizes.set(label, { text, note: label.note, size });
+  labelSizes.set(label, { text, size });
   return size;
 }
 
@@ -127,16 +126,18 @@ export function labelLayout(view = state.view, reuse = false) {
     const labels = visibleEdgeLabels(e, view);
     if (labels.length) labeled.push({ e, labels });
   }
+  const headers = viewHeaderObstacles(view);
   const paths = labeled.length ? view.edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
-  for (const { e, labels } of labeled) {
+  for (const { e, labels } of orderLabeledEdges(labeled)) {
     const items = labels.map((label) => ({ label, size: labelSizeOf(label) }));
     const bounds = routeBounds(e.points);
     const rects = placeEdgeLabels({
       items,
       pts: e.points || [],
       nodes: view.nodes,
+      headers,
       others: placed,
-      otherPaths: paths.filter((other) => other.edge !== e && boundsMeet(bounds, other.bounds, 0.501))
+      otherPaths: paths.filter((other) => other.edge !== e && boundsMeet(bounds, other.bounds, 120))
         .map(({ edge }) => edge.points || []),
     });
     const own = [];
@@ -185,9 +186,7 @@ export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const cx = rect.x + rect.w / 2;
-    const mainCy = label.note
-      ? rect.y + 4 + LABEL_FONT / 2
-      : rect.y + rect.h / 2;
+    const mainCy = rect.y + rect.h / 2;
 
     if (label.border) {
       roundRectPath(ctx, rect.x, rect.y, rect.w, rect.h, 4);
@@ -208,12 +207,6 @@ export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible
     ctx.font = FONT_SPEC(LABEL_FONT);
     ctx.fillStyle = label.color || '#2C2C2A';
     ctx.fillText(labelText(label), cx, mainCy + 0.5);
-    if (label.note) {
-      ctx.font = NOTE_SPEC;
-      ctx.fillStyle = '#6B6963';
-      // 说明行中心：主行（PAD+FONT/2）之下，与 labelBoxSize 的两行布局一致
-      ctx.fillText(label.note, cx, rect.y + LABEL_PAD_Y * 2 + LABEL_FONT + LABEL_NOTE_FONT / 2);
-    }
 
     if (selected) {
       const box = { x: rect.x - 2.5, y: rect.y - 2.5, w: rect.w + 5, h: rect.h + 5 };
@@ -274,6 +267,15 @@ export function makeLabel(preset, edge, { num } = {}) {
       color: LABEL_PRESETS.call.color,
     });
   }
+  if (preset === 'free') {
+    return normalizeLabel({
+      id,
+      preset: 'free',
+      text: t('label.freeDefault'),
+      border: LABEL_PRESETS.free.border,
+      color: LABEL_PRESETS.free.color,
+    });
+  }
   return normalizeLabel({
     id,
     preset: 'task',
@@ -300,10 +302,11 @@ export function switchPreset(label, preset, edge) {
   next.id = label.id; // 就地换型：id 不变，选中状态与面板定位都不丢
   next.dx = label.dx || 0;
   next.dy = label.dy || 0;
-  if (label.note) next.note = label.note;
+  if (label.note && preset !== 'call' && preset !== 'free') next.note = label.note;
   // 同预设来回切保留用户填的文字
   if (preset === 'task' && label.preset === 'task' && label.text) next.text = label.text;
   if (preset === 'call' && label.preset === 'call' && label.text) next.text = label.text;
+  if (preset === 'free' && (label.preset === 'free' || label.preset === 'custom') && label.text) next.text = label.text;
   if (preset === 'conn' && label.preset === 'conn' && label.num) {
     next.num = label.num;
     next.text = CONN_PREFIX + label.num;

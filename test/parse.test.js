@@ -380,8 +380,13 @@ void call_b(void) {
     ['fnptr', 'a.c::fnA'], ['fnptr', 'a.c::vvv'], ['fnptr', 'a.c::ghh'], ['fnptr', 'a.c::jjj'],
   ]);
 
-  // 动态下标不盲目画死所有候选，而是在 indirectCalls 保留完整候选供 LLM 判断
-  assert.equal(out('a.c::call_dyn').length, 0);
+  // expand 模式默认把动态下标与结构体表全部候选展开成虚线 fnptr 边，并在 indirectCalls 保留元数据
+  const expandDyn = out('a.c::call_dyn').filter((e) => e.kind === 'fnptr');
+  assert.ok(expandDyn.every((e) => e.resolution === 'possible' && e.dynamicDispatch));
+  assert.deepEqual(new Set(expandDyn.map((e) => e.callee)), new Set(['vvv', 'ggg', 'jjj', 'ghh', 'jkk', 'kkk']));
+  const strictModel = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const strictOut = (id) => (strictModel._index.outAdj.get(id) || []).filter((e) => e.kind !== 'var');
+  assert.equal(strictOut('a.c::call_dyn').length, 0);
   const dynSites = (model.indirectCalls || []).filter((ic) => ic.caller === 'a.c::call_dyn');
   assert.equal(dynSites.length, 3);
   const site2d = dynSites.find((ic) => ic.table?.name === 'e');
@@ -462,7 +467,10 @@ void dispatch(void) { (*arr[next()][column()])(); }
   assert.deepEqual(calls('app.c::cast_values'), ['read_value', 'read_value', 'read_value', 'handler_t']);
   assert.deepEqual(calls('app.c::cast_handler'), []);
   assert.deepEqual(calls('other.c::use'), ['Reading']);
-  assert.deepEqual(calls('app.c::dispatch'), ['next', 'column']);
+  assert.deepEqual(calls('app.c::dispatch'), ['next', 'column', 'first', 'second']);
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const strictCalls = (strict._index.outAdj.get('app.c::dispatch') || []).filter(e => e.kind !== 'var').map(e => e.callee);
+  assert.deepEqual(strictCalls, ['next', 'column']);
   const sites = model.indirectCalls.filter(call => call.caller === 'app.c::dispatch');
   assert.equal(sites.length, 1);
   assert.deepEqual(sites[0].indices, ['next()', 'column()']);
@@ -479,9 +487,12 @@ static void target(void) {}
 static void other(void) {}
 #define SLOT (2)
 const Fn table[4] = { [SLOT] = target, other };
+extern const int EXT_SLOT;
+static const Fn uncertain[4] = { [EXT_SLOT] = target, other };
 enum { ENUM_SLOT = 2 };
-static const Fn uncertain[4] = { [ENUM_SLOT] = target, other };
+static const Fn enum_tbl[4] = { [ENUM_SLOT] = target, other };
 void unknown(void) { uncertain[0](); }
+void by_enum(void) { enum_tbl[ENUM_SLOT](); enum_tbl[ENUM_SLOT + 1](); }
 `);
   fs.writeFileSync(path.join(dir, 'b.c'), `
 typedef void (*Fn)(void);
@@ -490,14 +501,15 @@ static void target(void) {}
 #define INDEX 2
 void call_sites(void) { table[INDEX](); table[3](); target(); }
 `);
-  const model = loadModel(dir);
-  const calls = id => (model._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var');
+  const strictModel = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const calls = id => (strictModel._index.outAdj.get(id) || []).filter(edge => edge.kind !== 'var');
   assert.deepEqual(calls('b.c::call_sites').map(edge => edge.to), ['a.c::target', 'a.c::other', 'b.c::target']);
+  assert.deepEqual(calls('a.c::by_enum').map(edge => edge.to), ['a.c::target', 'a.c::other']);
   assert.deepEqual(calls('a.c::unknown'), []);
-  const table = model.fnptrTables.find(table => table.name === 'uncertain');
+  const table = strictModel.fnptrTables.find(table => table.name === 'uncertain');
   assert.equal(table.incomplete, true);
-  assert.deepEqual(table.map, { '[?ENUM_SLOT]': 'target', '[?ENUM_SLOT+1]': 'other' });
-  const site = model.indirectCalls.find(call => call.caller === 'a.c::unknown');
+  assert.deepEqual(table.map, { '[?EXT_SLOT]': 'target', '[?EXT_SLOT+1]': 'other' });
+  const site = strictModel.indirectCalls.find(call => call.caller === 'a.c::unknown');
   assert.deepEqual(site.candidates.map(candidate => candidate.id), ['a.c::target', 'a.c::other']);
 });
 
@@ -621,12 +633,15 @@ void shadow(Fn runtime) {
 }
 `);
   const model = loadModel(dir);
-  const targets = name => (model._index.outAdj.get('app.c::' + name) || [])
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const targets = (m, name) => (m._index.outAdj.get('app.c::' + name) || [])
     .filter(edge => edge.kind !== 'var').map(edge => edge.to);
-  assert.deepEqual(targets('constant'), ['app.c::local', 'ext::external', 'ext::api']);
-  assert.deepEqual(targets('dynamic'), []);
-  assert.deepEqual(targets('partial'), ['app.c::local', 'ext::inside']);
-  assert.deepEqual(targets('shadow'), ['ext::external']);
+  assert.deepEqual(targets(model, 'constant'), ['app.c::local', 'ext::external', 'ext::api']);
+  assert.deepEqual(targets(strict, 'dynamic'), []);
+  assert.deepEqual(targets(model, 'dynamic'), ['app.c::local', 'ext::external', 'ext::api', 'ext::api', 'ext::api_only']);
+  assert.deepEqual(targets(strict, 'partial'), ['app.c::local', 'ext::inside']);
+  assert.deepEqual(targets(model, 'partial'), ['app.c::local', 'ext::inside', 'app.c::local', 'ext::inside', 'app.c::local']);
+  assert.deepEqual(targets(model, 'shadow'), ['ext::external']);
   const candidates = table => model.indirectCalls.find(call => call.receiver === table)?.candidates.map(c => c.id);
   assert.deepEqual(candidates('dispatch'), ['app.c::local', 'ext::external', 'ext::api']);
   assert.deepEqual(candidates('library'), ['ext::api', 'ext::api_only']);
@@ -786,8 +801,16 @@ void local(int i) {
   assert.deepEqual(edges('constant'), [
     'FnA', 'FnB', 'FnB', 'FnA', 'FnA', 'FnB', 'FnB', 'FnB', 'FnB', 'FnB', 'FnB',
   ].map(fn => ['fnptr', fn]));
-  assert.deepEqual(edges('local'), [['fnptr', 'FnB']]);
-  assert.deepEqual(edges('dynamic'), [['direct', 'index_of']]);
+  assert.deepEqual(edges('local'), [['fnptr', 'FnB'], ['fnptr', 'FnB'], ['fnptr', 'FnA']]);
+  assert.deepEqual(edges('dynamic'), [
+    ['fnptr', 'FnA'], ['fnptr', 'FnB'], ['direct', 'index_of'],
+    ['fnptr', 'FnA'], ['fnptr', 'FnB'], ['fnptr', 'FnA'], ['fnptr', 'FnB'], ['fnptr', 'FnA'], ['fnptr', 'FnB'],
+  ]);
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const strictEdges = name => strict.edges.filter(edge => edge.from === 'app.c::' + name && edge.kind !== 'var')
+    .map(edge => [edge.kind, edge.callee]);
+  assert.deepEqual(strictEdges('local'), [['fnptr', 'FnB']]);
+  assert.deepEqual(strictEdges('dynamic'), [['direct', 'index_of']]);
   assert.deepEqual(sites('dynamic').map(site => [site.table.name, site.candidates.map(c => c.slot)]), [
     ['rows', ['[0].handler', '[1].handler']], ['rows', ['[0].handler', '[1].handler']],
     ['nested', ['[0].sub.fn', '[1].sub.fn']], ['nested', ['[0].sub.more[0]', '[0].sub.more[1]']],
@@ -833,19 +856,23 @@ void conditional(void) {
 }
 `);
   const model = loadModel(dir);
-  const edges = name => model.edges.filter(edge => edge.from === 'app.c::' + name && edge.kind === 'fnptr')
+  const strict = loadModel(dir, { parserOptions: { dispatchPolicy: 'strict' } });
+  const edges = (m, name) => m.edges.filter(edge => edge.from === 'app.c::' + name && edge.kind === 'fnptr')
     .map(edge => edge.callee);
   const sites = name => model.indirectCalls.filter(site => site.caller === 'app.c::' + name);
-  assert.deepEqual(edges('constant'), ['FnA', 'FnA', 'FnA', 'FnA', 'FnB', 'FnA']);
+  assert.deepEqual(edges(model, 'constant'), ['FnA', 'FnA', 'FnA', 'FnA', 'FnB', 'FnA']);
   assert.deepEqual(sites('constant'), []);
-  for (const name of ['dynamic', 'reassign', 'move', 'escape', 'conditional']) assert.deepEqual(edges(name), [], name);
+  for (const name of ['dynamic', 'reassign', 'move', 'escape', 'conditional']) assert.deepEqual(edges(strict, name), [], name);
+  assert.deepEqual(edges(model, 'reassign'), ['FnA', 'FnB']);
+  assert.deepEqual(edges(model, 'conditional').sort(), ['FnA', 'FnB']);
   assert.deepEqual(sites('dynamic').map(site => [site.receiver, site.table.name, site.indices, site.candidates.map(c => c.slot)]), [
     ['r', 'rows', ['i'], ['[0].handler', '[1].handler']], ['s', 'one', ['i'], ['[0].handler']],
   ]);
   assert.deepEqual(sites('reassign')[0].candidates.map(c => c.name), ['FnA', 'FnB']);
   assert.deepEqual(sites('move')[0].candidates.map(c => c.name), ['FnA', 'FnB']);
   assert.deepEqual(sites('escape')[0].candidates.map(c => c.name), ['FnA']);
-  assert.deepEqual(edges('shadow'), ['FnA']);
+  assert.deepEqual(edges(model, 'shadow'), ['FnB', 'FnA']);
+  assert.deepEqual(edges(strict, 'shadow'), ['FnA']);
   assert.deepEqual(sites('shadow')[0].candidates.map(c => c.name), ['FnB']);
   assert.deepEqual(sites('conditional')[0].candidates.map(c => c.name).sort(), ['FnA', 'FnB']);
 });

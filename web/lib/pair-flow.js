@@ -1,4 +1,5 @@
 import { t } from '../i18n.js';
+import { api } from './api.js';
 import { edgeDirection } from './edge-flow.js';
 import { state, cam, els, esc } from './state.js';
 import { draw, pulseAdded } from './render.js';
@@ -9,12 +10,49 @@ import { edgeAiDetail } from './label-panel.js';
 
 let panel;
 let floatBar;
+let rwAbort = null;
+let rwSeq = 0;
+
+function rwLabelMap(pair) {
+  return new Map([
+    ...(pair?.result?.nodes || []),
+    ...(pair?.rwResult?.nodes || []),
+    ...(state.view?.nodes || []),
+  ].map((n) => [n.id, n]));
+}
+
+function summarizeRwPaths(pair) {
+  const rw = pair?.rwResult;
+  if (!rw || !Array.isArray(rw.paths) || !rw.paths.length) return { rwPaths: [], sharedVars: [] };
+  const byId = rwLabelMap(pair);
+  const sharedVarNames = new Set();
+  const summaries = [];
+  for (const p of rw.paths.slice(0, 8)) {
+    const parts = [];
+    for (let i = 0; i < (p.nodes || []).length; i++) {
+      const id = p.nodes[i];
+      const n = byId.get(id);
+      const name = n?.name || id.split('::').pop();
+      if (id.startsWith('var::') || n?.kind === 'var') sharedVarNames.add(name);
+      if (i > 0) {
+        const e = p.edges?.[i - 1];
+        const fields = e?.fields?.length ? `.{${e.fields.join(',')}}` : '';
+        const ln = e?.line ? `:${e.line}` : '';
+        parts.push(` -[${e?.kind || 'rw'}${fields}${ln}]-> `);
+      }
+      parts.push(name);
+    }
+    const ver = Array.isArray(p.versions) && p.versions.length ? ` [${p.versions.join('/')}]` : '';
+    summaries.push(parts.join('') + ver);
+  }
+  return { rwPaths: summaries, sharedVars: [...sharedVarNames].slice(0, 12) };
+}
 
 function buildPairAiDetail(pair) {
   const view = state.view;
   if (!pair || !view) return null;
   const nodes = pair.ids
-    .map((id) => view.nodes.find((n) => n.id === id))
+    .map((id) => view.nodes.find((n) => n.id === id) || rwLabelMap(pair).get(id))
     .filter(Boolean)
     .map(nodeAiDetail);
   if (!nodes.length) return null;
@@ -22,7 +60,7 @@ function buildPairAiDetail(pair) {
   const seenEdges = new Set();
   const edges = [];
   const pathSummaries = [];
-  const labelOf = (id) => view.nodes.find((n) => n.id === id)?.name || id;
+  const labelOf = (id) => rwLabelMap(pair).get(id)?.name || id.split('::').pop();
   for (const p of pair.result?.paths || []) {
     pathSummaries.push(p.nodes.map((id, i) => `${i ? stepArrow(p.steps[i - 1]) : ''}${labelOf(id)}`).join(''));
     for (const step of p.steps || []) {
@@ -32,13 +70,30 @@ function buildPairAiDetail(pair) {
       if (e) edges.push(edgeAiDetail(e));
     }
   }
+  const { rwPaths, sharedVars } = summarizeRwPaths(pair);
+  const fromName = labelOf(pair.ids[0]);
+  const toName = labelOf(pair.ids[1]);
   return {
     kind: 'pair',
+    id: `pair:${pair.ids[0]}->${pair.ids[1]}`,
+    label: `${fromName} ↔ ${toName}`,
+    fromId: pair.ids[0],
+    fromName,
+    toId: pair.ids[1],
+    toName,
     ids: pair.ids.slice(),
     nodes,
     edges: edges.slice(0, 12),
     pathCount: pair.result?.paths?.length || 0,
+    visiblePathCount: pair.result?.paths?.length || 0,
     pathSummaries: pathSummaries.slice(0, 6),
+    visiblePaths: pathSummaries.slice(0, 6),
+    rwLoading: !!pair.rwLoading,
+    rwPathCount: pair.rwResult?.paths?.length || 0,
+    rwPaths,
+    sharedVars,
+    rwTruncated: !!pair.rwResult?.truncated,
+    ...(pair.rwError ? { rwError: pair.rwError } : {}),
   };
 }
 
@@ -87,7 +142,13 @@ function renderFloatBar(pair, names) {
     return;
   }
   const n = pair.result?.paths?.length || 0;
-  const summary = n ? `${names[0]} ↔ ${names[1]}（${n} 条路径）` : `${names[0]} ↔ ${names[1]}（当前视图无直连路径）`;
+  const rwCount = pair.rwResult?.paths?.length || 0;
+  const rwTag = pair.rwLoading ? ' · 数据流查询中…' : rwCount ? ` · ${rwCount} 条读写链` : '';
+  const summary = n
+    ? `${names[0]} ↔ ${names[1]}（${n} 条画布路${rwTag}）`
+    : rwCount
+      ? `${names[0]} ↔ ${names[1]}（${rwCount} 条源码读写链）`
+      : `${names[0]} ↔ ${names[1]}（${pair.rwLoading ? '正在分析源码读写…' : '暂无直连路径'}）`;
   floatBar.innerHTML = `<span class="pair-float-txt"><strong>${summary}</strong></span>` +
     (n ? `<button type="button" data-pair-focus>聚焦</button>` : '') +
     (window.__EXPORT ? '' : `<button type="button" class="primary" data-pair-ai>✨ 加入对话</button>`) +
@@ -148,10 +209,23 @@ function renderPanel() {
   if (pair.result) {
     const r = pair.result;
     const directed = r.paths.filter(p => !p.mixed).length, related = r.paths.length - directed;
-    message = [names.join(' ↔ '), r.paths.length ? t('pair.directed', { n: directed }) : t('pair.empty'),
-      related ? t('pair.static', { n: related }) : ''].filter(Boolean).join(' · ');
+    const rwCount = pair.rwResult?.paths?.length || 0;
+    message = [
+      names.join(' ↔ '),
+      r.paths.length ? t('pair.directed', { n: directed }) : t('pair.empty'),
+      related ? t('pair.static', { n: related }) : '',
+      pair.rwLoading ? '读写流分析中…' : rwCount ? `源码读写 ${rwCount} 条` : '',
+    ].filter(Boolean).join(' · ');
     details = `<div class="pair-flow-hint">${r.paths.length ? t('pair.colorHint') : t('pair.scopeHint')}${r.truncated ? t('pair.truncated') : ''}</div>`;
     if (r.paths.length) details += `<details open><summary>${t('pair.show')}</summary>${r.paths.map((p, index) => `<div class="pair-flow-path" data-pair-path-idx="${index}" title="点击聚焦并高亮此路径" style="cursor:pointer"><strong>${t('pair.number', { n: index + 1 })}</strong><div>${p.nodes.map((id, i) => `${i ? `<span class="pair-flow-arrow" style="color:${pair.colors.get(p.steps[i - 1].edge)}">${stepArrow(p.steps[i - 1])}</span>` : ''}${esc(labels.get(id) || id)}`).join('')}</div><small>${p.mixed ? t('pair.staticHint') : t('pair.directedHint')}</small>${p.versions ? ` <small>${p.versions.length ? p.versions.map(v => v === 'before' ? t('compare.version.before') : t('compare.version.after')).join(' / ') : t('pair.crossVersion')}</small>` : ''}</div>`).join('')}</details>`;
+    if (pair.rwLoading) {
+      details += `<div class="pair-flow-hint">正在后台检索全工程变量读写路径…</div>`;
+    } else if (pair.rwError) {
+      details += `<div class="pair-flow-hint">源码读写检索未完成：${esc(pair.rwError)}</div>`;
+    } else if (pair.rwResult?.paths?.length) {
+      const { rwPaths } = summarizeRwPaths(pair);
+      details += `<details open><summary>源码变量读写链（${pair.rwResult.paths.length}）</summary>${rwPaths.map((line, i) => `<div class="pair-flow-path"><strong>读写 #${i + 1}</strong><div>${esc(line)}</div></div>`).join('')}</details>`;
+    }
   }
   const aiBtn = !window.__EXPORT && pair.ids.length === 2
     ? `<button type="button" data-pair-ai>✨ 加入对话</button>`
@@ -164,12 +238,44 @@ document.addEventListener('callgraph:langchange', renderPanel);
 
 export function clearPairFlow({ paint = true } = {}) {
   const pair = state.pairFlow;
+  rwSeq++;
+  rwAbort?.abort();
+  rwAbort = null;
   state.pairFlow = null;
   state.hoverRelation = null;
   if (panel) { panel.hidden = true; panel.textContent = ''; }
   renderFloatBar(null, []);
   if (pair) document.dispatchEvent(new CustomEvent('cg:pair-flow-cleared', { detail: pair.ids }));
   if (paint) draw();
+}
+
+async function fetchRwDataflow(pair) {
+  if (window.__EXPORT || pair.ids.length !== 2) return;
+  rwAbort?.abort();
+  const controller = new AbortController();
+  rwAbort = controller;
+  const seq = ++rwSeq;
+  pair.rwLoading = true;
+  pair.rwError = '';
+  renderPanel();
+  try {
+    const res = await api.pairDataflow(pair.ids[0], pair.ids[1], { signal: controller.signal });
+    if (seq !== rwSeq || state.pairFlow !== pair) return;
+    pair.rwLoading = false;
+    if (res?.ok) {
+      pair.rwResult = res;
+    } else if (res?.error) {
+      pair.rwError = res.error;
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError' || seq !== rwSeq || state.pairFlow !== pair) return;
+    pair.rwLoading = false;
+    pair.rwError = err?.message || '请求失败';
+  }
+  if (state.pairFlow !== pair) return;
+  renderPanel();
+  const detail = buildPairAiDetail(pair);
+  if (detail) publishAiSelection(detail);
 }
 
 export function pickPairFlow(id) {
@@ -180,7 +286,7 @@ export function pickPairFlow(id) {
   state.moveTarget = null; state.multiSelection = null;
   if (prior?.ids.length === 1 && prior.ids[0] === id) { clearPairFlow(); return; }
   const ids = prior?.ids.length === 1 ? [...prior.ids, id] : [id];
-  const pair = { ids, result: null, view };
+  const pair = { ids, result: null, rwResult: null, rwLoading: false, rwError: '', view };
   state.pairFlow = pair;
   state.hoverRelation = null;
   state.recent = null; state.flash = null;
@@ -201,6 +307,7 @@ export function pickPairFlow(id) {
     if (detail) publishAiSelection(detail);
   };
   pair.refresh(view);
+  if (ids.length === 2) void fetchRwDataflow(pair);
   focusPath();
   renderPanel();
   const detail = buildPairAiDetail(pair);

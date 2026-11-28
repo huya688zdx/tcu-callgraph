@@ -117,7 +117,7 @@ async function switchTo(body) {
       btn.textContent = result.project.name;
       btn.title = result.project.path || result.project.name;
     }
-    await hooks.reloadAll();
+    await hooks.reloadAll({ preserveAiChat: result.project?.id != null && result.project.id === state.view?.projectId });
     void syncProjectLabel();
     projectMessage('');
   } catch (error) {

@@ -31,7 +31,7 @@ import {
 import { hooks } from './hooks.js';
 import { statusControl, bindStatusControl } from './change-status.js';
 
-const LABEL_NAMES = { call: 'label.callOrder', task: 'label.taskPeriod', conn: 'label.conn', custom: 'label.custom' };
+const LABEL_NAMES = { call: 'label.callOrder', task: 'label.taskPeriod', conn: 'label.conn', free: 'label.free', custom: 'label.custom' };
 const TRUNK_ARROWS = { forward: '→', reverse: '←', both: '↔', unknown: '—' };
 
 const selectedId = (edge) => {
@@ -170,6 +170,11 @@ async function addLabel(edge, preset, num) {
   connPick = null;
   draw();
   renderLabelPanel();
+  if (preset === 'free') {
+    const input = els.labelPanel?.querySelector('#lblText');
+    input?.focus();
+    input?.select();
+  }
   try {
     await persistLabels(edge);
     pushHistory();
@@ -423,6 +428,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
     const isConn = selLabel.preset === 'conn';
     const isCall = selLabel.preset === 'call';
     const isTask = selLabel.preset === 'task';
+    const isFree = selLabel.preset === 'free';
     const maxOrder = isCall ? visibleCallOrderMap(state.view, edge.from).size : 0;
     const quickCallNums = isCall
       ? `<div class="lbl-picknum">${Array.from({ length: Math.min(12, Math.max(maxOrder, 4)) }, (_, i) => i + 1)
@@ -449,7 +455,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
           <button type="button" class="lbl-seg${connMode === 'renumber' ? ' on' : ''}" data-mode="renumber" aria-pressed="${connMode === 'renumber'}">${t('label.mode.renumber')}</button>
         </div>
       </div>` : ''}
-      ${isCall ? '' : `<div class="field">
+      ${isCall || isFree ? '' : `<div class="field">
         <label for="lblNote">${t('label.optionalNote')}</label>
         <input id="lblNote" type="text" maxlength="80" value="${esc(selLabel.note || '')}">
       </div>`}
@@ -459,7 +465,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
         <div class="field">
           <label for="lblBorder">${t('label.border')}</label>
           <div class="lbl-colors">
-            <input type="color" id="lblBorder" value="${esc(selLabel.border || LABEL_PRESETS.task.border)}"${selLabel.border ? '' : ' disabled'}>
+            <input type="color" id="lblBorder" value="${esc(selLabel.border || LABEL_PRESETS[selLabel.preset]?.border || LABEL_PRESETS.task.border)}"${selLabel.border ? '' : ' disabled'}>
             <label class="chk"><input type="checkbox" id="lblNoBorder"${selLabel.border ? '' : ' checked'}>${t('label.noBorder')}</label>
           </div>
         </div>
@@ -480,6 +486,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
       <button type="button" class="lbl-add" data-add="call" data-preset="call">${t('label.addCall')}</button>
       <button type="button" class="lbl-add" data-add="task" data-preset="task">${t('label.addTask')}</button>
       <button type="button" class="lbl-add${connPick ? ' on' : ''}" data-add="conn" data-preset="conn" aria-expanded="${Boolean(connPick)}">${t('label.addConn')}</button>
+      <button type="button" class="lbl-add" data-add="free" data-preset="free">${t('label.addFree')}</button>
     </div>
     ${connPick ? `<div class="lbl-picknum" role="group" aria-label="${t('label.chooseConn')}">
       ${connChoices(state.view, edge).map((n) => `<button type="button" class="lbl-num" data-num="${n}">${n}</button>`).join('')}
@@ -591,7 +598,7 @@ export function renderLabelPanel({ scrollToTrunkBranch = false } = {}) {
       noBorderEl.addEventListener('change', () => {
         const target = ensureEditableTarget();
         if (!target) return;
-        target.border = noBorderEl.checked ? null : LABEL_PRESETS.task.border;
+        target.border = noBorderEl.checked ? null : LABEL_PRESETS[target.preset]?.border || LABEL_PRESETS.task.border;
         if (borderEl) {
           borderEl.disabled = noBorderEl.checked;
           if (!noBorderEl.checked) borderEl.value = target.border;

@@ -43,6 +43,10 @@ const state = {
   hiddenVars: new Set(),
   /** 时间轴回看：0 表示看当前状态，>0 表示看这个事件之后的历史状态 */
   at: 0,
+  /** 当前绑定的书签：{ id, name, revision, baseFingerprint }，未绑定为 null */
+  activeBookmark: null,
+  /** 切换书签时暂存各视图的未保存草稿，防止切换丢失范围改动 */
+  bookmarkDrafts: new Map(),
   selected: null,
   hover: null,
   /** 右侧详情面板悬停某条调用/变量关系时高亮画布对应连线：{ peerId, dir } */
@@ -81,6 +85,10 @@ const state = {
   flash: null,
   /** 本次新加入的节点和连线，呼吸提示到期后自动清除。 */
   recent: null,
+  /** AI 叠加层高亮/漫游与双向悬停状态（纯只读视觉层，不修改用户选区） */
+  aiOverlay: null,
+  presentation: null,
+  aiHover: null,
 };
 
 const cam = { x: 0, y: 0, k: 1 };
@@ -98,6 +106,7 @@ export const THEME = {
   bg: '#F7F6F2',
   edge: {
     call: '#2C2C2A', // 函数调用
+    fnptr: '#7F77DD', // 函数指针调用
     var: '#2C2C2A', // 变量访问
     added: '#D9303E', // 新增边
     manual: '#639922', // 手动连线预览
@@ -112,6 +121,10 @@ export const THEME = {
     hover: '#378ADD', // 悬停高亮
     fnDash: true, // 函数框虚线（关 = 实线）
     varDash: false, // 变量框虚线（开 = 虚线）
+    tintFill: false, // 节点柔色卡片背景
+  },
+  canvas: {
+    gridDots: true, // 画布点阵网格
   },
   /** 变更分类底色：既存 / 变更 / 追加 / 删除（画布右键分类菜单与图例同源） */
   fill: {
@@ -143,11 +156,13 @@ function syncThemeSideEffects() {
     if (el) el.style.borderTopColor = c;
   };
   chip('lg-call', THEME.edge.call);
+  chip('lg-fnptr', THEME.edge.fnptr);
   chip('lg-var', THEME.edge.var);
   chip('lg-added', THEME.edge.added);
   // 删除边沿用调用色、中央带 X：图例里画的是 SVG，所以走 color 而不是 border
   const delChip = document.getElementById('lg-del');
   if (delChip) delChip.style.color = THEME.edge.call;
+  document.querySelector('main')?.classList.toggle('no-grid', !THEME.canvas?.gridDots);
 }
 
 /** 设置单个颜色（'fill.existing' 这类路径）。非法值拒绝，返回是否成功 */
@@ -210,6 +225,42 @@ const esc = (s) =>
 const nodeById = (id) => (state.view ? state.view.nodes.find((n) => n.id === id) : null);
 
 const edgeKey = (e) => `${e.from}->${e.to}:${e.line}`;
+const currentViewScope = () => ({
+  roots: [...state.roots],
+  up: state.up,
+  down: state.down,
+  group: state.group,
+  groupMode: state.groupMode,
+  vars: [...state.vars],
+  hiddenVars: [...state.hiddenVars],
+  expansions: state.expansions || [],
+});
+
+const sortUnique = (arr) => [...new Set((Array.isArray(arr) ? arr : []).filter((v) => typeof v === 'string' && v))].sort();
+
+const scopeFingerprint = (scope = {}) => {
+  const s = scope && typeof scope === 'object' ? scope : {};
+  const gm = ['file', 'period', 'flat'].includes(s.groupMode) ? s.groupMode : s.group === false ? 'flat' : 'file';
+  const exps = [...(Array.isArray(s.expansions) ? s.expansions : [])]
+    .filter((e) => e && typeof e.root === 'string' && e.root)
+    .map((e) => ({ root: e.root, up: Number(e.up) || 0, down: Number(e.down) || 0 }))
+    .sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0));
+  return JSON.stringify({
+    roots: sortUnique(s.roots),
+    up: Math.max(0, Number(s.up) || 0),
+    down: Math.max(0, Number(s.down) || 0),
+    groupMode: gm,
+    vars: sortUnique(s.vars),
+    hiddenVars: sortUnique(s.hiddenVars),
+    expansions: exps,
+  });
+};
+
+const isBookmarkDirty = () => {
+  if (!state.activeBookmark?.baseFingerprint) return false;
+  return scopeFingerprint(currentViewScope()) !== state.activeBookmark.baseFingerprint;
+};
+
 export {
   els,
   state,
@@ -220,4 +271,7 @@ export {
   esc,
   nodeById,
   edgeKey,
+  currentViewScope,
+  scopeFingerprint,
+  isBookmarkDirty,
 };

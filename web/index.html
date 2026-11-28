@@ -23,7 +23,7 @@
   .pair-flow-arrow { font-weight:700; font-size:16px; }
   body {
     font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-    font-size: 13px; color: #2C2C2A; background: #F7F6F2;
+    font-size: 13px; color: var(--text-primary); background: var(--bg-app);
   }
   #app {
     display: grid; height: 100vh;
@@ -33,9 +33,9 @@
   }
   header {
     grid-area: top; min-width: 0; position: relative; z-index: 30;
-    background: #fff; border-bottom: 1px solid rgba(0,0,0,.1);
+    background: var(--bg-surface); border-bottom: 1px solid var(--border);
   }
-  .top-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; min-height: 42px; padding: 5px 12px; }
+  .top-row { display: flex; align-items: center; flex-wrap: nowrap; overflow-x: auto; gap: 10px; min-height: 44px; padding: 5px 12px; scrollbar-width: thin; }
   .brand { flex: 0 1 auto; max-width: 250px; min-width: 150px; font-weight: 600; font-size: 14px; }
   .brand small { display: block; margin-top: 3px; color: #888780; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #projectBtn { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
@@ -139,7 +139,19 @@
   button:hover { background: #F1EFE8; }
   button.primary { background: #185FA5; color: #fff; border-color: #185FA5; }
   button.primary:hover { background: #0C447C; }
-  :root { --chev-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' fill='none' stroke='%23888780' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+  :root {
+    --bg-app: #F7F6F2;
+    --bg-surface: #FFFFFF;
+    --bg-subtle: #FAF9F6;
+    --border: rgba(31, 31, 29, 0.11);
+    --text-primary: #2C2C2A;
+    --text-muted: #78766E;
+    --accent: #185FA5;
+    --accent-soft: #E6F1FB;
+    --radius: 10px;
+    --font-mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    --chev-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.25 6 7.75l3.5-3.5' fill='none' stroke='%23888780' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
   .fsel { display: inline-block; position: relative; }
   .fsel select { display: none; }
   .fsel-btn { display: inline-flex; align-items: center; gap: 7px; }
@@ -166,7 +178,12 @@
   #left { grid-area: left; border-right: 1px solid rgba(0,0,0,.08); display: flex; flex-direction: column; overflow: hidden; }
   #right { grid-area: right; border-left: 1px solid rgba(0,0,0,.08); }
   #right[data-mode="dataflow"] > .sec:not(#secDataflow):not(#pairFlowBar) { display: none !important; }
-  main { grid-area: main; position: relative; overflow: hidden; }
+  main {
+    grid-area: main; position: relative; overflow: hidden;
+    background-color: var(--bg-app);
+    background-image: radial-gradient(rgba(31, 31, 29, 0.08) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
   #canvasEmptyGuide {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     width: min(420px, calc(100% - 32px)); padding: 24px; text-align: center;
@@ -300,6 +317,7 @@
   .chip.cross-period { color: #8A370C; background: #FCE9D9; font-weight: 600; }
   #addFunctionsMessage { flex: 1; align-self: center; color: #5F5E5A; font-size: 12px; }
   .empty { color: #B4B2A9; font-size: 12px; padding: 3px 0; }
+  main.no-grid { background-image: none; }
 
   /* ---- 连线标签面板 ---- */
   .detail-hint { color: #888780; font-size: 11.5px; line-height: 1.6; }
@@ -335,6 +353,7 @@
   .lbl-demo.task { color: #2C2C2A; background: #fff; border: 1.4px solid #2C2C2A; }
   .lbl-demo.conn { color: #C0392B; background: #fff; border: 1.4px solid #C0392B; }
   .lbl-demo.call { color: #2C2C2A; background: transparent; border: 0; padding-left: 0; }
+  .lbl-demo.free { color: #2C2C2A; background: #fff; border: 1.4px solid #4A5568; }
   .lbl-colors { display: flex; align-items: center; gap: 8px; }
   .lbl-colors input[type=color] {
     width: 34px; height: 24px; padding: 0; border: 1px solid rgba(0,0,0,.16);
@@ -860,11 +879,43 @@
   }
   .tl-more:hover { background: #F5F4EF; }
 
-  /* 书签行 */
+  /* 书签行与分体胶囊 */
+  .bm-split {
+    display: inline-flex; align-items: center; border-radius: 7px;
+    border: 1px solid rgba(31, 31, 29, 0.14); background: #FFFFFF; overflow: hidden;
+  }
+  .bm-split.active { background: #EFF6FD; border-color: #9EC5EC; }
+  .bm-split.dirty { border-color: #D97706; }
+  .bm-split > button {
+    border: 0 !important; border-radius: 0 !important; background: transparent;
+    height: 28px; box-shadow: none;
+  }
+  .bm-split > button:hover { background: rgba(24, 95, 165, 0.08); }
+  #bookmarkQuickSave {
+    border-left: 1px solid rgba(31, 31, 29, 0.12) !important;
+    font-size: 11.5px; font-weight: 600; color: #185FA5; padding: 0 8px;
+  }
+  #bookmarkQuickSave.dirty { background: #FFF7ED; color: #B45309; }
   .bm-summary {
     margin: 10px 12px 0; padding: 8px 10px; border: 1px solid #DFEAF4;
     border-radius: 8px; background: #F4F8FC; color: #124B71; font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
   }
+  .bm-summary-actions { display: inline-flex; gap: 6px; flex-shrink: 0; }
+  .bm-summary-actions button { height: 24px; padding: 0 8px; font-size: 11.5px; }
+  .bm.is-active { border-color: #8FC0EB; background: #F4F9FE; }
+  .bm-active-tag {
+    display: inline-block; margin-left: 5px; padding: 1px 6px; border-radius: 999px;
+    background: #185FA5; color: #fff; font-size: 10.5px; font-weight: 500;
+  }
+  .tl-extra-tools {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 14px 8px;
+    border-bottom: 1px solid #ECEAE2; background: #FAF9F6; font-size: 12px;
+  }
+  .tl-extra-tools label { display: inline-flex; align-items: center; gap: 4px; color: #4E4D49; cursor: pointer; }
+  .tl-cp-box { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: 1; min-width: 190px; justify-content: flex-end; }
+  .tl-cp-box input { flex: 1; max-width: 240px; height: 26px; padding: 0 8px; font-size: 12px; border: 1px solid rgba(0,0,0,0.16); border-radius: 6px; }
+  .tl-cp-box button { height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
   .bm {
     display: flex; align-items: center; gap: 10px; padding: 9px 10px; margin-bottom: 5px;
     border: 1px solid #EEEDE8; border-radius: 8px; cursor: pointer;
@@ -941,12 +992,12 @@
   #aiDrawer .ai-think pre::-webkit-scrollbar-thumb:hover { background: rgba(44, 44, 42, 0.3); }
 
   .ai-drawer-head {
-    display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px;
-    border-bottom: 1px solid #ECEAE3; background: #FAF9F6; flex-shrink: 0;
+    display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 6px 10px 6px 12px;
+    border-bottom: 1px solid #ECEAE3; background: var(--bg-subtle); flex-shrink: 0;
   }
   .ai-drawer-head h2 {
-    margin: 0; font-size: 13.5px; font-weight: 600; color: #1F1F1D;
-    display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; letter-spacing: -.01em;
+    margin: 0; font-size: 13px; font-weight: 600; color: #1F1F1D;
+    display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; letter-spacing: -.01em;
   }
   .ai-drawer-head h2::before {
     content: "✦"; display: inline-flex; align-items: center; justify-content: center;
@@ -1192,7 +1243,7 @@
   .ai-selection-bar {
     display: flex; flex-direction: column; gap: 5px;
     padding: 7px 12px; border-top: 1px solid #E1ECF6; background: #F7FAFD; flex-shrink: 0;
-    max-height: min(140px, 30vh); overflow-y: auto;
+    max-height: min(176px, 34vh); overflow-y: auto;
   }
   .ai-selection-bar[hidden] { display: none; }
   .ai-selection-bar > * { flex-shrink: 0; }
@@ -1202,27 +1253,50 @@
   .ai-pinned-list[hidden] { display: none; }
   .ai-pinned-chip {
     display: inline-flex; align-items: center; gap: 3px; max-width: 100%;
-    padding: 1px 3px 1px 8px; border: 1px solid #B5D4F4; border-radius: 999px;
-    background: #E8F2FC; color: #0C447C; font-size: 11px; font-weight: 500;
+    padding: 1px 3px 1px 7px; border: 1px solid #B5D4F4; border-radius: 999px;
+    background: #FFFFFF; color: #0C447C; font-size: 11px; font-weight: 500;
   }
-  .ai-pinned-chip > span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 210px; }
-  #aiDrawer .ai-pinned-rm {
+  .ai-pinned-chip.is-pinned {
+    background: #E4F0FC; border-color: #7BB3E8;
+  }
+  .ai-pinned-chip > span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 195px; }
+  #aiDrawer .ai-pinned-pin, #aiDrawer .ai-pinned-rm {
     flex: none; width: 17px; height: 17px; padding: 0; border: 0; border-radius: 50%;
     display: inline-flex; align-items: center; justify-content: center;
-    background: transparent; color: #4A7298; font-size: 13px; line-height: 1;
+    background: transparent; color: #547A9E; font-size: 11px; line-height: 1;
   }
+  #aiDrawer .ai-pinned-pin[aria-pressed="true"] { color: #185FA5; background: #D2E6FA; }
+  #aiDrawer .ai-pinned-pin:hover { background: #E3EFFB; color: #083463; }
+  #aiDrawer .ai-pinned-rm { font-size: 13px; }
   #aiDrawer .ai-pinned-rm:hover { background: #CCE0F5; color: #083463; }
   #aiDrawer .ai-pinned-clear {
     height: 20px; padding: 0 7px; border-radius: 999px; font-size: 10.5px;
     border: 1px dashed #B5C8DC; background: transparent; color: #537292;
   }
   #aiDrawer .ai-pinned-clear:hover { background: #E8F2FC; color: #0C447C; }
+  .ai-relation-bar {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+    padding: 2px 0; font-size: 11px; color: #5F5E5A;
+  }
+  .ai-relation-bar[hidden] { display: none; }
+  .ai-relation-label { color: #6E6C65; font-size: 10.5px; margin-right: 2px; }
+  #aiDrawer .ai-rel-btn {
+    height: 20px; padding: 0 7px; border-radius: 999px; font-size: 10.5px;
+    border: 1px solid #D5DEE8; background: #FFFFFF; color: #4A5568;
+  }
+  #aiDrawer .ai-rel-btn.on {
+    border-color: #185FA5; background: #E6F1FB; color: #0C447C; font-weight: 600;
+  }
   .ai-selection-row { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 6px; }
   .ai-selection-row[hidden] { display: none; }
   .ai-selection-pill {
     display: inline-flex; align-items: center; gap: 2px; min-width: 0; max-width: 100%;
-    padding: 1px 4px 1px 9px; border: 1px solid #C5DCF2; border-radius: 999px;
-    background: #FFFFFF; color: #124B71; box-shadow: 0 1px 2px rgba(24, 95, 165, 0.05);
+    padding: 1px 4px 1px 8px; border: 1px dashed #B8CBE0; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.72); color: #526A80;
+  }
+  .ai-cand-tag {
+    flex: none; font-size: 10px; padding: 0 4px; border-radius: 4px;
+    background: #EEF2F6; color: #5F6B7A; margin-right: 2px;
   }
   #aiSelectionText { min-width: 0; font-size: 11.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #aiDrawer #aiPinSelection, #aiDrawer #aiClearSelection {
@@ -1605,6 +1679,151 @@
   #aiDrawer #aiDeleteChat { padding: 0 7px; color: #78766E; }
   #aiDrawer #aiDeleteChat:hover:not(:disabled) { background: #FDECEC; color: #B42318; }
   #aiDrawer .ai-chat-bar button:disabled { opacity: .38; cursor: default; }
+
+  /* ---- CC-grade 对话组件：Slash/At 弹层、思考条、调查折叠、子调查、链路卡、导览 HUD、体检与指南 ---- */
+  .ai-slash-menu {
+    position: absolute; left: 0; right: 0; bottom: calc(100% + 6px); z-index: 25;
+    display: flex; flex-direction: column; gap: 2px; padding: 5px;
+    border-radius: 10px; background: #FFFFFF; border: 1px solid #DCD9CF;
+    box-shadow: 0 10px 28px rgba(24, 24, 22, 0.15); max-height: 230px; overflow-y: auto;
+  }
+  .ai-slash-menu[hidden] { display: none; }
+  #aiDrawer .ai-slash-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; height: auto; min-height: 28px; padding: 5px 8px; border: 0; border-radius: 7px;
+    background: transparent; text-align: left; font-size: 12px; color: #1F1F1D; white-space: normal;
+  }
+  #aiDrawer .ai-slash-item strong { font-family: var(--font-mono); font-size: 11.5px; color: #185FA5; }
+  #aiDrawer .ai-slash-item small { color: #78766E; font-size: 11px; overflow-wrap: anywhere; }
+  #aiDrawer .ai-slash-item.active, #aiDrawer .ai-slash-item:hover { background: #EEF5FC; }
+
+  .ai-think {
+    margin: 2px 0 8px; border: 1px solid #ECEAE2; border-radius: 8px; background: #FAF9F6;
+  }
+  .ai-think summary {
+    padding: 5px 9px; font-size: 11.5px; color: #6E6C65; cursor: pointer; user-select: none; list-style: none;
+  }
+  .ai-think[data-streaming="true"] summary {
+    background: linear-gradient(90deg, #6E6C65 0%, #185FA5 50%, #6E6C65 100%);
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: aiThinkShimmer 1.6s linear infinite;
+  }
+  @keyframes aiThinkShimmer { to { background-position: -200% center; } }
+  .ai-think pre {
+    margin: 0; padding: 6px 9px 8px; border-top: 1px solid #EEECE4;
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.45; color: #55534D;
+    white-space: pre-wrap; max-height: 180px; overflow: auto;
+  }
+
+  .ai-investigate {
+    margin: 2px 0 8px; border: 1px solid #E5E3DB; border-radius: 8px; background: #FAF9F6;
+  }
+  .ai-investigate summary {
+    padding: 5px 9px; font-family: var(--font-mono); font-size: 11.5px; color: #52514B; cursor: pointer;
+  }
+  .ai-steps { display: grid; gap: 4px; margin: 2px 0 6px; }
+  .ai-investigate .ai-steps { padding: 4px 8px 8px; border-top: 1px solid #ECEAE2; margin: 0; }
+  .ai-step {
+    padding: 4px 8px; border-radius: 6px; background: #FFFFFF; border: 1px solid #ECEAE2;
+    font-family: var(--font-mono); font-size: 11.5px; color: #4A4944;
+  }
+  .ai-step.ok { border-left: 3px solid #2F7A47; }
+  .ai-step.blocked { border-left: 3px solid #D97706; background: #FFFDF7; }
+  .ai-step.err { border-left: 3px solid #C83232; background: #FEF8F8; }
+  .ai-step-result { margin-top: 2px; color: #6E6C65; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+
+  .ai-subagent-list { display: grid; gap: 6px; margin: 6px 0 8px; }
+  .ai-subagent-card {
+    padding: 7px 9px; border-radius: 8px; border: 1px solid #D7E5F4; background: #F5F9FE; font-size: 11.5px;
+  }
+  .ai-subagent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; color: #0C447C; }
+  .ai-subagent-meta { font-family: var(--font-mono); font-size: 10.5px; color: #547A9E; margin-top: 2px; }
+  .ai-subagent-body { margin-top: 4px; color: #2C2C2A; line-height: 1.5; }
+
+  .ai-chain-card {
+    margin: 8px 0; border: 1px solid #D4E1EE; border-radius: 10px; background: #FAFCFF; overflow: hidden;
+  }
+  .ai-chain-head {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;
+    padding: 6px 9px; background: #F0F6FC; border-bottom: 1px solid #E1ECF7;
+  }
+  .ai-chain-title { font-size: 11.5px; font-weight: 600; color: #0C447C; }
+  .ai-chain-actions { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+  #aiDrawer .ai-chain-actions button {
+    height: 22px; padding: 0 7px; font-size: 11px; border-radius: 6px;
+    border: 1px solid #C4D9EE; background: #FFFFFF; color: #185FA5;
+  }
+  #aiDrawer .ai-chain-actions button:hover { background: #E6F1FB; }
+  .ai-chain-steps {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 8px 9px;
+  }
+  #aiDrawer .ai-chain-node {
+    height: auto; padding: 2px 7px; border-radius: 6px; font-family: var(--font-mono); font-size: 11.5px;
+    border: 1px solid #CCE0F5; background: #FFFFFF; color: #0C447C;
+  }
+  #aiDrawer .ai-chain-node:hover { background: #DCECFB; border-color: #7DB2E4; }
+  .ai-chain-arrow { font-size: 11px; color: #78889A; font-family: var(--font-mono); }
+
+  .ai-pres-card, .ai-health-card {
+    margin: 8px 0; padding: 8px 10px; border-radius: 10px;
+    border: 1px solid #D3E1F0; background: #F6FAFE; font-size: 12px;
+  }
+  .ai-pres-head, .ai-health-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 600; color: #124B71;
+  }
+  .ai-pres-steps { margin: 6px 0 0; padding-left: 16px; display: grid; gap: 4px; font-size: 11.5px; color: #3D3C38; }
+  .ai-health-issues { display: grid; gap: 5px; margin-top: 7px; }
+  .ai-health-issue {
+    padding: 6px 8px; border-radius: 7px; border: 1px solid #E5E7EB; background: #FFFFFF; font-size: 11.5px;
+  }
+  .ai-health-issue.sev-high { border-left: 3px solid #D9303E; }
+  .ai-health-issue.sev-medium { border-left: 3px solid #D97706; }
+  .ai-health-issue.sev-low { border-left: 3px solid #185FA5; }
+  .ai-msg-toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  #aiDrawer .ai-undo-btn {
+    height: 24px; padding: 0 9px; font-size: 11px; border-radius: 7px;
+    border: 1px solid #E4C185; background: #FFF9EE; color: #8A4F04;
+  }
+  #aiDrawer .ai-undo-btn:hover:not(:disabled) { background: #FEF0D2; }
+
+  #aiBookmarkBanner { background: #EEF6FD; border-color: #B5D4F4; color: #124B71; }
+  #aiBookmarkBanner .ai-bm-banner-actions { display: inline-flex; gap: 5px; flex-shrink: 0; }
+  #aiDrawer #aiBookmarkBanner button { height: 24px; padding: 0 8px; font-size: 11px; border-radius: 6px; }
+
+  #aiPaneGuide .ai-scroll { padding: 14px; display: grid; gap: 10px; align-content: start; }
+  .ai-guide-card {
+    padding: 10px 12px; border-radius: 10px; border: 1px solid #ECEAE2; background: #FAF9F6;
+  }
+  .ai-guide-card h3 { margin: 0 0 6px; font-size: 12.5px; font-weight: 600; color: #124B71; }
+  .ai-guide-card p, .ai-guide-card li { margin: 0; font-size: 12px; line-height: 1.62; color: #3D3C38; }
+  .ai-guide-card ul { margin: 4px 0 0; padding-left: 17px; display: grid; gap: 4px; }
+  .ai-guide-card code {
+    font-family: var(--font-mono); font-size: 11px; padding: 1px 5px; border-radius: 4px;
+    background: #FFFFFF; border: 1px solid #E2DFD6; color: #0C447C;
+  }
+
+  .ai-pres-hud {
+    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 38;
+    display: flex; align-items: center; gap: 8px; max-width: min(640px, calc(100% - 28px));
+    padding: 7px 10px 7px 12px; border-radius: 12px;
+    background: rgba(24, 34, 48, 0.94); color: #F8FAFC; font-size: 12px;
+    box-shadow: 0 8px 26px rgba(15, 23, 42, 0.28);
+  }
+  .ai-pres-hud[hidden] { display: none; }
+  .ai-pres-hud-info { min-width: 0; display: grid; gap: 1px; }
+  .ai-pres-hud-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ai-pres-hud-sub { font-size: 11px; color: #CBD5E1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ai-pres-hud-actions { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+  .ai-pres-hud button {
+    height: 24px; padding: 0 8px; border-radius: 6px; font-size: 11px;
+    border: 1px solid rgba(255,255,255,0.24); background: rgba(255,255,255,0.12); color: #FFFFFF;
+  }
+  .ai-pres-hud button:hover:not(:disabled) { background: rgba(255,255,255,0.24); }
+  .ai-pres-hud button:disabled { opacity: 0.45; cursor: default; }
+  .ai-pres-hud-counter { font-family: var(--font-mono); font-size: 11px; color: #93C5FD; padding: 0 4px; }
 </style>
 </head>
 <body>
@@ -1631,7 +1850,10 @@
         <button id="clearCanvas" type="button" disabled data-i18n="timeline.kindClearCanvas">清空画布</button>
       </div>
       <div class="top-actions" aria-label="工程工具" data-i18n-aria-label="toolbar.projectTools">
-        <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
+        <div class="bm-split" id="bookmarkSplit">
+          <button id="bookmarkBtn" data-i18n="btn.bookmark">书签</button>
+          <button id="bookmarkQuickSave" type="button" title="保存当前视图或书签改动 (Ctrl+S)" hidden>保存</button>
+        </div>
         <button id="timelineBtn" data-i18n="btn.timeline">时间轴</button>
         <details class="tool-menu" id="exportMenu">
           <summary data-i18n="toolbar.export">导出</summary>
@@ -1709,6 +1931,7 @@
     <div id="compareEmpty" hidden></div>
     <div id="legend">
       <span><i id="lg-call" style="border-color:#2C2C2A"></i><em data-i18n="legend.call">函数调用</em></span>
+      <span><i id="lg-fnptr" style="border-color:#7F77DD"></i><em data-i18n="legend.fnptr">函数指针调用</em></span>
       <span><i id="lg-var" style="border-color:#2C2C2A;border-top-style:dashed"></i><em data-i18n="legend.var" title="写入函数 → 变量 → 读取函数，双箭头表示读写" data-i18n-title="legend.varHint">数据流向</em></span>
       <span><i id="lg-added" style="border-color:#D9303E"></i><em data-i18n="legend.added">新增</em></span>
       <span><i id="lg-del"><svg viewBox="0 0 20 8" width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="20" y2="4" stroke="currentColor" stroke-width="2"/><path d="M8 1l4 6M12 1l-4 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></i><em data-i18n="legend.deleted">删除</em></span>
@@ -1720,6 +1943,18 @@
       <span id="reviewText" aria-live="polite"></span>
       <button id="reviewRestore" class="primary" data-i18n="timeline.restore">恢复到此</button>
       <button id="reviewExit" data-i18n="timeline.exit">回到最新</button>
+    </div>
+    <div id="aiPresentationHud" class="ai-pres-hud" hidden role="region" aria-label="AI 分步导览">
+      <div class="ai-pres-hud-info">
+        <span id="aiPresHudTitle" class="ai-pres-hud-title"></span>
+        <span id="aiPresHudSub" class="ai-pres-hud-sub"></span>
+      </div>
+      <div class="ai-pres-hud-actions">
+        <span id="aiPresHudCounter" class="ai-pres-hud-counter">1/1</span>
+        <button type="button" id="aiPresPrev">上一步</button>
+        <button type="button" id="aiPresNext">下一步</button>
+        <button type="button" id="aiPresClose">退出导览</button>
+      </div>
     </div>
     <div id="projectSwitchOverlay" role="status" aria-live="polite" hidden>
       <div class="switch-card">
@@ -1824,6 +2059,10 @@
       <label class="build-check">
         <input type="checkbox" id="buildStrictCheck" checked>
         <span>严格单机种编译数据库模式（仅解析当前所选配置包含的 .c 文件，防止多机种同名函数串扰）</span>
+      </label>
+      <label class="build-check">
+        <input type="checkbox" id="buildDispatchExpandCheck" checked>
+        <span>静态分派候选全展开（对结构成员、多维表索引与运行时赋值保留全部静态函数指针候选边，并用虚线区分）</span>
       </label>
       <label class="build-field">
         <span>Clang 可执行文件路径（可选，支持内网便携版 clang.exe）</span>
@@ -2040,16 +2279,24 @@
     <div class="tl-tools">
       <input id="tlSearch" type="search" placeholder="搜索函数名 / 备注…" data-i18n-ph="timeline.search">
       <div class="tl-chips" id="tlChips">
-        <button data-ops="" class="on" data-i18n="timeline.all">全部</button>
-        <button data-ops="edge.annotate,labels.renumber" data-i18n="timeline.kindEdge">连线标签</button>
-        <button data-ops="node.annotate" data-i18n="timeline.kindNode">节点标注</button>
-        <button data-ops="layout.save,layout.clear" data-i18n="timeline.kindLayout">布局</button>
-        <button data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
-        <button data-ops="bookmark.save,bookmark.delete" data-i18n="timeline.kindBookmark">书签</button>
-        <button data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
-        <button data-ops="view.snapshot,view.clear" data-i18n="timeline.kindCanvas">画布</button>
+        <button data-level="milestone" data-ops="" data-i18n="timeline.milestone">关键节点</button>
+        <button data-level="" data-ops="" class="on" data-i18n="timeline.all">全部</button>
+        <button data-level="" data-ops="edge.annotate,labels.renumber" data-i18n="timeline.kindEdge">连线标签</button>
+        <button data-level="" data-ops="node.annotate" data-i18n="timeline.kindNode">节点标注</button>
+        <button data-level="" data-ops="layout.save,layout.clear" data-i18n="timeline.kindLayout">布局</button>
+        <button data-level="" data-ops="delete,delete.restore,delete.clear" data-i18n="timeline.kindDelete">删除</button>
+        <button data-level="" data-ops="bookmark.save,bookmark.delete,view.checkpoint" data-i18n="timeline.kindBookmark">书签</button>
+        <button data-level="" data-ops="view.compose" data-i18n="timeline.kindCompose">AI 组图</button>
+        <button data-level="" data-ops="view.snapshot,view.clear" data-i18n="timeline.kindCanvas">画布</button>
       </div>
       <span class="tl-count" id="tlCount"></span>
+    </div>
+    <div class="tl-extra-tools">
+      <label id="tlScopeBookmarkWrap" hidden><input type="checkbox" id="tlScopeBookmark"> <span data-i18n="timeline.currentBookmark">仅当前书签</span></label>
+      <div class="tl-cp-box">
+        <input id="tlCheckpointInput" type="text" maxlength="80" placeholder="输入检查点名称（可选），如「核对完周期入口」…" data-i18n-ph="bookmark.checkpointPlaceholder">
+        <button id="tlCheckpointBtn" type="button" data-i18n="bookmark.checkpoint">打检查点</button>
+      </div>
     </div>
     <div class="modal-body" id="timelineList"></div>
   </div>
@@ -2076,6 +2323,7 @@
         <button type="button" class="ai-tab on" data-ai-tab="chat" data-i18n="ai.tabChat">对话助手</button>
         <button type="button" class="ai-tab" data-ai-tab="api" data-i18n="ai.tabApi">直连 API</button>
         <button type="button" class="ai-tab" data-ai-tab="mcp" data-i18n="ai.tabMcp">外部 MCP</button>
+        <button type="button" class="ai-tab" data-ai-tab="guide" id="aiGuideTab">? 指南</button>
       </div>
       <button type="button" id="aiDrawerClose" class="ai-drawer-close" aria-label="关闭">&times;</button>
     </div>
@@ -2093,6 +2341,14 @@
         <span>尚未配置本地模型 API 地址或模型名</span>
         <button type="button" id="aiGoConfig">去配置</button>
       </div>
+      <div id="aiBookmarkBanner" class="ai-banner" hidden>
+        <span id="aiBookmarkBannerText">当前书签已切换</span>
+        <span class="ai-bm-banner-actions">
+          <button type="button" id="aiBookmarkNewChat">新建书签对话</button>
+          <button type="button" id="aiBookmarkBindChat">绑定当前</button>
+          <button type="button" id="aiBookmarkDismiss" aria-label="忽略">&times;</button>
+        </span>
+      </div>
       <div class="ai-quick">
         <button type="button" data-ai-quick="git">⚡ Git 改动直接上图</button>
         <button type="button" data-ai-quick="find">🔍 按关键词找函数入图</button>
@@ -2103,12 +2359,20 @@
         <div class="empty">
           <div class="ai-empty-badge" aria-hidden="true">✦</div>
           <div class="ai-empty-title">TCU 调用图 AI 助手</div>
-          <p class="ai-empty-desc">直接提问查找函数、分析 Git 改动或补全标签，选中的画布节点与连线会自动作为上下文。</p>
-          <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/new 新建</span><span>·</span><span>/compact 压缩</span></div>
+          <p class="ai-empty-desc">支持先预览画布候选并显式加入上下文，也可用 <code>/present</code>、<code>/check</code>、<code>/subagent</code> 智能呈链、体检与并行调查。</p>
+          <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/ 指令</span><span>·</span><span>@ 符号</span><span>·</span><span>Alt+A 附着当前候选</span></div>
         </div>
       </div>
       <div class="ai-selection-bar" id="aiSelectionBar" role="group" aria-label="画布选区" hidden>
         <div class="ai-pinned-list" id="aiPinnedList" hidden></div>
+        <div class="ai-relation-bar" id="aiRelationBar" hidden>
+          <span class="ai-relation-label">多选关系：</span>
+          <button type="button" class="ai-rel-btn on" data-ai-rel="auto">自动</button>
+          <button type="button" class="ai-rel-btn" data-ai-rel="compare">对比差异</button>
+          <button type="button" class="ai-rel-btn" data-ai-rel="path">调用通路</button>
+          <button type="button" class="ai-rel-btn" data-ai-rel="dataflow">读写数据流</button>
+          <button type="button" class="ai-rel-btn" data-ai-rel="common_callers">公共调用者</button>
+        </div>
         <div class="ai-selection-row" id="aiSelectionRow">
           <div class="ai-trunk-switch" id="aiTrunkSwitch" hidden>
             <span class="ai-trunk-badge" id="aiTrunkBadge"></span>
@@ -2117,9 +2381,10 @@
             <button type="button" id="aiTrunkNext" class="ai-trunk-step" title="下一条共线分支">▶</button>
           </div>
           <div class="ai-selection-pill">
+            <span class="ai-cand-tag">候选</span>
             <span id="aiSelectionText"></span>
-            <button type="button" id="aiPinSelection" aria-label="暂存选区到多选列表" title="暂存到待提问列表，可继续点选多个画布关系">+</button>
-            <button type="button" id="aiClearSelection" aria-label="移除画布选区" title="移除画布选区">&times;</button>
+            <button type="button" id="aiPinSelection" aria-label="将画布候选加入本轮对话上下文" title="加入本轮对话上下文 (Alt+A)，只有加入后的芯片才随发送进入模型">+</button>
+            <button type="button" id="aiClearSelection" aria-label="移除画布候选" title="隐藏当前画布候选">&times;</button>
           </div>
           <div class="ai-selection-questions" id="aiSelectionQuestions"></div>
         </div>
@@ -2135,6 +2400,7 @@
         </div>
         <div class="ai-chat-status" id="aiChatStatus" role="status"></div>
         <div class="ai-input-shell" id="aiInputShell">
+          <div class="ai-slash-menu" id="aiSlashMenu" role="listbox" hidden></div>
           <div class="ai-attachments" id="aiAttachments" hidden></div>
           <div class="ai-prompt-wrap">
             <textarea id="aiPromptInput" placeholder=""></textarea>
@@ -2216,6 +2482,18 @@
               <input id="aiMaxTokens" type="number" min="0" max="65536" step="1" placeholder="8192">
             </label>
           </div>
+          <label class="build-check">
+            <input id="aiSubagentEnabled" type="checkbox" checked>
+            <span>启用并行只读子调查 (Subagent) —— 允许 AI 将复杂多模块/多路径核实任务并发拆给只读子代理</span>
+          </label>
+          <div class="ai-form-grid-2">
+            <label>子调查最大并发数 (1–3)
+              <input id="aiSubagentConcurrency" type="number" min="1" max="3" step="1" value="2">
+            </label>
+            <label>单子调查步数上限 (2–12)
+              <input id="aiSubagentMaxSteps" type="number" min="2" max="12" step="1" value="6">
+            </label>
+          </div>
           <div class="ai-form-actions">
             <button type="button" id="aiTestConn">测试连接</button>
             <button type="button" id="aiSaveApi" class="primary">保存配置</button>
@@ -2232,6 +2510,43 @@
         <p id="aiLocked" class="ai-locked" hidden data-i18n="ai.locked"></p>
         <div style="margin-top:10px;display:flex;justify-content:flex-end">
           <button id="aiSave" class="primary" data-i18n="ai.save">保存</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="ai-pane" id="aiPaneGuide" hidden>
+      <div class="ai-scroll">
+        <div class="ai-guide-card">
+          <h3>1. 显式上下文与精确暂存（不隐式带跑偏）</h3>
+          <ul>
+            <li>普通单击画布节点/连线/文件只更新灰色虚线<strong>「候选」</strong>预览条，不会在直接点击发送时擅自注入模型。</li>
+            <li>点击候选旁的 <code>+</code>（或按 <code>Alt+A</code>、画布右键「问 AI」、点击候选快捷问题）会将其冻结成实心芯片加入本轮上下文。</li>
+            <li>芯片上的 <code>📌</code> 可锁定跨轮保留；未锁定芯片会在发送成功后自动清空。附加 2 项以上时，可用<strong>多选关系</strong>切换对比 / 调用通路 / 读写数据流 / 公共调用者。</li>
+          </ul>
+        </div>
+        <div class="ai-guide-card">
+          <h3>2. 两点数据流（Ctrl+Click）与数据流面板联动</h3>
+          <ul>
+            <li>按住 <code>Ctrl</code> 依次点击两个函数，会自动查询它们之间的可见调用线与共享变量读写链，点击 <code>+</code> 可将完整 <code>A↔B</code> 关系（含源码读写证据）整体附着给 AI。</li>
+            <li>在右侧「数据流」面板查看某个函数或变量后，点击标题栏 <code>✨ 加入对话</code> 可将当前数据流上下文直接带入聊天框。</li>
+          </ul>
+        </div>
+        <div class="ai-guide-card">
+          <h3>3. 智能呈现、画布体检与并行子调查</h3>
+          <ul>
+            <li><code>/present</code>（或直接说「帮我呈现 xx 的调用和数据流」）：AI 自动按调用层切片、推送高亮节点与共享变量到画布，并在底部弹出<strong>分步导览条</strong>逐步聚焦。</li>
+            <li><code>/check</code>：只读体检当前画布——检查缺失的 TASK / コール順标签、未展开的间接调用点、孤立节点与排版重叠，提供一键修复按钮。</li>
+            <li><code>/subagent</code>（可在「直连 API」中开关与调节并发数 1–3）：针对跨车型、多入口、复杂间接调用并行派发只读子调查汇总证据。</li>
+            <li>支持 <code>/</code> 调出指令面板、<code>@</code> 快速检索并插入/暂存工程符号。</li>
+          </ul>
+        </div>
+        <div class="ai-guide-card">
+          <h3>4. 链路卡、轻量高亮与安全撤销</h3>
+          <ul>
+            <li>对话中的<strong>链路卡</strong>采用点击分离设计：点击单个 <code>ƒ fn</code> 芯片只定位/聚焦该节点（悬停会联动高亮画布）；点击卡片头部的 <code>◉ 高亮</code> / <code>≋ 动画</code> / <code>+ 入图</code> 才作用于整条链路。</li>
+            <li>AI 执行画布/标签/连线修改后，消息下方会提供 <code>↶ 撤销本轮改图</code> 按钮一键回退到执行前状态。</li>
+            <li>切换书签时支持提示新建或绑定当前对话，也可输入 <code>/bookmark 名称</code> 快速存为书签。</li>
+          </ul>
         </div>
       </div>
     </section>

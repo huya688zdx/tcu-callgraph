@@ -1261,6 +1261,13 @@ document.addEventListener('keydown', (e) => {
     els.tooltip.style.opacity = '0';
     cancelDrag();
     draw();
+  } else if (e.key === 'Escape' && (state.presentation || state.aiOverlay) && !document.querySelector('.modal.show')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    state.presentation = null;
+    state.aiOverlay = null;
+    document.dispatchEvent(new CustomEvent('cg:ai-overlay-cleared'));
+    draw();
   } else if (e.key === 'Escape' && state.pairFlow && !document.querySelector('.modal.show')) {
     e.preventDefault(); e.stopImmediatePropagation(); clearPairFlow();
   } else if ((state.multiSelection || activeTrunk()) && !document.querySelector('.modal.show')) {

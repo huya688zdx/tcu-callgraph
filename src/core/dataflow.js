@@ -38,18 +38,18 @@ const fnNodeOf = (model, id) => {
 };
 
 /**
- * 查询一个函数的数据流关系
+ * 查询函数或全局变量的数据流关系
  * @param {object} model
- * @param {string} fnId 函数节点 id
+ * @param {string} fnId 函数或变量的节点 id
  * @param {'out'|'in'|'both'} dir out=它的写影响到谁；in=谁的状态影响它
  */
 export async function dataflowFor(model, fnId, dir = 'out') {
-  const fn = model._index.byId.get(fnId);
-  if (!fn) throw new Error('函数不存在');
-
   const idx = await buildDataflowIndex(model);
+  const fn = model._index.byId.get(fnId);
+  if (!fn) throw new Error('函数或变量不存在');
+  const variable = idx.byId.get(fnId);
   const acc = idx.fnAccess.get(fnId);
-  if (!acc) return { ok: true, fn: { id: fn.id, name: fn.name }, vars: [], nodes: [], edges: [], empty: true };
+  if (!acc && !variable) return { ok: true, fn: { id: fn.id, name: fn.name }, vars: [], nodes: [], edges: [], empty: true };
 
   const nodes = new Map();
   const edges = [];
@@ -128,6 +128,29 @@ export async function dataflowFor(model, fnId, dir = 'out') {
   const wantOut = dir === 'out' || dir === 'both';
   const wantIn = dir === 'in' || dir === 'both';
 
+  if (variable) {
+    let truncated = false;
+    for (const [enabled, access, kind] of [[wantIn, idx.writers, 'df-write'], [wantOut, idx.readers, 'df-read']]) {
+      if (!enabled) continue;
+      const writers = kind === 'df-write';
+      const ids = access.get(fnId) || new Set();
+      const peers = [];
+      for (const id of ids) {
+        if (peers.length >= MAX_PEERS) { truncated = true; break; }
+        const peer = fnNodeOf(model, id);
+        if (!peer) continue;
+        addNode(peer);
+        const rec = idx.fnAccess.get(id)?.[writers ? 'writes' : 'reads'].get(fnId);
+        pushEdge(writers ? id : fnId, writers ? fnId : id, kind, variable.name, firstLine(rec));
+        peers.push({ id, name: peer.name, file: peer.file, taskPeriods: periods.get(id) || [] });
+      }
+      if (peers.length) vars.push({ id: fnId, name: fn.name, mode: writers ? 'write' : 'read', peers });
+    }
+    return { ok: true, fn: { id: fn.id, name: fn.name, file: fn.file, line: fn.line }, dir, vars,
+      nodes: [...nodes.values()], edges, writes: idx.writers.get(fnId)?.size || 0,
+      reads: idx.readers.get(fnId)?.size || 0, truncated };
+  }
+
   if (wantOut) {
     for (const [varId, rec] of acc.writes) {
       if (vars.length >= MAX_VARS) break;
@@ -163,6 +186,37 @@ export async function dataflowFor(model, fnId, dir = 'out') {
     reads: acc.reads.size,
     truncated,
   };
+}
+
+/** 从当前工程、同一版本的查询行生成模型证据。显式选中行不受摘要截取影响。 */
+export function dataflowAttachment(flow, dir, focus) {
+  const targetId = flow.fn.id;
+  const vars = new Map(), writers = new Set(), readers = new Set(), edges = [];
+  let focused = null;
+  for (const v of flow.vars) {
+    if (v.id.length > 200) continue;
+    if (vars.size < 12) vars.set(v.id, { id: v.id, name: v.name.slice(0, 120) });
+    const tag = v.version ? '[' + v.version + '] ' : '';
+    for (const peer of v.peers) {
+      if (peer.id.length > 200) continue;
+      // 变量根的一行只有一次访问。函数根的一行经变量连接写者与读者。
+      const rootFunction = v.id === targetId ? null : targetId;
+      const peerWrites = rootFunction ? v.mode === 'read' : v.mode === 'write';
+      const writer = peerWrites ? peer.id : rootFunction;
+      const reader = peerWrites ? rootFunction : peer.id;
+      const path = tag + [writer, v.id, reader].filter(Boolean).join(' → ');
+      if (writer && writers.size < 10) writers.add(tag + writer);
+      if (reader && readers.size < 10) readers.add(tag + reader);
+      if (edges.length < 16) edges.push(path);
+      if (focus?.varId === v.id && focus.peerId === peer.id && focus.mode === v.mode &&
+          (focus.version ?? null) === (v.version ?? null)) {
+        focused = { varId: v.id, peerId: peer.id, mode: v.mode, version: v.version, path };
+      }
+    }
+  }
+  if (focus != null && !focused) return null;
+  return { kind: 'dataflow', targetId, targetName: flow.fn.name.slice(0, 120), dir, vars: [...vars.values()],
+    writers: [...writers], readers: [...readers], edges, focused };
 }
 
 /**

@@ -115,22 +115,34 @@ export const api = {
   cancelComparison: (previewId) => post('/api/compare/cancel', { previewId }),
   exitComparison: () => post('/api/compare/exit', {}),
   /** 时间轴事件列表：分页 + 过滤，只回 brief 不回完整载荷 */
-  events: ({ limit = 50, before = 0, ops = [], q = '' } = {}) => {
+  events: ({ limit = 50, before = 0, ops = [], q = '', level = '', bookmarkId = null } = {}) => {
     const p = new URLSearchParams({ limit: String(limit) });
     if (before) p.set('before', String(before));
     if (ops && ops.length) p.set('ops', ops.join(','));
     if (q) p.set('q', q);
+    if (level) p.set('level', level);
+    if (bookmarkId !== null && bookmarkId !== undefined && bookmarkId !== '') p.set('bookmarkId', String(bookmarkId));
     return get('/api/events?' + p);
   },
   /** 恢复到历史某一刻（会追加一条 restore_point 事件） */
   restore: (eventId) => post('/api/restore', { eventId }),
   recordViewEvent: (body) => guardWrite('viewEvent') || post('/api/view-event', body),
+  saveCheckpoint: (checkpointName, view, ctx = {}) =>
+    guardWrite('viewEvent') ||
+    post('/api/view-event', {
+      op: 'view.checkpoint',
+      projectId: state.view?.projectId,
+      label: checkpointName,
+      view,
+      ctx: { ...ctx, checkpointName, milestone: 1 },
+    }),
   /** 失效标注：库里指向已不存在的函数 / 连线的条目 */
   orphans: () => get('/api/orphans'),
   purgeOrphans: () => guardWrite('orphans') || post('/api/orphans/purge', {}),
   /** 书签：保存的视图（入口集合 + 深度 + 模式） */
   bookmarks: () => get('/api/bookmarks'),
   saveBookmark: (body) => guardWrite('bookmarks') || post('/api/bookmarks', body),
+  updateBookmark: (body) => guardWrite('bookmarks') || post('/api/bookmarks/update', body),
   renameBookmark: (id, name) => guardWrite('bookmarks') || post('/api/bookmarks/rename', { id, name }),
   deleteBookmark: (id) => guardWrite('bookmarks') || post('/api/bookmarks/delete', { id }),
   /** 导入 .cgx 会话（导出走浏览器直接下载，不需要接口封装） */
@@ -166,8 +178,13 @@ export const api = {
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir), { timeout: ANALYSIS_TIMEOUT }),
-  pairDataflow: (a, b) => post('/api/dataflow/pair', { a, b, projectId: state.view?.projectId,
-    comparisonId: state.view?.comparison?.id }, { timeout: ANALYSIS_TIMEOUT }),
+  pairDataflow: (a, b, { signal } = {}) => post('/api/dataflow/pair', {
+    a,
+    b,
+    projectId: state.view?.projectId,
+    comparisonId: state.view?.comparison?.id,
+    sessionRevision: state.view?.sessionRevision,
+  }, { timeout: ANALYSIS_TIMEOUT, signal }),
   /** AI 访问（MCP）权限：level ∈ off / readonly / readwrite */
   mcpConfig: () => get('/api/mcp-config'),
   setMcpConfig: (level) => post('/api/mcp-config', { level }),
@@ -189,6 +206,8 @@ export const api = {
     return write;
   },
   compactChat: (body, signal) => post('/api/ai/compact', body, { timeout: MODEL_TIMEOUT, signal }),
+  aiTurnChangeset: (turnId, projectId) => get('/api/ai/changeset?' + new URLSearchParams({ turnId, projectId })),
+  aiUndoChangeset: (changesetId) => post('/api/ai/undo-changeset', { changesetId }),
   aiModels: (body, signal) => post('/api/ai/models', body, { timeout: MODEL_TIMEOUT, signal }),
   aiTest: (body) => post('/api/ai/test', body, { timeout: MODEL_TIMEOUT }),
   aiChat: (body, signal) =>

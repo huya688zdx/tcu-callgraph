@@ -1,7 +1,7 @@
 /**
  * 内置直连 OpenAI 兼容模型代理：
  * - 零新依赖，直接调用本地或远程 /v1/chat/completions（兼容 Ollama / vLLM / LM Studio / llama.cpp / 旧版中转）。
- * - 为本地中小模型（如 Qwen 27B）提供简洁的工具参数。
+ * - 面向通用大模型（不绑定单一模型家族），提供精炼、语义明确的工具集与结构化证据注入。
  * - 自动兼容旧版 OpenAI 接口：支持标准 tool_calls、旧版 function_call，以及不传 tools / role:"tool" 的纯对话工具调用回退。
  */
 
@@ -24,10 +24,19 @@ export const DEFAULT_AI_CONFIG = {
   temperature: 0.2,
   maxTokens: 8192,
   contextWindow: 32768,
+  subagentEnabled: true,
+  subagentMaxConcurrency: 2,
+  subagentMaxSteps: 6,
 };
 
 function validContextWindow(value) {
   return Number.isInteger(value) && value >= 4096 && value <= 1048576;
+}
+
+function clampInt(value, fallback, min, max) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(num)));
 }
 
 /** 兼容用户填写 http://host:port、.../v1、.../v1/chat/completions（含查询参数）三种形式。 */
@@ -80,7 +89,26 @@ export function normalizeAiConfig(raw = {}, existing = DEFAULT_AI_CONFIG) {
     : Math.max(0, Math.min(65536, Math.trunc(Number(raw.maxTokens) || 0)));
   const requestedWindow = Number(raw.contextWindow);
   const contextWindow = validContextWindow(requestedWindow) ? requestedWindow : prev.contextWindow;
-  return { baseUrl: nextNorm, model, apiKey, toolMode, reasoningEffort, temperature, maxTokens, contextWindow };
+  const subagentEnabled = raw.subagentEnabled !== undefined ? Boolean(raw.subagentEnabled) : Boolean(prev.subagentEnabled);
+  const subagentMaxConcurrency = raw.subagentMaxConcurrency === undefined
+    ? clampInt(prev.subagentMaxConcurrency, DEFAULT_AI_CONFIG.subagentMaxConcurrency, 1, 3)
+    : clampInt(raw.subagentMaxConcurrency, DEFAULT_AI_CONFIG.subagentMaxConcurrency, 1, 3);
+  const subagentMaxSteps = raw.subagentMaxSteps === undefined
+    ? clampInt(prev.subagentMaxSteps, DEFAULT_AI_CONFIG.subagentMaxSteps, 2, 12)
+    : clampInt(raw.subagentMaxSteps, DEFAULT_AI_CONFIG.subagentMaxSteps, 2, 12);
+  return {
+    baseUrl: nextNorm,
+    model,
+    apiKey,
+    toolMode,
+    reasoningEffort,
+    temperature,
+    maxTokens,
+    contextWindow,
+    subagentEnabled,
+    subagentMaxConcurrency,
+    subagentMaxSteps,
+  };
 }
 
 export function publicAiConfig(config) {
@@ -94,6 +122,9 @@ export function publicAiConfig(config) {
     temperature: c.temperature,
     maxTokens: c.maxTokens,
     contextWindow: c.contextWindow,
+    subagentEnabled: Boolean(c.subagentEnabled),
+    subagentMaxConcurrency: clampInt(c.subagentMaxConcurrency, DEFAULT_AI_CONFIG.subagentMaxConcurrency, 1, 3),
+    subagentMaxSteps: clampInt(c.subagentMaxSteps, DEFAULT_AI_CONFIG.subagentMaxSteps, 2, 12),
   };
 }
 
@@ -198,14 +229,14 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'read_function',
-    description: '读取某个函数的 C 源码、直接调用关系、间接调用点、变量读写和上游 TASK/ISR 入口。可直接传短函数名或完整 文件::函数名。',
+    description: '读取一个或多个函数的 C 源码、调用关系、间接调用点、变量读写和上游 TASK/ISR 入口。可传单个 name，或传 names 数组一次批量读取（最多 6 个）。',
     parameters: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: '函数名或完整函数 ID，如 "range_gather" 或 "app/pa7_hook.c::range_gather"' },
+        name: { type: 'string', description: '单个函数名或完整函数 ID，如 "range_gather" 或 "app/pa7_hook.c::range_gather"' },
+        names: { type: 'array', maxItems: 6, items: { type: 'string' }, description: '批量读取最多 6 个函数名或完整 ID' },
         encoding: { type: 'string', enum: ['auto', 'cp932', 'utf-8'], description: '源码编码，日文工程可传 cp932，默认 auto' },
       },
-      required: ['name'],
     },
   },
   {
@@ -310,7 +341,7 @@ export const AGENT_TOOLS = [
               from: { type: 'string', description: '调用方函数名或完整 ID' },
               to: { type: 'string', description: '被调方函数名或完整 ID' },
               line: { type: 'integer', description: '可选：具体调用行号' },
-              preset: { type: 'string', enum: ['task', 'call', 'conn'], description: 'task=周期(TASK:xms)，call=调用顺序(コール順N，不带注释)，conn=结合点' },
+              preset: { type: 'string', enum: ['task', 'call', 'conn', 'free'], description: 'task=周期(TASK:xms)，call=调用顺序(コール順N，不带注释)，conn=结合点，free=自由框纯文字标签（不带注释）' },
               text: { type: 'string', description: '标签文字，如 "TASK:10ms"' },
               order: { type: 'integer', description: 'preset=call 时的顺序编号，从 1 开始' },
               note: { type: 'string', description: '仅 task/conn 可选填简短依据，call(コール順) 不要填写' },
@@ -347,11 +378,13 @@ export const AGENT_TOOLS = [
   },
   {
     name: 'trace_upstream',
-    description: '只读追踪上游 TASK/ISR 调用链，按车型或目录前缀返回 pathBranches 和完整 file::fn ID。',
+    description: '只读追踪函数的上游 TASK/ISR 调用链或下游调用路径，按目录前缀返回 pathBranches、完整 file::fn ID 和结构化链路 chains。',
     parameters: {
       type: 'object',
       properties: {
         functions: { type: 'array', items: { type: 'string' }, description: '要追踪的函数名或完整 ID' },
+        direction: { type: 'string', enum: ['up', 'down', 'both'], description: '追踪方向：up 上游（默认）/ down 下游 / both 双向' },
+        depth: { type: 'integer', minimum: 1, maximum: 6, description: '追踪深度 (1-6)，默认 4' },
         limit: { type: 'integer', description: '最多返回的调用链数量' },
       },
       required: ['functions'],
@@ -413,9 +446,122 @@ export const AGENT_TOOLS = [
       },
     },
   },
+  {
+    name: 'inspect_dataflow',
+    description: '只读查询全局变量/函数的数据流向，或查询两点之间共享变量驱动的跨函数读写链路（pair dataflow）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: '目标函数名/ID 或全局变量名/var::ID' },
+        peer: { type: 'string', description: '可选：另一个函数或变量 ID；传入时查询 target 与 peer 的两点读写数据流链' },
+        dir: { type: 'string', enum: ['in', 'out', 'both'], description: '单目标数据流方向（in 写入源 / out 下游读取 / both），默认 both' },
+        maxPaths: { type: 'integer', minimum: 1, maximum: 20, description: '最多返回数据流路径条数，默认 10' },
+      },
+      required: ['target'],
+    },
+  },
+  {
+    name: 'present_logic',
+    description: '智能逻辑呈现与分步导览：围绕入口或目标函数自动切片调用链与共享变量，推送到画布并生成可逐步高亮讲解的导览步骤与链路卡。',
+    parameters: {
+      type: 'object',
+      properties: {
+        root: { type: 'string', description: '主切入函数或 var:: 变量' },
+        targets: { type: 'array', items: { type: 'string' }, description: '多个聚焦函数或变量列表' },
+        direction: { type: 'string', enum: ['up', 'down', 'both'], description: '切片方向，变量的 up 追踪写者，down 追踪读者，默认 both' },
+        depth: { type: 'integer', minimum: 1, maximum: 5, description: '切片深度 (1-5)，默认 2' },
+        includeDataflow: { type: 'boolean', description: '是否补充函数关联的全局变量，默认 true；显式指定的变量始终保留' },
+        addToCanvas: { type: 'boolean', description: '默认 true，需要可见函数才能组图；false 只返回导览。比较模式仅支持只读导览' },
+        mode: { type: 'string', enum: ['add', 'replace'], description: '画布更新模式：add 追加 / replace 替换' },
+        title: { type: 'string', description: '导览主题标题，如“档位切换与油压保护逻辑”' },
+        focusFilter: { type: 'array', items: { type: 'string' }, description: '可选：限定目录前缀，如 ["z145"]' },
+      },
+    },
+  },
+  {
+    name: 'canvas_visual',
+    description: '控制当前浏览器的轻量视觉叠加层（只作用于展示高亮/流动画，不写入持久画布数据）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['highlight', 'play_flow', 'clear'], description: 'highlight 高亮 / play_flow 播放流动画 / clear 清除' },
+        nodeIds: { type: 'array', items: { type: 'string' }, description: '要高亮的节点 ID 列表' },
+        edgeKeys: { type: 'array', items: { type: 'string' }, description: '要高亮的边键列表 (from->to)' },
+        label: { type: 'string', description: '画布悬浮提示徽章文字' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'diagnose_canvas',
+    description: '只读体检当前画布：检查缺失 TASK/コール順 标签、画布节点关联的未解析间接调用、孤立断开节点与布局重叠问题。',
+    parameters: {
+      type: 'object',
+      properties: {
+        check: { type: 'string', enum: ['all', 'orphans', 'indirect', 'labels', 'layout'], description: '体检维度，默认 all' },
+      },
+    },
+  },
+  {
+    name: 'manage_bookmarks',
+    description: '查询或操作工程书签与时间轴检查点。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'save', 'update', 'checkpoint', 'delete'], description: '操作类型' },
+        name: { type: 'string', description: '书签名称（save / checkpoint）' },
+        id: { type: 'integer', description: '书签 ID（update / delete）' },
+        checkpointName: { type: 'string', description: '时间轴检查点名称' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'run_subagent',
+    description: '派发 1–3 个并行只读子调查代理，在隔离上下文中分别追踪不同模块、分支或调用链并汇总结构化发现。不可在子代理中嵌套调用。',
+    parameters: {
+      type: 'object',
+      properties: {
+        tasks: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 3,
+          description: '并行子调查任务列表（1-3 项）',
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: '子调查简短标题' },
+              goal: { type: 'string', description: '明确要核实的只读问题与范围' },
+              seedSymbols: { type: 'array', items: { type: 'string' }, description: '可选：起始函数或变量符号' },
+            },
+            required: ['title', 'goal'],
+          },
+        },
+      },
+      required: ['tasks'],
+    },
+  },
 ];
 
+export const SUBAGENT_READONLY_TOOLS = new Set([
+  'find_symbols',
+  'read_function',
+  'read_source',
+  'trace_upstream',
+  'inspect_indirect_calls',
+  'inspect_dataflow',
+  'inspect_build_config',
+  'get_git_changes',
+  'diagnose_canvas',
+]);
+
 const TOOL_NAME_SET = new Set(AGENT_TOOLS.map(t => t.name));
+
+function resolveAllowedToolDefs(allowedTools) {
+  if (!allowedTools) return AGENT_TOOLS;
+  const set = allowedTools instanceof Set ? allowedTools : new Set(Array.isArray(allowedTools) ? allowedTools : []);
+  return AGENT_TOOLS.filter(t => set.has(t.name));
+}
 
 function tokenWeight(text) {
   let weight = 0;
@@ -431,7 +577,12 @@ export function estimateTokens(text) {
 
 const TOOL_SCHEMA_TOKENS = estimateTokens(JSON.stringify(openAiToolsPayload()));
 
-export function estimateMessagesTokens(messages, includeTools = false) {
+export function estimateMessagesTokens(messages, includeTools = false, toolDefs = AGENT_TOOLS) {
+  const schemaTokens = !includeTools
+    ? 0
+    : toolDefs === AGENT_TOOLS
+      ? TOOL_SCHEMA_TOKENS
+      : estimateTokens(JSON.stringify(openAiToolsPayload(toolDefs)));
   return messages.reduce((total, message) => {
     if (!Array.isArray(message.content)) return total + 4 + estimateTokens(JSON.stringify(message));
     let imageTokens = 0;
@@ -441,7 +592,7 @@ export function estimateMessagesTokens(messages, includeTools = false) {
       return { type: 'image_url' };
     });
     return total + 4 + estimateTokens(JSON.stringify({ ...message, content })) + imageTokens;
-  }, includeTools ? TOOL_SCHEMA_TOKENS : 0);
+  }, schemaTokens);
 }
 
 /** 仅裁剪 [start, end) 中的旧对话；移除提问时也移除它后面的回答。 */
@@ -457,8 +608,8 @@ function trimOldTurns(messages, start, end, excessTokens, excessCount = 0) {
   return freed;
 }
 
-function openAiToolsPayload() {
-  return AGENT_TOOLS.map(tool => ({
+function openAiToolsPayload(toolDefs = AGENT_TOOLS) {
+  return toolDefs.map(tool => ({
     type: 'function',
     function: {
       name: tool.name,
@@ -474,11 +625,21 @@ function authHeaders(apiKey) {
   return headers;
 }
 
+const RELATION_INTENT_LABELS = {
+  auto: '自动分析关系',
+  compare: '对比差异（功能/分支/调用上下文）',
+  path: '分析调用通路与触发关系',
+  dataflow: '分析共享变量读写与数据流向',
+  common_callers: '追踪公共上游调用者与 TASK 入口',
+};
+
 function formatUiContextSelections(ui) {
   if (!ui || typeof ui !== 'object') return { multi: false, selections: [] };
   const selectedNode = ui.selectedNode ?? (ui.kind === 'node' ? ui : null);
   const selectedEdge = ui.selectedEdge ?? (ui.kind === 'edge' ? ui : null);
   const selectedFile = ui.selectedFile ?? (ui.kind === 'file' ? ui : null);
+  const selectedPair = ui.selectedPair ?? (ui.kind === 'pair' ? ui : null);
+  const selectedDataflow = ui.selectedDataflow ?? (ui.kind === 'dataflow' ? ui : null);
   const location = (file, line) => {
     if (!line) return file;
     return file ? `${file}:${line}` : `第 ${line} 行`;
@@ -488,7 +649,7 @@ function formatUiContextSelections(ui) {
     if (kind === 'node') {
       const id = typeof item === 'string' ? item : item.id || item.name;
       const source = location(item.file ?? item.path, item.line ?? item.startLine);
-      return `节点 ${[id, source].filter(Boolean).join('，')}`;
+      return `${item.nodeKind === 'var' ? '变量' : '节点'} ${[id, source].filter(Boolean).join('，')}`;
     }
     if (kind === 'edge') {
       const { from, to, id, edgeKey, file, line, labels, label } = item;
@@ -497,6 +658,48 @@ function formatUiContextSelections(ui) {
         .map(value => typeof value === 'string' ? value : value?.text).filter(Boolean);
       const tagText = texts.length ? `标签 ${texts.join('、')}` : '';
       return `连线 ${[endpoints, edgeKey ?? id, location(file, line), tagText].filter(Boolean).join('，')}`;
+    }
+    if (kind === 'pair') {
+      const fromLabel = item.fromId || item.fromName || '';
+      const toLabel = item.toId || item.toName || '';
+      if (!fromLabel || !toLabel) return '';
+      const parts = [`两点链路 ${fromLabel} ↔ ${toLabel}`];
+      const vis = Array.isArray(item.visiblePaths) ? item.visiblePaths.length : 0;
+      const rw = Array.isArray(item.rwPaths) ? item.rwPaths.length : 0;
+      const sharedVars = Array.isArray(item.sharedVars)
+        ? item.sharedVars.slice(0, 6).map(v => v.name || v.id || v).filter(Boolean)
+        : [];
+      if (vis) parts.push(`可见连线 ${vis} 条`);
+      if (rw) parts.push(`跨函数读写数据流 ${rw} 条`);
+      if (sharedVars.length) parts.push(`共享变量 ${sharedVars.join('、')}`);
+      return parts.join('，');
+    }
+    if (kind === 'dataflow') {
+      const target = item.targetId || item.targetName || item.id || item.name || '';
+      if (!target) return '';
+      const dirText = item.dir === 'in' ? '写入源(in)' : item.dir === 'both' ? '双向' : '读取下游(out)';
+      const parts = [`数据流 ${target}（${dirText}）`];
+      if (typeof item.focused?.path === 'string') parts.push('选中读写关系 ' + item.focused.path.slice(0, 640));
+      const addSummary = (label, values, budget) => {
+        const kept = [];
+        for (const value of (Array.isArray(values) ? values : []).slice(0, 16)) {
+          if (typeof value !== 'string' || !value) continue;
+          if (value.length > budget) break;
+          kept.push(value);
+          budget -= value.length + 1;
+        }
+        if (kept.length) parts.push(label + ' ' + kept.join('、'));
+      };
+      addSummary('写入方', item.writers, 500);
+      addSummary('读取方', item.readers, 500);
+      addSummary('读写链', item.edges, 1200);
+      if (Array.isArray(item.vars) && item.vars.length) {
+        parts.push(`关联变量 ${item.vars.slice(0, 6).map(v => v.name || v).join('、')}`);
+      }
+      if (Array.isArray(item.peers) && item.peers.length) {
+        parts.push(`关联函数 ${item.peers.slice(0, 6).map(p => p.name || p).join('、')}`);
+      }
+      return parts.join('，');
     }
     if (kind !== 'file') return '';
     const file = typeof item === 'string' ? item : item.path || item.file;
@@ -513,6 +716,8 @@ function formatUiContextSelections(ui) {
     selections: [
       formatSelection('node', selectedNode),
       formatSelection('edge', selectedEdge),
+      formatSelection('pair', selectedPair),
+      formatSelection('dataflow', selectedDataflow),
       formatSelection('file', selectedFile),
     ].filter(Boolean),
   };
@@ -540,10 +745,28 @@ function buildTurnUserText(userText, uiContext, attachments = []) {
       ? `[本轮画布当前选中/暂存对象（共 ${selections.length} 项，指代最高优先级）]`
       : '[本轮画布当前选中对象（指代最高优先级）]';
     const body = selections.map((text, index) => (multi ? `${index + 1}. ${text}` : `- ${text}`)).join('\n');
-    sections.push(
+    const contextParts = [
+      '<current_turn_context scope="this-turn-only">',
       header,
       body,
-      '（若下方提问使用“这个函数/它/这个变量/这条线/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
+    ];
+    if (uiContext?.relationIntent && uiContext.relationIntent !== 'auto') {
+      contextParts.push(`交互关注意图：${RELATION_INTENT_LABELS[uiContext.relationIntent] || uiContext.relationIntent}`);
+    }
+    if (typeof uiContext?.enrichment === 'string' && uiContext.enrichment.trim()) {
+      contextParts.push('[图谱证据摘要]', uiContext.enrichment.trim());
+    }
+    contextParts.push(
+      '（若下方提问使用“这个函数/它/这个变量/这条线/这两者/当前对象”或未显式点名其他符号，目标必须固定为以上选中对象，严禁锚定到上轮对话提到的其他符号，也不要把上轮顺带提及的延伸内容当成本轮需求。）',
+      '</current_turn_context>',
+    );
+    sections.push(...contextParts);
+  } else if (typeof uiContext?.enrichment === 'string' && uiContext.enrichment.trim()) {
+    sections.push(
+      '<current_turn_context scope="this-turn-only">',
+      '[图谱证据摘要]',
+      uiContext.enrichment.trim(),
+      '</current_turn_context>',
     );
   }
   sections.push(...formatCodeAttachments(attachments));
@@ -552,7 +775,7 @@ function buildTurnUserText(userText, uiContext, attachments = []) {
   return sections.join('\n');
 }
 
-function buildSystemPrompt(context, promptToolMode) {
+function canvasSystemPrompt(context) {
   const ctxLines = [
     `当前工程：${context.projectName || '未命名'}（函数 ${context.fnCount ?? 0} / 变量 ${context.varCount ?? 0}）`,
     `当前画布入口：${context.canvasRoots?.length ? context.canvasRoots.join(', ') : '空画布'}`,
@@ -565,52 +788,37 @@ function buildSystemPrompt(context, promptToolMode) {
   if (context.tasks?.length) {
     ctxLines.push(`已识别任务入口：${context.tasks.slice(0, 10).join(', ')}`);
   }
-  if (context.uiContext) {
-    const { multi, selections } = formatUiContextSelections(context.uiContext);
-    if (multi) {
-      ctxLines.push(`用户当前在画布上选中/暂存的对象（共 ${selections.length} 项）：`,
-        ...selections.map((text, index) => `${index + 1}. ${text}`));
-    } else {
-      ctxLines.push('用户当前在画布上选中的对象：', ...(selections.length ? selections : ['无']));
-    }
-  }
 
   const base = [
-    '你是 TCU C 调用图画布助手。回答解释或排查类问题时先调只读工具查证事实；用户要求构图、标注或调整画布时，再尽快调用对应工具修改画布并给出简明中文说明。',
+    '你是 TCU C 调用图画布助手。回答解释或排查类问题时先调只读工具查证事实；用户要求构图、呈现、标注或调整画布时，再尽快调用对应工具并给出简明中文说明。',
     '核心原则：',
-    '1. 不要长篇空想，立刻动手调工具。',
-    '2. 用户要求将 Git 改动加入画布时，先调用 get_git_changes 检查目录分支，再按第 8、9 条确定范围。调用 add_to_canvas 时传 fromGit: true 和已取得的 snapshotId，自动写入改动函数、上游 TASK 链、变更颜色和 TASK:xms 标签。多个独立模块默认拆分为独立书签，若需要用户决定则用 ask_user 确认拆分或合并。用户要求合并时传 splitByGroup: false。',
-    '3. 用户按功能/关键词找函数或变量时，先调 find_symbols，再调 add_to_canvas 加入画布（支持短函数名，默认自动补齐上游 TASK 链）。',
-    '用户要求拆成指定的 N 组时，一次调用 add_to_canvas，传 groups: [{name, functions, vars}, ...]，每个书签只包含本组范围。涉及 Git 时同时传 fromGit: true 和 snapshotId。',
-    '普通最终回复末尾用 <next_steps>[{"label":"简短按钮文案","prompt":"点击后执行的具体指令"}]</next_steps> 给出 2–3 个结合本轮具体函数、变量或发现的后续操作。label 最多 28 字。书签建议可用 draft 字段填写 "/bookmark 名称"。调用 ask_user 时省略建议。',
-    '4. 补齐 TASK 周期或调用顺序时，先调用 find_symbols({}) 查看 canvasEdges 和 suggestedLabels（含从函数头注释提取的周期），再调用 apply_labels 传入 items 或 { autoDetect: true } 写入画布。手动标周期用 preset:"task"（如 text:"TASK:10ms"），标调用顺序用 preset:"call"（コール順N），且 call 标签禁止填写 note。',
-    '5. 源码若为日文 CP932，调 read_function 可传 encoding:"cp932"，严禁将乱码写入标签注释或回复。',
-    '6. 只使用已确认存在的函数名。遇到重名或同一函数/文件存在于多个车型目录（如 z144/a.c::foo 与 z145/a.c::foo）时，只要用户未指定车型目录且未在画布选中具体实例，严禁自行猜选其中一个或全部加入画布，必须在修改画布前调用 ask_user 提供候选项；用户意图明确或已回答时直接执行。',
-    '7. 完成后用 2-5 句中文总结：加入了哪些函数/变量、触发任务周期及关键调用或数据流。',
-    '8. 准备写入画布且需要确认上游车型或同名多车型路径时，先用 trace_upstream 读取上游链。get_git_changes、trace_upstream 或 add_to_canvas 返回至少两个 pathBranches 分支、ambiguous 或 needsVehicleChoice: true，且用户尚未明确范围时，下一步必须单独调用 ask_user。用每个分支的 prefix 作为一个选项，再加一个「全部保留」选项。等用户选择后再调用 add_to_canvas。',
-    '9. 用户明确指定车型、路径或选项后，立即调用 add_to_canvas，复用已有 snapshotId，按确认范围传 includePaths 或 excludePaths。用户明确选择「全部保留」时，传 includeAllBranches: true，省略路径过滤。用户要求从现有画布移除车型时，调用 remove_from_canvas 并传 excludePaths。执行工具后再确认结果。',
-    '工具结果包含 updatedWhileReviewing 时，说明已写入最新画布，用户退出时间轴回看后即可查看。',
-    '10. 指代锚定规则（最高优先级）：当本轮消息附带「本轮画布当前选中对象」时，任何指代词（“这个函数”、“它”、“这个变量”、“这条线”、“当前对象”）或未显式点名其他符号的提问，必须严格锚定到本轮画布选中对象的完整 ID、端点及文件路径；严禁因上一轮回复刚提过其他函数/连线（近因偏差）而把目标换成上轮对象。仅当用户本轮明确点名其他符号时，才以用户点名为准。',
-    '11. 严格作用域边界与只读排查：只回答或执行本轮用户明确提出的问题或动作；严禁把上一轮助手顺带提及、推测或推荐的延伸路径当成本轮隐含需求去追查或写入画布。纯解释类提问（“为什么没有/这个函数做什么”）只使用只读工具回答；如果用户反馈画布有问题（如“这一块有点问题/不对/漏了/乱了”）但未指明具体改法或尚未选中目标，先只读排查定位问题，再用 ask_user 给出具体修复方案征询用户确认，不要直接失败或盲目改动。',
-    '12. 整理画布布局时：用户要求“整理画布/排版/排整齐/减少交叉”时优先调用 arrange_canvas({ action: "tidy", direction: "LR" })（或 "TB"）；移动/对齐整个文件框或目录容器用 move_group / align_groups；精调单个节点时先 inspect 再 move/align。附有画布截图时结合图像与坐标操作。',
-    '13. 间接调用链（静态结构体、函数指针、1D/2D 常量结构体数组如 z[idx]() / e[r][c]() / s_tbl[i].fn()、回调注册、状态机/中断派发、复杂宏）：当用户要求将函数、调用链或 Git 改动加入画布，且源码核实存在静态图遗漏的静态结构体或间接调用时，不要只口头回答“静态解析没有”就结束，更不要只用 add_to_canvas 孤立加入目标节点！请在同一轮用 inspect_indirect_calls 和 read_source 核实确切的 from -> to 调用关系后，直接调用 add_call_edge({ edges: [{ from, to, via, reason }], addToCanvas: true, includeTasks: true })，一次性持久化连线、把端点连上画布并自动补齐调用方（from）的上游 TASK/上级调用链（仅限经源码确认的具体目标，切勿把无关表项全量写入）。仅当用户纯问原因且未要求构图/修改时，才只做只读解释。',
-    '14. 构建配置/多核工程诊断：当用户询问工程的构建方式、多核 .cproject/.project 机种配置（如 configurationName）、.mak/Makefile、QAC 目录、.pl 映射脚本，或要求用自然语言脱敏描述构建结构时，直接调用只读工具 inspect_build_config（先 scan，再按需 summarize_cproject 或 read）并清晰总结。',
-    '15. 除调用 ask_user 外，每次普通最终回复的末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（给出 2–3 个结合本轮函数/变量/发现的后续建议）。',
+    '1. 先用只读工具核实源码与图谱事实，不凭猜测作答；仅使用已确认存在的函数和变量名。',
+    '2. Git 改动入图：先调 get_git_changes 检查分支，再调 add_to_canvas（传 fromGit:true 和 snapshotId）；多独立模块可拆分为多个书签，用户要求合并时传 splitByGroup:false；指定分组时传 groups。',
+    '3. 智能呈现与导览：当用户要求“呈现/演示/梳理某块调用逻辑或数据流”时，优先调用 present_logic({ root / targets, direction, depth, includeDataflow, addToCanvas, title }) 切片构图并生成分步导览；纯高亮或播放流动画可用 canvas_visual。',
+    '4. 数据流与体检：查询变量读写链或两点读写通路调 inspect_dataflow；检查当前画布漏标/间接调用遗漏/孤立节点/重叠调 diagnose_canvas；查询或操作书签/检查点调 manage_bookmarks；并行拆解多模块/多路径复杂核实任务（仅限只读）可调 run_subagent。',
+    '5. 补齐 TASK 周期或调用顺序时，先调 find_symbols({}) 查看 canvasEdges 和 suggestedLabels，再调 apply_labels；preset:"call"（コール順N）禁止填写 note。源码为日文 CP932 时 read_function 可传 encoding:"cp932"。',
+    '6. 多车型/重名消歧：遇到重名函数/变量或上游横跨多个车型目录分支（如 z144/z145）且用户未指定目录前缀、也未在本轮上下文固定实例时，修改画布前必须先调 ask_user 提供目录前缀选项并加「全部保留」；若用户已指明目录或已回答，直接执行并传 includePaths / excludePaths 或 includeAllBranches:true（移除已有车型调 remove_from_canvas）。工具返回 updatedWhileReviewing 时提醒用户退出时间轴回看查看。',
+    '7. 指代锚定规则（最高优先级）：当本轮用户消息附带 <current_turn_context> 中的选中/暂存对象时，“这个函数/它/这个变量/这条线/这两者/当前对象”或未点名的提问必须严格锚定到本轮上下文的完整 ID、端点及路径，严禁因上轮回答提及过其他符号而漂移。',
+    '8. 严格作用域边界与只读排查：纯解释/排查提问只调只读工具，严禁擅自修改画布；用户反馈画布有问题但未指明改法时，先只读排查再用 ask_user 提供修复选项。',
+    '9. 间接调用与排版：核实结构体/函数指针数组/状态机等间接调用后要求补全链路时，先用 inspect_indirect_calls 与 read_source 核实确切的 from->to，再调 add_call_edge({ edges, addToCanvas:true, includeTasks:true })；整理布局优先调 arrange_canvas({ action:"tidy", direction:"LR" })，容器用 move_group / align_groups，微调用 move / align。',
+    '10. 构建诊断与收尾格式：询问 .cproject/.project/Makefile/QAC 构建配置时调 inspect_build_config；普通最终回复用 2–5 句简明总结事实/改动，并用完整函数名/文件::函数名引用关键链路，末尾务必附带 <next_steps>[{"label":"简短操作名","prompt":"点击后执行的具体指令"}]</next_steps>（2–3 项，label 最多 28 字，书签可用 draft:"/bookmark 名称"；调用 ask_user 时省略）。',
     '',
-    '当前上下文：',
+    '当前环境摘要：',
     ...ctxLines,
   ];
 
-  if (promptToolMode) {
-    base.push(
-      '',
-      '【工具调用格式】需要调用工具时，只输出如下标签块（不要额外废话），等待工具结果后再继续：',
-      '<tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
-      '可用工具清单：',
-      ...AGENT_TOOLS.map(t => `- ${t.name}: ${t.description} 参数: ${JSON.stringify(t.parameters.properties)}`),
-    );
-  }
   return base.join('\n');
+}
+
+function buildSystemPrompt(role, promptToolMode, toolDefs) {
+  if (!promptToolMode) return role;
+  return [
+    role, '',
+    '【工具调用格式】需要调用工具时，只输出如下标签块（不要额外废话），等待工具结果后再继续：',
+    '<tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
+    '可用工具清单：',
+    ...toolDefs.map(t => `- ${t.name}: ${t.description} 参数: ${JSON.stringify(t.parameters)}`),
+  ].join('\n');
 }
 
 function flattenContent(content, thoughts) {
@@ -709,8 +917,8 @@ function buildReasoningPayload(effort) {
 }
 
 /** 把已包含 tool_calls / role:tool / role:function 的会话无损转为纯 system/user/assistant，避免回退时重跑写工具。 */
-function convertMessagesToPromptMode(messages, context) {
-  const out = [{ role: 'system', content: buildSystemPrompt(context, true) }];
+function convertMessagesToPromptMode(messages, role, toolDefs) {
+  const out = [{ role: 'system', content: buildSystemPrompt(role, true, toolDefs) }];
   let pendingToolTexts = [];
   const flushTools = () => {
     if (!pendingToolTexts.length) return;
@@ -1148,13 +1356,42 @@ function summarizeToolResult(name, result) {
       : `画布 ${result.canvasRoots?.length || 0} 个入口，工程 ${result.tasks?.length || 0} 个任务`;
     return Array.isArray(result.suggestedLabels) ? `${summary}，${result.suggestedLabels.length} 条建议标签` : summary;
   }
-  if (name === 'read_function') return `已读 ${result.name || result.id} (${result.file}:${result.startLine}-${result.endLine})`;
+  if (name === 'read_function') {
+    if (Array.isArray(result.items)) return `已批量读取 ${result.items.length} 个函数源码`;
+    return `已读 ${result.name || result.id} (${result.file}:${result.startLine}-${result.endLine})`;
+  }
   if (name === 'read_source') {
     if (result.file) return `已读 ${result.file}:${result.startLine}-${result.endLine}`;
     return `源码检索找到 ${result.matches?.length || 0} 处匹配`;
   }
   if (name === 'inspect_indirect_calls') {
     return `查到 ${result.indirectCalls?.length || 0} 处间接调用、${result.tables?.length || 0} 张分派表`;
+  }
+  if (name === 'inspect_dataflow') {
+    if (result.peer) return `已查 ${result.targetName || result.target} ↔ ${result.peerName || result.peer}（${result.rwPaths?.length || 0} 条读写链）`;
+    return `已查 ${result.targetName || result.target} 数据流（${result.chains?.length || 0} 条链路）`;
+  }
+  if (name === 'present_logic') {
+    return `已生成导览「${result.presentation?.title || result.title || '逻辑链'}」（${result.presentation?.steps?.length || 0} 步，${result.chains?.length || 0} 条链路）`;
+  }
+  if (name === 'canvas_visual') {
+    if (result.action === 'clear') return '已清除画布叠加视觉高亮';
+    if (result.action === 'play_flow') return `已触发数据流动画（${result.edgeKeys?.length || 0} 条连线）`;
+    return `已在画布高亮 ${result.nodeIds?.length || 0} 个节点`;
+  }
+  if (name === 'diagnose_canvas') {
+    const count = result.healthReport?.issues?.length ?? result.issues?.length ?? 0;
+    return count ? `画布体检发现 ${count} 项待改进建议` : '画布体检通过，结构与标注完整';
+  }
+  if (name === 'manage_bookmarks') {
+    if (result.action === 'list') return `工程共有 ${result.bookmarks?.length || 0} 个书签`;
+    if (result.action === 'checkpoint') return `已创建检查点「${result.checkpointName || '检查点'}」`;
+    return `书签操作完成（${result.action}）`;
+  }
+  if (name === 'run_subagent') {
+    const count = Array.isArray(result.results) ? result.results.length : 0;
+    const okCount = Array.isArray(result.results) ? result.results.filter(r => r.ok !== false).length : 0;
+    return `已完成 ${okCount}/${count} 个只读子调查`;
   }
   if (name === 'add_call_edge') {
     const verb = result.removed ? '移除' : '写入';
@@ -1195,7 +1432,7 @@ const DIGEST_FIELDS = [
   'snapshotId', 'includePaths', 'excludePaths', 'includeAllBranches', 'functions', 'vars', 'fromGit', 'splitByGroup',
   'id', 'file', 'pathBranches', 'needsVehicleChoice', 'isolatedGroups', 'changedFunctions', 'changedFiles', 'changedVars',
   'roots', 'matches', 'upstreamChains', 'applied', 'removed', 'bookmarks', 'edgeKeys', 'error',
-  'action', 'axis', 'updatedCount', 'positions',
+  'action', 'axis', 'updatedCount', 'positions', 'target', 'peer', 'direction', 'title',
 ];
 
 export function summarizeToolDigest(name, args, result) {
@@ -1235,8 +1472,15 @@ export function summarizeToolDigest(name, args, result) {
   return [header, ...values].join(' ');
 }
 
-function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_000) {
-  const rawText = String(message.text ?? message.content ?? '').trim();
+function stripThinkText(text) {
+  return String(text ?? '')
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think>[\s\S]*$/i, '')
+    .trim();
+}
+
+function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_000, { isLatestAssistant = false, includeDetails = true } = {}) {
+  const rawText = stripThinkText(message.text ?? message.content ?? '');
   const selectionPrefix = message.role === 'user' && message.selectionSummary
     ? `[当时画布选中：${String(message.selectionSummary).trim()}]`
     : '';
@@ -1244,13 +1488,13 @@ function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_0
     ? [selectionPrefix, rawText].filter(Boolean).join('\n')
     : rawText;
   const details = [];
-  if (Array.isArray(message.tools)) {
+  if (includeDetails && Array.isArray(message.tools)) {
     for (const tool of message.tools) {
       if (!tool?.name && !tool?.digest) continue;
       details.push(tool.digest || [summarizeToolDigest(tool.name, tool.arguments, tool), tool.summary].filter(Boolean).join(' '));
     }
   }
-  if (Array.isArray(message.questionOptions) && message.questionOptions.length) {
+  if ((includeDetails || isLatestAssistant) && Array.isArray(message.questionOptions) && message.questionOptions.length) {
     details.push('待确认选项：' + message.questionOptions.map(option => typeof option === 'string'
       ? option : [option?.label, option?.description].filter(Boolean).join(' ')).join(' / '));
   }
@@ -1258,6 +1502,20 @@ function historyContent(message, maxLength = Infinity, maxAttachmentChars = 12_0
   const textBudget = metadata ? Math.max(0, maxLength - metadata.length - 1) : maxLength;
   const files = message.role === 'user' ? sanitizeCodeAttachments(message.attachedFiles) : [];
   return [text.slice(0, textBudget), metadata, ...formatCodeAttachments(files, maxAttachmentChars)].filter(Boolean).join('\n');
+}
+
+export function buildModelHistory(history, maxLength = 4000, maxAttachmentChars = 12_000) {
+  const filtered = (Array.isArray(history) ? history : [])
+    .filter(m => m && ['user', 'assistant'].includes(m.role));
+  const lastAssistantIdx = filtered.findLastIndex(m => m.role === 'assistant');
+  return filtered.map((m, idx) => {
+    const isLatestAssistant = idx === lastAssistantIdx;
+    const content = historyContent(m, maxLength, maxAttachmentChars, {
+      isLatestAssistant,
+      includeDetails: false,
+    });
+    return { role: m.role, content };
+  }).filter(m => m.content);
 }
 
 export async function compactConversation({ config, messages, fetchImpl = fetch, signal = null }) {
@@ -1313,7 +1571,21 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
 }
 
 /** 运行直连模型的工具调用闭环，支持自动从标准 tools 平滑降级到旧版纯对话模式。 */
-export async function runAiAgent({
+export async function runAiAgent(options) {
+  const toolLog = [];
+  const onEvent = event => { if (!options.signal?.aborted) options.onEvent?.(event); };
+  // 工具写入可以先于错误或取消发生。收尾只运行一次，已断开的流不再发布事件。
+  let finalization;
+  const finalize = (interrupted = false) => finalization ??= Promise.resolve().then(() => options.beforeDone?.({ toolLog, onEvent, interrupted }));
+  try {
+    return await runTurn({ ...options, onEvent }, toolLog, finalize);
+  } catch (error) {
+    await finalize(true);
+    throw error;
+  }
+}
+
+async function runTurn({
   config,
   prompt,
   images = [],
@@ -1325,7 +1597,10 @@ export async function runAiAgent({
   fetchImpl = fetch,
   signal = null,
   maxSteps = MAX_AGENT_STEPS,
-}) {
+  allowedTools = null,
+  systemPromptOverride = '',
+  isSubagent = false,
+}, toolLog, finalize) {
   signal?.throwIfAborted();
   const { chatUrl } = normalizeBaseUrl(config?.baseUrl);
   if (!chatUrl) throw new Error('尚未配置模型 API 地址，请先在「直连 API」中填写');
@@ -1338,41 +1613,38 @@ export async function runAiAgent({
     ...config,
     contextWindow: validContextWindow(config.contextWindow) ? config.contextWindow : DEFAULT_AI_CONFIG.contextWindow,
   };
+  const activeToolDefs = resolveAllowedToolDefs(
+    allowedTools ?? (isSubagent ? SUBAGENT_READONLY_TOOLS : null),
+  );
+  const activeToolNames = new Set(activeToolDefs.map(t => t.name));
+  const rolePrompt = systemPromptOverride || canvasSystemPrompt(context);
+
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
   const historyBudget = Math.floor(config.contextWindow * 0.65);
   const historyAttachmentChars = Math.min(MAX_CODE_ATTACHMENT_CHARS, Math.floor(historyBudget / 3));
-  const cleanHistory = (Array.isArray(history) ? history : [])
-    .filter(m => m && ['user', 'assistant'].includes(m.role))
-    .map(m => ({ role: m.role, content: historyContent(m, 4000, historyAttachmentChars) }))
-    .filter(m => m.content);
+  const cleanHistory = buildModelHistory(history, 4000, historyAttachmentChars);
   trimOldTurns(cleanHistory, 0, cleanHistory.length, estimateMessagesTokens(cleanHistory) - historyBudget, cleanHistory.length - 20);
-  const lastReply = cleanHistory.findLast(m => m.role === 'assistant')?.content ?? '';
   const asksForExplanation = /为什么|为何|啥原因|什么原因|怎么(?:回事|没|不|会|连)|是不是|有没有|干嘛的|做什么|是什么|什么关系|含义|解释|说明一下|分析(?:一下|下)|看一下|帮我看|查一下|如何连接/u;
   const explaining = asksForExplanation.test(userText) ||
     /^(?:why\b|what\s+(?:is|are|does|do)\b|how\s+(?:does|do)\b|explain\b|describe\b)/i.test(userText);
-  const editVerb = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开)/u;
+  const editVerb = /(?:加入|加到|加上|添加到|放进|拉进|推上|画到|画出来|画一下|构图|组图|补齐|补全|补边|补上|连上|连起来|连线|连接|修复|修正|修改|修一下|改一下|改好|移除|删除|去掉|剔除|清理|清空|标注|打标|加标签|写标签|移动|挪到|对齐|排布|排版|排列|整理|重排|调整位置|重置|恢复布局|拆分|分组|替换|保存书签|存为书签|新建书签|加变量|加上游|加下游|展开|呈现|展示|导览|检查点)/u;
   // 一句解释中也可能出现“连接、删除”等动词。混合请求只接受另一条明确的操作指令。
   const hasEditIntent = explaining
     ? userText.split(/[，,。！？!?；;\n]|(?:然后|顺便|顺手|并且|并(?=把|将|请|帮我))/u).some(clause =>
-      !asksForExplanation.test(clause) && /^(?:请|帮我|给我|直接|把|将|补齐|补全|补上|修复|删除|添加到)/u.test(clause.trim()) &&
+      !asksForExplanation.test(clause) && /^(?:请|帮我|给我|直接|把|将|补齐|补全|补上|修复|删除|添加到|呈现)/u.test(clause.trim()) &&
       editVerb.test(clause) && !/不要|别|无需|不用/u.test(clause))
     : editVerb.test(userText);
-  const removal = hasEditIntent && /(?:移除|删除|去掉|剔除)/u.test(userText) && /\bz\d+\b|车型|目录/u.test(userText);
-  const pendingVehicle = /车型|目录|全部保留|\bz\d+\b/u.test(lastReply) &&
-    /[？?]|待确认选项|已提供选项|请(?:选择|确认)/u.test(lastReply);
-  const selectedOption = !/^(?:继续|确认)[。！!]*$/u.test(userText) &&
-    /待确认选项|已提供选项|全部保留/u.test(lastReply) && lastReply.includes(userText);
-  const requiredTool = removal ? 'remove_from_canvas'
-    : pendingVehicle && (selectedOption || /全部保留|^全部$|\bz\d+\b/u.test(userText)) ? 'add_to_canvas' : '';
   const hasProblemReport = /(?:有点问题|有问题|不对|错了|漏了|少了|缺了|没连上|没加上|乱了|重了|重叠|挤在一起)/u.test(userText);
-  const readOnlyQuestion = !requiredTool && explaining && !hasEditIntent;
+  const readOnlyQuestion = explaining && !hasEditIntent;
   const hasSelectionContext = formatUiContextSelections(context.uiContext).selections.length > 0;
-  const unanchoredDeictic = !requiredTool && !hasSelectionContext &&
+  const unanchoredDeictic = !hasSelectionContext &&
     /(?:这个函数|这个变量|这条线|当前这个|上面那个|它(?:为什么|怎么|的|有|没|是|在))/u.test(userText) &&
     !/[A-Za-z_][A-Za-z0-9_]{2,}/u.test(userText);
   const isCanvasWriteTool = (call) =>
     ['add_to_canvas', 'remove_from_canvas', 'apply_labels', 'add_call_edge'].includes(call.name) ||
-    (call.name === 'arrange_canvas' && call.arguments?.action !== 'inspect');
+    (call.name === 'arrange_canvas' && call.arguments?.action !== 'inspect') ||
+    (call.name === 'present_logic' && call.arguments?.addToCanvas !== false) ||
+    (call.name === 'manage_bookmarks' && call.arguments?.action && call.arguments.action !== 'list');
 
   let imagesDegraded = false;
   const turnUserText = buildTurnUserText(userText, context.uiContext, attachments);
@@ -1396,17 +1668,19 @@ export async function runAiAgent({
     return true;
   };
   let messages = [
-    { role: 'system', content: buildSystemPrompt(context, activeMode === 'prompt') },
+    { role: 'system', content: buildSystemPrompt(rolePrompt, activeMode === 'prompt', activeToolDefs) },
     ...cleanHistory,
     userMessage,
   ];
   const allThoughts = [];
-  const toolLog = [];
+  const collectedChains = [];
+  const seenChainIds = new Set();
+  let latestPresentation = null;
+  let latestHealthReport = null;
   let switchedToPrompt = false;
   let reasoningDegraded = false;
   let streamMode = 'stream_usage';
   let emptyThinkRetries = 0;
-  let actionRetries = 0;
   let lastMetrics = null;
   const recordMetrics = (m) => { lastMetrics = m; };
   const reasoningPayload = buildReasoningPayload(config.reasoningEffort);
@@ -1414,7 +1688,7 @@ export async function runAiAgent({
   // 输出上限为 0 时由模型决定输出长度，至少留出一个生成 token。
   const inputBudget = config.contextWindow - Math.max(1, maxTokens);
   const fitRequestHistory = (request) => {
-    const tokens = estimateMessagesTokens(request.messages, Boolean(request.tools));
+    const tokens = estimateMessagesTokens(request.messages, Boolean(request.tools), activeToolDefs);
     const turnStart = request.messages.indexOf(userMessage);
     // 只移除本轮之前的消息，保留附件全文和已执行工具的调用/返回配对。
     return tokens - trimOldTurns(request.messages, 1, turnStart, tokens - inputBudget);
@@ -1424,20 +1698,30 @@ export async function runAiAgent({
     temperature: config.temperature ?? DEFAULT_AI_CONFIG.temperature,
     ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
   };
-  const finish = (answer, suggestions = []) => {
+  let terminalResult;
+  const finish = (...args) => terminalResult ??= finishTurn(...args);
+  async function finishTurn(answer, suggestions = [], question = null) {
+    signal?.throwIfAborted();
+    const extra = await finalize() || {};
     signal?.throwIfAborted();
     const result = {
       ok: true,
       answer: normalizeLineBreaks(answer).trim(),
+      ...(question ? { awaitingUser: true, ...question } : {}),
       ...(suggestions.length ? { suggestions } : {}),
+      ...(collectedChains.length ? { chains: collectedChains.slice(0, 12) } : {}),
+      ...(latestPresentation ? { presentation: latestPresentation } : {}),
+      ...(latestHealthReport ? { healthReport: latestHealthReport } : {}),
+      ...(extra.changeset ? { changeset: extra.changeset } : {}),
+      ...(Array.isArray(extra.subagents) && extra.subagents.length ? { subagents: extra.subagents } : {}),
       thinking: allThoughts.join('\n\n'),
       toolLog,
       modeUsed: activeMode,
       ...(lastMetrics ? { metrics: lastMetrics } : {}),
     };
-    onEvent({ type: 'done', ...result });
+    onEvent({ type: question ? 'question' : 'done', ...result });
     return result;
-  };
+  }
 
   let step = 0;
   for (; step < maxSteps; step++) {
@@ -1447,7 +1731,7 @@ export async function runAiAgent({
       ...requestDefaults,
       messages,
       ...(reasoningDegraded ? {} : reasoningPayload),
-      ...(activeMode === 'tools' ? { tools: openAiToolsPayload(), tool_choice: 'auto' } : {}),
+      ...(activeMode === 'tools' && activeToolDefs.length ? { tools: openAiToolsPayload(activeToolDefs), tool_choice: 'auto' } : {}),
       stream: streamMode !== 'sync',
       ...(streamMode === 'stream_usage' ? { stream_options: { include_usage: true } } : {}),
     };
@@ -1456,7 +1740,7 @@ export async function runAiAgent({
     if (inputTokens > inputBudget) {
       const reason = `本轮输入预计需要 ${inputTokens} 个 token，预留输出后可用 ${Math.max(0, inputBudget)} 个。请缩小${attachments.length ? '附件的选取范围' : '本轮输入'}，或调整上下文窗口和输出上限。`;
       if (!toolLog.length) throw new Error(reason);
-      return finish(`${reason}\n工具执行记录：${toolLog.map(tool => tool.summary).join('；')}。`);
+      return await finish(`${reason}\n工具执行记录：${toolLog.map(tool => tool.summary).join('；')}。`);
     }
     const metrics = createMetrics(config, inputTokens, onEvent, recordMetrics);
     const res = await fetchJson(chatUrl, {
@@ -1501,7 +1785,7 @@ export async function runAiAgent({
         switchedToPrompt = true;
         activeMode = 'prompt';
         // 保留已执行的工具结果并转换为纯对话格式，绝不丢弃历史导致重复执行写工具。
-        messages = convertMessagesToPromptMode(messages, context);
+        messages = convertMessagesToPromptMode(messages, rolePrompt, activeToolDefs);
         onEvent({ type: 'fallback', text: '接口不支持标准 tools / role:tool，已自动切换为旧版纯对话兼容模式' });
         step--;
         continue;
@@ -1561,7 +1845,7 @@ export async function runAiAgent({
       }];
     } else if (activeMode === 'prompt' || config.toolMode === 'auto') {
       // 标准 tools 模式下仅接受显式 <tool_call> 标签，绝不把正文里的 JSON 示例当工具执行。
-      const parsed = parsePromptToolCalls(toolText, TOOL_NAME_SET, { tagOnly: activeMode === 'tools' });
+      const parsed = parsePromptToolCalls(toolText, activeToolNames, { tagOnly: activeMode === 'tools' });
       if (parsed.length) {
         callStyle = 'prompt';
         calls = parsed.slice(0, 6).map((c, idx) => ({ id: `prompt_${step}_${idx}`, ...c }));
@@ -1571,9 +1855,9 @@ export async function runAiAgent({
     if (finishReason === 'length' || finishReason === 'content_filter') calls = [];
     if (!calls.length) {
       if (finishReason === 'length') {
-        return finish(text || '模型输出达到单次长度上限，可发送「继续」或调大 max_tokens。');
+        return await finish(text || '模型输出达到单次长度上限，可发送「继续」或调大 max_tokens。');
       }
-      if (finishReason === 'content_filter') return finish(text || '模型输出被上游内容过滤器拦截。');
+      if (finishReason === 'content_filter') return await finish(text || '模型输出被上游内容过滤器拦截。');
       if (!text && thinking && emptyThinkRetries < 1 && step + 1 < maxSteps) {
         emptyThinkRetries++;
         messages.push(
@@ -1587,26 +1871,15 @@ export async function runAiAgent({
     signal?.throwIfAborted();
 
     const ask = calls.find(call => call.name === 'ask_user');
-    if (requiredTool && (!calls.length || ask) && !toolLog.some(tool => tool.name === requiredTool && tool.ok)) {
-      const failed = toolLog.findLast(tool => tool.name === requiredTool);
-      if (failed) return finish(failed.summary);
-      if (actionRetries < 1 && step + 1 < maxSteps) {
-        actionRetries++;
-        if (text) messages.push({ role: 'assistant', content: text });
-        messages.push({ role: 'user', content: '用户已在上文确认操作。请保留已确认的目录和条件，立即调用 ' + requiredTool + ' 执行。' });
-        continue;
-      }
-      return finish('模型尚未调用画布工具，所确认的操作未执行。');
-    }
     if (!calls.length) {
-      return finish(text || (thinking
+      return await finish(text || (thinking
         ? '模型只返回了思考过程，未给出回复或调用工具。'
         : finishReason === 'tool_calls' || finishReason === 'function_call'
           ? '模型以工具调用结束，但没有返回可用的调用内容。'
           : '模型结束了本次请求，但没有返回回复或工具调用。'), suggestions);
     }
 
-    if (ask) {
+    if (ask && !isSubagent && activeToolNames.has('ask_user')) {
       const question = normalizeLineBreaks(String(ask.arguments?.question || text)).trim() || '请确认你的需求';
       const rawOptions = ask.arguments?.options;
       const parsedOptions = Array.isArray(rawOptions)
@@ -1617,20 +1890,7 @@ export async function runAiAgent({
         : [];
       const options = parsedOptions.some(option => option.label === '全部保留') ? parsedOptions : parsedOptions.slice(0, 6);
       const allowCustom = ask.arguments?.allowCustom !== false;
-      const thinking = allThoughts.join('\n\n');
-      onEvent({ type: 'question', question, options, allowCustom, thinking, ...(lastMetrics ? { metrics: lastMetrics } : {}) });
-      return {
-        ok: true,
-        awaitingUser: true,
-        question,
-        options,
-        allowCustom,
-        answer: question,
-        thinking,
-        toolLog,
-        modeUsed: activeMode,
-        ...(lastMetrics ? { metrics: lastMetrics } : {}),
-      };
+      return await finish(question, [], { question, options, allowCustom });
     }
 
     // 把模型本轮输出加入历史（确保 tool_calls 数量与后续 role:tool 回复一一对应）
@@ -1645,19 +1905,19 @@ export async function runAiAgent({
     const promptResults = [];
     for (const call of calls) {
       signal?.throwIfAborted();
-      onEvent({ type: 'tool_start', name: call.name, arguments: call.arguments });
+      onEvent({ type: 'tool_start', callId: call.id, name: call.name, arguments: call.arguments });
       signal?.throwIfAborted();
       let output;
       try {
-        if (!TOOL_NAME_SET.has(call.name)) {
-          output = { ok: false, error: `未知工具：${call.name}` };
-        } else if (readOnlyQuestion && isCanvasWriteTool(call)) {
+        if (!activeToolNames.has(call.name)) {
+          output = { ok: false, error: TOOL_NAME_SET.has(call.name) ? `当前模式不可用工具：${call.name}` : `未知工具：${call.name}` };
+        } else if (!isSubagent && readOnlyQuestion && isCanvasWriteTool(call)) {
           output = {
             ok: false,
             blocked: true,
             error: '当前属于排查/解释类提问，尚未明确确认直接改图。请立即调用 ask_user 简述你的发现和拟修改方案，提供「确认执行修改 / 仅查看不修改」选项让用户决定。',
           };
-        } else if ((unanchoredDeictic || (hasProblemReport && !hasEditIntent && !hasSelectionContext)) && isCanvasWriteTool(call)) {
+        } else if (!isSubagent && (unanchoredDeictic || (hasProblemReport && !hasEditIntent && !hasSelectionContext)) && isCanvasWriteTool(call)) {
           output = {
             ok: false,
             blocked: true,
@@ -1670,14 +1930,46 @@ export async function runAiAgent({
         output = { ok: false, error: String(err?.message || err) };
       }
       signal?.throwIfAborted();
-      const summary = summarizeToolResult(call.name, output);
-      const digest = summarizeToolDigest(call.name, call.arguments, output);
-      const blocked = Boolean(output?.blocked);
-      toolLog.push({ name: call.name, arguments: call.arguments, ok: output?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
-      onEvent({ type: 'tool_end', name: call.name, ok: output?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
+      let cleanOutput = output;
+      if (output && typeof output === 'object' && !Array.isArray(output)) {
+        const pushChain = (chain) => {
+          if (!chain || typeof chain !== 'object') return;
+          const cid = String(chain.id || `${chain.title || ''}:${(chain.steps || []).map(s => s.id).join('->')}`);
+          if (seenChainIds.has(cid)) return;
+          seenChainIds.add(cid);
+          collectedChains.push(chain);
+        };
+        if (Array.isArray(output.chains)) {
+          output.chains.forEach(pushChain);
+          if (!isSubagent && output.chains.length) onEvent({ type: 'chains', chains: output.chains });
+        }
+        if (output.presentation && typeof output.presentation === 'object') {
+          latestPresentation = output.presentation;
+          if (!isSubagent) onEvent({ type: 'presentation', presentation: output.presentation });
+        }
+        if (output.healthReport && typeof output.healthReport === 'object') {
+          latestHealthReport = output.healthReport;
+          if (!isSubagent) onEvent({ type: 'health_report', report: output.healthReport });
+        }
+        if (output.canvasOverlay && typeof output.canvasOverlay === 'object' && !output.presentation?.steps?.length && !isSubagent) {
+          onEvent({ type: 'canvas_overlay', ...output.canvasOverlay });
+        }
+        if (Array.isArray(output._events)) {
+          for (const ev of output._events) {
+            if (ev && typeof ev === 'object' && ev.type && !isSubagent) onEvent(ev);
+          }
+          const { _events, ...rest } = output;
+          cleanOutput = rest;
+        }
+      }
+      const summary = summarizeToolResult(call.name, cleanOutput);
+      const digest = summarizeToolDigest(call.name, call.arguments, cleanOutput);
+      const blocked = Boolean(cleanOutput?.blocked);
+      toolLog.push({ name: call.name, arguments: call.arguments, ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
+      onEvent({ type: 'tool_end', callId: call.id, name: call.name, ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
 
       const layoutBudget = Math.max(12000, Math.min(72000, config.contextWindow * 2));
-      const clipped = clipToolOutput(output, call.name === 'arrange_canvas' ? layoutBudget : 12000);
+      const clipped = clipToolOutput(cleanOutput, call.name === 'arrange_canvas' ? layoutBudget : 12000);
       if (callStyle === 'tool_calls' && activeMode === 'tools') {
         messages.push({ role: 'tool', tool_call_id: call.id, name: call.name, content: clipped });
       } else if (callStyle === 'function_call' && activeMode === 'tools') {
@@ -1696,9 +1988,6 @@ export async function runAiAgent({
   }
 
   signal?.throwIfAborted();
-  if (requiredTool && !toolLog.some(tool => tool.name === requiredTool && tool.ok)) {
-    return finish(toolLog.findLast(tool => tool.name === requiredTool)?.summary ?? '已达到工具调用步数上限，所确认的操作未执行。');
-  }
   let answer = '';
   if (toolLog.length > 0) {
     let summaryMessage;
@@ -1744,5 +2033,5 @@ export async function runAiAgent({
     ? `已完成 ${toolLog.length} 步操作：${toolLog.map(t => t.summary).join('；')}。如需继续，请发下一条指令。`
     : '已达到工具调用步数上限，可发送「继续」。';
   const parsed = readAnswer(answer);
-  return finish(parsed.text, parsed.suggestions);
+  return await finish(parsed.text, parsed.suggestions);
 }

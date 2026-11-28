@@ -20,7 +20,26 @@ function contentBounds() {
     : { x: 0, y: 0, w: 1, h: 1 };
 }
 
-const fittedZoom = (b) => Math.min(2, Math.max(1, els.cv.clientWidth - 28) / b.w, Math.max(1, els.cv.clientHeight - 28) / b.h);
+function getSafeViewport(pad = 0) {
+  const cw = els.cv?.clientWidth || 0;
+  const ch = els.cv?.clientHeight || 0;
+  const drawer = document.getElementById('aiDrawer');
+  const drawerRect = drawer?.classList.contains('show') ? drawer.getBoundingClientRect() : null;
+  const occupiedRight = drawerRect && drawerRect.width > 0 ? Math.min(drawerRect.width + 16, Math.max(0, cw - 240)) : 0;
+  return {
+    left: pad,
+    top: pad,
+    right: Math.max(pad + 120, cw - occupiedRight - pad),
+    bottom: Math.max(pad + 120, ch - pad),
+    width: Math.max(120, cw - occupiedRight - pad * 2),
+    height: Math.max(120, ch - pad * 2),
+  };
+}
+
+const fittedZoom = (b) => {
+  const vp = getSafeViewport(14);
+  return Math.min(2, vp.width / b.w, vp.height / b.h);
+};
 /** 通常 50%–200%；大图允许缩至整图适配比例，再往下就停止。 */
 function zoomLimits() { return { min: Math.min(0.5, fittedZoom(contentBounds())), max: 2 }; }
 function clampZoom(k) { const { min, max } = zoomLimits(); return Math.min(max, Math.max(min, k)); }
@@ -40,12 +59,13 @@ function fit({ paint = true } = {}) {
   stopCamAnim();
   const v = state.view;
   if (!v) return;
-  const W = els.cv.clientWidth;
-  const H = els.cv.clientHeight;
+  const vp = getSafeViewport(14);
+  const cx = vp.left + vp.width / 2;
+  const cy = vp.top + vp.height / 2;
   const b = contentBounds();
   cam.k = fittedZoom(b);
-  cam.x = W / 2 - (b.x + b.w / 2) * cam.k;
-  cam.y = H / 2 - (b.y + b.h / 2) * cam.k;
+  cam.x = cx - (b.x + b.w / 2) * cam.k;
+  cam.y = cy - (b.y + b.h / 2) * cam.k;
   if (paint) draw();
 }
 
@@ -140,30 +160,35 @@ function zoomCam(x, y, delta) {
 }
 
 function boxInViewport({ x, y, w, h }, margin = 0) {
-  return x * cam.k + cam.x >= margin && (x + w) * cam.k + cam.x <= els.cv.clientWidth - margin &&
-    y * cam.k + cam.y >= margin && (y + h) * cam.k + cam.y <= els.cv.clientHeight - margin;
+  const vp = getSafeViewport(margin);
+  return x * cam.k + cam.x >= vp.left && (x + w) * cam.k + cam.x <= vp.right &&
+    y * cam.k + cam.y >= vp.top && (y + h) * cam.k + cam.y <= vp.bottom;
 }
 
 /** 聚焦时沿用当前比例。容器超出视口时可缩小以容纳整体。 */
 function focusBox(box, pad = 90, { keepZoom = true } = {}) {
-  const W = els.cv.clientWidth;
-  const H = els.cv.clientHeight;
+  const vp = getSafeViewport(0);
+  const W = vp.width;
+  const H = vp.height;
   if (!W || !H || !box.w || !box.h) return;
+  const cx = vp.left + W / 2;
+  const cy = vp.top + H / 2;
   const { k: currentZoom } = cam;
   const oversized = box.w * currentZoom > W || box.h * currentZoom > H;
   const k = !keepZoom && oversized
     ? Math.min(currentZoom, clampZoom(Math.min(W / (box.w + pad * 2), H / (box.h + pad * 2))))
     : currentZoom;
   animateCam({
-    x: W / 2 - (box.x + box.w / 2) * k,
-    y: H / 2 - (box.y + box.h / 2) * k,
+    x: cx - (box.x + box.w / 2) * k,
+    y: cy - (box.y + box.h / 2) * k,
     k,
   });
 }
 
 /** 新增内容超出视口时平移，沿用当前缩放比例。 */
 function revealAdded(nodes, edges) {
-  const W = els.cv.clientWidth, H = els.cv.clientHeight;
+  const vp = getSafeViewport(0);
+  const W = vp.width, H = vp.height;
   if (!W || !H) return;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   const include = (x, y) => {
@@ -177,13 +202,13 @@ function revealAdded(nodes, edges) {
   }
   if (!Number.isFinite(x0) || boxInViewport({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 })) return;
   const { k } = cam;
-  const shift = (lo, hi, origin, size) => {
+  const shift = (lo, hi, origin, start, size) => {
     const span = (hi - lo) * k;
-    if (span >= size) return (size - (lo + hi) * k) / 2;
-    if (lo * k + origin >= 0 && hi * k + origin <= size) return origin;
+    if (span >= size) return start + (size - (lo + hi) * k) / 2;
+    if (lo * k + origin >= start && hi * k + origin <= start + size) return origin;
     const pad = Math.min(40, (size - span) / 2);
-    return Math.max(pad - lo * k, Math.min(origin, size - pad - hi * k));
+    return Math.max(start + pad - lo * k, Math.min(origin, start + size - pad - hi * k));
   };
-  animateCam({ x: shift(x0, x1, cam.x, W), y: shift(y0, y1, cam.y, H), k }, 300);
+  animateCam({ x: shift(x0, x1, cam.x, vp.left, W), y: shift(y0, y1, cam.y, vp.top, H), k }, 300);
 }
-export { contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, boxInViewport, focusBox, revealAdded };
+export { getSafeViewport, contentBounds, fit, zoomLimits, constrainCam, stopCamAnim, stepCam, animateCam, panCam, zoomCam, boxInViewport, focusBox, revealAdded };

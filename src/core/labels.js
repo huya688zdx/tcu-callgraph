@@ -28,19 +28,21 @@ export const LABEL_MAX_TEXT = 40;
 export const CONN_PREFIX = '結合点：';
 
 /**
- * 三个预设：
+ * 四个预设：
  * - task: 黑框白底黑字（任务耗时等，文字自己填）
  * - conn: 红框白底红字（結合点，编号自动递增且同一画面内不重复）
  * - call: 无框黑字（コール順）
+ * - free: 纯文字带框标签（自由填写，不附带注释）
  */
 export const LABEL_PRESETS = {
   task: { border: '#2C2C2A', color: '#2C2C2A', text: 'TASK:2ms' },
   conn: { border: '#C0392B', color: '#C0392B' },
   call: { border: null, color: '#2C2C2A', text: 'コール順' },
+  free: { border: '#4A5568', color: '#2C2C2A', text: '标签' },
 };
 
 const HEX = /^#[0-9a-f]{6}$/i;
-const PRESETS = new Set(['task', 'conn', 'call', 'custom']);
+const PRESETS = new Set(['task', 'conn', 'call', 'free', 'custom']);
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -88,9 +90,9 @@ export function normalizeLabel(raw) {
   if (!text) return null;
   const label = { preset, text, border, color, dx: Math.round(dx), dy: Math.round(dy) };
   if (preset === 'conn') label.num = num;
-  // 说明行：控制字符拍平、限长；コール順（call）标签不附带注释说明。
+  // 说明行：控制字符拍平、限长；コール順（call）和自由框（free）标签不附带注释说明。
   const note =
-    preset !== 'call' && typeof raw.note === 'string' && raw.note.trim()
+    preset !== 'call' && preset !== 'free' && typeof raw.note === 'string' && raw.note.trim()
       ? raw.note.replace(/[\r\n\t]/g, ' ').slice(0, LABEL_NOTE_MAX).trim()
       : '';
   if (note) label.note = note;
@@ -267,17 +269,10 @@ export function labelSize(text, measure) {
 }
 
 /**
- * 带说明行的标签盒子：主行 LABEL_FONT，说明行 LABEL_NOTE_FONT，
- * note 由调用方注入宽度测量（measure(text, font)），没有时退回主行尺寸。
+ * 标签盒子尺寸（只显示单行主文字，不把注释绘制进标签框）。
  */
 export function labelBoxSize(label, measure) {
-  const main = labelSize(labelText(label), (t) => measure(t, LABEL_FONT));
-  if (!label || !label.note) return main;
-  const nw = measure(label.note, LABEL_NOTE_FONT);
-  return {
-    w: Math.max(main.w, nw + LABEL_PAD_X * 2),
-    h: main.h + LABEL_NOTE_FONT + LABEL_PAD_Y,
-  };
+  return labelSize(labelText(label), (t) => measure(t, LABEL_FONT));
 }
 
 /** 删除标记位于整条连线的弧长中点，浏览器和服务端 SVG 使用相同的图形。 */
@@ -366,9 +361,44 @@ const rectAt = (cx, cy, size) => ({
 });
 
 const NODE_PAD = 5;
+const HEADER_PAD = 3;
+const EDGE_HIT_PAD = 1.5;
 const LABEL_GAP = 4;
 const AUTO_MAX_DIST = 88;
 const ESCAPE_MAX_DIST = 96;
+
+function polylineLength(pts = []) {
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    total += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+  }
+  return total;
+}
+
+/** 视图中的文件框标题栏与目录容器标题胶囊（供标签避障）。 */
+export function viewHeaderObstacles(view) {
+  const headers = [];
+  for (const g of view?.groups || []) {
+    if (Number.isFinite(g?.x) && Number.isFinite(g?.y) && Number.isFinite(g?.w)) {
+      headers.push({ x: g.x, y: g.y, w: g.w, h: 26 });
+    }
+  }
+  for (const c of view?.containers || []) {
+    if (!c?.label || !Number.isFinite(c?.x) || !Number.isFinite(c?.y)) continue;
+    const w = Math.max(24, Math.min((c.w || 0) - 8, estimateTextWidth(c.label, 13) + 20));
+    headers.push({ x: c.x + 4, y: c.y + 2, w, h: 22 });
+  }
+  return headers;
+}
+
+/** 优先布局含手动偏移的边及较短的受限连线，让紧空间连线先占好位置。 */
+export function orderLabeledEdges(entries = []) {
+  const hasManual = (labels) => (labels || []).some((l) => (l?.dx || 0) !== 0 || (l?.dy || 0) !== 0);
+  return entries.slice().sort((a, b) =>
+    Number(hasManual(b.labels)) - Number(hasManual(a.labels)) ||
+    polylineLength(a.e?.points) - polylineLength(b.e?.points)
+  );
+}
 
 function limitLabelCenter(center, pts, maxDist) {
   const near = nearestOnPolyline(center, pts);
@@ -386,29 +416,76 @@ function overlapArea(a, b) {
   return Math.max(0, w) * Math.max(0, h);
 }
 
-function nodeEscapeCenters(center, node, size) {
-  const gap = NODE_PAD + 1;
+function boxEscapeCenters(center, box, size, pad) {
+  const gap = pad + 1;
   return [
-    { x: center.x, y: node.y - size.h / 2 - gap },
-    { x: center.x, y: node.y + node.h + size.h / 2 + gap },
-    { x: node.x - size.w / 2 - gap, y: center.y },
-    { x: node.x + node.w + size.w / 2 + gap, y: center.y },
+    { x: center.x, y: box.y - size.h / 2 - gap },
+    { x: center.x, y: box.y + box.h + size.h / 2 + gap },
+    { x: box.x - size.w / 2 - gap, y: center.y },
+    { x: box.x + box.w + size.w / 2 + gap, y: center.y },
   ];
+}
+
+function rectIntersectsSegment(rect, a, b, pad = EDGE_HIT_PAD) {
+  const rx0 = rect.x - pad;
+  const rx1 = rect.x + rect.w + pad;
+  const ry0 = rect.y - pad;
+  const ry1 = rect.y + rect.h + pad;
+  const [x1, y1] = a;
+  const [x2, y2] = b;
+  if (Math.max(x1, x2) < rx0 || Math.min(x1, x2) > rx1 || Math.max(y1, y2) < ry0 || Math.min(y1, y2) > ry1) {
+    return false;
+  }
+  if (Math.abs(y1 - y2) < 0.5) return y1 >= ry0 && y1 <= ry1;
+  if (Math.abs(x1 - x2) < 0.5) return x1 >= rx0 && x1 <= rx1;
+  let t0 = 0;
+  let t1 = 1;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  for (const [p, q] of [[-dx, x1 - rx0], [dx, rx1 - x1], [-dy, y1 - ry0], [dy, ry1 - y1]]) {
+    if (Math.abs(p) < 1e-9) {
+      if (q < 0) return false;
+    } else {
+      const r = q / p;
+      if (p < 0) {
+        if (r > t1) return false;
+        if (r > t0) t0 = r;
+      } else {
+        if (r < t0) return false;
+        if (r < t1) t1 = r;
+      }
+    }
+  }
+  return t0 <= t1;
+}
+
+function pathEdgeHitCount(rect, paths, pad = EDGE_HIT_PAD) {
+  let count = 0;
+  for (const pts of paths || []) {
+    if (!Array.isArray(pts)) continue;
+    for (let i = 1; i < pts.length; i++) {
+      if (rectIntersectsSegment(rect, pts[i - 1], pts[i], pad)) count++;
+    }
+  }
+  return count;
 }
 
 /** 自动标签遍历独立线段。手动偏移以整条折线的中点为基准。 */
 export function placeLabel({
-  label, size, pts = [], nodes = [], others = [], otherPaths = [],
+  label, size, pts = [], nodes = [], headers = [], others = [], otherPaths = [],
   maxDist = LABEL_MAX_DIST, preferredSide = -1,
 } = {}) {
   return findLabelRect({
-    label, size, pts, nodes, others, maxDist, preferredSide,
+    label, size, pts, nodes, headers, others, otherPaths, maxDist, preferredSide,
     paths: privateLabelPaths(pts, otherPaths),
     centerUnstyled: otherPaths.length === 0,
   });
 }
 
-function findLabelRect({ label, size, pts, nodes, others, maxDist, preferredSide, paths, centerUnstyled }) {
+function findLabelRect({
+  label, size, pts, nodes, headers = [], others, otherPaths = [],
+  maxDist, preferredSide, paths, centerUnstyled,
+}) {
   const anchor = midAnchor(pts);
   if (!anchor || !size) return null;
   const dx = label?.dx || 0;
@@ -422,76 +499,123 @@ function findLabelRect({ label, size, pts, nodes, others, maxDist, preferredSide
     paths = privateLabelPaths(pts, []);
   }
 
+  const totalArc = polylineLength(pts);
   const candidateLimit = manual ? maxDist : AUTO_MAX_DIST;
   const escapeLimit = manual ? maxDist : ESCAPE_MAX_DIST;
   let best = null;
   let bestScore = null;
 
-  function evaluate(center, preferred, path, limit, preferencePenalty) {
+  function evaluate(center, meta, path, limit, preferencePenalty) {
     const distance = distToPolyline(center, path);
-    if (distance > limit + 1e-6) return [];
+    if (distance > limit + 1e-6) return { nodeHits: [], headerHits: [] };
     const rect = rectAt(center.x, center.y, size);
-    const hits = nodes.filter((node) => rectsOverlap(rect, node, NODE_PAD));
-    let area = 0;
-    let titleArea = 0;
-    let titleGap = Infinity;
-    for (const node of hits) {
-      area += overlapArea(rect, node);
+    const nodeHits = nodes.filter((node) => rectsOverlap(rect, node, NODE_PAD));
+    let nodeArea = 0;
+    let nodeTitleArea = 0;
+    let nodeTitleGap = Infinity;
+    for (const node of nodeHits) {
+      nodeArea += overlapArea(rect, node);
       const title = { ...node, h: Math.min(22, node.h) };
-      titleArea += overlapArea(rect, title);
+      nodeTitleArea += overlapArea(rect, title);
       const gap = Math.max(title.y - rect.y - rect.h, rect.y - title.y - title.h, 0);
-      titleGap = Math.min(titleGap, gap);
+      nodeTitleGap = Math.min(nodeTitleGap, gap);
     }
-    const proximity = distance + Math.hypot(center.x - preferred.x, center.y - preferred.y) + preferencePenalty;
-    // 按优先级逐项比较，距离再近也不能抵消碰撞。
+    const headerHits = headers.filter((h) => rectsOverlap(rect, h, HEADER_PAD));
+    let headerArea = 0;
+    for (const h of headerHits) headerArea += overlapArea(rect, h);
+    const otherEdgeHits = pathEdgeHitCount(rect, otherPaths, EDGE_HIT_PAD);
+    const ownEdgeHits = meta.onLine ? 0 : pathEdgeHitCount(rect, [pts], EDGE_HIT_PAD);
+    const surfaceClearance = Math.max(0, distance - (meta.halfPerp ?? 0));
+    let overhang = 0;
+    if (meta.host) {
+      const { a, ux, uy, len, halfAlong } = meta.host;
+      const proj = (center.x - a[0]) * ux + (center.y - a[1]) * uy;
+      overhang = Math.max(0, halfAlong - proj) + Math.max(0, proj + halfAlong - len);
+    }
+    const alongCost = meta.manualTarget
+      ? Math.hypot(center.x - meta.manualTarget.x, center.y - meta.manualTarget.y)
+      : meta.onLine
+      ? Math.hypot(center.x - anchor.x, center.y - anchor.y)
+      : label?.preset === 'task'
+      ? (meta.arcPos ?? 0) * 0.08
+      : Math.abs((meta.arcPos ?? totalArc / 2) - totalArc / 2) * 0.08;
+    // 按优先级逐项比较：节点、已有标签、文件/目录标题、交叉连线，其次是溢出短段与贴线距离。
     const score = [
-      Number(hits.length > 0), area, titleArea, hits.length ? -titleGap : 0,
-      overlapCount(rect, others, LABEL_GAP), Number(distance > maxDist + 1e-6), proximity,
+      Number(nodeHits.length > 0),
+      nodeArea,
+      nodeTitleArea,
+      nodeHits.length ? -nodeTitleGap : 0,
+      overlapCount(rect, others, LABEL_GAP),
+      Number(headerHits.length > 0),
+      headerArea,
+      otherEdgeHits,
+      ownEdgeHits,
+      Number(distance > maxDist + 1e-6),
+      Number(overhang > 0.5),
+      Math.round(overhang),
+      surfaceClearance + alongCost + preferencePenalty,
     ];
     const firstDifference = bestScore && score.findIndex((value, i) => value !== bestScore[i]);
     if (!bestScore || (firstDifference >= 0 && score[firstDifference] < bestScore[firstDifference])) {
       best = rect;
       bestScore = score;
     }
-    return hits;
+    return { nodeHits, headerHits };
   }
 
-  function probe(center, preferred, path, preferencePenalty) {
-    const hits = evaluate(center, preferred, path, candidateLimit, preferencePenalty);
-    for (const node of hits) {
-      for (const escaped of nodeEscapeCenters(center, node, size)) {
-        evaluate(escaped, preferred, pts, escapeLimit, preferencePenalty);
+  function probe(center, meta, path, preferencePenalty) {
+    const { nodeHits, headerHits } = evaluate(center, meta, path, candidateLimit, preferencePenalty);
+    for (const node of nodeHits) {
+      for (const escaped of boxEscapeCenters(center, node, size, NODE_PAD)) {
+        evaluate(escaped, { ...meta, onLine: false, host: null }, pts, escapeLimit, preferencePenalty + 2);
+      }
+    }
+    for (const h of headerHits) {
+      for (const escaped of boxEscapeCenters(center, h, size, HEADER_PAD)) {
+        evaluate(escaped, { ...meta, onLine: false, host: null }, pts, escapeLimit, preferencePenalty + 2);
       }
     }
   }
 
-  if (manualCenter) probe(manualCenter, manualCenter, pts, 0);
-  if (rectOnLine) probe(anchor, anchor, pts, 0);
+  if (manualCenter) probe(manualCenter, { manualTarget: manualCenter }, pts, 0);
+  if (rectOnLine) probe(anchor, { onLine: true }, pts, 0);
 
-  for (const path of paths) {
+  for (const entry of paths) {
+    const path = entry.seg;
     const [a, b] = path;
-    const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    const len = entry.len;
+    if (len <= 0.5) continue;
     const ux = (b[0] - a[0]) / len;
     const uy = (b[1] - a[1]) / len;
     const nx = -uy;
     const ny = ux;
-    const inset = Math.min(8, len / 2);
+    const halfPerp = Math.abs(nx) * size.w / 2 + Math.abs(ny) * size.h / 2;
+    const halfAlong = Math.abs(ux) * size.w / 2 + Math.abs(uy) * size.h / 2;
+    const startInset = entry.isStartPort && len >= 32 ? Math.min(14, len / 3) : Math.min(8, len / 2);
+    const endInset = entry.isEndPort && len >= 32 ? Math.min(14, len / 3) : Math.min(8, len / 2);
+    const maxPos = Math.max(startInset, len - endInset);
+    const clampPos = (d) => clamp(d, startInset, maxPos);
     const distances = label?.preset === 'task'
-      ? [Math.min(20, len - inset), len / 2, len * 0.25, len * 0.75, inset, len - inset]
-      : [len / 2, len * 0.3, len * 0.7, len * 0.2, len * 0.8, inset, len - inset];
+      ? [clampPos(20), len / 2, len * 0.25, len * 0.75, startInset, maxPos]
+      : [len / 2, len * 0.3, len * 0.7, len * 0.2, len * 0.8, len * 0.15, len * 0.85, startInset, maxPos];
     const along = (d) => ({ x: a[0] + ux * d, y: a[1] + uy * d });
-    const preferred = manualCenter || (rectOnLine ? anchor : along(distances[0]));
-    const baseOff = Math.abs(nx) * size.w / 2 + Math.abs(ny) * size.h / 2 + 6;
-    for (const [rank, d] of [...new Set(distances)].entries()) {
-      const point = along(d);
+    const baseOff = halfPerp + 6;
+    const host = { a, ux, uy, len, halfAlong };
+    for (const [rank, rawD] of [...new Set(distances.map(clampPos))].entries()) {
+      const point = along(rawD);
+      const arcPos = entry.arcStart + rawD;
       for (let step = 0; step < 4; step++) {
         const desiredOffset = baseOff + step * (size.h + 6);
         if (step > 0 && desiredOffset > candidateLimit) break;
         // 宽标签的最小净距可能已超限，仍测试距离上限及节点外沿。
         const offset = Math.min(desiredOffset, candidateLimit);
         for (const side of [preferredSide, -preferredSide]) {
-          probe({ x: point.x + nx * offset * side, y: point.y + ny * offset * side },
-            preferred, path, rank + (side === preferredSide ? 0 : 1));
+          probe(
+            { x: point.x + nx * offset * side, y: point.y + ny * offset * side },
+            { manualTarget: manualCenter || null, halfPerp, arcPos, host },
+            path,
+            rank + (side === preferredSide ? 0 : 1)
+          );
         }
       }
     }
@@ -500,13 +624,15 @@ function findLabelRect({ label, size, pts, nodes, others, maxDist, preferredSide
 }
 
 /** 依次摆放同一条边上的标签，让后放的标签避开已有标签。 */
-export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [], otherPaths = [], maxDist = LABEL_MAX_DIST } = {}) {
+export function placeEdgeLabels({
+  items = [], pts = [], nodes = [], headers = [], others = [], otherPaths = [], maxDist = LABEL_MAX_DIST,
+} = {}) {
   const placed = [...others];
   const paths = privateLabelPaths(pts, otherPaths);
   return items.map(({ label, size }, i) => {
     if (!label || !size) return null;
     const rect = findLabelRect({
-      label, size, pts, nodes, others: placed, maxDist, paths,
+      label, size, pts, nodes, headers, others: placed, otherPaths, maxDist, paths,
       preferredSide: i % 2 === 0 ? -1 : 1,
       centerUnstyled: false,
     });
@@ -515,20 +641,30 @@ export function placeEdgeLabels({ items = [], pts = [], nodes = [], others = [],
   });
 }
 
-/** 从正交线段中扣除共用部分，保留沿原折线方向的所有独立线段。 */
+/** 从正交线段中扣除共用部分，保留沿原折线方向的所有独立线段及弧长元信息。 */
 function privateLabelPaths(pts, otherPaths) {
   const paths = [];
   if (!Array.isArray(pts)) return paths;
+  let arcCursor = 0;
   for (let i = 1; i < pts.length; i++) {
     const a = pts[i - 1], b = pts[i];
     if (a[0] === b[0] && a[1] === b[1]) continue;
+    const segLen = Math.hypot(b[0] - a[0], b[1] - a[1]);
     if (a[0] !== b[0] && a[1] !== b[1]) {
-      paths.push([a, b]);
+      paths.push({
+        seg: [a, b],
+        len: segLen,
+        arcStart: arcCursor,
+        isStartPort: i === 1,
+        isEndPort: i === pts.length - 1,
+      });
+      arcCursor += segLen;
       continue;
     }
     const axis = a[0] !== b[0] ? 0 : 1;
     const cross = 1 - axis;
     const forward = b[axis] > a[axis];
+    const segStartVal = a[axis];
     let parts = [[Math.min(a[axis], b[axis]), Math.max(a[axis], b[axis])]];
     for (const other of otherPaths) {
       if (!parts.length) break;
@@ -549,8 +685,18 @@ function privateLabelPaths(pts, otherPaths) {
       const start = [...a], end = [...b];
       start[axis] = forward ? lo : hi;
       end[axis] = forward ? hi : lo;
-      paths.push([start, end]);
+      const len = hi - lo;
+      if (len <= 0.5) continue;
+      const localOffset = Math.abs(start[axis] - segStartVal);
+      paths.push({
+        seg: [start, end],
+        len,
+        arcStart: arcCursor + localOffset,
+        isStartPort: i === 1 && localOffset <= 0.5,
+        isEndPort: i === pts.length - 1 && Math.abs(end[axis] - b[axis]) <= 0.5,
+      });
     }
+    arcCursor += segLen;
   }
   return paths;
 }
@@ -590,14 +736,10 @@ const svgEsc = (s) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-/** 一个标签的 SVG 片段（服务端导出用；颜色已在 normalizeLabel 里限定为 #RRGGBB） */
+/** 一个标签的 SVG 片段（服务端导出用；颜色已在 normalizeLabel 里限定为 #RRGGBB；不输出注释行） */
 export function labelSvg(label, rect, background = '#F7F6F2') {
   const cx = (rect.x + rect.w / 2).toFixed(1);
-  // 有说明行时主行上移，说明行垫在下面（尺寸由 labelBoxSize 算好，这里只管对位）
-  const mainCy = (label.note
-    ? rect.y + LABEL_PAD_Y + LABEL_FONT / 2
-    : rect.y + rect.h / 2 + 0.5
-  ).toFixed(1);
+  const mainCy = (rect.y + rect.h / 2 + 0.5).toFixed(1);
   const text = svgEsc(labelText(label));
   const parts = [];
   if (label.border) {
@@ -612,13 +754,5 @@ export function labelSvg(label, rect, background = '#F7F6F2') {
       label.color
     )}"${label.border ? '' : ` paint-order="stroke" stroke="${svgEsc(background)}" stroke-width="3"`}>${text}</text>`
   );
-  if (label.note) {
-    const noteCy = (rect.y + LABEL_PAD_Y * 2 + LABEL_FONT + LABEL_NOTE_FONT / 2).toFixed(1);
-    parts.push(
-      `<text x="${cx}" y="${noteCy}" text-anchor="middle" dominant-baseline="middle" font-size="${LABEL_NOTE_FONT}" fill="#6B6963">${svgEsc(
-        label.note
-      )}</text>`
-    );
-  }
   return parts.join('\n');
 }

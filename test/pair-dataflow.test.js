@@ -94,7 +94,10 @@ test('比较两点数据流：before 和 after 各自独立查找，不拼接跨
   assert.equal((await comparisonPairDataflow(comparison, 'flow.c::writer', 'flow.c::reader')).paths.length, 0);
   fs.writeFileSync(path.join(dir, 'after/flow.c'), before.replace('return 0;', 'return value;'));
   comparison = await compareProjects(path.join(dir, 'project'), path.join(dir, 'before'), path.join(dir, 'after'));
-  assert.deepEqual((await comparisonPairDataflow(comparison, 'flow.c::writer', 'flow.c::reader')).paths[0].versions, ['after']);
+  const compDf = await comparisonPairDataflow(comparison, 'flow.c::writer', 'flow.c::reader');
+  assert.deepEqual(compDf.paths[0].versions, ['after']);
+  assert.ok(compDf.paths[0].evidenceByVersion && typeof compDf.paths[0].evidenceByVersion === 'object', 'comparisonPairDataflow 应保留 evidenceByVersion');
+  assert.ok(compDf.paths[0].evidenceByVersion.after, 'after 版本应保留源码读写证据');
 });
 
 test('两点接口：仅显式查询触发分析，不改画布；无效端点、旧工程和旧比较会话被拒绝', async t => {

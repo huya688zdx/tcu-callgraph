@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { layoutElk, validLayout } from '../src/core/layout-elk.js';
+import { graphOf, layoutElk, validLayout } from '../src/core/layout-elk.js';
 import { routeEdges, pathCrossesBody, routeOverlapConflicts } from '../src/core/routing.js';
 import { mergeSharedRoutes, routeLengthAndCrossings } from '../src/core/layout-metrics.js';
 import { beginHierarchyMove } from '../web/lib/hierarchy.js';
@@ -26,6 +26,91 @@ function geometry(view) {
   }
   return byId;
 }
+
+test('同面虚实线优先使用不同物理中点，多次同样式调用仍共用端口', () => {
+  const nodes = ['a', 'b'].map(id => ({ id, w: 120, h: 40 }));
+  const edges = ['direct', 'fnptr', 'df-signal'].map(kind => ({ from: 'a', to: 'b', kind }));
+  const graph = graphOf(nodes, edges, 'RIGHT', edges.map(() => ['EAST', 'WEST']), true, false);
+  const position = new Map(graph.children.flatMap(n => n.ports.map(p => [p.id, [p.x, p.y]])));
+  const [call, repeat, data] = edges.map((_, i) => graph.edges.find(e => e.id === 'e' + i));
+  for (const end of ['sources', 'targets']) {
+    assert.deepEqual(call[end], repeat[end]);
+    assert.notDeepEqual(position.get(call[end][0]), position.get(data[end][0]));
+    for (const e of [call, data]) assert.ok([[0,20],[120,20],[60,0],[60,40]]
+      .some(([x,y]) => position.get(e[end][0])[0] === x && position.get(e[end][0])[1] === y));
+  }
+});
+
+test('文件成员增多时加宽层间、状态侧翼和标题边距，调用者仍直连被调函数', async () => {
+  const distances = [];
+  for (const count of [3, 9]) {
+    const nodes = [], edges = [];
+    for (let i = 0; i < count; i++) {
+      nodes.push({ id: 'f'+i, file: 'dense.c', w: 90, h: 44 }, { id: 'v'+i, kind: 'var', file: 'dense.c', w: 90, h: 44 });
+      if (i) edges.push({ from: 'f'+(i-1), to: 'f'+i, kind: 'direct' });
+      edges.push({ from: 'f'+i, to: 'v'+i, kind: 'var', via: '写' });
+    }
+    const view = await layoutElk(nodes, edges);
+    const byId = geometry(view);
+    const group = view.groups[0], vertical = (group.layoutDirection || view.layoutDirection) === 'DOWN';
+    const [main, size, cross, breadth] = vertical ? ['y','h','x','w'] : ['x','w','y','h'];
+    const layers = [], wing = [];
+    for (let i = 0; i < count; i++) {
+      const f = byId.get('f'+i), v = byId.get('v'+i);
+      assert.equal(f[main], v[main]);
+      wing.push(Math.abs(f[cross] - v[cross]) - f[breadth]);
+      if (i) layers.push(f[main] - byId.get('f'+(i-1))[main] - f[size]);
+    }
+    assert.ok(view.edges.filter(e => e.kind === 'direct').every(e => e.points.length === 2));
+    distances.push([Math.min(...layers), Math.min(...wing), Math.min(...view.nodes.map(n => n.y)) - group.y]);
+  }
+  for (let i = 0; i < 3; i++) assert.ok(distances[1][i] > distances[0][i], JSON.stringify(distances));
+});
+
+test('文件内缺少直接边时，通过外部调用者和被调者恢复文件内三个函数的层次', async () => {
+  const fn = (id, file = 'core.c') => ({ id, file, w: 88, h: 40 });
+  const nodes = [...Array.from({ length: 10 }, (_, i) => fn('free'+i)), ...['last','middle','first'].map(id => fn(id)),
+    ...['entry','stage1','stage2','exit'].map(id => fn(id, 'outside.c'))];
+  const chain = ['entry','first','stage1','middle','stage2','last','exit'];
+  const edges = chain.slice(1).map((to, i) => ({ from: chain[i], to, kind: 'direct' }));
+  const view = await layoutElk(nodes, edges);
+  const positions = geometry(view);
+  const direction = view.groups.find(g => g.id === 'core.c').layoutDirection || view.layoutDirection;
+  const axis = direction === 'RIGHT' ? 'x' : 'y', size = direction === 'RIGHT' ? 'w' : 'h';
+  for (const [from, to] of [['first','middle'], ['middle','last']]) {
+    assert.ok(positions.get(from)[axis] + positions.get(from)[size] < positions.get(to)[axis]);
+  }
+  assert.deepEqual(view.edges.map(({points, ...e}) => e), edges);
+});
+
+test('几何校验拒绝穿过第三方空文件框和异样式占用同一走廊', () => {
+  const nodes = [{ id: 'a', group: 'a.c', x: 15, y: 30, w: 40, h: 40 },
+    { id: 'b', group: 'b.c', x: 300, y: 30, w: 40, h: 40 }];
+  const groups = [{ id: 'a.c', x: 0, y: 0, w: 70, h: 90 }, { id: 'b.c', x: 280, y: 0, w: 80, h: 90 }];
+  const call = { from: 'a', to: 'b', kind: 'direct', points: [[55,50],[300,50]] };
+  const view = { nodes, groups, containers: [], edges: [call] };
+  assert.equal(validLayout(view), true);
+  assert.equal(validLayout({ ...view, groups: [...groups, { id: 'empty.c', x: 130, y: 10, w: 80, h: 70 }] }), false);
+  assert.equal(validLayout({ ...view, edges: [call, { ...call, kind: 'var' }] }), false);
+});
+
+test('恢复旧画布时在原位修正端口折钩和虚实重线，再次恢复保持一致', async () => {
+  const nodes = [{ id: 'a', x: 52, y: 120, w: 260, h: 122 }, { id: 'b', x: 452, y: 56, w: 360, h: 122 },
+    { id: 'c', x: 60, y: 370, w: 120, h: 40 }, { id: 'd', x: 450, y: 370, w: 120, h: 40 }];
+  const calls = [{ from: 'a', to: 'b', kind: 'direct' }, { from: 'c', to: 'd', kind: 'direct', custom: true },
+    { from: 'c', to: 'd', kind: 'var', via: '读' }];
+  const straight = [[180,390], [450,390]];
+  const previous = { nodes, groups: [], containers: [], width: 860, height: 470, layoutDirection: 'DOWN',
+    edges: calls.map((e, i) => ({ ...e, points: i ? structuredClone(straight) : [[182,120],[182,117],[452,117]] })) };
+  const view = await layoutElk(nodes, calls, { group: false, previous });
+  geometry(view);
+  assert.deepEqual([view.edges[0].points[0], view.edges[0].points.at(-1)], [[312,181],[452,117]]);
+  assert.deepEqual(view.edges[1].points, straight);
+  assert.equal(routeOverlapConflicts(view.edges).length, 0);
+  assert.deepEqual(view.nodes.map(n => [n.x, n.y]), nodes.map(n => [n.x, n.y]));
+  const again = await layoutElk(nodes, calls, { group: false, previous: view });
+  assert.deepEqual(again.edges.map(e => e.points), view.edges.map(e => e.points));
+});
 
 test('192 节点跨文件链保持紧凑，正向调用使用左右中点', async () => {
   const nodes = Array.from({ length: 192 }, (_, i) => ({ id: 'f' + i, file: 'module' + Math.floor(i / 16) + '.c' }));

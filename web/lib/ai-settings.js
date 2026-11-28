@@ -7,8 +7,9 @@
 import { t } from '../i18n.js';
 import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
-import { focusBox } from './camera.js';
+import { focusBox, stopCamAnim } from './camera.js';
 import { hooks } from './hooks.js';
+import { refreshAfterAiUndo } from './live.js';
 import { selectNode } from './menu.js';
 import { confirmDialog, esc } from './modal.js';
 import { runSearch } from './panels.js';
@@ -24,6 +25,7 @@ const panes = {
   chat: document.getElementById('aiPaneChat'),
   api: document.getElementById('aiPaneApi'),
   mcp: document.getElementById('aiPaneMcp'),
+  guide: document.getElementById('aiPaneGuide'),
 };
 
 // 对话区 DOM
@@ -35,9 +37,15 @@ const renameInputEl = document.getElementById('aiRenameInput');
 const deleteChatBtn = document.getElementById('aiDeleteChat');
 const setupBanner = document.getElementById('aiSetupBanner');
 const goConfigBtn = document.getElementById('aiGoConfig');
+const bookmarkBannerEl = document.getElementById('aiBookmarkBanner');
+const bookmarkBannerTextEl = document.getElementById('aiBookmarkBannerText');
+const bookmarkNewChatBtn = document.getElementById('aiBookmarkNewChat');
+const bookmarkBindChatBtn = document.getElementById('aiBookmarkBindChat');
+const bookmarkDismissBtn = document.getElementById('aiBookmarkDismiss');
 const messagesEl = document.getElementById('aiMessages');
 const selectionBar = document.getElementById('aiSelectionBar');
 const pinnedListEl = document.getElementById('aiPinnedList');
+const relationBarEl = document.getElementById('aiRelationBar');
 const selectionRowEl = document.getElementById('aiSelectionRow');
 const trunkSwitchEl = document.getElementById('aiTrunkSwitch');
 const trunkBadgeEl = document.getElementById('aiTrunkBadge');
@@ -49,6 +57,7 @@ const pinSelectionBtn = document.getElementById('aiPinSelection');
 const selectionQuestions = document.getElementById('aiSelectionQuestions');
 const clearSelectionBtn = document.getElementById('aiClearSelection');
 const inputShellEl = document.getElementById('aiInputShell');
+const slashMenuEl = document.getElementById('aiSlashMenu');
 const attachmentsEl = document.getElementById('aiAttachments');
 const inputEl = document.getElementById('aiPromptInput');
 const ghostTabHintEl = document.getElementById('aiGhostTabHint');
@@ -71,6 +80,15 @@ const speedBadge = document.getElementById('aiSpeedBadge');
 const compactBtn = document.getElementById('aiCompactChat');
 const chatStatusEl = document.getElementById('aiChatStatus');
 
+// 导览 HUD DOM
+const presHudEl = document.getElementById('aiPresentationHud');
+const presHudTitleEl = document.getElementById('aiPresHudTitle');
+const presHudSubEl = document.getElementById('aiPresHudSub');
+const presHudCounterEl = document.getElementById('aiPresHudCounter');
+const presPrevBtn = document.getElementById('aiPresPrev');
+const presNextBtn = document.getElementById('aiPresNext');
+const presCloseBtn = document.getElementById('aiPresClose');
+
 // API 配置区 DOM
 const baseUrlEl = document.getElementById('aiBaseUrl');
 const modelEl = document.getElementById('aiModel');
@@ -82,6 +100,9 @@ const toolModeEl = document.getElementById('aiToolMode');
 const reasoningEffortEl = document.getElementById('aiReasoningEffort');
 const contextWindowEl = document.getElementById('aiContextWindow');
 const maxTokensEl = document.getElementById('aiMaxTokens');
+const subagentEnabledEl = document.getElementById('aiSubagentEnabled');
+const subagentConcurrencyEl = document.getElementById('aiSubagentConcurrency');
+const subagentMaxStepsEl = document.getElementById('aiSubagentMaxSteps');
 const testConnBtn = document.getElementById('aiTestConn');
 const saveApiBtn = document.getElementById('aiSaveApi');
 const apiStatusEl = document.getElementById('aiApiStatus');
@@ -195,7 +216,7 @@ const pendingFiles = [];  // [{ id, name, lines, startLine, endLine }]
 let llmConfig = {
   baseUrl: 'http://127.0.0.1:11434/v1', model: '', hasApiKey: false,
   toolMode: 'auto', reasoningEffort: 'default', contextWindow: DEFAULT_CONTEXT_WINDOW,
-  maxTokens: DEFAULT_MAX_TOKENS,
+  maxTokens: DEFAULT_MAX_TOKENS, subagentEnabled: true, subagentMaxConcurrency: 2, subagentMaxSteps: 6,
 };
 let clearApiKeyPending = false;
 let fetchedModels = [];
@@ -206,7 +227,7 @@ let chatGeneration = 0;
 let chatMutation = 0;
 let chatProjectId = null;
 let chatProjectName = '';
-let chatThreads = []; // [{ id, title, customTitle?, updatedAt, messages }]
+let chatThreads = []; // [{ id, title, customTitle?, bookmarkId?, bookmarkName?, updatedAt, messages }]
 let activeChatId = '';
 let renamingThread = null;
 let activeAbort = null;
@@ -214,11 +235,14 @@ let pendingSteer = null;
 let compacting = null;
 let stickToBottom = true;
 let displayedContext = { used: 0, promptTokens: 0, outputTokens: 0, estimated: false, hasMetrics: false };
-let canvasSelection = null;
-const pinnedSelections = [];
+let canvasSelection = null; // 被动画布候选（不主动随普通发送进入模型）
+const pinnedSelections = []; // 显式附着/暂存的上下文芯片（支持单轮自动消费或 _pinned 跨轮锁定）
 const MAX_PINNED_SELECTIONS = 16;
+let selectedRelationIntent = 'auto';
 const dismissedSelectionKeys = new Set();
 let activeStreamFlush = null;
+let slashMenuState = { open: false, mode: '', items: [], activeIndex: 0, triggerStart: 0 };
+let pendingBookmarkSwitch = null;
 
 function isCanvasDragging() {
   return Boolean(
@@ -278,10 +302,11 @@ function deriveThreadTitle(prompt, tools = []) {
   return [...subject].slice(0, 16).join('');
 }
 
-function newThreadObject(title = NEW_THREAD_TITLE) {
+function newThreadObject(title = NEW_THREAD_TITLE, bm = state.activeBookmark) {
   return {
     id: (crypto.randomUUID ? crypto.randomUUID() : `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
     title,
+    ...(bm?.id ? { bookmarkId: bm.id, bookmarkName: bm.name || '' } : {}),
     updatedAt: Date.now(),
     messages: [],
   };
@@ -372,7 +397,7 @@ function messageContext(message) {
 }
 
 function chatHistory(messages) {
-  const history = messages.filter((m) => !m.error).slice(-16).map((m) => ({
+  const history = messages.filter(m => !m.error || m.tools?.some(t => t.ok)).slice(-16).map((m) => ({
     role: m.role,
     content: messageContext(m),
     ...(m.attachedFiles?.length ? { attachedFiles: m.attachedFiles } : {}),
@@ -784,14 +809,18 @@ function showThinking(box, before, thinking, seconds, streaming = false) {
     details.className = 'ai-think';
     details.open = streaming;
     details.innerHTML = '<summary></summary><pre></pre>';
-    box.insertBefore(details, box.querySelector('.ai-steps') || before);
+    box.insertBefore(details, box.querySelector('.ai-investigate') || box.querySelector('.ai-steps') || before);
     const pre = details.querySelector('pre');
+    details.querySelector('summary').addEventListener('click', () => {
+      details.dataset.userToggled = '1';
+    });
     pre.addEventListener('scroll', () => {
       if (pre.clientHeight) pre.dataset.stickToBottom = String(isNearBottom(pre));
     }, { passive: true });
     details.addEventListener('toggle', () => followThinkingScroll(details, pre));
   }
   details.dataset.streaming = String(streaming);
+  if (!streaming && !details.dataset.userToggled) details.open = false;
   const timer = Number.isFinite(seconds) ? ` · ${seconds.toFixed(1)}s` : '';
   details.querySelector('summary').textContent = streaming
     ? (timer ? `Thinking${timer}` : 'Thinking…')
@@ -943,49 +972,71 @@ function selectionKey(selection) {
   if (selection?.kind === 'node' && selection.id) return `node:${selection.id}`;
   if (selection?.kind === 'edge' && selection.edgeKey) return `edge:${selection.edgeKey}`;
   if (selection?.kind === 'file' && typeof selection.path === 'string') return `file:${selection.path}`;
-  if (selection?.kind === 'pair' && Array.isArray(selection.ids) && selection.ids.length >= 2) {
-    return `pair:${selection.ids.join('|')}`;
+  if (selection?.kind === 'pair') {
+    const a = selection.fromId || selection.ids?.[0] || '';
+    const b = selection.toId || selection.ids?.[1] || '';
+    if (a && b) return `pair:${a}|${b}`;
+  }
+  if (selection?.kind === 'dataflow' && (selection.targetId || selection.id)) {
+    const f = selection.focused;
+    return 'df:' + JSON.stringify([selection.projectId, selection.comparisonId, selection.sessionRevision,
+      selection.targetId || selection.id, selection.dir || 'out', f?.varId, f?.mode, f?.peerId, f?.version]);
   }
   return '';
 }
 
 function stripUiOnlySelectionFields(item) {
   if (!item || typeof item !== 'object') return item;
-  if (item.kind !== 'edge') return item;
-  const { trunkBranches, trunkActiveIndex, trunkAll, ...clean } = item;
+  const { _pinned, trunkBranches, trunkActiveIndex, trunkAll, ...clean } = item;
   return clean;
 }
 
 function expandSelectionItems(selection) {
   if (!selection || typeof selection !== 'object') return [];
-  if (selection.kind === 'pair') {
-    return [
-      ...(Array.isArray(selection.nodes) ? selection.nodes : []),
-      ...(Array.isArray(selection.edges) ? selection.edges : []),
-    ].map(stripUiOnlySelectionFields);
-  }
   return [stripUiOnlySelectionFields(selection)];
+}
+
+function chipGlyph(item) {
+  if (item?.kind === 'pair') return 'A↔B';
+  if (item?.kind === 'dataflow') return '⇅';
+  if (item?.kind === 'edge') return '→';
+  if (item?.kind === 'file') return '📄';
+  if (item?.nodeKind === 'var' || item?.kind === 'var') return '◇';
+  return 'ƒ';
 }
 
 function describeSelection(selection) {
   if (selection.kind === 'pair') {
     const [a, b] = selection.nodes || [];
-    const nameA = a?.name || a?.id?.split('::').pop() || selection.ids?.[0] || '';
-    const nameB = b?.name || b?.id?.split('::').pop() || selection.ids?.[1] || '';
-    const idA = a?.id || selection.ids?.[0] || nameA;
-    const idB = b?.id || selection.ids?.[1] || nameB;
-    const n = Number(selection.pathCount) || 0;
-    const caption = n
-      ? `两点链路：${nameA} ↔ ${nameB}（${n} 条路径）`
+    const idA = selection.fromId || a?.id || selection.ids?.[0] || '';
+    const idB = selection.toId || b?.id || selection.ids?.[1] || '';
+    const nameA = selection.fromName || a?.name || idA.split('::').pop() || '';
+    const nameB = selection.toName || b?.name || idB.split('::').pop() || '';
+    const n = Number(selection.pathCount) || (selection.visiblePaths?.length || 0);
+    const rwCount = Array.isArray(selection.rwPaths) ? selection.rwPaths.length : 0;
+    const caption = n || rwCount
+      ? `两点链路：${nameA} ↔ ${nameB}（调用 ${n} · 读写 ${rwCount}）`
       : `两点关系：${nameA} ↔ ${nameB}（当前画布无直连）`;
     return {
       caption,
-      questions: n ? [
-        ['分析两点链路', `请结合当前选中的「${idA}」与「${idB}」及其中间连线，分析这两者之间的调用与数据流关系。`],
-        ['核对关键路径', `请说明「${idA}」到「${idB}」之间各条路径的触发条件和先后顺序。`],
+      questions: (n || rwCount) ? [
+        ['分析两点链路', `请结合已附着的「${idA}」与「${idB}」双向调用及读写数据流，分析这两者之间的依赖和执行逻辑。`],
+        ['核对关键路径', `请说明「${idA}」到「${idB}」之间各条路径的触发条件、变量交接和先后顺序。`],
       ] : [
         ['查为何无路径', `请只读分析「${idA}」和「${idB}」为什么在当前画布没有直接相连的调用/数据流路径。`],
-        ['补齐中间链', `请查找「${idA}」与「${idB}」之间的调用或数据流关系，确认范围后加入画布。`],
+        ['查找并呈示关系', `请调用 inspect_dataflow 和 present_logic 查找「${idA}」与「${idB}」的间接或数据流关联。`],
+      ],
+    };
+  }
+  if (selection.kind === 'dataflow') {
+    const id = selection.targetId || selection.id || '';
+    const name = selection.targetName || selection.name || id.replace(/^var::/, '').split('::').pop();
+    const dirLabel = selection.dir === 'in' ? '写入源(in)' : selection.dir === 'both' ? '双向' : '读取下游(out)';
+    return {
+      caption: `数据流(${dirLabel})：${name}`,
+      questions: [
+        ['梳理数据流链', `请梳理「${id}」(${dirLabel}) 所涉及变量的写入方、读取方和触发周期。`],
+        ['呈示交互大图', `请调用 present_logic 把「${id}」及其共享变量读写链路呈现在画布上并开启导览。`],
       ],
     };
   }
@@ -1054,34 +1105,57 @@ function renderSelectionBar() {
       for (const item of pinnedSelections) {
         const key = selectionKey(item);
         const { caption } = describeSelection(item);
+        const glyph = chipGlyph(item);
         const chip = document.createElement('span');
-        chip.className = 'ai-pinned-chip';
-        chip.title = caption;
+        chip.className = item._pinned ? 'ai-pinned-chip is-pinned' : 'ai-pinned-chip';
+        chip.title = `${caption}${item._pinned ? '（已锁定跨轮保留）' : '（本轮发送后自动清理）'}`;
         const label = document.createElement('span');
-        label.textContent = caption;
+        label.textContent = `${glyph} ${caption}`;
+        const pinToggle = document.createElement('button');
+        pinToggle.type = 'button';
+        pinToggle.className = 'ai-pinned-pin';
+        pinToggle.setAttribute('aria-pressed', String(Boolean(item._pinned)));
+        pinToggle.setAttribute('aria-label', item._pinned ? `取消跨轮锁定：${caption}` : `锁定跨轮保留：${caption}`);
+        pinToggle.title = item._pinned ? '已锁定：发送后继续保留（点击取消）' : '点击 📌 锁定以在后续追问中持续保留';
+        pinToggle.textContent = '📌';
+        pinToggle.addEventListener('click', () => {
+          item._pinned = !item._pinned;
+          renderSelectionBar();
+        });
         const rm = document.createElement('button');
         rm.type = 'button';
         rm.className = 'ai-pinned-rm';
-        rm.setAttribute('aria-label', `移除暂存：${caption}`);
+        rm.setAttribute('aria-label', `移除上下文：${caption}`);
         rm.textContent = '×';
         rm.addEventListener('click', () => {
           const idx = pinnedSelections.findIndex((x) => selectionKey(x) === key);
           if (idx >= 0) pinnedSelections.splice(idx, 1);
           renderSelectionBar();
         });
-        chip.append(label, rm);
+        chip.append(label, pinToggle, rm);
         pinnedListEl.appendChild(chip);
       }
       if (pinnedSelections.length >= 2) {
         const clearAll = document.createElement('button');
         clearAll.type = 'button';
         clearAll.className = 'ai-pinned-clear';
-        clearAll.textContent = `清空暂存 (${pinnedSelections.length})`;
+        clearAll.textContent = `清空上下文 (${pinnedSelections.length})`;
         clearAll.addEventListener('click', () => {
           pinnedSelections.length = 0;
+          selectedRelationIntent = 'auto';
           renderSelectionBar();
         });
         pinnedListEl.appendChild(clearAll);
+      }
+    }
+  }
+
+  if (relationBarEl) {
+    const showRel = pinnedSelections.length >= 2 || pinnedSelections.some(s => s?.kind === 'pair' || s?.kind === 'dataflow');
+    relationBarEl.hidden = !showRel;
+    if (showRel) {
+      for (const relBtn of relationBarEl.querySelectorAll('.ai-rel-btn')) {
+        relBtn.classList.toggle('on', relBtn.dataset.aiRel === selectedRelationIntent);
       }
     }
   }
@@ -1109,17 +1183,17 @@ function renderSelectionBar() {
   selectionQuestions.replaceChildren();
   if (hasActive) {
     const { caption, questions } = describeSelection(canvasSelection);
-    selectionText.textContent = selectionText.title = `📎 ${caption}`;
+    selectionText.textContent = selectionText.title = `${chipGlyph(canvasSelection)} ${caption}`;
     const activeKey = selectionKey(canvasSelection);
     const alreadyPinned = pinnedSelections.some((item) => selectionKey(item) === activeKey);
     if (pinSelectionBtn) {
       pinSelectionBtn.disabled = alreadyPinned || pinnedSelections.length >= MAX_PINNED_SELECTIONS;
       pinSelectionBtn.textContent = alreadyPinned ? '✓' : '+';
       pinSelectionBtn.title = alreadyPinned
-        ? '已暂存到待提问列表'
+        ? '已加入本轮对话上下文'
         : pinnedSelections.length >= MAX_PINNED_SELECTIONS
-          ? `最多暂存 ${MAX_PINNED_SELECTIONS} 项`
-          : '暂存到待提问列表，可继续点选多个画布关系';
+          ? `最多附着 ${MAX_PINNED_SELECTIONS} 项上下文`
+          : '加入本轮对话上下文 (Alt+A)，未加入时仅作预览';
     }
     for (const [label, prompt] of questions) {
       const chip = document.createElement('button');
@@ -1127,7 +1201,14 @@ function renderSelectionBar() {
       chip.className = 'ai-followup-chip';
       chip.textContent = label;
       chip.disabled = Boolean(compacting);
-      chip.addEventListener('click', () => sendPrompt(prompt));
+      chip.addEventListener('click', () => {
+        const stagedOk = pinSelectionSnapshot(canvasSelection, { quiet: true });
+        const frozenCtx = currentUiContext();
+        if (!stagedOk && pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
+          setChatStatus(`已满 ${MAX_PINNED_SELECTIONS} 项上下文，将沿用当前已附着项发送`, false);
+        }
+        void sendPrompt(prompt, frozenCtx);
+      });
       selectionQuestions.appendChild(chip);
     }
   }
@@ -1144,25 +1225,24 @@ function setCanvasSelection(selection, explicit = false) {
   syncInputSuggestion();
 }
 
-function pinCurrentSelection() {
-  if (!canvasSelection) return;
-  const additions = canvasSelection.kind === 'pair'
-    ? (canvasSelection.nodes || [])
-    : [stripUiOnlySelectionFields(canvasSelection)];
-  let added = 0;
-  for (const item of additions) {
-    const key = selectionKey(item);
-    if (!key || pinnedSelections.some((x) => selectionKey(x) === key)) continue;
-    if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
-      setChatStatus(`最多同时暂存 ${MAX_PINNED_SELECTIONS} 个画布关系`, true);
-      break;
-    }
-    pinnedSelections.push({ ...item });
-    added++;
+function pinSelectionSnapshot(selection, { pinned = false, quiet = false } = {}) {
+  if (!selection) return false;
+  const clean = stripUiOnlySelectionFields(selection);
+  const key = selectionKey(clean);
+  if (!key) return false;
+  if (pinnedSelections.some((x) => selectionKey(x) === key)) return true;
+  if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
+    if (!quiet) setChatStatus(`最多同时附着 ${MAX_PINNED_SELECTIONS} 项上下文，已保留现有 ${MAX_PINNED_SELECTIONS} 项`, true);
+    return false;
   }
-  if (!added) return;
+  pinnedSelections.push({ ...clean, ...(pinned ? { _pinned: true } : {}) });
   renderSelectionBar();
-  setChatStatus(`已暂存到上下文（共 ${pinnedSelections.length} 项），可继续点选其他关系`);
+  if (!quiet) setChatStatus(`已加入对话上下文（共 ${pinnedSelections.length} 项），发送后一次性芯片将自动清理`);
+  return true;
+}
+
+function pinCurrentSelection() {
+  pinSelectionSnapshot(canvasSelection);
 }
 
 function summarizeUiContext(uiContext) {
@@ -1175,6 +1255,15 @@ function summarizeUiContext(uiContext) {
       const endpoints = item.from && item.to ? `${item.from} → ${item.to}` : (item.edgeKey || '');
       return endpoints ? `连线 ${endpoints}` : '';
     }
+    if (item.kind === 'pair') {
+      const a = item.fromName || item.fromId || '';
+      const b = item.toName || item.toId || '';
+      return a && b ? `两点 ${a}↔${b}` : '';
+    }
+    if (item.kind === 'dataflow') {
+      const tName = item.targetName || item.targetId || '';
+      return tName ? `数据流 ${tName}` : '';
+    }
     if (item.kind === 'file') return item.path ? `文件 ${item.path}` : '';
     return '';
   }).filter(Boolean);
@@ -1182,11 +1271,11 @@ function summarizeUiContext(uiContext) {
   return labels.join('、').slice(0, 260);
 }
 
+/** 仅返回用户明确附着/暂存进芯片槽位的上下文（被动候选绝不自动发送）。 */
 function currentUiContext() {
   const items = [];
   const seen = new Set();
-  const sources = [...(canvasSelection ? [canvasSelection] : []), ...pinnedSelections];
-  for (const source of sources) {
+  for (const source of pinnedSelections) {
     for (const item of expandSelectionItems(source)) {
       const key = selectionKey(item);
       if (!key || seen.has(key)) continue;
@@ -1197,7 +1286,22 @@ function currentUiContext() {
     if (items.length >= MAX_PINNED_SELECTIONS) break;
   }
   if (!items.length) return undefined;
-  return { ...items[0], items };
+  return {
+    ...items[0],
+    items,
+    ...(selectedRelationIntent && selectedRelationIntent !== 'auto' ? { relationIntent: selectedRelationIntent } : {}),
+  };
+}
+
+function consumeUnpinnedStagedSelections(sentUiContext) {
+  if (!sentUiContext?.items?.length) return;
+  const sentKeys = new Set(sentUiContext.items.map(selectionKey).filter(Boolean));
+  const kept = pinnedSelections.filter((item) => item._pinned || !sentKeys.has(selectionKey(item)));
+  if (kept.length !== pinnedSelections.length) {
+    pinnedSelections.splice(0, pinnedSelections.length, ...kept);
+    if (!pinnedSelections.length) selectedRelationIntent = 'auto';
+    renderSelectionBar();
+  }
 }
 
 function buildCanvasLayoutSnapshot() {
@@ -1593,8 +1697,314 @@ const EMPTY_CHAT_HTML = `<div class="empty">
   <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/new 新建</span><span>·</span><span>/compact 压缩</span></div>
 </div>`;
 
+function syncPresentationHud() {
+  if (!presHudEl) return;
+  const pres = state.presentation;
+  const steps = Array.isArray(pres?.steps) ? pres.steps : [];
+  if (!pres || !steps.length) {
+    presHudEl.hidden = true;
+    return;
+  }
+  const idx = Math.max(0, Math.min(steps.length - 1, Number(pres.activeIndex) || 0));
+  const step = steps[idx];
+  presHudEl.hidden = false;
+  if (presHudTitleEl) presHudTitleEl.textContent = `${pres.title || '逻辑导览'} · ${step.title || `步骤 ${idx + 1}`}`;
+  if (presHudSubEl) presHudSubEl.textContent = step.summary || '';
+  if (presHudCounterEl) presHudCounterEl.textContent = `${idx + 1}/${steps.length}`;
+  if (presPrevBtn) presPrevBtn.disabled = idx <= 0;
+  if (presNextBtn) presNextBtn.disabled = idx >= steps.length - 1;
+}
+
+function activatePresentation(pres, stepIndex = 0) {
+  const steps = Array.isArray(pres?.steps) ? pres.steps : [];
+  if (!pres || !steps.length) {
+    state.presentation = null;
+    state.aiOverlay = null;
+    syncPresentationHud();
+    draw();
+    return;
+  }
+  const idx = Math.max(0, Math.min(steps.length - 1, stepIndex));
+  const step = steps[idx];
+  state.presentation = { ...pres, activeIndex: idx };
+  state.aiOverlay = {
+    action: 'highlight',
+    nodeIds: step.nodeIds || [],
+    edgeKeys: step.edgeKeys || [],
+    focusNodeId: step.focusNodeId || step.nodeIds?.[0] || null,
+    stepNumber: idx + 1,
+    label: step.title || pres.title || '逻辑导览',
+  };
+  syncPresentationHud();
+  const focusId = step.focusNodeId || step.nodeIds?.[0];
+  const node = focusId && state.view?.nodes?.find((n) => n.id === focusId);
+  if (node) focusBox(node, 110, { keepZoom: true });
+  draw();
+}
+
+function ensureInvestigateContainer(box, before, collapsed = false) {
+  let inv = box.querySelector('.ai-investigate');
+  if (!inv) {
+    inv = document.createElement('details');
+    inv.className = 'ai-investigate';
+    inv.open = !collapsed;
+    inv.innerHTML = '<summary>调查过程</summary><div class="ai-steps"></div>';
+    if (before) box.insertBefore(inv, before);
+    else box.appendChild(inv);
+  }
+  return { inv, summary: inv.querySelector('summary'), steps: inv.querySelector('.ai-steps') };
+}
+
+function updateInvestigateSummary(inv, count, running = false) {
+  const summary = inv?.querySelector('summary');
+  if (!summary) return;
+  summary.textContent = running ? `调查中 · 已调用 ${count} 个工具…` : `调查过程 · 共执行 ${count} 个工具`;
+}
+
+function renderSubagentCards(box, subagents, before = null) {
+  if (!Array.isArray(subagents) || !subagents.length) return;
+  let listEl = box.querySelector('.ai-subagent-list');
+  if (!listEl) {
+    listEl = document.createElement('div');
+    listEl.className = 'ai-subagent-list';
+    if (before) box.insertBefore(listEl, before);
+    else box.appendChild(listEl);
+  }
+  listEl.replaceChildren();
+  for (const sa of subagents) {
+    const card = document.createElement('div');
+    card.className = 'ai-subagent-card';
+    const head = document.createElement('div');
+    head.className = 'ai-subagent-head';
+    const icon = sa.running ? '◐' : (sa.ok !== false ? '✓' : '✕');
+    head.textContent = `${icon} 子调查 · ${sa.title || sa.id}`;
+    const meta = document.createElement('div');
+    meta.className = 'ai-subagent-meta';
+    meta.textContent = sa.running
+      ? (sa.lastTool ? `正在执行 ${sa.lastTool}${sa.lastSummary ? `：${sa.lastSummary}` : ''}` : '正在只读调查…')
+      : `已完成 ${sa.steps || 0} 步只读排查`;
+    card.append(head, meta);
+    if (sa.summary) {
+      const body = document.createElement('div');
+      body.className = 'ai-subagent-body';
+      body.textContent = sa.summary;
+      card.appendChild(body);
+    }
+    listEl.appendChild(card);
+  }
+}
+
+function chainEdgeKeys(chain, nodeIds) {
+  if (chain.edgeKeys?.length) return chain.edgeKeys;
+  // 旧版单边导览卡把完整调用点键存在 id 中，其他旧链路只保留了端点。
+  if (chain.id?.startsWith('pres_edge:')) return [chain.id.slice('pres_edge:'.length)];
+  return nodeIds.slice(1).map((to, i) => {
+    const from = nodeIds[i];
+    return chain.kind === 'dataflow' && from.startsWith('var::') ? `${to}->${from}` : `${from}->${to}`;
+  });
+}
+
+function clearChainHover(nodeId) {
+  if (nodeId && state.aiHover?.nodeId === nodeId) {
+    state.aiHover = null;
+    draw();
+  }
+}
+
+function renderChainCards(box, chains) {
+  if (!Array.isArray(chains) || !chains.length) return;
+  const txtEl = box.querySelector('.ai-msg-text');
+  for (const chain of chains.slice(0, 6)) {
+    const steps = Array.isArray(chain?.steps) ? chain.steps : [];
+    if (!steps.length) continue;
+    const card = document.createElement('div');
+    card.className = 'ai-chain-card';
+    // 严格分离点击区：卡片主体不绑点击，头部只放链路级操作，节点芯片只聚焦单节点。
+    const head = document.createElement('div');
+    head.className = 'ai-chain-head';
+    const title = document.createElement('span');
+    title.className = 'ai-chain-title';
+    title.textContent = `${chain.kind === 'dataflow' ? '⇅' : '⟿'} ${chain.title || '调用链路'}`;
+    const actions = document.createElement('span');
+    actions.className = 'ai-chain-actions';
+
+    const nodeIds = steps.map((s) => s.id).filter(Boolean);
+    const edgeKeys = chainEdgeKeys(chain, nodeIds);
+
+    const hlBtn = document.createElement('button');
+    hlBtn.type = 'button';
+    hlBtn.textContent = '◉ 高亮';
+    hlBtn.title = '在画布叠加高亮整条链路';
+    hlBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.aiOverlay = { action: 'highlight', nodeIds, edgeKeys, label: chain.title || '链路高亮' };
+      draw();
+    });
+
+    const flowBtn = document.createElement('button');
+    flowBtn.type = 'button';
+    flowBtn.textContent = '≋ 动画';
+    flowBtn.title = '在画布沿该链路播放流动画';
+    flowBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.aiOverlay = { action: 'play_flow', nodeIds, edgeKeys, label: chain.title || '数据流动画' };
+      draw();
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = '+ 入图';
+    addBtn.title = '请 AI 将整条链路加入画布并呈现';
+    addBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const targetIds = nodeIds.slice(0, 6);
+      void sendPrompt(`请调用 present_logic 将以下整条链路加入画布并梳理：${targetIds.join(', ')}`);
+    });
+
+    actions.append(hlBtn, flowBtn, addBtn);
+    head.append(title, actions);
+
+    const body = document.createElement('div');
+    body.className = 'ai-chain-steps';
+    steps.forEach((step, idx) => {
+      if (idx > 0) {
+        const arr = document.createElement('span');
+        arr.className = 'ai-chain-arrow';
+        arr.textContent = step.edgeKind === 'var' ? '──⇄──' : '──▶';
+        body.appendChild(arr);
+      }
+      const nodeBtn = document.createElement('button');
+      nodeBtn.type = 'button';
+      nodeBtn.className = 'ai-chain-node';
+      const isVar = String(step.id || '').startsWith('var::');
+      nodeBtn.textContent = `${isVar ? '◇' : 'ƒ'} ${step.name || step.id}`;
+      nodeBtn.title = `${step.id}${step.file ? ` (${step.file}${step.line ? `:${step.line}` : ''})` : ''}`;
+      nodeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        locateSymbolFromChat(step.id || step.name);
+      });
+      nodeBtn.addEventListener('mouseenter', () => {
+        if (!step.id) return;
+        state.aiHover = { nodeId: step.id };
+        draw();
+      });
+      nodeBtn.addEventListener('mouseleave', () => clearChainHover(step.id));
+      body.appendChild(nodeBtn);
+    });
+    card.append(head, body);
+    const anchor = txtEl?.nextSibling || null;
+    if (anchor) box.insertBefore(card, anchor);
+    else box.appendChild(card);
+  }
+}
+
+function renderPresCard(box, pres) {
+  if (!pres?.steps?.length) return;
+  const card = document.createElement('div');
+  card.className = 'ai-pres-card';
+  const head = document.createElement('div');
+  head.className = 'ai-pres-head';
+  const title = document.createElement('span');
+  title.textContent = `🎬 ${pres.title || '分步导览'}（${pres.steps.length} 步）`;
+  const startBtn = document.createElement('button');
+  startBtn.type = 'button';
+  startBtn.textContent = '▶ 开始分步导览';
+  startBtn.addEventListener('click', () => activatePresentation(pres, 0));
+  head.append(title, startBtn);
+  const ol = document.createElement('ol');
+  ol.className = 'ai-pres-steps';
+  for (const s of pres.steps.slice(0, 8)) {
+    const li = document.createElement('li');
+    li.textContent = `${s.title || ''}：${s.summary || ''}`;
+    ol.appendChild(li);
+  }
+  card.append(head, ol);
+  box.appendChild(card);
+}
+
+function renderHealthCard(box, report) {
+  if (!report) return;
+  const card = document.createElement('div');
+  card.className = 'ai-health-card';
+  const head = document.createElement('div');
+  head.className = 'ai-health-head';
+  head.textContent = `🩺 画布体检 ${report.score ?? 100}/100 · ${report.summary || ''}`;
+  card.appendChild(head);
+  if (Array.isArray(report.issues) && report.issues.length) {
+    const list = document.createElement('div');
+    list.className = 'ai-health-issues';
+    for (const issue of report.issues) {
+      const row = document.createElement('div');
+      row.className = `ai-health-issue sev-${issue.severity || 'medium'}`;
+      const rowHead = document.createElement('div');
+      rowHead.style.display = 'flex';
+      rowHead.style.justifyContent = 'space-between';
+      rowHead.style.gap = '6px';
+      const title = document.createElement('strong');
+      title.textContent = issue.title || issue.id;
+      rowHead.appendChild(title);
+      if (issue.fixPrompt) {
+        const fixBtn = document.createElement('button');
+        fixBtn.type = 'button';
+        fixBtn.textContent = '一键修复';
+        fixBtn.style.height = '21px';
+        fixBtn.style.fontSize = '11px';
+        fixBtn.addEventListener('click', () => void sendPrompt(issue.fixPrompt));
+        rowHead.appendChild(fixBtn);
+      }
+      row.appendChild(rowHead);
+      if (issue.detail) {
+        const det = document.createElement('div');
+        det.style.color = '#5F5E5A';
+        det.style.marginTop = '2px';
+        det.textContent = issue.detail;
+        row.appendChild(det);
+      }
+      list.appendChild(row);
+    }
+    card.appendChild(list);
+  }
+  box.appendChild(card);
+}
+
+function renderChangesetUndo(box, changeset) {
+  if (!changeset?.id || box.querySelector('.ai-undo-btn')) return;
+  const bar = document.createElement('div');
+  bar.className = 'ai-msg-toolbar';
+  const btnUndo = document.createElement('button');
+  btnUndo.type = 'button';
+  btnUndo.className = 'ai-undo-btn';
+  btnUndo.textContent = `↶ 撤销本轮改图 (${(changeset.ops || []).join(', ') || '画布修改'})`;
+  btnUndo.addEventListener('click', async () => {
+    btnUndo.disabled = true;
+    btnUndo.textContent = '正在撤销…';
+    const projectId = state.view?.projectId;
+    let res;
+    try {
+      res = await api.aiUndoChangeset(changeset.id);
+      if (!res?.ok) throw new Error(res?.error || '撤销失败');
+    } catch (err) {
+      btnUndo.disabled = false;
+      btnUndo.textContent = `↶ 撤销本轮改图`;
+      setChatStatus(`撤销失败：${err.message || err}`, true);
+      return;
+    }
+    try {
+      await refreshAfterAiUndo(res, projectId);
+      btnUndo.textContent = '✓ 已撤销本轮 AI 改动';
+      setChatStatus(state.at ? '已撤销最新画布的改动，当前仍在回看历史' : '已回退到本轮 AI 改图前状态');
+    } catch (err) {
+      btnUndo.textContent = '已撤销，画布待刷新';
+      setChatStatus(`撤销已完成，刷新画布失败：${err.message || err}`, true);
+    }
+  });
+  bar.appendChild(btnUndo);
+  box.appendChild(bar);
+}
+
 function renderThreadMessages() {
   if (!messagesEl) return;
+  clearChainHover(state.aiHover?.nodeId); // 替换消息 DOM 不会触发旧芯片的 mouseleave。
   const th = activeThread();
   renderTelemetry(th);
   updateChatControls();
@@ -1615,18 +2025,24 @@ function renderThreadMessages() {
       const box = document.createElement('div');
       box.className = m.error ? 'ai-msg assistant error' : 'ai-msg assistant';
       if (Array.isArray(m.tools) && m.tools.length) {
-        const steps = document.createElement('div');
-        steps.className = 'ai-steps';
+        const { inv, steps } = ensureInvestigateContainer(box, null, true);
         for (const tl of m.tools) {
           finishStep(addStep(steps, tl.name), tl);
         }
-        box.appendChild(steps);
+        updateInvestigateSummary(inv, m.tools.length, false);
+      }
+      if (Array.isArray(m.subagents) && m.subagents.length) {
+        renderSubagentCards(box, m.subagents);
       }
       const txt = document.createElement('div');
       txt.className = 'ai-msg-text';
       txt.innerHTML = formatAssistantText(m.text);
       box.appendChild(txt);
       showThinking(box, txt, m.thinking, m.thinkingSeconds);
+      if (Array.isArray(m.chains) && m.chains.length) renderChainCards(box, m.chains);
+      if (m.presentation) renderPresCard(box, m.presentation);
+      if (m.healthReport) renderHealthCard(box, m.healthReport);
+      if (m.changeset) renderChangesetUndo(box, m.changeset);
       if (Array.isArray(m.questionOptions)) renderQuestion(txt, m, th);
       else renderFollowups(box, m, th);
       messagesEl.appendChild(box);
@@ -1634,6 +2050,32 @@ function renderThreadMessages() {
   }
   if (!stickToBottom) messagesEl.scrollTop = scrollTop;
   followChatScroll();
+}
+
+// 页面或流关闭时，撤销记录可能在原响应结束以后才就绪。
+async function readTurnChangeset(id, projectId) {
+  try {
+    const result = await api.aiTurnChangeset(id, projectId);
+    if (result?.ok) return result;
+  } catch { /* 保留请求编号，重开同一工程时可再次恢复。 */ }
+}
+
+async function recoverInterruptedChat(thread, projectId, gen) {
+  for (const user of thread.messages.filter(m => m.pendingTurn)) {
+    const result = await readTurnChangeset(user.pendingTurn, projectId);
+    if (gen !== chatGeneration || projectId !== chatProjectId || !chatThreads.includes(thread)) return;
+    const index = thread.messages.indexOf(user), next = thread.messages[index + 1];
+    if (!result || index < 0 || !user.pendingTurn || (next?.role === 'assistant' && !next.error)) continue;
+    delete user.pendingTurn;
+    if (!result.changeset) continue;
+    if (next?.role === 'assistant') next.changeset = result.changeset;
+    else thread.messages.splice(index + 1, 0, {
+      role: 'assistant', text: result.interrupted ? '连接已中断，可撤销本轮已应用的改动。' : '本轮已应用的改动可撤销。',
+      error: Boolean(result.interrupted), changeset: result.changeset,
+    });
+    // 加载历史时只补充本窗口的副本，保留其他窗口可能已经保存的完整回复。
+    if (thread.id === activeChatId) renderThreadMessages();
+  }
 }
 
 async function loadProjectChats({ force = false } = {}) {
@@ -1674,6 +2116,7 @@ async function loadProjectChats({ force = false } = {}) {
       }
     }
     setActiveChat(res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id);
+    for (const thread of chatThreads) void recoverInterruptedChat(thread, projectId, gen);
     renderChatBar();
     renderThreadMessages();
   } catch {
@@ -1837,6 +2280,9 @@ function syncApiForm() {
   if (reasoningEffortEl) reasoningEffortEl.value = effort;
   contextWindowEl.value = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   maxTokensEl.value = llmConfig.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (subagentEnabledEl) subagentEnabledEl.checked = llmConfig.subagentEnabled !== false;
+  if (subagentConcurrencyEl) subagentConcurrencyEl.value = String(llmConfig.subagentMaxConcurrency ?? 2);
+  if (subagentMaxStepsEl) subagentMaxStepsEl.value = String(llmConfig.subagentMaxSteps ?? 6);
   renderContextBadge();
   const configured = Boolean(llmConfig.baseUrl && llmConfig.model);
   if (setupBanner) setupBanner.hidden = configured;
@@ -1844,6 +2290,8 @@ function syncApiForm() {
 }
 
 function readApiDraft() {
+  const conc = Number(subagentConcurrencyEl?.value);
+  const subSteps = Number(subagentMaxStepsEl?.value);
   const draft = {
     baseUrl: baseUrlEl.value.trim(),
     model: modelEl.value.trim(),
@@ -1851,6 +2299,9 @@ function readApiDraft() {
     reasoningEffort: reasoningEffortEl?.value || 'default',
     contextWindow: contextWindowEl.value ? contextWindowEl.valueAsNumber : DEFAULT_CONTEXT_WINDOW,
     maxTokens: maxTokensEl.value ? maxTokensEl.valueAsNumber : DEFAULT_MAX_TOKENS,
+    subagentEnabled: subagentEnabledEl ? subagentEnabledEl.checked : true,
+    subagentMaxConcurrency: Number.isFinite(conc) ? Math.max(1, Math.min(3, Math.trunc(conc))) : 2,
+    subagentMaxSteps: Number.isFinite(subSteps) ? Math.max(2, Math.min(12, Math.trunc(subSteps))) : 6,
   };
   if (clearApiKeyPending) draft.apiKey = '';
   else if (apiKeyEl.value.trim()) draft.apiKey = apiKeyEl.value.trim();
@@ -1949,11 +2400,12 @@ function createAssistantBox() {
   if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'ai-msg assistant';
-  box.innerHTML = '<div class="ai-steps"></div><div class="ai-msg-text">正在连接模型…</div>';
+  box.innerHTML = '<details class="ai-investigate" hidden><summary>调查过程</summary><div class="ai-steps"></div></details><div class="ai-msg-text">正在连接模型…</div>';
   messagesEl.appendChild(box);
   followChatScroll();
   return {
     box,
+    investigate: box.querySelector('.ai-investigate'),
     steps: box.querySelector('.ai-steps'),
     text: box.querySelector('.ai-msg-text'),
   };
@@ -2075,9 +2527,10 @@ async function saveViewBookmark(name) {
 }
 
 async function sendPrompt(rawText, uiContext = currentUiContext()) {
-  const text = String(rawText ?? inputEl.value).trim();
-  if (!text) return;
-  if (text === '/new' || text === '/clear') {
+  const rawInput = String(rawText ?? inputEl.value).trim();
+  if (!rawInput) return;
+  closeSlashMenu();
+  if (rawInput === '/new' || rawInput === '/clear') {
     pendingSteer = null;
     inputEl.value = '';
     if (await ensureChatProject()) {
@@ -2086,7 +2539,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     return;
   }
-  if (text === '/compact') {
+  if (rawInput === '/compact') {
     if (activeAbort || compacting) {
       setChatStatus('请等待当前生成结束后再压缩上下文');
       return;
@@ -2096,13 +2549,34 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     return;
   }
   if (compacting) return;
-  if (text === BOOKMARK_COMMAND || text.startsWith(BOOKMARK_COMMAND + ' ')) {
+  if (rawInput === BOOKMARK_COMMAND || rawInput.startsWith(BOOKMARK_COMMAND + ' ')) {
     if (activeAbort) {
       setChatStatus('请等待当前生成结束后再保存书签');
       return;
     }
-    await saveViewBookmark(text.slice(BOOKMARK_COMMAND.length).trim());
+    await saveViewBookmark(rawInput.slice(BOOKMARK_COMMAND.length).trim());
     return;
+  }
+  let text = rawInput;
+  const slashMatch = /^\/(present|check|flow|impact|subagent|git|labels)(?:\s+([\s\S]*))?$/i.exec(rawInput);
+  if (slashMatch) {
+    const cmd = slashMatch[1].toLowerCase();
+    const rest = (slashMatch[2] || '').trim();
+    if (cmd === 'check') {
+      text = rest ? `请先调用 diagnose_canvas 体检当前画布，并处理：${rest}` : '请调用 diagnose_canvas 对当前画布做全面体检，汇总问题并给出可执行的修复建议。';
+    } else if (cmd === 'present') {
+      text = `请调用 present_logic 智能呈现并分步导览：${rest || '围绕当前上下文或画布核心逻辑切片调用链与共享变量'}`;
+    } else if (cmd === 'flow') {
+      text = `请调用 inspect_dataflow 分析数据流与变量读写关系：${rest || '当前所选节点或两点'}`;
+    } else if (cmd === 'impact') {
+      text = `请优先调用 get_git_changes 与 trace_upstream 评估改动影响与调用分支：${rest || '当前工程未提交改动'}`;
+    } else if (cmd === 'subagent') {
+      text = `请调用 run_subagent 派发并行只读子调查核实以下内容并汇总结果：${rest || '并行核实当前相关调用分支与数据流'}`;
+    } else if (cmd === 'git') {
+      text = rest || GIT_QUICK_PROMPT;
+    } else if (cmd === 'labels') {
+      text = rest || LABELS_QUICK_PROMPT;
+    }
   }
   if (activeAbort) {
     pendingSteer = {
@@ -2132,7 +2606,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const turnMessages = thread.messages;
 
   if (!thread.customTitle && thread.title === NEW_THREAD_TITLE) {
-    thread.title = deriveThreadTitle(text) || NEW_THREAD_TITLE;
+    thread.title = deriveThreadTitle(rawInput) || NEW_THREAD_TITLE;
   }
   const historySnapshot = chatHistory(turnMessages);
 
@@ -2157,20 +2631,22 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   }));
   renderAttachments();
   const selectionSummary = summarizeUiContext(uiContext);
-  thread.messages.push({
-    role: 'user',
-    text,
+  const turnId = crypto.randomUUID();
+  const userEntry = {
+    role: 'user', pendingTurn: turnId,
+    text: rawInput,
     ...(selectionSummary ? { selectionSummary } : {}),
     ...(images.length ? { attachedImages: images } : {}),
     ...(attachments.length ? { attachedFiles: attachments } : {}),
-  });
+  };
+  thread.messages.push(userEntry);
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
 
   inputEl.value = '';
   stickToBottom = true;
-  appendUserMessage(text, images, attachments);
+  appendUserMessage(rawInput, images, attachments);
   const ui = createAssistantBox();
   const controller = new AbortController();
   activeAbort = controller;
@@ -2187,6 +2663,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let streamedText = '';
   let metrics;
   const collectedTools = [];
+  const collectedSubagents = [];
+  const collectedChains = [];
+  let collectedPresentation = null;
+  let collectedHealthReport = null;
+  let collectedChangeset = null;
   let dirtyText = false;
   let dirtyThinking = false;
   let dirtyMetrics = false;
@@ -2235,7 +2716,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     const wait = Math.max(16, 48 - (performance.now() - lastPaintAt));
     paintTimer = setTimeout(() => flushStreamPaint(false), wait);
   };
-  activeStreamFlush = () => flushStreamPaint(true);
+  const flushThisStream = () => flushStreamPaint(true);
+  activeStreamFlush = flushThisStream;
   const stopThinking = () => {
     dirtyThinking = false;
     if (thinkingSince !== null) {
@@ -2270,31 +2752,39 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     pendingSteer && pendingSteer.threadId === threadId &&
     pendingSteer.projectId === myProjectId && pendingSteer.gen === myGen
   );
+  const recoverDisconnected = async () => {
+    if (!isCurrent()) return;
+    if (collectedChangeset) { delete userEntry.pendingTurn; return; }
+    const recovered = await readTurnChangeset(turnId, myProjectId);
+    if (recovered !== undefined && isCurrent()) {
+      delete userEntry.pendingTurn;
+      collectedChangeset = recovered.changeset;
+    }
+  };
   const finishInterrupted = (message, stopped = false) => {
+    if (!isCurrent()) return;
     stopThinking();
     for (const { row, name } of pendingSteps) {
       finishStep(row, { name, ok: false, summary: '执行中断' });
     }
     const steeringNow = stopped && isSteerQueuedForThisTurn();
-    if (collectedTools.length || streamedText) {
-      ui.text.innerHTML = formatAssistantText(streamedText);
-      commitAssistantMsg({ text: streamedText });
-    } else if (steeringNow) {
+    if (!collectedChangeset && !collectedTools.length && !streamedText && steeringNow) {
       // 中途引导且本轮尚未产生工具结果或正文时，直接移除空占位，避免插入多余报错气泡。
       ui.box.remove();
       return;
-    } else {
-      ui.box.classList.toggle('error', !stopped);
-      ui.text.textContent = message;
-      commitAssistantMsg({ text: message, error: true });
     }
+    const text = [streamedText, message].filter(Boolean).join('\n\n');
+    ui.box.classList.toggle('error', !stopped);
+    ui.text.innerHTML = formatAssistantText(text);
+    if (collectedChangeset) renderChangesetUndo(ui.box, collectedChangeset);
+    commitAssistantMsg({ text, error: true, ...(collectedChangeset && { changeset: collectedChangeset }) });
     if (isVisible()) {
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
       if (!steeringNow && (collectedTools.length || streamedText)) setChatStatus(message, !stopped);
     }
   };
   const handleLine = (line) => {
-    if (terminalReceived || !line.trim()) return;
+    if (!isCurrent() || terminalReceived || !line.trim()) return;
     let ev;
     try { ev = JSON.parse(line); } catch { return; }
     if (ev.type === 'status') {
@@ -2327,24 +2817,84 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       scheduleStreamPaint();
     } else if (ev.type === 'tool_start') {
       if (thinkingSince !== null) stopThinking();
+      if (ui.investigate) { ui.investigate.hidden = false; ui.investigate.open = true; }
       const argBrief = ev.arguments && Object.keys(ev.arguments).length
         ? `(${JSON.stringify(ev.arguments).slice(0, 80)})` : '';
-      pendingSteps.push({ name: ev.name, row: addStep(ui.steps, `${ev.name}${argBrief}…`) });
+      pendingSteps.push({ callId: ev.callId, name: ev.name, row: addStep(ui.steps, `${ev.name}${argBrief}…`) });
+      updateInvestigateSummary(ui.investigate, collectedTools.length + pendingSteps.length, true);
       dirtyScroll = true;
       scheduleStreamPaint();
     } else if (ev.type === 'tool_end') {
       const tool = { name: ev.name, ok: ev.ok !== false, ...(ev.blocked ? { blocked: true } : {}), summary: ev.summary || '', digest: ev.digest || '' };
       collectedTools.push(tool);
-      const index = pendingSteps.findIndex((step) => step.name === tool.name);
+      const index = ev.callId
+        ? pendingSteps.findIndex((step) => step.callId === ev.callId)
+        : pendingSteps.findIndex((step) => step.name === tool.name);
       const row = index >= 0 ? pendingSteps.splice(index, 1)[0].row : addStep(ui.steps, tool.name);
       finishStep(row, tool);
+      updateInvestigateSummary(ui.investigate, collectedTools.length, pendingSteps.length > 0);
       dirtyScroll = true;
       scheduleStreamPaint();
+    } else if (ev.type === 'subagent_start') {
+      collectedSubagents.push({ id: ev.id, title: ev.title, running: true, steps: 0, summary: '' });
+      renderSubagentCards(ui.box, collectedSubagents, ui.text);
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'subagent_progress') {
+      const sa = collectedSubagents.find((s) => s.id === ev.id);
+      if (sa) {
+        sa.steps = (sa.steps || 0) + 1;
+        sa.lastTool = ev.tool;
+        sa.lastSummary = ev.summary;
+        renderSubagentCards(ui.box, collectedSubagents, ui.text);
+      }
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'subagent_end') {
+      const sa = collectedSubagents.find((s) => s.id === ev.id);
+      if (sa) {
+        sa.running = false;
+        sa.ok = ev.ok !== false;
+        sa.summary = ev.summary || '';
+        sa.steps = ev.steps ?? sa.steps;
+        renderSubagentCards(ui.box, collectedSubagents, ui.text);
+      }
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'chains' && Array.isArray(ev.chains)) {
+      for (const ch of ev.chains) {
+        if (ch && !collectedChains.some((x) => x.id === ch.id)) collectedChains.push(ch);
+      }
+      renderChainCards(ui.box, ev.chains);
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'presentation' && ev.presentation) {
+      collectedPresentation = ev.presentation;
+      renderPresCard(ui.box, ev.presentation);
+      activatePresentation(ev.presentation, 0);
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'health_report' && ev.report) {
+      collectedHealthReport = ev.report;
+      renderHealthCard(ui.box, ev.report);
+      dirtyScroll = true;
+      scheduleStreamPaint();
+    } else if (ev.type === 'canvas_overlay') {
+      state.aiOverlay = ev.action === 'clear' ? null : {
+        action: ev.action || 'highlight',
+        nodeIds: ev.nodeIds || [],
+        edgeKeys: ev.edgeKeys || [],
+        label: ev.label,
+      };
+      draw();
+    } else if (ev.type === 'changeset' && ev.changesetId) {
+      collectedChangeset = { id: ev.changesetId, ops: ev.ops || [] };
     } else if (ev.type === 'metrics') {
       metrics = ev;
       dirtyMetrics = true;
       scheduleStreamPaint();
     } else if (ev.type === 'done' || ev.type === 'question') {
+      delete userEntry.pendingTurn;
       terminalReceived = true;
       flushStreamPaint(true);
       if (ev.thinking) {
@@ -2353,10 +2903,26 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       }
       metrics = ev.metrics || metrics;
       stopThinking();
+      if (ui.investigate) {
+        ui.investigate.open = false;
+        updateInvestigateSummary(ui.investigate, collectedTools.length || ev.toolLog?.length || 0, false);
+        ui.investigate.hidden = !(collectedTools.length || ev.toolLog?.length);
+      }
       const entry = {};
       if (Array.isArray(ev.toolLog) && ev.toolLog.length) {
         entry.tools = ev.toolLog.map(({ name, ok, blocked, summary, digest }) => ({ name, ok, ...(blocked ? { blocked: true } : {}), summary, digest }));
       }
+      const finalChains = Array.isArray(ev.chains) && ev.chains.length ? ev.chains : collectedChains;
+      if (finalChains.length) entry.chains = finalChains;
+      const finalPres = ev.presentation || collectedPresentation;
+      if (finalPres) entry.presentation = finalPres;
+      const finalHealth = ev.healthReport || collectedHealthReport;
+      if (finalHealth) entry.healthReport = finalHealth;
+      const finalSubagents = Array.isArray(ev.subagents) && ev.subagents.length ? ev.subagents : collectedSubagents;
+      if (finalSubagents.length) entry.subagents = finalSubagents.map(({ id, title, ok, summary, steps }) => ({ id, title, ok: ok !== false, summary, steps }));
+      const finalChangeset = ev.changeset || collectedChangeset;
+      if (finalChangeset?.id) entry.changeset = finalChangeset;
+
       if (ev.type === 'question' || ev.awaitingUser) {
         entry.text = ev.question || '请确认以下选项：';
         entry.questionOptions = Array.isArray(ev.options) ? ev.options : [];
@@ -2368,6 +2934,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         if (suggestions.length) entry.suggestions = suggestions;
       }
       ui.text.innerHTML = formatAssistantText(entry.text);
+      if (finalChangeset?.id) renderChangesetUndo(ui.box, finalChangeset);
       const saved = commitAssistantMsg(entry);
       if (saved && isVisible()) {
         if (!messagesEl.contains(ui.box)) renderThreadMessages();
@@ -2376,6 +2943,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         followChatScroll();
       }
     } else if (ev.type === 'error') {
+      delete userEntry.pendingTurn;
+      collectedChangeset = ev.changeset || collectedChangeset;
       terminalReceived = true;
       flushStreamPaint(true);
       finishInterrupted(ev.error || '执行失败');
@@ -2387,7 +2956,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let reader;
   try {
     const res = await api.aiChat({
-      prompt: text,
+      turnId, prompt: text,
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -2400,6 +2969,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
+    if (isCurrent()) consumeUnpinnedStagedSelections(uiContext);
     reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -2415,9 +2985,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     buffer += decoder.decode();
     if (buffer.trim()) handleLine(buffer);
-    if (!terminalReceived) finishInterrupted('连接提前中断，可以继续对话或重试。');
+    if (!terminalReceived) {
+      await recoverDisconnected();
+      finishInterrupted('连接提前中断，可以继续对话或重试。');
+    }
   } catch (err) {
     if (!terminalReceived) {
+      await recoverDisconnected();
       const stopped = err.name === 'AbortError';
       finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
     }
@@ -2426,7 +3000,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       clearTimeout(paintTimer);
       paintTimer = 0;
     }
-    activeStreamFlush = null;
+    if (activeStreamFlush === flushThisStream) activeStreamFlush = null;
     clearTimeout(streamTimer);
     if (reader) {
       void reader.cancel().catch(() => {});
@@ -2479,6 +3053,7 @@ document.addEventListener('cg:pair-flow-cleared', ({ detail: ids }) => {
 document.addEventListener('cg:ask-ai', async (event) => {
   const { prompt, ...selection } = event.detail || {};
   setCanvasSelection(selection, true);
+  if (selection?.kind) pinSelectionSnapshot(selection, { quiet: true });
   const uiContext = currentUiContext();
   const projectId = state.view?.projectId;
   const configLoad = showDrawer();
@@ -2493,6 +3068,205 @@ document.addEventListener('cg:ask-ai', async (event) => {
     await sendPrompt(prompt, uiContext);
   }
 });
+if (relationBarEl) {
+  relationBarEl.addEventListener('click', (e) => {
+    const btn = e.target?.closest?.('.ai-rel-btn[data-ai-rel]');
+    if (!btn) return;
+    selectedRelationIntent = btn.dataset.aiRel || 'auto';
+    renderSelectionBar();
+  });
+}
+
+function hideBookmarkBanner() {
+  pendingBookmarkSwitch = null;
+  if (bookmarkBannerEl) bookmarkBannerEl.hidden = true;
+}
+
+const seenBookmarkEvents = new WeakSet();
+function handleBookmarkChanged(e) {
+  if (!e || seenBookmarkEvents.has(e)) return;
+  seenBookmarkEvents.add(e);
+  const bm = e.detail?.bookmark || null;
+  if (!bm?.id || !chatThreads.length) {
+    hideBookmarkBanner();
+    return;
+  }
+  const th = activeThread();
+  if (!th.messages.length) {
+    th.bookmarkId = bm.id;
+    th.bookmarkName = bm.name || '';
+    hideBookmarkBanner();
+    persistChats();
+    return;
+  }
+  if (th.bookmarkId === bm.id) {
+    hideBookmarkBanner();
+    return;
+  }
+  pendingBookmarkSwitch = bm;
+  if (bookmarkBannerEl && bookmarkBannerTextEl) {
+    bookmarkBannerTextEl.textContent = `书签已切至「${bm.name}」，可开启书签专属对话或继续当前线程`;
+    bookmarkBannerEl.hidden = false;
+  }
+}
+document.addEventListener('cg:bookmark-changed', handleBookmarkChanged);
+window.addEventListener('cg:bookmark-changed', handleBookmarkChanged);
+
+if (bookmarkNewChatBtn) {
+  bookmarkNewChatBtn.addEventListener('click', () => {
+    const bm = pendingBookmarkSwitch || state.activeBookmark;
+    hideBookmarkBanner();
+    startNewThread();
+    const th = activeThread();
+    if (bm?.id) {
+      th.bookmarkId = bm.id;
+      th.bookmarkName = bm.name || '';
+      persistChats();
+    }
+  });
+}
+if (bookmarkBindChatBtn) {
+  bookmarkBindChatBtn.addEventListener('click', () => {
+    const bm = pendingBookmarkSwitch || state.activeBookmark;
+    const th = activeThread();
+    if (bm?.id) {
+      th.bookmarkId = bm.id;
+      th.bookmarkName = bm.name || '';
+      persistChats();
+    }
+    hideBookmarkBanner();
+  });
+}
+if (bookmarkDismissBtn) bookmarkDismissBtn.addEventListener('click', hideBookmarkBanner);
+
+if (presPrevBtn) presPrevBtn.addEventListener('click', () => {
+  if (state.presentation) activatePresentation(state.presentation, (state.presentation.activeIndex || 0) - 1);
+});
+if (presNextBtn) presNextBtn.addEventListener('click', () => {
+  if (state.presentation) activatePresentation(state.presentation, (state.presentation.activeIndex || 0) + 1);
+});
+if (presCloseBtn) presCloseBtn.addEventListener('click', () => activatePresentation(null));
+document.addEventListener('cg:ai-overlay-cleared', () => syncPresentationHud());
+
+const SLASH_COMMANDS = [
+  { cmd: '/present', desc: '按调用层切片呈现逻辑并开启分步导览', fill: '/present ' },
+  { cmd: '/check', desc: '体检当前画布（漏标/间接调用/孤立/重叠）', run: true, prompt: '/check' },
+  { cmd: '/flow', desc: '追踪共享变量或两点间的跨函数读写数据流', fill: '/flow ' },
+  { cmd: '/impact', desc: '追踪 Git 改动与上游车型分支影响范围', fill: '/impact ' },
+  { cmd: '/subagent', desc: '派发并行只读子调查深挖复杂分支', fill: '/subagent ' },
+  { cmd: '/git', desc: '拉取当前 Git 改动并按模块拆分/上图', run: true, prompt: '/git' },
+  { cmd: '/labels', desc: '自动补全画布 TASK 周期与 コール順 标签', run: true, prompt: '/labels' },
+  { cmd: '/compact', desc: '压缩早期对话以释放上下文空间', run: true, prompt: '/compact' },
+  { cmd: '/new', desc: '开启一条新的空白对话', run: true, prompt: '/new' },
+];
+
+function closeSlashMenu() {
+  slashMenuState = { open: false, mode: '', items: [], activeIndex: 0, triggerStart: 0 };
+  if (slashMenuEl) {
+    slashMenuEl.hidden = true;
+    slashMenuEl.replaceChildren();
+  }
+}
+
+function renderSlashMenu() {
+  if (!slashMenuEl) return;
+  if (!slashMenuState.open || !slashMenuState.items.length) {
+    closeSlashMenu();
+    return;
+  }
+  slashMenuEl.replaceChildren();
+  slashMenuState.items.forEach((item, idx) => {
+    const btnItem = document.createElement('button');
+    btnItem.type = 'button';
+    btnItem.className = idx === slashMenuState.activeIndex ? 'ai-slash-item active' : 'ai-slash-item';
+    btnItem.setAttribute('role', 'option');
+    btnItem.setAttribute('aria-selected', String(idx === slashMenuState.activeIndex));
+    const left = document.createElement('strong');
+    left.textContent = item.label || item.cmd;
+    const right = document.createElement('small');
+    right.textContent = item.desc || item.meta || '';
+    btnItem.append(left, right);
+    btnItem.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      applySlashMenuItem(item);
+    });
+    slashMenuEl.appendChild(btnItem);
+  });
+  slashMenuEl.hidden = false;
+}
+
+function applySlashMenuItem(item) {
+  if (!item || !inputEl) return;
+  if (slashMenuState.mode === 'slash') {
+    closeSlashMenu();
+    if (item.run) {
+      inputEl.value = '';
+      void sendPrompt(item.prompt);
+      return;
+    }
+    const val = item.fill || `${item.cmd} `;
+    inputEl.value = val;
+    inputEl.focus();
+    inputEl.setSelectionRange(val.length, val.length);
+    syncInputSuggestion();
+    return;
+  }
+  // '@' 符号插入 + 自动附着上下文
+  const val = inputEl.value;
+  const start = slashMenuState.triggerStart;
+  const cursor = inputEl.selectionStart ?? val.length;
+  const before = val.slice(0, start);
+  const after = val.slice(cursor);
+  const inserted = `${item.id} `;
+  inputEl.value = before + inserted + after;
+  const nextPos = before.length + inserted.length;
+  inputEl.focus();
+  inputEl.setSelectionRange(nextPos, nextPos);
+  if (item.node) {
+    pinSelectionSnapshot({
+      kind: 'node',
+      id: item.node.id,
+      name: item.node.name,
+      nodeKind: item.node.kind === 'var' ? 'var' : 'fn',
+      file: item.node.file || '',
+      line: item.node.line || 0,
+    }, { quiet: true });
+  }
+  closeSlashMenu();
+  syncInputSuggestion();
+}
+
+function updateAutocompletePopover() {
+  if (!inputEl || !slashMenuEl) return;
+  const val = inputEl.value;
+  const cursor = inputEl.selectionStart ?? val.length;
+  const prefix = val.slice(0, cursor);
+  if (prefix.startsWith('/') && !/\s/.test(prefix)) {
+    const q = prefix.toLowerCase();
+    const matches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(q));
+    if (matches.length) {
+      slashMenuState = { open: true, mode: 'slash', items: matches, activeIndex: 0, triggerStart: 0 };
+      renderSlashMenu();
+      return;
+    }
+  }
+  const atMatch = /(?:^|\s)(@[A-Za-z0-9_.:/-]*)$/.exec(prefix);
+  if (atMatch) {
+    const q = atMatch[1].slice(1).toLowerCase();
+    const triggerStart = prefix.length - atMatch[1].length;
+    const nodes = state.view?.nodes || [];
+    const items = nodes
+      .filter((n) => !q || String(n.name || '').toLowerCase().includes(q) || String(n.id || '').toLowerCase().includes(q))
+      .slice(0, 8)
+      .map((n) => ({ id: n.id, label: `@${n.name || n.id}`, meta: n.file || n.id, node: n }));
+    if (items.length) {
+      slashMenuState = { open: true, mode: 'at', items, activeIndex: 0, triggerStart };
+      renderSlashMenu();
+      return;
+    }
+  }
+  closeSlashMenu();
+}
 if (pinSelectionBtn) pinSelectionBtn.addEventListener('click', pinCurrentSelection);
 if (trunkSelectEl) {
   trunkSelectEl.addEventListener('change', () => selectTrunkBranchAt(Number(trunkSelectEl.value)));
@@ -2587,6 +3361,10 @@ messagesEl.addEventListener('scroll', () => {
 
 // 切换工程时自动隔离并切换到目标工程的独立对话列表
 document.addEventListener('cg:project-changed', () => {
+  state.aiHover = null;
+  stopCamAnim();
+  activatePresentation(null);
+  messagesEl.innerHTML = EMPTY_CHAT_HTML;
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
   pinnedSelections.length = 0;
@@ -2731,8 +3509,45 @@ if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
   void saveQuickConfig({ reasoningEffort: val }, `已切换思考强度：${REASONING_LABELS.get(val) || val}`);
 });
 if (inputEl) {
-  inputEl.addEventListener('input', syncInputSuggestion);
+  inputEl.addEventListener('input', () => {
+    syncInputSuggestion();
+    updateAutocompletePopover();
+  });
   inputEl.addEventListener('keydown', (e) => {
+    if (slashMenuState.open && slashMenuState.items.length) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        slashMenuState.activeIndex = (slashMenuState.activeIndex + 1) % slashMenuState.items.length;
+        renderSlashMenu();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        slashMenuState.activeIndex = (slashMenuState.activeIndex - 1 + slashMenuState.items.length) % slashMenuState.items.length;
+        renderSlashMenu();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeSlashMenu();
+        return;
+      }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        if (!e.isComposing) {
+          e.preventDefault();
+          applySlashMenuItem(slashMenuState.items[slashMenuState.activeIndex]);
+          return;
+        }
+      }
+    }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'a') {
+      if (canvasSelection) {
+        e.preventDefault();
+        pinCurrentSelection();
+      }
+      return;
+    }
     if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing && !inputEl.value && currentGhostSuggestion) {
       e.preventDefault();
       acceptGhostSuggestion();

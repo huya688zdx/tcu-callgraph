@@ -1,4 +1,4 @@
-import { children, initializer, typeOf, unwrap, walk } from './clang-ast.js';
+import { children, evaluatedChildren, initializer, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 import { emptyDataflow } from './ir.js';
 
 export function collectDataflow(units, records, defs, resolveVariable, callTargets) {
@@ -69,7 +69,7 @@ export function collectDataflow(units, records, defs, resolveVariable, callTarge
   }
 
   const accesses = records.map((record) => ({
-    ...record, nodes: [...walk(record.body)].filter((n) =>
+    ...record, nodes: [...walkEvaluated(record.body)].filter((n) =>
       n.kind === 'VarDecl' || n.kind === 'CallExpr' || (n.kind === 'BinaryOperator' && n.opcode === '=')),
   }));
   const params = new Map(records.map((r) => [r, children(r.node).filter((n) => n.kind === 'ParmVarDecl')]));
@@ -149,7 +149,7 @@ export function collectDataflow(units, records, defs, resolveVariable, callTarge
         // 下标和用来寻址的指针本身仍会被读取。
         visitAddressing(node);
       } else {
-        for (const child of children(node)) visit(child);
+        for (const child of evaluatedChildren(node)) visit(child);
         for (const child of node.array_filler || []) visit(child);
         if (kind === 'CallExpr' && !callTargets.get(node)?.length) {
           // 外部函数可能通过实参访问对象，保留保守的潜在读写。

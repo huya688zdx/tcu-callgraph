@@ -1,4 +1,4 @@
-import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
+import { isDataEdge, svgEdgeStroke } from '../../web/lib/edge-flow.js';
 /**
  * 服务端 SVG 导出：与 web/lib/svg.js 的画布样式保持一致。
  *
@@ -11,7 +11,17 @@ import { isDataEdge, svgMarkers } from '../../web/lib/edge-flow.js';
  * 所以 MCP / HTTP 导出的图与界面上看到的是同一份布局。
  */
 import { roundedPathD } from './routing.js';
-import { deletedEdgeMarkSvg, displayEdgeLabels, placeEdgeLabels, labelBoxSize, estimateTextWidth, labelSvg } from './labels.js';
+import {
+  deletedEdgeMarkSvg,
+  displayEdgeLabels,
+  placeEdgeLabels,
+  viewHeaderObstacles,
+  orderLabeledEdges,
+  labelBoxSize,
+  estimateTextWidth,
+  labelSvg,
+} from './labels.js';
+import { boundsMeet, routeBounds } from './routing.js';
 import { canvasPeriodBadge, periodBadgeSvg, periodContainerStyle, periodSubtitle } from '../../web/lib/period-text.js';
 
 export function layoutExportEdgeLabels(view) {
@@ -19,16 +29,24 @@ export function layoutExportEdgeLabels(view) {
   const occupied = [];
   const nodes = view.nodes || [];
   const edges = view.edges || [];
+  const headers = viewHeaderObstacles(view);
+  const labeled = [];
   for (const e of edges) {
     const rawLabels = e.labels?.length ? e.labels : e.label ? [e.label] : [];
     const labels = displayEdgeLabels(e, rawLabels, view);
-    if (!labels.length) continue;
+    if (labels.length) labeled.push({ e, labels });
+  }
+  const paths = labeled.length ? edges.map((edge) => ({ edge, bounds: routeBounds(edge.points) })) : [];
+  for (const { e, labels } of orderLabeledEdges(labeled)) {
+    const bounds = routeBounds(e.points);
     const rects = placeEdgeLabels({
       items: labels.map(label => ({ label, size: labelBoxSize(label, estimateTextWidth) })),
       pts: e.points || [],
       nodes,
+      headers,
       others: occupied,
-      otherPaths: edges.filter(other => other !== e).map(other => other.points || []),
+      otherPaths: paths.filter((other) => other.edge !== e && boundsMeet(bounds, other.bounds, 120))
+        .map(({ edge }) => edge.points || []),
     });
     labels.forEach((label, i) => {
       const rect = rects[i];
@@ -179,10 +197,7 @@ export function exportSvg(view, { title = '' } = {}) {
     const d = roundedPathD(e.points, 7);
     const style = e.change === 'added' ? 'added' : isDataEdge(e) ? 'var' : 'direct';
     const c = COLORS[style];
-    const dash = isDataEdge(e) ? ' stroke-dasharray="7 4"' : '';
-    out.push(
-      `<path d="${esc(d)}" fill="none" stroke="${c}" stroke-width="1.3"${dash}${svgMarkers(e, `mk-${style}`)} data-from="${esc(e.from)}" data-to="${esc(e.to)}"/>`
-    );
+    out.push(svgEdgeStroke(e, esc(d), c, 1.3, `mk-${style}`, `data-from="${esc(e.from)}" data-to="${esc(e.to)}"`));
     if (e.change === 'deleted') out.push(deletedEdgeMarkSvg(e.points, c));
   }
 
