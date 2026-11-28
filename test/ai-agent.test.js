@@ -3402,3 +3402,58 @@ test('浏览器在 AI 提问卡片中撤销已保存的书签', async t => {
   assert.ok(!(await list()).some(b => b.name === name));
   assert.ok(await br.evaluate("!document.querySelector('.ai-question-opts button').disabled"));
 });
+
+test('中断已落盘的助手改图仍可撤销，安全重试和只读模式隔离工程与会话', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  let release;
+  let reachedWrite;
+  const atWrite = new Promise(resolve => { reachedWrite = resolve; });
+  const hold = new Promise(resolve => { release = resolve; });
+  let pause = true;
+  const { post, run } = await mockAiTurn(t, srv.baseUrl, async last => {
+    if (last.role !== 'tool') return [['manage_bookmarks', { action: 'save', name: '恢复验证' }]];
+    if (pause) { reachedWrite(); await hold; }
+    return [];
+  });
+  const turn = { turnId: 'interrupted-write', threadId: 'work' };
+  const payload = { ...turn, prompt: '请将当前视图保存为书签' };
+  const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+  const status = opts => post('/api/ai/turn-status', opts).then(r => r.json());
+  const bookmarks = () => get('/api/bookmarks').then(result => result.list);
+  const original = await bookmarks();
+  const controller = new AbortController();
+  const res = await fetch(srv.baseUrl + '/api/ai/chat', { method: 'POST', signal: controller.signal,
+    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  assert.equal(res.status, 200);
+  await atWrite;
+  assert.equal((await status(turn)).state, 'running');
+  controller.abort();
+  release();
+  pause = false;
+  let result;
+  for (let i = 0; i < 30; i++) {
+    result = await status(turn);
+    if (result.state === 'settled') break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(result.changeset?.id);
+  assert.equal(result.canRetry, false);
+  assert.deepEqual(await status({ ...turn, threadId: 'another' }), { state: 'unknown', canRetry: false });
+  const repeat = await post('/api/ai/chat', { ...payload, retryOf: turn.turnId, turnId: 'retry-after-change' });
+  assert.equal(repeat.status, 409);
+  const read = { turnId: 'readonly-inspection', threadId: 'work', accessMode: 'read' };
+  const events = await run(payload.prompt, read);
+  assert.ok(events.some(ev => ev.type === 'tool_end' && ev.blocked));
+  assert.equal((await status(read)).canRetry, true);
+  assert.equal((await bookmarks()).length, original.length + 1);
+  assert.ok((await (await post('/api/ai/undo-changeset', { changesetId: result.changeset.id })).json()).ok);
+  assert.deepEqual(await bookmarks(), original);
+  await run(payload.prompt, { ...read, turnId: 'readonly-replayed', retryOf: read.turnId });
+  assert.equal((await status(read)).canRetry, false);
+  assert.equal((await post('/api/ai/chat', { ...payload, ...read })).status, 409);
+  const switched = await post('/api/switch', { path: path.resolve('samples/deep') });
+  assert.equal(switched.status, 200);
+  assert.deepEqual(await status(turn), { state: 'unknown', canRetry: false });
+  assert.equal((await post('/api/ai/undo-changeset', { changesetId: result.changeset.id })).status, 404);
+});

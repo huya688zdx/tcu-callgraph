@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createTurnRegistry } from './core/ai-turns.js';
 import { randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +27,7 @@ import { createMcpServer } from './mcp.js';
 import {
   DEFAULT_AI_CONFIG,
   SUBAGENT_READONLY_TOOLS,
+  isReadOnlyAiTool,
   compactConversation,
   listModels as listAiModels,
   normalizeAiConfig,
@@ -295,6 +297,7 @@ function sameSavedCanvas(a, b) {
     isDeepStrictEqual(a.inferredEdges, b.inferredEdges);
 }
 
+const aiTurns = createTurnRegistry();
 const aiChangesets = new Map();
 function saveAiChangeset(entry) {
   if (!entry?.id) return;
@@ -2731,6 +2734,21 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (u.pathname === '/api/ai/turn-status' && req.method === 'POST') {
+      if (!guardWrite(req, res)) return;
+      let p;
+      try { p = await readJson(req, res); } catch { return; }
+      if (!currentSession(req)) return sessionConflict(res);
+      const turn = aiTurns.lookup(p.turnId, { projectId: PROJECT.id, sessionRevision, threadId: p.threadId });
+      if (!turn) return json(res, { state: 'unknown', canRetry: false });
+      const change = turn.changesetId && aiChangesets.get(turn.changesetId);
+      return json(res, {
+        state: turn.settled ? 'settled' : 'running',
+        canRetry: aiTurns.canRetry(turn),
+        writeStarted: turn.writeStarted,
+        ...(change && turn.settled ? { changeset: { id: change.id, ops: change.ops } } : {}),
+      });
+    }
     if (u.pathname === '/api/ai/undo-changeset' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       let p;
@@ -2892,6 +2910,10 @@ export const server = http.createServer(async (req, res) => {
               return {
                 role: m.role,
                 text: String(m.text || '').slice(0, 8000),
+                ...(m.role === 'user' && /^[\w-]{12,80}$/.test(m.pendingTurn?.turnId || '') ? { pendingTurn: {
+                  turnId: m.pendingTurn.turnId, mode: m.pendingTurn.mode === 'read' ? 'read' : 'edit',
+                  hasContext: Boolean(m.pendingTurn.hasContext),
+                } } : {}),
                 ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                   ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
                 ...(m.role === 'user' && Array.isArray(m.attachedFiles) ? { attachedFiles: m.attachedFiles } : {}),
@@ -2901,6 +2923,12 @@ export const server = http.createServer(async (req, res) => {
                 ...(healthReport ? { healthReport } : {}),
                 ...(subagents.length ? { subagents } : {}),
                 ...(changeset ? { changeset } : {}),
+                ...(m.role === 'assistant' && typeof m.recovery?.turnId === 'string' ? { recovery: {
+                  turnId: m.recovery.turnId.slice(0, 80),
+                  mode: m.recovery.mode === 'read' ? 'read' : 'edit',
+                  state: ['safe', 'changed', 'unknown'].includes(m.recovery.state) ? m.recovery.state : 'unknown',
+                  hasContext: Boolean(m.recovery.hasContext),
+                } } : {}),
                 ...(m.role === 'assistant' && m.completed ? { completed: true } : {}),
                 ...(typeof m.thinking === 'string' && m.thinking ? { thinking: m.thinking.slice(0, 4000) } : {}),
                 ...(Array.isArray(m.tools) && m.tools.length ? {
@@ -2997,6 +3025,14 @@ export const server = http.createServer(async (req, res) => {
       try { cfg = normalizeAiConfig(p.config || {}, saved, tr); } catch (err) { return bad(res, err.message); }
       const prompt = String(p.prompt || '').trim();
       if (!prompt) return bad(res, tr('noPrompt'));
+      const accessMode = p.accessMode ?? 'edit';
+      if (!['read', 'edit'].includes(accessMode)) return bad(res, tr('turn.mode'));
+      const scope = { projectId: PROJECT.id, sessionRevision, threadId: p.threadId };
+      for (const field of ['turnId', 'retryOf']) {
+        if (p[field] !== undefined && (typeof p[field] !== 'string' || !/^[\w-]{12,80}$/.test(p[field]))) return bad(res, tr('turn.invalid'));
+      }
+      if ((p.retryOf && !p.turnId) || (p.turnId && (typeof p.threadId !== 'string' ||
+          !p.threadId.length || p.threadId.length > 64))) return bad(res, tr('turn.invalid'));
       const images = [];
       for (const item of Array.isArray(p.images) ? p.images : []) {
         const dataUrl = typeof item === 'string' ? item : item?.dataUrl;
@@ -3015,6 +3051,8 @@ export const server = http.createServer(async (req, res) => {
       if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
       const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
       let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
+      const turn = p.turnId && aiTurns.begin(p.turnId, scope, accessMode, p.retryOf);
+      if (p.turnId && !turn) return json(res, { ok: false, error: tr('turn.invalid') }, 409);
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -4006,6 +4044,16 @@ export const server = http.createServer(async (req, res) => {
         return turnChangeset;
       };
 
+      const registerCommittedChange = () => {
+        if (!turnChangeset.canvas && !turnChangeset.bookmarks.size) {
+          aiChangesets.delete(turnChangeset.id);
+          return;
+        }
+        turnChangeset.ops = [...turnWriteOps];
+        saveAiChangeset(turnChangeset);
+        if (turn) turn.changesetId = turnChangeset.id;
+      };
+
       // 仅在同步写入两侧取样。模型等待、布局计算或其他工具运行期间的独立编辑不能算作本轮写入。
       const withCanvasWrite = (op, write) => {
         if (COMPARISON) return write();
@@ -4020,6 +4068,7 @@ export const server = http.createServer(async (req, res) => {
             if (!sameSavedCanvas(change.canvas.after, before)) change.canvas.stale = true;
             change.canvas.after = after;
           } else change.canvas = { before, after, stale: false };
+          registerCommittedChange();
         }
         return result;
       };
@@ -4030,12 +4079,17 @@ export const server = http.createServer(async (req, res) => {
         const before = last && last.revision === prev?.revision ? last.before : prev;
         if (!before && !bookmark) changes.delete(id);
         else changes.set(id, { before, revision: bookmark?.revision ?? null, lastRevision: (bookmark || prev).revision });
+        registerCommittedChange();
       };
 
       const executeAiTool = async (name, args) => {
         const write = operation => withCanvasWrite(name, operation);
         const compose = (...params) => write(() => composeMcpView(...params));
         assertActive();
+        if (!isReadOnlyAiTool(name, args)) {
+          if (accessMode === 'read') return { ok: false, blocked: true, error: tr('turn.readOnly') };
+          if (turn) turn.writeStarted = true;
+        }
         if (name === 'arrange_canvas') {
           return arrangeCanvas(args);
         }
@@ -5943,8 +5997,6 @@ export const server = http.createServer(async (req, res) => {
           beforeDone: async ({ onEvent }) => {
             const extra = {};
             if (turnChangeset && (turnChangeset.canvas || turnChangeset.bookmarks.size)) {
-              turnChangeset.ops = [...turnWriteOps];
-              saveAiChangeset(turnChangeset);
               const cs = { id: turnChangeset.id, ops: turnChangeset.ops };
               onEvent({ type: 'changeset', changesetId: cs.id, ops: cs.ops });
               extra.changeset = cs;
@@ -5956,6 +6008,7 @@ export const server = http.createServer(async (req, res) => {
       } catch (err) {
         sendEvent({ type: 'error', error: String(err?.message || err) });
       } finally {
+        if (turn) turn.settled = true;
         req.off('close', cancel);
         res.off('close', cancel);
         if (!res.writableEnded) res.end();

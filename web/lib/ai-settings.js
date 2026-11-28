@@ -318,7 +318,13 @@ function newThreadObject(title = NEW_THREAD_TITLE, bm = state.activeBookmark) {
 }
 
 function setActiveChat(id) {
-  if (id !== activeChatId) stickToBottom = true;
+  if (id !== activeChatId) {
+    stickToBottom = true;
+    if (restoredTurn && restoredTurn.threadId !== id) {
+      inputEl.value = '';
+      restoredTurn = null;
+    }
+  }
   activeChatId = id;
 }
 
@@ -1459,6 +1465,7 @@ function renderAttachments() {
     startInput.addEventListener('change', syncRange);
     endInput.addEventListener('change', syncRange);
     range.append('L', startInput, '-', endInput, t('ai.linesTotal', { n: file.lines.length }));
+    if (file.saved) range.textContent = `L${file.startLine}–${file.endLine}`;
     const rm = document.createElement('button');
     rm.type = 'button';
     rm.className = 'ai-att-rm';
@@ -1984,6 +1991,111 @@ function renderHealthCard(box, report) {
   box.appendChild(card);
 }
 
+// Keep the submitted attachments and selection available for an exact retry in this tab.
+const interruptedInputs = new WeakMap();
+let restoredTurn = null;
+
+function restoreInputs(original, source, recovery, thread, canRetry) {
+  const items = source?.uiContext?.items || [];
+  const keys = new Set(items.map(selectionKey));
+  if ((inputEl.value.trim() && inputEl.value.trim() !== original.text) || pendingFiles.length || pendingImages.length ||
+      pinnedSelections.some(item => !keys.has(selectionKey(item)))) {
+    setChatStatus(() => t('ai.recovery.draftBusy'), true);
+    return;
+  }
+  const files = source?.files || (original.attachedFiles || []).map(file => ({
+    id: crypto.randomUUID?.() || file.name, name: file.name, lines: file.content.split('\n'),
+    startLine: file.startLine, endLine: file.endLine, saved: file,
+  }));
+  pendingFiles.push(...files);
+  pendingImages.push(...(source?.stagedImages || []));
+  for (const item of items) pinSelectionSnapshot(item, { quiet: true });
+  selectedRelationIntent = source?.uiContext?.relationIntent || 'auto';
+  inputEl.value = original.text;
+  restoredTurn = { threadId: thread.id, projectId: chatProjectId, draft: original.text, accessMode: canRetry ? recovery.mode : 'read',
+    ...(canRetry ? { retryOf: recovery.turnId } : {}) };
+  renderSelectionBar();
+  renderAttachments();
+  updateChatControls();
+  if (!source && recovery.hasContext) setChatStatus(() => t('ai.recovery.partial'));
+  else if (!canRetry) setChatStatus(() => t('ai.recovery.readDraft'));
+  inputEl.focus();
+}
+
+async function readTurnStatus(id, threadId) {
+  for (let i = 0; i < 4; i++) {
+    try {
+      const result = await api.aiTurnStatus(id, threadId);
+      if (result.state !== 'running' || i === 3) return result;
+    } catch { break; }
+    await new Promise(resolve => setTimeout(resolve, 100 * (i + 1)));
+  }
+  return { state: 'unknown', canRetry: false };
+}
+
+function renderRecovery(box, entry, thread, original = thread.messages[thread.messages.indexOf(entry) - 1]) {
+  const recovery = entry.recovery;
+  if (!recovery || original?.role !== 'user') return;
+  const source = interruptedInputs.get(entry);
+  const retry = recovery.state === 'safe' && (!recovery.hasContext || source);
+  const row = document.createElement('div');
+  row.className = 'ai-recovery';
+  const status = document.createElement('span');
+  status.textContent = t('ai.recovery.' + recovery.state);
+  const action = document.createElement('button');
+  action.type = 'button';
+  action.dataset.recovery = retry ? 'retry' : 'inspect';
+  action.textContent = t(retry ? 'ai.recovery.retry' : 'ai.recovery.inspect');
+  const project = chatProjectId;
+  const current = () => !activeAbort && !compacting && project === chatProjectId && activeThread() === thread;
+  action.onclick = async () => {
+    if (!current()) return;
+    action.disabled = true;
+    if (retry) {
+      const status = await readTurnStatus(recovery.turnId, thread.id);
+      if (!current()) { action.disabled = false; return; }
+      if (!status.canRetry) {
+        recovery.state = status.changeset ? 'changed' : 'unknown';
+        row.remove();
+        renderRecovery(box, entry, thread, original);
+        return;
+      }
+      await sendPrompt(original.text, source?.uiContext ?? null, {
+        accessMode: recovery.mode, retryOf: recovery.turnId, original: source || {},
+      });
+    } else {
+      await sendPrompt(t('ai.recovery.prompt'), null, { accessMode: 'read', original: {} });
+    }
+    action.disabled = false;
+  };
+  const restore = document.createElement('button');
+  restore.type = 'button';
+  restore.dataset.recovery = 'restore';
+  restore.textContent = t('ai.recovery.restore');
+  restore.onclick = async () => {
+    if (!current()) return;
+    const status = await readTurnStatus(recovery.turnId, thread.id);
+    if (current()) restoreInputs(original, source, recovery, thread, status.canRetry);
+  };
+  row.append(status, action, restore);
+  box.append(row);
+}
+
+// Reload can close the stream before its error handler runs. The saved user row carries
+// its turn reference. Looking it up never overwrites another tab's in-flight transcript.
+async function showPendingTurn(original, thread) {
+  const box = document.createElement('div');
+  box.className = 'ai-msg assistant';
+  messagesEl.append(box);
+  const project = chatProjectId;
+  const turn = original.pendingTurn;
+  const status = await readTurnStatus(turn.turnId, thread.id);
+  if (!box.isConnected || project !== chatProjectId || original !== thread.messages.at(-1)) return;
+  const recovery = { ...turn, state: status.changeset ? 'changed' : status.canRetry ? 'safe' : 'unknown' };
+  if (status.changeset) renderChangesetUndo(box, status.changeset);
+  renderRecovery(box, { recovery }, thread, original);
+}
+
 function renderChangesetUndo(box, changeset) {
   if (!changeset?.id || box.querySelector('.ai-undo-btn')) return;
   const bar = document.createElement('div');
@@ -2039,6 +2151,7 @@ function renderThreadMessages({ preserveStatus = false } = {}) {
       div.className = 'ai-msg user';
       buildUserBubbleContent(div, m.text || '', m.attachedImages || [], m.attachedFiles || []);
       messagesEl.appendChild(div);
+      if (!activeAbort && m.pendingTurn && m === th.messages.at(-1)) void showPendingTurn(m, th);
     } else {
       const box = document.createElement('div');
       box.className = m.error ? 'ai-msg assistant error' : 'ai-msg assistant';
@@ -2061,6 +2174,7 @@ function renderThreadMessages({ preserveStatus = false } = {}) {
       if (m.presentation) renderPresCard(box, m.presentation);
       if (m.healthReport) renderHealthCard(box, m.healthReport);
       if (m.changeset) renderChangesetUndo(box, m.changeset);
+      if (m.recovery) renderRecovery(box, m, th);
       if (Array.isArray(m.questionOptions)) renderQuestion(txt, m, th);
       else renderFollowups(box, m, th);
       messagesEl.appendChild(box);
@@ -2520,7 +2634,11 @@ async function saveViewBookmark(name) {
   }
 }
 
-async function sendPrompt(rawText, uiContext = currentUiContext()) {
+async function sendPrompt(rawText, uiContext = currentUiContext(), options = {}) {
+  const restoring = !options.original && restoredTurn?.projectId === chatProjectId &&
+    restoredTurn?.threadId === activeChatId ? restoredTurn : null;
+  if (restoring && (!restoring.retryOf || (rawText ?? inputEl.value).trim() === restoring.draft)) options = { ...restoring, ...options };
+  const accessMode = options.accessMode ?? 'edit';
   const rawInput = String(rawText ?? inputEl.value).trim();
   if (!rawInput) return;
   closeSlashMenu();
@@ -2546,6 +2664,10 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   if (rawInput === BOOKMARK_COMMAND || rawInput.startsWith(BOOKMARK_COMMAND + ' ')) {
     if (activeAbort) {
       setChatStatus(() => t('ai.waitBookmark'));
+      return;
+    }
+    if (accessMode === 'read') {
+      setChatStatus(() => t('ai.recovery.readDraft'), true);
       return;
     }
     await saveViewBookmark(rawInput.slice(BOOKMARK_COMMAND.length).trim());
@@ -2574,7 +2696,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   }
   if (activeAbort) {
     pendingSteer = {
-      text,
+      text: rawInput,
+      options: { ...options, accessMode },
       uiContext,
       threadId: activeChatId,
       projectId: chatProjectId,
@@ -2598,11 +2721,12 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const myProjectId = chatProjectId;
   const myGen = chatGeneration;
   const turnMessages = thread.messages;
+  const turnId = crypto.randomUUID?.() ?? `turn_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
   if (!thread.customTitle && thread.title === NEW_THREAD_TITLE) {
     thread.title = deriveThreadTitle(rawInput) || NEW_THREAD_TITLE;
   }
-  const historySnapshot = chatHistory(turnMessages);
+  const historySnapshot = options.original?.history ?? chatHistory(turnMessages);
 
   const lastMessageEl = messagesEl.lastElementChild;
   lastMessageEl?.querySelector('.ai-followups')?.remove();
@@ -2611,8 +2735,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     for (const button of questionCard.querySelectorAll('.ai-q-opt')) button.disabled = true;
     questionCard.querySelector('.ai-q-hint')?.remove();
   }
-  const images = pendingImages.splice(0, MAX_PENDING_IMAGES).map(({ dataUrl, label }) => ({ dataUrl, label }));
-  const attachments = sanitizeCodeAttachments(pendingFiles.splice(0, MAX_PENDING_FILES).map((file) => {
+  const stagedImages = options.original ? options.original.stagedImages || [] : pendingImages.splice(0, MAX_PENDING_IMAGES);
+  const files = options.original ? options.original.files || [] : pendingFiles.splice(0, MAX_PENDING_FILES);
+  const images = options.original ? options.original.images || [] : stagedImages.map(({ dataUrl, label }) => ({ dataUrl, label }));
+  const attachments = options.original ? options.original.attachments || [] : sanitizeCodeAttachments(files.map((file) => {
+    if (file.saved) return file.saved;
     const start = Math.max(1, file.startLine || 1);
     const end = Math.max(start, Math.min(file.lines.length, file.endLine || file.lines.length));
     return {
@@ -2624,19 +2751,21 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     };
   }));
   renderAttachments();
+  if (restoring || (options.retryOf && restoredTurn?.retryOf === options.retryOf)) restoredTurn = null;
   const selectionSummary = summarizeUiContext(uiContext);
-  thread.messages.push({
-    role: 'user',
-    text: rawInput,
+  const userEntry = {
+    role: 'user', text: rawInput,
+    pendingTurn: { turnId, mode: accessMode, hasContext: Boolean(images.length || attachments.length || uiContext) },
     ...(selectionSummary ? { selectionSummary } : {}),
     ...(images.length ? { attachedImages: images } : {}),
     ...(attachments.length ? { attachedFiles: attachments } : {}),
-  });
+  };
+  thread.messages.push(userEntry);
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
 
-  inputEl.value = '';
+  if (!options.original || inputEl.value.trim() === rawInput) inputEl.value = '';
   stickToBottom = true;
   appendUserMessage(rawInput, images, attachments);
   const ui = createAssistantBox();
@@ -2723,6 +2852,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     if ((entry.completed || entry.questionOptions) && !thread.customTitle && GENERIC_THREAD_TITLES.has(thread.title)) {
       thread.title = deriveThreadTitle('', tools) || thread.title;
     }
+    delete userEntry.pendingTurn;
     turnMessages.push({
       role: 'assistant',
       thinking: joinThinking(thinkingDelta),
@@ -2744,28 +2874,43 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     pendingSteer && pendingSteer.threadId === threadId &&
     pendingSteer.projectId === myProjectId && pendingSteer.gen === myGen
   );
+  let recoveryLookup;
   const finishInterrupted = (message, stopped = false) => {
     stopThinking();
     for (const { row, name } of pendingSteps) {
       finishStep(row, { name, ok: false, summary: t('ai.interrupted') });
     }
-    const steeringNow = stopped && isSteerQueuedForThisTurn();
-    if (collectedTools.length || streamedText) {
-      ui.text.innerHTML = formatAssistantText(streamedText);
-      commitAssistantMsg({ text: streamedText });
-    } else if (steeringNow) {
-      // 中途引导且本轮尚未产生工具结果或正文时，直接移除空占位，避免插入多余报错气泡。
-      ui.box.remove();
-      return;
-    } else {
-      ui.box.classList.toggle('error', !stopped);
-      ui.text.textContent = message;
-      commitAssistantMsg({ text: message, error: true });
-    }
-    if (isVisible()) {
+    const partial = Boolean(collectedTools.length || streamedText);
+    const recovering = readTurnStatus(turnId, threadId);
+    if (partial) ui.text.innerHTML = formatAssistantText(streamedText);
+    else ui.text.textContent = message;
+    recoveryLookup = recovering.then(status => {
+      if (!isCurrent()) return;
+      const changeset = status.changeset || collectedChangeset;
+      const steering = stopped && isSteerQueuedForThisTurn();
+      if (steering && !partial && !changeset && status.canRetry) { ui.box.remove(); return; }
+      const entry = commitAssistantMsg({
+        text: partial ? streamedText : message,
+        error: !partial && !stopped,
+        ...(changeset ? { changeset } : {}),
+        recovery: {
+          turnId, mode: accessMode,
+          state: changeset ? 'changed' : status.canRetry ? 'safe' : 'unknown',
+          hasContext: Boolean(images.length || attachments.length || uiContext),
+        },
+      });
+      interruptedInputs.set(entry, { images, attachments, uiContext, history: historySnapshot, files, stagedImages });
+      if (!isVisible()) return;
+      if (changeset) renderChangesetUndo(ui.box, changeset);
+      renderRecovery(ui.box, entry, thread);
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
-      if (!steeringNow && (collectedTools.length || streamedText)) setChatStatus(message, !stopped);
-    }
+      if (!steering && partial) setChatStatus(message, !stopped);
+      if (!steering && status.canRetry && !inputEl.value && !entry.recovery.hasContext &&
+          !pendingImages.length && !pendingFiles.length && !pinnedSelections.length) {
+        inputEl.value = rawInput;
+        restoredTurn = { threadId, projectId: myProjectId, accessMode, retryOf: turnId, draft: rawInput };
+      }
+    });
   };
   const handleLine = (line) => {
     if (!isCurrent() || terminalReceived || !line.trim()) return;
@@ -2937,7 +3082,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let reader;
   try {
     const res = await api.aiChat({
-      language: getLang(), prompt: text,
+      language: getLang(), prompt: text, turnId, accessMode,
+      ...(options.retryOf ? { retryOf: options.retryOf } : {}),
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -2950,7 +3096,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
       throw new Error(err.error || `HTTP ${res.status}`);
     }
-    if (isCurrent()) consumeUnpinnedStagedSelections(uiContext);
+    if (isCurrent() && !options.original) consumeUnpinnedStagedSelections(uiContext);
     reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -2983,6 +3129,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       void reader.cancel().catch(() => {});
       reader.releaseLock();
     }
+    if (recoveryLookup) await recoveryLookup;
     let steer = null;
     if (activeAbort === controller) {
       activeAbort = null;
@@ -2991,7 +3138,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       updateChatControls();
     }
     if (isVisible()) followChatScroll();
-    if (steer) void sendPrompt(steer.text, steer.uiContext);
+    if (steer) void sendPrompt(steer.text, steer.uiContext, steer.options);
   }
 }
 
@@ -3355,6 +3502,8 @@ document.addEventListener('cg:project-changed', () => {
   setCanvasSelection(null);
   renderSelectionBar();
   chatGeneration++;
+  if (restoredTurn) inputEl.value = '';
+  restoredTurn = null;
   chatProjectId = null;
   chatThreads = [];
   setActiveChat('');
@@ -3489,6 +3638,9 @@ if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
 });
 if (inputEl) {
   inputEl.addEventListener('input', () => {
+    if (restoredTurn && (!inputEl.value || (restoredTurn.retryOf && inputEl.value.trim() !== restoredTurn.draft))) {
+      restoredTurn = null;
+    }
     syncInputSuggestion();
     updateAutocompletePopover();
   });

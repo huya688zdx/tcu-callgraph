@@ -561,6 +561,14 @@ export const SUBAGENT_READONLY_TOOLS = new Set([
   'diagnose_canvas',
 ]);
 
+// Keep the read-only boundary explicit when adding tools with new side effects.
+export function isReadOnlyAiTool(name, args = {}) {
+  return SUBAGENT_READONLY_TOOLS.has(name) || name === 'ask_user' || name === 'run_subagent' ||
+    (name === 'manage_bookmarks' && args.action === 'list') ||
+    (name === 'arrange_canvas' && args.action === 'inspect') ||
+    (name === 'present_logic' && args.addToCanvas === false);
+}
+
 const TOOL_NAME_SET = new Set(AGENT_TOOLS.map(t => t.name));
 
 function resolveAllowedToolDefs(allowedTools, language) {

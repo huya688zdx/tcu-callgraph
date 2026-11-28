@@ -206,6 +206,7 @@ export const api = {
     return write;
   },
   compactChat: (body, signal) => post('/api/ai/compact', body, { timeout: MODEL_TIMEOUT, signal }),
+  aiTurnStatus: (turnId, threadId) => post('/api/ai/turn-status', { turnId, threadId, projectId: state.view?.projectId, sessionRevision: state.view?.sessionRevision }, { timeout: 2500 }),
   aiUndoChangeset: (changesetId, language) => post('/api/ai/undo-changeset', { changesetId, language }),
   aiModels: (body, signal) => post('/api/ai/models', body, { timeout: MODEL_TIMEOUT, signal }),
   aiTest: (body) => post('/api/ai/test', body, { timeout: MODEL_TIMEOUT }),
