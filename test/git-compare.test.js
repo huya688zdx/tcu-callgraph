@@ -5,9 +5,11 @@ import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { comparisonDataflow } from '../src/core/compare.js';
 import { buildFlowchart } from '../src/core/flowchart.js';
 import { compareGitProject, inspectGitRepo } from '../src/core/git-compare.js';
 import { decodeSource } from '../src/core/index.js';
+import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 import { launchServer } from '../scripts/lib/server.mjs';
 
 function repository(t) {
@@ -32,6 +34,97 @@ function repository(t) {
 }
 
 const byId = (comparison, id) => comparison.model._index.byId.get(id);
+
+test('Git dataflow opens the access in its own snapshot across line edits and shifts', async t => {
+  const { root, put, commit } = repository(t);
+  const files = (n, pad = '') => {
+    put('reader.c', `int level;\nint read_level(void) {\n${pad}  return level + ${n};\n}\n`);
+    put('writer.c', `extern int level;\nvoid write_level(void) {\n${pad}  level = ${n};\n}\n`);
+  };
+  files(1); const a = commit('first');
+  files(2); const b = commit('second');
+  files(2, '  /* moved */\n\n'); const c = commit('shifted');
+  files(999);
+  const srv = await launchServer({ target: root });
+  t.after(srv.close);
+  const post = async (route, body) => (await fetch(srv.baseUrl + route, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })).json();
+  const fn = 'reader.c::read_level';
+  let priorComparison;
+  for (const [baseRef, targetRef, expected] of [[a, b, [[3, 1], [3, 2]]], [b, c, [[3, 2], [5, 2]]]]) {
+    const { preview } = await post('/api/compare', { mode: 'git', baseRef, targetRef });
+    const applied = await post('/api/compare/apply', { previewId: preview.id, selectedIds: [fn] });
+    assert.equal(applied.ok, true, applied.error);
+    const flow = await (await fetch(srv.baseUrl + '/api/dataflow?fn=' + fn + '&dir=both')).json();
+    assert.equal(flow.comparisonId, applied.comparison.id);
+    const headers = { 'X-Callgraph-Project': String(flow.projectId), 'X-Callgraph-Session': String(flow.sessionRevision) };
+    for (const [i, version] of ['before', 'after'].entries()) {
+      const [line, number] = expected[i];
+      const edges = flow.edges.filter(e => e.version === version);
+      assert.equal(edges.length, 2);
+      for (const edge of edges) {
+        const write = edge.kind === 'df-write';
+        const file = write ? 'writer.c' : 'reader.c';
+        assert.deepEqual(edge.site, { file, line, indirect: false });
+        const q = new URLSearchParams({ file, version, startLine: line, endLine: line, comparisonId: flow.comparisonId });
+        const source = await (await fetch(srv.baseUrl + '/api/source?' + q, { headers })).json();
+        assert.equal(source.traceVersion, version);
+        assert.equal(source.source.trim(), write ? `level = ${number};` : `return level + ${number};`);
+        if (priorComparison) {
+          q.set('comparisonId', priorComparison);
+          assert.equal((await fetch(srv.baseUrl + '/api/source?' + q, { headers })).status, 409);
+        }
+      }
+    }
+    priorComparison = flow.comparisonId;
+  }
+
+  await t.test('keyboard follows both versions and returns to the same relation and function', async t => {
+    try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+    const br = await launchCdp({ url: srv.baseUrl, width: 390 });
+    t.after(() => br.close());
+    await br.waitFor('window.__cg?.view?.comparison?.id');
+    await br.evaluate(`const search = document.getElementById('search'); search.value = 'read_level';
+      search.dispatchEvent(new Event('input', { bubbles: true }))`);
+    const result = '#results li[data-id="reader.c::read_level"]';
+    await br.waitFor(`document.querySelector('${result}')`);
+    await br.evaluate(`document.querySelector('${result}').click()`);
+    await br.waitFor('document.querySelector("[data-node-dataflow]")');
+    await br.evaluate('document.querySelector("[data-node-dataflow]").click()');
+    await br.waitFor('document.activeElement.id === "dfFilter"');
+    const open = () => br.pressKey({ key: ' ', code: 'Space', vk: 32 });
+    const back = () => br.pressKey({ key: 'Escape', code: 'Escape', vk: 27 });
+    const radio = await br.evaluate('document.querySelector("#dataflow input:checked").value');
+    for (const [version, expectedLine] of [['before', 3], ['after', 5]]) {
+      const site = `[data-version="${version}"][data-df-site$="-write"]`;
+      await br.evaluate(`document.querySelector('${site}').focus()`);
+      await open();
+      await br.waitFor('document.activeElement.getAttribute("aria-current") === "location"');
+      assert.deepEqual(await br.evaluate('[...document.activeElement.children].map(e => e.textContent.trim())'),
+        [String(expectedLine), 'level = 2;']);
+      await back();
+      assert.ok(await br.evaluate(`document.activeElement.matches('${site}')`));
+      assert.equal(await br.evaluate('document.querySelector("#dataflow input:checked").value'), radio);
+    }
+    await back();
+    assert.ok(await br.evaluate('document.activeElement.hasAttribute("data-node-dataflow")'));
+    assert.equal(await br.evaluate('window.__cg.selected.node'), fn);
+  });
+
+  // Older parser records can contain only a fallback function-definition line.
+  const comp = await compareGitProject(root, { baseRef: b, targetRef: c });
+  const model = comp.beforeModel;
+  model.parserId = 'clang-ast';
+  const record = model._df.fnAccess.get('writer.c::write_level').writes.get('var::level');
+  record.lines = new Set([2]);
+  const queryWrite = async () => (await comparisonDataflow(comp, fn, 'in')).edges.find(
+    e => e.version === 'before' && e.kind === 'df-write');
+  assert.equal((await queryWrite()).site, null);
+  record.lines.add(3);
+  record.sourceSite = { file: 'writer.c', line: 3 };
+  assert.deepEqual((await queryWrite()).site, { file: 'writer.c', line: 3, indirect: false });
+});
 
 test('Git 预览和 MCP 读取遵守活动构建配置，同标识的配置内容变化会刷新比较', async t => {
   const { root, put, commit } = repository(t);

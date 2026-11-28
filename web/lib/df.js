@@ -8,6 +8,8 @@ import { periodCaption, periodText } from './period-text.js';
 export const df = { root: null, result: null, selected: 0, query: '' };
 let querySeq = 0;
 let updating = false;
+let detailOpener = null;
+let sourceView = null;
 
 const relations = (res) => ['read', 'write'].flatMap((mode) =>
   res.vars.filter((v) => v.mode === mode).flatMap((v) => v.peers.map((peer) => ({ v, peer }))));
@@ -67,10 +69,110 @@ function showPanel(html) {
   document.getElementById('right').dataset.mode = 'dataflow';
 }
 
+function syncBackButton() {
+  const button = document.querySelector('#secDataflow [data-df="close"]');
+  const key = sourceView ? 'df.backList' : detailOpener ? 'df.backFunction' : 'df.close';
+  button.dataset.i18n = key;
+  button.textContent = t(key);
+}
+
+function accessLabel(kind, site) {
+  return t(site?.indirect ? `df.possible.${kind}` : `df.access.${kind}`);
+}
+
+function evidenceLinks(edgesByVersion, res, { v, peer }, index) {
+  const writer = v.mode === 'read' ? peer.id : res.fn.id;
+  const reader = v.mode === 'read' ? res.fn.id : peer.id;
+  const edges = edgesByVersion.get(v.version);
+  const link = (kind, from, to) => {
+    const site = edges?.get(JSON.stringify([from, to]))?.site;
+    const label = accessLabel(kind, site);
+    if (!site) return `<span class="detail-meta">${esc(t('df.noSite', { access: label }))}</span>`;
+    const title = `${versionLabel(v.version)} · ${label} · ${site.file}:${site.line}`;
+    return `<button type="button" class="df-site" data-df-site="${index}-${kind}" data-version="${v.version}"
+      data-file="${esc(site.file)}" data-line="${site.line}" data-indirect="${site.indirect === true}"
+      title="${esc(title)}" aria-label="${esc(title)}">${esc(label)} :${site.line}</button>`;
+  };
+  return `<div class="df-sites"><span class="df-version">${esc(versionLabel(v.version))}</span>
+    ${link('write', writer, v.id)} ${link('read', v.id, reader)}</div>`;
+}
+
+function renderSource() {
+  const view = sourceView;
+  if (!view) return;
+  const list = document.querySelector('#dataflow [data-df-list]');
+  const output = document.querySelector('#dataflow [data-df-source]');
+  if (!output) return;
+  list.hidden = true;
+  output.hidden = false;
+  syncBackButton();
+  const title = `${versionLabel(view.version)} · ${accessLabel(view.kind, view)}`;
+  let body = `<div class="detail-meta" role="status">${t('df.loadingSource')}</div>`;
+  if (view.error) body = `<div class="df-error" role="alert">${t(view.error)}</div>`;
+  if (view.data) {
+    const { source, startLine } = view.data;
+    body = `<div class="df-code">${source.split('\n').map((text, index) => {
+      const line = startLine + index;
+      return `<div ${line === view.line ? 'aria-current="location" tabindex="-1"' : ''}><span>${line}</span><code>${esc(text)}</code></div>`;
+    }).join('')}</div>`;
+  }
+  output.innerHTML = `<h4>${esc(title)}</h4><div class="df-source-path">${esc(view.file)}:${view.line}</div>${body}`;
+}
+
+async function openSource(button) {
+  const scope = df.result;
+  if (!scope?.comparisonId || scope.projectId == null || scope.sessionRevision == null || !currentDataflowScope(scope)) return;
+  const { dfSite, version, file, line, indirect } = button.dataset;
+  sourceView?.controller.abort();
+  const view = { key: dfSite, kind: dfSite.split('-')[1], version, file, line: Number(line), indirect: indirect === 'true',
+    scroll: document.getElementById('right').scrollTop, controller: new AbortController() };
+  sourceView = view;
+  renderSource();
+  const back = document.querySelector('#secDataflow [data-df="close"]');
+  back.focus();
+  try {
+    const data = await api.dataflowSource(scope, version, view, view.controller.signal);
+    if (sourceView !== view || df.result !== scope || !currentDataflowScope(scope)) return;
+    if (data?.ok && data.traceVersion === version && data.file === file && typeof data.source === 'string' &&
+        data.startLine <= view.line && data.endLine >= view.line && data.source.split('\n').length === data.endLine - data.startLine + 1) {
+      view.data = data;
+    } else {
+      view.error = data?.status === 403 ? 'df.sourceDenied' : 'df.sourceUnavailable';
+    }
+  } catch {
+    if (sourceView !== view || df.result !== scope || !currentDataflowScope(scope)) return;
+    view.error = 'df.sourceUnavailable';
+  }
+  renderSource();
+  if (document.activeElement === back) document.querySelector('#dataflow [aria-current="location"]')?.focus();
+}
+
+function goBack() {
+  if (sourceView) {
+    const { key, scroll, controller } = sourceView;
+    controller.abort();
+    sourceView = null;
+    document.querySelector('[data-df-source]').hidden = true;
+    document.querySelector('[data-df-list]').hidden = false;
+    syncBackButton();
+    document.getElementById('right').scrollTop = scroll;
+    document.querySelector(`[data-df-site="${key}"]`)?.focus({ preventScroll: true });
+    return;
+  }
+  const opener = detailOpener;
+  clearDataflow();
+  if (opener?.isConnected) opener.focus();
+}
+
 function renderDataflowResult(error = '') {
   const res = df.result;
   if (!res) return;
   const rows = relations(res);
+  const edgesByVersion = new Map();
+  for (const edge of res.edges) {
+    if (!edgesByVersion.has(edge.version)) edgesByVersion.set(edge.version, new Map());
+    edgesByVersion.get(edge.version).set(JSON.stringify([edge.from, edge.to]), edge);
+  }
   const varsById = new Map();
   for (const v of res.vars) {
     if (!varsById.has(v.id)) varsById.set(v.id, []);
@@ -84,9 +186,9 @@ function renderDataflowResult(error = '') {
       const { v, peer } = row;
       if (v.mode !== mode) return;
       count++;
-      const access = res.edges.filter((e) => !v.version || e.version === v.version).find((e) => mode === 'read'
-        ? e.from === peer.id && e.to === v.id && e.kind === 'df-write'
-        : e.from === v.id && e.to === peer.id && e.kind === 'df-read');
+      const endpoints = mode === 'read' ? [peer.id, v.id] : [v.id, peer.id];
+      const access = edgesByVersion.get(v.version)?.get(JSON.stringify(endpoints));
+      const evidence = !window.__EXPORT && comparison?.git && v.version && res.fn.id !== v.id;
       const line = access?.line;
       const present = relationInView(row, res);
       const hash = [...v.id].reduce((value, ch) => (value * 31 + ch.charCodeAt(0)) >>> 0, 0);
@@ -96,14 +198,14 @@ function renderDataflowResult(error = '') {
       const peerVersion = versionLabel(peer.version);
       const period = periodCaption(periodNode(peer), comparison);
       const hint = comparison ? t('common.relAdd') : t('df.toggleHint');
-      const html = `<label class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}" title="${esc(peer.file)}${line ? `:${line}` : ''} · ${hint}">
+      const html = `<div class="edge-item df-relation${df.selected === index ? ' selected' : ''}" data-search="${esc(search)}" data-added="${present}"><label class="df-choice" title="${esc(peer.file)}${line && !evidence ? `:${line}` : ''} · ${hint}">
         <input type="radio" name="dfRelation" value="${index}" ${df.selected === index ? 'checked' : ''}>
-        <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
+        <span>${mode === 'read' ? '←' : '→'}</span> <b class="df-peer-name">${esc(peer.name)}</b>${peerVersion && !evidence ? `<span class="chip">${esc(peerVersion)}</span>` : ''}
         ${period ? `<span class="compare-badge period" title="${t('df.period')}">${esc(period)}</span>` : ''}
-        ${line ? `<span class="df-access-line">:${line}</span>` : ''}
-        <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
+        ${line && !evidence ? `<span class="df-access-line">:${line}</span>` : ''}
+        <span class="chip df-via" data-var="${esc(v.id)}" style="--df-var-hue:${hue}" title="${esc(t('df.via', { name: v.name }))} · ${esc(v.file)}:${v.line}${v.indirect ? ` · ${t('df.viaPtr')}` : ''}">${esc(v.name)}</span>${variableVersion && !evidence ? `<span class="chip">${esc(variableVersion)}</span>` : ''}
         ${present ? `<span class="df-present" title="${t('df.added')}">✓</span>` : ''}
-      </label>`;
+      </label>${evidence ? evidenceLinks(edgesByVersion, res, row, index) : ''}</div>`;
       if (!byVariable.has(v.id)) byVariable.set(v.id, { name: v.name, rows: [] });
       byVariable.get(v.id).rows.push(html);
     });
@@ -116,16 +218,18 @@ function renderDataflowResult(error = '') {
       ${truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}</div>`
       : '';
   };
-  showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
+  showPanel(`<div data-df-list><div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
     <div class="df-actions"><button class="primary" data-df="toggle">${t('common.relAdd')}</button>
-      ${window.__EXPORT ? '' : '<button type="button" data-df="askAi" title="将数据流分析结果明确加入 AI 对话上下文">✨ 加入对话</button>'}
+      ${window.__EXPORT ? '' : `<button type="button" data-df="askAi">${t('df.addToChat')}</button>`}
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
     <div class="empty" data-df-empty hidden>${t('df.noMatch')}</div>
-    ${res.truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}`);
+    ${res.truncated ? `<div class="detail-meta">${t('df.truncated')}</div>` : ''}</div><div data-df-source hidden></div>`);
   filterResults();
+  syncBackButton();
+  renderSource();
 }
 
 document.addEventListener('callgraph:langchange', () => renderDataflowResult());
@@ -161,6 +265,10 @@ function filterResults() {
 /** 清除查询结果，不改动画布节点、连线或坐标。 */
 export function clearDataflow() {
   querySeq++;
+  sourceView?.controller.abort();
+  sourceView = null;
+  detailOpener = null;
+  syncBackButton();
   df.root = null;
   df.result = null;
   df.selected = 0;
@@ -171,8 +279,10 @@ export function clearDataflow() {
 }
 
 /** 函数可以来自文件树，不要求它已经在画布中。 */
-export async function analyseDataflow(fnId) {
+export async function analyseDataflow(fnId, opener = null) {
   clearDataflow();
+  detailOpener = opener;
+  syncBackButton();
   const seq = querySeq;
   const projectId = state.view?.projectId;
   df.root = fnId;
@@ -185,6 +295,7 @@ export async function analyseDataflow(fnId) {
     if (!currentDataflowScope(res)) return clearDataflow();
     df.result = res;
     renderDataflowResult();
+    if (opener) document.getElementById('dfFilter')?.focus();
   } catch (err) {
     if (seq !== querySeq || projectId !== state.view?.projectId) return;
     showPanel(`<div class="df-error" role="alert">${t('df.failed')}：${esc(String(err))}</div>`);
@@ -211,7 +322,7 @@ async function toggleSelectedRelation() {
       state.hiddenVars.delete(chosen.v.id);
       roots = [...new Set([...roots, res.fn.id, chosen.peer.id])];
       await hooks.loadView(roots, { incremental: true });
-      if (state.view?.projectId !== projectId) return;
+      if (!currentDataflowScope(res)) return;
       df.root = res.fn.id;
       df.result = res;
       df.selected = selected;
@@ -242,7 +353,7 @@ async function toggleSelectedRelation() {
     df.selected = selected;
     df.query = query;
   } catch (err) {
-    if (state.view?.projectId !== projectId) return;
+    if (!currentDataflowScope(res)) return;
     df.root = res.fn.id;
     df.result = res;
     df.selected = selected;
@@ -268,7 +379,7 @@ document.addEventListener('input', (e) => {
 
 document.addEventListener('dblclick', (e) => {
   const row = e.target.closest?.('#dataflow .df-relation');
-  if (!row || row.hidden || updating) return;
+  if (!row || row.hidden || updating || !e.target.closest('.df-choice')) return;
   e.preventDefault();
   df.selected = Number(row.querySelector('input').value);
   filterResults();
@@ -312,11 +423,21 @@ function buildDataflowAiDetail() {
   };
 }
 
+document.getElementById('secDataflow').addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && (sourceView || detailOpener)) {
+    e.preventDefault();
+    e.stopPropagation();
+    goBack();
+  }
+});
+
 document.addEventListener('click', (e) => {
+  const site = e.target.closest?.('#dataflow [data-df-site]');
+  if (site) return void openSource(site);
   const button = e.target.closest?.('#secDataflow [data-df]');
   if (!button || button.disabled) return;
   if (button.dataset.df === 'toggle') void toggleSelectedRelation();
-  if (button.dataset.df === 'close') clearDataflow();
+  if (button.dataset.df === 'close') goBack();
   if (button.dataset.df === 'askAi') {
     const detail = buildDataflowAiDetail();
     if (detail) document.dispatchEvent(new CustomEvent('cg:ask-ai', { detail }));

@@ -178,6 +178,13 @@ export const api = {
   /** 按需数据流分析：out=它的写影响谁，in=谁的状态影响它 */
   dataflow: (fn, dir = 'out') =>
     get('/api/dataflow?fn=' + encodeURIComponent(fn) + '&dir=' + encodeURIComponent(dir), { timeout: ANALYSIS_TIMEOUT }),
+  dataflowSource: (scope, version, { file, line }, signal) => {
+    const q = new URLSearchParams({ comparisonId: scope.comparisonId, version, file,
+      startLine: Math.max(1, line - 2), endLine: line + 2 });
+    return request('/api/source?' + q, { signal, headers: {
+      'X-Callgraph-Project': String(scope.projectId), 'X-Callgraph-Session': String(scope.sessionRevision),
+    } }, parseJson);
+  },
   pairDataflow: (a, b, { signal } = {}) => post('/api/dataflow/pair', {
     a,
     b,

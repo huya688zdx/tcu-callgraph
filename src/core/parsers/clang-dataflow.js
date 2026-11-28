@@ -103,7 +103,12 @@ export function collectDataflow(units, records, defs, resolveVariable, callTarge
       const { id, field } = target;
       if (!bucket.has(id)) bucket.set(id, { lines: new Set(), fields: new Set(), whole: false, indirect: false });
       const access = bucket.get(id);
-      access.lines.add(context.loc.loc(node)?.line || fn.line);
+      const loc = context.loc.loc(node);
+      access.lines.add(loc?.line || fn.line);
+      if (loc?.file === fn.file && Number.isSafeInteger(loc.offset) && loc.offset >= 0 && loc.line >= fn.line &&
+          loc.line <= fn.endLine && (!access.sourceSite || loc.line < access.sourceSite.line)) {
+        access.sourceSite = { file: loc.file, line: loc.line };
+      }
       if (field) access.fields.add(field);
       else access.whole = true;
       access.indirect ||= indirect;

@@ -393,13 +393,30 @@ export async function compareProjects(projectPath, beforePath, afterPath, option
     macroChanges, macroDetails, changePoints, totalNodes: roots.length };
 }
 
+// Resolve an access against this side's function and parser records before merging the models.
+function comparisonAccessSite(model, edge) {
+  const write = edge.kind === 'df-write';
+  const fnId = write ? edge.from : edge.to;
+  const variableId = write ? edge.to : edge.from;
+  const fn = model._index.byId.get(fnId);
+  const rec = model._df.fnAccess.get(fnId)?.[write ? 'writes' : 'reads'].get(variableId);
+  if (!fn?.file || !Number.isSafeInteger(fn.line) || !Number.isSafeInteger(fn.endLine) || !rec) return null;
+  // Built-in access lines come from syntax nodes. Other parsers may supply a
+  // definition line as a fallback, so require their explicit source location.
+  const site = model.parserId === 'builtin' ? { file: fn.file, line: edge.line } : rec.sourceSite;
+  if (site?.file !== fn.file || !Number.isSafeInteger(site.line) ||
+      site.line < fn.line || site.line > fn.endLine || !rec.lines.has(site.line)) return null;
+  return { file: site.file, line: site.line, indirect: !!rec.indirect };
+}
+
 /** 两侧数据流分别查询再合并，避免制造跨版本的虚假写者/读者配对。 */
 export async function comparisonDataflow(comparison, id, dir) {
   const results = [];
   for (const [version, m] of [['before', comparison.beforeModel], ['after', comparison.afterModel]]) {
     if (!m._index.byId.has(id)) continue;
     const result = await dataflowFor(m, id, dir);
-    results.push({ ...result, edges: result.edges.map((e) => ({ ...e, version })),
+    results.push({ ...result, edges: result.edges.map((e) => ({ ...e, version,
+      ...(comparison.git ? { site: comparisonAccessSite(m, e) } : {}) })),
       vars: result.vars.map((v) => ({ ...v, version, peers: v.peers.map((p) => ({ ...p, version })) })) });
   }
   const node = comparison.model._index.byId.get(id);

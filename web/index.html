@@ -224,6 +224,28 @@
   .df-group + .df-group { border-top: 1px solid #E8E7E1; margin-top: 10px; padding-top: 10px; }
   .df-group h4 { margin: 6px 0; font-size: 12px; font-weight: 600; }
   .edge-item.df-relation { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 32px; padding: 5px 6px; border-radius: 6px; cursor: pointer; user-select: none; }
+  .df-choice, .df-sites { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; width: 100%; min-width: 0; }
+  .df-choice { cursor: pointer; min-height: 24px; }
+  .df-sites { cursor: default; }
+  .df-version { color: #5F5E5A; font-size: 11px; }
+  .df-site { height: auto; min-height: 24px; padding: 2px 4px; font-size: 11.5px; color: #185FA5; background: transparent; border: 0; text-decoration: underline; }
+  .df-site:focus-visible { outline: 2px solid #185FA5; }
+  .df-source-path { font: 12px monospace; overflow-wrap: anywhere; margin-bottom: 8px; }
+  .df-code { overflow-x: auto; font: 12px/1.65 monospace; }
+  .df-code > div { display: flex; min-width: max-content; }
+  .df-code span { flex: none; min-width: 3ch; margin-right: 1ch; color: #66645F; text-align: right; }
+  .df-code code { white-space: pre; }
+  .df-code [aria-current] { background: #E6F1FB; outline-offset: -1px; }
+  #secDataflow .df-actions { flex-wrap: wrap; gap: 4px; }
+  @media (max-width: 600px) {
+    #app:has([data-node-dataflow], .df-sites) {
+      grid-template-columns: minmax(0, 1fr) minmax(0, .65fr) minmax(min(100vw, 218px), 1.85fr);
+    }
+    #app:has([data-node-dataflow], .df-sites) #right[data-mode="dataflow"] {
+      grid-column: 1 / -1; grid-row: 2; z-index: 2;
+    }
+    #app:has([data-node-dataflow], .df-sites):has(#right[data-mode="dataflow"]) > :is(main, #left) { visibility: hidden; }
+  }
   .df-relation:hover { background: #FAFAF8; }
   .df-relation.selected { background: #E6F1FB; }
   .df-relation input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }

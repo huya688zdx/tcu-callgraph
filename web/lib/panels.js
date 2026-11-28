@@ -1059,6 +1059,7 @@ async function renderDetail(id, boxDetail = null) {
   els.detail.innerHTML = `
     <div class="detail-title">${esc(target.displayName || n.name)}</div>
     <div class="detail-meta">${esc(n.file)}${n.manual ? ' · ' + t('node.manualFn') : `:${n.line}`}${n.isStatic ? ' · ' + t('node.static') : ''}${n.external ? ' · ' + t('node.externalTag') : ''}</div>
+    ${comparison?.git && !n.external && !n.manual && !n.headerSymbol && !window.__EXPORT ? `<button class="flowchart-detail" type="button" data-node-dataflow>${t('df.openAccesses')}</button>` : ''}
     ${canOpenFlowchart(n) ? `<button class="flowchart-detail" type="button" data-node-flowchart>${t('flowchart.menu')}</button>` : ''}
     ${askAiButton}
     ${comparison ? comparisonDetail(n, comparison.changePoints ?? state.view?.comparison?.changePoints ?? d.changePoints) : ''}
@@ -1073,6 +1074,7 @@ async function renderDetail(id, boxDetail = null) {
     ${periodDetail(target)}
   `;
   els.detail.querySelector('[data-node-name]')?.addEventListener('change', (ev) => setNodeName(target, ev.target.value));
+  els.detail.querySelector('[data-node-dataflow]')?.addEventListener('click', (ev) => analyseDataflow(id, ev.currentTarget));
   els.detail.querySelector('[data-node-flowchart]')?.addEventListener('click', () => openFlowchart(id));
   bindStatusControl(els.detail, target);
 

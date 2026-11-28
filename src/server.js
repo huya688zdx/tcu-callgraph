@@ -1334,7 +1334,10 @@ async function readMcpSource(q) {
   if (!model.files?.some((entry) => entry.rel === file)) {
     throw new Error('只允许读取当前工程内已索引的源码相对路径');
   }
-  const source = await readIndexedSourceBytes(model, file, comparison);
+  // A scoped Git link must resolve from the captured snapshot, including for worktree comparisons.
+  const source = comparison?.git && q.has('comparisonId')
+    ? await model._sourceBuffers?.getAsync(file) : await readIndexedSourceBytes(model, file, comparison);
+  if (!source) throw new Error('比较快照中没有此文件的源码');
   const decoder = sourceDecoder(source, q.get('encoding') ?? 'auto', { fatal: true });
   let decoded;
   try { decoded = decoder.decode(source.subarray(decoder.bomLength)); }
@@ -6034,6 +6037,8 @@ export const server = http.createServer(async (req, res) => {
           Number(req.headers['x-callgraph-project']) !== PROJECT.id)) {
         return json(res, { ok: false, error: '工程已切换，请重新调用' }, 409);
       }
+      if (u.pathname === '/api/source' && u.searchParams.has('comparisonId') &&
+          u.searchParams.get('comparisonId') !== String(COMPARISON?.id ?? '')) return sessionConflict(res);
       try {
         const source = u.pathname === '/api/source' ? await readMcpSource(u.searchParams) : await readMcpChanges(u.searchParams, req);
         if (!currentSession(req)) return sessionConflict(res);
