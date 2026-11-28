@@ -1028,6 +1028,7 @@ test('e2e：直连旧版无 tools 本地接口，MCP 关闭时仍可一键把 Gi
     await evaluate(`(() => {
       window.__chatProjectChanges = 0;
       document.addEventListener('cg:project-changed', () => { window.__chatProjectChanges++; });
+      document.getElementById('aiAccessMode').click();
       document.querySelector('#aiPromptInput').value = '把工作区改动加入比较画布';
       document.querySelector('#aiSendChat').click();
     })()`);
@@ -2933,6 +2934,7 @@ test('成功撤销 AI 组图后，较早发出的组图请求不能再覆盖页�
   await br.waitFor("document.getElementById('aiModel').value === 'mock'");
   await br.evaluate(`(() => {
     const prompt = document.getElementById('aiPromptInput');
+    document.getElementById('aiAccessMode').click();
     prompt.value = '请把 Gear_Apply 加入当前画布';
     prompt.dispatchEvent(new Event('input', { bubbles: true }));
     document.getElementById('aiSendChat').click();
@@ -3392,6 +3394,7 @@ test('浏览器在 AI 提问卡片中撤销已保存的书签', async t => {
   await br.evaluate("document.getElementById('aiBtn').click()");
   await br.waitFor("document.getElementById('aiModel').value === 'mock'");
   await br.evaluate(`const input = document.getElementById('aiPromptInput');
+    document.getElementById('aiAccessMode').click();
     input.value = '请保存书签，然后问我是否继续'; input.dispatchEvent(new Event('input', { bubbles: true }));
     document.getElementById('aiSendChat').click();`);
   await br.waitFor("document.querySelector('.ai-question-opts button')?.textContent.includes('继续')");
@@ -3401,6 +3404,54 @@ test('浏览器在 AI 提问卡片中撤销已保存的书签', async t => {
   await br.waitFor("document.querySelector('.ai-undo-btn')?.textContent.includes('已撤销')");
   assert.ok(!(await list()).some(b => b.name === name));
   assert.ok(await br.evaluate("!document.querySelector('.ai-question-opts button').disabled"));
+});
+
+test('浏览器只给明确允许的那一轮修改画布和书签', async t => {
+  try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  let index = 0;
+  const target = 'gear.c::Gear_Apply';
+  const { post } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'user' ? [
+    ['add_to_canvas', { functions: [target], includeTasks: false }],
+    ['manage_bookmarks', { action: 'save', name: 'one-turn-' + ++index }],
+  ] : []);
+  await post('/api/page', { roots: ['main.c::main'], up: 0, down: 0 });
+  const br = await launchCdp({ url: srv.baseUrl, width: 390 });
+  t.after(() => br.close());
+  await br.waitFor('window.__cg?.root === "main.c::main"');
+  await br.evaluate("document.getElementById('aiBtn').click()");
+  await br.waitFor("document.getElementById('aiModel').value === 'mock' && !document.getElementById('aiAccessMode').disabled");
+  const mode = () => br.evaluate("document.getElementById('aiAccessMode').getAttribute('aria-pressed')");
+  const arm = () => br.evaluate("document.getElementById('aiAccessMode').click()");
+  const bookmarks = () => fetch(srv.baseUrl + '/api/bookmarks').then(r => r.json()).then(r => r.list.map(b => b.name));
+  const send = async n => {
+    await br.evaluate(`document.getElementById('aiPromptInput').value = '请把 Gear_Apply 加入画布并保存书签';
+      document.getElementById('aiSendChat').click()`);
+    await br.waitFor(`document.querySelectorAll('.ai-msg.assistant').length === ${n} && document.getElementById('aiStopChat').hidden`);
+    return br.evaluate("Array.from(document.querySelectorAll('.ai-msg.assistant')).at(-1).querySelectorAll('.ai-step.blocked').length");
+  };
+  const onCanvas = `window.__cg.view.nodes.some(n => n.id === ${JSON.stringify(target)})`;
+  assert.equal(await mode(), 'false');
+  assert.equal(await send(1), 2);
+  assert.deepEqual(await bookmarks(), []);
+  assert.equal(await br.evaluate(onCanvas), false);
+  await arm();
+  assert.equal(await mode(), 'true');
+  assert.equal(await send(2), 0);
+  await br.waitFor(onCanvas);
+  assert.deepEqual(await bookmarks(), ['one-turn-2']);
+  assert.equal(await mode(), 'false');
+  assert.equal(await send(3), 2);
+  assert.deepEqual(await bookmarks(), ['one-turn-2']);
+  const oldChat = await br.evaluate("document.getElementById('aiChatSelect').value");
+  await arm();
+  await br.evaluate("document.getElementById('aiNewChat').click()");
+  assert.equal(await mode(), 'false');
+  await arm();
+  await br.evaluate(`const select = document.getElementById('aiChatSelect');
+    select.value = ${JSON.stringify(oldChat)}; select.dispatchEvent(new Event('change'))`);
+  assert.equal(await mode(), 'false');
 });
 
 test('中断已落盘的助手改图仍可撤销，安全重试和只读模式隔离工程与会话', async t => {
@@ -3445,6 +3496,10 @@ test('中断已落盘的助手改图仍可撤销，安全重试和只读模式�
   const read = { turnId: 'readonly-inspection', threadId: 'work', accessMode: 'read' };
   const events = await run(payload.prompt, read);
   assert.ok(events.some(ev => ev.type === 'tool_end' && ev.blocked));
+  assert.ok(events.some(ev => ev.type === 'tool_end' && ev.summary.includes('未修改画布或书签')));
+  const escalated = await post('/api/ai/chat', { ...read, prompt: payload.prompt,
+    accessMode: 'edit', turnId: 'read-retry-as-edit', retryOf: read.turnId });
+  assert.equal(escalated.status, 409);
   assert.equal((await status(read)).canRetry, true);
   assert.equal((await bookmarks()).length, original.length + 1);
   assert.ok((await (await post('/api/ai/undo-changeset', { changesetId: result.changeset.id })).json()).ok);

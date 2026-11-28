@@ -145,19 +145,19 @@ const BOOKMARK_COMMAND = '/bookmark';
 const DEFAULT_CONTEXT_WINDOW = 32768;
 const DEFAULT_MAX_TOKENS = 8192;
 
-const LABELS_FOLLOWUP = { label: 'ai.follow.labels', prompt: 'ai.quickPrompt.labels' };
+const LABELS_FOLLOWUP = { label: 'ai.follow.labels', prompt: 'ai.quickPrompt.labels', edit: true };
 const FOLLOWUPS = new Map([
   ['add_to_canvas', [
     LABELS_FOLLOWUP,
-    { label: 'ai.follow.tidy', prompt: 'ai.action.tidy' },
+    { label: 'ai.follow.tidy', prompt: 'ai.action.tidy', edit: true },
     { label: 'ai.follow.bookmark', draft: BOOKMARK_COMMAND + ' ' },
   ]],
   ['get_git_changes', [
-    { label: 'ai.follow.split', prompt: 'ai.action.split' },
+    { label: 'ai.follow.split', prompt: 'ai.action.split', edit: true },
     { label: 'ai.follow.variants', prompt: 'ai.action.variants' },
   ]],
   ['apply_labels', [
-    { label: 'ai.follow.shared', prompt: 'ai.action.shared' },
+    { label: 'ai.follow.shared', prompt: 'ai.action.shared', edit: true },
     { label: 'ai.follow.git', prompt: 'ai.action.git' },
   ]],
   ['remove_from_canvas', [
@@ -167,31 +167,31 @@ const FOLLOWUPS = new Map([
   ['read_function', [
     { label: 'ai.follow.tasks', prompt: 'ai.action.tasks' },
     { label: 'ai.follow.indirect', prompt: 'ai.action.indirect' },
-    { label: 'ai.follow.functions', prompt: 'ai.action.functions' },
+    { label: 'ai.follow.functions', prompt: 'ai.action.functions', edit: true },
   ]],
   ['read_source', [
-    { label: 'ai.follow.verifyEdges', prompt: 'ai.action.verifyEdges' },
+    { label: 'ai.follow.verifyEdges', prompt: 'ai.action.verifyEdges', edit: true },
     { label: 'ai.follow.callers', prompt: 'ai.action.callers' },
   ]],
   ['inspect_indirect_calls', [
-    { label: 'ai.follow.addEdges', prompt: 'ai.action.addEdges' },
+    { label: 'ai.follow.addEdges', prompt: 'ai.action.addEdges', edit: true },
     { label: 'ai.follow.dispatch', prompt: 'ai.action.dispatch' },
   ]],
   ['add_call_edge', [
     { label: 'ai.follow.retrace', prompt: 'ai.action.retrace' },
-    { label: 'ai.follow.layout', prompt: 'ai.action.layout' },
+    { label: 'ai.follow.layout', prompt: 'ai.action.layout', edit: true },
   ]],
   ['trace_upstream', [
-    { label: 'ai.follow.addChain', prompt: 'ai.action.addChain' },
+    { label: 'ai.follow.addChain', prompt: 'ai.action.addChain', edit: true },
     { label: 'ai.follow.missing', prompt: 'ai.action.missing' },
   ]],
   ['find_symbols', [
-    { label: 'ai.follow.matches', prompt: 'ai.action.matches' },
+    { label: 'ai.follow.matches', prompt: 'ai.action.matches', edit: true },
     { label: 'ai.follow.source', prompt: 'ai.action.source' },
   ]],
   ['arrange_canvas', [
-    { label: 'ai.follow.vertical', prompt: 'ai.action.vertical' },
-    { label: 'ai.follow.reset', prompt: 'ai.action.reset' },
+    { label: 'ai.follow.vertical', prompt: 'ai.action.vertical', edit: true },
+    { label: 'ai.follow.reset', prompt: 'ai.action.reset', edit: true },
   ]],
 ]);
 
@@ -232,6 +232,7 @@ let chatProjectId = null;
 let chatProjectName = '';
 let chatThreads = []; // [{ id, title, customTitle?, bookmarkId?, bookmarkName?, updatedAt, messages }]
 let activeChatId = '';
+let composerAccess = 'read';
 let renamingThread = null;
 let activeAbort = null;
 let pendingSteer = null;
@@ -320,6 +321,7 @@ function newThreadObject(title = NEW_THREAD_TITLE, bm = state.activeBookmark) {
 
 function setActiveChat(id) {
   if (id !== activeChatId) {
+    composerAccess = 'read';
     stickToBottom = true;
     if (restoredTurn && restoredTurn.threadId !== id) {
       inputEl.value = '';
@@ -616,14 +618,15 @@ function acceptGhostSuggestion() {
   return true;
 }
 
-let composerAccess = 'edit';
 const accessBtn = document.getElementById('aiAccessMode');
 function renderAccess() {
   const restored = restoredTurn?.threadId === activeChatId && restoredTurn?.projectId === chatProjectId ? restoredTurn : null;
-  const readOnly = (restored?.accessMode || composerAccess) === 'read';
-  accessBtn.disabled = Boolean(restored);
-  accessBtn.textContent = t(readOnly ? 'ai.access.read' : 'ai.access.edit');
-  accessBtn.setAttribute('aria-pressed', String(readOnly));
+  const locked = restored?.accessMode === 'read';
+  const allowEdits = !locked && composerAccess === 'edit';
+  accessBtn.disabled = locked || !activeChatId || chatProjectId == null || chatProjectId !== state.view?.projectId;
+  accessBtn.textContent = t(allowEdits ? 'ai.access.edit' : 'ai.access.read');
+  accessBtn.setAttribute('aria-pressed', String(allowEdits));
+  accessBtn.title = t(locked ? 'ai.recovery.readDraft' : 'ai.access.hint');
 }
 accessBtn.addEventListener('click', () => {
   composerAccess = composerAccess === 'read' ? 'edit' : 'read';
@@ -955,7 +958,7 @@ function sanitizeSuggestions(raw) {
 
 function translateFollowup(option) {
   return option.draft ? { label: t(option.label), draft: option.draft }
-    : { label: t(option.label), prompt: t(option.prompt) };
+    : { label: t(option.label), prompt: t(option.prompt), edit: option.edit };
 }
 
 function buildFallbackFollowups(message) {
@@ -1018,7 +1021,7 @@ function renderFollowups(box, message, thread) {
         prefillPrompt(option.draft);
         if (option.draft.startsWith(BOOKMARK_COMMAND)) setChatStatus(() => t('ai.bookmarkEnter'));
       } else {
-        void sendPrompt(option.prompt);
+        void sendPrompt(option.prompt, undefined, !isDynamic && option.edit ? { accessMode: 'edit' } : {});
       }
     });
     chips.appendChild(button);
@@ -1854,8 +1857,11 @@ function renderEvidence(box, evidence) {
 function updateInvestigateSummary(inv, tools = [], running = false) {
   const summary = inv?.querySelector('summary');
   if (!summary) return;
-  const counts = { read: 0, edit: 0, failed: 0, other: 0 };
-  for (const tool of tools) counts[tool.ok === false ? 'failed' : tool.access || 'other']++;
+  const counts = { read: 0, edit: 0, blocked: 0, failed: 0, other: 0 };
+  for (const tool of tools) {
+    if (tool.blocked && tool.access === 'edit') counts.blocked++;
+    else counts[tool.ok === false ? 'failed' : tool.access || 'other']++;
+  }
   const parts = Object.entries(counts).filter(([, n]) => n).map(([key, n]) => t('ai.tools.' + key, { n }));
   if (running) parts.push(t('ai.tools.active'));
   summary.textContent = parts.join(' · ') || t('ai.investigation');
@@ -1960,7 +1966,7 @@ function renderChainCards(box, chains) {
     addBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const targetIds = nodeIds.slice(0, 6);
-      void sendPrompt(t('ai.addChainPrompt', { ids: targetIds.join(', ') }));
+      void sendPrompt(t('ai.addChainPrompt', { ids: targetIds.join(', ') }), undefined, { accessMode: 'edit' });
     });
 
     actions.append(hlBtn, flowBtn, addBtn);
@@ -2090,6 +2096,7 @@ function restoreInputs(original, source, recovery, thread, canRetry) {
   for (const item of items) pinSelectionSnapshot(item, { quiet: true });
   selectedRelationIntent = source?.uiContext?.relationIntent || 'auto';
   inputEl.value = original.text;
+  composerAccess = 'read';
   restoredTurn = { threadId: thread.id, projectId: chatProjectId, draft: original.text, accessMode: canRetry ? recovery.mode : 'read',
     ...(canRetry ? { retryOf: recovery.turnId } : {}) };
   renderSelectionBar();
@@ -2123,7 +2130,8 @@ function renderRecovery(box, entry, thread, original = thread.messages[thread.me
   const action = document.createElement('button');
   action.type = 'button';
   action.dataset.recovery = retry ? 'retry' : 'inspect';
-  action.textContent = t(retry ? 'ai.recovery.retry' : 'ai.recovery.inspect');
+  const retryLabel = recovery.mode === 'edit' ? 'ai.recovery.retryEdit' : 'ai.recovery.retry';
+  action.textContent = t(retry ? retryLabel : 'ai.recovery.inspect');
   const project = chatProjectId;
   const current = () => !activeAbort && !compacting && project === chatProjectId && activeThread() === thread;
   action.onclick = async () => {
@@ -2281,6 +2289,7 @@ async function loadProjectChats({ force = false } = {}) {
     const res = await api.aiChats();
     if (gen !== chatGeneration || mutation !== chatMutation || !res?.ok) return;
     const projectId = res.projectId ?? currentId;
+    if (projectId !== chatProjectId) composerAccess = 'read';
     const previousThreads = projectId === chatProjectId ? chatThreads : [];
     chatProjectId = projectId;
     chatProjectName = res.projectName || '';
@@ -2614,7 +2623,7 @@ function finishStep(row, tool) {
   const cls = tool.ok !== false ? 'ok' : (tool.blocked ? 'blocked' : 'err');
   row.classList.add(cls);
   const head = row.querySelector('.ai-step-head');
-  const label = tool.blocked ? t('ai.toolPending', { name: tool.name }) : tool.name;
+  const label = tool.blocked ? t('ai.toolBlocked', { name: tool.name }) : tool.name;
   head.textContent = head.title = [label, tool.target].filter(Boolean).join(' · ');
   if (tool.summary) {
     const result = document.createElement('div');
@@ -2716,12 +2725,18 @@ async function saveViewBookmark(name) {
 }
 
 async function sendPrompt(rawText, uiContext = currentUiContext(), options = {}) {
-  const restoring = !options.original && restoredTurn?.projectId === chatProjectId &&
-    restoredTurn?.threadId === activeChatId ? restoredTurn : null;
-  if (restoring && (!restoring.retryOf || (rawText ?? inputEl.value).trim() === restoring.draft)) options = { ...restoring, ...options };
-  const accessMode = options.accessMode ?? composerAccess;
   const rawInput = String(rawText ?? inputEl.value).trim();
   if (!rawInput) return;
+  const submittedProjectId = state.view?.projectId ?? chatProjectId;
+  if (chatProjectId != null && chatProjectId !== submittedProjectId) return;
+  const submittedThreadId = activeChatId;
+  const restored = !options.original && !options.queued && restoredTurn?.projectId === chatProjectId &&
+    restoredTurn?.threadId === submittedThreadId ? restoredTurn : null;
+  const restoring = rawText == null ? restored : null;
+  const accessMode = restored?.accessMode === 'read' ? 'read' : options.accessMode ?? composerAccess;
+  if (restoring?.retryOf && restoring.accessMode === accessMode && rawInput === restoring.draft) {
+    options = { ...options, retryOf: restoring.retryOf };
+  }
   closeSlashMenu();
   if (rawInput === '/new' || rawInput === '/clear') {
     pendingSteer = null;
@@ -2747,10 +2762,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       setChatStatus(() => t('ai.waitBookmark'));
       return;
     }
-    if (accessMode === 'read') {
-      setChatStatus(() => t('ai.access.read'), true);
+    // A named command submitted in the composer saves exactly that bookmark without an AI turn.
+    if (accessMode === 'read' && (rawText != null || restoring)) {
+      setChatStatus(() => t(restored ? 'ai.recovery.readDraft' : 'ai.bookmarkEnter'), true);
       return;
     }
+    composerAccess = 'read';
+    renderAccess();
     await saveViewBookmark(rawInput.slice(BOOKMARK_COMMAND.length).trim());
     return;
   }
@@ -2778,12 +2796,14 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
   if (activeAbort) {
     pendingSteer = {
       text: rawInput,
-      options: { ...options, accessMode },
+      options: { ...options, accessMode, queued: true },
       uiContext,
       threadId: activeChatId,
       projectId: chatProjectId,
       gen: chatGeneration,
     };
+    composerAccess = 'read';
+    renderAccess();
     inputEl.value = '';
     setChatStatus(() => t('ai.steering'));
     activeAbort.abort();
@@ -2794,9 +2814,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
     setApiStatus(() => t('ai.api.required'), true);
     return;
   }
-  const submittedProjectId = state.view?.projectId ?? chatProjectId;
   if (!(await ensureChatProject()) || activeAbort || compacting ||
-      (submittedProjectId !== null && submittedProjectId !== chatProjectId)) return;
+      (submittedProjectId !== null && submittedProjectId !== chatProjectId) ||
+      (submittedThreadId && submittedThreadId !== activeChatId)) return;
+  // A queued instruction already consumed its grant when the user submitted it.
+  if (!options.queued) composerAccess = 'read';
   const thread = activeThread();
   const threadId = thread.id;
   const myProjectId = chatProjectId;
@@ -2991,7 +3013,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       renderRecovery(ui.box, entry, thread);
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
       if (!steering && partial) setChatStatus(message, !stopped);
-      if (!steering && status.canRetry && !inputEl.value && !entry.recovery.hasContext &&
+      if (!steering && status.canRetry && composerAccess === 'read' && !inputEl.value && !entry.recovery.hasContext &&
           !pendingImages.length && !pendingFiles.length && !pinnedSelections.length) {
         inputEl.value = rawInput;
         restoredTurn = { threadId, projectId: myProjectId, accessMode, retryOf: turnId, draft: rawInput };
@@ -3276,12 +3298,13 @@ document.addEventListener('cg:ask-ai', async (event) => {
   if (selection?.kind) pinSelectionSnapshot(selection, { quiet: true });
   const uiContext = currentUiContext();
   const projectId = state.view?.projectId;
+  const threadId = activeChatId;
   const configLoad = showDrawer();
   setTab('chat');
   inputEl.focus({ preventScroll: true });
   if (typeof prompt !== 'string' || !prompt.trim()) return;
   await configLoad;
-  if (!drawer.classList.contains('show') || state.view?.projectId !== projectId) return;
+  if (!drawer.classList.contains('show') || state.view?.projectId !== projectId || (threadId && activeChatId !== threadId)) return;
   if (activeAbort || compacting || !llmConfig.baseUrl || !llmConfig.model) {
     prefillPrompt(prompt);
   } else {
@@ -3613,9 +3636,11 @@ document.addEventListener('cg:project-changed', () => {
   chatGeneration++;
   if (restoredTurn) inputEl.value = '';
   restoredTurn = null;
+  composerAccess = 'read';
   chatProjectId = null;
   chatThreads = [];
   setActiveChat('');
+  renderAccess();
   renameChatBtn.disabled = true;
   pendingSteer = null;
   compacting?.abort();
@@ -3716,7 +3741,7 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
     } else if (kind === 'find') {
       prefillPrompt(t('ai.findDraft'));
     } else if (kind === 'labels') {
-      sendPrompt(t('ai.quickPrompt.labels'));
+      sendPrompt(t('ai.quickPrompt.labels'), undefined, { accessMode: 'edit' });
     } else if (kind === 'build') {
       sendPrompt(t('ai.quickPrompt.build'));
     }
