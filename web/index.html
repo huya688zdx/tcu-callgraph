@@ -982,15 +982,18 @@
   }
   .orphan-head button { flex: 0 0 auto; }
 
-  /* ---- 右侧悬浮 AI 助手抽屉（不遮挡画布，支持边聊边看节点实时入图） ---- */
   #aiDrawer {
-    position: fixed; top: max(8px, min(calc(var(--toolbar-height, 44px) + 8px), 25vh, calc(100vh - 28rem)));
-    right: 12px; bottom: 12px; width: 460px; max-width: calc(100vw - 24px);
-    z-index: 45; display: none; flex-direction: column;
-    background: #FFFFFF; border: 1px solid rgba(31, 31, 29, 0.12); border-radius: 14px;
-    box-shadow: 0 18px 44px rgba(24, 24, 22, 0.14), 0 2px 8px rgba(24, 24, 22, 0.06);
-    overflow: hidden; contain: layout style paint; container: ai-drawer / inline-size; transform: translateZ(0);
+    grid-area: right; position: relative; min-width: 0; min-height: 0;
+    display: none; flex-direction: column; background: #fff; border-inline-start: 1px solid var(--border);
+    overflow: hidden; container: ai-drawer / inline-size;
   }
+  @media (min-width: 901px) {
+    #app:has(> #aiDrawer.show) {
+      grid-template-columns: min(16vw, 216px) minmax(0, 1fr) clamp(340px, var(--ai-dock-width, 420px), min(43vw, calc(100vw - min(16vw, 216px) - 460px)));
+    }
+  }
+  #aiDrawer.show ~ #right { display: none; }
+  .ai-canvas-label { display: none; }
   #aiDrawer.resizing { user-select: none; transition: none; }
   .ai-resize-handle {
     position: absolute; top: 0; left: 0; bottom: 0; width: 7px; z-index: 8;
@@ -1004,16 +1007,15 @@
   }
   .ai-resize-handle:hover, #aiDrawer.resizing .ai-resize-handle { background: rgba(24, 95, 165, 0.08); }
   .ai-resize-handle:hover::after, #aiDrawer.resizing .ai-resize-handle::after { opacity: 1; background: #185FA5; }
-  @media (max-width: 480px) {
-    .ai-resize-handle { display: none; }
-  }
-  #aiDrawer.show { display: flex; animation: aiDrawerIn .18s cubic-bezier(.16, 1, .3, 1); }
-  @keyframes aiDrawerIn {
-    from { opacity: 0; transform: translateX(8px) scale(.99); }
-    to { opacity: 1; transform: translateX(0) scale(1); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    #aiDrawer.show { animation: none; }
+  #aiDrawer.show { display: flex; }
+  @media (max-width: 900px) {
+    /* Keep the hidden canvas measurable for snapshots and preserve its camera. */
+    #app:has(> #aiDrawer.show) > :is(header, main, #left, #right) { visibility: hidden; }
+    #aiDrawer.show ~ #right { display: block; }
+    #aiDrawer.show { position: fixed; inset: 0; z-index: 45; height: 100dvh; border: 0; }
+    .ai-resize-handle, .ai-close-x { display: none; }
+    .ai-canvas-label { display: inline; }
+    #aiDrawer.show .ai-drawer-close { min-width: fit-content; width: auto; padding-inline: 8px; font-size: 12px; }
   }
   #aiDrawer .ai-scroll::-webkit-scrollbar,
   #aiDrawer .ai-think pre::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -1285,6 +1287,14 @@
     padding: 7px 12px; border-top: 1px solid #E1ECF6; background: #F7FAFD; flex-shrink: 0;
     max-height: min(176px, 34vh); overflow-y: auto;
   }
+  #aiSelectionBar { padding: 0 10px; gap: 0; max-height: min(210px, 36vh); }
+  .ai-context-line { display: flex; align-items: center; gap: 6px; min-height: 37px; }
+  #aiCandidatePill { flex: 0 1 auto; min-width: 0; }
+  #aiCandidatePill[hidden], #aiContextDetails[hidden] { display: none; }
+  #aiContextToggle { margin-inline-start: auto; display: inline-flex; align-items: center; gap: 5px; flex: none;
+    background: transparent; border: 0; color: #425c75; }
+  #aiContextToggle[aria-expanded="true"] > span:last-child { transform: rotate(180deg); }
+  #aiContextDetails { display: flex; flex-direction: column; gap: 5px; padding-bottom: 7px; }
   .ai-selection-bar[hidden] { display: none; }
   .ai-selection-bar > * { flex-shrink: 0; }
   .ai-pinned-list {
@@ -1856,11 +1866,14 @@
     .ai-tabs { grid-row: 2; grid-column: 1 / -1; margin: 0; flex-wrap: wrap; }
     #aiDrawer .ai-tab { flex: 1 0 auto; padding-inline: 6px; }
     .ai-drawer-close { grid-row: 1; grid-column: 2; }
-    .ai-composer-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+    .ai-composer-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-areas: "model model reasoning" "mode attach actions"; align-items: center; }
     .ai-composer-controls { display: contents; }
-    .ai-composer-controls .fsel:has(#aiQuickModel) { min-width: 0; max-width: none; }
-    .ai-composer-controls .fsel:has(#aiQuickReasoning) { justify-self: end; }
-    #aiAttachShot { justify-self: start; }
+    .ai-composer-controls .fsel:has(#aiQuickModel) { grid-area: model; min-width: 0; max-width: none; }
+    .ai-composer-controls .fsel:has(#aiQuickReasoning) { grid-area: reasoning; justify-self: end; }
+    #aiAccessMode { grid-area: mode; justify-self: start; }
+    #aiAttachShot { grid-area: attach; }
+    .ai-composer-actions { grid-area: actions; justify-self: end; }
     .ai-banner, .ai-chain-head, .ai-pres-head, #aiBookmarkBanner .ai-bm-banner-actions { flex-wrap: wrap; }
     .ai-banner > span:first-child { flex: 1 1 12em; overflow-wrap: anywhere; }
   }
@@ -1933,7 +1946,7 @@
           </div>
         </details>
         <button id="styleBtn" data-i18n="btn.style" title="调整默认显示名称与画布样式" data-i18n-title="toolbar.styleHint">设置</button>
-        <button id="aiBtn" title="内置 AI 助手与 MCP 设置" data-i18n-title="btn.ai" data-i18n="ai.assistantTitle">AI 助手</button>
+        <button id="aiBtn" aria-controls="aiDrawer" aria-expanded="false" title="内置 AI 助手与 MCP 设置" data-i18n-title="btn.ai" data-i18n="ai.assistantTitle">AI 助手</button>
         <details class="tool-menu" id="helpMenu">
           <summary id="helpSummary" data-i18n="toolbar.help">操作说明</summary>
           <div class="tool-popover help-popover" tabindex="0" role="region" aria-labelledby="helpSummary">
@@ -1982,7 +1995,7 @@
   </aside>
 
   <main>
-    <canvas id="cv"></canvas>
+    <canvas id="cv" tabindex="-1"></canvas>
     <section id="canvasEmptyGuide" aria-labelledby="canvasEmptyTitle" hidden>
       <h2 id="canvasEmptyTitle" data-i18n="canvas.emptyTitle">当前画布为空</h2>
       <p data-i18n="canvas.emptyHint">从左侧文件树或搜索框选择函数加入画布，或通过「工程比较」自动生成变更影响图。</p>
@@ -2385,7 +2398,7 @@
   </div>
 
   <div id="aiDrawer" aria-label="AI 助手" data-i18n-aria-label="ai.assistantTitle">
-    <div id="aiResizeHandle" class="ai-resize-handle" title="左右拖动调整 AI 助手宽度（双击恢复默认）" data-i18n-title="ai.resizeHint" aria-label="调整 AI 助手宽度" data-i18n-aria-label="ai.resize" role="separator" aria-orientation="vertical"></div>
+    <div id="aiResizeHandle" class="ai-resize-handle" title="左右拖动调整 AI 助手宽度（双击恢复默认）" data-i18n-title="ai.resizeHint" aria-label="调整 AI 助手宽度" data-i18n-aria-label="ai.resize" role="separator" aria-orientation="vertical" tabindex="0"></div>
     <div class="ai-drawer-head">
       <h2 data-i18n="ai.assistantTitle">AI 助手</h2>
       <div class="ai-tabs" role="tablist">
@@ -2394,7 +2407,7 @@
         <button type="button" class="ai-tab" data-ai-tab="mcp" data-i18n="ai.tabMcp">外部 MCP</button>
         <button type="button" class="ai-tab" data-ai-tab="guide" id="aiGuideTab" data-i18n="ai.tabGuide">? 指南</button>
       </div>
-      <button type="button" id="aiDrawerClose" class="ai-drawer-close" aria-label="关闭" data-i18n-aria-label="common.close">&times;</button>
+      <button type="button" id="aiDrawerClose" class="ai-drawer-close" aria-label="返回画布" data-i18n-aria-label="ai.showCanvas"><span class="ai-close-x" aria-hidden="true">&times;</span><span class="ai-canvas-label" data-i18n="ai.showCanvas">返回画布</span></button>
     </div>
 
     <section class="ai-pane" id="aiPaneChat">
@@ -2433,29 +2446,34 @@
         </div>
       </div>
       <div class="ai-selection-bar" id="aiSelectionBar" role="group" aria-label="画布选区" data-i18n-aria-label="ai.selection" hidden>
-        <div class="ai-pinned-list" id="aiPinnedList" hidden></div>
-        <div class="ai-relation-bar" id="aiRelationBar" hidden>
-          <span class="ai-relation-label" data-i18n="ai.relation">多选关系：</span>
-          <button type="button" class="ai-rel-btn on" data-ai-rel="auto" data-i18n="common.ready">自动</button>
-          <button type="button" class="ai-rel-btn" data-ai-rel="compare" data-i18n="ai.rel.compare">对比差异</button>
-          <button type="button" class="ai-rel-btn" data-ai-rel="path" data-i18n="ai.rel.path">调用通路</button>
-          <button type="button" class="ai-rel-btn" data-ai-rel="dataflow" data-i18n="ai.rel.dataflow">读写数据流</button>
-          <button type="button" class="ai-rel-btn" data-ai-rel="common_callers" data-i18n="ai.rel.common">公共调用者</button>
-        </div>
-        <div class="ai-selection-row" id="aiSelectionRow">
-          <div class="ai-trunk-switch" id="aiTrunkSwitch" hidden>
-            <span class="ai-trunk-badge" id="aiTrunkBadge"></span>
-            <select id="aiTrunkSelect" class="ai-trunk-select" aria-label="切换共线分支" data-i18n-aria-label="ai.trunkSelect"></select>
-            <button type="button" id="aiTrunkPrev" class="ai-trunk-step" title="上一条共线分支" data-i18n-title="ai.trunkPrev">◀</button>
-            <button type="button" id="aiTrunkNext" class="ai-trunk-step" title="下一条共线分支" data-i18n-title="ai.trunkNext">▶</button>
-          </div>
-          <div class="ai-selection-pill">
+        <div class="ai-context-line">
+          <div class="ai-selection-pill" id="aiCandidatePill">
             <span class="ai-cand-tag" data-i18n="ai.candidate">候选</span>
             <span id="aiSelectionText"></span>
             <button type="button" id="aiPinSelection" aria-label="将画布候选加入本轮对话上下文" data-i18n-aria-label="ai.attachCandidate" title="加入本轮对话上下文 (Alt+A)，只有加入后的芯片才随发送进入模型" data-i18n-title="ai.attachCandidateHint">+</button>
             <button type="button" id="aiClearSelection" aria-label="移除画布候选" data-i18n-aria-label="ai.removeCandidate" title="隐藏当前画布候选" data-i18n-title="ai.hideCandidate">&times;</button>
           </div>
-          <div class="ai-selection-questions" id="aiSelectionQuestions"></div>
+          <button type="button" id="aiContextToggle" aria-expanded="false" aria-controls="aiContextDetails" title="展开或收起上下文操作" data-i18n-title="ai.contextToggle" aria-label="展开或收起上下文操作" data-i18n-aria-label="ai.contextToggle"><span id="aiContextCount"></span><span aria-hidden="true">⌄</span></button>
+        </div>
+        <div id="aiContextDetails" hidden>
+          <div class="ai-pinned-list" id="aiPinnedList" hidden></div>
+          <div class="ai-relation-bar" id="aiRelationBar" hidden>
+            <span class="ai-relation-label" data-i18n="ai.relation">多选关系：</span>
+            <button type="button" class="ai-rel-btn on" data-ai-rel="auto" data-i18n="common.ready">自动</button>
+            <button type="button" class="ai-rel-btn" data-ai-rel="compare" data-i18n="ai.rel.compare">对比差异</button>
+            <button type="button" class="ai-rel-btn" data-ai-rel="path" data-i18n="ai.rel.path">调用通路</button>
+            <button type="button" class="ai-rel-btn" data-ai-rel="dataflow" data-i18n="ai.rel.dataflow">读写数据流</button>
+            <button type="button" class="ai-rel-btn" data-ai-rel="common_callers" data-i18n="ai.rel.common">公共调用者</button>
+          </div>
+          <div class="ai-selection-row" id="aiSelectionRow">
+            <div class="ai-trunk-switch" id="aiTrunkSwitch" hidden>
+              <span class="ai-trunk-badge" id="aiTrunkBadge"></span>
+              <select id="aiTrunkSelect" class="ai-trunk-select" aria-label="切换共线分支" data-i18n-aria-label="ai.trunkSelect"></select>
+              <button type="button" id="aiTrunkPrev" class="ai-trunk-step" title="上一条共线分支" data-i18n-title="ai.trunkPrev">◀</button>
+              <button type="button" id="aiTrunkNext" class="ai-trunk-step" title="下一条共线分支" data-i18n-title="ai.trunkNext">▶</button>
+            </div>
+            <div class="ai-selection-questions" id="aiSelectionQuestions"></div>
+          </div>
         </div>
       </div>
       <div class="ai-composer">

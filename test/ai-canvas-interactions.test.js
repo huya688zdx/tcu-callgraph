@@ -335,3 +335,44 @@ test('浏览器延迟书签保存回复时保留当前画布绑定', async t => 
     assert.ok(received.unchangedBinding, '过期回复不能重新绑定同一 ID 的新视图');
   });
 });
+
+test('助手停靠时留出真实画布，窄窗符号定位切回目标且保留草稿', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const srv = await launchServer();
+  t.after(srv.close);
+  const post = (url, data) => fetch(srv.baseUrl + url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+  });
+  const id = 'gear.c::Gear_Init';
+  await post('/api/page', { roots: [id], up: 0, down: 1 });
+  await post('/api/ai/config', { baseUrl: srv.baseUrl, model: 'local-fixture' });
+  await post('/api/ai/chats', { activeId: 'dock', threads: [{ id: 'dock', messages: [
+    { role: 'assistant', text: '`gear.c::Gear_Init`' },
+  ] }] });
+  const br = await launchCdp({ url: srv.baseUrl });
+  t.after(() => br.close());
+  const width = width => br.send('Emulation.setDeviceMetricsOverride', { width, height: 800, deviceScaleFactor: 1, mobile: false });
+  await width(1024);
+  await br.waitFor('Boolean(window.__cg?.view?.nodes.length)');
+  await br.evaluate("document.getElementById('aiBtn').click()");
+  await br.waitFor("document.querySelector('[data-ai-sym]')?.getClientRects().length");
+  const bounds = await br.evaluate(`(() => {
+    const cv = document.querySelector('#cv').getBoundingClientRect();
+    const drawer = document.querySelector('#aiDrawer').getBoundingClientRect();
+    return [cv.width, cv.right, drawer.left, document.documentElement.scrollWidth];
+  })()`);
+  assert.ok(bounds[0] >= 460 && bounds[1] <= bounds[2]);
+  assert.equal(bounds[3], 1024);
+  await width(390);
+  await br.evaluate(`document.querySelector('#aiPromptInput').value = '尚未发送';
+    document.querySelector('[data-ai-sym]').click()`);
+  await br.waitFor(`(async () => {
+    const { state, cam } = await import('/lib/state.js');
+    const n = state.view.nodes.find(item => item.id === state.selected);
+    const cv = document.querySelector('#cv'), r = cv.getBoundingClientRect();
+    return n?.id === 'gear.c::Gear_Init' && !document.querySelector('#aiDrawer.show') &&
+      document.elementFromPoint(r.x + cam.x + (n.x + n.w / 2) * cam.k, r.y + cam.y + (n.y + n.h / 2) * cam.k) === cv;
+  })()`);
+  await br.evaluate("document.querySelector('#aiBtn').click()");
+  assert.ok(await br.evaluate("document.querySelector('#aiPromptInput').value === '尚未发送' && Boolean(document.querySelector('[data-ai-sym]'))"));
+});

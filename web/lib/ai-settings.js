@@ -686,6 +686,7 @@ function isClickableSymbolToken(raw) {
 function locateSymbolFromChat(rawSym) {
   const clean = String(rawSym || '').trim().replace(/\(\s*\)$/, '');
   if (!clean) return;
+  revealCanvas();
   const node = findCanvasNodeBySymbol(clean);
   if (node) {
     selectNode(node.id);
@@ -1149,10 +1150,23 @@ function selectTrunkBranchAt(index) {
   }
 }
 
+const contextToggle = document.getElementById('aiContextToggle');
+const contextDetails = document.getElementById('aiContextDetails');
+contextToggle.addEventListener('click', () => {
+  contextDetails.hidden = !contextDetails.hidden;
+  contextToggle.setAttribute('aria-expanded', String(!contextDetails.hidden));
+});
+
 function renderSelectionBar() {
   const hasPinned = pinnedSelections.length > 0;
   const hasActive = Boolean(canvasSelection);
   selectionBar.hidden = !hasPinned && !hasActive;
+  document.getElementById('aiCandidatePill').hidden = !hasActive;
+  document.getElementById('aiContextCount').textContent = hasPinned ? t('ai.contextCount', { n: pinnedSelections.length }) : '';
+  if (selectionBar.hidden) {
+    contextDetails.hidden = true;
+    contextToggle.setAttribute('aria-expanded', 'false');
+  }
 
   if (pinnedListEl) {
     pinnedListEl.hidden = !hasPinned;
@@ -1923,6 +1937,7 @@ function renderChainCards(box, chains) {
     hlBtn.title = t('ai.highlightHint');
     hlBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      revealCanvas();
       state.aiOverlay = { action: 'highlight', nodeIds, edgeKeys, label: chain.title || t('ai.pathHighlight') };
       draw();
     });
@@ -1933,6 +1948,7 @@ function renderChainCards(box, chains) {
     flowBtn.title = t('ai.animateHint');
     flowBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      revealCanvas();
       state.aiOverlay = { action: 'play_flow', nodeIds, edgeKeys, label: chain.title || t('ai.flowAnimation') };
       draw();
     });
@@ -1995,7 +2011,7 @@ function renderPresCard(box, pres) {
   const startBtn = document.createElement('button');
   startBtn.type = 'button';
   startBtn.textContent = t('ai.startWalkthrough');
-  startBtn.addEventListener('click', () => activatePresentation(pres, 0));
+  startBtn.addEventListener('click', () => { revealCanvas(); activatePresentation(pres, 0); });
   head.append(title, startBtn);
   const ol = document.createElement('ol');
   ol.className = 'ai-pres-steps';
@@ -3204,12 +3220,30 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
   }
 }
 
+const singlePane = window.matchMedia('(max-width: 900px)');
+
+function closeDrawer() {
+  drawer.classList.remove('show');
+  btn.setAttribute('aria-expanded', 'false');
+  btn.focus({ preventScroll: true });
+}
+
+function revealCanvas() {
+  if (!singlePane.matches || !drawer.classList.contains('show')) return;
+  closeDrawer();
+  const canvas = document.getElementById('cv');
+  canvas.scrollIntoView({ block: 'nearest' });
+  canvas.focus({ preventScroll: true });
+}
+
 function showDrawer(showSetup = false) {
   if (drawer.classList.contains('show')) return apiConfigLoad;
   drawer.classList.add('show');
+  btn.setAttribute('aria-expanded', 'true');
+  if (singlePane.matches) closeBtn.focus({ preventScroll: true });
   showApiOnOpen = showSetup;
   followChatScroll();
-  void loadProjectChats({ force: true });
+  void loadProjectChats();
   if (!apiConfigLoad) {
     const previousConfig = llmConfig;
     apiConfigLoad = api.aiConfig().catch(() => null).then((result) => {
@@ -3657,17 +3691,17 @@ if (deleteChatBtn) deleteChatBtn.addEventListener('click', async () => {
 });
 
 if (btn) btn.addEventListener('click', () => {
-  if (drawer.classList.contains('show')) drawer.classList.remove('show');
+  if (drawer.classList.contains('show')) closeDrawer();
   else void showDrawer(true);
 });
-if (closeBtn) closeBtn.addEventListener('click', () => drawer?.classList.remove('show'));
+if (closeBtn) closeBtn.addEventListener('click', closeDrawer);
 // 隔离抽屉内按键事件，防止 F / Delete / Esc 误触画布快捷键
 if (drawer) drawer.addEventListener('keydown', (e) => {
   e.stopPropagation();
   if (e.key === 'Escape') {
     if (lightboxEl && !lightboxEl.hidden) { closeImageLightbox(); return; }
     if (attachMenuEl && !attachMenuEl.hidden) { closeAttachMenu(); return; }
-    drawer.classList.remove('show');
+    closeDrawer();
   }
 });
 for (const tab of tabs) tab.addEventListener('click', () => setTab(tab.dataset.aiTab));
@@ -3891,66 +3925,58 @@ if (saveBtn)
     }
   });
 
-// AI 抽屉左侧拖拽调宽（记住宽度并在窄窗自动收拢，双击恢复默认 460px）
+// Size the dock's grid track. The canvas ResizeObserver redraws at its new size.
 const AI_DRAWER_WIDTH_KEY = 'cg.aiDrawerWidth';
-const AI_DRAWER_DEFAULT_WIDTH = 460;
-const AI_DRAWER_MIN_WIDTH = 340;
-const AI_DRAWER_MAX_WIDTH = 960;
+const AI_DRAWER_DEFAULT_WIDTH = 420;
+const appGrid = document.getElementById('app');
 
-function applyAiDrawerWidth(px, { persist = false } = {}) {
-  if (!drawer) return;
-  if (window.innerWidth <= 480) {
-    drawer.style.width = '';
-    return;
-  }
-  const maxW = Math.max(AI_DRAWER_MIN_WIDTH, Math.min(AI_DRAWER_MAX_WIDTH, window.innerWidth - 24));
-  const clamped = Math.round(Math.max(AI_DRAWER_MIN_WIDTH, Math.min(maxW, px)));
-  drawer.style.width = `${clamped}px`;
+function applyAiDrawerWidth(px, persist = false) {
+  if (!Number.isFinite(px)) return;
+  const width = Math.round(Math.min(960, Math.max(340, px)));
+  appGrid.style.setProperty('--ai-dock-width', width + 'px');
   if (persist) {
-    try { localStorage.setItem(AI_DRAWER_WIDTH_KEY, String(clamped)); } catch { /* ignore */ }
+    try { localStorage.setItem(AI_DRAWER_WIDTH_KEY, String(width)); } catch { /* storage unavailable */ }
   }
 }
 
 try {
   const saved = Number(localStorage.getItem(AI_DRAWER_WIDTH_KEY));
-  if (Number.isFinite(saved) && saved >= AI_DRAWER_MIN_WIDTH) applyAiDrawerWidth(saved);
-} catch { /* ignore */ }
-
-window.addEventListener('resize', () => {
-  if (!drawer) return;
-  if (window.innerWidth <= 480) {
-    drawer.style.width = '';
-    return;
-  }
-  const cur = Number.parseFloat(drawer.style.width);
-  if (Number.isFinite(cur) && cur > 0) applyAiDrawerWidth(cur);
-});
+  if (saved >= 340) applyAiDrawerWidth(saved);
+} catch { /* storage unavailable */ }
 
 if (resizeHandle && drawer) {
-  let resizing = false;
-  resizeHandle.addEventListener('pointerdown', (e) => {
-    if (e.button !== 0 || window.innerWidth <= 480) return;
-    resizing = true;
+  let pointerId = null;
+  let requestedWidth = 0;
+  let frame = 0;
+  resizeHandle.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || pointerId !== null) return;
+    pointerId = e.pointerId;
+    requestedWidth = drawer.getBoundingClientRect().width;
     drawer.classList.add('resizing');
-    resizeHandle.setPointerCapture?.(e.pointerId);
+    resizeHandle.setPointerCapture(pointerId);
     e.preventDefault();
   });
-  resizeHandle.addEventListener('pointermove', (e) => {
-    if (!resizing) return;
-    const desired = window.innerWidth - 12 - e.clientX;
-    applyAiDrawerWidth(desired);
+  resizeHandle.addEventListener('pointermove', e => {
+    if (e.pointerId !== pointerId) return;
+    requestedWidth = appGrid.getBoundingClientRect().right - e.clientX;
+    if (!frame) frame = requestAnimationFrame(() => { frame = 0; applyAiDrawerWidth(requestedWidth); });
   });
-  const endResize = (e) => {
-    if (!resizing) return;
-    resizing = false;
+  const end = e => {
+    if (e.pointerId !== pointerId) return;
+    cancelAnimationFrame(frame);
+    frame = 0;
+    pointerId = null;
     drawer.classList.remove('resizing');
-    if (e?.pointerId != null) resizeHandle.releasePointerCapture?.(e.pointerId);
-    const cur = Number.parseFloat(drawer.style.width);
-    if (Number.isFinite(cur) && cur > 0) applyAiDrawerWidth(cur, { persist: true });
+    applyAiDrawerWidth(requestedWidth);
+    applyAiDrawerWidth(drawer.getBoundingClientRect().width, true);
   };
-  resizeHandle.addEventListener('pointerup', endResize);
-  resizeHandle.addEventListener('pointercancel', endResize);
-  resizeHandle.addEventListener('dblclick', () => {
-    applyAiDrawerWidth(AI_DRAWER_DEFAULT_WIDTH, { persist: true });
+  resizeHandle.addEventListener('pointerup', end);
+  resizeHandle.addEventListener('lostpointercapture', end);
+  resizeHandle.addEventListener('dblclick', () => applyAiDrawerWidth(AI_DRAWER_DEFAULT_WIDTH, true));
+  resizeHandle.addEventListener('keydown', e => {
+    const delta = e.key === 'ArrowLeft' ? 16 : e.key === 'ArrowRight' ? -16 : 0;
+    if (!delta) return;
+    e.preventDefault();
+    applyAiDrawerWidth(drawer.getBoundingClientRect().width + delta, true);
   });
 }

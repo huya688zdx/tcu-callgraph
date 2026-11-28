@@ -23,15 +23,12 @@ function contentBounds() {
 function getSafeViewport(pad = 0) {
   const cw = els.cv?.clientWidth || 0;
   const ch = els.cv?.clientHeight || 0;
-  const drawer = document.getElementById('aiDrawer');
-  const drawerRect = drawer?.classList.contains('show') ? drawer.getBoundingClientRect() : null;
-  const occupiedRight = drawerRect && drawerRect.width > 0 ? Math.min(drawerRect.width + 16, Math.max(0, cw - 240)) : 0;
   return {
     left: pad,
     top: pad,
-    right: Math.max(pad + 120, cw - occupiedRight - pad),
+    right: Math.max(pad + 120, cw - pad),
     bottom: Math.max(pad + 120, ch - pad),
-    width: Math.max(120, cw - occupiedRight - pad * 2),
+    width: Math.max(120, cw - pad * 2),
     height: Math.max(120, ch - pad * 2),
   };
 }
