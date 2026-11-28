@@ -52,6 +52,14 @@ export function* walk(node, childrenOf = children) {
   if (node.array_filler) for (const child of node.array_filler) yield* walk(child, childrenOf);
 }
 
+// GNU a ?: b 的四个 Clang 子节点是 a、条件、真值、b。中间两项用 OpaqueValueExpr 引用已求出的 a。
+export function conditionalValues(node) {
+  const items = children(node);
+  if (node.kind === 'ConditionalOperator') return items.slice(1);
+  if (node.kind === 'BinaryConditionalOperator') return items.length > 1 ? [items[0], items.at(-1)] : items;
+  return null;
+}
+
 // 源码位置、声明及指纹仍使用原始树。运行时效果只遍历实际参与求值的操作数。
 export function evaluatedChildren(node) {
   const items = children(node);
@@ -59,6 +67,7 @@ export function evaluatedChildren(node) {
     const result = genericResult(node);
     return result ? [result] : [];
   }
+  if (node.kind === 'BinaryConditionalOperator') return conditionalValues(node);
   if (node.kind !== 'UnaryExprOrTypeTraitExpr') return items;
   if (node.name !== 'sizeof') return [];
   if (node.argType) return items; // Clang 将运行时求值的 VLA 类型边界列为子表达式。
@@ -444,10 +453,7 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots, ind
       out.push(resolveFunction(ref.referencedDecl, context));
       return;
     }
-    if (u.kind === 'ConditionalOperator') {
-      collectRhsRefs(children(u)[1], out);
-      collectRhsRefs(children(u)[2], out);
-    }
+    for (const arm of conditionalValues(u) || []) collectRhsRefs(arm, out);
   }
   function visit(value, slot, fieldId, sourceSlot, unionId) {
     value = unwrap(value);
@@ -458,7 +464,7 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots, ind
       slots.set(slot, target);
       sourceSlots?.set(slot, sourceSlot);
       if (fieldId) indexField(fieldId, slot, target, unionId);
-    } else if (value.kind === 'ConditionalOperator' && candidateSlots) {
+    } else if (candidateSlots && conditionalValues(value)) {
       const cands = [];
       collectRhsRefs(value, cands);
       if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
@@ -696,7 +702,8 @@ function parameterAddresses(expr, context, offset = 0, move = null) {
     const sum = offset === '*' || arithmetic.delta == null ? null : offset + arithmetic.delta;
     return parameterAddresses(arithmetic.base, context, Number.isSafeInteger(sum) ? sum : '*', move);
   }
-  if (node.kind === 'ConditionalOperator') return children(node).slice(1).flatMap(arm => parameterAddresses(arm, context, offset, move));
+  const arms = conditionalValues(node);
+  if (arms) return arms.flatMap(arm => parameterAddresses(arm, context, offset, move));
   if (node.kind === 'BinaryOperator' && [',','='].includes(node.opcode)) return parameterAddresses(children(node)[1], context, offset, move);
   const source = pointerExpression(node, context);
   if (source) {

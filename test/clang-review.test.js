@@ -1495,3 +1495,98 @@ test('Clang 跨调用组合写保留形参所指回调与相邻独立槽', requi
     member_site: [a, written(b), other, c], read_site: [a,b,c],
   }));
 });
+
+const omittedConditionalSource = `typedef int (*Fn)(void);
+static int initial(void) { return 1; }
+static int updated(void) { return 2; }
+static int marked(void) { return 3; }
+static int spare(void) { return 4; }
+static int gate_hits;
+static int no(void) { ++gate_hits; return 0; }
+static int yes(void) { ++gate_hits; return 1; }
+
+int plain(int present) {
+  Fn cb=initial; present ?: (cb=updated,0); return cb();
+}
+int parenthesized(int present) {
+  Fn cb=initial; (void)((((present))) ?: (((cb=updated),0))); return cb();
+}
+int nested(int a, int b) {
+  Fn cb=initial; (void)(a ?: (cb=marked, b ?: (cb=updated,0))); return cb();
+}
+int nested_common(int a, int b) {
+  Fn cb=initial; (void)(((cb=marked,a) ?: (cb=updated,b)) ?: (cb=spare,0)); return cb();
+}
+int mixed(int a, int b) {
+  Fn cb=initial; (void)(a ? (b ?: (cb=updated,0)) : (cb=marked,0)); return cb();
+}
+int condition_write(int present) {
+  Fn cb=initial; (void)((cb=marked,present) ?: (cb=updated,0)); return cb();
+}
+int in_fallback(int present) {
+  Fn cb=initial; int value=0;
+  (void)(present ?: (cb=updated,value=cb(),0)); return value*10 + cb();
+}
+int standard(int present) {
+  Fn cb=initial; (void)(present ? present : (cb=updated,0)); return cb();
+}
+int standard_write(int present) {
+  Fn cb=initial; (void)((cb=marked,present) ? present : (cb=updated,0)); return cb();
+}
+int once_move(int present) {
+  Fn a[]={initial,initial,marked,spare}, *p=a;
+  (void)((++p,present) ?: 0); *p=updated;
+  return a[0]()*1000 + a[1]()*100 + a[2]()*10 + a[3]();
+}
+int once_call(int present) {
+  Fn gate=present ? yes : no, cb=initial;
+  gate_hits=0; (void)(gate() ?: (cb=updated,0)); return gate_hits*10 + cb();
+}
+int selected(int present) {
+  Fn source=present ? initial : (Fn)0; Fn cb=source ?: updated; return cb();
+}
+int saved_value(int present) {
+  Fn source=present ? initial : (Fn)0;
+  Fn cb=source ?: (source=spare,updated); return cb()*10 + source();
+}
+int saved_address(int present) {
+  Fn x=initial,y=marked,other=spare; Fn *cur=present ? &x : (Fn*)0;
+  Fn *dest=cur ?: (cur=&other,&y); *dest=updated;
+  return x()*100 + y()*10 + other();
+}
+static void write_selected(Fn *p, Fn *q) { *(p ?: q)=updated; }
+int argument(int present) {
+  Fn a[]={initial,marked,spare}, fallback=initial;
+  write_selected(present ? &a[1] : (Fn*)0,&fallback);
+  return a[0]()*1000 + a[1]()*100 + a[2]()*10 + fallback();
+}
+static Fn const table[] = { ((Fn)0) ?: updated };
+int table_slot(void) { return table[0](); }
+static Fn shared=initial, untouched=spare;
+static Fn *alias=((Fn*)0) ?: &shared;
+int global_address(void) {
+  shared=initial; *alias=updated; return shared()*10 + untouched();
+}
+int overwritten(int present) {
+  Fn cb=initial; (void)(present ?: (cb=updated,0)); cb=spare; return cb();
+}
+int unevaluated(int present) {
+  Fn cb=initial; (void)sizeof(present ?: (cb=updated,0)); return cb();
+}
+`;
+
+test('Clang GNU 省略中项只求值一次，并保留回退前后可达的回调', requiresClang, async t => {
+  const root = project(t, omittedConditionalSource);
+  const initial = ['initial'], updated = ['updated'], marked = ['marked'], spare = ['spare'];
+  const both = ['initial','updated'], fallback = ['marked','updated'], all = ['initial','marked','updated'];
+  await checkCallbackFlow(t, root, policy => ({
+    plain: [both], parenthesized: [both], nested: [all], nested_common: [['marked','spare','updated']],
+    mixed: [all], condition_write: [fallback],
+    in_fallback: [updated,both], standard: [both], standard_write: [fallback],
+    once_move: [initial,updated,marked,spare], once_call: [['no','yes'],both], selected: [both],
+    saved_value: [both,['initial','spare']], saved_address: [both,fallback,spare],
+    argument: [initial,fallback,spare,both], table_slot: [updated],
+    global_address: [{ required: policy === 'expand' ? updated : [], allowed: ['initial','marked','no','spare','updated','yes'] }, spare],
+    overwritten: [spare], unevaluated: [initial],
+  }));
+});

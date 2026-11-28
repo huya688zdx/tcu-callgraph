@@ -1,4 +1,4 @@
-import { asmMemoryOperands, callbackChildren, children, evaluatedChildren, fnRef, initializer, initializerMembers, pointerArithmetic, pointerExpression, pointerMove, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
+import { asmMemoryOperands, callbackChildren, children, conditionalValues, evaluatedChildren, fnRef, initializer, initializerMembers, pointerArithmetic, pointerExpression, pointerMove, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
@@ -81,7 +81,7 @@ function hasCaseEntry(node) {
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值，传址写入按覆盖范围合并。
 export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode, initiallyEscaped }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
-  const designators = new WeakMap(), addressed = new Map();
+  const designators = new WeakMap(), commonValuePoints = new WeakMap(), addressed = new Map();
   function noteAddressWrite(key, slot, write) {
     if (!hasStaticStorage(key)) return;
     if (!addressed.has(key)) addressed.set(key, []);
@@ -220,8 +220,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     if (addr.kind === 'CompoundLiteralExpr') return carried(children(addr)[0], at, trace);
     if (addr.kind === 'InitListExpr') return initializerMembers(addr, unit).flatMap(({ child, suffix }) =>
       carried(child, at, trace).map(item => ({ ...item, path: suffix + item.path })));
-    if (addr.kind === 'ConditionalOperator') return children(addr).slice(1).flatMap(alt =>
-      carried(alt, at, trace).map(item => ({ ...item, weak: true })));
+    const arms = conditionalValues(addr);
+    if (arms) return arms.flatMap(alt =>
+      carried(alt, commonValuePoints.get(alt) || at, trace).map(item => ({ ...item, weak: true })));
     if (addr.kind === 'BinaryOperator' && [',','='].includes(addr.opcode)) return carried(children(addr)[1], at, trace);
     const arithmetic = pointerArithmetic(addr, unit);
     if (arithmetic) {
@@ -360,7 +361,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (parent) irregularSwitches.add(parent);
     }
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
-    const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
+    const omitted = node.kind === 'BinaryConditionalOperator';
+    const shortCircuit = omitted || (node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode));
     const items = callbackChildren(node, unit);
     const nested = node.array_filler ? [...items, ...node.array_filler] : items;
     const call = node.kind === 'CallExpr' && node;
@@ -371,6 +373,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const guarded = i > 0 && (branch || shortCircuit);
       const next = guarded ? new Map(guards).set(node, branch ? i : true) : guards;
       visit(child, next, loop);
+      // GNU 真值是左操作数此刻的值。回退分支对同一变量的后续写入不能改变它。
+      if (omitted && i === 0) commonValuePoints.set(child, { order: ++order, guards, loop, operand });
       if (siblings && i === 0 && !fnRef(child)) designators.set(call, { order: ++order, guards, loop, operand });
       operand = parent;
     });
@@ -471,8 +475,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (--budget < 0 || depth > 32 || value.kind === 'UnknownWrite') { unknown = true; return; }
       if (value.kind === 'ImplicitValueInitExpr' || value.kind === 'GNUNullExpr' ||
           (value.kind === 'IntegerLiteral' && value.value === '0')) return;
-      if (value.kind === 'ConditionalOperator') {
-        for (const alt of children(value).slice(1)) evaluate(alt, rest, point, depth + 1, fieldId, unionId);
+      const arms = conditionalValues(value);
+      if (arms) {
+        for (const alt of arms) evaluate(alt, rest, commonValuePoints.get(alt) || point, depth + 1, fieldId, unionId);
         return;
       }
       if (value.kind === 'BinaryOperator' && value.opcode === ',') {

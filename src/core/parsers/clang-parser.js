@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
-import { children, collectAssignmentWrites, evaluatedChildren, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
+import { children, collectAssignmentWrites, conditionalValues, evaluatedChildren, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, transferredValues, typeOf, unwrap, variableModel, walk, walkEvaluated } from './clang-ast.js';
 import { argumentSource, callbackSlotReader, hasStaticStorage, matchingSlot, relativeSlot, writeProjection } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
@@ -110,9 +110,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       return;
     }
     const items = children(node);
-    let values;
+    let values = conditionalValues(node);
     if (node.kind === 'GenericSelectionExpr') values = evaluatedChildren(node);
-    else if (node.kind === 'ConditionalOperator') values = items.slice(1);
     else if (node.kind === 'InitListExpr') values = node.array_filler || items;
     else if (node.kind.endsWith('CastExpr') || ['ParenExpr','CompoundLiteralExpr','ConstantExpr'].includes(node.kind) ||
         (node.kind === 'BinaryOperator' && typeOf(node).includes('*'))) values = items;
