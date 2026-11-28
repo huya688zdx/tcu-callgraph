@@ -23,7 +23,7 @@ import { clearDataflow } from './lib/df.js';
 // 工程切换与时间轴面板同样自带事件注册
 import './lib/projects.js';
 import { hideBar, reloadTimeline } from './lib/timeline.js';
-import './lib/bookmarks.js';
+import { bookmarkBinding, reviseBookmark } from './lib/bookmarks.js';
 import './lib/ai-settings.js';
 // AI 改动实时同步：SSE 监听 + 页面视图状态上报（cg_page 的数据源）
 import { acceptRestoredRevision, restorePage, savePage } from './lib/live.js';
@@ -357,34 +357,59 @@ async function requestBookmarkSave(request, details) {
 }
 hooks.requestBookmarkSave = requestBookmarkSave;
 
+let bookmarkUpdates, bookmarkEpoch = 0;
+function updateActiveBookmark() {
+  const bookmark = state.activeBookmark, binding = bookmarkBinding(bookmark), projectId = state.view?.projectId;
+  const epoch = bookmarkEpoch, scope = structuredClone(currentViewScope()), fingerprint = scopeFingerprint(scope);
+  const isCurrent = () => epoch === bookmarkEpoch && state.view?.projectId === projectId &&
+    !state.at && !state.view?.comparison && bookmarkBinding(state.activeBookmark) === binding;
+  if (!bookmarkUpdates || bookmarkUpdates.binding !== binding || bookmarkUpdates.epoch !== epoch || bookmarkUpdates.failed) {
+    bookmarkUpdates = { binding, epoch, tail: Promise.resolve() };
+  }
+  const queue = bookmarkUpdates;
+  // 每次按键保留当时的范围；同一绑定的下次写入使用上次成功确认的版本。
+  const save = async () => {
+    if (queue.failed || !isCurrent()) return;
+    let result;
+    try {
+      result = await api.updateBookmark({ id: bookmark.id, expectedRevision: state.activeBookmark.revision, ...scope, projectId });
+    } catch (error) {
+      queue.failed = true;
+      if (isCurrent()) throw error;
+      return;
+    }
+    if (!isCurrent()) return;
+    if (!result?.ok || !result.bookmark) queue.failed = true;
+    else if (result.bookmark.revision >= state.activeBookmark.revision) {
+      state.activeBookmark = reviseBookmark(state.activeBookmark, { revision: result.bookmark.revision, baseFingerprint: fingerprint });
+      state.bookmarkDrafts.delete(String(bookmark.id));
+      syncBookmarkBadge();
+      await savePage(true).catch(() => {});
+      if (isCurrent()) void reloadTimeline();
+    }
+    return { result, isCurrent };
+  };
+  const response = queue.tail.then(save);
+  queue.tail = response.catch(() => {});
+  return response;
+}
+hooks.updateActiveBookmark = updateActiveBookmark;
+
 async function saveActiveBookmark({ saveAs = false } = {}) {
   if (state.at || state.view?.comparison || !state.roots.length) return;
-  const bm = state.activeBookmark;
-  if (saveAs || !bm?.id) {
+  if (saveAs || !state.activeBookmark?.id) {
     bookmarkBtn?.click();
     return;
   }
-  const reply = await requestBookmarkSave(api.updateBookmark, { id: bm.id, expectedRevision: bm.revision });
+  const reply = await updateActiveBookmark();
   if (!reply?.isCurrent()) return;
-  const { result, fingerprint, isCurrent } = reply;
+  const { result } = reply;
   if (result?.conflict) {
     alert(t('bookmark.conflict'));
     bookmarkBtn?.click();
     return;
   }
   if (!result?.ok || !result.bookmark) throw new Error(result?.error || t('bookmark.failed'));
-  const saved = result.bookmark;
-  const active = {
-    id: saved.id,
-    name: saved.name,
-    revision: saved.revision || 1,
-    baseFingerprint: fingerprint,
-  };
-  state.activeBookmark = active;
-  state.bookmarkDrafts.delete(String(saved.id));
-  syncBookmarkBadge();
-  await savePage(true).catch(() => {});
-  if (isCurrent(active)) void reloadTimeline();
 }
 
 bookmarkQuickSave?.addEventListener('click', () => {
@@ -395,6 +420,7 @@ document.addEventListener('callgraph:langchange', syncBookmarkBadge);
 /** 应用书签：先暂存未保存草稿、以参数请求 loadView，成功后再切 activeBookmark 并派发事件 */
 hooks.applyBookmark = async (b) => {
   if (state.at || canvasAction) return;
+  bookmarkEpoch++;
   pendingVarChoices.clear();
   const prev = state.activeBookmark;
   if (prev ? isBookmarkDirty() : (state.roots.length > 0 || state.expansions.length > 0)) {
@@ -429,6 +455,7 @@ hooks.applyBookmark = async (b) => {
 
 /** 换工程后整体重载：解析结果、文件树、变量清单、视图全变了 */
 hooks.reloadAll = async ({ preserveAiChat = false } = {}) => {
+  bookmarkEpoch++;
   const epoch = ++reloadEpoch;
   pendingVarChoices.clear();
   comparisonPage = null;

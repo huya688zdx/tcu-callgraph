@@ -603,3 +603,63 @@ void opaque(int n) { Ops o={0}; if(n) goto done; o.run=unknown(); done: o.run();
     opaque: [policy === 'expand' ? ['first', 'noise', 'second'] : []],
   }));
 });
+
+test('Clang 联合体共用存储按实例、成员位置和下标解析回调', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void); typedef int (*Other)(int);
+void first(void) {} void second(void) {} void third(void) {} void noise(void) {}
+int wrong(int n) { return n; } void legacy() {}
+struct S { Fn cb; Fn slots[2]; }; union U { struct S a,b; };
+struct Pair { union U left, right; union U rows[2]; };
+struct Separate { struct S a,b; };
+struct Anon { union { struct S left,right; }; union { struct S upper,lower; }; };
+struct A { Fn x; Fn y; int tail; }; struct B { Fn renamed; Fn extra; char tail; };
+union Variant { struct A a; struct B b; struct { int tag; Fn other; } tagged; unsigned char bytes[64]; };
+union Different { struct __attribute__((packed)) { Fn x; Other y; } a;
+                  struct __attribute__((packed)) { Fn y; Other x; } b; };
+struct One { Fn x, extra; }; struct Two { Fn renamed, spare; };
+union Entry { struct One in; struct Two out; };
+static union Entry saved = { .out.renamed=first };
+static struct One not_an_entry = { noise,noise };
+void write_entry(union Entry *p) { p->out.renamed=second; p->out.spare=third; }
+void receiver(union Entry *p) { p->in.x(); p->in.extra(); }
+static const union U fixed = { .b = {first,{second,third}} };
+static union U shared = { .a.cb=first };
+void set_global(void) { shared.b.cb=second; }
+void set_arg(union U *p) { p->b.cb=second; }
+void direct(void) { union U u; u.a.cb=first; u.b.cb=second; u.a.cb(); }
+void compatible(void) { union U u={.a.cb=first}; u.b.cb=legacy; u.a.cb(); }
+void backwards(void) { union U u={.b.cb=second}; u.a.cb=first; u.b.cb(); }
+void overlap(int n) { union U u={.b.cb=first}; if(n) u.a.cb=second; u.b.cb(); }
+void slots(void) { union U u={.a={first,{second,third}}}; u.b.slots[0]=first;
+  u.a.slots[0](); u.b.slots[1](); u.b.cb(); }
+void nested(void) { struct Pair p={.left.a.cb=first,.right.a.cb=noise,.rows={{.a.cb=third},{.b.cb=noise}}};
+  p.left.b.cb=second; p.rows[1].a.cb=first; p.left.a.cb(); p.right.b.cb(); p.rows[0].b.cb(); p.rows[1].b.cb(); }
+void anonymous(void) { struct Anon o={.right.cb=first,.upper.cb=noise};
+  o.left.cb=second; o.right.cb(); o.lower.cb(); }
+void common(void) { union Variant u={.a={first,noise,1}}; u.b.renamed=second; u.b.extra=third;
+  u.a.x(); u.a.y(); }
+void copied(void) { struct B source={second,third,0}; union Variant u={.a.x=first}; u.b=source;
+  source.renamed=noise; u.a.x(); u.a.y(); }
+void fallback(void) { union Different u={.a={first,wrong}}; u.b.y=second; u.b.x=wrong; u.a.x(); }
+void indirect_arg(void) { union U u={.a.cb=first}; set_arg(&u); u.a.cb(); }
+void global(void) { shared.a.cb=first; set_global(); shared.a.cb(); }
+void clear(void) { union U u={.a.cb=first}; u.b.cb=0; if(u.a.cb) u.a.cb(); }
+void isolated(void) { struct Separate p={.a.cb=first,.b.cb=noise}; p.b.cb=second; p.a.cb(); }
+void data(void) { union U a={.a.cb=first}, b={.b.cb=noise}; b.a.cb=third; a.b.cb(); }
+void immutable(void) { fixed.a.slots[0](); }`);
+  const both = ['first','second'];
+  await checkCallbackFlow(t, root, () => ({
+    direct: [['second']], compatible: [['legacy']], backwards: [['first']], overlap: [both], slots: [['first'], ['third'], ['first']],
+    nested: [['second'], ['noise'], ['third'], ['first']], anonymous: [['second'], ['noise']],
+    common: [['second'], ['third']], copied: [['second'], ['third']],
+    fallback: [{ required: ['second'], allowed: both }], indirect_arg: [both], global: [both],
+    clear: [[]], isolated: [['first']], data: [['first']], receiver: [both, ['third']],
+  }));
+  for (const policy of ['strict','expand']) await t.test(policy + ' immutable', async () => {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const edges = model.edges.filter(e => e.from === 'main.c::immutable' && e.kind === 'fnptr');
+    assert.deepEqual(edges.map(e => [e.callee, e.resolution]), [['second', 'exact']]);
+    assert.deepEqual(model.fnptrTables.find(t => t.name === 'fixed').map,
+      { '.b.cb':'first', '.b.slots[0]':'second', '.b.slots[1]':'third' });
+  });
+});

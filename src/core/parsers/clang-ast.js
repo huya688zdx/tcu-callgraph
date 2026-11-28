@@ -176,6 +176,49 @@ function collectEnum(node, context, insideFunction) {
   }
 }
 
+// 结构体成员按声明序号定位。联合体同类型成员共享全部存储；不同结构体只保证公共初始序列。
+function storageFields(records, context) {
+  const slots = new Map(), unionOwners = new Map();
+  const fieldsOf = record => children(record).filter(n => n.kind === 'FieldDecl');
+  const builtin = /^(?:void|char|short|int|long|float|double|signed|unsigned|_Bool|_Complex|const|volatile|restrict)$/;
+  const special = node => node.isBitfield || children(node).some(n => n.kind?.endsWith('Attr'));
+  const fieldType = field => {
+    if (special(field)) return field;
+    const type = typeOf(field);
+    const record = context.valueRecords.get(field);
+    if (record && !/[\[*]/.test(type)) return record;
+    // 无法从完整类型拼写确认声明身份时，不用同名标签推断相同布局。
+    return type && (type.match(/[A-Za-z_]\w*/g) || []).every(word => builtin.test(word)) ? type : field;
+  };
+  for (const record of new Set(records.values())) {
+    const fields = fieldsOf(record);
+    if (record.tagUsed !== 'union') {
+      fields.forEach((f, i) => { if (f.id) slots.set(f.id, '.f' + i); });
+      continue;
+    }
+    const groups = new Map(), memberTypes = new Map();
+    for (const field of fields) {
+      if (!field.id) continue;
+      const type = fieldType(field);
+      if (!groups.has(type)) {
+        const prefix = [];
+        if (type?.tagUsed === 'struct' && !special(type)) {
+          for (const member of fieldsOf(type)) {
+            if (special(member)) break;
+            const key = fieldType(member);
+            if (!memberTypes.has(key)) memberTypes.set(key, memberTypes.size);
+            prefix.push(memberTypes.get(key));
+          }
+        }
+        groups.set(type, '.|' + groups.size + ':' + prefix.join(','));
+      }
+      slots.set(field.id, groups.get(type));
+      unionOwners.set(field.id, record.id);
+    }
+  }
+  return { slots, unionOwners };
+}
+
 export function readTranslationUnit(ast, root, unit, files) {
   if (ast?.kind !== 'TranslationUnitDecl') throw new Error('Clang 未返回 TranslationUnitDecl');
   const loc = sourceLocations(root, unit, files);
@@ -221,7 +264,7 @@ export function readTranslationUnit(ast, root, unit, files) {
         scope.set(name, decl);
       }
     }
-    if (node.type && (kind.endsWith('Expr') || ['VarDecl', 'BinaryOperator', 'ConditionalOperator', 'UnaryOperator'].includes(kind))) {
+    if (node.type && (kind.endsWith('Expr') || ['VarDecl', 'FieldDecl', 'BinaryOperator', 'ConditionalOperator', 'UnaryOperator'].includes(kind))) {
       // Clang 的 typedef id 优先；同名结构标签按初始化器所在块查找。
       let decl = typedefRecords.get(node.type?.typeAliasDeclId);
       const type = typeOf(node).replace(/\b(const|volatile|restrict)\b/g, '').trim();
@@ -257,6 +300,7 @@ export function readTranslationUnit(ast, root, unit, files) {
     if (newScope) recordScopes.pop();
   }
   collect(ast, false);
+  context.storageFields = storageFields(recordsById, context);
   for (const [name, decl] of context.records) {
     if (recordsById.has(decl.id)) context.records.set(name, recordsById.get(decl.id));
   }
@@ -331,12 +375,13 @@ export function initializerMembers(value, context) {
   const isArray = /\[[^\]]*\]$/.test(typeOf(value));
   return initializers(value).map((child, i) => {
     const field = value.field || fields[i];
-    return { child, field, suffix: field?.name ? '.' + field.name : isArray ? '[' + i + ']' : '' };
+    const sourceSuffix = field?.name ? '.' + field.name : isArray ? '[' + i + ']' : '';
+    return { child, field, suffix: context.storageFields.slots.get(field?.id) ?? sourceSuffix, sourceSuffix };
   });
 }
 
 /** Clang 的语义 InitListExpr 已把位置和指定初始化排列到了字段/下标对应的槽上。 */
-export function pointerSlots(node, context, resolveFunction, candidateSlots, indexField) {
+export function pointerSlots(node, context, resolveFunction, candidateSlots, indexField, sourceSlots) {
   const slots = new Map();
   function collectRhsRefs(expr, out) {
     const u = unwrap(expr);
@@ -351,26 +396,28 @@ export function pointerSlots(node, context, resolveFunction, candidateSlots, ind
       collectRhsRefs(children(u)[2], out);
     }
   }
-  function visit(value, slot, fieldId) {
+  function visit(value, slot, fieldId, sourceSlot, unionId) {
     value = unwrap(value);
     if (!value) return;
     const ref = fnRef(value);
     if (ref) {
       const target = resolveFunction(ref.referencedDecl, context);
       slots.set(slot, target);
-      if (fieldId) indexField(fieldId, slot, target);
+      sourceSlots?.set(slot, sourceSlot);
+      if (fieldId) indexField(fieldId, slot, target, unionId);
     } else if (value.kind === 'ConditionalOperator' && candidateSlots) {
       const cands = [];
       collectRhsRefs(value, cands);
       if (cands.length) candidateSlots.set(slot, [...new Set(cands)]);
-      if (fieldId) for (const target of cands) indexField(fieldId, slot, target);
+      if (fieldId) for (const target of cands) indexField(fieldId, slot, target, unionId);
     } else if (value.kind === 'InitListExpr') {
-      for (const { child, field, suffix } of initializerMembers(value, context)) {
-        visit(child, slot + suffix, field?.id || (suffix.startsWith('[') ? fieldId : null));
+      for (const { child, field, suffix, sourceSuffix } of initializerMembers(value, context)) {
+        visit(child, slot + suffix, field?.id || (suffix.startsWith('[') ? fieldId : null), sourceSlot + sourceSuffix,
+          context.storageFields.unionOwners.get(field?.id) || unionId);
       }
     }
   }
-  visit(initializer(node), '');
+  visit(initializer(node), '', null, '');
   return slots;
 }
 
@@ -404,7 +451,7 @@ export function normalizeRecordBaseType(type, context) {
 export function pointerExpression(node, context = null) {
   node = unwrap(node);
   if (node?.kind === 'DeclRefExpr') {
-    return { decl: node.referencedDecl, slot: '', member: null, baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
+    return { decl: node.referencedDecl, slot: '', sourceSlot: '', member: null, baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
   }
   if (!node) return null;
   if (node.kind === 'MemberExpr' || node.kind === 'ArraySubscriptExpr') {
@@ -414,9 +461,12 @@ export function pointerExpression(node, context = null) {
     const rawIndex = children(node)[1];
     const constant = node.kind === 'ArraySubscriptExpr' ? constIndexValue(rawIndex, context) : null;
     const rawBaseType = node.kind === 'MemberExpr' ? normalizeRecordBaseType(typeOf(baseNode), context) : base.baseType;
+    const sourceSuffix = node.kind === 'MemberExpr' ? (node.name ? '.' + node.name : '') : `[${constant ?? '*'}]`;
     return {
       ...base,
-      slot: base.slot + (node.kind === 'MemberExpr' ? `.${node.name}` : `[${constant ?? '*'}]`),
+      slot: base.slot + (context?.storageFields?.slots.get(node.referencedMemberDecl) ?? sourceSuffix),
+      unionId: context?.storageFields?.unionOwners.get(node.referencedMemberDecl) || base.unionId,
+      sourceSlot: base.sourceSlot + sourceSuffix,
       ...(node.kind === 'ArraySubscriptExpr' && constant === null
         ? { bounds: [...(base.bounds || []), Number(/\[(\d+)\]/.exec(typeOf(unwrap(baseNode)))?.[1])] } : {}),
       ...(node.kind === 'ArraySubscriptExpr' && !base.slot && !base.throughPointer && baseNode.castKind !== 'ArrayToPointerDecay'
@@ -447,7 +497,7 @@ export function collectAssignmentWrites(body, context) {
     const lhs = pointerExpression(target, context);
     if (!lhs?.decl) continue;
     writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
-      slot: lhs.slot, fieldId: lhs.fieldId });
+      slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId });
   }
   return writes;
 }

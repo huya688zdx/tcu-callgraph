@@ -5,19 +5,33 @@ const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
 function relativeSlot(prefix, slot) {
   if (!prefix) return { rest: slot, covers: true };
   const left = parts(prefix), right = parts(slot);
-  if (left.length > right.length) return null;
   let covers = true;
   for (let i = 0; i < left.length; i++) {
+    if (right[i] === '.?') return { rest: '.?', covers: false };
+    if (left[i] !== right[i] && left[i].startsWith('.|') && right[i]?.startsWith('.|')) {
+      const a = left[i].split(':')[1].split(','), b = right[i].split(':')[1].split(',');
+      let common = 0;
+      while (a[common] && a[common] === b[common]) common++;
+      const shared = part => part?.startsWith('.f') && Number(part.slice(2)) < common;
+      if (shared(left[i + 1]) || shared(right[i + 1])) continue;
+      // 布局不足以比较这两个分支。仅在同一联合体子对象内收集函数，不据此作必经覆盖。
+      return { rest: '.?', covers: false };
+    }
     if (left[i] === '[*]' || right[i] === '[*]') {
-      if (!left[i].startsWith('[') || !right[i].startsWith('[')) return null;
+      if (!left[i].startsWith('[') || !right[i]?.startsWith('[')) return null;
       covers = false;
     } else if (left[i] !== right[i]) return null;
   }
   return { rest: right.slice(left.length).join(''), covers };
 }
 
+// 返回完整槽位的匹配程度，供未确认布局的候选做额外的类型检查。
 export function matchingSlot(a, b) {
-  return a === b || ((a.includes('[*]') || b.includes('[*]')) && relativeSlot(a, b)?.rest === '');
+  if (a === b) return 'slot';
+  if (!a.includes('[*]') && !b.includes('[*]') && !a.includes('.|') && !b.endsWith('.?')) return null;
+  const match = relativeSlot(a, b);
+  if (match?.rest === '') return 'slot';
+  return match?.rest === '.?' ? 'overlap' : null;
 }
 
 // 将 p[i].field 对齐到 &rows[j] 的 rows[j+i].field；(*p)[i] 的下标属于对象本身。
@@ -271,36 +285,38 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
 
   function resolve(pointer, value, at) {
     const targets = new Set(), parameters = new Set();
-    let budget = 512, unknown = false;
+    let budget = 512, unknown = false, uncertainLayout = false;
     function merge(result) {
       for (const id of result.targets) targets.add(id);
       unknown ||= result.unknown;
+      uncertainLayout ||= result.uncertainLayout;
     }
-    function evaluate(value, rest, point, depth, fieldId) {
+    function evaluate(value, rest, point, depth, fieldId, unionId) {
       value = unwrap(value);
       if (!value) return;
+      if (rest === '.?') uncertainLayout = true;
       if (--budget < 0 || depth > 32) { unknown = true; return; }
       if (value.kind === 'ConditionalOperator') {
-        for (const alt of children(value).slice(1)) evaluate(alt, rest, point, depth + 1, fieldId);
+        for (const alt of children(value).slice(1)) evaluate(alt, rest, point, depth + 1, fieldId, unionId);
         return;
       }
       if (value.kind === 'CompoundLiteralExpr') {
-        evaluate(children(value)[0], rest, point, depth + 1, fieldId);
+        evaluate(children(value)[0], rest, point, depth + 1, fieldId, unionId);
         return;
       }
       if (value.kind === 'InitListExpr') {
         for (const { child, suffix } of initializerMembers(value, unit)) {
           const match = relativeSlot(suffix, rest);
-          if (match) evaluate(child, match.rest, point, depth + 1, fieldId);
+          if (match) evaluate(child, match.rest, point, depth + 1, fieldId, unionId);
         }
         return;
       }
       if (value.kind === 'BinaryOperator' && value.opcode === '=') value = children(value)[0];
       const direct = fnRef(value);
-      if (direct && !rest) { targets.add(resolveFunction(direct.referencedDecl, unit)); return; }
+      if (direct && (!rest || rest === '.?')) { targets.add(resolveFunction(direct.referencedDecl, unit)); return; }
       const src = objectSlot(pointerExpression(value, unit));
       if (src) {
-        for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId);
+        for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId, rest ? unionId : src.unionId);
       } else if ((!rest || unstructuredJump) && value.kind !== 'ImplicitValueInitExpr' && value.kind !== 'GNUNullExpr' &&
           !(value.kind === 'IntegerLiteral' && value.value === '0')) {
         unknown = true;
@@ -318,14 +334,14 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         else unknown = true;
       }
     }
-    function read(source, path, at, depth, fieldId) {
+    function read(source, path, at, depth, fieldId, unionId) {
       const exposed = escapes.get(source)?.filter(w => !w.effect && reaches(w.point, at) && relativeSlot(w.slot, path));
       function possibleAliasWrite(since) {
         if (!exposed?.length) return;
         // 明确覆盖之后，只有新的传址、调用或间接写才可能再次通过别名改变值。
         if (since && !exposed.some(w => reaches(since, w.point)) &&
             !indirectActions.some(p => p !== at && reaches(since, p) && reaches(p, at))) return;
-        if (fieldId) merge(fieldWrites(fieldId, path));
+        if (fieldId) merge(fieldWrites(fieldId, path, unionId));
         else unknown = true;
       }
       function mergeInterveningCalls(since) {
@@ -334,6 +350,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
           if (!action.call || action === at || (since && !reaches(since, action)) || !reaches(action, at)) continue;
           const effects = globalWritesFrom(action.call, unit, source, path);
           unknown ||= effects.unknown;
+          uncertainLayout ||= effects.uncertainLayout;
           for (const w of effects.writes) evaluateWrite(w, w.record === effects.direct ? action.call : null, action, depth);
         }
       }
@@ -352,6 +369,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
           if (same === false) excluded = true;
         }
         if (excluded) continue;
+        uncertainLayout ||= match.rest === '.?';
         if (effect) {
           evaluateWrite(effect, call, point, depth);
         } else {
@@ -372,14 +390,14 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       else merge(ambient(source, path));
     }
     if (!at) return { targets: [], parameters: [], unknown: true };
-    if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId);
+    if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId, pointer.unionId);
     else evaluate(value, '', at, 0);
-    return { targets: [...targets], unknown, parameters: [...parameters] };
+    return { targets: [...targets], unknown, uncertainLayout, parameters: [...parameters] };
   }
   return {
     calls: indirectActions.filter(p => p.call).map(p => p.call),
     isEvaluated: node => points.has(node),
-    addressWrites: (key, slot) => (escapes.get(key) || []).filter(w => relativeSlot(w.slot, slot)).map(w => w.effect),
+    addressWrites: (key, slot) => (escapes.get(key) || []).filter(w => relativeSlot(w.slot, slot)),
     atCall(pointer, call) {
       const src = objectSlot(pointer), at = points.get(call);
       if (!src) return null;

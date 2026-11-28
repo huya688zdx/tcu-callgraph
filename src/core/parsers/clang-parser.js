@@ -89,13 +89,21 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     const start = slot.indexOf('[', slot.lastIndexOf('.') + 1);
     return start < 0 ? '' : slot.slice(start);
   };
-  const indexField = (fields, unit, id, slot, target) => {
-    const key = fieldKey(unit, id);
-    if (!key) return;
-    if (!fields.has(key)) fields.set(key, new Map());
-    const indices = memberIndices(slot), slots = fields.get(key);
-    if (!slots.has(indices)) slots.set(indices, new Set());
-    slots.get(indices).add(target);
+  // 未知接收对象从声明归集；含联合体的访问还须限定联合体声明及其内部槽位。
+  const fieldLocation = (unit, id, slot, unionId) => {
+    const arm = slot.lastIndexOf('.|');
+    return unionId && arm >= 0 ? [fieldKey(unit, unionId), slot.slice(arm)] : [fieldKey(unit, id), memberIndices(slot)];
+  };
+  const indexField = (fields, unit, id, slot, target, unionId) => {
+    const put = ([key, path]) => {
+      if (!key) return;
+      if (!fields.has(key)) fields.set(key, new Map());
+      const slots = fields.get(key);
+      if (!slots.has(path)) slots.set(path, new Set());
+      slots.get(path).add(target);
+    };
+    put(fieldLocation(unit, id, slot));
+    if (unionId) put(fieldLocation(unit, id, slot, unionId));
   };
   const noteAddress = (ref, unit) => {
     const target = resolveFunction(ref.referencedDecl, unit);
@@ -111,11 +119,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     return localFields.get(scope);
   };
   const indexTable = (node, unit, fields) => {
-    const candidateSlots = new Map();
+    const candidateSlots = new Map(), sourceSlots = new Map();
     const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
-      (id, slot, target) => indexField(fields, unit, id, slot, target));
+      (id, slot, target, unionId) => indexField(fields, unit, id, slot, target, unionId), sourceSlots);
     if (slots.size || candidateSlots.size) {
-      tables.set(objectKey(node, unit), { slots, candidateSlots, constant: hasConstSlots(node) });
+      tables.set(objectKey(node, unit), { slots, candidateSlots, sourceSlots, constant: hasConstSlots(node) });
     }
   };
   const definitionOf = (ref, unit) => {
@@ -157,8 +165,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         declWrites.get(declKey).push(w);
         if (w.fieldId) {
           const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
-          indexField(fields, unit, w.fieldId, w.slot, w);
-          if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, w);
+          indexField(fields, unit, w.fieldId, w.slot, w, w.unionId);
+          if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, w, w.unionId);
         }
       }
     }
@@ -178,21 +186,24 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     }
     return writeValues.get(write);
   }
-  function fieldValues(fields, key, indices) {
+  function fieldValues(fields, [key, indices]) {
     const targets = new Set();
-    let unknown = false;
+    let unknown = false, uncertainLayout = false;
     for (const [slot, entries] of fields?.get(key) || []) {
-      if (!matchingSlot(slot, indices)) continue;
+      const match = matchingSlot(slot, indices);
+      if (!match) continue;
+      uncertainLayout ||= match === 'overlap';
       for (const entry of entries) {
         if (typeof entry === 'string') targets.add(entry);
         else {
           const value = writeValue(entry);
           for (const id of value.targets) targets.add(id);
           unknown ||= value.unknown || value.parameters.length > 0;
+          uncertainLayout ||= value.uncertainLayout;
         }
       }
     }
-    return { targets: [...targets], unknown };
+    return { targets: [...targets], unknown, uncertainLayout };
   }
   // 已知函数只引入它及其被调函数在该全局槽位上的写入。未知调用保留可能性。
   const reachable = new Map();
@@ -219,34 +230,46 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     const records = reachable.get(direct), opaque = records.has(null);
     const writes = new Set();
     const mutable = !tables.get(key)?.constant;
-    let unknown = opaque && mutable;
+    let unknown = opaque && mutable, uncertainLayout = false;
     for (const w of declWrites.get(key) || []) {
-      if ((opaque || records.has(w.record)) && matchingSlot(w.slot, slot) && readerFor(w.record).isEvaluated(w.node)) writes.add(w);
+      if (!opaque && !records.has(w.record)) continue;
+      const match = matchingSlot(w.slot, slot);
+      if (!match || !readerFor(w.record).isEvaluated(w.node)) continue;
+      writes.add(w);
+      uncertainLayout ||= match === 'overlap';
     }
     for (const record of records) {
       if (!record) continue;
-      for (const effect of readerFor(record).addressWrites(key, slot)) {
-        if (effect) writes.add(effect);
-        else if (mutable) unknown = true;
+      for (const entry of readerFor(record).addressWrites(key, slot)) {
+        if (entry.effect) {
+          writes.add(entry.effect);
+          uncertainLayout ||= matchingSlot(entry.slot, slot) === 'overlap';
+        } else if (mutable) unknown = true;
       }
     }
-    return { writes, direct, unknown };
+    return { writes, direct, unknown, uncertainLayout };
   }
   function readerFor(record) {
     if (!readers.has(record)) {
       const ambient = (key, slot) => {
         if (typeof key !== 'string' && key?.storageClass !== 'static') return { targets: [], unknown: false };
         const ids = [];
-        let unknown = !!defs.get(key)?.isExtern && !slot;
+        let unknown = !!defs.get(key)?.isExtern && !slot, uncertainLayout = false;
+        const matches = path => {
+          const match = matchingSlot(path, slot);
+          uncertainLayout ||= match === 'overlap';
+          return match;
+        };
         const table = tables.get(key);
-        for (const [path, id] of table?.slots || []) if (matchingSlot(path, slot)) ids.push(id);
-        for (const [path, targets] of table?.candidateSlots || []) if (matchingSlot(path, slot)) ids.push(...targets);
-        for (const w of declWrites.get(key) || []) if (matchingSlot(w.slot, slot)) {
+        for (const [path, id] of table?.slots || []) if (matches(path)) ids.push(id);
+        for (const [path, targets] of table?.candidateSlots || []) if (matches(path)) ids.push(...targets);
+        for (const w of declWrites.get(key) || []) if (matches(w.slot)) {
           const value = writeValue(w);
           ids.push(...value.targets);
           unknown ||= value.unknown || value.parameters.length > 0;
+          uncertainLayout ||= value.uncertainLayout;
         }
-        return { targets: ids, unknown };
+        return { targets: ids, unknown, uncertainLayout };
       };
       const parameterWrites = (callee, index) => {
         const unit = record.context;
@@ -257,7 +280,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         if (forwardedParams.has(param)) writes.push(null);
         return writes;
       };
-      const fieldWrites = (id, slot) => fieldValues(indirectFieldWrites, fieldKey(record.context, id), memberIndices(slot));
+      const fieldWrites = (id, slot, unionId) => fieldValues(indirectFieldWrites, fieldLocation(record.context, id, slot, unionId));
       readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }));
     }
     return readers.get(record);
@@ -287,30 +310,40 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       // 空数组表示追踪过该成员，但目前的值未知；不能重新引入旧初始化值。
       const exact = tracked === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
       const targets = addressTaken.get(signature);
-      const matchingSlots = tracked?.targets || [];
+      // C 的旧式无原型函数也可能与调用签名兼容。已证明同一槽位的值不需要这个回退筛选。
+      const resultType = signature.split('(')[0], oldStyle = resultType + '()';
+      const compatible = id => targets?.has(id) || addressTaken.get(oldStyle)?.has(id) ||
+        (signature === oldStyle && [...addressTaken].some(([sig, ids]) => sig.startsWith(resultType + '(') && ids.has(id)));
+      const slotTargets = tracked?.uncertainLayout ? tracked.targets.filter(compatible) : [...(tracked?.targets || [])];
       if (tracked === null && table) {
-        if (pointer.slot.includes('[*]')) {
-          for (const [slot, to] of table.slots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(to);
-          for (const [slot, tos] of table.candidateSlots) if (matchingSlot(slot, pointer.slot)) matchingSlots.push(...tos);
+        if (pointer.slot.includes('[*]') || pointer.slot.includes('.|')) {
+          const add = (slot, ids) => {
+            const match = matchingSlot(slot, pointer.slot);
+            if (match) slotTargets.push(...(match === 'overlap' ? ids.filter(compatible) : ids));
+          };
+          for (const [slot, to] of table.slots) add(slot, [to]);
+          for (const [slot, tos] of table.candidateSlots) add(slot, tos);
         } else {
-          if (table.slots.has(pointer.slot)) matchingSlots.push(table.slots.get(pointer.slot));
-          matchingSlots.push(...(table.candidateSlots.get(pointer.slot) || []));
+          if (table.slots.has(pointer.slot)) slotTargets.push(table.slots.get(pointer.slot));
+          slotTargets.push(...(table.candidateSlots.get(pointer.slot) || []));
         }
       }
       const objectWrites = varKey == null ? [] : declWrites.get(varKey) || [];
       const writesForVar = tracked === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
       const writtenValues = writesForVar.map(writeValue);
-      const writtenTargets = writtenValues.flatMap(value => value.targets);
-      const field = fieldKey(context, pointer?.fieldId);
+      for (const [i, value] of writtenValues.entries()) {
+        const uncertain = value.uncertainLayout || matchingSlot(writesForVar[i].slot, pointer.slot) === 'overlap';
+        slotTargets.push(...(uncertain ? value.targets.filter(compatible) : value.targets));
+      }
       const fieldCandidates = new Set();
       let unknownValue = tracked?.unknown || tracked?.parameters.length > 0 || writtenValues.some(v => v.unknown || v.parameters.length > 0);
       const knownObject = tracked || table || (!pointer?.throughPointer && defs.has(varKey) && !defs.get(varKey).isExtern) || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
         (pointer.member || objectWrites.length || /\[[^\]]*\]$/.test(typeOf(pointer.decl))));
-      if (field && !knownObject) {
-        const indices = memberIndices(pointer.slot);
+      if (pointer?.fieldId && !knownObject) {
+        const location = fieldLocation(context, pointer.fieldId, pointer.slot, pointer.unionId);
         const collect = fields => {
-          const value = fieldValues(fields, field, indices);
-          for (const id of value.targets) fieldCandidates.add(id);
+          const value = fieldValues(fields, location);
+          for (const id of value.targets) if (!value.uncertainLayout || compatible(id)) fieldCandidates.add(id);
           unknownValue ||= value.unknown;
         };
         collect(byRecordField);
@@ -324,16 +357,16 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         } else {
           candidates = [];
           resolution = 'unresolved';
-          const fallbackList = [...new Set([...matchingSlots, ...writtenTargets, ...fieldCandidates])];
+          const fallbackList = [...new Set([...slotTargets, ...fieldCandidates])];
           indirectCalls.push({
             caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
             expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
             resolution, truncated: false, matchedSlots: fallbackList.length,
-            candidates: fallbackList.map(id => ({ slot: pointer?.slot || '', name: (functions.get(id) || externals.get(id))?.name || id, id })),
+            candidates: fallbackList.map(id => ({ slot: pointer?.sourceSlot || '', name: (functions.get(id) || externals.get(id))?.name || id, id })),
           });
         }
       } else {
-        const combinedSlots = [...new Set([...matchingSlots, ...writtenTargets,
+        const combinedSlots = [...new Set([...slotTargets,
           ...(unknownValue ? [...fieldCandidates, ...(targets || [])] : [])])];
         const signatureTargets = !knownObject && !(pointer?.member && pointer.baseType) ? targets : null;
         if (exact && !writesForVar.length) {
@@ -362,7 +395,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
         if (resolution !== 'exact') {
           const icCands = candidates.filter(id => !id.startsWith('ext::fnptr::')).map(id => ({
-            slot: pointer?.slot || '',
+            slot: pointer?.sourceSlot || '',
             name: (functions.get(id) || externals.get(id))?.name || id,
             id,
           }));
@@ -407,9 +440,9 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
     edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings, indirectCalls,
     enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
-    fnptrTables: [...tables].filter(([id]) => defs.has(id)).map(([id, { slots }]) => ({
+    fnptrTables: [...tables].filter(([id]) => defs.has(id)).map(([id, { slots, sourceSlots }]) => ({
       id, name: defs.get(id).name, file: defs.get(id).file,
-      map: Object.fromEntries([...slots].map(([slot, to]) => [slot, (functions.get(to) || externals.get(to)).name])),
+      map: Object.fromEntries([...slots].map(([slot, to]) => [sourceSlots.get(slot) ?? slot, (functions.get(to) || externals.get(to)).name])),
     })),
   };
   applyDataflow(model, df);

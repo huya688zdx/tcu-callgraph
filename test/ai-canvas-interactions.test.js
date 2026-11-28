@@ -212,9 +212,11 @@ test('浏览器悬停 AI 链路节点时只为对应画布节点描边，离开�
 
 test('浏览器延迟书签保存回复时保留当前画布绑定', async t => {
   try { resolveChromePath(); } catch (error) { t.skip(error.message); return; }
-  const modes = ['快速保存', '版本冲突', '切换工程', '面板更新', '另存书签', '重开同一书签', '原绑定的版本冲突'];
+  const modes = ['快速保存', '版本冲突', '切换工程', '面板更新', '另存书签', '重开同一书签', '原绑定的版本冲突',
+    '保存期间继续编辑', '连续两次快速保存', '面板更新期间继续编辑', '排队保存后切换书签'];
   for (const mode of modes) await t.test(mode, async t => {
     const conflict = mode.includes('冲突');
+    const panelUpdate = mode.startsWith('面板更新');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-bookmark-reply-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
     const [one, two] = ['one','two'].map(name => {
@@ -275,10 +277,10 @@ test('浏览器延迟书签保存回复时保留当前画布绑定', async t => 
         return response;
       };
     })()`);
-    if (mode === '面板更新' || mode === '另存书签') {
+    if (panelUpdate || mode === '另存书签') {
       await br.evaluate("document.getElementById('bookmarkBtn').click()");
       await br.waitFor(`Boolean(${row('B')})`);
-      if (mode === '面板更新') await br.evaluate(`${row('A')}.querySelector('.bm-update').click()`);
+      if (panelUpdate) await br.evaluate(`${row('A')}.querySelector('.bm-update').click()`);
       else await br.evaluate("document.getElementById('bookmarkName').value = 'C'; document.getElementById('bookmarkSave').click()");
     } else await quick();
     await br.waitFor('Boolean(window.heldSave)');
@@ -286,6 +288,43 @@ test('浏览器延迟书签保存回复时保留当前画布绑定', async t => 
     const savedName = mode === '另存书签' ? 'C' : 'A';
     const submitted = await find(savedName);
     assert.deepEqual(submitted.roots, scope(conflict ? 'a' : 'a_edit').roots);
+    if (mode.includes('继续编辑') || mode === '连续两次快速保存') {
+      const parallel = mode === '连续两次快速保存';
+      if (panelUpdate) await br.evaluate("(async () => (await import('/lib/modal.js')).closeModal())()");
+      await navigate('b_edit');
+      const fingerprint = await br.evaluate(`(async () => (await import('/lib/state.js')).scopeFingerprint(${JSON.stringify(submitted)}))()`);
+      await br.evaluate(`(async () => {
+        const { api } = await import('/lib/api.js'), update = api.updateBookmark;
+        api.updateBookmark = async body => {
+          const res = await update(body);
+          window.secondSave = { expected: body.expectedRevision, roots: body.roots, ok: res.ok };
+          return res;
+        };
+        document.activeElement.blur();
+      })()`);
+      if (parallel) {
+        await quick();
+        await navigate('b'); // 第二次 Ctrl+S 提交的应当是按键时的 b_edit。
+      }
+      await br.evaluate("window.releaseSave(); new Promise(resolve => setTimeout(resolve, 0))");
+      if (!parallel) {
+        const active = await br.evaluate("window.bmState.activeBookmark");
+        assert.deepEqual([active.id, active.revision, active.baseFingerprint], [a.id, submitted.revision, fingerprint]);
+        assert.ok(await br.evaluate("document.getElementById('bookmarkQuickSave').classList.contains('dirty')"));
+        assert.deepEqual((await find('A')).roots, scope('a_edit').roots);
+        await quick();
+      }
+      await br.waitFor('Boolean(window.secondSave)');
+      assert.deepEqual(await br.evaluate('window.secondSave'), { expected: submitted.revision, roots: scope('b_edit').roots, ok: true });
+      const last = await find('A');
+      assert.equal(last.revision, submitted.revision + 1);
+      assert.deepEqual(last.roots, scope('b_edit').roots);
+      await br.waitFor(`window.bmState.activeBookmark.revision === ${last.revision}`);
+      assert.deepEqual(await br.evaluate("window.alerts"), []);
+      assert.equal(await br.evaluate("document.getElementById('bookmarkQuickSave').classList.contains('dirty')"), parallel);
+      assert.deepEqual((await find('B')).roots, scope('b').roots);
+      return;
+    }
     if (mode === '原绑定的版本冲突') {
       await br.evaluate('window.releaseSave()');
       await br.waitFor("window.alerts.length === 1 && document.querySelector('#bookmarkModal.show')");
@@ -293,8 +332,12 @@ test('浏览器延迟书签保存回复时保留当前画布绑定', async t => 
       assert.deepEqual(await find('A'), submitted);
       return;
     }
+    if (mode === '排队保存后切换书签') {
+      await navigate('b_edit');
+      await quick();
+    }
     if (mode === '切换工程') { await project(two); b = await create('B','b'); }
-    if (mode === '面板更新' || mode === '另存书签') {
+    if (panelUpdate || mode === '另存书签') {
       await br.evaluate(`${row('B')}.querySelector('.bm-open').click()`);
       await br.waitFor(`window.bmState.activeBookmark?.id === ${b.id} && !document.querySelector('.modal.show')`);
     } else await open(b);
