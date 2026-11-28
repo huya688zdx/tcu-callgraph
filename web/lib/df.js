@@ -119,7 +119,7 @@ function renderDataflowResult(error = '') {
   showPanel(`<div class="detail-title" title="${esc(res.fn.file || '')}:${res.fn.line || ''}">${esc(res.fn.name)}</div>
     <div class="df-tools"><input id="dfFilter" type="search" aria-label="${t('df.filter')}" placeholder="${t('df.filter')}" value="${esc(df.query)}">
     <div class="df-actions"><button class="primary" data-df="toggle">${t('common.relAdd')}</button>
-      ${window.__EXPORT ? '' : '<button type="button" data-df="askAi" title="将数据流分析结果明确加入 AI 对话上下文">✨ 加入对话</button>'}
+      ${window.__EXPORT ? '' : `<button type="button" data-df="askAi" title="${t('ai.addFlowHint')}">${t('ai.addToChat')}</button>`}
       <span data-df-total>${t('df.summary', { n: rows.length })}</span></div></div>
     ${error ? `<div class="df-error" role="alert">${esc(error)}</div>` : ''}
     ${group('read', 'df.upstream')}${group('write', 'df.downstream')}
@@ -294,7 +294,7 @@ function buildDataflowAiDetail() {
     dir: 'both',
     file: res.fn.file || '',
     line: res.fn.line || 0,
-    label: `数据流 · ${res.fn.name} (${rows.length})`,
+    label: t('ai.flowLabel', { name: res.fn.name, n: rows.length }),
     relationCount: rows.length,
     projectId: res.projectId,
     comparisonId: res.comparisonId,
