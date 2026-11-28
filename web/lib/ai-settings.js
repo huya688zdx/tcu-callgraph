@@ -4,7 +4,7 @@
  * 2. 直连 API：配置 Base URL / Model / Key / 兼容模式，支持拉取模型与连通性测试；
  * 3. 外部 MCP：保留原有三档权限控制、一键复制 CC 命令与精简指令。
  */
-import { t } from '../i18n.js';
+import { applyI18n, getLang, t } from '../i18n.js';
 import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
 import { focusBox, stopCamAnim } from './camera.js';
@@ -126,71 +126,71 @@ const NEW_THREAD_TITLE = '新对话';
 const GIT_THREAD_TITLE = 'Git 改动分析';
 const LABELS_THREAD_TITLE = '补全 TASK / 顺序标签';
 const BUILD_DIAG_THREAD_TITLE = '构建配置诊断';
-const GENERIC_THREAD_TITLES = new Set([NEW_THREAD_TITLE, GIT_THREAD_TITLE, LABELS_THREAD_TITLE, BUILD_DIAG_THREAD_TITLE]);
-const GIT_QUICK_PROMPT = '先调用 get_git_changes 查看当前 Git 未提交改动。如果改动涉及多个独立模块或多个车型目录（如不同路径前缀），先用 ask_user 询问我保留哪些车型或是否按书签拆分；如果范围唯一明确，直接调用 add_to_canvas({ fromGit: true }) 加入画布并简述影响。';
-const LABELS_QUICK_PROMPT = '立即补全当前画布上缺失的 TASK 周期（含函数上方注释中的周期）和 コール順 标签：先调 find_symbols({}) 查看画布连线与自动识别的候选标签，再直接调用 apply_labels 把标签写入画布（コール順 不带注释），不要只口头列出。';
-const BUILD_DIAG_QUICK_PROMPT = [
-  '请调用 inspect_build_config（先 action:"scan"，再按需用 summarize_cproject 或 read 查看代表性的 .cproject/.mak/QAC 文件）做只读摸底。',
-  '重要：我只能手打转述，请把最终回复严格压到 7 行、总字数不超过 120 字，且全部脱敏（不写真实机种/业务/公司名），严格按下面极简格式输出：',
-  '1.cproject：个数(位置)、配置数、有无linkedResources',
-  '2.编译器/架构：如 ccv850/ccrh/gcc + v800',
-  '3.路径/宏：主要标签/变量(${...})、有无excluding',
-  '4.mak：单/多mak、-I/-D/@rsp/-f 写法',
-  '5.扩展语法：是否见到 __interrupt/__near/__far/@地址/#pragma/内联汇编',
-  '6.QAC/pl：有无及主要扩展名(.via/.prj/xml/.pl)',
-  '7.Clang：本机有/无、重名函数数',
-].join('\n');
+// 自动标题沿用已有存储值，仅在显示时翻译。
+const GENERIC_THREAD_TITLES = new Map([
+  [NEW_THREAD_TITLE, 'ai.thread.new'], [GIT_THREAD_TITLE, 'ai.thread.git'],
+  [LABELS_THREAD_TITLE, 'ai.thread.labels'], [BUILD_DIAG_THREAD_TITLE, 'ai.thread.build'],
+]);
+
+function displayThreadTitle(thread) {
+  if (thread.customTitle) return thread.title;
+  const key = GENERIC_THREAD_TITLES.get(thread.title || NEW_THREAD_TITLE);
+  if (key) return t(key);
+  return thread.title.replace(/^(画布|标签)(?= · )/, prefix =>
+    prefix === '画布' ? t('timeline.kindCanvas') : t('ai.thread.labelPrefix'));
+}
+
 const BOOKMARK_COMMAND = '/bookmark';
 const DEFAULT_CONTEXT_WINDOW = 32768;
 const DEFAULT_MAX_TOKENS = 8192;
 
-const LABELS_FOLLOWUP = { label: '🏷 补全当前图 TASK/顺序标签', prompt: LABELS_QUICK_PROMPT };
+const LABELS_FOLLOWUP = { label: 'ai.follow.labels', prompt: 'ai.quickPrompt.labels' };
 const FOLLOWUPS = new Map([
   ['add_to_canvas', [
     LABELS_FOLLOWUP,
-    { label: '✨ 一键整理画布排版', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 一键整理当前画布布局。' },
-    { label: '🔖 为当前视图保存书签', draft: BOOKMARK_COMMAND + ' ' },
+    { label: 'ai.follow.tidy', prompt: 'ai.action.tidy' },
+    { label: 'ai.follow.bookmark', draft: BOOKMARK_COMMAND + ' ' },
   ]],
   ['get_git_changes', [
-    { label: '⚡ 按独立模块拆分书签上图', prompt: '请基于刚才的 Git 改动调用 add_to_canvas({ fromGit: true, splitByGroup: true })，复用已有 snapshotId 并沿用已确认的车型范围，按独立模块拆分书签并上图。' },
-    { label: '🔍 查看上游车型分支', prompt: '请调用 trace_upstream 追踪刚才 Git 改动函数的上游 TASK/ISR 调用链，按车型或目录汇总上游分支。' },
+    { label: 'ai.follow.split', prompt: 'ai.action.split' },
+    { label: 'ai.follow.variants', prompt: 'ai.action.variants' },
   ]],
   ['apply_labels', [
-    { label: '🔍 查找相关共享变量入图', prompt: '请查找当前画布函数相关的共享变量，确认读写关系后把找到的共享变量加入当前画布。' },
-    { label: '⚡ 检查 Git 未提交改动', prompt: '请调用 get_git_changes 只读检查当前 Git 未提交改动，汇总改动涉及的文件、函数和独立模块。' },
+    { label: 'ai.follow.shared', prompt: 'ai.action.shared' },
+    { label: 'ai.follow.git', prompt: 'ai.action.git' },
   ]],
   ['remove_from_canvas', [
     LABELS_FOLLOWUP,
-    { label: '🔖 保存当前筛选结果为书签', draft: BOOKMARK_COMMAND + ' ' },
+    { label: 'ai.follow.filtered', draft: BOOKMARK_COMMAND + ' ' },
   ]],
   ['read_function', [
-    { label: '🔍 查上游 TASK 调用链', prompt: '请调用 trace_upstream 只读追踪刚才分析函数的上游 TASK/ISR 调用链。' },
-    { label: '🧭 查间接/函数指针调用', prompt: '请调用 inspect_indirect_calls 和 read_source 检查刚才分析函数是否存在函数指针数组、常量结构体或回调间接调用。' },
-    { label: '➕ 将相关函数加入画布', prompt: '请将刚才分析的相关函数及上游入口加入当前画布。' },
+    { label: 'ai.follow.tasks', prompt: 'ai.action.tasks' },
+    { label: 'ai.follow.indirect', prompt: 'ai.action.indirect' },
+    { label: 'ai.follow.functions', prompt: 'ai.action.functions' },
   ]],
   ['read_source', [
-    { label: '🧭 核实并补入间接调用边', prompt: '请根据刚才查到的源码证据，调用 add_call_edge 只加入真正会触发的间接调用边到画布。' },
-    { label: '🔍 追踪上游调用链', prompt: '请追踪刚才源码涉及核心函数的上游 TASK/ISR 调用链。' },
+    { label: 'ai.follow.verifyEdges', prompt: 'ai.action.verifyEdges' },
+    { label: 'ai.follow.callers', prompt: 'ai.action.callers' },
   ]],
   ['inspect_indirect_calls', [
-    { label: '🔗 按源码核实并补边入图', prompt: '请结合实际代码逻辑，只选择真正会执行的间接调用目标，调用 add_call_edge 写入工程调用图并加入画布。' },
-    { label: '📄 读取分派表定义源码', prompt: '请调用 read_source 读取对应常量结构体/分派表的完整定义源码。' },
+    { label: 'ai.follow.addEdges', prompt: 'ai.action.addEdges' },
+    { label: 'ai.follow.dispatch', prompt: 'ai.action.dispatch' },
   ]],
   ['add_call_edge', [
-    { label: '🔍 重新追踪上游调用链', prompt: '请重新调用 trace_upstream 验证补边后的完整上游 TASK/ISR 调用链。' },
-    { label: '✨ 整理当前画布布局', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 整理当前画布。' },
+    { label: 'ai.follow.retrace', prompt: 'ai.action.retrace' },
+    { label: 'ai.follow.layout', prompt: 'ai.action.layout' },
   ]],
   ['trace_upstream', [
-    { label: '➕ 将上游调用链加入画布', prompt: '请将刚才查到的上游调用链加入当前画布。' },
-    { label: '🧭 排查缺失的间接调用', prompt: '请调用 inspect_indirect_calls 检查是否还有通过函数指针表或回调触发的上游调用。' },
+    { label: 'ai.follow.addChain', prompt: 'ai.action.addChain' },
+    { label: 'ai.follow.missing', prompt: 'ai.action.missing' },
   ]],
   ['find_symbols', [
-    { label: '➕ 将匹配结果加入画布', prompt: '请将刚才找到的主要相关函数加入当前画布。' },
-    { label: '📖 查看核心函数源码', prompt: '请调用 read_function 读取其中最核心函数的源码实现。' },
+    { label: 'ai.follow.matches', prompt: 'ai.action.matches' },
+    { label: 'ai.follow.source', prompt: 'ai.action.source' },
   ]],
   ['arrange_canvas', [
-    { label: '↕️ 改为自上而下排布', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "TB" }) 按从上到下方向重新整理画布。' },
-    { label: '↩️ 恢复自动布局', prompt: '请调用 arrange_canvas({ action: "reset" }) 恢复画布自动布局。' },
+    { label: 'ai.follow.vertical', prompt: 'ai.action.vertical' },
+    { label: 'ai.follow.reset', prompt: 'ai.action.reset' },
   ]],
 ]);
 
@@ -205,9 +205,11 @@ let apiConfigLoad = null;
 let showApiOnOpen = false;
 let mcpLevel = 'readonly';
 let envLocked = false;
-const REASONING_LABELS = new Map([['default', '默认'], ['off', '关'], ['low', '低'], ['medium', '中'], ['high', '高']]);
+const EFFORT_KEYS = {
+  default: 'ai.effort.default', off: 'ai.effort.off', low: 'ai.effort.low',
+  medium: 'ai.effort.medium', high: 'ai.effort.high',
+};
 const QUICK_CONFIG_ACTION = '__ai_open_config__';
-const STEERING_PROMPT_PLACEHOLDER = '生成中可随时输入并按 Enter 中途引导或纠正…';
 const MAX_PENDING_IMAGES = 2;
 const MAX_PENDING_FILES = MAX_CODE_ATTACHMENTS;
 let currentGhostSuggestion = '';
@@ -291,6 +293,9 @@ function deriveThreadTitle(prompt, tools = []) {
     const title = tool && toolTitleSubject(tool, source);
     if (title) return title;
   }
+  if (prompt === t('ai.quickPrompt.git') || prompt === '/git') return GIT_THREAD_TITLE;
+  if (prompt === t('ai.quickPrompt.labels') || prompt === '/labels') return LABELS_THREAD_TITLE;
+  if (prompt === t('ai.quickPrompt.build')) return BUILD_DIAG_THREAD_TITLE;
   const request = String(prompt ?? '').trim()
     .replace(/^(?:(?:请(?:你)?(?:帮我)?|帮我|麻烦(?:帮我|你)?|能否)\s*[，,:：]?\s*)+/u, '');
   if (/^(?:先)?(?:调用|调)\s*`?get_git_changes\b/iu.test(request)) return GIT_THREAD_TITLE;
@@ -338,7 +343,7 @@ function persistChats(projectId = chatProjectId) {
   const payload = { projectId, activeId: activeChatId, threads };
   void api.saveAiChats(payload).catch(error => {
     if (projectId === chatProjectId && mutation === chatMutation) {
-      setChatStatus(`对话保存失败：${error.message}`, true);
+      setChatStatus(() => t('ai.thread.saveError', { error: error.message }), true);
     }
   });
 }
@@ -351,7 +356,7 @@ function finishThreadRename(save) {
   renameInputEl.hidden = true;
   chatSelectEl.hidden = false;
   renameChatBtn.disabled = chatProjectId == null;
-  if (!save || !title || thread.id !== activeChatId || !chatThreads.includes(thread) ||
+  if (!save || !title || title === renameInputEl.defaultValue || thread.id !== activeChatId || !chatThreads.includes(thread) ||
       chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
   thread.title = title;
   thread.customTitle = true;
@@ -365,12 +370,12 @@ function renderChatBar() {
   }
   renameChatBtn.disabled = chatProjectId == null || Boolean(renamingThread);
   if (projectTagEl) {
-    projectTagEl.textContent = chatProjectName ? `工程：${chatProjectName}` : '工程';
-    projectTagEl.title = chatProjectName ? `当前工程：${chatProjectName}（不同工程对话完全隔离）` : '按工程隔离保存对话';
+    projectTagEl.textContent = chatProjectName ? t('ai.projectName', { name: chatProjectName }) : t('timeline.kindProject');
+    projectTagEl.title = chatProjectName ? t('ai.currentProject', { name: chatProjectName }) : t('ai.projectHint');
   }
   if (chatSelectEl) {
     chatSelectEl.innerHTML = chatThreads.map((th) =>
-      `<option value="${esc(th.id)}"${th.id === activeChatId ? ' selected' : ''}>${esc(th.title)} (${th.messages.length})</option>`
+      `<option value="${esc(th.id)}"${th.id === activeChatId ? ' selected' : ''}>${esc(displayThreadTitle(th))} (${th.messages.length})</option>`
     ).join('');
   }
   if (deleteChatBtn) deleteChatBtn.disabled = chatThreads.length <= 1 && !(activeThread().messages.length);
@@ -379,18 +384,18 @@ function renderChatBar() {
 function messageContext(message) {
   const parts = [];
   if (message.role === 'user' && message.selectionSummary) {
-    parts.push(`[当时画布选中：${message.selectionSummary}]`);
+    parts.push(t('ai.history.selection', { name: message.selectionSummary }));
   }
   if (message.text) parts.push(message.text);
   if (message.role === 'assistant') {
     for (const tool of message.tools || []) {
       const digest = tool.digest || tool.summary;
-      if (digest) parts.push(`[已执行工具：${tool.name} -> ${typeof digest === 'string' ? digest : JSON.stringify(digest)}]`);
+      if (digest) parts.push(t('ai.history.tool', { name: tool.name, result: typeof digest === 'string' ? digest : JSON.stringify(digest) }));
     }
     if (message.questionOptions?.length) {
       const options = message.questionOptions.map((opt) =>
         opt.description ? `${opt.label}（${opt.description}）` : opt.label);
-      parts.push(`[已提供选项：${options.join(' / ')}]`);
+      parts.push(t('ai.history.options', { options: options.join(' / ') }));
     }
   }
   return parts.filter(Boolean).join('\n');
@@ -497,19 +502,19 @@ function renderContextBadge() {
   if (contextTextEl) {
     contextTextEl.innerHTML = `${prefix}${formatTokens(used)} / ${formatWindowSize(limit)}<span class="ai-ctx-pct"> · ${pct}%</span>`;
   } else {
-    contextBadge.textContent = `上下文 ${prefix}${formatTokens(used)} / ${formatWindowSize(limit)} · ${pct}%`;
+    contextBadge.textContent = `${prefix}${formatTokens(used)} / ${formatWindowSize(limit)} · ${pct}%`;
   }
   contextBadge.classList.toggle('warn', rawPct >= 65 && rawPct < 85);
   contextBadge.classList.toggle('danger', rawPct >= 85);
   compactBtn?.classList.toggle('suggest', rawPct >= 75);
 
-  const lines = [`上下文窗口占用：${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`];
+  const lines = [t('ai.context.usage', { used: used.toLocaleString(getLang()), limit: limit.toLocaleString(getLang()), pct })];
   if (hasMetrics && (promptTokens > 0 || outputTokens > 0)) {
-    lines.push(`最近一轮：输入 ${promptTokens.toLocaleString()} · 输出 ${outputTokens.toLocaleString()} tokens（${estimated ? '估算' : '模型实测'}）`);
+    lines.push(t('ai.context.lastTurn', { input: promptTokens.toLocaleString(getLang()), output: outputTokens.toLocaleString(getLang()), source: estimated ? t('ai.context.estimated') : t('ai.context.measured') }));
   } else if (used === 0) {
-    lines.push('当前暂无对话消息');
+    lines.push(t('ai.context.empty'));
   } else {
-    lines.push('基于当前对话文本估算（发送请求后将按模型接口返回更新）');
+    lines.push(t('ai.context.estimateHint'));
   }
   contextBadge.title = lines.join('\n');
 }
@@ -524,7 +529,7 @@ function renderTelemetry(thread, liveMetrics) {
   const elapsedMs = Number(metrics?.elapsedMs);
   const parts = [];
   if (Number.isFinite(tokens) && tokens > 0) {
-    parts.push(`输出 ${metrics?.estimated ? '~' : ''}${formatTokens(tokens)}`);
+    parts.push(t('ai.context.output', { count: (metrics?.estimated ? ', ' : '') + formatTokens(tokens) }));
   }
   if (Number.isFinite(speed) && speed > 0) {
     parts.push(`${speed.toFixed(1)} tok/s`);
@@ -532,19 +537,30 @@ function renderTelemetry(thread, liveMetrics) {
   speedBadge.textContent = parts.join(' · ');
   if (parts.length) {
     const detail = [];
-    if (Number.isFinite(tokens) && tokens > 0) detail.push(`输出 ${tokens.toLocaleString()} tokens${metrics?.estimated ? '（估算）' : '（实测）'}`);
-    if (Number.isFinite(speed) && speed > 0) detail.push(`速度 ${speed.toFixed(1)} tok/s`);
-    if (Number.isFinite(elapsedMs) && elapsedMs >= 100) detail.push(`耗时 ${(elapsedMs / 1000).toFixed(1)}s`);
+    if (Number.isFinite(tokens) && tokens > 0) detail.push(t('ai.context.outputDetail', { n: tokens.toLocaleString(getLang()), source: metrics?.estimated ? t('ai.context.estimated') : t('ai.context.measured') }));
+    if (Number.isFinite(speed) && speed > 0) detail.push(t('ai.context.speed', { n: speed.toFixed(1) }));
+    if (Number.isFinite(elapsedMs) && elapsedMs >= 100) detail.push(t('ai.context.elapsed', { n: (elapsedMs / 1000).toFixed(1) }));
     speedBadge.title = detail.join(' · ');
   } else {
     speedBadge.title = '';
   }
 }
 
-function setChatStatus(text = '', error = false) {
-  chatStatusEl.textContent = text;
-  chatStatusEl.classList.toggle('err', error);
+// 已显示的状态也随语言刷新，服务端或模型返回的原文直接保留。
+function bindStatus(element) {
+  let render;
+  document.addEventListener('callgraph:langchange', () => {
+    if (render) element.textContent = render();
+  });
+  return (message = '', isError = false) => {
+    render = typeof message === 'function' ? message : null;
+    element.textContent = render ? render() : message;
+    element.classList.toggle('err', isError);
+  };
 }
+
+const setChatStatus = bindStatus(chatStatusEl);
+const setApiStatus = bindStatus(apiStatusEl);
 
 function computeInputSuggestion() {
   if (activeAbort) return '';
@@ -563,16 +579,16 @@ function computeInputSuggestion() {
   const nodes = state.view?.nodes || [];
   if (nodes.length) {
     const root = nodes.find((n) => n.id === state.roots?.[0]) || nodes[0];
-    if (root?.name) return `分析「${root.name}」的上下游调用链及共享变量读写关系`;
+    if (root?.name) return t('ai.suggest.root', { name: root.name });
   }
-  return '查看当前 Git 未提交改动，汇总涉及的文件、函数和独立模块';
+  return t('ai.suggest.git');
 }
 
 function syncInputSuggestion() {
   if (!inputEl) return;
   if (activeAbort) {
     currentGhostSuggestion = '';
-    inputEl.placeholder = STEERING_PROMPT_PLACEHOLDER;
+    inputEl.placeholder = t('ai.steerPlaceholder');
     if (ghostTabHintEl) ghostTabHintEl.hidden = true;
     return;
   }
@@ -595,8 +611,8 @@ function acceptGhostSuggestion() {
 function updateChatControls() {
   const streaming = Boolean(activeAbort);
   sendBtn.disabled = Boolean(compacting);
-  sendBtn.textContent = streaming ? '引导' : '发送';
-  sendBtn.title = streaming ? '立即中止当前步骤并带上新引导继续' : '';
+  sendBtn.textContent = streaming ? t('ai.steer') : t('ai.send');
+  sendBtn.title = streaming ? t('ai.steerHint') : '';
   sendBtn.classList.toggle('steering', streaming);
   syncInputSuggestion();
   compactBtn.disabled = Boolean(streaming || compacting) || !activeThread().messages.length;
@@ -609,7 +625,7 @@ function isNearBottom(el) {
 }
 
 function followChatScroll() {
-  if (stickToBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (stickToBottom) messagesEl.scrollTop = messagesEl.querySelector('.empty') ? 0 : messagesEl.scrollHeight;
 }
 
 const NON_SYMBOL_CODE_WORDS = new Set([
@@ -653,7 +669,7 @@ function locateSymbolFromChat(rawSym) {
     focusBox(node, 110, { keepZoom: true });
     state.flash = { box: node, until: performance.now() + 900, dur: 900 };
     draw({ geometryUnchanged: true });
-    setChatStatus(`已定位到画布${node.kind === 'var' ? '变量' : '函数'}：${node.name}`);
+    setChatStatus(() => t('ai.located', { kind: node.kind === 'var' ? t('manual.kindVar') : t('manual.kindFn'), name: node.name }));
     return;
   }
   if (els.search) {
@@ -661,7 +677,7 @@ function locateSymbolFromChat(rawSym) {
     els.search.value = query;
     els.search.focus();
     void runSearch();
-    setChatStatus(`当前画布暂无「${query}」，已在左侧搜索定位`);
+    setChatStatus(() => t('ai.focusSearch', { query }));
   }
 }
 
@@ -701,7 +717,7 @@ function formatAssistantText(text) {
       const inner = part.slice(1, -1);
       if (isClickableSymbolToken(inner)) {
         const clean = inner.trim().replace(/\(\s*\)$/, '');
-        return `<button type="button" class="ai-sym-link" data-ai-sym="${esc(clean)}" title="点击在画布中定位「${esc(clean)}」">${esc(inner)}</button>`;
+        return `<button type="button" class="ai-sym-link" data-ai-sym="${esc(clean)}" title="${esc(t('ai.symbolLocate', { name: clean }))}">${esc(inner)}</button>`;
       }
       return `<code>${esc(inner)}</code>`;
     }
@@ -823,8 +839,8 @@ function showThinking(box, before, thinking, seconds, streaming = false) {
   if (!streaming && !details.dataset.userToggled) details.open = false;
   const timer = Number.isFinite(seconds) ? ` · ${seconds.toFixed(1)}s` : '';
   details.querySelector('summary').textContent = streaming
-    ? (timer ? `Thinking${timer}` : 'Thinking…')
-    : `Thinking${timer} · 点击收起/展开`;
+    ? t('ai.thinking', { timer: timer || '…' })
+    : t('ai.thought', { timer });
   const pre = details.querySelector('pre');
   pre.textContent = thinking;
   followThinkingScroll(details, pre);
@@ -870,7 +886,7 @@ function renderQuestion(text, message, thread) {
   if (pending && message.allowCustom !== false) {
     const hint = document.createElement('p');
     hint.className = 'ai-q-hint';
-    hint.textContent = '也可以直接在下方输入框自定义回复';
+    hint.textContent = t('ai.questionCustom');
     card.appendChild(hint);
   }
 }
@@ -899,32 +915,37 @@ function sanitizeSuggestions(raw) {
   return out;
 }
 
+function translateFollowup(option) {
+  return option.draft ? { label: t(option.label), draft: option.draft }
+    : { label: t(option.label), prompt: t(option.prompt) };
+}
+
 function buildFallbackFollowups(message) {
   const tools = Array.isArray(message?.tools) ? message.tools : [];
   const successfulTools = tools.filter(tool => tool.ok !== false);
   const addedToCanvas = successfulTools.some(tool => tool.name === 'add_to_canvas');
   const action = successfulTools.findLast(tool => FOLLOWUPS.has(tool.name) &&
     (tool.name !== 'get_git_changes' || !addedToCanvas));
-  if (action) return FOLLOWUPS.get(action.name) || [];
+  if (action) return FOLLOWUPS.get(action.name).map(translateFollowup);
   if (canvasSelection) {
     const { questions } = describeSelection(canvasSelection);
     if (questions?.length) {
       return [
         ...questions.slice(0, 2).map(([label, prompt]) => ({ label: `🔍 ${label}`, prompt })),
-        { label: '🧭 查间接/函数指针调用', prompt: '请调用 inspect_indirect_calls 检查当前选中对象是否存在间接调用或分派表关系。' },
+        { label: t('ai.follow.indirect'), prompt: t('ai.inspectSelection') },
       ];
     }
   }
   if (state.view?.nodes?.length) {
     return [
-      LABELS_FOLLOWUP,
-      { label: '✨ 一键整理画布排版', prompt: '请调用 arrange_canvas({ action: "tidy", direction: "LR" }) 整理当前画布布局。' },
-      { label: '⚡ 检查 Git 未提交改动', prompt: '请调用 get_git_changes 只读检查当前 Git 未提交改动，汇总改动涉及的文件和函数。' },
+      translateFollowup(LABELS_FOLLOWUP),
+      { label: t('ai.follow.tidy'), prompt: t('ai.action.tidy') },
+      { label: t('ai.follow.git'), prompt: t('ai.reviewFiles') },
     ];
   }
   return [
-    { label: '⚡ 检查 Git 未提交改动', prompt: '请调用 get_git_changes 只读检查当前 Git 未提交改动，汇总改动涉及的文件、函数和独立模块。' },
-    { label: '🔍 按关键词查找函数', draft: '帮我找出和 ' },
+    { label: t('ai.follow.git'), prompt: t('ai.action.git') },
+    { label: t('ai.findFunctions'), draft: t('ai.findDraft') },
   ];
 }
 
@@ -944,7 +965,7 @@ function renderFollowups(box, message, thread) {
   const chips = document.createElement('div');
   chips.className = 'ai-followups';
   chips.setAttribute('role', 'group');
-  chips.setAttribute('aria-label', isDynamic ? 'AI 推荐的后续操作' : '后续操作');
+  chips.setAttribute('aria-label', isDynamic ? t('ai.followupDynamic') : t('ai.followupGroup'));
   for (const option of options) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -957,7 +978,7 @@ function renderFollowups(box, message, thread) {
       if (chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
       if (option.draft) {
         prefillPrompt(option.draft);
-        if (option.draft.startsWith(BOOKMARK_COMMAND)) setChatStatus('输入书签名称后按 Enter 保存');
+        if (option.draft.startsWith(BOOKMARK_COMMAND)) setChatStatus(() => t('ai.bookmarkEnter'));
       } else {
         void sendPrompt(option.prompt);
       }
@@ -1013,28 +1034,28 @@ function describeSelection(selection) {
     const n = Number(selection.pathCount) || (selection.visiblePaths?.length || 0);
     const rwCount = Array.isArray(selection.rwPaths) ? selection.rwPaths.length : 0;
     const caption = n || rwCount
-      ? `两点链路：${nameA} ↔ ${nameB}（调用 ${n} · 读写 ${rwCount}）`
-      : `两点关系：${nameA} ↔ ${nameB}（当前画布无直连）`;
+      ? t('ai.selection.pair', { nameA, nameB, n, rwCount })
+      : t('ai.selection.noPath', { nameA, nameB });
     return {
       caption,
       questions: (n || rwCount) ? [
-        ['分析两点链路', `请结合已附着的「${idA}」与「${idB}」双向调用及读写数据流，分析这两者之间的依赖和执行逻辑。`],
-        ['核对关键路径', `请说明「${idA}」到「${idB}」之间各条路径的触发条件、变量交接和先后顺序。`],
+        [t('ai.question.pair'), t('ai.prompt.pair', { idA, idB })],
+        [t('ai.question.paths'), t('ai.prompt.paths', { idA, idB })],
       ] : [
-        ['查为何无路径', `请只读分析「${idA}」和「${idB}」为什么在当前画布没有直接相连的调用/数据流路径。`],
-        ['查找并呈示关系', `请调用 inspect_dataflow 和 present_logic 查找「${idA}」与「${idB}」的间接或数据流关联。`],
+        [t('ai.question.noPath'), t('ai.prompt.noPath', { idA, idB })],
+        [t('ai.question.findRelation'), t('ai.prompt.findRelation', { idA, idB })],
       ],
     };
   }
   if (selection.kind === 'dataflow') {
     const id = selection.targetId || selection.id || '';
     const name = selection.targetName || selection.name || id.replace(/^var::/, '').split('::').pop();
-    const dirLabel = selection.dir === 'in' ? '写入源(in)' : selection.dir === 'both' ? '双向' : '读取下游(out)';
+    const dirLabel = selection.dir === 'in' ? t('ai.selection.in') : selection.dir === 'both' ? t('ai.selection.both') : t('ai.selection.out');
     return {
-      caption: `数据流(${dirLabel})：${name}`,
+      caption: t('ai.selection.flow', { dirLabel, name }),
       questions: [
-        ['梳理数据流链', `请梳理「${id}」(${dirLabel}) 所涉及变量的写入方、读取方和触发周期。`],
-        ['呈示交互大图', `请调用 present_logic 把「${id}」及其共享变量读写链路呈现在画布上并开启导览。`],
+        [t('ai.question.flow'), t('ai.prompt.flowSelection', { id, dirLabel })],
+        [t('ai.question.present'), t('ai.prompt.presentFlow', { id })],
       ],
     };
   }
@@ -1043,13 +1064,13 @@ function describeSelection(selection) {
     const variable = selection.nodeKind === 'var';
     const location = file ? ` (${file}${line ? `:${line}` : ''})` : '';
     return {
-      caption: `${variable ? '变量' : '函数'}：${name || id}${location}`,
+      caption: t('ai.selection.caption', { kind: variable ? t('manual.kindVar') : t('manual.kindFn'), name: (name || id) + location }),
       questions: variable ? [
-        ['解释变量', `请解释变量「${id}」的用途。`],
-        ['查读写关系', `请查找读写变量「${id}」的函数。`],
+        [t('ai.question.variable'), t('ai.prompt.variable', { id })],
+        [t('ai.question.readWrite'), t('ai.prompt.readWrite', { id })],
       ] : [
-        ['解释函数', `请解释函数「${id}」的职责和主要逻辑。`],
-        ['查上游调用链', `请追踪函数「${id}」的上游调用链。`],
+        [t('ai.question.function'), t('ai.prompt.function', { id })],
+        [t('ai.question.upstream'), t('ai.prompt.upstream', { id })],
       ],
     };
   }
@@ -1057,23 +1078,23 @@ function describeSelection(selection) {
     const { from, to, fromName, toName, labels = [], line } = selection;
     const tag = labels.find(label => label.preset === 'task')?.text || labels[0]?.text;
     const endpoints = `${fromName || from?.split('::').pop()} → ${toName || to?.split('::').pop()}`;
-    const edgeRef = `「${from} → ${to}」${line ? `（第 ${line} 行）` : ''}`;
+    const edgeRef = `「${from} → ${to}」${line ? t('ai.selection.line', { line }) : ''}`;
     return {
-      caption: `连线：${endpoints}${tag ? ` [${tag}]` : ''}`,
+      caption: t('ai.selection.edge', { tagText: tag ? ` [${tag}]` : '', endpoints }),
       questions: [
-        ['分析此连线', `请分析连线${edgeRef}的关系和调用场景。`],
-        ['核对标签周期', `请核对连线${edgeRef}的 TASK 标签和实际任务周期。`],
+        [t('ai.question.edge'), t('ai.prompt.edge', { edgeRef })],
+        [t('ai.question.period'), t('ai.prompt.period', { edgeRef })],
       ],
     };
   }
   const directory = selection.containerKind === 'dir';
-  const kind = directory ? '目录' : '文件';
+  const kind = directory ? t('ai.directory') : t('ai.file');
   const path = selection.path || '.';
   return {
-    caption: `${kind}：${selection.path || selection.label || path}`,
+    caption: t('ai.selection.caption', { kind, name: selection.path || selection.label || path }),
     questions: [
-      [directory ? '梳理目录函数' : '梳理文件函数', `请梳理${kind}「${path}」中的主要函数及其关系。`],
-      ['查改动影响', `请分析${kind}「${path}」中的 Git 改动及其影响范围。`],
+      [directory ? t('ai.question.dir') : t('ai.question.file'), t('ai.prompt.fileFunctions', { kind, path })],
+      [t('ai.question.impact'), t('ai.prompt.fileImpact', { kind, path })],
     ],
   };
 }
@@ -1106,15 +1127,15 @@ function renderSelectionBar() {
         const glyph = chipGlyph(item);
         const chip = document.createElement('span');
         chip.className = item._pinned ? 'ai-pinned-chip is-pinned' : 'ai-pinned-chip';
-        chip.title = `${caption}${item._pinned ? '（已锁定跨轮保留）' : '（本轮发送后自动清理）'}`;
+        chip.title = `${caption}${item._pinned ? t('ai.pin.lockedSuffix') : t('ai.pin.onceSuffix')}`;
         const label = document.createElement('span');
         label.textContent = `${glyph} ${caption}`;
         const pinToggle = document.createElement('button');
         pinToggle.type = 'button';
         pinToggle.className = 'ai-pinned-pin';
         pinToggle.setAttribute('aria-pressed', String(Boolean(item._pinned)));
-        pinToggle.setAttribute('aria-label', item._pinned ? `取消跨轮锁定：${caption}` : `锁定跨轮保留：${caption}`);
-        pinToggle.title = item._pinned ? '已锁定：发送后继续保留（点击取消）' : '点击 📌 锁定以在后续追问中持续保留';
+        pinToggle.setAttribute('aria-label', item._pinned ? t('ai.pin.unlock', { caption }) : t('ai.pin.lock', { caption }));
+        pinToggle.title = item._pinned ? t('ai.pin.lockedHint') : t('ai.pin.hint');
         pinToggle.textContent = '📌';
         pinToggle.addEventListener('click', () => {
           item._pinned = !item._pinned;
@@ -1123,7 +1144,7 @@ function renderSelectionBar() {
         const rm = document.createElement('button');
         rm.type = 'button';
         rm.className = 'ai-pinned-rm';
-        rm.setAttribute('aria-label', `移除上下文：${caption}`);
+        rm.setAttribute('aria-label', t('ai.pin.remove', { caption }));
         rm.textContent = '×';
         rm.addEventListener('click', () => {
           const idx = pinnedSelections.findIndex((x) => selectionKey(x) === key);
@@ -1137,7 +1158,7 @@ function renderSelectionBar() {
         const clearAll = document.createElement('button');
         clearAll.type = 'button';
         clearAll.className = 'ai-pinned-clear';
-        clearAll.textContent = `清空上下文 (${pinnedSelections.length})`;
+        clearAll.textContent = t('ai.pin.clear', { n: pinnedSelections.length });
         clearAll.addEventListener('click', () => {
           pinnedSelections.length = 0;
           selectedRelationIntent = 'auto';
@@ -1168,7 +1189,7 @@ function renderSelectionBar() {
       const activeIdx = Number.isInteger(canvasSelection.trunkActiveIndex) && canvasSelection.trunkActiveIndex >= 0
         ? canvasSelection.trunkActiveIndex
         : Math.max(0, branches.findIndex((b) => b.edgeKey === canvasSelection.edgeKey));
-      if (trunkBadgeEl) trunkBadgeEl.textContent = `共线 ${activeIdx + 1}/${branches.length}`;
+      if (trunkBadgeEl) trunkBadgeEl.textContent = t('ai.trunkPosition', { current: activeIdx + 1, total: branches.length });
       trunkSelectEl.replaceChildren(...branches.map((b, idx) => {
         const from = b.fromName || b.from?.split('::').pop() || '';
         const to = b.toName || b.to?.split('::').pop() || '';
@@ -1188,10 +1209,10 @@ function renderSelectionBar() {
       pinSelectionBtn.disabled = alreadyPinned || pinnedSelections.length >= MAX_PINNED_SELECTIONS;
       pinSelectionBtn.textContent = alreadyPinned ? '✓' : '+';
       pinSelectionBtn.title = alreadyPinned
-        ? '已加入本轮对话上下文'
+        ? t('ai.pin.attached')
         : pinnedSelections.length >= MAX_PINNED_SELECTIONS
-          ? `最多附着 ${MAX_PINNED_SELECTIONS} 项上下文`
-          : '加入本轮对话上下文 (Alt+A)，未加入时仅作预览';
+          ? t('ai.pin.limit', { n: MAX_PINNED_SELECTIONS })
+          : t('ai.pin.previewHint');
     }
     for (const [label, prompt] of questions) {
       const chip = document.createElement('button');
@@ -1203,7 +1224,7 @@ function renderSelectionBar() {
         const stagedOk = pinSelectionSnapshot(canvasSelection, { quiet: true });
         const frozenCtx = currentUiContext();
         if (!stagedOk && pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
-          setChatStatus(`已满 ${MAX_PINNED_SELECTIONS} 项上下文，将沿用当前已附着项发送`, false);
+          setChatStatus(() => t('ai.pin.full', { n: MAX_PINNED_SELECTIONS }), false);
         }
         void sendPrompt(prompt, frozenCtx);
       });
@@ -1230,12 +1251,15 @@ function pinSelectionSnapshot(selection, { pinned = false, quiet = false } = {})
   if (!key) return false;
   if (pinnedSelections.some((x) => selectionKey(x) === key)) return true;
   if (pinnedSelections.length >= MAX_PINNED_SELECTIONS) {
-    if (!quiet) setChatStatus(`最多同时附着 ${MAX_PINNED_SELECTIONS} 项上下文，已保留现有 ${MAX_PINNED_SELECTIONS} 项`, true);
+    if (!quiet) setChatStatus(() => t('ai.pin.kept', { n: MAX_PINNED_SELECTIONS }), true);
     return false;
   }
   pinnedSelections.push({ ...clean, ...(pinned ? { _pinned: true } : {}) });
   renderSelectionBar();
-  if (!quiet) setChatStatus(`已加入对话上下文（共 ${pinnedSelections.length} 项），发送后一次性芯片将自动清理`);
+  if (!quiet) {
+    const n = pinnedSelections.length;
+    setChatStatus(() => t('ai.pin.added', { n }));
+  }
   return true;
 }
 
@@ -1248,25 +1272,25 @@ function summarizeUiContext(uiContext) {
   const list = Array.isArray(uiContext.items) && uiContext.items.length ? uiContext.items : [uiContext];
   const labels = list.map((item) => {
     if (!item || typeof item !== 'object') return '';
-    if (item.kind === 'node') return `节点 ${item.id || item.name || ''}`.trim();
+    if (item.kind === 'node') return t('ai.history.node', { id: item.id || item.name || '' }).trim();
     if (item.kind === 'edge') {
       const endpoints = item.from && item.to ? `${item.from} → ${item.to}` : (item.edgeKey || '');
-      return endpoints ? `连线 ${endpoints}` : '';
+      return endpoints ? t('ai.history.edge', { endpoints }) : '';
     }
     if (item.kind === 'pair') {
       const a = item.fromName || item.fromId || '';
       const b = item.toName || item.toId || '';
-      return a && b ? `两点 ${a}↔${b}` : '';
+      return a && b ? t('ai.history.pair', { a, b }) : '';
     }
     if (item.kind === 'dataflow') {
       const tName = item.targetName || item.targetId || '';
-      return tName ? `数据流 ${tName}` : '';
+      return tName ? t('ai.history.flow', { name: tName }) : '';
     }
-    if (item.kind === 'file') return item.path ? `文件 ${item.path}` : '';
+    if (item.kind === 'file') return item.path ? t('ai.history.file', { path: item.path }) : '';
     return '';
   }).filter(Boolean);
   if (!labels.length) return '';
-  return labels.join('、').slice(0, 260);
+  return labels.join(t('ai.history.sep')).slice(0, 260);
 }
 
 /** 仅返回用户明确附着/暂存进芯片槽位的上下文（被动候选绝不自动发送）。 */
@@ -1341,7 +1365,7 @@ function buildCanvasLayoutSnapshot() {
 function openImageLightbox(dataUrl, caption = '') {
   if (!lightboxEl || !lightboxImgEl) return;
   lightboxImgEl.src = dataUrl;
-  if (lightboxCaptionEl) lightboxCaptionEl.textContent = caption || '画布/附件图片预览';
+  if (lightboxCaptionEl) lightboxCaptionEl.textContent = caption || t('ai.lightboxCaption');
   lightboxEl.hidden = false;
 }
 
@@ -1357,11 +1381,11 @@ function updateAttachButton() {
   attachShotBtn.setAttribute('aria-pressed', String(total > 0));
   if (total > 0) {
     const parts = [];
-    if (pendingImages.length) parts.push(`${pendingImages.length}图`);
-    if (pendingFiles.length) parts.push(`${pendingFiles.length}文件`);
-    attachShotBtn.textContent = `📎 已附 ${parts.join('+')}`;
+    if (pendingImages.length) parts.push(t('ai.imageCount', { n: pendingImages.length }));
+    if (pendingFiles.length) parts.push(t('ai.fileCount', { n: pendingFiles.length }));
+    attachShotBtn.textContent = t('ai.attachedCount', { items: parts.join('+') });
   } else {
-    attachShotBtn.textContent = '📎 截图/文件';
+    attachShotBtn.textContent = t('ai.attach');
   }
 }
 
@@ -1379,22 +1403,22 @@ function renderAttachments() {
     const thumb = document.createElement('img');
     thumb.className = 'ai-att-thumb';
     thumb.src = img.dataUrl;
-    thumb.alt = img.label || '截图';
-    thumb.title = '点击查看大图预览';
+    thumb.alt = img.label || t('ai.screenshot');
+    thumb.title = t('ai.previewHint');
     thumb.addEventListener('click', () => openImageLightbox(img.dataUrl, `${img.label} (${img.width}×${img.height})`));
     const meta = document.createElement('div');
     meta.className = 'ai-att-meta';
     const name = document.createElement('span');
     name.className = 'ai-att-name';
-    name.textContent = name.title = img.label || '画布截图';
+    name.textContent = name.title = img.label || t('ai.canvasShot');
     const sub = document.createElement('span');
     sub.className = 'ai-att-sub';
-    sub.textContent = `${img.width}×${img.height} · 点击预览`;
+    sub.textContent = t('ai.thumbHint', { width: img.width, height: img.height });
     meta.append(name, sub);
     const rm = document.createElement('button');
     rm.type = 'button';
     rm.className = 'ai-att-rm';
-    rm.setAttribute('aria-label', `移除图片：${img.label}`);
+    rm.setAttribute('aria-label', t('ai.removeImage', { label: img.label }));
     rm.textContent = '×';
     rm.addEventListener('click', () => {
       const idx = pendingImages.findIndex((x) => x.id === img.id);
@@ -1410,7 +1434,7 @@ function renderAttachments() {
     chip.className = 'ai-att-file';
     const title = document.createElement('span');
     title.textContent = `📄 ${file.name}`;
-    title.title = `${file.name}（共 ${file.lines.length} 行）`;
+    title.title = t('ai.fileLines', { name: file.name, n: file.lines.length });
     const range = document.createElement('span');
     range.className = 'ai-att-range';
     const startInput = document.createElement('input');
@@ -1418,13 +1442,13 @@ function renderAttachments() {
     startInput.min = '1';
     startInput.max = String(Math.max(1, file.lines.length));
     startInput.value = String(file.startLine);
-    startInput.title = '导入起始行号';
+    startInput.title = t('ai.startLine');
     const endInput = document.createElement('input');
     endInput.type = 'number';
     endInput.min = '1';
     endInput.max = String(Math.max(1, file.lines.length));
     endInput.value = String(file.endLine);
-    endInput.title = '导入结束行号（可只导入部分片段）';
+    endInput.title = t('ai.endLine');
     const syncRange = () => {
       const total = Math.max(1, file.lines.length);
       file.startLine = Math.max(1, Math.min(total, Math.trunc(Number(startInput.value) || 1)));
@@ -1434,11 +1458,11 @@ function renderAttachments() {
     };
     startInput.addEventListener('change', syncRange);
     endInput.addEventListener('change', syncRange);
-    range.append('L', startInput, '-', endInput, ` / ${file.lines.length}行`);
+    range.append('L', startInput, '-', endInput, t('ai.linesTotal', { n: file.lines.length }));
     const rm = document.createElement('button');
     rm.type = 'button';
     rm.className = 'ai-att-rm';
-    rm.setAttribute('aria-label', `移除文件：${file.name}`);
+    rm.setAttribute('aria-label', t('ai.removeFile', { name: file.name }));
     rm.textContent = '×';
     rm.addEventListener('click', () => {
       const idx = pendingFiles.findIndex((x) => x.id === file.id);
@@ -1458,7 +1482,7 @@ function addImageAttachment(img) {
   pendingImages.push({
     id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     dataUrl: img.dataUrl,
-    label: img.label || '图片',
+    label: img.label || t('ai.image'),
     width: img.width || 0,
     height: img.height || 0,
   });
@@ -1487,7 +1511,7 @@ function captureViewportImage() {
     compositeEffects(ctx);
     ctx.restore();
     const dataUrl = off.toDataURL('image/jpeg', 0.85);
-    return dataUrl.startsWith('data:image/') ? { dataUrl, width: w, height: h, label: '当前画布视图' } : null;
+    return dataUrl.startsWith('data:image/') ? { dataUrl, width: w, height: h, label: t('ai.canvasView') } : null;
   } catch {
     return null;
   }
@@ -1500,10 +1524,10 @@ function resolveSelectedCanvasBox() {
     if (!id) return null;
     if (kind === 'file') {
       const g = (v.groups || []).find((x) => x.id === id);
-      return g ? { kind: 'file', box: g, label: `文件：${g.label || g.id}` } : null;
+      return g ? { kind: 'file', box: g, label: t('ai.selection.file', { name: g.label || g.id }) } : null;
     }
     const c = (v.containers || []).find((x) => x.id === id && !x.root);
-    return c ? { kind: 'dir', box: c, label: `目录：${c.label || c.id}` } : null;
+    return c ? { kind: 'dir', box: c, label: t('ai.selection.dir', { name: c.label || c.id }) } : null;
   };
   if (state.ctxBox?.id) {
     const found = findBox(state.ctxBox.kind, state.ctxBox.id);
@@ -1527,15 +1551,15 @@ function captureScopedBoxAttachment(entry) {
   if (!entry?.box) return false;
   const shot = captureBoxImage(entry.box, { padding: 28, maxDim: 1280 });
   if (!shot) {
-    setChatStatus('无法截取该层级/文件框，请确认画布已渲染', true);
+    setChatStatus(() => t('ai.captureFail'), true);
     return false;
   }
   addImageAttachment({ ...shot, label: entry.label || entry.box.label || entry.box.id });
-  setChatStatus(`已截取「${entry.label}」，点击缩略图可放大确认`);
+  setChatStatus(() => t('ai.captured', { name: entry.label }));
   return true;
 }
 
-function encodeImageBlob(blob, label = '外部截图') {
+function encodeImageBlob(blob, label = t('ai.externalShot')) {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(blob);
     const img = new Image();
@@ -1566,26 +1590,26 @@ function encodeImageBlob(blob, label = '外部截图') {
   });
 }
 
-async function addImageFromBlob(blob, label = '剪贴板截图') {
+async function addImageFromBlob(blob, label = t('ai.clipboardShot')) {
   const encoded = await encodeImageBlob(blob, label);
   if (!encoded) {
-    setChatStatus('图片解析失败，请确认图片格式（PNG/JPG/WebP）', true);
+    setChatStatus(() => t('ai.imageError'), true);
     return false;
   }
   addImageAttachment(encoded);
-  setChatStatus(`已附带图片「${label}」（${encoded.width}×${encoded.height}），点击缩略图可放大预览`);
+  setChatStatus(() => t('ai.imageAdded', { w: encoded.width, h: encoded.height, label }));
   return true;
 }
 
 async function addExternalTextFile(file) {
   if (!file) return false;
   if (file.size > 1_500_000) {
-    setChatStatus(`文件「${file.name}」超过 1.5MB，请裁剪后再导入`, true);
+    setChatStatus(() => t('ai.fileTooLarge', { name: file.name }), true);
     return false;
   }
   const text = await file.text().catch(() => null);
   if (typeof text !== 'string' || !text.trim()) {
-    setChatStatus(`文件「${file.name}」内容为空或无法按文本读取`, true);
+    setChatStatus(() => t('ai.fileEmpty', { name: file.name }), true);
     return false;
   }
   const lines = text.replace(/\r\n?/g, '\n').split('\n');
@@ -1599,7 +1623,7 @@ async function addExternalTextFile(file) {
     endLine,
   });
   renderAttachments();
-  setChatStatus(`已导入「${file.name}」（共 ${lines.length} 行，默认 L1-${endLine}，可在上方微调导入行范围）`);
+  setChatStatus(() => t('ai.fileAdded', { name: file.name, n: lines.length, endLine }));
   return true;
 }
 
@@ -1611,7 +1635,6 @@ function closeAttachMenu() {
 
 function openAttachMenu() {
   if (!attachMenuEl) return;
-  if (!attachMenuEl.hidden) { closeAttachMenu(); return; }
   attachMenuEl.replaceChildren();
   const addItem = (title, hint, onClick, disabled = false) => {
     const btnEl = document.createElement('button');
@@ -1644,34 +1667,34 @@ function openAttachMenu() {
     attachMenuEl.appendChild(el);
   };
 
-  addTitle('画布截图（即时显示缩略图）');
+  addTitle(t('ai.captureMenu'));
   const hasNodes = Boolean(state.view?.nodes?.length);
-  addItem('📷 截取当前画布视图', '当前视野', () => {
+  addItem(t('ai.captureCurrent'), t('ai.viewport'), () => {
     const shot = captureViewportImage();
     if (shot) {
       addImageAttachment(shot);
-      setChatStatus('已截取当前画布视图，点击缩略图可放大确认');
+      setChatStatus(() => t('ai.capturedView'));
     } else {
-      setChatStatus('当前画布暂无可截取内容', true);
+      setChatStatus(() => t('ai.captureEmpty'), true);
     }
   }, !hasNodes);
 
   const selectedBox = resolveSelectedCanvasBox();
   addItem(
-    selectedBox ? `📦 截取选中区域` : '📦 截取选中层级 / 文件框',
-    selectedBox ? selectedBox.label : '先在画布点选文件或目录',
+    selectedBox ? t('ai.captureSelected') : t('ai.captureBox'),
+    selectedBox ? selectedBox.label : t('ai.selectBox'),
     () => captureScopedBoxAttachment(selectedBox),
     !selectedBox,
   );
 
   const v = state.view;
   const pickableBoxes = [
-    ...(v?.containers || []).filter((c) => !c.root).map((c) => ({ kind: 'dir', box: c, label: `目录：${c.label || c.id}` })),
-    ...(v?.groups || []).map((g) => ({ kind: 'file', box: g, label: `文件：${g.label || g.id}` })),
+    ...(v?.containers || []).filter((c) => !c.root).map((c) => ({ kind: 'dir', box: c, label: t('ai.selection.dir', { name: c.label || c.id }) })),
+    ...(v?.groups || []).map((g) => ({ kind: 'file', box: g, label: t('ai.selection.file', { name: g.label || g.id }) })),
   ].slice(0, 8);
   if (pickableBoxes.length) {
     addSep();
-    addTitle('按画布层级 / 文件框单独截图');
+    addTitle(t('ai.captureBoxes'));
     for (const entry of pickableBoxes) {
       addItem(entry.kind === 'dir' ? `📁 ${entry.box.label || entry.box.id}` : `📄 ${entry.box.label || entry.box.id}`, entry.box.id, () => {
         captureScopedBoxAttachment(entry);
@@ -1680,20 +1703,15 @@ function openAttachMenu() {
   }
 
   addSep();
-  addTitle('外部图片与文件导入（也支持 Ctrl+V 粘贴截图 / 拖入文件）');
-  addItem('🖼️ 导入外部图片', 'PNG / JPG / WebP', () => imageFileInputEl?.click());
-  addItem('📄 导入外部代码/文本文件', '支持选定起止行片段', () => textFileInputEl?.click());
+  addTitle(t('ai.importMenu'));
+  addItem(t('ai.importImage'), 'PNG / JPG / WebP', () => imageFileInputEl?.click());
+  addItem(t('ai.importFile'), t('ai.importRange'), () => textFileInputEl?.click());
 
   attachMenuEl.hidden = false;
   attachShotBtn?.setAttribute('aria-expanded', 'true');
 }
 
-const EMPTY_CHAT_HTML = `<div class="empty">
-  <div class="ai-empty-badge" aria-hidden="true">✦</div>
-  <div class="ai-empty-title">TCU 调用图 AI 助手</div>
-  <p class="ai-empty-desc">直接提问查找函数、分析 Git 改动或补全标签，选中的画布节点与连线会自动作为上下文。</p>
-  <div class="ai-empty-keys"><span>Enter 发送</span><span>·</span><span>Shift+Enter 换行</span><span>·</span><span>/new 新建</span><span>·</span><span>/compact 压缩</span></div>
-</div>`;
+const emptyChatEl = messagesEl.querySelector('.empty');
 
 function syncPresentationHud() {
   if (!presHudEl) return;
@@ -1706,7 +1724,7 @@ function syncPresentationHud() {
   const idx = Math.max(0, Math.min(steps.length - 1, Number(pres.activeIndex) || 0));
   const step = steps[idx];
   presHudEl.hidden = false;
-  if (presHudTitleEl) presHudTitleEl.textContent = `${pres.title || '逻辑导览'} · ${step.title || `步骤 ${idx + 1}`}`;
+  if (presHudTitleEl) presHudTitleEl.textContent = `${pres.title || t('ai.walkthrough')} · ${step.title || t('ai.step', { n: idx + 1 })}`;
   if (presHudSubEl) presHudSubEl.textContent = step.summary || '';
   if (presHudCounterEl) presHudCounterEl.textContent = `${idx + 1}/${steps.length}`;
   if (presPrevBtn) presPrevBtn.disabled = idx <= 0;
@@ -1731,7 +1749,7 @@ function activatePresentation(pres, stepIndex = 0) {
     edgeKeys: step.edgeKeys || [],
     focusNodeId: step.focusNodeId || step.nodeIds?.[0] || null,
     stepNumber: idx + 1,
-    label: step.title || pres.title || '逻辑导览',
+    label: step.title || pres.title || t('ai.walkthrough'),
   };
   syncPresentationHud();
   const focusId = step.focusNodeId || step.nodeIds?.[0];
@@ -1746,7 +1764,8 @@ function ensureInvestigateContainer(box, before, collapsed = false) {
     inv = document.createElement('details');
     inv.className = 'ai-investigate';
     inv.open = !collapsed;
-    inv.innerHTML = '<summary>调查过程</summary><div class="ai-steps"></div>';
+    inv.innerHTML = '<summary></summary><div class="ai-steps"></div>';
+    inv.querySelector('summary').textContent = t('ai.investigation');
     if (before) box.insertBefore(inv, before);
     else box.appendChild(inv);
   }
@@ -1756,7 +1775,7 @@ function ensureInvestigateContainer(box, before, collapsed = false) {
 function updateInvestigateSummary(inv, count, running = false) {
   const summary = inv?.querySelector('summary');
   if (!summary) return;
-  summary.textContent = running ? `调查中 · 已调用 ${count} 个工具…` : `调查过程 · 共执行 ${count} 个工具`;
+  summary.textContent = running ? t('ai.toolsRunning', { count }) : t('ai.toolsDone', { count });
 }
 
 function renderSubagentCards(box, subagents, before = null) {
@@ -1775,12 +1794,12 @@ function renderSubagentCards(box, subagents, before = null) {
     const head = document.createElement('div');
     head.className = 'ai-subagent-head';
     const icon = sa.running ? '◐' : (sa.ok !== false ? '✓' : '✕');
-    head.textContent = `${icon} 子调查 · ${sa.title || sa.id}`;
+    head.textContent = t('ai.subtask', { title: sa.title || sa.id, icon });
     const meta = document.createElement('div');
     meta.className = 'ai-subagent-meta';
     meta.textContent = sa.running
-      ? (sa.lastTool ? `正在执行 ${sa.lastTool}${sa.lastSummary ? `：${sa.lastSummary}` : ''}` : '正在只读调查…')
-      : `已完成 ${sa.steps || 0} 步只读排查`;
+      ? (sa.lastTool ? [t('ai.runningTool', { name: sa.lastTool }), sa.lastSummary].filter(Boolean).join(' · ') : t('ai.investigating'))
+      : t('ai.subtaskDone', { n: sa.steps || 0 });
     card.append(head, meta);
     if (sa.summary) {
       const body = document.createElement('div');
@@ -1822,7 +1841,7 @@ function renderChainCards(box, chains) {
     head.className = 'ai-chain-head';
     const title = document.createElement('span');
     title.className = 'ai-chain-title';
-    title.textContent = `${chain.kind === 'dataflow' ? '⇅' : '⟿'} ${chain.title || '调用链路'}`;
+    title.textContent = `${chain.kind === 'dataflow' ? '⇅' : '⟿'} ${chain.title || t('ai.chain')}`;
     const actions = document.createElement('span');
     actions.className = 'ai-chain-actions';
 
@@ -1831,32 +1850,32 @@ function renderChainCards(box, chains) {
 
     const hlBtn = document.createElement('button');
     hlBtn.type = 'button';
-    hlBtn.textContent = '◉ 高亮';
-    hlBtn.title = '在画布叠加高亮整条链路';
+    hlBtn.textContent = t('ai.highlight');
+    hlBtn.title = t('ai.highlightHint');
     hlBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      state.aiOverlay = { action: 'highlight', nodeIds, edgeKeys, label: chain.title || '链路高亮' };
+      state.aiOverlay = { action: 'highlight', nodeIds, edgeKeys, label: chain.title || t('ai.pathHighlight') };
       draw();
     });
 
     const flowBtn = document.createElement('button');
     flowBtn.type = 'button';
-    flowBtn.textContent = '≋ 动画';
-    flowBtn.title = '在画布沿该链路播放流动画';
+    flowBtn.textContent = t('ai.animate');
+    flowBtn.title = t('ai.animateHint');
     flowBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      state.aiOverlay = { action: 'play_flow', nodeIds, edgeKeys, label: chain.title || '数据流动画' };
+      state.aiOverlay = { action: 'play_flow', nodeIds, edgeKeys, label: chain.title || t('ai.flowAnimation') };
       draw();
     });
 
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
-    addBtn.textContent = '+ 入图';
-    addBtn.title = '请 AI 将整条链路加入画布并呈现';
+    addBtn.textContent = t('ai.addChain');
+    addBtn.title = t('ai.addChainHint');
     addBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       const targetIds = nodeIds.slice(0, 6);
-      void sendPrompt(`请调用 present_logic 将以下整条链路加入画布并梳理：${targetIds.join(', ')}`);
+      void sendPrompt(t('ai.addChainPrompt', { ids: targetIds.join(', ') }));
     });
 
     actions.append(hlBtn, flowBtn, addBtn);
@@ -1903,17 +1922,17 @@ function renderPresCard(box, pres) {
   const head = document.createElement('div');
   head.className = 'ai-pres-head';
   const title = document.createElement('span');
-  title.textContent = `🎬 ${pres.title || '分步导览'}（${pres.steps.length} 步）`;
+  title.textContent = t('ai.walkthroughTitle', { title: pres.title || t('ai.walkthroughDefault'), n: pres.steps.length });
   const startBtn = document.createElement('button');
   startBtn.type = 'button';
-  startBtn.textContent = '▶ 开始分步导览';
+  startBtn.textContent = t('ai.startWalkthrough');
   startBtn.addEventListener('click', () => activatePresentation(pres, 0));
   head.append(title, startBtn);
   const ol = document.createElement('ol');
   ol.className = 'ai-pres-steps';
   for (const s of pres.steps.slice(0, 8)) {
     const li = document.createElement('li');
-    li.textContent = `${s.title || ''}：${s.summary || ''}`;
+    li.textContent = [s.title, s.summary].filter(Boolean).join(' · ');
     ol.appendChild(li);
   }
   card.append(head, ol);
@@ -1926,7 +1945,7 @@ function renderHealthCard(box, report) {
   card.className = 'ai-health-card';
   const head = document.createElement('div');
   head.className = 'ai-health-head';
-  head.textContent = `🩺 画布体检 ${report.score ?? 100}/100 · ${report.summary || ''}`;
+  head.textContent = t('ai.health', { score: report.score ?? 100, summary: report.summary || '' });
   card.appendChild(head);
   if (Array.isArray(report.issues) && report.issues.length) {
     const list = document.createElement('div');
@@ -1944,7 +1963,7 @@ function renderHealthCard(box, report) {
       if (issue.fixPrompt) {
         const fixBtn = document.createElement('button');
         fixBtn.type = 'button';
-        fixBtn.textContent = '一键修复';
+        fixBtn.textContent = t('ai.fix');
         fixBtn.style.height = '21px';
         fixBtn.style.fontSize = '11px';
         fixBtn.addEventListener('click', () => void sendPrompt(issue.fixPrompt));
@@ -1972,43 +1991,44 @@ function renderChangesetUndo(box, changeset) {
   const btnUndo = document.createElement('button');
   btnUndo.type = 'button';
   btnUndo.className = 'ai-undo-btn';
-  btnUndo.textContent = `↶ 撤销本轮改图 (${(changeset.ops || []).join(', ') || '画布修改'})`;
+  btnUndo.textContent = `${t('ai.undo')} (${(changeset.ops || []).join(', ') || t('ai.canvasEdit')})`;
   btnUndo.addEventListener('click', async () => {
     btnUndo.disabled = true;
-    btnUndo.textContent = '正在撤销…';
+    btnUndo.textContent = t('ai.undoing');
     const projectId = state.view?.projectId;
     let res;
     try {
-      res = await api.aiUndoChangeset(changeset.id);
-      if (!res?.ok) throw new Error(res?.error || '撤销失败');
+      res = await api.aiUndoChangeset(changeset.id, getLang());
+      if (!res?.ok) throw new Error(res?.error || t('ai.undoFailed'));
     } catch (err) {
       btnUndo.disabled = false;
-      btnUndo.textContent = `↶ 撤销本轮改图`;
-      setChatStatus(`撤销失败：${err.message || err}`, true);
+      btnUndo.textContent = t('ai.undo');
+      setChatStatus(() => t('ai.undoError', { error: err.message || err }), true);
       return;
     }
     try {
       await refreshAfterAiUndo(res, projectId);
-      btnUndo.textContent = '✓ 已撤销本轮 AI 改动';
-      setChatStatus(state.at ? '已撤销最新画布的改动，当前仍在回看历史' : '已回退到本轮 AI 改图前状态');
+      btnUndo.textContent = t('ai.undone');
+      setChatStatus(() => t(state.at ? 'ai.undoHistory' : 'ai.restored'));
     } catch (err) {
-      btnUndo.textContent = '已撤销，画布待刷新';
-      setChatStatus(`撤销已完成，刷新画布失败：${err.message || err}`, true);
+      btnUndo.textContent = t('ai.undoRefresh');
+      setChatStatus(() => t('ai.undoRefreshError', { error: err.message || err }), true);
     }
   });
   bar.appendChild(btnUndo);
   box.appendChild(bar);
 }
 
-function renderThreadMessages() {
+function renderThreadMessages({ preserveStatus = false } = {}) {
   if (!messagesEl) return;
   clearChainHover(state.aiHover?.nodeId); // 替换消息 DOM 不会触发旧芯片的 mouseleave。
   const th = activeThread();
   renderTelemetry(th);
   updateChatControls();
-  setChatStatus();
+  if (!preserveStatus) setChatStatus();
   if (!th.messages.length) {
-    messagesEl.innerHTML = EMPTY_CHAT_HTML;
+    applyI18n(emptyChatEl);
+    messagesEl.replaceChildren(emptyChatEl);
     return;
   }
   const scrollTop = messagesEl.scrollTop;
@@ -2127,12 +2147,6 @@ function setTab(name) {
   if (name === 'chat') followChatScroll();
 }
 
-function setApiStatus(text, isError = false) {
-  if (!apiStatusEl) return;
-  apiStatusEl.textContent = text;
-  apiStatusEl.classList.toggle('err', isError);
-}
-
 function syncModelPicker() {
   modelSelectEl.value = modelEl.value.trim();
   if (modelSelectEl.selectedIndex < 0) modelSelectEl.value = '';
@@ -2141,7 +2155,8 @@ function syncModelPicker() {
 function applyFetchedModels(models, baseUrl = llmConfig.baseUrl || '') {
   fetchedModels = [...new Set((Array.isArray(models) ? models : []).map(id => String(id || '').trim()).filter(Boolean))];
   fetchedModelsBaseUrl = baseUrl;
-  const placeholder = new Option('选择已获取的模型', '');
+  const placeholder = new Option(t('ai.selectFetched'), '');
+  placeholder.dataset.i18n = 'ai.selectFetched';
   placeholder.disabled = true;
   modelSelectEl.replaceChildren(placeholder, ...fetchedModels.map(id => new Option(id, id)));
   modelSelectEl.hidden = !fetchedModels.length;
@@ -2160,24 +2175,24 @@ function syncQuickControls() {
     }
     const options = [];
     if (!current) {
-      const emptyOpt = new Option(llmConfig.baseUrl ? '选择或配置模型…' : '未配置模型 · 去配置', '');
+      const emptyOpt = new Option(llmConfig.baseUrl ? t('ai.chooseModel') : t('ai.noModel'), '');
       options.push(emptyOpt);
     }
     for (const id of list) {
       options.push(new Option(id, id));
     }
-    options.push(new Option('⚙ 配置或刷新模型…', QUICK_CONFIG_ACTION));
+    options.push(new Option(t('ai.configureModels'), QUICK_CONFIG_ACTION));
     quickModelEl.replaceChildren(...options);
     quickModelEl.value = current || '';
     quickModelEl.classList.toggle('unconfigured', !configured);
     quickModelEl.title = configured
-      ? `当前模型：${current}${llmConfig.toolMode === 'prompt' ? '（旧版兼容）' : ''} · 点击切换`
-      : '尚未配置模型，点击前往配置';
+      ? t('ai.modelCurrent', { name: current, mode: llmConfig.toolMode === 'prompt' ? t('ai.modelLegacy') : '' })
+      : t('ai.modelMissingHint');
   }
   if (quickReasoningEl) {
-    const effort = REASONING_LABELS.has(llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
+    const effort = Object.hasOwn(EFFORT_KEYS, llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
     quickReasoningEl.value = effort;
-    quickReasoningEl.title = `思考强度：${REASONING_LABELS.get(effort) || '默认'}（切换后下轮生效）`;
+    quickReasoningEl.title = t('ai.effortHint', { effort: t(EFFORT_KEYS[effort]) });
   }
 }
 
@@ -2197,14 +2212,14 @@ async function saveQuickConfig(patch, okMessage) {
     });
     const r = await response.json().catch(() => null);
     if (!response.ok || !r?.ok || !r.config) {
-      throw new Error(r?.error || (response.ok ? '保存失败' : `HTTP ${response.status}`));
+      throw new Error(r?.error || (response.ok ? t('bookmark.failed') : `HTTP ${response.status}`));
     }
     llmConfig = r.config;
     syncApiForm();
     if (okMessage) setChatStatus(okMessage);
   } catch (err) {
     syncQuickControls();
-    setChatStatus(controller.signal.aborted ? '切换超时，请重试' : `切换失败：${err.message || err}`, true);
+    setChatStatus(() => controller.signal.aborted ? t('ai.switchTimedOut') : t('ai.switchFailed', { error: err.message || err }), true);
   } finally {
     clearTimeout(timeout);
     quickSaving = false;
@@ -2221,7 +2236,7 @@ function prefetchModelsForQuickPicker() {
   const controller = new AbortController();
   const pending = { baseUrl, controller };
   backgroundModelFetch = pending;
-  void api.aiModels({ baseUrl }, controller.signal)
+  void api.aiModels({ baseUrl, language: getLang() }, controller.signal)
     .then((r) => {
       if (r?.ok && Array.isArray(r.models) && r.models.length && llmConfig.baseUrl === baseUrl) {
         applyFetchedModels(r.models, baseUrl);
@@ -2229,6 +2244,11 @@ function prefetchModelsForQuickPicker() {
     })
     .catch(() => {})
     .finally(() => { if (backgroundModelFetch === pending) backgroundModelFetch = null; });
+}
+
+function syncApiKeyHint() {
+  apiKeyEl.placeholder = clearApiKeyPending ? t('ai.api.keyPending')
+    : llmConfig.hasApiKey ? t('ai.api.keySaved') : t('ai.api.keyOptional');
 }
 
 function syncApiForm() {
@@ -2243,11 +2263,11 @@ function syncApiForm() {
   }
   syncModelPicker();
   apiKeyEl.value = '';
-  apiKeyEl.placeholder = llmConfig.hasApiKey ? '已保存（留空保持不变）' : '可选；本地模型留空即可';
   clearApiKeyPending = false;
+  syncApiKeyHint();
   if (clearKeyBtn) clearKeyBtn.hidden = !llmConfig.hasApiKey;
   if (toolModeEl) toolModeEl.value = llmConfig.toolMode || 'auto';
-  const effort = REASONING_LABELS.has(llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
+  const effort = Object.hasOwn(EFFORT_KEYS, llmConfig.reasoningEffort) ? llmConfig.reasoningEffort : 'default';
   if (reasoningEffortEl) reasoningEffortEl.value = effort;
   contextWindowEl.value = llmConfig.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
   maxTokensEl.value = llmConfig.maxTokens ?? DEFAULT_MAX_TOKENS;
@@ -2264,6 +2284,7 @@ function readApiDraft() {
   const conc = Number(subagentConcurrencyEl?.value);
   const subSteps = Number(subagentMaxStepsEl?.value);
   const draft = {
+    language: getLang(),
     baseUrl: baseUrlEl.value.trim(),
     model: modelEl.value.trim(),
     toolMode: toolModeEl.value,
@@ -2341,8 +2362,8 @@ function buildUserBubbleContent(div, text, attachedImages = [], attachedFiles = 
       const el = document.createElement('img');
       el.className = 'ai-msg-att-img';
       el.src = img.dataUrl;
-      el.alt = img.label || '已发送图片';
-      el.title = `${img.label || '图片'} · 点击放大`;
+      el.alt = img.label || t('ai.sentImage');
+      el.title = t('ai.enlarge', { name: img.label || t('ai.image') });
       el.addEventListener('click', () => openImageLightbox(img.dataUrl, img.label));
       atts.appendChild(el);
     }
@@ -2371,7 +2392,9 @@ function createAssistantBox() {
   if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'ai-msg assistant';
-  box.innerHTML = '<details class="ai-investigate" hidden><summary>调查过程</summary><div class="ai-steps"></div></details><div class="ai-msg-text">正在连接模型…</div>';
+  box.innerHTML = '<details class="ai-investigate" hidden><summary></summary><div class="ai-steps"></div></details><div class="ai-msg-text"></div>';
+  box.querySelector('summary').textContent = t('ai.investigation');
+  box.querySelector('.ai-msg-text').textContent = t('ai.connecting');
   messagesEl.appendChild(box);
   followChatScroll();
   return {
@@ -2397,7 +2420,7 @@ function finishStep(row, tool) {
   const cls = tool.ok !== false ? 'ok' : (tool.blocked ? 'blocked' : 'err');
   row.classList.add(cls);
   const head = row.querySelector('.ai-step-head');
-  head.textContent = head.title = tool.blocked ? `${tool.name}（待确认）` : tool.name;
+  head.textContent = head.title = tool.blocked ? t('ai.toolPending', { name: tool.name }) : tool.name;
   if (tool.summary) {
     const result = document.createElement('div');
     result.className = 'ai-step-result';
@@ -2428,11 +2451,11 @@ async function compactChat() {
   const controller = new AbortController();
   compacting = controller;
   updateChatControls();
-  setChatStatus('正在压缩上下文…');
+  setChatStatus(() => t('ai.compacting'));
   try {
-    const result = await api.compactChat({ projectId, threadId: thread.id, messages: compactMessages }, controller.signal);
+    const result = await api.compactChat({ language: getLang(), projectId, threadId: thread.id, messages: compactMessages }, controller.signal);
     if (result?.ok === false) throw new Error(result.error);
-    if (!Array.isArray(result?.messages)) throw new Error('压缩接口返回了无效的对话数据');
+    if (!Array.isArray(result?.messages)) throw new Error(t('ai.compactInvalid'));
     if (!isCurrent()) return;
     thread.messages = result.messages;
     const after = result.afterTokens ?? estimateContext(thread.messages);
@@ -2454,10 +2477,10 @@ async function compactChat() {
     persistChats();
     if (activeChatId === thread.id) {
       renderThreadMessages();
-      setChatStatus(`已压缩上下文：${formatTokens(result.beforeTokens ?? before)} → ${formatTokens(after)} tokens`);
+      setChatStatus(() => t('ai.compacted', { before: formatTokens(result.beforeTokens ?? before), after: formatTokens(after) }));
     }
   } catch (err) {
-    if (isCurrent() && activeChatId === thread.id) setChatStatus(`压缩失败：${err.message}`, true);
+    if (isCurrent() && activeChatId === thread.id) setChatStatus(() => t('ai.compactFailed', { error: err.message }), true);
   } finally {
     if (compacting === controller) {
       compacting = null;
@@ -2468,31 +2491,31 @@ async function compactChat() {
 
 async function saveViewBookmark(name) {
   if (!name) {
-    setChatStatus('请输入书签名称', true);
+    setChatStatus(() => t('ai.nameBookmark'), true);
     inputEl.focus();
     return;
   }
   const projectId = state.view?.projectId;
   if (projectId == null || !state.roots.length) {
-    setChatStatus('保存书签需要在当前画布选定至少一个入口函数', true);
+    setChatStatus(() => t('ai.bookmarkRoot'), true);
     return;
   }
   const threadId = activeChatId;
   const isCurrent = () => activeChatId === threadId && state.view?.projectId === projectId && !activeAbort && !compacting;
   const draft = inputEl.value;
   inputEl.value = '';
-  setChatStatus('正在保存书签…');
+  setChatStatus(() => t('ai.savingBookmark'));
   try {
     const result = await api.saveBookmark({
       projectId, name, roots: state.roots, expansions: state.expansions,
       up: state.up, down: state.down, group: state.group, groupMode: state.groupMode, vars: [...state.vars],
     });
-    if (!result?.ok) throw new Error(result?.error || '请求失败');
-    if (isCurrent()) setChatStatus('已' + (result.overwritten ? '更新' : '保存') + '书签「' + name + '」');
+    if (!result?.ok) throw new Error(result?.error || t('common.requestFailed'));
+    if (isCurrent()) setChatStatus(() => t(result.overwritten ? 'ai.bookmarkUpdated' : 'ai.bookmarkSaved', { name }));
   } catch (err) {
     if (isCurrent()) {
       if (!inputEl.value) inputEl.value = draft;
-      setChatStatus('保存书签失败：' + (err.message || err), true);
+      setChatStatus(() => t('ai.bookmarkFailed', { error: err.message || err }), true);
     }
   }
 }
@@ -2506,13 +2529,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     inputEl.value = '';
     if (await ensureChatProject()) {
       startNewThread();
-      setChatStatus('已新建空白对话，原对话保留在历史列表中');
+      setChatStatus(() => t('ai.createdChat'));
     }
     return;
   }
   if (rawInput === '/compact') {
     if (activeAbort || compacting) {
-      setChatStatus('请等待当前生成结束后再压缩上下文');
+      setChatStatus(() => t('ai.waitCompact'));
       return;
     }
     inputEl.value = '';
@@ -2522,7 +2545,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   if (compacting) return;
   if (rawInput === BOOKMARK_COMMAND || rawInput.startsWith(BOOKMARK_COMMAND + ' ')) {
     if (activeAbort) {
-      setChatStatus('请等待当前生成结束后再保存书签');
+      setChatStatus(() => t('ai.waitBookmark'));
       return;
     }
     await saveViewBookmark(rawInput.slice(BOOKMARK_COMMAND.length).trim());
@@ -2534,19 +2557,19 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     const cmd = slashMatch[1].toLowerCase();
     const rest = (slashMatch[2] || '').trim();
     if (cmd === 'check') {
-      text = rest ? `请先调用 diagnose_canvas 体检当前画布，并处理：${rest}` : '请调用 diagnose_canvas 对当前画布做全面体检，汇总问题并给出可执行的修复建议。';
+      text = rest ? t('ai.slash.check', { rest }) : t('ai.slash.checkAll');
     } else if (cmd === 'present') {
-      text = `请调用 present_logic 智能呈现并分步导览：${rest || '围绕当前上下文或画布核心逻辑切片调用链与共享变量'}`;
+      text = t('ai.slash.present', { subject: rest || t('ai.slash.presentDefault') });
     } else if (cmd === 'flow') {
-      text = `请调用 inspect_dataflow 分析数据流与变量读写关系：${rest || '当前所选节点或两点'}`;
+      text = t('ai.slash.flow', { subject: rest || t('ai.slash.flowDefault') });
     } else if (cmd === 'impact') {
-      text = `请优先调用 get_git_changes 与 trace_upstream 评估改动影响与调用分支：${rest || '当前工程未提交改动'}`;
+      text = t('ai.slash.impact', { subject: rest || t('ai.slash.impactDefault') });
     } else if (cmd === 'subagent') {
-      text = `请调用 run_subagent 派发并行只读子调查核实以下内容并汇总结果：${rest || '并行核实当前相关调用分支与数据流'}`;
+      text = t('ai.slash.subagent', { subject: rest || t('ai.slash.subDefault') });
     } else if (cmd === 'git') {
-      text = rest || GIT_QUICK_PROMPT;
+      text = rest || t('ai.quickPrompt.git');
     } else if (cmd === 'labels') {
-      text = rest || LABELS_QUICK_PROMPT;
+      text = rest || t('ai.quickPrompt.labels');
     }
   }
   if (activeAbort) {
@@ -2558,13 +2581,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       gen: chatGeneration,
     };
     inputEl.value = '';
-    setChatStatus('正在中断当前步骤并应用新引导…');
+    setChatStatus(() => t('ai.steering'));
     activeAbort.abort();
     return;
   }
   if (!llmConfig.baseUrl || !llmConfig.model) {
     setTab('api');
-    setApiStatus('请先填写本地模型 API 地址和模型名称', true);
+    setApiStatus(() => t('ai.api.required'), true);
     return;
   }
   const submittedProjectId = state.view?.projectId ?? chatProjectId;
@@ -2724,7 +2747,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   const finishInterrupted = (message, stopped = false) => {
     stopThinking();
     for (const { row, name } of pendingSteps) {
-      finishStep(row, { name, ok: false, summary: '执行中断' });
+      finishStep(row, { name, ok: false, summary: t('ai.interrupted') });
     }
     const steeringNow = stopped && isSteerQueuedForThisTurn();
     if (collectedTools.length || streamedText) {
@@ -2884,11 +2907,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       if (finalChangeset?.id) entry.changeset = finalChangeset;
 
       if (ev.type === 'question' || ev.awaitingUser) {
-        entry.text = ev.question || '请确认以下选项：';
+        entry.text = ev.question || t('ai.confirmOptions');
         entry.questionOptions = Array.isArray(ev.options) ? ev.options : [];
         entry.allowCustom = ev.allowCustom !== false;
       } else {
-        entry.text = ev.answer || streamedText || '已完成。';
+        entry.text = ev.answer || streamedText || t('ai.done');
         entry.completed = true;
         const suggestions = sanitizeSuggestions(ev.suggestions);
         if (suggestions.length) entry.suggestions = suggestions;
@@ -2905,16 +2928,16 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     } else if (ev.type === 'error') {
       terminalReceived = true;
       flushStreamPaint(true);
-      finishInterrupted(ev.error || '执行失败');
+      finishInterrupted(ev.error || t('ai.failed'));
       if (isVisible()) followChatScroll();
     }
   };
   const canvasLayout = buildCanvasLayoutSnapshot();
-  let streamTimer = setTimeout(() => controller.abort(new Error('连接 AI 服务超时')), 15_000);
+  let streamTimer = setTimeout(() => controller.abort(new Error(t('ai.connectTimeout'))), 15_000);
   let reader;
   try {
     const res = await api.aiChat({
-      prompt: text,
+      language: getLang(), prompt: text,
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -2933,7 +2956,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     let buffer = '';
     while (true) {
       clearTimeout(streamTimer);
-      streamTimer = setTimeout(() => controller.abort(new Error('等待 AI 响应超时')), 420_000);
+      streamTimer = setTimeout(() => controller.abort(new Error(t('ai.responseTimeout'))), 420_000);
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -2943,11 +2966,11 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     buffer += decoder.decode();
     if (buffer.trim()) handleLine(buffer);
-    if (!terminalReceived) finishInterrupted('连接提前中断，可以继续对话或重试。');
+    if (!terminalReceived) finishInterrupted(t('ai.disconnected'));
   } catch (err) {
     if (!terminalReceived) {
       const stopped = err.name === 'AbortError';
-      finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
+      finishInterrupted(stopped ? t('ai.stopped') : (err.message || String(err)), stopped);
     }
   } finally {
     if (paintTimer) {
@@ -3059,7 +3082,7 @@ function handleBookmarkChanged(e) {
   }
   pendingBookmarkSwitch = bm;
   if (bookmarkBannerEl && bookmarkBannerTextEl) {
-    bookmarkBannerTextEl.textContent = `书签已切至「${bm.name}」，可开启书签专属对话或继续当前线程`;
+    bookmarkBannerTextEl.textContent = t('ai.bookmarkSwitch', { name: bm.name });
     bookmarkBannerEl.hidden = false;
   }
 }
@@ -3103,15 +3126,15 @@ if (presCloseBtn) presCloseBtn.addEventListener('click', () => activatePresentat
 document.addEventListener('cg:ai-overlay-cleared', () => syncPresentationHud());
 
 const SLASH_COMMANDS = [
-  { cmd: '/present', desc: '按调用层切片呈现逻辑并开启分步导览', fill: '/present ' },
-  { cmd: '/check', desc: '体检当前画布（漏标/间接调用/孤立/重叠）', run: true, prompt: '/check' },
-  { cmd: '/flow', desc: '追踪共享变量或两点间的跨函数读写数据流', fill: '/flow ' },
-  { cmd: '/impact', desc: '追踪 Git 改动与上游车型分支影响范围', fill: '/impact ' },
-  { cmd: '/subagent', desc: '派发并行只读子调查深挖复杂分支', fill: '/subagent ' },
-  { cmd: '/git', desc: '拉取当前 Git 改动并按模块拆分/上图', run: true, prompt: '/git' },
-  { cmd: '/labels', desc: '自动补全画布 TASK 周期与 コール順 标签', run: true, prompt: '/labels' },
-  { cmd: '/compact', desc: '压缩早期对话以释放上下文空间', run: true, prompt: '/compact' },
-  { cmd: '/new', desc: '开启一条新的空白对话', run: true, prompt: '/new' },
+  { cmd: '/present', desc: 'ai.command.present', fill: '/present ' },
+  { cmd: '/check', desc: 'ai.command.check', run: true, prompt: '/check' },
+  { cmd: '/flow', desc: 'ai.command.flow', fill: '/flow ' },
+  { cmd: '/impact', desc: 'ai.command.impact', fill: '/impact ' },
+  { cmd: '/subagent', desc: 'ai.command.subagent', fill: '/subagent ' },
+  { cmd: '/git', desc: 'ai.command.git', run: true, prompt: '/git' },
+  { cmd: '/labels', desc: 'ai.command.labels', run: true, prompt: '/labels' },
+  { cmd: '/compact', desc: 'ai.command.compact', run: true, prompt: '/compact' },
+  { cmd: '/new', desc: 'ai.command.new', run: true, prompt: '/new' },
 ];
 
 function closeSlashMenu() {
@@ -3138,7 +3161,7 @@ function renderSlashMenu() {
     const left = document.createElement('strong');
     left.textContent = item.label || item.cmd;
     const right = document.createElement('small');
-    right.textContent = item.desc || item.meta || '';
+    right.textContent = item.desc ? t(item.desc) : item.meta || '';
     btnItem.append(left, right);
     btnItem.addEventListener('mousedown', (ev) => {
       ev.preventDefault();
@@ -3240,7 +3263,8 @@ clearSelectionBtn.addEventListener('click', () => {
 });
 if (attachShotBtn) attachShotBtn.addEventListener('click', (e) => {
   e.stopPropagation();
-  openAttachMenu();
+  if (attachMenuEl.hidden) openAttachMenu();
+  else closeAttachMenu();
 });
 document.addEventListener('click', (e) => {
   if (attachMenuEl && !attachMenuEl.hidden && !attachMenuEl.contains(e.target) && e.target !== attachShotBtn) {
@@ -3256,7 +3280,7 @@ if (imageFileInputEl) imageFileInputEl.addEventListener('change', async () => {
   const files = [...(imageFileInputEl.files || [])];
   imageFileInputEl.value = '';
   for (const f of files.slice(0, MAX_PENDING_IMAGES)) {
-    await addImageFromBlob(f, f.name || '外部图片');
+    await addImageFromBlob(f, f.name || t('ai.externalImage'));
   }
 });
 if (textFileInputEl) textFileInputEl.addEventListener('change', async () => {
@@ -3274,7 +3298,7 @@ const handlePasteFiles = async (e) => {
   e.preventDefault();
   for (const item of imageItems.slice(0, MAX_PENDING_IMAGES)) {
     const blob = item.getAsFile();
-    if (blob) await addImageFromBlob(blob, '粘贴的外部截图');
+    if (blob) await addImageFromBlob(blob, t('ai.pastedImage'));
   }
 };
 if (inputEl) inputEl.addEventListener('paste', handlePasteFiles);
@@ -3318,7 +3342,8 @@ document.addEventListener('cg:project-changed', () => {
   state.aiHover = null;
   stopCamAnim();
   activatePresentation(null);
-  messagesEl.innerHTML = EMPTY_CHAT_HTML;
+  applyI18n(emptyChatEl);
+  messagesEl.replaceChildren(emptyChatEl);
   finishThreadRename(false);
   dismissedSelectionKeys.clear();
   pinnedSelections.length = 0;
@@ -3368,7 +3393,7 @@ if (newChatBtn) newChatBtn.addEventListener('click', startNewThread);
 renameChatBtn.addEventListener('click', () => {
   if (renamingThread || chatProjectId == null || chatProjectId !== (state.view?.projectId ?? chatProjectId)) return;
   renamingThread = activeThread();
-  renameInputEl.value = renamingThread.title;
+  renameInputEl.defaultValue = renameInputEl.value = displayThreadTitle(renamingThread);
   chatSelectEl.hidden = true;
   renameInputEl.hidden = false;
   renameChatBtn.disabled = true;
@@ -3390,9 +3415,9 @@ if (deleteChatBtn) deleteChatBtn.addEventListener('click', async () => {
   if (!targetId) return;
   if (th.messages.length) {
     const ok = await confirmDialog({
-      title: '删除对话',
-      message: `确定删除对话「${th.title || NEW_THREAD_TITLE}」（共 ${th.messages.length} 条记录）吗？\n删除后无法恢复；如只想开启新上下文，请点「+ 新建」。`,
-      okText: '删除对话',
+      title: t('ai.deleteChat'),
+      message: t('ai.deleteConfirm', { name: displayThreadTitle(th), n: th.messages.length }),
+      okText: t('ai.deleteChat'),
       danger: true,
     });
     if (!ok || activeChatId !== targetId) return;
@@ -3429,13 +3454,13 @@ for (const quick of document.querySelectorAll('[data-ai-quick]')) {
   quick.addEventListener('click', () => {
     const kind = quick.dataset.aiQuick;
     if (kind === 'git') {
-      sendPrompt(GIT_QUICK_PROMPT);
+      sendPrompt(t('ai.quickPrompt.git'));
     } else if (kind === 'find') {
-      prefillPrompt('帮我找出和 ');
+      prefillPrompt(t('ai.findDraft'));
     } else if (kind === 'labels') {
-      sendPrompt(LABELS_QUICK_PROMPT);
+      sendPrompt(t('ai.quickPrompt.labels'));
     } else if (kind === 'build') {
-      sendPrompt(BUILD_DIAG_QUICK_PROMPT);
+      sendPrompt(t('ai.quickPrompt.build'));
     }
   });
 }
@@ -3455,12 +3480,12 @@ if (quickModelEl) quickModelEl.addEventListener('change', () => {
     return;
   }
   if (val === llmConfig.model) return;
-  void saveQuickConfig({ model: val }, `已切换模型：${val}`);
+  void saveQuickConfig({ model: val }, () => t('ai.modelSwitched', { name: val }));
 });
 if (quickReasoningEl) quickReasoningEl.addEventListener('change', () => {
   const val = quickReasoningEl.value;
   if (val === (llmConfig.reasoningEffort || 'default')) return;
-  void saveQuickConfig({ reasoningEffort: val }, `已切换思考强度：${REASONING_LABELS.get(val) || val}`);
+  void saveQuickConfig({ reasoningEffort: val }, () => t('ai.effortSwitched', { effort: t(EFFORT_KEYS[val]) }));
 });
 if (inputEl) {
   inputEl.addEventListener('input', () => {
@@ -3525,20 +3550,20 @@ if (apiKeyEl) apiKeyEl.addEventListener('input', () => {
 if (clearKeyBtn) clearKeyBtn.addEventListener('click', () => {
   clearApiKeyPending = true;
   apiKeyEl.value = '';
-  apiKeyEl.placeholder = '保存后将清除已存 Key';
+  syncApiKeyHint();
   clearKeyBtn.hidden = true;
 });
 if (fetchModelsBtn) fetchModelsBtn.addEventListener('click', async () => {
-  setApiStatus('正在拉取模型列表…');
+  setApiStatus(() => t('ai.api.fetching'));
   fetchModelsBtn.disabled = true;
   try {
     const draft = readApiDraft();
     const r = await api.aiModels(draft);
-    if (!r?.ok) throw new Error(r?.error || '拉取失败');
+    if (!r?.ok) throw new Error(r?.error || t('ai.api.fetchFailed'));
     const models = r.models || [];
     if (!modelEl.value.trim() && models.length) modelEl.value = models[0];
     applyFetchedModels(models, draft.baseUrl);
-    setApiStatus(models.length ? `已获取 ${models.length} 个模型，可在下拉中选择` : '接口返回空列表，可手动输入模型名');
+    setApiStatus(() => models.length ? t('ai.api.fetchedCount', { n: models.length }) : t('ai.api.noModels'));
   } catch (err) {
     setApiStatus(err.message || String(err), true);
   } finally {
@@ -3546,12 +3571,12 @@ if (fetchModelsBtn) fetchModelsBtn.addEventListener('click', async () => {
   }
 });
 if (testConnBtn) testConnBtn.addEventListener('click', async () => {
-  setApiStatus('正在测试连接…');
+  setApiStatus(() => t('ai.api.testing'));
   testConnBtn.disabled = true;
   try {
     const r = await api.aiTest(readApiDraft());
-    if (!r?.ok) throw new Error(r?.error || '连接失败');
-    setApiStatus(`✓ 连接成功（${r.latencyMs}ms · ${r.model}）`);
+    if (!r?.ok) throw new Error(r?.error || t('ai.api.testFailed'));
+    setApiStatus(() => t('ai.api.connected', { ms: r.latencyMs, model: r.model }));
   } catch (err) {
     setApiStatus(err.message || String(err), true);
   } finally {
@@ -3561,19 +3586,19 @@ if (testConnBtn) testConnBtn.addEventListener('click', async () => {
 if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
   const draft = readApiDraft();
   if (invalidTokenCount(contextWindowEl, draft.contextWindow)) {
-    setApiStatus('上下文窗口须为 4096 到 1048576 之间的整数', true);
+    setApiStatus(() => t('ai.api.windowInvalid'), true);
     contextWindowEl.focus();
     return;
   }
   if (invalidTokenCount(maxTokensEl, draft.maxTokens)) {
-    setApiStatus('单次最大输出须为 0 到 65536 之间的整数', true);
+    setApiStatus(() => t('ai.api.outputInvalid'), true);
     maxTokensEl.focus();
     return;
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   saveApiBtn.disabled = true;
-  setApiStatus('正在保存…');
+  setApiStatus(() => t('common.saving'));
   try {
     const response = await fetch('/api/ai/config', {
       method: 'POST',
@@ -3583,14 +3608,14 @@ if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
     });
     const r = await response.json().catch(() => null);
     if (!response.ok || !r?.ok || !r.config) {
-      throw new Error(r?.error || (response.ok ? '保存失败' : `HTTP ${response.status}`));
+      throw new Error(r?.error || (response.ok ? t('bookmark.failed') : `HTTP ${response.status}`));
     }
     llmConfig = r.config;
     syncApiForm();
     prefetchModelsForQuickPicker();
-    setApiStatus('✓ 配置已保存，可直接切到「对话助手」使用');
+    setApiStatus(() => t('ai.api.saved'));
   } catch (err) {
-    setApiStatus(controller.signal.aborted ? '保存配置超时，请重试' : err.message || String(err), true);
+    setApiStatus(() => controller.signal.aborted ? t('ai.api.saveTimeout') : err.message || String(err), true);
   } finally {
     clearTimeout(timeout);
     saveApiBtn.disabled = false;
@@ -3598,7 +3623,28 @@ if (saveApiBtn) saveApiBtn.addEventListener('click', async () => {
 });
 
 document.addEventListener('callgraph:langchange', () => {
-  if (levelsEl?.childElementCount) renderMcp();
+  syncApiKeyHint();
+  syncQuickControls();
+  if (chatThreads.length) {
+    renderChatBar();
+    // 流式回调仍持有当前消息元素，此时只更新控件，不替换消息树。
+    if (activeAbort) updateChatControls();
+    else renderThreadMessages({ preserveStatus: true });
+  } else {
+    syncInputSuggestion();
+  }
+  renderSelectionBar();
+  renderAttachments();
+  if (slashMenuState.open) renderSlashMenu();
+  if (attachMenuEl && !attachMenuEl.hidden) openAttachMenu();
+  if (pendingBookmarkSwitch) bookmarkBannerTextEl.textContent = t('ai.bookmarkSwitch', { name: pendingBookmarkSwitch.name });
+  syncPresentationHud();
+  if (levelsEl?.childElementCount) {
+    const selected = levelsEl.querySelector('input:checked')?.value;
+    renderMcp();
+    const previous = [...levelsEl.querySelectorAll('input')].find(input => input.value === selected);
+    if (previous) previous.checked = true;
+  }
 });
 
 if (saveBtn)

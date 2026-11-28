@@ -24,6 +24,7 @@ function place(el, x, y, anchor = null) {
   const r = el.getBoundingClientRect();
   if (r.right > window.innerWidth - 8) el.style.left = `${Math.max(8, window.innerWidth - r.width - 8)}px`;
   if (r.bottom > window.innerHeight - 8) el.style.top = `${Math.max(8, window.innerHeight - r.height - 8)}px`;
+  if (anchor) el.querySelector('button')?.focus({ preventScroll: true });
 }
 
 /** 单层菜单（带色块，用于变更分类这类互斥选项） */
@@ -91,7 +92,9 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && els.ctxMenu?.classList.contains('show')) {
     event.preventDefault();
     event.stopPropagation();
+    const anchor = menuAnchor;
     hideMenu();
+    anchor?.focus({ preventScroll: true });
   }
 }, true);
 document.addEventListener('scroll', (event) => {

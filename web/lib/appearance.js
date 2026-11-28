@@ -327,12 +327,12 @@ function installPanelStyle() {
       padding: 0 16px 16px; color: #27343c; background: #f6f7f8; font-size: 13px;
     }
     #styleBody .appearance-tabs {
-      display: flex; gap: 18px; position: sticky; top: 0; z-index: 1;
+      display: flex; gap: 2px 14px; position: sticky; top: 0; z-index: 1;
       margin-bottom: 12px; padding-top: 3px; background: #f6f7f8;
       border-bottom: 1px solid var(--settings-border);
     }
     #styleBody .appearance-tabs button {
-      height: 37px; padding: 0 5px; color: var(--settings-muted); background: transparent;
+      min-width: 0; min-height: 37px; height: auto; padding: 5px; white-space: normal; overflow-wrap: anywhere; color: var(--settings-muted); background: transparent;
       border: 0; border-bottom: 2px solid transparent; border-radius: 0; font: inherit;
     }
     #styleBody .appearance-tabs button[aria-selected="true"] {
@@ -381,7 +381,8 @@ function installPanelStyle() {
       border: 1px solid var(--preview-container-stroke); border-radius: 5px;
     }
     #styleBody .appearance-preview-graph {
-      display: grid; grid-template-columns: 1fr .7fr 1fr .7fr 1fr; align-items: center; gap: 4px;
+      display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .8fr) minmax(0, 1fr) minmax(0, .8fr) minmax(0, 1fr);
+      align-items: center; gap: 4px; overflow-wrap: anywhere;
     }
     #styleBody .appearance-preview-node {
       display: inline-block; padding: 5px 3px; border: 1px var(--preview-fn-line) var(--preview-node-border);
@@ -403,10 +404,10 @@ function installPanelStyle() {
       position: relative; display: block; border-top: 2px solid var(--edge-color);
     }
     #styleBody .appearance-preview-graph .appearance-preview-edge {
-      position: relative; height: 100%; align-content: center; padding-bottom: 14px;
+      align-content: center; padding-block: 3px; gap: 4px;
     }
     #styleBody .appearance-preview-graph .appearance-preview-edge i {
-      position: absolute; top: 50%; left: 0; right: 0;
+      position: relative;
     }
     #styleBody .appearance-preview-graph .appearance-preview-edge i::after {
       content: ''; position: absolute; right: 0; top: -4px;
@@ -461,6 +462,18 @@ function installPanelStyle() {
       #styleBody { padding-right: 10px; padding-left: 10px; }
       #styleBody .appearance-card { padding-right: 9px; padding-left: 9px; }
       #styleBody .appearance-preview-group { padding: 10px 5px; }
+      #styleBody .appearance-preview-graph { grid-template-columns: minmax(0, 1fr); justify-items: center; }
+      #styleBody .appearance-preview-graph .appearance-preview-node { min-width: 55%; }
+      #styleBody .appearance-preview-graph .appearance-preview-edge {
+        position: relative; width: 100%; padding: 4px 2px 4px calc(50% + 8px); text-align: start;
+      }
+      #styleBody .appearance-preview-graph .appearance-preview-edge i {
+        position: absolute; inset: 0 auto 0 50%; border: 0; border-left: 2px solid var(--edge-color);
+      }
+      #styleBody .appearance-preview-graph .appearance-preview-edge.data i { border-left-style: dashed; }
+      #styleBody .appearance-preview-graph .appearance-preview-edge i::after {
+        inset: auto auto 0 -4px; border-width: 5px 3px 0; border-color: var(--edge-color) transparent transparent;
+      }
       #styleBody .appearance-presets button { flex-direction: column; }
       #styleBody .appearance-semantics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       #styleBody .appearance-advanced-grid { grid-template-columns: 1fr; }

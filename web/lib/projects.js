@@ -80,13 +80,18 @@ const ICONS = {
 };
 
 /** 顶栏按钮显示当前工程名，让用户始终知道自己在看哪个工程 */
+let toolbarProject;
+function renderProjectLabel() {
+  if (!btn || !toolbarProject || state.view?.comparison) return;
+  btn.textContent = toolbarProject.name + (toolbarProject.changed ? ' *' : '');
+  btn.title = toolbarProject.path + (toolbarProject.changed ? '\n' + t('project.changed') : '');
+}
+document.addEventListener('callgraph:langchange', renderProjectLabel);
+
 export async function syncProjectLabel() {
   try {
-    const p = await api.project();
-    if (btn) {
-      btn.textContent = p.name + (p.changed ? ' *' : '');
-      btn.title = `${p.path}${p.changed ? `\n${t('project.changed')}` : ''}`;
-    }
+    toolbarProject = await api.project();
+    renderProjectLabel();
   } catch {
     /* 工程信息拿不到不影响主流程 */
   }

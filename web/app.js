@@ -14,7 +14,7 @@ import { renderLabelPanel, deleteSelectedLabel } from './lib/label-panel.js';
 import { buildSVG } from './lib/svg.js';
 import { buildPNG, saveExport } from './lib/export.js';
 import { buildStandaloneHtml } from './lib/html.js';
-import './lib/ui-select.js';
+import { positionPopover } from './lib/ui-select.js';
 // 样式设置面板：恢复已存主题并接好「样式」按钮，纯副作用导入
 import './lib/appearance.js';
 // 交互模块在加载时注册画布事件，没有导出给入口使用，纯副作用导入
@@ -323,8 +323,10 @@ function syncBookmarkBadge() {
   }
   if (bookmarkBtn) {
     if (bm) {
-      bookmarkBtn.textContent = `🔖 ${bm.name}${dirty ? ' ●' : ''}`;
-      bookmarkBtn.title = dirty ? t('bookmark.dirtyHint') : `当前书签：${bm.name}`;
+      const name = document.createElement('span');
+      name.textContent = bm.name + (dirty ? ' ●' : '');
+      bookmarkBtn.replaceChildren('🔖 ', name);
+      bookmarkBtn.title = dirty ? t('bookmark.dirtyHint') : t('bookmark.currentName', { name: bm.name });
     } else if (hasContent && !state.view?.comparison) {
       bookmarkBtn.textContent = `🔖 ${t('bookmark.unnamed')}`;
       bookmarkBtn.title = t('btn.bookmark');
@@ -337,7 +339,7 @@ function syncBookmarkBadge() {
     bookmarkQuickSave.hidden = readOnly || (!dirty && (!hasContent || !!bm));
     bookmarkQuickSave.classList.toggle('dirty', dirty);
     bookmarkQuickSave.textContent = bm ? t('common.save') : t('bookmark.saveAs');
-    bookmarkQuickSave.title = bm ? '更新当前书签 (Ctrl+S)' : '保存为书签 (Ctrl+S)';
+    bookmarkQuickSave.title = bm ? t('bookmark.quickUpdate') : t('bookmark.quickSave');
   }
 }
 hooks.syncBookmarkBadge = syncBookmarkBadge;
@@ -797,12 +799,12 @@ function updateBuildConfigBtn() {
   if (active) {
     buildConfigBtn.textContent = `⚙ ${active.label}`;
     buildConfigBtn.classList.add('active');
-    buildConfigBtn.title = `当前构建配置：${active.label}（${active.compiler} · ${active.activeFileCount} 个 .c）`;
+    buildConfigBtn.title = t('build.active', { name: active.label, compiler: active.compiler, n: active.activeFileCount });
   } else {
     const count = (buildConfigState.profiles || []).length;
-    buildConfigBtn.textContent = count ? `⚙ 构建配置 (${count})` : '⚙ 构建配置';
+    buildConfigBtn.textContent = count ? t('build.count', { count }) : t('build.button');
     buildConfigBtn.classList.remove('active');
-    buildConfigBtn.title = '选择机种构建配置（.cproject / .mak / QAC）、设置便携版 Clang 路径或导出 compile_commands.json';
+    buildConfigBtn.title = t('build.hint');
   }
 }
 
@@ -813,22 +815,22 @@ function renderBuildProfileSummary() {
   buildProfileInfo.replaceChildren();
   if (!p) {
     const line = document.createElement('div');
-    line.textContent = `全部源码（未按机种过滤）：共 ${buildConfigState.totalSourceFiles || 0} 个 .c 文件。` +
+    line.textContent = t('build.allSummary', { n: buildConfigState.totalSourceFiles || 0 }) + ' ' +
       ((buildConfigState.profiles || []).length
-        ? `已检测到 ${buildConfigState.profiles.length} 个构建配置，切换后将按所选机种过滤参与编译的源码并注入宏定义。`
-        : '当前目录未发现 .cproject / .mak / QAC 配置，可直接使用全部源码或配置 Clang 路径。');
+        ? t('build.detected', { n: buildConfigState.profiles.length })
+        : t('build.none'));
     buildProfileInfo.append(line);
     return;
   }
   const head = document.createElement('div');
-  head.textContent = `来源：${p.configFile} · 编译器/架构：${p.compiler} (${p.arch}) · 参与编译：${p.activeFileCount} / ${buildConfigState.totalSourceFiles || 0} 个 .c`;
+  head.textContent = t('build.profileSummary', { file: p.configFile, compiler: p.compiler, arch: p.arch, n: p.activeFileCount, total: buildConfigState.totalSourceFiles || 0 });
   buildProfileInfo.append(head);
   const tags = document.createElement('div');
   tags.className = 'build-tags';
   const items = [
-    `-I 目录 ${p.includeCount}`,
-    `-D 宏定义 ${p.defineCount}`,
-    ...(p.exclusionCount ? [`排除规则 ${p.exclusionCount}`] : []),
+    t('build.includes', { n: p.includeCount }),
+    t('build.defines', { n: p.defineCount }),
+    ...(p.exclusionCount ? [t('build.exclusions', { n: p.exclusionCount })] : []),
     ...(p.sampleDefines || []).slice(0, 6).map((d) => `-D${d}`),
   ];
   for (const label of items) {
@@ -844,16 +846,11 @@ function renderBuildConfigModal() {
   if (!buildConfigState || !buildProfileSelect) return;
   const profiles = buildConfigState.profiles || [];
   buildProfileSelect.replaceChildren(
-    new Option(`全部源码（默认 · ${buildConfigState.totalSourceFiles || 0} 个 .c）`, ''),
+    new Option('', ''),
     ...profiles.map((p) => new Option(`${p.label} [${p.source} · ${p.activeFileCount} .c]`, p.id)),
   );
   buildProfileSelect.value = buildConfigState.activeProfileId || '';
-  if (buildMultiCoreHint) {
-    buildMultiCoreHint.hidden = !buildConfigState.multiCoreHint;
-    buildMultiCoreHint.textContent = buildConfigState.multiCoreHint
-      ? `检测到 ${buildConfigState.cprojectCount} 个 .cproject（多核或多工程结构），已按目录前缀拆分为独立配置供单独选择。`
-      : '';
-  }
+  renderBuildConfigDescriptions();
   if (buildParserSelect) {
     buildParserSelect.value = buildConfigState.activeParser || activeParser || 'builtin';
   }
@@ -866,14 +863,27 @@ function renderBuildConfigModal() {
   if (buildClangBin) {
     buildClangBin.value = buildConfigState.clangBin || '';
   }
+}
+
+function renderBuildConfigDescriptions() {
+  if (!buildConfigState) return;
+  if (buildProfileSelect?.options.length) {
+    buildProfileSelect.options[0].textContent = t('build.allSources', { n: buildConfigState.totalSourceFiles || 0 });
+  }
+  if (buildMultiCoreHint) {
+    buildMultiCoreHint.hidden = !buildConfigState.multiCoreHint;
+    buildMultiCoreHint.textContent = buildConfigState.multiCoreHint
+      ? t('build.multicore', { n: buildConfigState.cprojectCount })
+      : '';
+  }
   if (buildClangStatus) {
     const st = buildConfigState.clangStatus;
     if (st?.ok) {
       buildClangStatus.className = 'build-status ok';
-      buildClangStatus.textContent = `✓ 已就绪：${st.version}（${st.bin}）`;
+      buildClangStatus.textContent = t('build.clangReady', { version: st.version, bin: st.bin });
     } else {
       buildClangStatus.className = 'build-status warn';
-      buildClangStatus.textContent = `⚠ 未检测到 Clang（${st?.reason || '未安装'}）。仍可使用「内置快速解析」按所选机种过滤源码与宏定义；后续拷贝便携版 clang.exe 后在此填入路径即可启用 Clang AST。`;
+      buildClangStatus.textContent = t('build.clangMissing', { reason: st?.reason || t('build.notInstalled') });
     }
   }
   renderBuildProfileSummary();
@@ -909,14 +919,14 @@ buildConfigBtn?.addEventListener('click', async () => {
   const seq = ++buildModalSeq;
   const epoch = reloadEpoch;
   buildStrictTouched = false;
-  setBuildMessage('正在刷新工程构建配置…');
+  setBuildMessage(t('build.refreshing'));
   if (buildConfigApply) buildConfigApply.disabled = true;
   if (buildExportDb) buildExportDb.disabled = true;
   openModal('buildConfigModal');
   const data = await api.buildConfigs();
   if (seq !== buildModalSeq || epoch !== reloadEpoch) return;
   if (!data) {
-    setBuildMessage('获取构建配置失败，请关闭重试', true);
+    setBuildMessage(t('build.loadFailed'), true);
     return;
   }
   buildConfigState = data;
@@ -930,16 +940,16 @@ buildConfigBtn?.addEventListener('click', async () => {
 buildExportDb?.addEventListener('click', async () => {
   if (parserBusy) return;
   buildExportDb.disabled = true;
-  setBuildMessage('正在生成 compile_commands.json…');
+  setBuildMessage(t('build.exporting'));
   try {
     const result = await api.saveBuildConfig({
       profileId: buildProfileSelect?.value || null,
       exportCompileCommands: true,
     });
-    if (!result?.ok) throw new Error(result?.error || '导出失败');
-    setBuildMessage(`已导出 ${result.exportedPath}（共 ${result.unitCount} 个编译单元，${result.includeCount} 个 -I，${result.defineCount} 个 -D${result.shimPath ? '，含 GHS 兼容垫片' : ''}）`);
+    if (!result?.ok) throw new Error(result?.error || t('build.exportFailed'));
+    setBuildMessage(t('build.exported', { path: result.exportedPath, units: result.unitCount, includes: result.includeCount, defines: result.defineCount, shim: result.shimPath ? t('build.shim') : '' }));
   } catch (error) {
-    setBuildMessage(error.message || '导出失败', true);
+    setBuildMessage(error.message || t('build.exportFailed'), true);
   } finally {
     buildExportDb.disabled = false;
   }
@@ -951,7 +961,7 @@ buildConfigApply?.addEventListener('click', async () => {
   buildConfigApply.disabled = true;
   buildExportDb.disabled = true;
   syncCanvasControls();
-  setBuildMessage('正在应用构建配置并重新解析工程…');
+  setBuildMessage(t('build.applying'));
   try {
     const result = await api.saveBuildConfig({
       profileId: buildProfileSelect?.value || null,
@@ -963,14 +973,14 @@ buildConfigApply?.addEventListener('click', async () => {
     if (!result?.ok) {
       if (result?.clangStatus && buildClangStatus) {
         buildClangStatus.className = 'build-status warn';
-        buildClangStatus.textContent = `⚠ ${result.clangStatus.reason || 'Clang 不可用'}`;
+        buildClangStatus.textContent = `⚠ ${result.clangStatus.reason || t('build.clangUnavailable')}`;
       }
-      throw new Error(result?.error || '应用构建配置失败');
+      throw new Error(result?.error || t('build.applyFailed'));
     }
     closeModal();
     await hooks.reloadAll();
   } catch (error) {
-    setBuildMessage(error.message || '应用构建配置失败', true);
+    setBuildMessage(error.message || t('build.applyFailed'), true);
   } finally {
     parserBusy = false;
     buildConfigApply.disabled = false;
@@ -1050,14 +1060,25 @@ els.cv.addEventListener('pointerdown', (event) => {
 
 // 顶栏菜单一次只展开一个；选完、点击外部或按 Escape 即收起。
 const toolMenus = [...document.querySelectorAll('header .tool-menu')];
+function positionToolMenus() {
+  for (const menu of toolMenus) {
+    if (menu.open) positionPopover(menu.querySelector('.tool-popover'),
+      menu.querySelector('summary').getBoundingClientRect(), window.innerHeight * 0.7, true);
+  }
+}
+document.getElementById('app').addEventListener('scroll', positionToolMenus);
 document.addEventListener('click', (event) => {
   for (const menu of toolMenus) {
     if (!menu.contains(event.target) || event.target.closest('button')) menu.open = false;
   }
 });
 for (const menu of toolMenus) {
-  menu.querySelector('summary').addEventListener('click', () => {
+  menu.addEventListener('toggle', positionToolMenus);
+  menu.querySelector('summary').addEventListener('click', (event) => {
+    event.preventDefault();
     for (const other of toolMenus) if (other !== menu) other.open = false;
+    menu.open = !menu.open;
+    positionToolMenus();
   });
 }
 document.addEventListener('keydown', (event) => {
@@ -1098,17 +1119,25 @@ document.getElementById('exportXlsx').addEventListener('click', () => {
 applyI18n();
 document.addEventListener('callgraph:langchange', () => {
   renderParserSelect();
+  updateBuildConfigBtn();
+  if (document.getElementById('buildConfigModal')?.classList.contains('show')) renderBuildConfigDescriptions();
   renderTree(true);
   syncTreeSelection();
   runSearch().catch(() => {});
   loadStats().catch(() => {});
   renderVars();
-  if (document.getElementById('secDataflow').hidden) renderDetail(state.selected).catch(() => {});
-  renderLabelPanel();
+  if (document.getElementById('secDataflow').hidden) renderDetail(state.selected, null, { notifySelection: false }).catch(() => {});
+  renderLabelPanel({ notifySelection: false });
   syncCanvasControls();
+  positionToolMenus();
   draw();
 });
-window.addEventListener('resize', () => { constrainCam(); resize(); });
+window.addEventListener('resize', () => { constrainCam(); resize(); positionToolMenus(); });
+// 工具栏会因译文或书签换行，浮层随它的实际高度定位。
+new ResizeObserver(([entry]) => {
+  document.documentElement.style.setProperty('--toolbar-height', entry.target.offsetHeight + 'px');
+  positionToolMenus();
+}).observe(document.querySelector('header'));
 resize();
 // 添加偏好与现有画布范围分开；没有已保存视图时，首屏使用默认查找层数。
 (async () => {
