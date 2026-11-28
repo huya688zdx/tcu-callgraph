@@ -7,6 +7,7 @@
 
 import { SUPPORTED_LANGS } from '../../web/lib/message-catalog.js';
 import { aiTranslator } from './ai-messages.js';
+import { evidenceForTool } from '../../web/lib/ai-source-evidence.js';
 import { MAX_CODE_ATTACHMENT_CHARS, sanitizeCodeAttachments } from '../../web/lib/ai-code-attachments.js';
 
 const VALID_TOOL_MODES = new Set(['auto', 'tools', 'prompt']);
@@ -567,6 +568,13 @@ export function isReadOnlyAiTool(name, args = {}) {
     (name === 'manage_bookmarks' && args.action === 'list') ||
     (name === 'arrange_canvas' && args.action === 'inspect') ||
     (name === 'present_logic' && args.addToCanvas === false);
+}
+
+export function toolTarget(args = {}) {
+  const values = [args.action, args.file, args.name, args.id, args.root, args.functions, args.names,
+    args.targets, args.caller, args.callee, args.query].flat();
+  return values.filter(value => typeof value === 'string').map(value => value.replace(/[\r\n\t]+/g, ' ').trim())
+    .filter(Boolean).slice(0, 3).join(' · ').slice(0, 100);
 }
 
 const TOOL_NAME_SET = new Set(AGENT_TOOLS.map(t => t.name));
@@ -1602,7 +1610,8 @@ export async function runAiAgent({
     allowedTools ?? (isSubagent ? SUBAGENT_READONLY_TOOLS : null), context.language,
   );
   const activeToolNames = new Set(activeToolDefs.map(t => t.name));
-  const rolePrompt = systemPromptOverride || canvasSystemPrompt(context);
+  const role = systemPromptOverride || canvasSystemPrompt(context);
+  const rolePrompt = context.accessMode === 'read' ? role + '\n' + tr('turn.readOnlyRole') : role;
 
   let activeMode = config.toolMode === 'prompt' ? 'prompt' : 'tools';
   const historyBudget = Math.floor(config.contextWindow * 0.65);
@@ -1894,7 +1903,7 @@ export async function runAiAgent({
     const promptResults = [];
     for (const call of calls) {
       signal?.throwIfAborted();
-      onEvent({ type: 'tool_start', callId: call.id, name: call.name, arguments: call.arguments });
+      onEvent({ type: 'tool_start', callId: call.id, name: call.name, arguments: call.arguments, target: toolTarget(call.arguments) });
       signal?.throwIfAborted();
       let output;
       try {
@@ -1954,8 +1963,12 @@ export async function runAiAgent({
       const summary = summarizeToolResult(call.name, cleanOutput, tr);
       const digest = summarizeToolDigest(call.name, call.arguments, cleanOutput, tr);
       const blocked = Boolean(cleanOutput?.blocked);
-      toolLog.push({ name: call.name, arguments: call.arguments, ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
-      onEvent({ type: 'tool_end', callId: call.id, name: call.name, ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
+      const access = isReadOnlyAiTool(call.name, call.arguments) ? 'read' : 'edit';
+      const target = toolTarget(call.arguments);
+      const evidence = evidenceForTool(call.name, cleanOutput);
+      toolLog.push({ name: call.name, arguments: call.arguments, access, target, ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
+      onEvent({ type: 'tool_end', callId: call.id, name: call.name, access, target,
+        ...(evidence.length ? { evidence } : {}), ok: cleanOutput?.ok !== false, ...(blocked ? { blocked: true } : {}), summary, digest });
 
       const layoutBudget = Math.max(12000, Math.min(72000, config.contextWindow * 2));
       const clipped = clipToolOutput(cleanOutput, call.name === 'arrange_canvas' ? layoutBudget : 12000);

@@ -1185,6 +1185,13 @@
     cursor: pointer; vertical-align: baseline;
     transition: background .12s ease, border-color .12s ease, color .12s ease;
   }
+  .ai-source-list { margin: 5px 0; }
+  .ai-source-list summary { cursor: pointer; color: #235483; overflow-wrap: anywhere; font: 12px/1.6 monospace; }
+  .ai-source-list pre { margin: 3px 0; padding: 6px; overflow: auto; max-height: 11rem; background: #f4f6f8; }
+  .ai-source-list pre span { display: block; width: max-content; min-width: 100%; }
+  .ai-source-list [aria-current] { background: #d9ebfa; outline: 1px solid #6797c0; }
+  .ai-recovery { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px; }
+  .ai-recovery span { flex: 1 0 100%; color: #514e49; }
   #aiDrawer .ai-sym-link:hover { background: #DCECFB; border-color: #7DB2E4; color: #083463; }
   .ai-msg-text strong { font-weight: 600; color: #171715; }
   .ai-msg-text p { margin: 0 0 7px; }
@@ -2481,6 +2488,7 @@
                 <option value="medium" data-i18n="ai.effort.medium">思考：中</option>
                 <option value="high" data-i18n="ai.effort.high">思考：高</option>
               </select>
+              <button type="button" id="aiAccessMode" class="ai-inline-btn" aria-pressed="false" title="切换下一轮可用的工具权限" data-i18n-title="ai.access.hint" data-i18n="ai.access.edit">允许改图</button>
               <button type="button" id="aiAttachShot" class="ai-inline-btn" aria-pressed="false" aria-haspopup="menu" aria-expanded="false" title="画布截图（整图/选中层级/文件框）、粘贴外部截图或导入外部文件片段" data-i18n-title="ai.attachHint" data-i18n="ai.attach">📎 截图/文件</button>
             </div>
             <div class="ai-composer-actions">

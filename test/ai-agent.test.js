@@ -3457,3 +3457,24 @@ test('中断已落盘的助手改图仍可撤销，安全重试和只读模式�
   assert.deepEqual(await status(turn), { state: 'unknown', canRetry: false });
   assert.equal((await post('/api/ai/undo-changeset', { changesetId: result.changeset.id })).status, 404);
 });
+
+test('源码证据来自成功读取的范围，工具结果保留短目标', async t => {
+  const srv = await launchServer();
+  t.after(srv.close);
+  const { run } = await mockAiTurn(t, srv.baseUrl, last => last.role === 'tool' ? [] : [
+    ['read_source', { file: 'gear.c', startLine: 2, endLine: 4 }],
+    ['read_source', { file: 'absent.c', startLine: 1, endLine: 5 }],
+  ]);
+  const events = await run('只读检查源码', { accessMode: 'read' });
+  const result = events.filter(ev => ev.type === 'tool_end');
+  assert.equal(result.length, 2);
+  assert.equal(result[0].target, 'gear.c');
+  assert.equal(result[0].access, 'read');
+  assert.equal(result[0].evidence[0].startLine, 2);
+  assert.equal(result[0].evidence[0].endLine, 4);
+  const source = fs.readFileSync('samples/tcu/gear.c', 'utf8').split(/\r?\n/);
+  assert.equal(result[0].evidence[0].source, source.slice(1, 4).join('\n'));
+  assert.equal(result[1].ok, false);
+  assert.equal(result[1].evidence, undefined);
+  assert.deepEqual(events.at(-1).toolLog.map(item => item.target), ['gear.c', 'absent.c']);
+});

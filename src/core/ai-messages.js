@@ -215,6 +215,7 @@ export const aiTranslator = createMessageCatalog([
   ["imageFallback", "当前模型接口不支持图片输入，已自动降级为纯文本继续", "このモデルは画像入力に対応していません。テキストで続行します。", "This model does not support images. Continuing with text."],
   ["noApi", "尚未配置模型 API 地址，请先在「直连 API」中填写", "「直接 API」でモデルの API URL を入力してください。", "Enter the model API URL in Direct API first."],
   ["noModel", "尚未配置模型名称，请先在「直连 API」中填写或拉取模型", "「直接 API」でモデル名を入力するか、一覧を取得してください。", "Enter a model name or fetch the list in Direct API first."],
+  ["turn.readOnlyRole", "本轮只读。只检查源码、画布或书签，不请求写入工具。", "このターンは読み取り専用です。ソース、キャンバス、ブックマークを調査し、書き込みを要求しないでください。", "This turn is read-only. Inspect source, canvas or bookmarks without requesting a write."],
   ["turn.readOnly", "本轮只读，无法执行此工具。", "このターンは読み取り専用です。この操作は実行できません。", "This turn is read-only. This tool cannot run."],
   ["turn.mode", "无效的助手模式。", "無効なアシスタントモードです。", "Invalid assistant mode."],
   ["turn.invalid", "本轮无法安全重试。请检查当前状态。", "このターンを安全に再試行できません。現在の状態を確認してください。", "This turn cannot be replayed safely. Check the current state."],

@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { boundSavedEvidence, sourceEvidence } from '../web/lib/ai-source-evidence.js';
 import { createTurnRegistry } from './core/ai-turns.js';
 import { randomInt, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -2923,6 +2924,7 @@ export const server = http.createServer(async (req, res) => {
                 ...(healthReport ? { healthReport } : {}),
                 ...(subagents.length ? { subagents } : {}),
                 ...(changeset ? { changeset } : {}),
+                ...(m.role === 'assistant' && Array.isArray(m.evidence) ? { evidence: sourceEvidence(m.evidence) } : {}),
                 ...(m.role === 'assistant' && typeof m.recovery?.turnId === 'string' ? { recovery: {
                   turnId: m.recovery.turnId.slice(0, 80),
                   mode: m.recovery.mode === 'read' ? 'read' : 'edit',
@@ -2935,6 +2937,9 @@ export const server = http.createServer(async (req, res) => {
                   tools: m.tools.slice(0, 20).map((tl) => ({
                     name: String(tl?.name || '').slice(0, 64),
                     ok: tl?.ok !== false,
+                    ...(tl?.blocked ? { blocked: true } : {}),
+                    ...(typeof tl?.target === 'string' ? { target: tl.target.slice(0, 100) } : {}),
+                    ...(['read', 'edit'].includes(tl?.access) ? { access: tl.access } : {}),
                     summary: String(tl?.summary || '').slice(0, 240),
                     ...(typeof tl?.digest === 'string' && tl.digest ? { digest: tl.digest.slice(0, 600) } : {}),
                   })),
@@ -2976,6 +2981,7 @@ export const server = http.createServer(async (req, res) => {
         const activeId = typeof raw?.activeId === 'string' && seen.has(raw.activeId)
           ? raw.activeId : (threads[0]?.id || '');
         boundSavedCodeAttachments(threads, activeId);
+        boundSavedEvidence(threads, activeId);
         return { activeId, threads };
       };
       if (req.method === 'POST') {
@@ -4456,6 +4462,7 @@ export const server = http.createServer(async (req, res) => {
               ok: true,
               id: src.id,
               name: src.name,
+              traceVersion: src.traceVersion,
               file: src.file,
               startLine: src.startLine,
               endLine: kept.length ? src.startLine + kept.length - 1 : src.startLine,
@@ -4504,6 +4511,7 @@ export const server = http.createServer(async (req, res) => {
               startLine: src.startLine,
               endLine: src.endLine,
               totalLines: src.totalLines,
+              traceVersion: src.traceVersion,
               truncated: Boolean(src.truncated),
               sourceEncoding: src.sourceEncoding,
               source: src.source,
@@ -5975,6 +5983,7 @@ export const server = http.createServer(async (req, res) => {
         ]);
         const context = {
           language: p.language,
+          accessMode,
           projectName: PROJECT.name,
           fnCount: MODEL.functions?.length || 0,
           varCount: MODEL.variables?.length || 0,

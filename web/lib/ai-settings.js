@@ -5,6 +5,7 @@
  * 3. 外部 MCP：保留原有三档权限控制、一键复制 CC 命令与精简指令。
  */
 import { applyI18n, getLang, t } from '../i18n.js';
+import { boundSavedEvidence, sourceEvidence } from './ai-source-evidence.js';
 import { boundSavedCodeAttachments, MAX_CODE_ATTACHMENTS, sanitizeCodeAttachments } from './ai-code-attachments.js';
 import { api, clientId } from './api.js';
 import { focusBox, stopCamAnim } from './camera.js';
@@ -346,6 +347,7 @@ function persistChats(projectId = chatProjectId) {
     messages: (th.messages || []).slice(-80).map(({ attachedImages, ...rest }) => rest),
   }));
   boundSavedCodeAttachments(threads, activeChatId);
+  boundSavedEvidence(threads, activeChatId);
   const payload = { projectId, activeId: activeChatId, threads };
   void api.saveAiChats(payload).catch(error => {
     if (projectId === chatProjectId && mutation === chatMutation) {
@@ -614,7 +616,22 @@ function acceptGhostSuggestion() {
   return true;
 }
 
+let composerAccess = 'edit';
+const accessBtn = document.getElementById('aiAccessMode');
+function renderAccess() {
+  const restored = restoredTurn?.threadId === activeChatId && restoredTurn?.projectId === chatProjectId ? restoredTurn : null;
+  const readOnly = (restored?.accessMode || composerAccess) === 'read';
+  accessBtn.disabled = Boolean(restored);
+  accessBtn.textContent = t(readOnly ? 'ai.access.read' : 'ai.access.edit');
+  accessBtn.setAttribute('aria-pressed', String(readOnly));
+}
+accessBtn.addEventListener('click', () => {
+  composerAccess = composerAccess === 'read' ? 'edit' : 'read';
+  renderAccess();
+});
+
 function updateChatControls() {
+  renderAccess();
   const streaming = Boolean(activeAbort);
   sendBtn.disabled = Boolean(compacting);
   sendBtn.textContent = streaming ? t('ai.steer') : t('ai.send');
@@ -716,18 +733,32 @@ function parseTableAlignRow(line) {
   return aligns;
 }
 
-function formatAssistantText(text) {
+function citation(text, evidence) {
+  const match = /^(.*):L?(\d+)$/.exec(text);
+  if (!match) return null;
+  const line = Number(match[2]);
+  const matches = evidence.filter(item => item.file === match[1] && line >= item.startLine && line <= item.endLine);
+  if (!matches.length || matches.some(item => item.traceVersion !== matches[0].traceVersion ||
+      item.source.split('\n')[line - item.startLine] !== matches[0].source.split('\n')[line - matches[0].startLine])) return null;
+  return `<button type="button" class="ai-sym-link" data-source-index="${evidence.indexOf(matches[0])}" data-source-line="${line}">${esc(text)}</button>`;
+}
+
+function formatAssistantText(text, evidence = []) {
+  const prose = part => part.split(/([\p{L}\p{N}_.+/-]+:L?\d+)/gu)
+    .map((word, i) => i % 2 ? citation(word, evidence) || esc(word) : esc(word)).join('');
   const inline = (line) => line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, index) => {
-    if (index % 2 === 0) return esc(part);
+    if (index % 2 === 0) return prose(part);
     if (part.startsWith('`')) {
       const inner = part.slice(1, -1);
+      const source = citation(inner, evidence);
+      if (source) return source;
       if (isClickableSymbolToken(inner)) {
         const clean = inner.trim().replace(/\(\s*\)$/, '');
         return `<button type="button" class="ai-sym-link" data-ai-sym="${esc(clean)}" title="${esc(t('ai.symbolLocate', { name: clean }))}">${esc(inner)}</button>`;
       }
       return `<code>${esc(inner)}</code>`;
     }
-    return `<strong>${esc(part.slice(2, -2))}</strong>`;
+    return `<strong>${prose(part.slice(2, -2))}</strong>`;
   }).join('');
   const lines = String(text || '').replace(/\r\n?/g, '\n')
     .replace(/^\s*\n+/, '').replace(/\n+\s*$/, '').replace(/\n{3,}/g, '\n\n').split('\n');
@@ -1779,10 +1810,41 @@ function ensureInvestigateContainer(box, before, collapsed = false) {
   return { inv, summary: inv.querySelector('summary'), steps: inv.querySelector('.ai-steps') };
 }
 
-function updateInvestigateSummary(inv, count, running = false) {
+function renderEvidence(box, evidence) {
+  if (!evidence?.length) return;
+  let list = box.querySelector('.ai-source-list');
+  if (!list) {
+    list = document.createElement('div');
+    list.className = 'ai-source-list';
+    box.querySelector('.ai-msg-text').after(list);
+  }
+  // Receipts are appended in tool order. Keep an opened source excerpt and its focus.
+  for (const item of evidence.slice(list.children.length)) {
+    const block = document.createElement('details');
+    const label = document.createElement('summary');
+    label.textContent = `${item.file}:${item.startLine}–${item.endLine}${item.traceVersion ? ' [' + item.traceVersion + ']' : ''}`;
+    label.title = t('ai.sourceRead');
+    const pre = document.createElement('pre');
+    item.source.split('\n').forEach((line, i) => {
+      const row = document.createElement('span');
+      row.dataset.line = item.startLine + i;
+      row.tabIndex = -1;
+      row.textContent = `${item.startLine + i}  ${line}`;
+      pre.append(row);
+    });
+    block.append(label, pre);
+    list.append(block);
+  }
+}
+
+function updateInvestigateSummary(inv, tools = [], running = false) {
   const summary = inv?.querySelector('summary');
   if (!summary) return;
-  summary.textContent = running ? t('ai.toolsRunning', { count }) : t('ai.toolsDone', { count });
+  const counts = { read: 0, edit: 0, failed: 0, other: 0 };
+  for (const tool of tools) counts[tool.ok === false ? 'failed' : tool.access || 'other']++;
+  const parts = Object.entries(counts).filter(([, n]) => n).map(([key, n]) => t('ai.tools.' + key, { n }));
+  if (running) parts.push(t('ai.tools.active'));
+  summary.textContent = parts.join(' · ') || t('ai.investigation');
 }
 
 function renderSubagentCards(box, subagents, before = null) {
@@ -2160,15 +2222,17 @@ function renderThreadMessages({ preserveStatus = false } = {}) {
         for (const tl of m.tools) {
           finishStep(addStep(steps, tl.name), tl);
         }
-        updateInvestigateSummary(inv, m.tools.length, false);
+        updateInvestigateSummary(inv, m.tools, false);
       }
       if (Array.isArray(m.subagents) && m.subagents.length) {
-        renderSubagentCards(box, m.subagents);
+        const { inv } = ensureInvestigateContainer(box, null, true);
+        renderSubagentCards(inv, m.subagents);
       }
       const txt = document.createElement('div');
       txt.className = 'ai-msg-text';
-      txt.innerHTML = formatAssistantText(m.text);
-      box.appendChild(txt);
+      txt.innerHTML = formatAssistantText(m.text, m.evidence);
+      box.prepend(txt);
+      renderEvidence(box, m.evidence);
       showThinking(box, txt, m.thinking, m.thinkingSeconds);
       if (Array.isArray(m.chains) && m.chains.length) renderChainCards(box, m.chains);
       if (m.presentation) renderPresCard(box, m.presentation);
@@ -2506,7 +2570,7 @@ function createAssistantBox() {
   if (messagesEl.querySelector('.empty')) messagesEl.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'ai-msg assistant';
-  box.innerHTML = '<details class="ai-investigate" hidden><summary></summary><div class="ai-steps"></div></details><div class="ai-msg-text"></div>';
+  box.innerHTML = '<div class="ai-msg-text"></div><details class="ai-investigate" hidden><summary></summary><div class="ai-steps"></div></details>';
   box.querySelector('summary').textContent = t('ai.investigation');
   box.querySelector('.ai-msg-text').textContent = t('ai.connecting');
   messagesEl.appendChild(box);
@@ -2534,7 +2598,8 @@ function finishStep(row, tool) {
   const cls = tool.ok !== false ? 'ok' : (tool.blocked ? 'blocked' : 'err');
   row.classList.add(cls);
   const head = row.querySelector('.ai-step-head');
-  head.textContent = head.title = tool.blocked ? t('ai.toolPending', { name: tool.name }) : tool.name;
+  const label = tool.blocked ? t('ai.toolPending', { name: tool.name }) : tool.name;
+  head.textContent = head.title = [label, tool.target].filter(Boolean).join(' · ');
   if (tool.summary) {
     const result = document.createElement('div');
     result.className = 'ai-step-result';
@@ -2638,7 +2703,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
   const restoring = !options.original && restoredTurn?.projectId === chatProjectId &&
     restoredTurn?.threadId === activeChatId ? restoredTurn : null;
   if (restoring && (!restoring.retryOf || (rawText ?? inputEl.value).trim() === restoring.draft)) options = { ...restoring, ...options };
-  const accessMode = options.accessMode ?? 'edit';
+  const accessMode = options.accessMode ?? composerAccess;
   const rawInput = String(rawText ?? inputEl.value).trim();
   if (!rawInput) return;
   closeSlashMenu();
@@ -2667,7 +2732,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       return;
     }
     if (accessMode === 'read') {
-      setChatStatus(() => t('ai.recovery.readDraft'), true);
+      setChatStatus(() => t('ai.access.read'), true);
       return;
     }
     await saveViewBookmark(rawInput.slice(BOOKMARK_COMMAND.length).trim());
@@ -2784,6 +2849,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
   let streamedText = '';
   let metrics;
   const collectedTools = [];
+  let evidence = [];
   const collectedSubagents = [];
   const collectedChains = [];
   let collectedPresentation = null;
@@ -2816,7 +2882,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
     }
     if (dirtyText) {
       dirtyText = false;
-      ui.text.innerHTML = formatAssistantText(streamedText);
+      ui.text.innerHTML = formatAssistantText(streamedText, evidence);
     }
     if (dirtyMetrics) {
       dirtyMetrics = false;
@@ -2859,6 +2925,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       thinkingSeconds,
       tools,
       metrics,
+      ...(evidence.length ? { evidence } : {}),
       ...entry,
     });
     if (metrics) thread.metrics = metrics;
@@ -2877,12 +2944,15 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
   let recoveryLookup;
   const finishInterrupted = (message, stopped = false) => {
     stopThinking();
-    for (const { row, name } of pendingSteps) {
-      finishStep(row, { name, ok: false, summary: t('ai.interrupted') });
+    for (const { row, name, target } of pendingSteps) {
+      const step = { name, target, ok: false, summary: t('ai.interrupted') };
+      collectedTools.push(step);
+      finishStep(row, step);
     }
+    updateInvestigateSummary(ui.investigate, collectedTools);
     const partial = Boolean(collectedTools.length || streamedText);
     const recovering = readTurnStatus(turnId, threadId);
-    if (partial) ui.text.innerHTML = formatAssistantText(streamedText);
+    if (partial) ui.text.innerHTML = formatAssistantText(streamedText, evidence);
     else ui.text.textContent = message;
     recoveryLookup = recovering.then(status => {
       if (!isCurrent()) return;
@@ -2941,44 +3011,39 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       dirtyScroll = true;
       scheduleStreamPaint();
     } else if (ev.type === 'fallback') {
+      ui.investigate.hidden = false;
       addStep(ui.steps, `↻ ${ev.text}`);
-      dirtyScroll = true;
-      scheduleStreamPaint();
     } else if (ev.type === 'tool_start') {
       if (thinkingSince !== null) stopThinking();
-      if (ui.investigate) { ui.investigate.hidden = false; ui.investigate.open = true; }
-      const argBrief = ev.arguments && Object.keys(ev.arguments).length
-        ? `(${JSON.stringify(ev.arguments).slice(0, 80)})` : '';
-      pendingSteps.push({ callId: ev.callId, name: ev.name, row: addStep(ui.steps, `${ev.name}${argBrief}…`) });
-      updateInvestigateSummary(ui.investigate, collectedTools.length + pendingSteps.length, true);
-      dirtyScroll = true;
-      scheduleStreamPaint();
+      if (ui.investigate) ui.investigate.hidden = false;
+      const target = typeof ev.target === 'string' ? ev.target : '';
+      pendingSteps.push({ callId: ev.callId, name: ev.name, target,
+        row: addStep(ui.steps, [ev.name, target].filter(Boolean).join(' · ')) });
+      updateInvestigateSummary(ui.investigate, collectedTools, true);
     } else if (ev.type === 'tool_end') {
-      const tool = { name: ev.name, ok: ev.ok !== false, ...(ev.blocked ? { blocked: true } : {}), summary: ev.summary || '', digest: ev.digest || '' };
+      const tool = { name: ev.name, target: ev.target, access: ev.access, ok: ev.ok !== false, ...(ev.blocked ? { blocked: true } : {}), summary: ev.summary || '', digest: ev.digest || '' };
       collectedTools.push(tool);
       const index = ev.callId
         ? pendingSteps.findIndex((step) => step.callId === ev.callId)
         : pendingSteps.findIndex((step) => step.name === tool.name);
       const row = index >= 0 ? pendingSteps.splice(index, 1)[0].row : addStep(ui.steps, tool.name);
       finishStep(row, tool);
-      updateInvestigateSummary(ui.investigate, collectedTools.length, pendingSteps.length > 0);
-      dirtyScroll = true;
-      scheduleStreamPaint();
+      updateInvestigateSummary(ui.investigate, collectedTools, pendingSteps.length > 0);
+      if (ev.evidence?.length) {
+        evidence = sourceEvidence([...evidence, ...ev.evidence]);
+        renderEvidence(ui.box, evidence);
+      }
     } else if (ev.type === 'subagent_start') {
       collectedSubagents.push({ id: ev.id, title: ev.title, running: true, steps: 0, summary: '' });
-      renderSubagentCards(ui.box, collectedSubagents, ui.text);
-      dirtyScroll = true;
-      scheduleStreamPaint();
+      renderSubagentCards(ui.investigate, collectedSubagents);
     } else if (ev.type === 'subagent_progress') {
       const sa = collectedSubagents.find((s) => s.id === ev.id);
       if (sa) {
         sa.steps = (sa.steps || 0) + 1;
         sa.lastTool = ev.tool;
         sa.lastSummary = ev.summary;
-        renderSubagentCards(ui.box, collectedSubagents, ui.text);
+        renderSubagentCards(ui.investigate, collectedSubagents);
       }
-      dirtyScroll = true;
-      scheduleStreamPaint();
     } else if (ev.type === 'subagent_end') {
       const sa = collectedSubagents.find((s) => s.id === ev.id);
       if (sa) {
@@ -2986,10 +3051,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
         sa.ok = ev.ok !== false;
         sa.summary = ev.summary || '';
         sa.steps = ev.steps ?? sa.steps;
-        renderSubagentCards(ui.box, collectedSubagents, ui.text);
+        renderSubagentCards(ui.investigate, collectedSubagents);
       }
-      dirtyScroll = true;
-      scheduleStreamPaint();
     } else if (ev.type === 'chains' && Array.isArray(ev.chains)) {
       for (const ch of ev.chains) {
         if (ch && !collectedChains.some((x) => x.id === ch.id)) collectedChains.push(ch);
@@ -3032,13 +3095,12 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
       metrics = ev.metrics || metrics;
       stopThinking();
       if (ui.investigate) {
-        ui.investigate.open = false;
-        updateInvestigateSummary(ui.investigate, collectedTools.length || ev.toolLog?.length || 0, false);
+        updateInvestigateSummary(ui.investigate, collectedTools.length ? collectedTools : ev.toolLog, false);
         ui.investigate.hidden = !(collectedTools.length || ev.toolLog?.length);
       }
       const entry = {};
       if (Array.isArray(ev.toolLog) && ev.toolLog.length) {
-        entry.tools = ev.toolLog.map(({ name, ok, blocked, summary, digest }) => ({ name, ok, ...(blocked ? { blocked: true } : {}), summary, digest }));
+        entry.tools = ev.toolLog.map(({ name, ok, blocked, target, access, summary, digest }) => ({ name, target, access, ok, ...(blocked ? { blocked: true } : {}), summary, digest }));
       }
       const finalChains = Array.isArray(ev.chains) && ev.chains.length ? ev.chains : collectedChains;
       if (finalChains.length) entry.chains = finalChains;
@@ -3061,7 +3123,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext(), options = {})
         const suggestions = sanitizeSuggestions(ev.suggestions);
         if (suggestions.length) entry.suggestions = suggestions;
       }
-      ui.text.innerHTML = formatAssistantText(entry.text);
+      ui.text.innerHTML = formatAssistantText(entry.text, evidence);
       if (finalChangeset?.id) renderChangesetUndo(ui.box, finalChangeset);
       const saved = commitAssistantMsg(entry);
       if (saved && isVisible()) {
@@ -3473,6 +3535,19 @@ if (inputShellEl) {
   });
 }
 messagesEl.addEventListener('click', (event) => {
+  const link = event.target.closest('button[data-source-index]');
+  if (link) {
+    const block = link.closest('.ai-msg').querySelector('.ai-source-list')?.children[Number(link.dataset.sourceIndex)];
+    const line = block?.querySelector('[data-line="' + Number(link.dataset.sourceLine) + '"]');
+    if (line) {
+      block.open = true;
+      block.querySelector('[aria-current]')?.removeAttribute('aria-current');
+      line.setAttribute('aria-current', 'location');
+      line.focus({ preventScroll: true });
+      line.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    return;
+  }
   const symBtn = event.target?.closest?.('.ai-sym-link[data-ai-sym]');
   if (!symBtn) return;
   locateSymbolFromChat(symBtn.dataset.aiSym);
@@ -3640,6 +3715,7 @@ if (inputEl) {
   inputEl.addEventListener('input', () => {
     if (restoredTurn && (!inputEl.value || (restoredTurn.retryOf && inputEl.value.trim() !== restoredTurn.draft))) {
       restoredTurn = null;
+      renderAccess();
     }
     syncInputSuggestion();
     updateAutocompletePopover();
