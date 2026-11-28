@@ -2,7 +2,7 @@ import { children, constIndexValue, fnRef, initializer, initializerMembers, poin
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
-function relativeSlot(prefix, slot) {
+export function relativeSlot(prefix, slot) {
   if (!prefix) return { rest: slot, covers: true };
   const left = parts(prefix), right = parts(slot);
   let covers = true;
@@ -55,6 +55,18 @@ function argumentSlot(base, write) {
   return slot == null ? null : slot + write.slot.slice(write.slot.indexOf(']') + 1);
 }
 
+// 全局存储键是编译单元解析后的 ID；块内 static 以声明节点区分同名实例。
+export const hasStaticStorage = key => typeof key === 'string' || (key?.kind === 'VarDecl' && key.storageClass === 'static');
+
+// 将形参来源投影回一个已知调用点。指向对象的来源只接受可以确认的实参地址。
+export function argumentSource(callee, call, parameter) {
+  const formals = children(callee?.node).filter(n => n.kind === 'ParmVarDecl');
+  const index = formals.indexOf(parameter.decl);
+  const arg = unwrap(call && index >= 0 && children(call)[index + 1]);
+  if (!parameter.pointee) return arg;
+  return arg?.kind === 'UnaryOperator' && arg.opcode === '&' ? children(arg)[0] : null;
+}
+
 const isCase = node => node?.kind === 'CaseStmt' || node?.kind === 'DefaultStmt';
 // 内层 switch 的标签只从该 switch 进入，外层 case 则可能跳进将被略过的语句。
 function hasCaseEntry(node) {
@@ -62,9 +74,14 @@ function hasCaseEntry(node) {
 }
 
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值，传址写入按覆盖范围合并。
-export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }) {
+export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
-  const designators = new WeakMap();
+  const designators = new WeakMap(), addressed = new Map();
+  function noteAddressWrite(key, slot, write) {
+    if (!hasStaticStorage(key)) return;
+    if (!addressed.has(key)) addressed.set(key, []);
+    addressed.get(key).push({ slot, write });
+  }
   const indirectActions = [], aliases = new Map(), rebound = new Set();
   // 同一块中无条件向前跳转时可以直接跳过中间语句。其他跳转不能依赖源码中的先后顺序。
   const forwardJumps = new Map();
@@ -149,6 +166,8 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const slot = effect ? argumentSlot(base.slot, effect) : base.region;
       if (slot == null) continue;
       const definite = effect?.replacesPointee && !conditional && addr?.kind === 'UnaryOperator' && addr.opcode === '&';
+      // 保留传址调用所在的栈帧，跨调用读取时才能把写入函数的形参绑定到实际值。
+      noteAddressWrite(base.key, slot, effect && { record, node: call, effect, aggregate: effect.aggregate });
       const entry = { slot, point, effect, call, definite };
       if (!escapes.has(base.key)) escapes.set(base.key, []);
       escapes.get(base.key).push(entry);
@@ -268,8 +287,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     } else if (node.kind === 'BinaryOperator' && node.opcode === '=') {
       const lhs = pointerExpression(children(node)[0], unit);
       const dest = objectSlot(lhs);
-      if (dest) add(dest.key, dest.slot, children(node)[1], point, true);
-      else if (lhs?.throughPointer) indirectActions.push(point);
+      if (dest) {
+        add(dest.key, dest.slot, children(node)[1], point, true);
+        if (lhs.throughPointer && writesByNode.has(node)) noteAddressWrite(dest.key, dest.slot, writesByNode.get(node));
+      } else if (lhs?.throughPointer) indirectActions.push(point);
     }
   }
   visit(record.body, new Map(), null);
@@ -314,7 +335,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return slots;
   }
 
-  function resolve(pointer, value, at, valueSlot = '') {
+  function resolve(pointer, value, at, valueSlot = '', effect = null) {
     const targets = new Set(), parameters = [];
     let budget = 512, unknown = false, uncertainLayout = false;
     function merge(result) {
@@ -360,18 +381,16 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         unknown = true;
       }
     }
-    function evaluateWrite(effect, rest, call, point, depth) {
-      const result = writeValue(effect, rest);
+    function evaluateResult(result, callee, call, point, depth) {
       merge(result);
-      if (!result.parameters.length) return;
-      const formals = children(effect.record.node).filter(n => n.kind === 'ParmVarDecl');
-      for (const { decl, slot, pointee } of result.parameters) {
-        const index = formals.indexOf(decl);
-        const arg = unwrap(call && index >= 0 && children(call)[index + 1]);
-        if (arg && !pointee) evaluate(arg, slot, point, depth + 1);
-        else if (pointee && arg?.kind === 'UnaryOperator' && arg.opcode === '&') evaluate(children(arg)[0], slot, point, depth + 1);
+      for (const parameter of result.parameters) {
+        const arg = argumentSource(callee, call, parameter);
+        if (arg) evaluate(arg, parameter.slot, point, depth + 1);
         else unknown = true;
       }
+    }
+    function evaluateWrite(effect, rest, call, point, depth) {
+      evaluateResult(writeValue(effect, rest), effect.record, call, point, depth);
     }
     function read(source, path, at, depth, fieldId, unionId) {
       const exposed = escapes.get(source)?.filter(w => !w.effect && reaches(w.point, at) && relativeSlot(w.slot, path));
@@ -384,15 +403,11 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         else unknown = true;
       }
       function mergeInterveningCalls(since) {
-        if (typeof source !== 'string') return;
+        if (!hasStaticStorage(source)) return;
         for (const action of indirectActions) {
           if (!action.call || action === at || (since && !reaches(since, action)) || !reaches(action, at)) continue;
-          const effects = globalWritesFrom(action.call, unit, source, path);
-          unknown ||= effects.unknown;
-          uncertainLayout ||= effects.uncertainLayout;
-          for (const { write, rest } of effects.writes) {
-            evaluateWrite(write, rest, write.record === effects.direct ? action.call : null, action, depth);
-          }
+          const effects = callWrites(action.call, unit, source, path);
+          evaluateResult(effects, effects.direct, action.call, action, depth);
         }
       }
       const history = writes.get(source) || [];
@@ -432,6 +447,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     }
     if (!at) return { targets: [], parameters: [], unknown: true };
     if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId, pointer.unionId);
+    else if (effect) evaluateWrite(effect, valueSlot, at.call, at, 0);
     else evaluate(value, valueSlot, at, 0);
     return { targets: [...targets], unknown, uncertainLayout, parameters };
   }
@@ -439,9 +455,9 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     calls: indirectActions.filter(p => p.call).map(p => p.call),
     isEvaluated: node => points.has(node),
     *addressWrites(key, slot) {
-      for (const entry of escapes.get(key) || []) {
-        const match = entry.effect ? writeProjection(entry.effect, entry.slot, slot) : relativeSlot(entry.slot, slot);
-        if (match) yield { write: entry.effect, rest: match.rest };
+      for (const { slot: prefix, write } of addressed.get(key) || []) {
+        const match = write ? writeProjection(write, prefix, slot) : relativeSlot(prefix, slot);
+        if (match) yield { write, rest: match.rest };
       }
     },
     atCall(pointer, call) {
@@ -452,6 +468,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       return src.throughPointer || changed || escaped ? resolve(src, null, at) : null;
     },
     atAssignment(write, slot) {
+      if (write.effect) return resolve(null, null, points.get(write.node), slot, write.effect);
       const value = unwrap(write.value);
       // 在单条 *dst = *src 里，源成员来自调用者传入的对象，缓存中只保存形参和路径。
       if (slot && write.replacesPointee && value?.kind === 'UnaryOperator' && value.opcode === '*') {

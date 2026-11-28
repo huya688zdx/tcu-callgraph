@@ -854,3 +854,100 @@ void indirect(void) { Ops local={first}; parameter(&local); local.run(); }`);
     without_prior: [['first','third']], copy_ambient: [['first','third']], shadow: [['first']], indirect: [['other']],
   }));
 });
+
+test('Clang 跨调用按存储期追踪回调，局部 static 递归保留真实写入', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run, keep; } Ops;
+int observed;
+void first(void) { observed=observed*10+1; } void second(void) { observed=observed*10+2; }
+void third(void) { observed=observed*10+3; } void foreign(void) { observed=observed*10+4; }
+void put(Fn *p, Fn value) { *p=value; }
+void fill(Ops *p, Fn value) { *p=(Ops){value,third}; }
+void outside(void); void unknown_store(Fn *p);
+void scalar(int n) { static Fn cb=first; cb=first; if(n){scalar(0); cb();} else cb=second; }
+void aggregate(int n); void middle(void) { aggregate(0); }
+void aggregate(int n) { static Ops rows[2]={{first,third},{foreign,third}};
+  rows[0].run=first; if(n){middle(); rows[0].run(); rows[0].keep(); rows[1].run();}
+  else rows[0]=(Ops){second,third}; }
+void via_arg(int n, Fn value) { static Fn cb=first; cb=first;
+  if(n){via_arg(0,second); cb();} else { Fn *alias=&cb; put(alias,value); } }
+void via_relay(int n, Fn value);
+void relay_value(Fn v) { via_relay(0,v); }
+void via_relay(int n, Fn value) { static Fn cb=first; cb=first;
+  if(n){relay_value(second); cb();} else put(&cb,value); }
+void via_record(int n) { static Ops o={first,third}; o.run=first;
+  if(n){via_record(0); o.run(); o.keep();} else fill(&o,second); }
+void alias_write(int n) { static Fn cb=first; Fn *alias=&cb; cb=first;
+  if(n){alias_write(0); cb();} else *alias=second; }
+void previous(int read) { static Fn cb=first; if(read) cb(); else put(&cb,second); }
+void latest(int n) { static Fn cb=first; if(n){latest(0); cb=third; cb();} else cb=second; }
+void neighbor(void) { static Fn cb=first; cb=foreign; }
+void isolated(void) { static Fn cb=first; cb=first; neighbor(); cb(); }
+void private_only(void) { static Fn cb=first; cb=first; outside(); cb(); }
+void leaked(void) { static Fn cb=first; cb=first; unknown_store(&cb); cb(); }
+void automatic(int n) { Fn cb=first; if(n){automatic(0); cb();} else cb=second; }
+void auto_alias(void) { Fn cb=first; put(&cb,second); cb(); }
+static Ops published={first,third}; Fn *handle=&published.run;
+static Ops measured={first,third}; const int width=sizeof(&measured.run);
+void measured_only(void) { measured.run=first; outside(); measured.run(); }
+static Fn const fixed[]={first}; Fn const *view=fixed;
+void immutable(void) { fixed[0](); }
+void publish_call(void) { published.run=first; published.keep=third; outside(); published.run(); published.keep(); }
+Fn shared=first; void other_unit(void);
+void external_direct(void) { shared=first; other_unit(); shared(); }
+void external_prior(void) { shared(); }`);
+  fs.writeFileSync(path.join(root, 'other.c'), `typedef void (*Fn)(void);
+extern Fn shared; void put(Fn *,Fn); void second(void);
+void other_unit(void) { put(&shared,second); }`);
+  const updated = { required: ['second'], allowed: ['first','second'] };
+  await checkCallbackFlow(t, root, policy => ({
+    scalar: [updated], aggregate: [updated, ['third'], ['foreign']],
+    via_arg: [updated], via_relay: [updated], via_record: [updated, ['third']], alias_write: [updated],
+    previous: [['first','second']], latest: [['third']], isolated: [['first']], private_only: [['first']],
+    leaked: [policy === 'expand' ? { required: ['foreign'], allowed: ['first','second','third','foreign'] } : ['first']],
+    publish_call: [policy === 'expand' ? { required: ['foreign'], allowed: ['first','second','third','foreign'] } : ['first'], ['third']],
+    measured_only: [['first']], automatic: [['first']], auto_alias: [updated], external_direct: [updated], external_prior: [['first','second']],
+  }));
+  for (const policy of ['strict','expand']) await t.test(policy + ' immutable', async () => {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const edges = model.edges.filter(e => e.from === 'main.c::immutable' && e.kind === 'fnptr');
+    assert.deepEqual(edges.map(e => [e.callee,e.resolution]), [['first','exact']]);
+  });
+});
+
+test('Clang 跨调用按存储期隔离同一头文件的静态对象', requiresClang, async t => {
+  const unit = (init, next, entry) => `#define INITIAL ${init}
+#define NEXT ${next}
+#include "callbacks.h"
+void ${entry}(void) { local_step(1); file_step(1); }`;
+  const root = project(t, unit('a0', 'a1', 'entry_a'));
+  fs.writeFileSync(path.join(root, 'other.c'), unit('b0', 'b1', 'entry_b'));
+  fs.writeFileSync(path.join(root, 'callbacks.h'), `typedef void (*Fn)(void);
+void a0(void); void a1(void); void b0(void); void b1(void); void put(Fn *, Fn);
+static Fn cell=INITIAL;
+static void file_step(int n) { cell=INITIAL; if(n){file_step(0); cell();} else cell=NEXT; }
+static void local_step(int n) { static Fn cell=INITIAL; cell=INITIAL;
+  if(n){local_step(0); cell();} else put(&cell,NEXT); }`);
+  fs.writeFileSync(path.join(root, 'values.c'), `typedef void (*Fn)(void);
+void a0(void) {} void a1(void) {} void b0(void) {} void b1(void) {}
+void put(Fn *p, Fn value) { *p=value; }`);
+  for (const policy of ['strict','expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const name of ['local_step','file_step']) await t.test(policy + ' ' + name, () => {
+      const caller = 'callbacks.h::' + name;
+      const sites = model.indirectCalls.filter(s => s.caller === caller);
+      assert.deepEqual(sites.map(s => s.translationUnit).sort(), ['main.c','other.c']);
+      for (const site of sites) {
+        const prefix = site.translationUnit === 'main.c' ? 'a' : 'b';
+        const names = site.candidates.map(c => c.name);
+        assert.ok(names.includes(prefix + '1'), site.translationUnit + ' ' + names);
+        assert.ok(names.every(n => n === prefix + '0' || n === prefix + '1'), site.translationUnit + ' ' + names);
+        assert.equal(site.resolution, policy === 'expand' ? 'possible' : 'unresolved');
+      }
+      const edges = model.edges.filter(e => e.from === caller && e.kind === 'fnptr');
+      assert.ok(edges.every(e => e.resolution === 'possible'));
+      assert.deepEqual(new Set(edges.map(e => e.callee)),
+        new Set(policy === 'expand' ? sites.flatMap(s => s.candidates.map(c => c.name)) : []));
+    });
+  }
+});

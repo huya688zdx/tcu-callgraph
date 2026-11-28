@@ -38,7 +38,7 @@ export function clangCacheKey(root, options, status) {
   const file = findCompileCommands(root, options.compileCommandsPath);
   const st = file && fs.statSync(file, { throwIfNoEntry: false });
   return JSON.stringify([
-    'clang-ast', 'v20', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
+    'clang-ast', 'v21', root, status.bin, status.version, file, st?.mtimeMs, st?.size,
     Boolean(options.strictCompileCommands), options.buildProfileId || null,
     options.dispatchPolicy === 'strict' ? 'strict' : 'expand',
   ]);
