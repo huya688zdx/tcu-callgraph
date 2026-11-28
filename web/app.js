@@ -1091,7 +1091,25 @@ document.addEventListener('click', (event) => {
   }
 });
 for (const menu of toolMenus) {
-  menu.querySelector('summary').addEventListener('click', () => {
+  const trigger = menu.querySelector('summary');
+  const popover = menu.querySelector('.tool-popover');
+  // 按按钮的视口坐标定位，避开顶栏滚动容器的裁剪。
+  const positionPopover = () => {
+    if (!menu.open) return;
+    const { left, right, bottom } = trigger.getBoundingClientRect();
+    const viewportWidth = document.documentElement.clientWidth;
+    if (right <= 0 || left >= viewportWidth) {
+      menu.open = false;
+      return;
+    }
+    const rightEdge = Math.min(right, viewportWidth - 6);
+    popover.style.left = `${Math.max(6, rightEdge - popover.offsetWidth)}px`;
+    popover.style.setProperty('--tool-popover-top', `${bottom + 7}px`);
+  };
+  menu.addEventListener('toggle', positionPopover);
+  menu.closest('.top-row').addEventListener('scroll', positionPopover);
+  window.addEventListener('resize', positionPopover);
+  trigger.addEventListener('click', () => {
     for (const other of toolMenus) if (other !== menu) other.open = false;
   });
 }

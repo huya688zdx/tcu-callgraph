@@ -149,3 +149,61 @@ export function pathEdgeColors(paths) {
   }
   return colors;
 }
+
+/**
+ * 过滤两点选中的画布展示层级：
+ * - 有直接有向路径时默认只画有向流，避免被冗长的无向折线淹没；
+ * - 无有向流但存在 2 跳以内共同关联（共同调用者/共同被调/共享变量）时柔和显示；
+ * - 无直接关系且仅有 3 跳以上间接静态拐弯路径时，默认只高亮两端点，按需再展开或单条预览。
+ */
+export function resolvePairDisplay(result, { showStatic = false, selectedPathIndex = null } = {}) {
+  const paths = Array.isArray(result?.paths) ? result.paths : [];
+  const directedPaths = paths.filter((p) => !p.mixed);
+  const staticPaths = paths.filter((p) => p.mixed);
+  const minStaticHops = staticPaths.length ? Math.min(...staticPaths.map((p) => p.steps.length)) : Infinity;
+
+  let visiblePaths = [];
+  let muted = false;
+  let showingStatic = false;
+  let hiddenStaticCount = 0;
+
+  if (Number.isInteger(selectedPathIndex) && selectedPathIndex >= 0 && paths[selectedPathIndex]) {
+    visiblePaths = [paths[selectedPathIndex]];
+    muted = Boolean(paths[selectedPathIndex].mixed);
+    showingStatic = muted;
+  } else if (directedPaths.length > 0) {
+    visiblePaths = showStatic ? paths : directedPaths;
+    showingStatic = Boolean(showStatic && staticPaths.length > 0);
+    hiddenStaticCount = showStatic ? 0 : staticPaths.length;
+  } else if (staticPaths.length > 0) {
+    muted = true;
+    if (showStatic) {
+      visiblePaths = staticPaths;
+      showingStatic = true;
+    } else if (minStaticHops <= 2) {
+      visiblePaths = staticPaths.filter((p) => p.steps.length <= 2);
+      showingStatic = true;
+      hiddenStaticCount = staticPaths.length - visiblePaths.length;
+    } else {
+      visiblePaths = [];
+      showingStatic = false;
+      hiddenStaticCount = staticPaths.length;
+    }
+  }
+
+  const edgeIndices = [...new Set(visiblePaths.flatMap((p) => p.steps.map((s) => s.edge)))];
+  const flowEdgeIndices = [...new Set(visiblePaths.filter((p) => !p.mixed).flatMap((p) => p.steps.map((s) => s.edge)))];
+  const colors = pathEdgeColors(visiblePaths);
+  return {
+    visiblePaths,
+    edgeIndices,
+    flowEdgeIndices,
+    colors,
+    directedCount: directedPaths.length,
+    staticCount: staticPaths.length,
+    hiddenStaticCount,
+    showingStatic,
+    muted,
+    minStaticHops,
+  };
+}

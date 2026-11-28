@@ -182,7 +182,7 @@ export function drawEdgeLabels(ctx, view, { onAnimatedBox, focusedEdges, visible
       ? state.multiSelection.labels.has(key)
       : state.selectedLabel === key;
     ctx.save();
-    if (focusedEdges?.size && !focusedEdges.has(edge)) ctx.globalAlpha = 0.22;
+    if (focusedEdges && !focusedEdges.has(edge)) ctx.globalAlpha = 0.22;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const cx = rect.x + rect.w / 2;
