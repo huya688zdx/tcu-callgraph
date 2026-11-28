@@ -495,13 +495,22 @@ function draw({ geometryUnchanged = false } = {}) {
   const focusedEdge = state.selectedEdge && edgeKey(state.selectedEdge) === focusedKey && v.edges.includes(state.selectedEdge)
     ? state.selectedEdge : focusedKey ? v.edges.find((e) => edgeKey(e) === focusedKey) : null;
   const trace = state.pairFlow?.result;
-  const tracedColors = new Map((trace?.edgeIndices || []).map(index => [v.edges[index], state.pairFlow.colors.get(index)]));
+  const pairDisplay = state.pairFlow?.display;
+  const tracedEdgesList = pairDisplay ? pairDisplay.edgeIndices : (trace?.edgeIndices || []);
+  const tracedFlowList = pairDisplay ? pairDisplay.flowEdgeIndices : (trace?.flowEdgeIndices || []);
+  const tracedColorsMap = state.pairFlow?.colors || new Map();
+  const tracedMuted = Boolean(pairDisplay?.muted);
+  const pairIds = state.pairFlow?.ids || [];
+  const pairTwoSelected = pairIds.length === 2;
+  const tracedColors = new Map(tracedEdgesList.map(index => [v.edges[index], tracedColorsMap.get(index)]));
   const tracedEdges = new Set(tracedColors.keys());
-  const flowingEdges = new Set((trace?.flowEdgeIndices || []).map(index => v.edges[index]));
+  const flowingEdges = new Set(tracedFlowList.map(index => v.edges[index]));
   const focusedEdges = new Set(tracedEdges.size ? tracedEdges : state.multiSelection?.trunk ? state.multiSelection.hits
     : state.multiSelection?.edges
     ? v.edges.filter((e) => state.multiSelection.edges.has(edgeKey(e))) : focusedEdge ? [focusedEdge] : []);
-  const focusedNodes = focusedEdges.size ? new Set([...focusedEdges].flatMap((e) => [e.from, e.to])) : null;
+  const focusedNodeIds = new Set([...focusedEdges].flatMap((e) => [e.from, e.to]));
+  if (pairTwoSelected) for (const id of pairIds) focusedNodeIds.add(id);
+  const focusedNodes = focusedNodeIds.size ? focusedNodeIds : null;
   const trunkHits = state.trunkHits;
   const trunkNodes = trunkHits?.length > 1 && trunkHits.includes(focusedEdge)
     ? new Set(trunkHits.flatMap((e) => [e.from, e.to])) : null;
@@ -536,7 +545,7 @@ function draw({ geometryUnchanged = false } = {}) {
   for (const c of v.containers || []) if (groupVisible(c)) drawContainer(ctx, c, !!(activeBoxes && !c.root && !activeBoxes.has(c.id)));
   for (const g of v.groups || []) if (groupVisible(g)) drawGroup(ctx, g, !!(activeBoxes && !activeBoxes.has(g.id)));
 
-  const dim = Boolean(focusedEdges.size || state.selected || selectedNodes?.size);
+  const dim = Boolean(focusedEdges.size || pairTwoSelected || state.selected || selectedNodes?.size);
   const hoverRel = relations ? state.hoverRelation : null;
   const matchesHover = (e, role) => {
     if (!hoverRel) return false;
@@ -575,7 +584,7 @@ function draw({ geometryUnchanged = false } = {}) {
   for (const e of focusedEdges) {
     if (!pathVisible(edgePoints(e), area)) continue;
     const animated = tracedEdges.has(e) ? flowingEdges.has(e) : !state.multiSelection?.edges || state.multiSelection.trunk || e === focusedEdge;
-    drawEdge(ctx, e, false, true, tracedColors.get(e), animated);
+    drawEdge(ctx, e, false, true, tracedColors.get(e), animated, false, tracedEdges.has(e) && tracedMuted ? { mutedTrace: true } : null);
   }
   for (const e of aiEdges) {
     const ek = edgeKey(e);
@@ -624,18 +633,10 @@ function draw({ geometryUnchanged = false } = {}) {
   for (const n of v.nodes) {
     if (boxVisible(n, area)) drawNode(ctx, n, nb, focusedNodes, relations?.nodeRoles || null, trunkNodes?.has(n.id), aiCtx);
   }
-  for (const [index, id] of (state.pairFlow?.ids || []).entries()) {
-    const node = v.nodes.find(n => n.id === id);
-    if (!node || !boxVisible(node, area)) continue;
-    const gap = 5 / cam.k;
-    recordBoxEffect({ x: node.x - gap, y: node.y - gap, w: node.w + gap * 2, h: node.h + gap * 2 },
-      [6 / cam.k, 4 / cam.k], 2.5 / cam.k, 10, '#7C3AED');
-    ctx.save(); ctx.fillStyle = '#7C3AED'; ctx.font = `bold ${12 / cam.k}px ${FONT}`;
-    ctx.textAlign = 'left'; ctx.fillText(String(index + 1), node.x + 4 / cam.k, node.y - 9 / cam.k); ctx.restore();
-  }
 
   // 连线标签画在节点之后：标签本身已经避开节点，压在最上层更不容易被线穿花
   const activeLabelEdges = tracedEdges.size ? tracedEdges
+    : pairTwoSelected ? new Set()
     : focusedEdges.size ? focusedEdges
     : relations?.edgeRoles.size ? new Set(relations.edgeRoles.keys())
     : selectedNodes?.size ? new Set([...related, ...emphasized])
@@ -867,11 +868,12 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     ctx.lineWidth = Math.max(4.5, 3 / cam.k);
     stroke();
   }
+  const mutedTrace = Boolean(relationMeta?.mutedTrace);
   if (traceColor || selected) {
-    // 选中和路径追踪着色在外圈，保留线芯和箭头的变更状态。
-    ctx.strokeStyle = traceColor || hexToRgba(SELECTED_EDGE_COLOR, 0.54);
-    ctx.lineWidth = (traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
-    ctx.globalAlpha = traceColor ? 0.9 : 1;
+    // 选中和路径追踪着色在外圈，保留线芯和箭头的变更状态；静态间接关联改用低饱和细晕。
+    ctx.strokeStyle = mutedTrace ? hexToRgba(traceColor, 0.24) : (traceColor || hexToRgba(SELECTED_EDGE_COLOR, 0.54));
+    ctx.lineWidth = (mutedTrace ? 4 : traceColor ? 6 : 5.5) * Math.min(1, 1 / cam.k);
+    ctx.globalAlpha = mutedTrace ? 1 : traceColor ? 0.9 : 1;
     stroke();
   } else if (hasRole) {
     ctx.strokeStyle = hexToRgba(roleColor, 0.58);
@@ -881,11 +883,11 @@ function drawEdge(ctx, e, related, selected, traceColor = null, animated = true,
     stroke();
   }
 
-  ctx.strokeStyle = color;
-  ctx.lineWidth = traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.5
+  ctx.strokeStyle = mutedTrace && traceColor ? traceColor : color;
+  ctx.lineWidth = mutedTrace ? 1.9 * Math.min(1, 1 / cam.k) : traceColor ? 3 * Math.min(1, 1 / cam.k) : selected ? 2.5
     : hasRole ? Math.min(10, (relationMeta.emphasized ? 3.4 : 2.6) * invK)
     : related ? 2.2 : 1.4;
-  ctx.globalAlpha = relationMeta?.subdued ? 0.42 : 1;
+  ctx.globalAlpha = mutedTrace ? 0.72 : relationMeta?.subdued ? 0.42 : 1;
   stroke();
   ctx.setLineDash([]);
 
@@ -991,6 +993,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   const recentlyAdded = state.recent?.nodes.has(n.id);
   const role = !selected && nodeRoles?.get(n.id);
   const isHoverPeer = state.hoverRelation?.peerId === n.id;
+  const pairIndex = state.pairFlow?.ids?.indexOf(n.id) ?? -1;
+  const pairEndpoint = pairIndex >= 0;
   const aiActive = Boolean(aiCtx?.activeNodes?.has(n.id));
   const aiHovered = aiCtx?.hoverNodeId === n.id;
   const aiDimmed = Boolean(aiCtx?.dimOthers && !selected && !edgeRelated && !aiActive && !aiHovered);
@@ -1032,10 +1036,10 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ctx.setLineDash([]);
   }
 
-  if (aiActive || aiHovered) {
-    const aiGap = Math.min(8, 3.5 * invK);
+  if (pairEndpoint || aiActive || aiHovered) {
+    const aiGap = Math.min(8, (pairEndpoint ? 3.2 : 3.5) * invK);
     roundRect(ctx, x - aiGap, y - aiGap, w + aiGap * 2, h + aiGap * 2, rx + 3);
-    ctx.strokeStyle = hexToRgba(aiHovered ? '#6366F1' : '#7C3AED', aiHovered ? 0.24 : 0.22);
+    ctx.strokeStyle = hexToRgba(pairEndpoint ? '#7C3AED' : aiHovered ? '#6366F1' : '#7C3AED', aiHovered ? 0.24 : pairEndpoint ? 0.20 : 0.22);
     ctx.lineWidth = Math.min(8, 4.5 * invK);
     ctx.stroke();
   }
@@ -1052,6 +1056,7 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
   if (recentlyAdded) ctx.globalAlpha = 1;
   ctx.lineWidth = recentlyAdded ? 2.4
     : dropTarget ? 2.6
+    : pairEndpoint ? Math.min(5, 2.2 * invK)
     : selected || edgeRelated ? Math.min(6, 2.6 * invK)
     : aiHovered ? Math.min(6, 2.6 * invK)
     : aiActive ? Math.min(5.5, 2.2 * invK)
@@ -1062,6 +1067,8 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ? RECENT_COLOR
     : dropTarget
     ? '#639922'
+    : pairEndpoint
+    ? '#7C3AED'
     : selected || edgeRelated
     ? THEME.node.selected
     : aiHovered
@@ -1079,10 +1086,11 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     : isVar
     ? THEME.node.varBorder
     : THEME.node.border;
-  // 函数框/变量框各自的虚实线型，样式面板可调；选中时的流动虚线只在虚线开启时有效
+  // 函数框/变量框各自的虚实线型，样式面板可调；两点选中的端点改用实线外框避免双虚线打架
   const impactDash = impacted && !changed && !selected && !edgeRelated;
-  ctx.setLineDash(impactDash ? [7 * invK, 4 * invK] :
-    !accent && (isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
+  ctx.setLineDash(pairEndpoint ? []
+    : impactDash ? [7 * invK, 4 * invK]
+    : !accent && (isVar ? THEME.node.varDash : THEME.node.fnDash) ? [5, 3] : []);
   const animated = collectingEffects && selected && !state.dragNode && ((allNodes && n.id === state.selected) ||
     state.moveTarget?.kind === 'node' && state.moveTarget.item === n);
   const dash = ctx.getLineDash();
@@ -1212,6 +1220,25 @@ function drawNode(ctx, n, nb = null, focusedNodes = null, nodeRoles = null, trun
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(stepText, bx + bw / 2, by + bh / 2);
+  }
+  if (pairEndpoint && cam.k >= 0.3) {
+    const badgeText = String(pairIndex + 1);
+    const r = Math.min(h * 0.30, Math.max(7, 8 / cam.k));
+    const cxBadge = x + r + 4;
+    const cyBadge = y + r + 4;
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.arc(cxBadge, cyBadge, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#7C3AED';
+    ctx.fill();
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = Math.max(1.2, 1.4 / cam.k);
+    ctx.stroke();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = `bold ${Math.max(10, Math.round(r * 1.15))}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(badgeText, cxBadge, cyBadge + 0.5);
   }
   ctx.restore();
 }

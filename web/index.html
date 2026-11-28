@@ -18,6 +18,7 @@
   .pair-flow-bar details { margin-top:10px; }
   .pair-flow-bar summary { cursor:pointer; color:#5F5E5A; }
   .pair-flow-path { padding:10px 0; overflow-wrap:anywhere; line-height:1.8; border-bottom:1px solid #EFEEE9; }
+  .pair-flow-path.on { background: #F5F3FF; border-radius: 6px; padding-left: 6px; padding-right: 6px; }
   .pair-flow-path:last-child { border-bottom:0; padding-bottom:0; }
   .pair-flow-path strong, .pair-flow-path small { display:block; color:#888780; font-size:11px; font-weight:400; }
   .pair-flow-arrow { font-weight:700; font-size:16px; }
@@ -35,6 +36,8 @@
     grid-area: top; min-width: 0; position: relative; z-index: 30;
     background: var(--bg-surface); border-bottom: 1px solid var(--border);
   }
+  /* 展开时让菜单位于 AI 抽屉与模态遮罩之间。 */
+  header:has(.tool-menu[open]) { z-index: 46; }
   .top-row { display: flex; align-items: center; flex-wrap: nowrap; overflow-x: auto; gap: 10px; min-height: 44px; padding: 5px 12px; scrollbar-width: thin; }
   .brand { flex: 0 1 auto; max-width: 250px; min-width: 150px; font-weight: 600; font-size: 14px; }
   .brand small { display: block; margin-top: 3px; color: #888780; font-size: 11px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -98,7 +101,6 @@
   .period-warning.guarded { color: #166534; }
   .period-multi { color: #6D28D9; }
   header button:disabled { opacity: .4; cursor: default; }
-  .tool-menu { position: relative; }
   .tool-menu summary {
     display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px;
     border: 1px solid rgba(0,0,0,.16); border-radius: 8px; cursor: pointer; list-style: none; font-size: 12.5px;
@@ -113,12 +115,13 @@
   .tool-menu summary:hover, .tool-menu[open] summary { background: #E6F1FB; border-color: #B5D4F4; }
   header :focus-visible { outline: 2px solid #185FA5; outline-offset: 2px; }
   .tool-popover {
-    position: absolute; top: calc(100% + 7px); right: 0; min-width: 160px; padding: 5px;
+    position: fixed; top: var(--tool-popover-top, 50px); width: 160px; padding: 5px;
+    max-width: calc(100vw - 12px); max-height: calc(100vh - var(--tool-popover-top, 50px) - 6px); overflow: auto;
     background: #fff; border: 1px solid #DEDDD6; border-radius: 10px; box-shadow: 0 8px 24px #0000001A;
   }
   .tool-menu[open] .tool-popover { animation: popIn .16s ease; }
   .tool-popover button { display: block; width: 100%; height: 34px; border: 0; text-align: left; }
-  .help-popover { width: 290px; max-width: calc(100vw - 28px); max-height: calc(100vh - 80px); overflow-y: auto; padding: 12px 14px; }
+  .help-popover { width: 290px; padding: 12px 14px; }
   .help-popover p { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0; padding: 6px 0; font-size: 12px; }
   .help-popover p + p { border-top: 1px solid #F1EFE8; }
   .help-popover kbd { font: inherit; color: #5F5E5A; white-space: nowrap; }
@@ -1327,7 +1330,7 @@
 
   .pair-flow-float {
     position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 42;
-    display: inline-flex; align-items: center; gap: 8px; max-width: min(620px, calc(100% - 24px));
+    display: inline-flex; align-items: center; gap: 8px; max-width: min(740px, calc(100% - 24px));
     padding: 6px 10px 6px 12px; border-radius: 999px;
     background: rgba(24, 34, 48, 0.92); color: #F8FAFC; font-size: 12px;
     box-shadow: 0 6px 20px rgba(15, 23, 42, 0.24);

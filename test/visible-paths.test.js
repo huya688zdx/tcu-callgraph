@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { traceVisiblePaths, visibleGraphKey, pathEdgeColors } from '../web/lib/visible-paths.js';
+import { traceVisiblePaths, visibleGraphKey, pathEdgeColors, resolvePairDisplay } from '../web/lib/visible-paths.js';
 
 const graph = (nodes, pairs) => ({ nodes: nodes.map(id => ({ id, name: id })),
   edges: pairs.map(([from, to], i) => ({ from, to, kind: 'direct', points: [[i, 0], [i, 20]] })) });
@@ -156,4 +156,47 @@ test('比较图中同版本长单向流不被跨版本短路径掩盖', () => {
   assert.deepEqual(result.paths[0].versions, ['after']);
   assert.equal(result.paths[0].mixed, false);
   assert.deepEqual(result.flowEdgeIndices, [2, 3, 4]);
+});
+
+test('resolvePairDisplay 默认屏蔽无关系多跳曲折静态路径，保留 2 跳共同关联并支持显式展开或单条预览', () => {
+  const twoHop = traceVisiblePaths(graph(['p', 'a', 'b'], [['p', 'a'], ['p', 'b']]), 'a', 'b');
+  const d2 = resolvePairDisplay(twoHop);
+  assert.equal(d2.directedCount, 0);
+  assert.equal(d2.staticCount, 1);
+  assert.equal(d2.visiblePaths.length, 1);
+  assert.equal(d2.muted, true);
+
+  // 4 跳静态关联默认不直接把整张图拐弯线全画亮
+  const fourHopView = graph(['a', 'x1', 'top', 'x2', 'b'], [['a', 'x1'], ['top', 'x1'], ['top', 'x2'], ['x2', 'b']]);
+  const fourHop = traceVisiblePaths(fourHopView, 'a', 'b');
+  const hidden = resolvePairDisplay(fourHop);
+  assert.equal(hidden.directedCount, 0);
+  assert.equal(hidden.staticCount, 1);
+  assert.equal(hidden.visiblePaths.length, 0);
+  assert.equal(hidden.hiddenStaticCount, 1);
+  assert.deepEqual(hidden.edgeIndices, []);
+
+  // 显式展开所有间接关联
+  const shown = resolvePairDisplay(fourHop, { showStatic: true });
+  assert.equal(shown.visiblePaths.length, 1);
+  assert.equal(shown.muted, true);
+  assert.equal(shown.edgeIndices.length, 4);
+
+  // 单条预览
+  const single = resolvePairDisplay(fourHop, { selectedPathIndex: 0 });
+  assert.equal(single.visiblePaths.length, 1);
+  assert.equal(single.muted, true);
+
+  // 有直接有向流时默认不混入静态关联
+  const withDirected = traceVisiblePaths(graph(['a', 'dir', 'b', 'p'], [['a', 'dir'], ['dir', 'b'], ['p', 'a'], ['p', 'b']]), 'a', 'b');
+  const dirOnly = resolvePairDisplay(withDirected);
+  assert.equal(dirOnly.directedCount, 1);
+  assert.equal(dirOnly.visiblePaths.length, 1);
+  assert.equal(dirOnly.muted, false);
+  assert.equal(dirOnly.hiddenStaticCount, 1);
+
+  // 彻底无关的两点
+  const none = resolvePairDisplay(traceVisiblePaths(graph(['a', 'b'], []), 'a', 'b'));
+  assert.deepEqual(none.visiblePaths, []);
+  assert.equal(none.muted, false);
 });
