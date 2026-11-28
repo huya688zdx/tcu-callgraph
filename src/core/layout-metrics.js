@@ -10,7 +10,20 @@ export function textWidth(s) {
   return w;
 }
 
-function measureLines(edges, geometryOnly = false, crossed = null) {
+// 手工直线上的控制点不是路口。只合并同向线段，保留折返实际画过的范围。
+function crossingVertices(points) {
+  const vertices = [];
+  for (const p of points) {
+    const a = vertices.at(-2), b = vertices.at(-1);
+    if (b && b[0] === p[0] && b[1] === p[1]) continue;
+    if (a && ((a[0] === b[0] && b[0] === p[0] && (b[1] - a[1]) * (p[1] - b[1]) > 0) ||
+        (a[1] === b[1] && b[1] === p[1] && (b[0] - a[0]) * (p[0] - b[0]) > 0))) vertices.pop();
+    vertices.push(p);
+  }
+  return vertices;
+}
+
+function measureLines(edges, { geometryOnly = false, crossed, independentOnly = false } = {}) {
   const horizontal = [];
   const vertical = [];
   const pathKeys = new Set();
@@ -28,13 +41,14 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
       for (let i = 0; i < pts.length - 1; i++) pathLength += Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
       rawLength += pathLength;
     }
-    for (let i = 0; i < pts.length - 1; i++) {
-      const [x1, y1] = pts[i];
-      const [x2, y2] = pts[i + 1];
+    const vertices = geometryOnly ? pts : crossingVertices(pts);
+    for (let i = 0; i < vertices.length - 1; i++) {
+      const [x1, y1] = vertices[i];
+      const [x2, y2] = vertices[i + 1];
       if (Math.abs(y1 - y2) < 0.5) {
-        horizontal.push({ y: Math.round((y1 + y2) / 2), x1: Math.min(x1, x2), x2: Math.max(x1, x2), edge: e });
+        horizontal.push({ y: (y1 + y2) / 2, x1: Math.min(x1, x2), x2: Math.max(x1, x2), edge: e, vertices });
       } else if (Math.abs(x1 - x2) < 0.5) {
-        vertical.push({ x: Math.round((x1 + x2) / 2), y1: Math.min(y1, y2), y2: Math.max(y1, y2), edge: e });
+        vertical.push({ x: (x1 + x2) / 2, y1: Math.min(y1, y2), y2: Math.max(y1, y2), edge: e, vertices });
       }
     }
   }
@@ -43,7 +57,8 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
   const unionLength = (segments, axis, coord) => {
     const byLine = new Map();
     for (const s of segments) {
-      const key = edgeStyleKey(s.edge) + ':' + Math.round(s[axis] / 2) * 2;
+      const pixel = Math.round(s[axis]);
+      const key = edgeStyleKey(s.edge) + ':' + Math.round(pixel / 2) * 2;
       if (!byLine.has(key)) byLine.set(key, []);
       byLine.get(key).push([s[coord[0]], s[coord[1]]]);
     }
@@ -68,6 +83,15 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
   // 汇流候选只比较线长和拐点，无需反复计算全组交叉。
   if (geometryOnly) return { length, bends };
 
+  // 多处调用或反向边可能复用整条折线，其自身的交点不算两条不同线路的交叉。
+  const paths = new Map();
+  const pathKey = (vertices) => {
+    if (!paths.has(vertices)) {
+      const forward = vertices.join(';'), reverse = vertices.toReversed().join(';');
+      paths.set(vertices, forward < reverse ? forward : reverse);
+    }
+    return paths.get(vertices);
+  };
   const intersections = new Set();
   vertical.sort((a, b) => a.x - b.x);
   for (const h of horizontal) {
@@ -80,35 +104,37 @@ function measureLines(edges, geometryOnly = false, crossed = null) {
     for (let i = lo; i < vertical.length && vertical[i].x < h.x2 - 0.5; i++) {
       const v = vertical[i];
       if (h.y <= v.y1 + 0.5 || h.y >= v.y2 - 0.5) continue;
-      const related = h.edge.from === v.edge.from || h.edge.from === v.edge.to || h.edge.to === v.edge.from || h.edge.to === v.edge.to;
-      if (!related) {
-        intersections.add(`${Math.round(v.x)},${Math.round(h.y)}`);
-        crossed?.add(h.edge);
-        crossed?.add(v.edge);
-      }
+      if (h.edge === v.edge) continue;
+      if (independentOnly && (h.edge.from === v.edge.from || h.edge.from === v.edge.to ||
+          h.edge.to === v.edge.from || h.edge.to === v.edge.to)) continue;
+      if (pathKey(h.vertices) === pathKey(v.vertices)) continue;
+      intersections.add(`${v.x.toFixed(6)},${h.y.toFixed(6)}`);
+      crossed?.add(h.edge);
+      crossed?.add(v.edge);
     }
   }
   return { length, rawLength, crossings: intersections.size, bends, shortPorts };
 }
 
 export function routeLengthAndCrossings(edges, geometryOnly = false) {
-  const lines = measureLines(edges, geometryOnly);
+  const lines = measureLines(edges, { geometryOnly });
   if (geometryOnly) return lines;
   const { length: overlapLength, styleLength: styleOverlapLength } = routeOverlapConflicts(edges);
   // length 已按线型取并集，同一根干线上有再多调用也只画一段。
   return { ...lines, sharedLength: Math.max(0, lines.rawLength - lines.length), overlapLength, styleOverlapLength };
 }
 
-function layoutMetrics(edges) {
+function layoutMetrics(edges, options) {
   const { length: styleOverlapLength } = routeOverlapConflicts(edges, { differentStylesOnly: true });
-  return { ...measureLines(edges), styleOverlapLength };
+  return { ...measureLines(edges, options), styleOverlapLength };
 }
 
 function scoreMetrics(m) {
   return m.crossings * 40 + m.styleOverlapLength / 20 + m.shortPorts + m.bends * 2 + m.length / 50 + m.rawLength / 200;
 }
 
-export const routeScore = (edges) => scoreMetrics(layoutMetrics(edges));
+// 选择节点摆放时保留独立线路的交叉代价。共端点的线路交给局部布线处理，避免为一个可绕开的交点拉长整张图。
+export const routeScore = (edges) => scoreMetrics(layoutMetrics(edges, { independentOnly: true }));
 
 /** 统计同层目录与文件框之间的留白，父框的标题和边距不计入。 */
 export function directoryWhitespace({ groups, containers }) {
@@ -139,7 +165,7 @@ export function improveEdgeRoutes(view, subset, simplify = () => true, crossingP
   if (!subset.length) return;
   if (crossingPass) {
     const crossed = new Set();
-    measureLines(view.edges, false, crossed);
+    measureLines(view.edges, { crossed });
     subset = subset.filter(e => crossed.has(e));
     if (!subset.length) return;
   }

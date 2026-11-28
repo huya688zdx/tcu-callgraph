@@ -7,6 +7,44 @@ import { buildSVGFromLayout } from '../src/core/export.js';
 import { launchServer } from '../scripts/lib/server.mjs';
 import { launchCdp, resolveChromePath } from '../scripts/lib/cdp.mjs';
 
+test('只按不同折线的内部交点计数，共端点、共干线和重复调用不改变交点身份', () => {
+  const h = { from: 'A', to: 'B', kind: 'direct', points: [[0,30],[60,30]] };
+  const v = { from: 'A', to: 'C', kind: 'direct', points: [[30,10],[30,50]] };
+  const count = (...edges) => routeLengthAndCrossings(edges).crossings;
+  for (const [from, to] of [['A','C'], ['C','B'], ['B','C'], ['A','B'], ['D','C']]) {
+    assert.equal(count(h, { ...v, from, to }), 1);
+  }
+  assert.equal(count(h, { ...v, points: [[30,10],[30,30],[60,30]] }), 0, 'T 形汇入');
+  assert.equal(count(h, { ...v, points: [[60,30],[60,50]] }), 0, '端点相接');
+  assert.equal(count(h, v, { ...v, line: 42 }), 1);
+  assert.equal(count(h, { ...v, points: [[29.8,10],[29.8,50]] }, { ...v, points: [[30.2,10],[30.2,50]] }), 2);
+  assert.equal(count({ ...h, points: [[0,30],[30,30],[30,30],[60,30]] },
+    { ...v, points: [[30,10],[30,30],[30,50]] }), 1, '直线内部的手工控制点');
+  assert.equal(count({ ...h, points: [[0,30],[60,30],[20,30]] }, v), 1, '折返画过的线段');
+
+  const loop = { ...h, points: [[0,0],[60,0],[60,40],[30,40],[30,-10]] };
+  const reverse = { ...v, from: 'B', to: 'A', points: loop.points.toReversed() };
+  const split = { ...h, points: [[0,0],[10,0], ...loop.points.slice(1)] };
+  assert.equal(count(loop, reverse, split), 0, '重复或反向绘制同一折线，不计自身交点');
+});
+
+test('Task_Shift 两条调用在干线外相交时只调整自动线，保留钉面、手工折线和调用位置', () => {
+  const nodes = [{ id: 'Task_Shift', x: 76, y: 192, w: 120, h: 44 },
+    { id: 'Can_GetRpm', x: 254, y: 83, w: 120, h: 44 }, { id: 'Can_GetSpeed', x: 254, y: 143, w: 135.2, h: 44 }];
+  for (const pin of [{ custom: true }, { fromSide: 'right', toSide: 'left' }]) {
+    const rpm = { from: 'Task_Shift', to: 'Can_GetRpm', kind: 'direct', line: 39, col: 41,
+      points: [[136,192],[136,177],[228,177],[228,105],[254,105]] };
+    const speed = { ...pin, from: rpm.from, to: 'Can_GetSpeed', kind: 'direct', line: 39, col: 55,
+      points: [[196,214],[225,214],[225,165],[254,165]] };
+    const edges = [rpm, speed], saved = structuredClone(speed);
+    assert.equal(routeLengthAndCrossings(edges).crossings, 2);
+    improveEdgeRoutes({ nodes, edges, layoutDirection: 'RIGHT', width: 450, height: 440 }, edges, () => true, true);
+    assert.equal(routeLengthAndCrossings(edges).crossings, 0);
+    assert.deepEqual(speed, saved);
+    assert.deepEqual([rpm.from, rpm.to, rpm.line, rpm.col], ['Task_Shift', 'Can_GetRpm', 39, 41]);
+  }
+});
+
 test('所有异样式冲突都重布，第 13 对及之后的边也与手工实线分道', () => {
   const nodes = [], calls = [], refs = [];
   for (let i = 0; i < 17; i++) {
