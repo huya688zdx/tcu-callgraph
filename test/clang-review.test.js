@@ -1393,3 +1393,105 @@ test('Clang GNU 汇编输出恢复候选，输入和独立槽保持原值', requ
     global_site: [possible(policy,'updated')],
   }));
 });
+
+const parameterWriteSource = `typedef int (*Fn)(void);
+static int first(void) { return 1; }
+static int middle(void) { return 2; }
+static int last(void) { return 3; }
+static int updated(void) { return 4; }
+static int separate(void) { return 5; }
+#define ARRAY Fn a[3] = {first, middle, last}
+static void pre(Fn *p) { *++p = updated; }
+static void post(Fn *p) { *p++ = updated; }
+static void pre_dec(Fn *p) { *--p = updated; }
+static void post_dec(Fn *p) { *p-- = updated; }
+static void add(Fn *p) { *(1 + p) = updated; }
+static void sub(Fn *p) { *(p - 1) = updated; }
+static void indexed(Fn *p) { (p + 1)[1] = updated; }
+static void element(Fn *p) { *(&p[1] + 1) = updated; }
+static void after_loop(Fn *p, int n) { while (n > 0) --n; *++p = updated; }
+static void compound(Fn *p) { *(p += 2) = updated; }
+static void unknown(Fn *p, int i) { *(p + i) = updated; }
+static void choose(Fn *p, Fn *q, int f) { *((f ? p : q) + 1) = updated; }
+static void many(Fn *p, int n) { while (n--) *p++ = updated; }
+static void advanced(Fn *p, int f) { if (f) ++p; *++p = updated; }
+static void rebound(Fn *p) { ++p; ++p; *(p - 1) = updated; }
+static Fn *locate(Fn *p, int i) { return p + i; }
+static void opaque(Fn *p, int i, Fn *selector) { *locate(p,*selector != 0 ? i : 0) = updated; }
+static void by_input(Fn *p, Fn *selector) { *(p + (*selector != 0)) = updated; }
+typedef struct { Fn *cursor; } Args;
+static void by_member(Args a) { *++a.cursor = updated; }
+static void by_ref(Args *a) { *(a->cursor + 1) = updated; }
+static void by_ref_index(Args *a) { a->cursor[1] = updated; }
+static void look(Fn *p) { (void)*++p; }
+typedef struct { Fn run, keep; } Row;
+static void member(Row *p) { (++p)->run = updated; }
+
+int prefix_site(void) { ARRAY; pre(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int postfix_site(void) { ARRAY; post(&a[1]); return a[0]()*100 + a[1]()*10 + a[2](); }
+int pre_dec_site(void) { ARRAY; pre_dec(&a[2]); return a[0]()*100 + a[1]()*10 + a[2](); }
+int post_dec_site(void) { ARRAY; post_dec(&a[1]); return a[0]()*100 + a[1]()*10 + a[2](); }
+int add_site(void) { ARRAY; add(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int sub_site(void) { ARRAY; sub(&a[2]); return a[0]()*100 + a[1]()*10 + a[2](); }
+int indexed_site(void) { ARRAY; indexed(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int element_site(void) { ARRAY; element(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int after_loop_site(void) { ARRAY; after_loop(a,3); return a[0]()*100 + a[1]()*10 + a[2](); }
+int compound_site(void) { ARRAY; compound(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int scalar_site(void) { Fn f = first, keep = separate; post(&f); return f()*10 + keep(); }
+int unknown_site(int i) {
+  struct { Fn a[3], other[2]; } g = {{first,middle,last},{separate,separate}};
+  unknown(g.a,i); return g.a[0]()*1000 + g.a[1]()*100 + g.a[2]()*10 + g.other[1]();
+}
+int choose_site(int f) {
+  Fn a[2] = {first,middle}, b[2] = {last,first}, keep = separate;
+  choose(a,b,f); return a[0]()*10000 + a[1]()*1000 + b[0]()*100 + b[1]()*10 + keep();
+}
+int repeated_site(int n) { ARRAY; many(a,n); return a[0]()*100 + a[1]()*10 + a[2](); }
+int advanced_site(int f) { ARRAY; advanced(a,f); return a[0]()*100 + a[1]()*10 + a[2](); }
+int member_site(void) {
+  Row rows[] = {{first,separate},{middle,separate},{last,separate}};
+  member(rows); return rows[0].run()*1000 + rows[1].run()*100 + rows[1].keep()*10 + rows[2].run();
+}
+int rebound_site(void) { ARRAY; rebound(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+int opaque_site(int i) {
+  ARRAY; Fn keep = separate; opaque(a,i,&keep); return a[0]()*1000 + a[1]()*100 + a[2]()*10 + keep();
+}
+int selector_site(void) {
+  ARRAY; Fn selector = separate; by_input(a,&selector);
+  return a[0]()*1000 + a[1]()*100 + a[2]()*10 + selector();
+}
+int carrier_site(void) {
+  ARRAY; Args arg = {a}; by_member(arg); return a[0]()*100 + a[1]()*10 + a[2]();
+}
+int by_ref_site(void) {
+  ARRAY; Args arg = {a}; Fn keep = separate; by_ref(&arg);
+  return a[0]()*1000 + a[1]()*100 + a[2]()*10 + keep();
+}
+int by_ref_index_site(void) {
+  ARRAY; Args arg = {a}; Fn keep = separate; by_ref_index(&arg);
+  return a[0]()*1000 + a[1]()*100 + a[2]()*10 + keep();
+}
+int read_site(void) { ARRAY; look(a); return a[0]()*100 + a[1]()*10 + a[2](); }
+`;
+
+test('Clang 跨调用组合写保留形参所指回调与相邻独立槽', requiresClang, async t => {
+  const root = project(t, parameterWriteSource);
+  const a = ['first'], b = ['middle'], c = ['last'], other = ['separate'];
+  const written = old => ({ required: ['updated'], allowed: [...old, 'updated'] });
+  const affected = [written(a), written(b), written(c)];
+  const retained = old => ({ required: old, allowed: [...old, 'updated'] });
+  // 现有传址规则允许载体中的游标在本数组内移动。两种写法均需保留真实的中间槽和独立对象。
+  const viaHolder = [retained(a), written(b), retained(c), other];
+  const center = [a, written(b), c], end = [a, b, written(c)];
+  await checkCallbackFlow(t, root, () => ({
+    prefix_site: center, postfix_site: center, pre_dec_site: center, post_dec_site: center,
+    add_site: center, sub_site: center, indexed_site: end, element_site: end, after_loop_site: center, compound_site: end,
+    scalar_site: [written(a), other], unknown_site: [...affected, other],
+    choose_site: [a, written(b), c, written(a), other], repeated_site: affected,
+    advanced_site: [retained(a), written(b), written(c)],
+    rebound_site: [retained(a), written(b), retained(c)],
+    opaque_site: [...affected.map(() => ({ required: ['updated'], allowed: ['first','middle','last','separate','updated'] })), other],
+    selector_site: [...affected, other], carrier_site: center, by_ref_site: viaHolder, by_ref_index_site: viaHolder,
+    member_site: [a, written(b), other, c], read_site: [a,b,c],
+  }));
+});

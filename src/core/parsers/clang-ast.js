@@ -669,30 +669,98 @@ export function pointerExpression(node, context = null) {
   return null;
 }
 
+// C 指针算术以元素为单位。无法求出下标时仍保留基址。
+export function pointerArithmetic(node, context) {
+  if (node.kind !== 'BinaryOperator' || !['+', '-'].includes(node.opcode) || !typeOf(node).includes('*')) return null;
+  const [left, right] = children(node), leftPointer = typeOf(left).includes('*');
+  const delta = constIndexValue(leftPointer ? right : left, context);
+  return { base: leftPointer ? left : right, delta: delta == null ? null : node.opcode === '-' ? -delta : delta };
+}
+
+// 把组合左值的地址投影回形参；偏移单位不明或表达式不透明时，只保留可能提供地址的形参。
+function parameterAddresses(expr, context, offset = 0, move = null) {
+  if (!expr) return [];
+  const node = unwrap(expr);
+  for (let part = expr; part !== node; part = evaluatedChildren(part)[0]) {
+    if (offset && (part.castKind === 'BitCast' || part.castKind === 'IntegralToPointer')) offset = '*';
+  }
+  const update = pointerMove(node);
+  if (update) return parameterAddresses(children(update)[node.isPostfix ? 0 : 1], context, offset, update);
+  // &*p 和 &p[i] 分别传递 p 和 p+i 的地址。
+  const target = node.kind === 'UnaryOperator' && node.opcode === '&' && unwrap(children(node)[0]);
+  if (target?.kind === 'UnaryOperator' && target.opcode === '*') return parameterAddresses(children(target)[0], context, offset, move);
+  const arithmetic = target?.kind === 'ArraySubscriptExpr'
+    ? pointerArithmetic({ kind: 'BinaryOperator', opcode: '+', type: node.type, inner: children(target) }, context)
+    : pointerArithmetic(node, context);
+  if (arithmetic) {
+    const sum = offset === '*' || arithmetic.delta == null ? null : offset + arithmetic.delta;
+    return parameterAddresses(arithmetic.base, context, Number.isSafeInteger(sum) ? sum : '*', move);
+  }
+  if (node.kind === 'ConditionalOperator') return children(node).slice(1).flatMap(arm => parameterAddresses(arm, context, offset, move));
+  if (node.kind === 'BinaryOperator' && [',','='].includes(node.opcode)) return parameterAddresses(children(node)[1], context, offset, move);
+  const source = pointerExpression(node, context);
+  if (source) {
+    return source.decl.kind === 'ParmVarDecl' ? [{ decl: source.decl, prefix: source.slot, offset, move }] : [];
+  }
+  if (node.kind === 'CallExpr') {
+    // 返回地址可能来自指针实参。计算整数或条件的只读操作数不向被调函数提供地址。
+    return transferredValues(node).filter(arg => typeOf(arg).includes('*'))
+      .flatMap(arg => parameterAddresses(arg, context, '*'));
+  }
+  const possible = new Map();
+  for (const use of walkEvaluated(node)) {
+    const decl = use.referencedDecl;
+    if (decl?.kind === 'ParmVarDecl' && typeOf(use).includes('*')) possible.set(decl.id, { decl, prefix: '', offset: '*' });
+  }
+  return [...possible.values()];
+}
+
 export function collectAssignmentWrites(body, context) {
   const writes = [];
   const reboundParams = new Map();
-  for (const node of walk(body, n => callbackChildren(n, context))) {
+  const binding = (decl, slot) => decl.id + ':' + slot;
+  const inLoop = new WeakSet();
+  let hasJump = false;
+  function bodyChildren(node) {
+    const items = callbackChildren(node, context);
+    if (inLoop.has(node) || ['ForStmt','WhileStmt','DoStmt'].includes(node.kind)) {
+      for (const child of items.concat(node.array_filler || [])) inLoop.add(child);
+    }
+    return items;
+  }
+  for (const node of walk(body, bodyChildren)) {
+    if (node.kind === 'GotoStmt' || node.kind === 'IndirectGotoStmt') hasJump = true;
     if (node.kind !== 'BinaryOperator' || node.opcode !== '=') continue;
     const [target, value] = children(node);
     const dest = unwrap(target);
     const lhs = pointerExpression(target, context);
     if (!lhs?.decl) continue;
     if (lhs.decl.kind === 'ParmVarDecl' && !lhs.throughPointer && typeOf(target).includes('*')) {
-      if (!reboundParams.has(lhs.decl.id)) reboundParams.set(lhs.decl.id, new Set());
-      reboundParams.get(lhs.decl.id).add(lhs.slot);
+      const key = binding(lhs.decl, lhs.slot);
+      reboundParams.set(key, reboundParams.has(key) ? null : node);
     }
     const callback = /\(\s*\*/.test(cleanType(typeOf(target), context.aliases));
     if (!callback && (typeOf(dest).includes('*') || !context.valueRecords.has(dest))) continue;
     // 只有整个函数就是 *p = value 时，直接传入的确定对象一定被替换。
     const replacesPointee = !callback && children(body).length === 1 && children(body)[0] === node &&
       dest.kind === 'UnaryOperator' && dest.opcode === '*' && unwrap(children(dest)[0])?.kind === 'DeclRefExpr';
-    writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, indirection: lhs.indirection,
-      slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, aggregate: !callback, replacesPointee });
+    const write = { node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, indirection: lhs.indirection,
+      slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, aggregate: !callback, replacesPointee };
+    const address = lhs.indirection;
+    const origins = address && !['VarDecl','ParmVarDecl','CompoundLiteralExpr'].includes(lhs.decl.kind)
+      ? parameterAddresses(address.operand, context) : [];
+    if (!origins.length) writes.push(write);
+    for (const { decl, prefix, offset, move } of origins) {
+      writes.push({ ...write, decl, slot: prefix + lhs.slot.slice(address.prefix.length),
+        indirection: { ...address, prefix }, offset, move });
+    }
   }
-  // 跨函数摘要没有形参在每个程序点的地址。移动过的游标只能约束到实参的相应数组区域。
-  for (const write of writes) if (write.throughPointer && reboundParams.get(write.decl.id)?.has(write.indirection.prefix)) {
-    write.unknownOffset = true;
+  // 同一次组合写中的唯一移动有确定步长。其他重绑定或可能重复的移动仅约束到实参数组。
+  for (const write of writes) if (write.throughPointer) {
+    const key = binding(write.decl, write.indirection.prefix);
+    if (reboundParams.has(key) && (!write.move || hasJump || inLoop.has(write.move) || reboundParams.get(key) !== write.move)) {
+      write.offset = '*';
+    }
   }
   return writes;
 }

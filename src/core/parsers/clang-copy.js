@@ -1,4 +1,4 @@
-import { asmMemoryOperands, callbackChildren, children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, pointerMove, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
+import { asmMemoryOperands, callbackChildren, children, evaluatedChildren, fnRef, initializer, initializerMembers, pointerArithmetic, pointerExpression, pointerMove, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
@@ -223,14 +223,12 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     if (addr.kind === 'ConditionalOperator') return children(addr).slice(1).flatMap(alt =>
       carried(alt, at, trace).map(item => ({ ...item, weak: true })));
     if (addr.kind === 'BinaryOperator' && [',','='].includes(addr.opcode)) return carried(children(addr)[1], at, trace);
-    if (addr.kind === 'BinaryOperator' && ['+', '-'].includes(addr.opcode) && typeOf(addr).includes('*')) {
-      const [left, right] = children(addr);
-      const leftPointer = typeOf(left).includes('*');
-      const n = constIndexValue(leftPointer ? right : left, unit);
+    const arithmetic = pointerArithmetic(addr, unit);
+    if (arithmetic) {
       const cycles = trace.cycles;
-      const bases = carried(leftPointer ? left : right, at, trace);
+      const bases = carried(arithmetic.base, at, trace);
       // 同一游标沿回边重复移动时，单次步长不能界定总偏移。
-      const offset = n == null || (n !== 0 && trace.cycles !== cycles) ? null : addr.opcode === '-' ? -n : n;
+      const offset = trace.cycles !== cycles && arithmetic.delta !== 0 ? null : arithmetic.delta;
       return bases.map(base => shiftedAddress(base, offset)).filter(Boolean);
     }
     const decay = typeOf(addr).endsWith(']') && typeOf(expr) !== typeOf(addr) && typeOf(expr).includes('*');
@@ -266,10 +264,11 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         const prefix = effect?.indirection?.prefix || '';
         if (effect && !matchingSlot(prefix, base.path)) continue;
         const tail = effect && { slot: effect.slot.slice(prefix.length), pointerIndex: effect.indirection?.index };
-        const origin = effect?.unknownOffset ? shiftedAddress(base, null) : base;
+        const origin = effect?.offset ? shiftedAddress(base, effect.offset === '*' ? null : effect.offset) : base;
+        if (!origin) continue;
         const slot = effect ? argumentSlot(origin.slot, tail) : offsetSlot(base.region, null);
         if (slot == null) continue;
-        const definite = effect?.replacesPointee && !effect.unknownOffset && !base.weak && !base.path && unwrap(expr)?.opcode === '&';
+        const definite = effect?.replacesPointee && !effect.offset && !base.weak && !base.path && unwrap(expr)?.opcode === '&';
         // 跨调用读取时用传址调用的实际参数绑定形参。
         noteAddressWrite(base.key, slot, effect && { record, node: call, effect, aggregate: effect.aggregate });
         const entry = { slot, point, effect, call, definite, viaMember: !!base.path };
