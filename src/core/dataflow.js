@@ -188,6 +188,37 @@ export async function dataflowFor(model, fnId, dir = 'out') {
   };
 }
 
+/** 从当前工程、同一版本的查询行生成模型证据。显式选中行不受摘要截取影响。 */
+export function dataflowAttachment(flow, dir, focus) {
+  const targetId = flow.fn.id;
+  const vars = new Map(), writers = new Set(), readers = new Set(), edges = [];
+  let focused = null;
+  for (const v of flow.vars) {
+    if (v.id.length > 200) continue;
+    if (vars.size < 12) vars.set(v.id, { id: v.id, name: v.name.slice(0, 120) });
+    const tag = v.version ? '[' + v.version + '] ' : '';
+    for (const peer of v.peers) {
+      if (peer.id.length > 200) continue;
+      // 变量根的一行只有一次访问。函数根的一行经变量连接写者与读者。
+      const rootFunction = v.id === targetId ? null : targetId;
+      const peerWrites = rootFunction ? v.mode === 'read' : v.mode === 'write';
+      const writer = peerWrites ? peer.id : rootFunction;
+      const reader = peerWrites ? rootFunction : peer.id;
+      const path = tag + [writer, v.id, reader].filter(Boolean).join(' → ');
+      if (writer && writers.size < 10) writers.add(tag + writer);
+      if (reader && readers.size < 10) readers.add(tag + reader);
+      if (edges.length < 16) edges.push(path);
+      if (focus?.varId === v.id && focus.peerId === peer.id && focus.mode === v.mode &&
+          (focus.version ?? null) === (v.version ?? null)) {
+        focused = { varId: v.id, peerId: peer.id, mode: v.mode, version: v.version, path };
+      }
+    }
+  }
+  if (focus != null && !focused) return null;
+  return { kind: 'dataflow', targetId, targetName: flow.fn.name.slice(0, 120), dir, vars: [...vars.values()],
+    writers: [...writers], readers: [...readers], edges, focused };
+}
+
 /**
  * 全工程的全局变量 / 常量清单（供右侧面板勾选）
  * 与 sharedVariables 不同：不过滤「有没有跨函数共享」，常量、只在单个函数里用到的也算

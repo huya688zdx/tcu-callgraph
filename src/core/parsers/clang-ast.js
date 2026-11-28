@@ -503,12 +503,12 @@ export function collectAssignmentWrites(body, context) {
     const callback = /\(\s*\*/.test(cleanType(typeOf(target), context.aliases));
     if (!callback && (typeOf(dest).includes('*') || !context.valueRecords.has(dest))) continue;
     const lhs = pointerExpression(target, context);
-    if (!lhs?.decl || (!callback && !(lhs.throughPointer && lhs.decl.kind === 'ParmVarDecl'))) continue;
+    if (!lhs?.decl) continue;
     // 只有整个函数就是 *p = value 时，直接传入的确定对象一定被替换。
     const replacesPointee = !callback && children(body).length === 1 && children(body)[0] === node &&
       dest.kind === 'UnaryOperator' && dest.opcode === '*' && unwrap(children(dest)[0])?.kind === 'DeclRefExpr';
     writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
-      slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, replacesPointee });
+      slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, aggregate: !callback, replacesPointee });
   }
   return writes;
 }

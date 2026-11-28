@@ -978,7 +978,9 @@ function selectionKey(selection) {
     if (a && b) return `pair:${a}|${b}`;
   }
   if (selection?.kind === 'dataflow' && (selection.targetId || selection.id)) {
-    return `df:${selection.targetId || selection.id}:${selection.dir || 'out'}`;
+    const f = selection.focused;
+    return 'df:' + JSON.stringify([selection.projectId, selection.comparisonId, selection.sessionRevision,
+      selection.targetId || selection.id, selection.dir || 'out', f?.varId, f?.mode, f?.peerId, f?.version]);
   }
   return '';
 }

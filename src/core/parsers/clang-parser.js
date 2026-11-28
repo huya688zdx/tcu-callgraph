@@ -8,7 +8,7 @@ import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, file
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, collectAssignmentWrites, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
   readTranslationUnit, transferredValues, typeOf, variableModel, walk } from './clang-ast.js';
-import { callbackSlotReader, matchingSlot } from './clang-copy.js';
+import { callbackSlotReader, matchingSlot, writeProjection } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
 import { lex } from '../lexer.js';
@@ -174,10 +174,13 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       }
       for (const w of collectAssignmentWrites(record.body, unit)) {
         const declKey = objectKey(w.decl, unit);
+        // 普通局部聚合体由调用点读取器追踪。跨调用只索引实际存储或形参所指对象。
+        if (w.aggregate && (w.throughPointer ? w.decl.kind !== 'ParmVarDecl' :
+          typeof declKey !== 'string' && declKey?.storageClass !== 'static')) continue;
         if (!declWrites.has(declKey)) declWrites.set(declKey, []);
         w.record = record;
         declWrites.get(declKey).push(w);
-        if (w.fieldId) {
+        if (w.fieldId && !w.aggregate) {
           const fields = typeof declKey === 'string' || w.decl.kind === 'ParmVarDecl' ? byRecordField : fieldsFor(unit, w.node);
           indexField(fields, unit, w.fieldId, w.slot, w, w.unionId);
           if (w.throughPointer) indexField(indirectFieldWrites, unit, w.fieldId, w.slot, w, w.unionId);
@@ -249,10 +252,10 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     let unknown = opaque && mutable, uncertainLayout = false;
     for (const w of declWrites.get(key) || []) {
       if (!opaque && !records.has(w.record)) continue;
-      const match = matchingSlot(w.slot, slot);
+      const match = writeProjection(w, w.slot, slot);
       if (!match || !readerFor(w.record).isEvaluated(w.node)) continue;
-      writes.push({ write: w, rest: '' });
-      uncertainLayout ||= match === 'overlap';
+      writes.push({ write: w, rest: match.rest });
+      uncertainLayout ||= match.rest === '.?';
     }
     for (const record of records) {
       if (!record) continue;
@@ -279,8 +282,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         const table = tables.get(key);
         for (const [path, id] of table?.slots || []) if (matches(path)) ids.push(id);
         for (const [path, targets] of table?.candidateSlots || []) if (matches(path)) ids.push(...targets);
-        for (const w of declWrites.get(key) || []) if (matches(w.slot)) {
-          const value = writeValue(w);
+        for (const w of declWrites.get(key) || []) {
+          const match = writeProjection(w, w.slot, slot);
+          if (!match) continue;
+          uncertainLayout ||= match.rest === '.?';
+          const value = writeValue(w, match.rest);
           ids.push(...value.targets);
           unknown ||= value.unknown || value.parameters.length > 0;
           uncertainLayout ||= value.uncertainLayout;
@@ -360,10 +366,13 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         }
       }
       const objectWrites = varKey == null ? [] : declWrites.get(varKey) || [];
-      const writesForVar = tracked === null ? objectWrites.filter(w => matchingSlot(w.slot, pointer.slot)) : [];
-      const writtenValues = writesForVar.map(w => writeValue(w));
-      for (const [i, value] of writtenValues.entries()) {
-        const uncertain = value.uncertainLayout || matchingSlot(writesForVar[i].slot, pointer.slot) === 'overlap';
+      const writtenValues = [];
+      if (tracked === null) for (const w of objectWrites) {
+        const match = writeProjection(w, w.slot, pointer.slot);
+        if (!match) continue;
+        const value = writeValue(w, match.rest);
+        writtenValues.push(value);
+        const uncertain = value.uncertainLayout || match.rest === '.?';
         slotTargets.push(...(uncertain ? value.targets.filter(compatible) : value.targets));
       }
       const fieldCandidates = new Set();
@@ -382,7 +391,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         for (let scope = context.scopeOf.get(node); scope; scope = context.scopeOf.get(scope)) collect(localFields.get(scope));
       }
       if (dispatchPolicy === 'strict') {
-        if (exact && !writesForVar.length) {
+        if (exact && !writtenValues.length) {
           candidates = [exact];
           resolution = 'exact';
           via = `${expression}（初始化槽位）`;
@@ -401,7 +410,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         const combinedSlots = [...new Set([...slotTargets,
           ...(unknownValue ? [...fieldCandidates, ...(targets || [])] : [])])];
         const signatureTargets = !knownObject && !(pointer?.member && pointer.baseType) ? targets : null;
-        if (exact && !writesForVar.length) {
+        if (exact && !writtenValues.length) {
           candidates = [exact];
           resolution = 'exact';
           via = `${expression}（初始化槽位）`;

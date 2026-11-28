@@ -25,6 +25,12 @@ function relativeSlot(prefix, slot) {
   return { rest: right.slice(left.length).join(''), covers };
 }
 
+// 整记录写入还可能覆盖后代成员；标量写入只能覆盖自身或不确定的联合体重叠槽。
+export function writeProjection(write, prefix, slot) {
+  const match = relativeSlot(prefix, slot);
+  return match && (write.aggregate || !match.rest || match.rest === '.?') ? match : null;
+}
+
 // 返回完整槽位的匹配程度，供未确认布局的候选做额外的类型检查。
 export function matchingSlot(a, b) {
   if (a === b) return 'slot';
@@ -394,7 +400,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const shadowed = path.includes('[*]') ? new Set() : null;
       for (const { slot, value, point, effect, call, definite } of writesAt(history, at)) {
         if (shadowed?.has(slot)) continue;
-        const match = relativeSlot(slot, path);
+        const match = effect ? writeProjection(effect, slot, path) : relativeSlot(slot, path);
         if (!match) continue;
         // 未建模的跳转下只收集同一对象和槽位的可能来源，不用任一赋值覆盖其他证据。
         let mandatory = !unstructuredJump && point.order < at.order && !unordered(point, at), excluded = false;
@@ -434,7 +440,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     isEvaluated: node => points.has(node),
     *addressWrites(key, slot) {
       for (const entry of escapes.get(key) || []) {
-        const match = relativeSlot(entry.slot, slot);
+        const match = entry.effect ? writeProjection(entry.effect, entry.slot, slot) : relativeSlot(entry.slot, slot);
         if (match) yield { write: entry.effect, rest: match.rest };
       }
     },

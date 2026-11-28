@@ -9,7 +9,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { loadModel, stats, subgraph, search, dataflowOf, rebuildIndex } from './core/index.js';
 import { decodeSource, sourceDecoder } from './core/source-files.js';
 import { isFlowchartFunction } from './core/flowchart.js';
-import { dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
+import { dataflowAttachment, dataflowFor, sharedVariables, listGlobals } from './core/dataflow.js';
 import { comparisonDataflow, comparisonGlobals } from './core/compare.js';
 import { compareGitProject, inspectGitRepo, quickGitDirtySummary, watchGitProject } from './core/git-compare.js';
 import { pairDataflow, comparisonPairDataflow } from './core/pair-dataflow.js';
@@ -4155,7 +4155,7 @@ export const server = http.createServer(async (req, res) => {
               while (stack.length && downstreamPaths.length < 12) {
                 const cur = stack.shift();
                 const outs = (side._index?.outAdj?.get(cur.node) || [])
-                  .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[keyFor(e)]);
+                  .filter((e) => isCallEvidence(e) && !overlay.deleted.nodes[e.to] && !overlay.deleted.edges[keyFor(e)] && !cur.path.includes(e.to));
                 if (!outs.length || cur.path.length > depth) {
                   if (cur.path.length > 1) {
                     downstreamPaths.push(cur.path);
@@ -4164,7 +4164,6 @@ export const server = http.createServer(async (req, res) => {
                   continue;
                 }
                 for (const e of outs.slice(0, 6)) {
-                  if (cur.path.includes(e.to)) continue;
                   stack.push({ node: e.to, path: [...cur.path, e.to], edgeKeys: [...cur.edgeKeys, keyFor(e)],
                     possible: cur.possible || possibleCall(e) });
                 }
@@ -5707,7 +5706,7 @@ export const server = http.createServer(async (req, res) => {
         const gitInfo = MODEL.parserId === 'dot' ? null : await quickGitDirtySummary(COMPARISON?.projectPath || root).catch(() => null);
         assertActive();
         const tasks = MODEL.parserId === 'dot' ? [] : projectTasks(MODEL).slice(0, 10).map(t => t.name);
-        const sanitizeUiContext = (raw) => {
+        const sanitizeUiContext = async (raw) => {
           if (!raw || typeof raw !== 'object') return null;
           const sanitizeNode = (n) => (!n || typeof n !== 'object' ? null : {
             kind: 'node',
@@ -5764,20 +5763,26 @@ export const server = http.createServer(async (req, res) => {
               name: String(v?.name || v || '').slice(0, 120),
             })),
           });
-          const sanitizeDataflow = (df) => (!df || typeof df !== 'object' ? null : {
-            kind: 'dataflow',
-            targetId: String(df.targetId || df.fnId || df.id || '').slice(0, 200),
-            targetName: String(df.targetName || df.fnName || df.name || '').slice(0, 120),
-            dir: ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out',
-            vars: (Array.isArray(df.vars) ? df.vars : []).slice(0, 16).map(v => ({
-              id: String(v?.id || v || '').slice(0, 200),
-              name: String(v?.name || v || '').slice(0, 120),
-            })),
-            peers: (Array.isArray(df.peers) ? df.peers : []).slice(0, 16).map(peer => ({
-              id: String(peer?.id || peer || '').slice(0, 200),
-              name: String(peer?.name || peer || '').slice(0, 120),
-            })),
-          });
+          const flows = new Map();
+          const sanitizeDataflow = async (df) => {
+            if (!df || typeof df !== 'object' || (df.projectId != null && df.projectId !== chatProjectId) ||
+                (df.sessionRevision != null && df.sessionRevision !== expectedSession) ||
+                (Object.hasOwn(df, 'comparisonId') && df.comparisonId !== (COMPARISON?.id ?? null))) return null;
+            const id = df.targetId || df.fnId || df.id;
+            if (typeof id !== 'string' || !id || id.length > 200 || !MODEL._index) return null;
+            const dir = ['in', 'out', 'both'].includes(df.dir) ? df.dir : 'out';
+            const key = JSON.stringify([id, dir]);
+            if (!flows.has(key)) {
+              if (!COMPARISON) await ensureAnalysis(MODEL);
+              assertActive();
+              if (!MODEL._index.byId.has(id)) return null;
+              const result = await (COMPARISON ? comparisonDataflow(COMPARISON, id, dir) : dataflowFor(MODEL, id, dir));
+              assertActive();
+              flows.set(key, result);
+            }
+            const result = flows.get(key);
+            return result.fn ? dataflowAttachment(result, dir, df.focused) : null;
+          };
           const out = {};
           const types = [
             ['node', 'selectedNode', sanitizeNode],
@@ -5789,9 +5794,12 @@ export const server = http.createServer(async (req, res) => {
           const flat = types.find(([kind]) => raw.kind === kind);
           for (const [, key, sanitize] of flat ? [flat] : types) {
             if (flat) {
-              const item = sanitize(raw);
-              Object.assign(out, item, { [key]: item });
-            } else if (raw[key]) out[key] = sanitize(raw[key]);
+              const item = await sanitize(raw);
+              if (item) Object.assign(out, item, { [key]: item });
+            } else if (raw[key]) {
+              const item = await sanitize(raw[key]);
+              if (item) out[key] = item;
+            }
           }
           if (typeof raw.relationIntent === 'string' && ['auto', 'compare', 'path', 'dataflow', 'common_callers'].includes(raw.relationIntent)) {
             out.relationIntent = raw.relationIntent;
@@ -5810,8 +5818,8 @@ export const server = http.createServer(async (req, res) => {
                 item = sanitizePair(entry);
                 id = item?.fromId && item?.toId && [item.fromId, item.toId].sort().join('<->');
               } else if (entry?.kind === 'dataflow') {
-                item = sanitizeDataflow(entry);
-                id = item?.targetId && `${item.targetId}:${item.dir}`;
+                item = await sanitizeDataflow(entry);
+                id = item && JSON.stringify([item.targetId, item.dir, item.focused?.path]);
               } else if (entry?.kind === 'file') {
                 item = sanitizeFile(entry);
                 id = item?.path;
@@ -5898,7 +5906,7 @@ export const server = http.createServer(async (req, res) => {
           }
           return lines.slice(0, 28).join('\n');
         };
-        const uiContext = sanitizeUiContext(p.uiContext);
+        const uiContext = await sanitizeUiContext(p.uiContext);
         if (uiContext) {
           const enrichment = await enrichTurnContext(MODEL, uiContext);
           if (enrichment) uiContext.enrichment = enrichment;
@@ -7442,7 +7450,7 @@ export const server = http.createServer(async (req, res) => {
         .then((r) => {
           if (!currentSession(req)) return sessionConflict(res);
           if (!comparison && r.fn) r.fn.taskPeriods = taskPeriods(model).get(r.fn.id) || [];
-          return json(res, r);
+          return json(res, { ...r, projectId: PROJECT.id, comparisonId: comparison?.id ?? null, sessionRevision });
         })
         .catch((err) => {
           console.error('[数据流]', err);

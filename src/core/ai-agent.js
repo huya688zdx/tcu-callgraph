@@ -679,6 +679,20 @@ function formatUiContextSelections(ui) {
       if (!target) return '';
       const dirText = item.dir === 'in' ? '写入源(in)' : item.dir === 'both' ? '双向' : '读取下游(out)';
       const parts = [`数据流 ${target}（${dirText}）`];
+      if (typeof item.focused?.path === 'string') parts.push('选中读写关系 ' + item.focused.path.slice(0, 640));
+      const addSummary = (label, values, budget) => {
+        const kept = [];
+        for (const value of (Array.isArray(values) ? values : []).slice(0, 16)) {
+          if (typeof value !== 'string' || !value) continue;
+          if (value.length > budget) break;
+          kept.push(value);
+          budget -= value.length + 1;
+        }
+        if (kept.length) parts.push(label + ' ' + kept.join('、'));
+      };
+      addSummary('写入方', item.writers, 500);
+      addSummary('读取方', item.readers, 500);
+      addSummary('读写链', item.edges, 1200);
       if (Array.isArray(item.vars) && item.vars.length) {
         parts.push(`关联变量 ${item.vars.slice(0, 6).map(v => v.name || v).join('、')}`);
       }

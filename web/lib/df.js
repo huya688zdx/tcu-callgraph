@@ -182,6 +182,7 @@ export async function analyseDataflow(fnId) {
     const res = await api.dataflow(fnId, 'both');
     if (seq !== querySeq || projectId !== state.view?.projectId) return;
     if (!res || res.error || res.ok === false) throw new Error(res?.error || t('df.unknownError'));
+    if (!currentDataflowScope(res)) return clearDataflow();
     df.result = res;
     renderDataflowResult();
   } catch (err) {
@@ -274,22 +275,16 @@ document.addEventListener('dblclick', (e) => {
   void toggleSelectedRelation();
 });
 
+function currentDataflowScope(res) {
+  return (res.projectId == null || res.projectId === state.view?.projectId) &&
+    (!Object.hasOwn(res, 'comparisonId') || res.comparisonId === (state.view?.comparison?.id ?? null)) &&
+    (res.sessionRevision == null || res.sessionRevision === state.view?.sessionRevision);
+}
+
 function buildDataflowAiDetail() {
   const res = df.result;
-  if (!res?.fn) return null;
+  if (!res?.fn || !currentDataflowScope(res)) return null;
   const rows = relations(res);
-  const vars = [];
-  const readers = new Set();
-  const writers = new Set();
-  const edges = [];
-  for (const r of rows) {
-    vars.push(r.v.name);
-    if (r.v.mode === 'read') writers.add(r.peer.name);
-    else readers.add(r.peer.name);
-    if (edges.length < 16) {
-      edges.push(`${r.v.mode === 'read' ? r.peer.name + ' → ' + r.v.name + ' → ' + res.fn.name : res.fn.name + ' → ' + r.v.name + ' → ' + r.peer.name}`);
-    }
-  }
   const chosen = rows[df.selected];
   return {
     kind: 'dataflow',
@@ -301,10 +296,9 @@ function buildDataflowAiDetail() {
     line: res.fn.line || 0,
     label: `数据流 · ${res.fn.name} (${rows.length})`,
     relationCount: rows.length,
-    vars: [...new Set(vars)].slice(0, 12),
-    writers: [...writers].slice(0, 10),
-    readers: [...readers].slice(0, 10),
-    edges,
+    projectId: res.projectId,
+    comparisonId: res.comparisonId,
+    sessionRevision: res.sessionRevision,
     ...(chosen ? {
       focused: {
         varId: chosen.v.id,
@@ -312,6 +306,7 @@ function buildDataflowAiDetail() {
         mode: chosen.v.mode,
         peerId: chosen.peer.id,
         peerName: chosen.peer.name,
+        version: chosen.v.version,
       },
     } : {}),
   };

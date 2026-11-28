@@ -820,3 +820,37 @@ void global_slot(void) { shared=(Ops){.run=first}; configure(); shared.slots[0](
     neighbors: [['first'], updated('spare')], global_run: [updated('first')], global_slot: [['third']],
   }));
 });
+
+test('Clang 全局聚合覆盖按被读取的成员投影到直接与间接调用', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run; Fn slots[2]; } Ops;
+typedef struct { Ops rows[2]; Fn tail; } Box;
+void first(void) {} void second(void) {} void third(void) {} void other(void) {}
+static Ops g={first,{0,0}}, ambient={first}; static Box box;
+void set(void) { g=(Ops){second,{third,0}}; }
+void relay(void) { set(); }
+void by_value(Ops value) { g=value; }
+void nested(int n) { if(n) box.rows[1]=(Ops){third,{0,second}}; }
+void indexed(int i) { box.rows[i]=(Ops){.run=second}; }
+void change_ambient(void) { ambient=(Ops){.run=third}; }
+void parameter(Ops *p) { *p=(Ops){.run=other}; }
+void direct(void) { g.run=first; set(); g.run(); }
+void transitive(void) { g.slots[0]=0; relay(); g.slots[0](); }
+void zero(void) { g.slots[1]=0; set(); if(g.slots[1]) g.slots[1](); }
+void bound(void) { g.run=first; by_value((Ops){third,{other,0}}); g.run(); }
+void later(void) { set(); g.run=other; g.run(); }
+void optional(int n) { box.rows[1].run=first; nested(n); box.rows[1].run(); }
+void index(int i) { box.rows[0].run=first; indexed(i); box.rows[0].run(); }
+void sibling(void) { box.rows[0].run=first; nested(1); box.rows[0].run(); }
+void other_object(void) { ambient.run=first; set(); ambient.run(); }
+void without_prior(void) { ambient.run(); }
+void copy_ambient(void) { Ops saved=ambient; saved.run(); }
+void shadow(void) { Ops g={0}; g.run=first; set(); g.run(); }
+void indirect(void) { Ops local={first}; parameter(&local); local.run(); }`);
+  const replaced = next => ({ required: [next], allowed: ['first',next] });
+  await checkCallbackFlow(t, root, () => ({
+    direct: [replaced('second')], transitive: [['third']], zero: [[]], bound: [replaced('third')], later: [['other']],
+    optional: [['first','third']], index: [['first','second']], sibling: [['first']], other_object: [['first']],
+    without_prior: [['first','third']], copy_ambient: [['first','third']], shadow: [['first']], indirect: [['other']],
+  }));
+});

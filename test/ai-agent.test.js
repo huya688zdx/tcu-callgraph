@@ -3594,3 +3594,159 @@ test('AI 撤销点保留无页面时的定义，画布冲突时保留独立新�
   assert.equal((await get('/api/events')).latest, head);
   assert.deepEqual((await get('/api/session/export')).manualNodes, [first, later]);
 });
+
+test('AI 递归下游调用链保留循环边界与并行出口', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-trace-recursive-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'graph.c'), `void a(void); void b(void){a();} void a(void){b();}
+void leaf(void) {} void entry(void){a(); leaf();}
+void self(void){ self(); } void starts_self(void){ self(); }
+void wide(void){
+  wide();
+  wide();
+  wide();
+  wide();
+  wide();
+  wide();
+  leaf();
+}
+void parallel(void){ a(); wide(); }`);
+  const srv = await launchServer({ target: root }); t.after(srv.close);
+  let requested = ['entry'], traces;
+  const { run } = await mockAiTurn(t, srv.baseUrl, last => {
+    if (last.role === 'tool') { traces = JSON.parse(last.content).traces; return []; }
+    return [['trace_upstream', { functions: requested, direction: 'down', depth: 4 }]];
+  });
+  const paths = trace => trace.downstreamPaths.map(p => p.map(id => id.split('::')[1]).join('/')).sort();
+  await t.test('工具保留已到达的路径，循环边不占后继名额', async () => {
+    requested = ['entry', 'starts_self', 'self', 'parallel', 'wide'];
+    const events = await run('检查下游调用链');
+    assert.ok(events.some(e => e.type === 'done'));
+    assert.equal(traces.find(v => v.id === 'graph.c::wide').directCallees.filter(e => e.to === 'graph.c::wide').length, 6);
+    const byId = Object.fromEntries(traces.map(v => [v.id, paths(v)]));
+    assert.deepEqual(byId, {
+      'graph.c::entry': ['entry/a/b','entry/leaf'], 'graph.c::starts_self': ['starts_self/self'],
+      'graph.c::self': [], 'graph.c::parallel': ['parallel/a/b','parallel/wide/leaf'], 'graph.c::wide': ['wide/leaf'],
+    });
+  });
+  await t.test('浏览器显示递归终点及普通叶子的链条卡片', async t => {
+    try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+    requested = ['entry'];
+    const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+    await br.waitFor('Boolean(window.__cg?.view)');
+    await br.evaluate("document.getElementById('aiBtn').click()");
+    await br.waitFor('document.getElementById("aiModel").value === "mock"');
+    await br.evaluate("document.getElementById('aiPromptInput').value='显示本轮下游'; document.getElementById('aiPromptInput').dispatchEvent(new Event('input')); document.getElementById('aiSendChat').click()");
+    await br.waitFor('document.querySelectorAll(".ai-chain-card").length > 0 && !document.getElementById("aiSendChat").classList.contains("steering")');
+    const visible = await br.evaluate("[...document.querySelectorAll('.ai-chain-card')].filter(c => c.getBoundingClientRect().height > 0).map(c => [...c.querySelectorAll('.ai-chain-node')].map(n => n.title.split(' ')[0]).join('/')).sort()");
+    assert.deepEqual(visible, ['graph.c::entry/graph.c::a/graph.c::b','graph.c::entry/graph.c::leaf']);
+  });
+});
+
+test('AI 数据流附件从面板选中关系到模型按工程和版本隔离', async t => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-df-selection-'));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const create = (dir, writers) => {
+    const target = path.join(tmp, dir); fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'logic.c'), ['int shared, outbox;',
+      ...writers.map(name => 'void ' + name + '(void) { shared=1; }'),
+      'int consumer(void) { outbox=shared; return shared; }', 'int downstream(void) { return outbox; }'].join('\n'));
+    return target;
+  };
+  const project = create('current', Array.from({ length: 20 }, (_, i) => 'producer' + String(i).padStart(2, '0')));
+  const beforePath = create('before', ['oldPeer','producer19']), afterPath = create('after', ['newPeer','producer19']);
+  const srv = await launchServer({ target: project }); t.after(srv.close);
+  const id = name => 'logic.c::' + name;
+  const varId = name => 'var::' + name;
+  let prompt, onRequest;
+  const { post, run } = await mockAiTurn(t, srv.baseUrl, last => {
+    prompt = last.content;
+    onRequest?.(); onRequest = null;
+    return [];
+  });
+  const get = url => fetch(srv.baseUrl + url).then(r => r.json());
+  const context = () => String(prompt).match(/<current_turn_context\b[^>]*>([\s\S]*?)<\/current_turn_context>/)?.[1] || '';
+  const flow = (targetId = id('consumer')) => get('/api/dataflow?dir=both&fn=' + encodeURIComponent(targetId));
+  const attachment = (result, peer, variable = 'shared', mode = 'read', version) => ({
+    kind: 'dataflow', targetId: result.fn.id, dir: 'both', projectId: result.projectId,
+    comparisonId: result.comparisonId ?? null, sessionRevision: result.sessionRevision,
+    focused: { varId: varId(variable), mode, peerId: id(peer), ...(version ? { version } : {}) },
+  });
+  const query = async selection => { await run('请核对附着的关系', { uiContext: selection }); return context(); };
+  const current = await flow();
+  const origin = attachment(current, 'producer19');
+  const newBrowser = async t => {
+    const br = await launchCdp({ url: srv.baseUrl }); t.after(() => br.close());
+    await br.waitFor('Boolean(window.__cg?.view?.projectId)');
+    await br.waitFor('Boolean(document.querySelector(\'#tree .file[data-path="logic.c"]\'))');
+    await br.evaluate(`(() => {
+      const file = document.querySelector('#tree .file[data-path="logic.c"]');
+      if (file.getAttribute('aria-expanded') !== 'true') file.click();
+      const fn = document.querySelector('#tree [data-fnid="logic.c::consumer"]');
+      fn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: 2 }));
+      [...document.querySelectorAll('#ctxMenu button')].find(b => b.textContent.trim() === '数据流分析').click();
+    })()`);
+    await br.waitFor('Boolean(document.querySelector("#dataflow .df-relation input"))');
+    return br;
+  };
+  const attach = async (br, peer) => br.evaluate(`(() => {
+    const row=[...document.querySelectorAll('#dataflow .df-relation')].find(r => r.querySelector('.df-peer-name').textContent===${JSON.stringify(peer)});
+    row.querySelector('input').click(); document.querySelector('#dataflow [data-df="askAi"]').click();
+  })()`);
+  const send = async br => {
+    await br.waitFor('document.getElementById("aiModel").value === "mock"');
+    const received = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('模拟模型未收到本轮请求')), 10000);
+      onRequest = () => { clearTimeout(timer); resolve(); };
+    });
+    await br.evaluate("const box=document.getElementById('aiPromptInput'); box.value='核对所选读写关系'; box.dispatchEvent(new Event('input')); document.getElementById('aiSendChat').click()");
+    await received;
+    await br.waitFor('document.getElementById("aiMessages").textContent.includes("已完成。")');
+    return context();
+  };
+  await t.test('浏览器保留同一目标的两个所选关系，含超出摘要上限的写者', async t => {
+    try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+    const br = await newBrowser(t);
+    await attach(br, 'producer19'); await attach(br, 'downstream');
+    const result = await send(br);
+    assert.ok(result.includes('选中读写关系 logic.c::producer19 → var::shared → logic.c::consumer'), result);
+    assert.ok(result.includes('选中读写关系 logic.c::consumer → var::outbox → logic.c::downstream'), result);
+    assert.match(result, /写入方 .*logic\.c::producer00/);
+    assert.match(result, /读取方 .*logic\.c::downstream/);
+    assert.match(result, /读写链 .*logic\.c::producer00 → var::shared → logic\.c::consumer/);
+    assert.ok(!result.includes('producer18'), '摘要限制应保留，所选行可单独显示');
+  });
+  await t.test('变量根只展示与写者或读者之间的一段', async () => {
+    const result = await query(attachment(await flow(varId('shared')), 'producer19', 'shared', 'write'));
+    assert.ok(result.includes('选中读写关系 logic.c::producer19 → var::shared'), result);
+    assert.ok(!result.includes('var::shared → var::shared'), result);
+  });
+  await t.test('缺失和过长的端点不向模型提供关系', async () => {
+    assert.equal(await query({ ...origin, focused: { ...origin.focused, peerId: id('unknown') } }), '');
+    assert.equal(await query({ ...origin, targetId: 'x'.repeat(300) }), '');
+  });
+  const prepared = await (await post('/api/compare', { beforePath, afterPath })).json();
+  assert.ok(prepared.preview?.id, JSON.stringify(prepared));
+  assert.ok((await (await post('/api/compare/apply', { previewId: prepared.preview.id, selectedIds: [id('consumer'), varId('shared')] })).json()).ok);
+  const compared = await flow();
+  await t.test('比较前的附件及版本不匹配的选中行被丢弃', async () => {
+    assert.equal(await query(origin), '');
+    assert.equal(await query(attachment(compared, 'oldPeer', 'shared', 'read', 'after')), '');
+  });
+  await t.test('浏览器比较行在模型请求中保留 before 与 after 的独立证据', async t => {
+    try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+    const br = await newBrowser(t); await attach(br, 'oldPeer');
+    const result = await send(br);
+    assert.ok(result.includes('选中读写关系 [before] logic.c::oldPeer → var::shared → logic.c::consumer'), result);
+    assert.ok(result.includes('[after] logic.c::newPeer → var::shared → logic.c::consumer'), result);
+    assert.ok(!result.includes('[after] logic.c::oldPeer') && !result.includes('[before] logic.c::newPeer'), result);
+  });
+  await post('/api/compare/exit', {});
+  await post('/api/switch', { path: afterPath });
+  await t.test('另一工程使用同一函数 ID 时不携带先前的选择', async () => {
+    assert.equal(await query(origin), '');
+    assert.equal(await query(attachment(compared, 'newPeer', 'shared', 'read', 'after')), '');
+    const fresh = await query(attachment(await flow(), 'producer19'));
+    assert.ok(fresh.includes('选中读写关系 logic.c::producer19 → var::shared → logic.c::consumer'), fresh);
+  });
+});
