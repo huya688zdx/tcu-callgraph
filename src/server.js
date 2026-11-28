@@ -246,8 +246,8 @@ function buildView(rootId, up, down, group = false, dfNode = null, optimal = fal
   const slot = optimal ? {} : overlay.layout?.[layoutKey(g.root, mode)] || {};
 
   // 手动拖拽的节点位置优先。
-  // 但坐标必须仍落在它所属的文件框内才采用——拖拽本身被前端限制在框内，
-  // 出框的坐标只可能是跨视图/跨深度的陈旧存档，直接丢弃并回落自动布局
+  // 坐标必须完整落在原文件框内才采用。容差会让 fitGroups 把框向外撑大，
+  // 进而压缩相邻文件框 / 目录框之间的硬间距，所以越界的旧存档直接回落自动布局。
   const savedNodes = slot.nodes || {};
   const groupBox = new Map((laid.groups || []).map((bg) => [bg.id, bg]));
   const savedApplied = [];
@@ -256,12 +256,11 @@ function buildView(rootId, up, down, group = false, dfNode = null, optimal = fal
     if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
     const gb = groupBox.get(n.group);
     if (gb) {
-      const tol = 2;
       const inside =
-        p.x >= gb.x - tol &&
-        p.y >= gb.y - tol &&
-        p.x + n.w <= gb.x + gb.w + tol &&
-        p.y + n.h <= gb.y + gb.h + tol;
+        p.x >= gb.x &&
+        p.y >= gb.y &&
+        p.x + n.w <= gb.x + gb.w &&
+        p.y + n.h <= gb.y + gb.h;
       if (!inside) continue;
     }
     n._autoX = n.x;

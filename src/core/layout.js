@@ -51,7 +51,6 @@ function layoutBase(nodes, edges, opts = {}) {
     gapX = 34,
     gapY = 76,
     padding = 40,
-    maxLabelWidth = 260,
     minWidth = 120,
   } = opts;
 
@@ -168,7 +167,9 @@ function layoutBase(nodes, edges, opts = {}) {
     const label = n.label || n.name || n.id;
     // 函数名显示时带 ()，比裸名字多留两个字符
     const extra = n.kind === 'var' ? 0 : 16;
-    return Math.min(maxLabelWidth, Math.max(minWidth, textWidth(label) + 28 + extra));
+    // 不能把长函数名宽度截在 maxLabelWidth 后再让画布省略标题；完整文字
+    // 需要先进入节点尺寸，布局器才能据此留位并计算连线与相邻节点的位置。
+    return Math.max(minWidth, textWidth(label) + 28 + extra);
   };
   const heightOf = (n) => n.h || (n.sub ? subH : nodeH);
 
@@ -474,6 +475,19 @@ function routeLengthAndCrossings(edges) {
   return { length, rawLength, sharedLength: Math.max(0, rawLength - length), crossings: intersections.size, bends };
 }
 
+function weightedRouteLength(edges) {
+  let total = 0;
+  for (const e of edges) {
+    const pts = e.points || [];
+    let length = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+      length += Math.abs(pts[i + 1][0] - pts[i][0]) + Math.abs(pts[i + 1][1] - pts[i][1]);
+    }
+    total += length * (1 + Math.log2(Math.max(1, e.weight || 1)));
+  }
+  return total;
+}
+
 function normalizeCandidate(nodes, edges, padding) {
   let minX = Infinity;
   let minY = Infinity;
@@ -506,6 +520,8 @@ function normalizeCandidate(nodes, edges, padding) {
 function candidateScore(candidate) {
   if (overlapNodes(candidate.nodes)) return Infinity;
   const { length, sharedLength, crossings, bends } = routeLengthAndCrossings(candidate.edges);
+  // 高频连接在位置选择中应比偶发调用更有分量；节点宽高已包含完整函数标题。
+  const weightedLength = weightedRouteLength(candidate.edges);
   let width = candidate.width;
   let height = candidate.height;
   if (!Number.isFinite(width) || !Number.isFinite(height)) {
@@ -524,7 +540,7 @@ function candidateScore(candidate) {
   }
   const area = width * height;
   const bundleCredit = Math.min(length * 0.65, sharedLength * 1.1);
-  return length - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008;
+  return weightedLength - bundleCredit + crossings * 360 + bends * 16 + area * 0.00008;
 }
 
 function refineGroupedNodes(nodes, edges, groups, headerH = 26) {
@@ -641,7 +657,7 @@ export function layout(nodes, edges, opts = {}) {
     const widthOf = (n) => {
       if (n.w) return n.w;
       const label = n.label || n.name || n.id;
-      return Math.min(opts.maxLabelWidth ?? 260, Math.max(opts.minWidth ?? 120, textWidth(label) + 28 + (n.kind === 'var' ? 0 : 16)));
+      return Math.max(opts.minWidth ?? 120, textWidth(label) + 28 + (n.kind === 'var' ? 0 : 16));
     };
     const heightOf = (n) => n.h || (n.sub ? (opts.subH ?? 58) : (opts.nodeH ?? 44));
     const swapped = nodes.map((n) => ({ ...n, w: heightOf(n), h: widthOf(n) }));
@@ -919,6 +935,26 @@ export function layoutPartitioned(items, edges, opts = {}) {
   };
   const m = units.length;
   let best = null;
+  const candidateRs = m <= 32
+    ? Array.from({ length: m }, (_, i) => i + 1)
+    : [...new Set(Array.from({ length: 32 }, (_, i) => Math.round(1 + (i * (m - 1)) / 31)))];
+  const candidateIsClear = (positions) => {
+    for (let i = 0; i < items.length; i++) {
+      const aPos = positions.get(items[i].id);
+      const a = { ...aPos, w: wOf(items[i].id), h: hOf(items[i].id) };
+      for (let j = i + 1; j < items.length; j++) {
+        const bPos = positions.get(items[j].id);
+        const b = { ...bPos, w: wOf(items[j].id), h: hOf(items[j].id) };
+        const apart =
+          a.x + a.w + 12 <= b.x ||
+          b.x + b.w + 12 <= a.x ||
+          a.y + a.h + 12 <= b.y ||
+          b.y + b.h + 12 <= a.y;
+        if (!apart) return false;
+      }
+    }
+    return true;
+  };
   const placeUnits = (R) => {
     const C = Math.ceil(m / R);
     const colW = [];
@@ -961,8 +997,9 @@ export function layoutPartitioned(items, edges, opts = {}) {
       colH,
     };
   };
-  for (let R = 1; R <= m; R++) {
+  for (const R of candidateRs) {
     const candidate = placeUnits(R);
+    if (!candidateIsClear(candidate.pos)) continue;
     const W = candidate.width;
     const H = candidate.height;
     const aspect = W / Math.max(1, H);
@@ -979,6 +1016,9 @@ export function layoutPartitioned(items, edges, opts = {}) {
     const score = aspectScore * 0.25 + wireScore;
     if (!best || score < best.score - 0.001) best = { ...candidate, score };
   }
+
+  // 单列是始终可行的确定性兜底；正常候选已先经过同一层框间距检查。
+  if (!best) best = placeUnits(m);
 
   return {
     pos: best.pos,
@@ -1024,7 +1064,6 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       padding: 14,
       gapX: 26,
       gapY: 52,
-      maxLabelWidth: 190,
       minGapX: 12,
     });
     for (const n of laid.nodes) n.y += headerH;
@@ -1032,6 +1071,9 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       if (e.points) for (const p of e.points) p[1] += headerH;
     }
     laid.height += headerH;
+    // 文件名也画在文件框标题栏内，必须计入文件框宽度，避免长文件名溢出并覆盖相邻框。
+    const titleW = textWidth(String(file).split('/').at(-1)) + 24;
+    laid.width = Math.max(laid.width, titleW);
     inner.set(file, laid);
   }
 
@@ -1146,19 +1188,39 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       return a && b && a !== b;
     });
     const fanoutByGroupPair = new Map();
+    const byFunctionPair = new Map();
     for (const e of crossingFunctionEdges) {
       const sourceGroup = childOfFile.get(fileOfId.get(e.from));
       const targetGroup = childOfFile.get(fileOfId.get(e.to));
-      const key = `${sourceGroup}\u0000${targetGroup}`;
-      if (!fanoutByGroupPair.has(key)) fanoutByGroupPair.set(key, { sourceGroup, targetGroup, targets: new Set() });
-      fanoutByGroupPair.get(key).targets.add(e.to);
+      const groupKey = `${sourceGroup}\u0000${targetGroup}`;
+      if (!fanoutByGroupPair.has(groupKey)) {
+        fanoutByGroupPair.set(groupKey, { sourceGroup, targetGroup, weight: 0, targets: new Set() });
+      }
+      const groupPair = fanoutByGroupPair.get(groupKey);
+      groupPair.weight++;
+      groupPair.targets.add(e.to);
+
+      const functionKey = `${e.from}\u0000${e.to}\u0000${e.kind || 'direct'}`;
+      const functionPair = byFunctionPair.get(functionKey) || {
+        from: e.from,
+        to: e.to,
+        kind: e.kind || 'direct',
+        line: e.line || 0,
+        weight: 0,
+      };
+      functionPair.weight++;
+      byFunctionPair.set(functionKey, functionPair);
     }
     const fanoutBundles = [...fanoutByGroupPair.values()].filter((b) => b.targets.size > 1);
+    const summaryEdges = [...byFunctionPair.values()]
+      .sort((a, b) => b.weight - a.weight || (a.from < b.from ? -1 : a.from > b.from ? 1 : 0) || (a.to < b.to ? -1 : a.to > b.to ? 1 : 0))
+      .slice(0, 512);
     const childDims = new Map(cn.map((child) => [child.id, child]));
     const actualNodes = [...filesByChild.values()].reduce((sum, files) =>
       sum + files.reduce((n, f) => n + (inner.get(f.file)?.nodes.length || 0), 0), 0);
-    const scorePlacement = actualNodes <= 160 && crossingFunctionEdges.length <= 160
-      ? (positions, width, height) => {
+    const exactScoring = actualNodes <= 160 && crossingFunctionEdges.length <= 160;
+    const scorePlacement = (positions, width, height) => {
+      if (exactScoring) {
           const tempNodes = [];
           for (const [childPath, files] of filesByChild) {
             const base = positions.get(childPath);
@@ -1174,7 +1236,8 @@ export function layoutGrouped(nodes, edges, opts = {}) {
           const tempEdges = cloneEdges(crossingFunctionEdges);
           routeEdges(tempNodes, tempEdges);
           const metrics = routeLengthAndCrossings(tempEdges);
-          const bundleCredit = Math.min(metrics.length * 0.75, metrics.sharedLength * 1.5);
+          const weightedLength = weightedRouteLength(tempEdges);
+          const bundleCredit = Math.min(weightedLength * 0.75, metrics.sharedLength * 1.5);
           // 高扇出跨文件调用优先让文件并排；这样路由器能用一根纵向主干分发到多个目标。
           let fanoutAxisPenalty = 0;
           for (const bundle of fanoutBundles) {
@@ -1187,21 +1250,55 @@ export function layoutGrouped(nodes, edges, opts = {}) {
             const dy = Math.abs((b.y + db.h / 2) - (a.y + da.h / 2));
             if (dx < dy * 1.15) fanoutAxisPenalty += Math.min(2, bundle.targets.size - 1) * 1.5;
           }
-          return (metrics.length - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
+          return (weightedLength - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
+      }
+
+      // 大视图以稳定的组对摘要代替全量函数折线，连接数越多的组对影响越大。
+      const tempNodes = [];
+      for (const [childPath, files] of filesByChild) {
+        const base = positions.get(childPath);
+        if (!base) continue;
+        for (const f of files) {
+          const laidFile = inner.get(f.file);
+          if (!laidFile) continue;
+          for (const fn of laidFile.nodes) {
+            tempNodes.push({ ...fn, x: base.x + f.x + fn.x, y: base.y + f.y + fn.y, group: f.file });
+          }
         }
-      : null;
+      }
+      const tempEdges = summaryEdges.map((e) => ({ ...e }));
+      routeEdges(tempNodes, tempEdges);
+      const metrics = routeLengthAndCrossings(tempEdges);
+      const length = weightedRouteLength(tempEdges);
+      const bundleCredit = Math.min(length * 0.65, metrics.sharedLength * 1.1);
+      let fanoutAxisPenalty = 0;
+      for (const bundle of fanoutBundles) {
+        const a = positions.get(bundle.sourceGroup);
+        const b = positions.get(bundle.targetGroup);
+        const da = childDims.get(bundle.sourceGroup);
+        const db = childDims.get(bundle.targetGroup);
+        if (!a || !b || !da || !db) continue;
+        const dx = Math.abs((b.x + db.w / 2) - (a.x + da.w / 2));
+        const dy = Math.abs((b.y + db.h / 2) - (a.y + da.h / 2));
+        if (dx < dy * 1.15) fanoutAxisPenalty += Math.log2(bundle.weight + 1) * Math.min(2, bundle.targets.size - 1) * 1.5;
+      }
+      return (length - bundleCredit) / Math.max(1, width + height) + metrics.crossings * 0.35 + metrics.bends * 0.12 + fanoutAxisPenalty;
+    };
     const laid = layoutPartitioned(cn, childEdgesOf(node), { ...BOX, scorePlacement });
     const byId = new Map(list.map((c) => [c.path, c]));
     for (const it of cn) {
       const c = byId.get(it.id);
       const p = laid.pos.get(it.id);
       c.x = p.x;
-      c.y = p.y;
+      // 目录标题占掉布局器预留上边距之外的 16px；在父级排布前就占位，
+      // 不要等到最终套容器时才把子框整体向下撑开。
+      c.y = p.y + 16;
       c.w = it.w;
       c.h = it.h;
     }
-    node.w = laid.width;
-    node.h = laid.height;
+    // 目录名位于容器标题栏；先撑开目录，再让父目录按完整宽度排布它。
+    node.w = Math.max(laid.width, textWidth(node.name) + 28);
+    node.h = laid.height + 16;
     node.columns = laid.columns;
   };
   layoutDir(root);
@@ -1287,11 +1384,8 @@ export function layoutGrouped(nodes, edges, opts = {}) {
   collectDir(root);
   containers.sort((a, b) => a.depth - b.depth);
 
-  // 6a. 目录容器几何：按「文件框 + 子容器」的包围盒逐层外扩（深的先算），
-  //     每级只多留一小圈（标题 + 呼吸空隙），嵌套紧凑不浪费面积。
-  //     这里算完就是最终坐标，服务端只在此基础上做「只扩不缩」的兜底，
-  //     否则两边各算一套坐标系，手动布局存档会对不上
-  const maxDepth = containers.reduce((m, c) => Math.max(m, c.depth), 1);
+  // 6a. 目录框按其完整子树取包围盒。上方标题区的 30px 已在 layoutDir
+  //     中预先占位，因此这里的最终尺寸不会在父级排布完成后再意外变大。
   for (const c of containers.slice().sort((a, b) => b.depth - a.depth)) {
     const inner = fileGroups.filter((g) => String(g.id).startsWith(c.id + '/'));
     const kids = containers.filter((k) => k !== c && String(k.id).startsWith(c.id + '/'));
@@ -1307,11 +1401,10 @@ export function layoutGrouped(nodes, edges, opts = {}) {
       if (b.x + b.w > x1) x1 = b.x + b.w;
       if (b.y + b.h > y1) y1 = b.y + b.h;
     }
-    const extra = (maxDepth - c.depth) * 10;
-    c.x = x0 - 14 - extra;
-    c.y = y0 - 30 - extra;
-    c.w = x1 - x0 + 28 + extra * 2;
-    c.h = y1 - y0 + 44 + extra * 2;
+    c.x = x0 - 14;
+    c.y = y0 - 30;
+    c.w = Math.max(x1 - x0 + 28, textWidth(c.label) + 28);
+    c.h = y1 - y0 + 44;
   }
 
   // 6b. 根容器：包住所有文件框与子目录容器，标题用根目录名
@@ -1338,7 +1431,8 @@ export function layoutGrouped(nodes, edges, opts = {}) {
         depth: 1,
         x: x0 - RING.side,
         y: y0 - RING.top,
-        w: x1 - x0 + RING.side * 2,
+        // 根目录名也参与根容器的最小宽度，标题不会盖到旁边的根级内容。
+        w: Math.max(x1 - x0 + RING.side * 2, textWidth(rootLabel) + 44),
         h: y1 - y0 + RING.top + RING.bottom,
       };
     }
