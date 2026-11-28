@@ -225,7 +225,7 @@ export function readTranslationUnit(ast, root, unit, files) {
   loc.record(ast);
   const context = { unit, loc, functions: [], globals: [], declarations: new Map(), aliases: new Map(), records: new Map(),
     declaratorSources: new WeakMap(), valueRecords: new WeakMap(), scopeOf: new WeakMap(), enumById: new Map(), enumDeclarations: [] };
-  const recordsById = new Map();
+  const recordsById = new Map(), anonymousAt = new Map();
   const recordScopes = [context.records], typedefRecords = new Map();
   function collect(node, insideFunction, parentScope) {
     const position = loc.loc(node);
@@ -243,6 +243,7 @@ export function readTranslationUnit(ast, root, unit, files) {
         recordsById.set(decl.id, node);
       }
       if (name) scope.set(`${node.tagUsed} ${name}`, node);
+      else if (position?.abs) anonymousAt.set(`${position.abs}:${position.line}:${node.loc?.col ?? position.col}`, node);
       // 内嵌匿名记录的 FieldDecl 与定义从同一源位置开始。保留 Clang 的完整类型名。
       const anonymous = new Map();
       for (const child of children(node)) {
@@ -269,6 +270,11 @@ export function readTranslationUnit(ast, root, unit, files) {
       let decl = typedefRecords.get(node.type?.typeAliasDeclId);
       const type = typeOf(node).replace(/\b(const|volatile|restrict)\b/g, '').trim();
       for (let i = recordScopes.length - 1; !decl && i >= 0; i--) decl = recordScopes[i].get(type);
+      if (!decl && type.includes('(unnamed')) {
+        // 独立的匿名结构体变量没有 typedef；Clang 的完整类型给出标签的定义位置。
+        const site = /^(?:struct|union) \(unnamed(?: (?:struct|union))? at (.+):(\d+):(\d+)\)$/.exec(type);
+        if (site) decl = anonymousAt.get(path.resolve(unit.cwd, site[1]) + ':' + site[2] + ':' + site[3]);
+      }
       if (decl) context.valueRecords.set(node, recordsById.get(decl.id) || decl);
     }
     if (position?.file && name && !node.isImplicit) {

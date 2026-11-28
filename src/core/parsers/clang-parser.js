@@ -56,6 +56,12 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     }
     for (const node of unit.globals) {
       const def = variableModel(node, unit);
+      // extern 重声明继承此前在同一编译单元内可见的内部链接。
+      const prior = defs.get(localVars.get(node.previousDecl));
+      if (prior?.isStatic) {
+        def.id = prior.id;
+        def.isStatic = true;
+      }
       const prev = defs.get(def.id);
       if (!prev || (prev.isExtern && !def.isExtern)) defs.set(def.id, def);
       localVars.set(node.id, def.id);
@@ -77,7 +83,13 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const resolveVariable = (ref, unit) => ref?.kind === 'VarDecl' ? varDecls.get(unit).get(ref.id) : undefined;
 
   // AST 地址只在单个编译单元内唯一。局部对象用声明节点本身作为键。
-  const objectKey = (decl, unit) => resolveVariable(decl, unit) ?? unit.declarations.get(decl?.id)?.node;
+  const objectKey = (decl, unit) => {
+    const id = resolveVariable(decl, unit);
+    if (!id) return unit.declarations.get(decl?.id)?.node;
+    const def = defs.get(id);
+    // 头文件里的 static 只有一个源码声明，每个编译单元却分别分配存储。
+    return def.isStatic && def.file !== unit.unit.rel ? JSON.stringify([unit.unit.rel, id]) : id;
+  };
   const tables = new Map(), addressTaken = new Map(), calls = [], byRecordField = new Map(), declWrites = new Map();
   // 同一头文件声明在不同编译单元有不同 AST id，但共享源码位置。
   const fieldKey = (unit, id) => {
@@ -123,7 +135,9 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     const slots = pointerSlots(node, unit, resolveFunction, candidateSlots,
       (id, slot, target, unionId) => indexField(fields, unit, id, slot, target, unionId), sourceSlots);
     if (slots.size || candidateSlots.size) {
-      tables.set(objectKey(node, unit), { slots, candidateSlots, sourceSlots, constant: hasConstSlots(node) });
+      const key = objectKey(node, unit), id = resolveVariable(node, unit);
+      tables.set(key, { slots, candidateSlots, sourceSlots, constant: hasConstSlots(node), def: defs.get(id),
+        translationUnit: id && key !== id ? unit.unit.rel : null });
     }
   };
   const definitionOf = (ref, unit) => {
@@ -288,7 +302,21 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const edges = new Map(), callTargets = new WeakMap(), indirectCalls = [];
   const includes = new Map();
   for (const unit of units) for (const entry of unit.loc.includes) includes.set(...entry);
-  for (const { record, node, callee, ref } of calls) {
+  const sourceSite = (fn, pos) => `${fn.id}@${pos?.line ?? fn.line}:${pos?.col ?? 0}`;
+  const fixedTarget = (pointer, table) => pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+  // 头文件函数的各实例在图中共用一个源码调用点。仅当各实例一致时才把它标为精确。
+  const headerSites = new Map();
+  for (const call of calls) {
+    const { context, fn } = call.record;
+    if (call.ref || fn.file === context.unit.rel || recordsById.get(fn.id).length < 2) continue;
+    const id = sourceSite(fn, context.loc.begin(call.node));
+    if (!headerSites.has(id)) headerSites.set(id, new Set());
+    call.headerTargets = headerSites.get(id);
+    call.pointer = pointerExpression(call.callee, context);
+    const table = tables.get(objectKey(call.pointer?.decl, context));
+    call.headerTargets.add(fixedTarget(call.pointer, table) || null);
+  }
+  for (const { record, node, callee, ref, headerTargets, pointer: headerPointer } of calls) {
     const { context, fn } = record;
     const pos = context.loc.begin(node);
     const line = pos?.line ?? fn.line;
@@ -300,15 +328,16 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       if (macro) via = context.loc.token(macro) || ref.referencedDecl.name;
     } else {
       kind = 'fnptr';
-      siteId = `${fn.id}@${line}:${pos?.col ?? 0}`;
-      const pointer = pointerExpression(callee, context);
+      siteId = sourceSite(fn, pos);
+      const pointer = headerTargets ? headerPointer : pointerExpression(callee, context);
+      const provenance = headerTargets ? { translationUnit: context.unit.rel } : {};
       const expression = context.loc.text(callee) || pointer?.decl?.name || '<间接调用>';
       const signature = functionSignature(typeOf(callee), context);
       const varKey = objectKey(pointer?.decl, context);
       const table = tables.get(varKey);
       const tracked = pointer?.decl ? readerFor(record).atCall(pointer, node) : null;
       // 空数组表示追踪过该成员，但目前的值未知；不能重新引入旧初始化值。
-      const exact = tracked === null && pointer?.exact && table?.constant && table.slots.get(pointer.slot);
+      const exact = tracked === null && (headerTargets?.size ?? 1) === 1 && fixedTarget(pointer, table);
       const targets = addressTaken.get(signature);
       // C 的旧式无原型函数也可能与调用签名兼容。已证明同一槽位的值不需要这个回退筛选。
       const resultType = signature.split('(')[0], oldStyle = resultType + '()';
@@ -337,7 +366,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       }
       const fieldCandidates = new Set();
       let unknownValue = tracked?.unknown || tracked?.parameters.length > 0 || writtenValues.some(v => v.unknown || v.parameters.length > 0);
-      const knownObject = tracked || table || (!pointer?.throughPointer && defs.has(varKey) && !defs.get(varKey).isExtern) || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
+      const variable = defs.get(resolveVariable(pointer?.decl, context));
+      const knownObject = tracked || table || (!pointer?.throughPointer && variable && !variable.isExtern) || (pointer?.decl?.kind === 'VarDecl' && !pointer.throughPointer &&
         (pointer.member || objectWrites.length || /\[[^\]]*\]$/.test(typeOf(pointer.decl))));
       if (pointer?.fieldId && !knownObject) {
         const location = fieldLocation(context, pointer.fieldId, pointer.slot, pointer.unionId);
@@ -359,7 +389,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           resolution = 'unresolved';
           const fallbackList = [...new Set([...slotTargets, ...fieldCandidates])];
           indirectCalls.push({
-            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId, ...provenance,
             expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
             resolution, truncated: false, matchedSlots: fallbackList.length,
             candidates: fallbackList.map(id => ({ slot: pointer?.sourceSlot || '', name: (functions.get(id) || externals.get(id))?.name || id, id })),
@@ -400,7 +430,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
             id,
           }));
           indirectCalls.push({
-            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId,
+            caller: fn.id, callerName: fn.name, file: fn.file, line, col: pos?.col, siteId, ...provenance,
             expr: expression, receiver: pointer?.decl?.name || null, member: pointer?.member || null,
             resolution, truncated: (combinedSlots.length || fieldCandidates.size || signatureTargets?.size || 0) > 32,
             matchedSlots: icCands.length, candidates: icCands,
@@ -440,8 +470,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
   const model = { root, files, functions: [...functions.values()], externals: [...externals.values()],
     edges: [...edges.values()], macros, externalDeps, _df: df, includes: [...includes.values()], warnings, indirectCalls,
     enumConstants: [...enumConstants.values()], enumDeclarations: [...enumDeclarations.values()],
-    fnptrTables: [...tables].filter(([id]) => defs.has(id)).map(([id, { slots, sourceSlots }]) => ({
-      id, name: defs.get(id).name, file: defs.get(id).file,
+    fnptrTables: [...tables.values()].filter(t => t.def).map(({ def, slots, sourceSlots, translationUnit }) => ({
+      id: def.id, name: def.name, file: def.file, ...(translationUnit ? { translationUnit } : {}),
       map: Object.fromEntries([...slots].map(([slot, to]) => [sourceSlots.get(slot) ?? slot, (functions.get(to) || externals.get(to)).name])),
     })),
   };

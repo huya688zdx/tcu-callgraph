@@ -267,7 +267,7 @@ test('Clang 聚合复制按复制时的声明和成员解析回调', requiresCla
     for (const [caller, expected] of Object.entries({
       declare: [['alpha'], ['beta']], assign: [['alpha']], chain: [['alpha']],
       member: [['alpha'], []], designated: [['alpha']], choose: [['alpha', 'beta']],
-      partial: [['alpha']], overwrite: [[]], branch: [['alpha', 'beta']],
+      partial: [policy === 'expand' ? ['alpha','beta','noise'] : ['alpha']], overwrite: [policy === 'expand' ? ['alpha','beta','noise'] : []], branch: [['alpha', 'beta']],
       sparse: [['alpha']], chain_assign: [['alpha'], ['beta']], loop: [['alpha','beta']], branches: [['alpha'], ['beta']], jump: [['alpha']],
       dynamic: [['alpha','beta']], literal: [['alpha','beta'], ['beta']], unknownptr: [[]], again: [['alpha']],
       snapshots: [['beta'], ['noise'], ['alpha']], shadow: [['beta'], ['alpha']], isolated: [['noise']],
@@ -662,4 +662,112 @@ void immutable(void) { fixed.a.slots[0](); }`);
     assert.deepEqual(model.fnptrTables.find(t => t.name === 'fixed').map,
       { '.b.cb':'first', '.b.slots[0]':'second', '.b.slots[1]':'third' });
   });
+});
+
+test('Clang 不透明聚合返回值保留同签名候选与已知零成员', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void); typedef int (*Other)(int);
+typedef struct { Fn cb; Fn slots[2]; } Ops; typedef struct { int tag; Ops ops; } Box;
+void first(void) {} void second(void) {} int wrong(int n) { return n; }
+static Fn const evidence[]={first,second}; static Other other=wrong;
+Ops make(void); Box make_box(void);
+void returned(void) { Ops x=make(); x.cb(); x.slots[1](); }
+void nested(void) { Box x=make_box(); Ops copy=x.ops; copy.slots[0](); }
+void branch(int n) { Ops x=n?(Ops){.cb=first}:make(); x.cb(); }
+void rewritten(void) { Ops x=make(); x.cb=second; x.cb(); x=(Ops){0}; if(x.cb) x.cb(); }
+void zeros(void) { Box x={.tag=7}; if(x.ops.cb) x.ops.cb(); Ops y={.cb=0}; if(y.slots[1]) y.slots[1](); }`);
+  await checkCallbackFlow(t, root, policy => {
+    const unknown = policy === 'expand' ? ['first', 'second'] : [];
+    return { returned: [unknown, unknown], nested: [unknown], branch: [policy === 'expand' ? unknown : ['first']],
+      rewritten: [['second'], []], zeros: [[], []] };
+  });
+});
+
+test('Clang 头文件静态回调在各编译单元独立，外部链接回调共享', requiresClang, async t => {
+  const root = project(t, `#define INITIAL first
+#include "callbacks.h"
+void first(void) {} void second(void) {} void changed(void) {}
+Fn shared=first;
+extern Fn private_cb;
+void mutate(void) { private_cb=changed; ops.cb=changed; unset=changed; }
+void a_read(void) { fixed(); private_cb(); ops.cb(); shared(); if(unset) unset(); }`);
+  fs.renameSync(path.join(root, 'main.c'), path.join(root, 'a.c'));
+  fs.writeFileSync(path.join(root, 'b.c'), `#define INITIAL second
+#include "callbacks.h"
+void update_shared(void) { shared=second; }
+void b_read(void) { fixed(); private_cb(); ops.cb(); shared(); if(unset) unset(); }
+void call_other(void) { private_cb=second; mutate(); private_cb(); }`);
+  fs.writeFileSync(path.join(root, 'callbacks.h'), `typedef void (*Fn)(void);
+void first(void); void second(void); void changed(void); void mutate(void);
+static Fn const fixed=INITIAL, stable=first;
+static Fn private_cb=INITIAL, unset;
+static struct { Fn cb; } ops={INITIAL};
+extern Fn shared;
+static inline void in_header(void) { private_cb(); }
+static inline void header_fixed(void) { fixed(); stable(); }`);
+  for (const policy of ['strict', 'expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [file, initial, candidates] of [['a', 'first', ['changed', 'first']], ['b', 'second', ['second']]]) {
+      await t.test(policy + ' ' + file, () => {
+        const caller = file + '.c::' + file + '_read';
+        const edges = model.edges.filter(e => e.kind === 'fnptr' && e.from === caller);
+        assert.deepEqual(edges.filter(e => e.resolution === 'exact').map(e => e.callee), [initial]);
+        const sites = model.indirectCalls.filter(s => s.caller === caller).sort((a, b) => a.col - b.col);
+        const expected = [candidates, candidates, ['first', 'second'], file === 'a' ? ['changed'] : []];
+        assert.deepEqual(sites.map(s => s.candidates.map(c => c.name).sort()), expected);
+        assert.deepEqual(sites.map(s => edges.filter(e => e.siteId === s.siteId && !e.to.startsWith('ext::')).map(e => e.callee).sort()),
+          policy === 'strict' ? expected.map(() => []) : expected);
+      });
+    }
+    await t.test(policy + ' 跨单元调用', () => {
+      const site = model.indirectCalls.find(s => s.caller === 'b.c::call_other');
+      assert.deepEqual(site.candidates.map(c => c.name), ['second']);
+      const fromHeader = model.indirectCalls.filter(s => s.caller === 'callbacks.h::in_header');
+      assert.deepEqual(fromHeader.map(s => s.candidates.map(c => c.name).sort().join(', ')).sort(), ['changed, first', 'second']);
+    });
+    await t.test(policy + ' 同一头文件调用点', () => {
+      const caller = 'callbacks.h::header_fixed';
+      const edges = model.edges.filter(e => e.from === caller && e.kind === 'fnptr');
+      assert.deepEqual(edges.filter(e => e.resolution === 'exact').map(e => e.callee), ['first']);
+      const alternatives = model.indirectCalls.filter(s => s.caller === caller);
+      assert.deepEqual(alternatives.map(s => [s.translationUnit, s.candidates.map(c => c.name)]).sort(),
+        [['a.c', ['first']], ['b.c', ['second']]]);
+      assert.deepEqual(edges.filter(e => e.resolution === 'possible').map(e => e.callee).sort(),
+        policy === 'strict' ? [] : ['first', 'second']);
+    });
+    await t.test(policy + ' 表初始值', () => {
+      const tables = model.fnptrTables.filter(t => t.name === 'fixed');
+      assert.deepEqual(tables.map(t => [t.translationUnit, t.map['']]).sort(), [['a.c', 'first'], ['b.c', 'second']]);
+      assert.equal(model.fnptrTables.filter(t => t.name === 'shared').length, 1);
+    });
+  }
+});
+
+test('Clang 同一调用的兄弟实参允许两种求值顺序', requiresClang, async t => {
+  const root = project(t, `typedef int (*Fn)(void); typedef int (*WithArg)(int);
+int first(void){return 1;} int second(void){return 2;} int noise(void){return 3;}
+Fn cb=first, spare=noise;
+int set(void){cb=second; return 0;} int setter(Fn *p){*p=second; return 0;}
+int take(int a,int b){return a+b;} int after_args(int a,int b){cb=second;return a+b;}
+int forward(void){cb=first; return take(cb(),set());}
+int reverse(void){cb=first; return take(set(),cb());}
+int nested(void){cb=first; return take(take(1,cb()),take(set(),0));}
+int local(void){Fn p=first; return take(p(),setter(&p));}
+int local_reverse(void){Fn p=first; return take(setter(&p),p());}
+int local_nested(int n){Fn p=first; return take(p(),n?setter(&p):0);}
+int separate(void){cb=first;int v=cb();set();return v;}
+int comma_order(void){cb=first;return take((cb(),set()),0);}
+int short_order(void){cb=first;return take(cb() && set(),0);}
+int exclusive(int n){cb=first;return take(n?cb():set(),0);}
+int outer(void){cb=first;return after_args(cb(),0);}
+int reset(void){cb=first;take(0,set());cb=first;return cb();}
+int a1(int n){return n;} int a2(int n){return n+1;}
+WithArg arg=a1; int choose(void){arg=a2;return 1;}
+int designator(void){arg=a1;return arg(choose());}
+int snapshot(void){arg=a1;WithArg saved=arg;return saved(choose());}`);
+  const both = ['first', 'second'], first = ['first'];
+  await checkCallbackFlow(t, root, () => ({
+    forward: [both], reverse: [both], nested: [both],
+    local: [both], local_reverse: [both], local_nested: [both], separate: [first], comma_order: [first],
+    short_order: [first], exclusive: [first], outer: [first], reset: [first], designator: [['a1', 'a2']], snapshot: [['a1']],
+  }));
 });

@@ -1925,7 +1925,7 @@ export async function runAiAgent({
           latestHealthReport = output.healthReport;
           if (!isSubagent) onEvent({ type: 'health_report', report: output.healthReport });
         }
-        if (output.canvasOverlay && typeof output.canvasOverlay === 'object' && !isSubagent) {
+        if (output.canvasOverlay && typeof output.canvasOverlay === 'object' && !output.presentation?.steps?.length && !isSubagent) {
           onEvent({ type: 'canvas_overlay', ...output.canvasOverlay });
         }
         if (Array.isArray(output._events)) {

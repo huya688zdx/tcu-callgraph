@@ -3402,3 +3402,85 @@ test('浏览器在 AI 提问卡片中撤销已保存的书签', async t => {
   assert.ok(!(await list()).some(b => b.name === name));
   assert.ok(await br.evaluate("!document.querySelector('.ai-question-opts button').disabled"));
 });
+
+test('浏览器分步导览按当前步骤绘制，退出后可独立播放动画', async t => {
+  try { resolveChromePath(); } catch (err) { t.skip(err.message); return; }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-guide-step-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'guide.c'), 'void leaf(void) {}\nvoid mid(void) {leaf();}\nvoid start(void) {mid();}');
+  const srv = await launchServer({ target: root });
+  t.after(srv.close);
+  const ids = ['start', 'mid', 'leaf'].map(name => 'guide.c::' + name);
+  const { post } = await mockAiTurn(t, srv.baseUrl, last => {
+    if (last.role !== 'user') return [];
+    if (last.content.includes('独立动画')) {
+      return [['canvas_visual', { action: 'play_flow', nodeIds: [ids[2]], edgeKeys: [ids[1] + '->' + ids[2] + ':2'] }]];
+    }
+    return [['present_logic', { root: ids[0], direction: 'down', depth: 2, includeDataflow: false, mode: 'replace', title: '逐层查看' }]];
+  });
+  await post('/api/page', { roots: [ids[0]], up: 0, down: 2, groupMode: 'flat' });
+  const br = await launchCdp({ url: srv.baseUrl });
+  t.after(() => br.close());
+  await br.waitFor('window.__cg?.view?.nodes.length === 3');
+  await br.evaluate("document.getElementById('aiBtn').click()");
+  await br.waitFor("document.getElementById('aiModel').value === 'mock'");
+  const send = prompt => br.evaluate(`(() => {
+    const input = document.getElementById('aiPromptInput');
+    input.value = ${JSON.stringify(prompt)};
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    document.getElementById('aiSendChat').click();
+  })()`);
+  const sample = () => br.evaluate(`(async () => {
+    const { state, cam, els } = await import('/lib/state.js');
+    const { draw } = await import('/lib/render.js');
+    (await import('/lib/camera.js')).stopCamAnim();
+    const oldCamera = { ...cam }, d = devicePixelRatio;
+    // 将每个真实节点的上边框移入相同采样框，避开边的连入点。
+    const painted = ${JSON.stringify(ids)}.map(id => {
+      const node = state.view.nodes.find(n => n.id === id);
+      Object.assign(cam, { k: 1, x: 100 - node.x - node.w / 3, y: 100 - node.y });
+      draw();
+      const pixels = els.ctx.getImageData(100 * d - 8, 100 * d - 3, 16, 7).data;
+      for (let i = 0; i < pixels.length; i += 4) {
+        const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+        if (pixels[i + 3] > 200 && r - g > 35 && b - r > 70 && b - g > 100) return true;
+      }
+      return false;
+    });
+    // 临时分开两条真实调用边，直接采样动画层的两行粒子，排除框、文字和箭头。
+    const edges = ${JSON.stringify(ids.slice(0, 2))}.map(id => state.view.edges.find(e => e.from === id));
+    const paths = edges.map(e => e.points);
+    edges.forEach((e, i) => {
+      const y = -6900 + i * 70;
+      e.points = [[-5000, y], [-4780, y]];
+    });
+    Object.assign(cam, { k: 1, x: 5020, y: 7020 });
+    draw();
+    const effects = document.getElementById('cvEffects')?.getContext('2d');
+    const flow = [120, 190].map(y => {
+      const pixels = effects?.getImageData(24 * d, (y - 5) * d, 200 * d, 10 * d).data;
+      return Boolean(pixels?.some((value, i) => i % 4 === 3 && value > 40));
+    });
+    edges.forEach((e, i) => { e.points = paths[i]; });
+    Object.assign(cam, oldCamera);
+    draw();
+    const counter = document.getElementById('aiPresentationHud').hidden ? null : document.getElementById('aiPresHudCounter').textContent;
+    return { painted, flow, counter, action: state.aiOverlay?.action ?? null, nodes: state.aiOverlay?.nodeIds ?? [] };
+  })()`);
+  const stage = (name, active, counter, flow, action = 'highlight') => t.test(name, async () => {
+    assert.deepEqual(await sample(), { painted: ids.map(id => id === active), flow, counter, action, nodes: active ? [active] : [] });
+  });
+
+  await send('分步导览');
+  await br.waitFor("window.__cg.presentation?.steps.length === 3 && document.getElementById('aiStopChat').hidden");
+  await stage('首步', ids[0], '1/3', [true, false]);
+  await br.evaluate("document.getElementById('aiPresNext').click()");
+  await stage('下一步', ids[1], '2/3', [true, true]);
+  await br.evaluate("document.getElementById('aiPresNext').click()");
+  await stage('最后一步', ids[2], '3/3', [false, true]);
+  await br.evaluate("document.getElementById('aiPresClose').click()");
+  await stage('退出', null, null, [false, false], null);
+  await send('独立动画');
+  await br.waitFor("window.__cg.aiOverlay?.action === 'play_flow' && document.getElementById('aiStopChat').hidden");
+  await stage('独立动画', ids[2], null, [false, true], 'play_flow');
+});

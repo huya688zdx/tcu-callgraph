@@ -5398,7 +5398,8 @@ export const server = http.createServer(async (req, res) => {
             edgeKeys: [...new Set(sliceEdges.map(presentationEdgeKey))].slice(0, 80),
             label: presTitle,
           };
-          if (composedResult) sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
+          // 浏览器会从对话流启动逐步导览。无浏览器发起的请求仍向观察画布广播全图摘要。
+          if (composedResult && !chatClientId) sendClientEvent(chatClientId, 'canvas_overlay', canvasOverlay);
           return {
             ok: true,
             title: presTitle,
