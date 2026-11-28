@@ -1158,3 +1158,84 @@ test('Clang 聚合中保存回调槽地址时追踪实际写入及独立成员',
     assert.deepEqual(edges.map(e => [e.callee,e.resolution]), [['initial','exact']]);
   });
 });
+
+const atomicCallbackSource = `#include <stdatomic.h>
+typedef int (*Fn)(void);
+typedef _Atomic(Fn) Slot;
+typedef struct { Slot a, b; } Pair;
+int old_result(void) { return 1; } int new_result(void) { return 2; } int sibling(void) { return 3; }
+int direct(void){_Atomic(Fn) fn=old_result; atomic_store(&fn,new_result); return fn();}
+int exchange_old(void){Slot fn=old_result; Fn prev=atomic_exchange(&fn,new_result); return prev()*10+fn();}
+int cas(int fail){Slot fn=old_result; Fn expected=fail?sibling:old_result;
+  int ok=atomic_compare_exchange_strong(&fn,&expected,new_result); return fn()*10+expected()+0*ok;}
+int loaded(void){Slot fn=old_result; return atomic_load(&fn)();}
+int explicit_ops(void){Slot fn=old_result; atomic_store_explicit(&fn,new_result,memory_order_relaxed);
+  return atomic_load_explicit(&fn,memory_order_acquire)();}
+int init_call(void){Slot fn; atomic_init(&fn,new_result); return fn();}
+int nested(void){Pair p={old_result,sibling}; atomic_store(&p.a,new_result); return p.a()*10+p.b();}
+int alias(int flag){Pair p={old_result,sibling}; Slot *q=flag?&p.a:&p.b; atomic_store(q,new_result); return p.a()*10+p.b();}
+void set(Slot *p){atomic_store(p,new_result);}
+int helper(void){Slot fn=old_result; set(&fn); return fn();}
+int readonly(void){Slot fn=old_result; (void)atomic_load(&fn); return fn();}
+int dormant(void){Slot fn=old_result; (void)sizeof((atomic_store(&fn,new_result),0)); return fn();}
+#define SAVE(p,v) atomic_store((p),(v))
+int wrapper(void){Slot fn=old_result; SAVE(&fn,new_result); return fn();}
+int old_calls(void){Slot fn=old_result; int previous=atomic_exchange(&fn,new_result)(); return previous*10+fn();}
+int gnu_ops(void){Fn fn=old_result; __atomic_store_n(&fn,new_result,0); return __atomic_load_n(&fn,0)();}
+int gnu_buf(void){Fn fn=old_result, value=new_result, out=0; __atomic_store(&fn,&value,0); __atomic_load(&fn,&out,0); return out();}
+int weak_case(int fail){Slot fn=old_result; Fn expected=fail?sibling:old_result; (void)atomic_compare_exchange_weak_explicit(&fn,&expected,new_result,memory_order_relaxed,memory_order_relaxed); return fn()*10+expected();}
+static Slot shared=old_result;
+void reset_shared(void){atomic_store(&shared,new_result);}
+int global_set(void){shared=old_result; reset_shared(); return shared();}
+int conditional_address(int i){Pair p={old_result,sibling}; atomic_store(i?&p.a:&p.b,new_result); return p.a()*10+p.b();}
+int gnu_exchange(void){Fn fn=old_result, desired=new_result, out=sibling; __atomic_exchange(&fn,&desired,&out,0); return out()*10+fn();}
+int later_store(void){Slot fn=old_result; atomic_store(&fn,new_result); fn=sibling; return fn();}
+int exchange_buffer_alias(void){Fn fn=old_result, both=new_result; __atomic_exchange(&fn,&both,&both,0); return both()*10+fn();}
+int gnu_cas(void){Fn fn=old_result, expected=sibling, desired=new_result; (void)__atomic_compare_exchange(&fn,&expected,&desired,0,0,0); return fn()*10+expected();}
+int mismatch(void){Slot fn=old_result; Fn expected=sibling; (void)atomic_compare_exchange_strong(&fn,&expected,new_result); return expected();}
+Slot *external_slot(Slot *,Slot *);
+int opaque_choice(void){Pair p={old_result,sibling}; atomic_store(external_slot(&p.a,&p.b),new_result); return p.a()*10+p.b();}
+int cleared(void){Slot fn=old_result; atomic_store(&fn,0); if(fn) return fn(); return 0;}
+`;
+
+test('Clang 按存储位置识别原子回调读写和返回的旧值', requiresClang, async t => {
+  const root = project(t, atomicCallbackSource);
+  const old = ['old_result'], replacement = ['new_result'], other = ['sibling'];
+  const mayChange = ['new_result','old_result'], expected = ['old_result','sibling'];
+  const secondSlot = ['new_result','sibling'];
+  await checkCallbackFlow(t, root, policy => ({
+    direct: [replacement], wrapper: [replacement], explicit_ops: [replacement], init_call: [replacement],
+    exchange_old: [old,replacement], old_calls: [old,replacement], cas: [mayChange,expected], weak_case: [mayChange,expected],
+    loaded: [old], readonly: [old], dormant: [old], nested: [replacement,other], alias: [mayChange,secondSlot],
+    conditional_address: [mayChange,secondSlot], helper: [{ required: replacement, allowed: mayChange }],
+    global_set: [{ required: replacement, allowed: mayChange }], later_store: [other],
+    gnu_ops: [replacement], gnu_buf: [replacement], gnu_exchange: [old,replacement], exchange_buffer_alias: [old,replacement],
+    gnu_cas: [mayChange,expected], mismatch: [expected], cleared: [[]],
+    opaque_choice: policy === 'strict' ? [old,other] : [
+      {required:mayChange,allowed:['new_result','old_result','sibling']},
+      {required:secondSlot,allowed:['new_result','old_result','sibling']},
+    ],
+  }));
+});
+
+test('Clang 按存储位置识别原子操作，缺少操作名时保留目标不确定性', requiresClang, async t => {
+  const root = project(t, atomicCallbackSource);
+  const execClang = (file, args, {cwd}) => {
+    const ast = JSON.parse(execFileSync(clang.bin, args, {cwd, encoding:'utf8', maxBuffer:8*1024*1024}));
+    function omitName(node) {
+      if (node.kind === 'AtomicExpr') delete node.name;
+      for (const child of node.inner || []) omitName(child);
+    }
+    omitName(ast);
+    return ast;
+  };
+  for (const policy of ['strict','expand']) await t.test(policy, async () => {
+    const model = await buildIndex(root, {...options,parserOptions:{execClang,dispatchPolicy:policy}});
+    const sites = model.indirectCalls.filter(s => s.caller === 'main.c::nested').sort((a,b)=>a.col-b.col);
+    assert.equal(sites.length,2);
+    assert.equal(sites[0].resolution,policy === 'strict' ? 'unresolved' : 'possible');
+    if (policy === 'expand') assert.ok(sites[0].candidates.some(c => c.name === 'new_result'));
+    assert.deepEqual(sites[1].candidates.map(c=>c.name),['sibling']);
+    assert.ok(!model.edges.some(e=>e.from === 'main.c::nested' && e.kind === 'fnptr' && e.resolution === 'exact'));
+  });
+});

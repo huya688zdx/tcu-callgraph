@@ -1571,7 +1571,21 @@ export async function compactConversation({ config, messages, fetchImpl = fetch,
 }
 
 /** 运行直连模型的工具调用闭环，支持自动从标准 tools 平滑降级到旧版纯对话模式。 */
-export async function runAiAgent({
+export async function runAiAgent(options) {
+  const toolLog = [];
+  const onEvent = event => { if (!options.signal?.aborted) options.onEvent?.(event); };
+  // 工具写入可以先于错误或取消发生。收尾只运行一次，已断开的流不再发布事件。
+  let finalization;
+  const finalize = (interrupted = false) => finalization ??= Promise.resolve().then(() => options.beforeDone?.({ toolLog, onEvent, interrupted }));
+  try {
+    return await runTurn({ ...options, onEvent }, toolLog, finalize);
+  } catch (error) {
+    await finalize(true);
+    throw error;
+  }
+}
+
+async function runTurn({
   config,
   prompt,
   images = [],
@@ -1586,8 +1600,7 @@ export async function runAiAgent({
   allowedTools = null,
   systemPromptOverride = '',
   isSubagent = false,
-  beforeDone = null,
-}) {
+}, toolLog, finalize) {
   signal?.throwIfAborted();
   const { chatUrl } = normalizeBaseUrl(config?.baseUrl);
   if (!chatUrl) throw new Error('尚未配置模型 API 地址，请先在「直连 API」中填写');
@@ -1660,7 +1673,6 @@ export async function runAiAgent({
     userMessage,
   ];
   const allThoughts = [];
-  const toolLog = [];
   const collectedChains = [];
   const seenChainIds = new Set();
   let latestPresentation = null;
@@ -1690,7 +1702,7 @@ export async function runAiAgent({
   const finish = (...args) => terminalResult ??= finishTurn(...args);
   async function finishTurn(answer, suggestions = [], question = null) {
     signal?.throwIfAborted();
-    const extra = typeof beforeDone === 'function' ? (await beforeDone({ toolLog, onEvent })) || {} : {};
+    const extra = await finalize() || {};
     signal?.throwIfAborted();
     const result = {
       ok: true,

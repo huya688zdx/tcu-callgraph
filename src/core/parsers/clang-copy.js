@@ -1,4 +1,4 @@
-import { children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
+import { callbackChildren, children, constIndexValue, evaluatedChildren, fnRef, initializer, initializerMembers, pointerExpression, transferredValues, typeOf, unwrap, walkEvaluated } from './clang-ast.js';
 
 // 只匹配完整字段和下标。运行时下标可以匹配具体下标，不能越过一层数组或字段。
 const parts = slot => slot.match(/\.[^.\[]+|\[[^\]]+\]/g) || [];
@@ -350,7 +350,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     }
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
     const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
-    const items = evaluatedChildren(node);
+    const items = callbackChildren(node);
     const nested = node.array_filler ? [...items, ...node.array_filler] : items;
     const call = node.kind === 'CallExpr' && node;
     const siblings = call && nested.length > 1;
@@ -377,15 +377,15 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       events.push({ key, value, point });
     } else if (node.kind === 'BinaryOperator' && node.opcode === '=') {
       const [target, value] = children(node), lhs = pointerExpression(target, unit);
-      if (lhs && !lhs.throughPointer) remember(objectKey(lhs.decl, unit), lhs.slot, value, point);
+      if (lhs && !lhs.throughPointer) remember(objectKey(lhs.decl, unit), lhs.slot, value, point, node.weak);
       events.push({ node, lhs, value, point });
     } else if (call || node.kind === 'ReturnStmt') events.push({ node, call, point });
   }
   visit(record.body, new Map(), null);
   // 先取得完整程序点，再按真实写入顺序投影。循环回边和同一调用的兄弟实参可读到源码靠后的地址。
-  for (const { lhs, value, point } of events) if (lhs?.throughPointer && canCarry(value)) {
+  for (const { node, lhs, value, point } of events) if (lhs?.throughPointer && canCarry(value)) {
     const destinations = objectSlots(lhs, point);
-    for (const dest of destinations) remember(dest.key, dest.slot, value, point, dest.weak || destinations.length > 1);
+    for (const dest of destinations) remember(dest.key, dest.slot, value, point, node.weak || dest.weak || destinations.length > 1);
     if (destinations.length) addressCache = new WeakMap();
   }
   for (const { node, key, lhs, value, point, call } of events) {
@@ -395,7 +395,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     } else if (node.kind === 'BinaryOperator') {
       const destinations = objectSlots(lhs, point);
       for (const dest of destinations) {
-        add(dest.key, dest.slot, value, point, true, dest.weak || destinations.length > 1);
+        add(dest.key, dest.slot, value, point, true, node.weak || dest.weak || destinations.length > 1);
         if (lhs.throughPointer && writesByNode.has(node)) noteAddressWrite(dest.key, dest.slot, writesByNode.get(node));
       }
       if (lhs?.throughPointer && (!destinations.length || destinations.some(d => d.unknown))) indirectActions.push(point);
@@ -455,7 +455,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       value = unwrap(value);
       if (!value) return;
       if (rest === '.?') uncertainLayout = true;
-      if (--budget < 0 || depth > 32) { unknown = true; return; }
+      if (--budget < 0 || depth > 32 || value.kind === 'UnknownAtomicValue') { unknown = true; return; }
       if (value.kind === 'ImplicitValueInitExpr' || value.kind === 'GNUNullExpr' ||
           (value.kind === 'IntegerLiteral' && value.value === '0')) return;
       if (value.kind === 'ConditionalOperator') {

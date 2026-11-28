@@ -268,7 +268,7 @@ export function readTranslationUnit(ast, root, unit, files) {
     const { id, kind, name } = node;
     if (kind === 'GenericSelectionExpr' && !genericResult(node)) unknownSelections.add(node);
     const newScope = ['FunctionDecl', 'CompoundStmt', 'ForStmt'].includes(kind);
-    if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator'].includes(kind))) {
+    if (insideFunction && (newScope || ['VarDecl', 'CallExpr', 'BinaryOperator', 'AtomicExpr'].includes(kind))) {
       context.scopeOf.set(node, parentScope);
     }
     if (newScope) recordScopes.push(new Map());
@@ -501,8 +501,67 @@ export function normalizeRecordBaseType(type, context) {
   return cleaned;
 }
 
+// Clang 的 AtomicExpr 按 AST 顺序放置内存序、期望值和新值。只给回调分析投影读写；
+// 原始操作数仍各求值一次。exchange 的结果和比较失败时回写的值都来自更新前的槽。
+const atomicModels = new WeakMap();
+function atomicModel(node) {
+  if (atomicModels.has(node)) return atomicModels.get(node);
+  const args = children(node), [address, second, value, fourth, desired] = args;
+  const model = { effects: [], result: null };
+  atomicModels.set(node, model);
+  function pointee(pointer) {
+    const raw = unwrap(pointer);
+    if (raw?.kind === 'UnaryOperator' && raw.opcode === '&') return children(raw)[0];
+    return { kind: 'UnaryOperator', opcode: '*', atomicPointee: true,
+      type: { qualType: typeOf(pointer).replace(/\s*\*\s*(?:const|volatile|restrict)?\s*$/, '') }, inner: [pointer] };
+  }
+  const slot = pointee(address);
+  function previous() {
+    const temp = { kind: 'CompoundLiteralExpr', type: slot.type, atomicEffect: node, inner: [slot] };
+    model.effects.push(temp);
+    return { kind: 'DeclRefExpr', referencedDecl: temp, type: slot.type };
+  }
+  function write(target, source, weak = false) {
+    model.effects.push({ kind: 'BinaryOperator', opcode: '=', atomicEffect: node, weak, inner: [target, source] });
+  }
+  switch (node.name + '/' + args.length) {
+    case '__c11_atomic_init/2': write(slot, second); break;
+    case '__c11_atomic_load/2': case '__atomic_load_n/2': model.result = previous(); break;
+    case '__atomic_load/3': write(pointee(value), previous()); break;
+    case '__c11_atomic_store/3': case '__atomic_store_n/3': write(slot, value); break;
+    case '__atomic_store/3': write(slot, pointee(value)); break;
+    case '__c11_atomic_exchange/3': case '__atomic_exchange_n/3':
+      model.result = previous(); write(slot, value); break;
+    case '__atomic_exchange/4': {
+      const old = previous();
+      write(slot, pointee(value));
+      write(pointee(fourth), old);
+      break;
+    }
+    case '__c11_atomic_compare_exchange_strong/5': case '__c11_atomic_compare_exchange_weak/5':
+    case '__atomic_compare_exchange_n/6': case '__atomic_compare_exchange/6': {
+      const old = previous();
+      write(slot, node.name === '__atomic_compare_exchange' ? pointee(desired) : desired, true);
+      write(pointee(value), old, true);
+      break;
+    }
+    default:
+      // 旧 AST 可能缺少操作名；涉及的可写对象保留未知值，不能把初始化器当作完整证据。
+      for (const arg of args) if (typeOf(arg).includes('*') && !fnRef(arg)) {
+        write(pointee(arg), { kind: 'UnknownAtomicValue' }, true);
+      }
+  }
+  return model;
+}
+export function callbackChildren(node) {
+  if (node.atomicEffect) return [];
+  const items = evaluatedChildren(node);
+  return node.kind === 'AtomicExpr' ? [...items, ...atomicModel(node).effects] : items;
+}
+
 export function pointerExpression(node, context = null) {
   node = unwrap(node);
+  if (node?.kind === 'AtomicExpr') return pointerExpression(atomicModel(node).result, context);
   if (node?.kind === 'DeclRefExpr' || node?.kind === 'CompoundLiteralExpr') {
     return { decl: node.referencedDecl || node, slot: '', sourceSlot: '', member: null,
       baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
@@ -535,7 +594,9 @@ export function pointerExpression(node, context = null) {
   if (node.kind === 'UnaryOperator' && node.opcode === '*') {
     const operand = children(node)[0], base = pointerExpression(operand, context);
     // (*cb)() 对函数指示符的解引用等价于 cb()，而 (*slot)() 仍需读取另一个对象。
-    if (context && cleanType(typeOf(node), context.aliases) === functionSignature(typeOf(operand), context)) return base;
+    if (node.atomicPointee && !base) return { decl: node, slot: '', sourceSlot: '', throughPointer: true,
+      indirection: { operand, prefix: '', index: null } };
+    if (!node.atomicPointee && context && cleanType(typeOf(node), context.aliases) === functionSignature(typeOf(operand), context)) return base;
     return base && { ...base, throughPointer: true, indirection: { operand, prefix: base.slot, index: null } };
   }
   return null;
@@ -543,7 +604,7 @@ export function pointerExpression(node, context = null) {
 
 export function collectAssignmentWrites(body, context) {
   const writes = [];
-  for (const node of walkEvaluated(body)) {
+  for (const node of walk(body, callbackChildren)) {
     if (node.kind !== 'BinaryOperator' || node.opcode !== '=') continue;
     const [target, value] = children(node);
     const dest = unwrap(target);

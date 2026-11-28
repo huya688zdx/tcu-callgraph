@@ -397,7 +397,7 @@ function messageContext(message) {
 }
 
 function chatHistory(messages) {
-  const history = messages.filter((m) => !m.error).slice(-16).map((m) => ({
+  const history = messages.filter(m => !m.error || m.tools?.some(t => t.ok)).slice(-16).map((m) => ({
     role: m.role,
     content: messageContext(m),
     ...(m.attachedFiles?.length ? { attachedFiles: m.attachedFiles } : {}),
@@ -2052,6 +2052,32 @@ function renderThreadMessages() {
   followChatScroll();
 }
 
+// 页面或流关闭时，撤销记录可能在原响应结束以后才就绪。
+async function readTurnChangeset(id, projectId) {
+  try {
+    const result = await api.aiTurnChangeset(id, projectId);
+    if (result?.ok) return result;
+  } catch { /* 保留请求编号，重开同一工程时可再次恢复。 */ }
+}
+
+async function recoverInterruptedChat(thread, projectId, gen) {
+  for (const user of thread.messages.filter(m => m.pendingTurn)) {
+    const result = await readTurnChangeset(user.pendingTurn, projectId);
+    if (gen !== chatGeneration || projectId !== chatProjectId || !chatThreads.includes(thread)) return;
+    const index = thread.messages.indexOf(user), next = thread.messages[index + 1];
+    if (!result || index < 0 || !user.pendingTurn || (next?.role === 'assistant' && !next.error)) continue;
+    delete user.pendingTurn;
+    if (!result.changeset) continue;
+    if (next?.role === 'assistant') next.changeset = result.changeset;
+    else thread.messages.splice(index + 1, 0, {
+      role: 'assistant', text: result.interrupted ? '连接已中断，可撤销本轮已应用的改动。' : '本轮已应用的改动可撤销。',
+      error: Boolean(result.interrupted), changeset: result.changeset,
+    });
+    // 加载历史时只补充本窗口的副本，保留其他窗口可能已经保存的完整回复。
+    if (thread.id === activeChatId) renderThreadMessages();
+  }
+}
+
 async function loadProjectChats({ force = false } = {}) {
   const currentId = state.view?.projectId ?? null;
   if ((!force || activeAbort) && chatProjectId !== null && currentId === chatProjectId && chatThreads.length) {
@@ -2090,6 +2116,7 @@ async function loadProjectChats({ force = false } = {}) {
       }
     }
     setActiveChat(res.activeId && chatThreads.some((x) => x.id === res.activeId) ? res.activeId : chatThreads[0].id);
+    for (const thread of chatThreads) void recoverInterruptedChat(thread, projectId, gen);
     renderChatBar();
     renderThreadMessages();
   } catch {
@@ -2604,13 +2631,15 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   }));
   renderAttachments();
   const selectionSummary = summarizeUiContext(uiContext);
-  thread.messages.push({
-    role: 'user',
+  const turnId = crypto.randomUUID();
+  const userEntry = {
+    role: 'user', pendingTurn: turnId,
     text: rawInput,
     ...(selectionSummary ? { selectionSummary } : {}),
     ...(images.length ? { attachedImages: images } : {}),
     ...(attachments.length ? { attachedFiles: attachments } : {}),
-  });
+  };
+  thread.messages.push(userEntry);
   thread.updatedAt = Date.now();
   renderChatBar();
   persistChats(myProjectId);
@@ -2723,24 +2752,32 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     pendingSteer && pendingSteer.threadId === threadId &&
     pendingSteer.projectId === myProjectId && pendingSteer.gen === myGen
   );
+  const recoverDisconnected = async () => {
+    if (!isCurrent()) return;
+    if (collectedChangeset) { delete userEntry.pendingTurn; return; }
+    const recovered = await readTurnChangeset(turnId, myProjectId);
+    if (recovered !== undefined && isCurrent()) {
+      delete userEntry.pendingTurn;
+      collectedChangeset = recovered.changeset;
+    }
+  };
   const finishInterrupted = (message, stopped = false) => {
+    if (!isCurrent()) return;
     stopThinking();
     for (const { row, name } of pendingSteps) {
       finishStep(row, { name, ok: false, summary: '执行中断' });
     }
     const steeringNow = stopped && isSteerQueuedForThisTurn();
-    if (collectedTools.length || streamedText) {
-      ui.text.innerHTML = formatAssistantText(streamedText);
-      commitAssistantMsg({ text: streamedText });
-    } else if (steeringNow) {
+    if (!collectedChangeset && !collectedTools.length && !streamedText && steeringNow) {
       // 中途引导且本轮尚未产生工具结果或正文时，直接移除空占位，避免插入多余报错气泡。
       ui.box.remove();
       return;
-    } else {
-      ui.box.classList.toggle('error', !stopped);
-      ui.text.textContent = message;
-      commitAssistantMsg({ text: message, error: true });
     }
+    const text = [streamedText, message].filter(Boolean).join('\n\n');
+    ui.box.classList.toggle('error', !stopped);
+    ui.text.innerHTML = formatAssistantText(text);
+    if (collectedChangeset) renderChangesetUndo(ui.box, collectedChangeset);
+    commitAssistantMsg({ text, error: true, ...(collectedChangeset && { changeset: collectedChangeset }) });
     if (isVisible()) {
       if (!messagesEl.contains(ui.box)) renderThreadMessages();
       if (!steeringNow && (collectedTools.length || streamedText)) setChatStatus(message, !stopped);
@@ -2857,6 +2894,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
       dirtyMetrics = true;
       scheduleStreamPaint();
     } else if (ev.type === 'done' || ev.type === 'question') {
+      delete userEntry.pendingTurn;
       terminalReceived = true;
       flushStreamPaint(true);
       if (ev.thinking) {
@@ -2905,6 +2943,8 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
         followChatScroll();
       }
     } else if (ev.type === 'error') {
+      delete userEntry.pendingTurn;
+      collectedChangeset = ev.changeset || collectedChangeset;
       terminalReceived = true;
       flushStreamPaint(true);
       finishInterrupted(ev.error || '执行失败');
@@ -2916,7 +2956,7 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
   let reader;
   try {
     const res = await api.aiChat({
-      prompt: text,
+      turnId, prompt: text,
       history: historySnapshot,
       at: state.at || 0,
       threadId,
@@ -2945,9 +2985,13 @@ async function sendPrompt(rawText, uiContext = currentUiContext()) {
     }
     buffer += decoder.decode();
     if (buffer.trim()) handleLine(buffer);
-    if (!terminalReceived) finishInterrupted('连接提前中断，可以继续对话或重试。');
+    if (!terminalReceived) {
+      await recoverDisconnected();
+      finishInterrupted('连接提前中断，可以继续对话或重试。');
+    }
   } catch (err) {
     if (!terminalReceived) {
+      await recoverDisconnected();
       const stopped = err.name === 'AbortError';
       finishInterrupted(stopped ? '已停止本次执行。' : (err.message || String(err)), stopped);
     }

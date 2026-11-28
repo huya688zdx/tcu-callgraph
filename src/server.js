@@ -295,6 +295,8 @@ function sameSavedCanvas(a, b) {
 }
 
 const aiChangesets = new Map();
+const activeAiTurns = new Map();
+const validTurnId = id => typeof id === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id);
 function saveAiChangeset(entry) {
   if (!entry?.id) return;
   if (aiChangesets.has(entry.id)) aiChangesets.delete(entry.id);
@@ -2730,6 +2732,16 @@ export const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (u.pathname === '/api/ai/changeset' && req.method === 'GET') {
+      const id = u.searchParams.get('turnId'), projectId = Number(u.searchParams.get('projectId'));
+      const pending = activeAiTurns.get(id);
+      if (projectId === PROJECT.id && pending?.projectId === projectId) await pending.finished;
+      const snap = aiChangesets.get(id);
+      const available = !switching && projectId === PROJECT.id && snap?.projectId === projectId && snap.sessionRevision === sessionRevision;
+      return json(res, { ok: true, changeset: available ? { id: snap.id, ops: snap.ops } : null,
+        ...(available && { interrupted: snap.interrupted }) });
+    }
+
     if (u.pathname === '/api/ai/undo-changeset' && req.method === 'POST') {
       if (!guardWrite(req, res)) return;
       let p;
@@ -2891,6 +2903,7 @@ export const server = http.createServer(async (req, res) => {
               } : null;
               return {
                 role: m.role,
+                ...(m.role === 'user' && validTurnId(m.pendingTurn) ? { pendingTurn: m.pendingTurn } : {}),
                 text: String(m.text || '').slice(0, 8000),
                 ...(m.role === 'user' && typeof m.selectionSummary === 'string' && m.selectionSummary.trim()
                   ? { selectionSummary: m.selectionSummary.trim().slice(0, 300) } : {}),
@@ -3013,6 +3026,11 @@ export const server = http.createServer(async (req, res) => {
       if (canvasSnapshot && canvasSnapshot.root !== snapshotRoot && canvasSnapshot.root !== snapshotRoots[0]) canvasSnapshot = null;
       const snapshotKey = canvasSnapshot && layoutKey(snapshotRoot, canvasSnapshot.mode === 'flat' ? 'flat' : 'group');
       let snapshotSlot = snapshotKey && overlay.layout[snapshotKey];
+      const turnId = p.turnId ?? randomUUID();
+      if (!validTurnId(turnId)) return bad(res, '无效的 AI 请求编号');
+      if (activeAiTurns.has(turnId) || aiChangesets.has(turnId)) return json(res, { ok: false, error: '本轮 AI 请求已存在' }, 409);
+      const finished = Promise.withResolvers();
+      activeAiTurns.set(turnId, { projectId: PROJECT.id, finished: finished.promise });
 
       res.writeHead(200, {
         'Content-Type': 'application/x-ndjson; charset=utf-8',
@@ -3025,7 +3043,7 @@ export const server = http.createServer(async (req, res) => {
       req.on('close', cancel);
       res.on('close', cancel);
       const sendEvent = (ev) => {
-        if (res.writableEnded || res.destroyed) return;
+        if (abort.signal.aborted || res.writableEnded || res.destroyed) return;
         if (res.writableLength > 1024 * 1024) {
           cancel();
           res.destroy();
@@ -3995,11 +4013,11 @@ export const server = http.createServer(async (req, res) => {
 
       const chatClientId = String(req.headers['x-callgraph-client'] || '').slice(0, 128);
       const collectedSubagents = [];
-      let turnChangeset = null;
+      let turnChangeset = null, savedChangeset = null;
       const turnWriteOps = new Set();
       const ensureTurnSnapshot = op => {
         turnWriteOps.add(op);
-        turnChangeset ??= { id: randomUUID(), projectId: PROJECT.id, sessionRevision: expectedSession,
+        turnChangeset ??= { id: turnId, projectId: chatProjectId, sessionRevision: expectedSession,
           bookmarks: new Map(), ops: [], createdAt: Date.now() };
         return turnChangeset;
       };
@@ -5945,22 +5963,29 @@ export const server = http.createServer(async (req, res) => {
           executeTool: executeAiTool,
           onEvent: sendEvent,
           signal: abort.signal,
-          beforeDone: async ({ onEvent }) => {
+          beforeDone: ({ onEvent, interrupted }) => {
             const extra = {};
             if (turnChangeset && (turnChangeset.canvas || turnChangeset.bookmarks.size)) {
+              turnChangeset.interrupted = interrupted || !sessionCurrent();
               turnChangeset.ops = [...turnWriteOps];
               saveAiChangeset(turnChangeset);
-              const cs = { id: turnChangeset.id, ops: turnChangeset.ops };
-              onEvent({ type: 'changeset', changesetId: cs.id, ops: cs.ops });
-              extra.changeset = cs;
+              savedChangeset = { id: turnId, ops: turnChangeset.ops };
+              if (sessionCurrent()) {
+                onEvent({ type: 'changeset', changesetId: turnId, ops: savedChangeset.ops });
+                extra.changeset = savedChangeset;
+              }
             }
+            if (!sameSession()) assertActive();
             if (collectedSubagents.length) extra.subagents = collectedSubagents;
             return extra;
           },
         });
       } catch (err) {
-        sendEvent({ type: 'error', error: String(err?.message || err) });
+        sendEvent({ type: 'error', error: String(err?.message || err),
+          ...(savedChangeset && sessionCurrent() ? { changeset: savedChangeset } : {}) });
       } finally {
+        activeAiTurns.delete(turnId);
+        finished.resolve();
         req.off('close', cancel);
         res.off('close', cancel);
         if (!res.writableEnded) res.end();
