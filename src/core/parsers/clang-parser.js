@@ -218,7 +218,8 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     if (!reachable.has(direct)) reachable.set(direct, reachableCallees(direct));
     const records = reachable.get(direct), opaque = records.has(null);
     const writes = new Set();
-    let unknown = opaque;
+    const mutable = !tables.get(key)?.constant;
+    let unknown = opaque && mutable;
     for (const w of declWrites.get(key) || []) {
       if ((opaque || records.has(w.record)) && matchingSlot(w.slot, slot) && readerFor(w.record).isEvaluated(w.node)) writes.add(w);
     }
@@ -226,7 +227,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
       if (!record) continue;
       for (const effect of readerFor(record).addressWrites(key, slot)) {
         if (effect) writes.add(effect);
-        else unknown = true;
+        else if (mutable) unknown = true;
       }
     }
     return { writes, direct, unknown };

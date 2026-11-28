@@ -268,7 +268,7 @@ test('Clang 聚合复制按复制时的声明和成员解析回调', requiresCla
       declare: [['alpha'], ['beta']], assign: [['alpha']], chain: [['alpha']],
       member: [['alpha'], []], designated: [['alpha']], choose: [['alpha', 'beta']],
       partial: [['alpha']], overwrite: [[]], branch: [['alpha', 'beta']],
-      sparse: [['alpha']], chain_assign: [['alpha'], ['beta']], loop: [['alpha','beta']], branches: [['alpha'], ['beta']], jump: [[]],
+      sparse: [['alpha']], chain_assign: [['alpha'], ['beta']], loop: [['alpha','beta']], branches: [['alpha'], ['beta']], jump: [['alpha']],
       dynamic: [['alpha','beta']], literal: [['alpha','beta'], ['beta']], unknownptr: [[]], again: [['alpha']],
       snapshots: [['beta'], ['noise'], ['alpha']], shadow: [['beta'], ['alpha']], isolated: [['noise']],
     })) await t.test(policy + ' ' + caller, () => {
@@ -527,4 +527,79 @@ void unusual(int n,int flag) { Fn cb=first; switch(n) { if(flag) { case 0: cb=se
         policy === 'expand' ? targets : targets.map(() => []));
     });
   }
+});
+
+async function checkCallbackFlow(t, root, cases) {
+  for (const policy of ['strict', 'expand']) {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    for (const [name, expected] of Object.entries(cases(policy))) await t.test(policy + ' ' + name, () => {
+      const caller = 'main.c::' + name;
+      const sites = model.indirectCalls.filter(s => s.caller === caller).sort((a,b) => a.line - b.line || a.col - b.col);
+      assert.equal(sites.length, expected.length);
+      const edges = model.edges.filter(e => e.from === caller && e.kind === 'fnptr' && !e.to.startsWith('ext::'));
+      for (const [i, site] of sites.entries()) {
+        const names = site.candidates.map(c => c.name).sort();
+        if (Array.isArray(expected[i])) assert.deepEqual(names, expected[i]);
+        else {
+          for (const target of expected[i].required) assert.ok(names.includes(target), '缺少实际调用目标 ' + target);
+          assert.ok(names.every(target => expected[i].allowed.includes(target)));
+        }
+        const emitted = edges.filter(e => e.siteId === site.siteId);
+        assert.deepEqual(emitted.map(e => e.callee).sort(), policy === 'expand' ? names : []);
+        assert.ok(emitted.every(e => e.resolution === 'possible'));
+        assert.equal(site.resolution, policy === 'expand' && names.length ? 'possible' : 'unresolved');
+      }
+    });
+  }
+}
+
+test('Clang 回调跟随 for 的初始化、条件、循环体和步进顺序', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void);
+typedef struct { Fn run; } Ops;
+void first(void) {} void second(void) {} void last(void) {}
+void once(void) { Fn cb=first; for(int i=0; i<1; cb=second, ++i) { cb(); } }
+void twice(void) { Fn cb=first; for(int i=0; i<2; cb=second, ++i) { cb(); } }
+void slots(int n) { Ops ops={first}; for(; n--; ops.run=second) ops.run(); }
+void in_init(int n) { Fn cb=first; for(cb(); n--; cb=second) cb(); }
+void in_condition(int n) { Fn cb=first; for(; cb(), n--; cb=second) {} }
+void in_step(int n) { Fn cb=first; for(; n--; cb()) { cb=second; } }
+void reset_body(int n) { Fn cb=first; for(; n--; cb=last) { cb=second; cb(); } }
+void initialized(int n) { Fn cb=last; for(cb=first; n--; cb=second) {} cb(); }
+void nested(int n,int m) { while(n--) { Fn cb=first; for(int j=0; j<m; cb=second, ++j) cb(); } }
+void skipped(int n,int flag) { Fn cb=first; for(; n--; cb()) { if(flag) continue; cb=second; } }
+void missing(int n) { Fn cb=first; for(;;) { cb(); cb=second; if(!n--) break; } }
+void after(int n) { Fn cb=first; for(; n--; cb=second) {} cb=last; cb(); }`);
+  const both = ['first', 'second'];
+  await checkCallbackFlow(t, root, () => ({
+    once: [{ required: ['first'], allowed: both }], twice: [both], slots: [both],
+    in_init: [['first'], both], in_condition: [both], in_step: [['second']], reset_body: [['second']],
+    initialized: [both], nested: [both], skipped: [both], missing: [both], after: [['last']],
+  }));
+});
+
+test('Clang 跳转控制流保留来自对应对象和槽位的可能回调', requiresClang, async t => {
+  const root = project(t, `typedef void (*Fn)(void); typedef struct { Fn run; Fn slots[2]; } Ops;
+void first(void) {} void second(void) {} void noise(void) {} int wrong(int n) { return n; }
+static const Ops initial={first,{first,noise}}; static int (*other_signature)(int)=wrong;
+extern Fn unknown(void);
+void straight(void) { Ops o={first}; o.run=second; goto invoke; invoke: o.run(); }
+void forward(void) { Ops o=initial; goto done; o.run=noise; done: o.run(); }
+void conditional(int n) { Ops o={first,{first,noise}}; if(n) goto invoke; o.run=second; invoke: o.run(); }
+void backwards(int n) { Ops o={first}; invoke: o.run(); o.run=second; if(--n) goto invoke; }
+void computed(int n) { Ops o=initial; void *next=n ? &&invoke : &&change; goto *next;
+  change: o.slots[0]=second; invoke: o.slots[0](); o.slots[1](); }
+void copied(int n) { Ops o=initial; Fn src=second; if(n) goto done; o.run=src; done: o.run(); }
+void via_case(int n) { Ops o={first}; switch(n) {
+  case 0: o.run=second; goto invoke; case 1: o.run=first; invoke: o.run(); } }
+static Ops global;
+void set(Fn *p) { *p=second; } void change_global(void) { set(&global.run); }
+void via_callee(int n) { global.run=first; if(n) goto done; change_global(); done: global.run(); }
+void clear_only(int n) { Ops o={0}; if(n) goto done; o.run=0; done: if(o.run) o.run(); }
+void opaque(int n) { Ops o={0}; if(n) goto done; o.run=unknown(); done: o.run(); }`);
+  const both = ['first', 'second'];
+  await checkCallbackFlow(t, root, policy => ({
+    straight: [['second']], forward: [['first']], conditional: [both], backwards: [both],
+    computed: [both, ['noise']], copied: [both], via_case: [both], via_callee: [both], clear_only: [[]],
+    opaque: [policy === 'expand' ? ['first', 'noise', 'second'] : []],
+  }));
 });

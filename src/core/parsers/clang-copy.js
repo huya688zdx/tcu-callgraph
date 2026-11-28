@@ -35,12 +35,30 @@ function argumentSlot(base, write) {
   return slot == null ? null : slot + write.slot.slice(write.slot.indexOf(']') + 1);
 }
 
+const isCase = node => node?.kind === 'CaseStmt' || node?.kind === 'DefaultStmt';
+// 内层 switch 的标签只从该 switch 进入，外层 case 则可能跳进将被略过的语句。
+function hasCaseEntry(node) {
+  return isCase(node) || (node.kind !== 'SwitchStmt' && children(node).some(hasCaseEntry));
+}
+
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值；传址写入只作为可能值。
 export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, globalWritesFrom }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
   const indirectActions = [], aliases = new Map(), rebound = new Set();
+  // 同一块中无条件向前跳转时可以直接跳过中间语句。其他跳转不能依赖源码中的先后顺序。
+  const forwardJumps = new Map();
+  let unstructuredJump = false;
   // 只绑定初始化后既不改写、也不按地址传出的局部指针。其他别名保持保守。
   for (const n of walk(record.body)) {
+    if (n.kind === 'CompoundStmt' && children(n).some(s => s.kind === 'GotoStmt') && !hasCaseEntry(n)) {
+      const statements = children(n), labels = new Map();
+      for (let i = statements.length - 1; i >= 0; i--) {
+        const s = statements[i];
+        if (s.kind === 'LabelStmt' && s.declId) labels.set(s.declId, i);
+        if (s.kind === 'GotoStmt' && labels.has(s.targetLabelDeclId)) forwardJumps.set(s, labels.get(s.targetLabelDeclId));
+      }
+    }
+    if (n.kind === 'IndirectGotoStmt' || (n.kind === 'GotoStmt' && !forwardJumps.has(n))) unstructuredJump = true;
     if (n.kind === 'CompoundAssignOperator' || (n.kind === 'BinaryOperator' && n.opcode === '=') ||
         (n.kind === 'UnaryOperator' && ['&', '++', '--'].includes(n.opcode))) {
       const target = unwrap(children(n)[0]);
@@ -56,7 +74,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     const slot = argumentSlot(alias.slot, pointer);
     return slot == null ? null : { ...pointer, key: alias.key, slot };
   }
-  let order = 0, hasGoto = false;
+  let order = 0;
   function add(key, slot, value, point, assignment = false) {
     value = unwrap(value);
     // 字面函数初始化可以沿用不可变表的精确槽位。其他来源和后续赋值要按读取位置求值。
@@ -120,7 +138,6 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
   }
 
   const irregularSwitches = new Set();
-  const isCase = n => n?.kind === 'CaseStmt' || n?.kind === 'DefaultStmt';
   function endsCase(n) {
     while (n?.kind === 'CompoundStmt') n = children(n).at(-1);
     return ['BreakStmt','ReturnStmt','ContinueStmt'].includes(n?.kind);
@@ -147,25 +164,50 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       if (arm !== other && arm.section === other.section) return null;
     }
     if (arm === other) return true;
-    return point.loop && point.loop === at.loop ? null : false;
+    return point.loop && point.loop.outer === at.loop?.outer ? null : false;
+  }
+  function visitLoop(node, guards, parent) {
+    const parts = children(node), isFor = node.kind === 'ForStmt';
+    if (isFor) visit(parts[0], guards, parent); // 初始化只在进入循环时执行一次。
+    const loop = { parent, outer: parent?.outer || node, start: order };
+    const bodyGuards = new Map(guards).set(node, true);
+    if (isFor) {
+      // Clang 将步进放在循环体之前，并为省略的子句保留空位。
+      const [, conditionVar, condition, step, body] = parts;
+      visit(conditionVar, guards, loop);
+      visit(condition, guards, loop);
+      visit(body, bodyGuards, loop);
+      visit(step, loop.continued ? new Map(guards).set(node, 'step') : bodyGuards, loop);
+    } else {
+      for (const child of parts) visit(child, bodyGuards, loop);
+    }
+    loop.end = order;
   }
   function visit(node, guards, loop) {
     if (!node?.kind || (node.kind === 'UnaryExprOrTypeTraitExpr' && !node.argType)) return;
     if (node.kind === 'SwitchStmt') return visitSwitch(node, guards, loop);
+    if (['ForStmt', 'WhileStmt', 'DoStmt'].includes(node.kind)) return visitLoop(node, guards, loop);
+    if (loop && node.kind === 'ContinueStmt') loop.continued = true;
+    if (!unstructuredJump && forwardJumps.size && node.kind === 'CompoundStmt') {
+      const statements = children(node);
+      for (let i = 0; i < statements.length; i++) {
+        i = forwardJumps.get(statements[i]) ?? i;
+        visit(statements[i], guards, loop);
+      }
+      return;
+    }
     if (isCase(node)) {
       // 嵌入其他控制流的标签允许直接跳入块内；不要把该处的条件当成必经写入。
       const parent = [...guards.keys()].findLast(g => g.kind === 'SwitchStmt');
       if (parent) irregularSwitches.add(parent);
     }
-    if (node.kind === 'GotoStmt' || node.kind === 'IndirectGotoStmt') hasGoto = true;
     const branch = ['IfStmt', 'ConditionalOperator'].includes(node.kind);
-    const iteration = ['ForStmt', 'WhileStmt', 'DoStmt'].includes(node.kind);
     const shortCircuit = node.kind === 'BinaryOperator' && ['&&', '||'].includes(node.opcode);
     const nested = node.array_filler ? [...children(node), ...node.array_filler] : children(node);
     nested.forEach((child, i) => {
-      const guarded = iteration || (i > 0 && (branch || shortCircuit));
+      const guarded = i > 0 && (branch || shortCircuit);
       const next = guarded ? new Map(guards).set(node, branch ? i : true) : guards;
-      visit(child, next, iteration ? (loop || node) : loop);
+      visit(child, next, loop);
     });
     const point = { order: ++order, guards, loop };
     const call = node.kind === 'CallExpr' && node;
@@ -194,11 +236,27 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
 
   function reaches(point, at) {
     if (!at) return false;
-    if (point.order >= at.order) return at.loop && at.loop === point.loop;
+    if (unstructuredJump) return true;
+    if (point.order >= at.order) return at.loop && at.loop.outer === point.loop?.outer;
     for (const [guard, arm] of point.guards) {
       if (sameArm(guard, arm, point, at) === false) return false;
     }
     return true;
+  }
+
+  // 从读取点倒推：本轮已执行的写入优先，然后是上一轮可能的尾部，再向外层追溯。
+  function* writesAt(history, at) {
+    if (unstructuredJump) { yield* history; return; }
+    let before = history.length - 1;
+    while (before >= 0 && history[before].point.order >= at.order) before--;
+    let after = before + 1;
+    for (let loop = at.loop; loop; loop = loop.parent) {
+      while (before >= 0 && history[before].point.order > loop.start) yield history[before--];
+      const start = after;
+      while (after < history.length && history[after].point.order <= loop.end) after++;
+      for (let i = after - 1; i >= start; i--) yield history[i];
+    }
+    while (before >= 0) yield history[before--];
   }
 
   // 将有界的动态下标逐槽读取。一个槽的覆盖或清空不会复活该槽的旧值。
@@ -243,7 +301,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const src = objectSlot(pointerExpression(value, unit));
       if (src) {
         for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId);
-      } else if (!rest && value.kind !== 'ImplicitValueInitExpr' && value.kind !== 'GNUNullExpr' &&
+      } else if ((!rest || unstructuredJump) && value.kind !== 'ImplicitValueInitExpr' && value.kind !== 'GNUNullExpr' &&
           !(value.kind === 'IntegerLiteral' && value.value === '0')) {
         unknown = true;
       }
@@ -273,7 +331,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       function mergeInterveningCalls(since) {
         if (typeof source !== 'string') return;
         for (const action of indirectActions) {
-          if (!action.call || action === at || !reaches(since, action) || !reaches(action, at)) continue;
+          if (!action.call || action === at || (since && !reaches(since, action)) || !reaches(action, at)) continue;
           const effects = globalWritesFrom(action.call, unit, source, path);
           unknown ||= effects.unknown;
           for (const w of effects.writes) evaluateWrite(w, w.record === effects.direct ? action.call : null, action, depth);
@@ -282,18 +340,16 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const history = writes.get(source) || [];
       // 大数组或未知长度保留符号下标。某个具体槽一旦被必经赋值覆盖，就不再取它更早的值。
       const shadowed = path.includes('[*]') ? new Set() : null;
-      for (let i = history.length - 1; i >= 0; i--) {
-        const { slot, value, point, effect, call } = history[i];
+      for (const { slot, value, point, effect, call } of writesAt(history, at)) {
         if (shadowed?.has(slot)) continue;
-        const previousIteration = point.order >= at.order;
-        if (previousIteration && (!at.loop || at.loop !== point.loop)) continue;
         const match = relativeSlot(slot, path);
         if (!match) continue;
-        let mandatory = !previousIteration, excluded = false;
-        for (const [guard, arm] of point.guards) {
+        // 未建模的跳转下只收集同一对象和槽位的可能来源，不用任一赋值覆盖其他证据。
+        let mandatory = !unstructuredJump && point.order < at.order, excluded = false;
+        if (mandatory) for (const [guard, arm] of point.guards) {
           const same = sameArm(guard, arm, point, at);
           if (same !== true) mandatory = false;
-          if (same === false && !previousIteration) excluded = true;
+          if (same === false) excluded = true;
         }
         if (excluded) continue;
         if (effect) {
@@ -311,10 +367,11 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
         }
       }
       possibleAliasWrite();
+      if (unstructuredJump) mergeInterveningCalls();
       if (source?.kind === 'ParmVarDecl' && !path) parameters.add(source);
       else merge(ambient(source, path));
     }
-    if (!at || hasGoto) return { targets: [], parameters: [], unknown: !pointer?.member };
+    if (!at) return { targets: [], parameters: [], unknown: true };
     if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId);
     else evaluate(value, '', at, 0);
     return { targets: [...targets], unknown, parameters: [...parameters] };
@@ -327,7 +384,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const src = objectSlot(pointer), at = points.get(call);
       if (!src) return null;
       const changed = [...(tracked.get(src.key) || [])].some(prefix => relativeSlot(prefix, src.slot));
-      const escaped = escapes.get(src.key)?.some(w => relativeSlot(w.slot, src.slot) && (hasGoto || reaches(w.point, at)));
+      const escaped = escapes.get(src.key)?.some(w => relativeSlot(w.slot, src.slot) && reaches(w.point, at));
       return src.throughPointer || changed || escaped ? resolve(src, null, at) : null;
     },
     atAssignment(write) { return resolve(null, write.value, points.get(write.node)); },
