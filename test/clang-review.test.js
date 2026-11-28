@@ -1065,3 +1065,96 @@ int good(void){ (void)sizeof _Generic(42,int:chosen(),default:0);
     assert.deepEqual(model.edges.filter(e => e.from === 'good.c::good').map(e => e.callee), ['chosen']);
   });
 });
+
+const aggregateAddressSource = `typedef int (*Fn)(void);
+typedef struct { Fn *ptr; } Holder;
+typedef struct { Fn *left, *right; } Pair;
+typedef struct { Holder slots[2]; } Group;
+typedef struct { Fn run, keep; } Ops;
+int initial(void) { return 1; } int replacement(void) { return 2; }
+int sibling(void) { return 3; } int external_target(void) { return 4; }
+int unrelated(void) { Fn different=external_target; return different(); }
+void put(Fn *p, Fn value) { *p=value; }
+void use_holder(Holder h) { *h.ptr=replacement; }
+int inspect(Holder h) { return h.ptr != 0; }
+int inspect_slot(Fn const *p) { return *p != 0; }
+void outside(Holder); void outside_ptr(Holder const *); void outside_slot(Fn *); void unseen(Holder);
+typedef struct { Fn const *p; } ReadOnly;
+void inspect_external(ReadOnly);
+static Fn public_slot=initial;
+Holder shared_holder={&public_slot};
+int global_holder(void) { public_slot=initial; *shared_holder.ptr=replacement; return public_slot(); }
+int incoming(Fn cb) { Holder h={&cb}; *h.ptr=replacement; return cb(); }
+int immutable_member(void) { Fn const cb=initial; ReadOnly h={&cb}; inspect_external(h); return cb(); }
+int unindexed(void) { Fn cb=initial; unseen((Holder){&cb}); return cb(); }
+void forward(Holder h) { outside(h); }
+Holder wrap(Fn *p) { return (Holder){p}; }
+void change_member(const Holder *h) { *h->ptr=replacement; }
+int simple(void) { Fn cb=initial; Holder local={.ptr=&cb}; *local.ptr=replacement; return cb(); }
+int nested(void) { Fn a=initial,b=sibling; Group g={.slots={[1]={.ptr=&b},[0]={.ptr=&a}}};
+  *g.slots[1].ptr=replacement; return a()*10+b(); }
+int designated(void) { Fn a=initial,b=sibling; Pair h={.right=&b,.left=&a}; *h.left=replacement; return a()*10+b(); }
+int array(void) { Fn a=initial,b=sibling; Fn *refs[2]={[1]=&b,[0]=&a}; *refs[0]=replacement; return a()*10+b(); }
+int literal(void) { Fn cb=initial; Holder h=(Holder){.ptr=&cb}; *h.ptr=replacement; return cb(); }
+int inline_literal(void) { Fn cb=initial; *((Holder){.ptr=&cb}).ptr=replacement; return cb(); }
+int through_helper(void) { Fn cb=initial; use_holder((Holder){.ptr=&cb}); return cb(); }
+int via_alias(void) { Fn cb=initial; Fn *p=&cb; Holder h={p}; Fn *q=h.ptr; *q=replacement; return cb(); }
+int member_argument(void) { Fn cb=initial; Holder h={&cb}; put(h.ptr,replacement); return cb(); }
+int direct(void) { Fn cb=initial; put(&cb,replacement); return cb(); }
+int member_target(void) { Ops f={initial,sibling}; Holder h={&f.run}; *h.ptr=replacement; return f.run()*10+f.keep(); }
+int offset(void) { Fn slots[]={initial,sibling}; Holder h={slots}; h.ptr[1]=replacement; return slots[0]()*10+slots[1](); }
+int potential(int flag) { Fn a=initial,b=sibling; Holder h={flag?&a:&b}; *h.ptr=replacement; return a()*10+b(); }
+int dynamic(int i) { Fn a=initial,b=sibling,c=external_target; Holder h[]={{&a},{&b}}; *h[i].ptr=replacement;
+  return a()*100+b()*10+c(); }
+int later(int flag) { Fn a=initial,b=sibling; Holder h={&a}; if(flag) h.ptr=&b; *h.ptr=replacement; return a()*10+b(); }
+int opaque_value(void) { Fn a=initial,b=sibling; Holder h={&a}; outside(h); return a()*10+b(); }
+int opaque_address(void) { Ops f={initial,sibling}; Holder h={&f.run}; outside_ptr(&h); return f.run()*10+f.keep(); }
+int opaque_literal(void) { Fn cb=initial; outside((Holder){.ptr=&cb}); return cb(); }
+int overwritten(void) { Fn cb=initial; outside((Holder){&cb}); cb=sibling; return cb(); }
+int forwarded(void) { Fn cb=initial; forward((Holder){&cb}); return cb(); }
+int returned_holder(void) { Fn cb=initial; Holder h=wrap(&cb); *h.ptr=replacement; return cb(); }
+int escaped_member(void) { Ops f={initial,sibling}; Holder h={&f.run}; outside_slot(h.ptr); return f.run()*10+f.keep(); }
+int helper_pointer(void) { Fn cb=initial; Holder h={&cb}; change_member(&h); return cb(); }
+int loop_carrier(int n) { Fn a=initial,b=sibling; Holder h={&a}; while(n--){ *h.ptr=replacement; h.ptr=&b; } return a()*10+b(); }
+int switched(void) { Fn a=initial,b=sibling; Holder h={&a}; h.ptr=&b; *h.ptr=replacement; return a()*10+b(); }
+int before_switch(void) { Fn a=initial,b=sibling; Holder h={&a}; *h.ptr=replacement; h.ptr=&b; return a()*10+b(); }
+int copy(void) { Fn a=initial,b=sibling; Holder h={&a}; Holder saved=h; h.ptr=&b; *saved.ptr=replacement; return a()*10+b(); }
+int read_either(int n) { Fn a=initial,b=sibling; Holder h={n?&a:&b}; return (*h.ptr)(); }
+int read_only(void) { Fn cb=initial; Holder h={&cb}; (void)inspect(h); (void)inspect_slot(h.ptr); return cb(); }
+int only_stored(void) { Fn cb=initial; Holder h={&cb}; (void)*h.ptr; return cb(); }
+int selected(void) { Fn a=initial,b=sibling; Holder h={_Generic(0,int:&a,default:&b)};
+  (void)sizeof(put(&b,replacement),0); *h.ptr=replacement; return a()*10+b(); }
+int dormant(void) { Fn cb=initial; (void)sizeof(outside((Holder){&cb}),0);
+  (void)_Generic(0,int:0,default:(outside((Holder){&cb}),0)); return cb(); }
+`;
+
+test('Clang 聚合中保存回调槽地址时追踪实际写入及独立成员', requiresClang, async t => {
+  const root = project(t, aggregateAddressSource);
+  const changed = { required: ['replacement'], allowed: ['initial','replacement'] };
+  const choicesA = ['initial','replacement'], choicesB = ['replacement','sibling'];
+  const escaped = policy => policy === 'strict' ? ['initial'] : {
+    required: ['external_target'], allowed: ['initial','replacement','sibling','external_target'],
+  };
+  await checkCallbackFlow(t, root, policy => ({
+    simple: [['replacement']], nested: [['initial'],['replacement']], designated: [['replacement'],['sibling']],
+    array: [['replacement'],['sibling']], literal: [['replacement']], inline_literal: [['replacement']],
+    through_helper: [changed], via_alias: [['replacement']], member_argument: [changed], direct: [changed],
+    member_target: [['replacement'],['sibling']], offset: [['initial'],['replacement']],
+    potential: [choicesA,choicesB], dynamic: [choicesA,choicesB,['external_target']], later: [choicesA,choicesB],
+    opaque_value: [escaped(policy),['sibling']], opaque_address: [escaped(policy),['sibling']],
+    opaque_literal: [escaped(policy)], overwritten: [['sibling']], read_only: [['initial']], only_stored: [['initial']],
+    incoming: [['replacement']], unindexed: [escaped(policy)],
+    global_holder: [policy === 'strict' ? ['initial'] : { required: ['replacement'], allowed: ['initial','replacement','sibling','external_target'] }],
+    forwarded: [escaped(policy)], returned_holder: [policy === 'strict' ? ['initial'] : {
+      required: ['replacement'], allowed: ['initial','replacement','sibling','external_target'],
+    }], escaped_member: [escaped(policy),['sibling']], helper_pointer: [changed], loop_carrier: [choicesA,choicesB],
+    switched: [['initial'],['replacement']], before_switch: [['replacement'],['sibling']],
+    copy: [['replacement'],['sibling']], read_either: [['initial','sibling']],
+    selected: [['replacement'],['sibling']], dormant: [['initial']],
+  }));
+  for (const policy of ['strict','expand']) await t.test(policy + ' immutable pointee', async () => {
+    const model = await buildIndex(root, { ...options, parserOptions: { dispatchPolicy: policy } });
+    const edges = model.edges.filter(e => e.from === 'main.c::immutable_member' && e.kind === 'fnptr');
+    assert.deepEqual(edges.map(e => [e.callee,e.resolution]), [['initial','exact']]);
+  });
+});

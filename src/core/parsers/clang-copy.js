@@ -74,7 +74,7 @@ function hasCaseEntry(node) {
 }
 
 // 以声明身份和调用点读取聚合成员。复制读取当时的源值，传址写入按覆盖范围合并。
-export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode }) {
+export function callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode, initiallyEscaped }) {
   const unit = record.context, writes = new Map(), tracked = new Map(), escapes = new Map(), points = new WeakMap();
   const designators = new WeakMap(), addressed = new Map();
   function noteAddressWrite(key, slot, write) {
@@ -82,11 +82,19 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     if (!addressed.has(key)) addressed.set(key, []);
     addressed.get(key).push({ slot, write });
   }
-  const indirectActions = [], aliases = new Map(), rebound = new Set();
+  const indirectActions = [], events = [], held = new Map(), rebound = new Map();
+  let addressCache = new WeakMap();
   // 同一块中无条件向前跳转时可以直接跳过中间语句。其他跳转不能依赖源码中的先后顺序。
   const forwardJumps = new Map();
   let unstructuredJump = false;
-  // 只绑定初始化后既不改写、也不按地址传出的局部指针。其他别名保持保守。
+  // 精确绑定以声明和完整槽位为界。可能改写或传址的槽仍能提供候选，不能作为必经覆盖。
+  function mayRebind(expr) {
+    const p = pointerExpression(expr, unit);
+    if (!p?.decl || p.throughPointer) return;
+    const key = objectKey(p.decl, unit);
+    if (!rebound.has(key)) rebound.set(key, new Set());
+    rebound.get(key).add(p.slot);
+  }
   for (const n of walkEvaluated(record.body)) {
     if (n.kind === 'CompoundStmt' && children(n).some(s => s.kind === 'GotoStmt') && !hasCaseEntry(n)) {
       const statements = children(n), labels = new Map();
@@ -97,23 +105,65 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       }
     }
     if (n.kind === 'IndirectGotoStmt' || (n.kind === 'GotoStmt' && !forwardJumps.has(n))) unstructuredJump = true;
-    if (n.kind === 'CompoundAssignOperator' || (n.kind === 'BinaryOperator' && n.opcode === '=') ||
-        (n.kind === 'UnaryOperator' && ['&', '++', '--'].includes(n.opcode))) {
-      const target = unwrap(children(n)[0]);
-      if (target?.kind === 'DeclRefExpr') rebound.add(objectKey(target.referencedDecl, unit));
+    if (n.kind === 'CompoundAssignOperator' || (n.kind === 'UnaryOperator' && ['&', '++', '--'].includes(n.opcode))) {
+      mayRebind(children(n)[0]);
+    }
+    for (const value of transferredValues(n)) {
+      const raw = unwrap(value);
+      if (typeOf(raw).endsWith(']') && typeOf(raw) !== typeOf(value)) mayRebind(raw);
     }
   }
-  function objectSlot(pointer) {
-    if (!pointer?.decl) return null;
-    const key = objectKey(pointer.decl, unit);
-    if (!pointer.throughPointer) return { ...pointer, key };
-    const alias = aliases.get(key);
-    if (!alias) return null;
-    const slot = argumentSlot(alias.slot, pointer);
-    return slot == null ? null : { ...pointer, key: alias.key, slot };
+  // 沿用回调值的写入顺序和分支规则。复制载体时，地址来自复制当时的源槽。
+  function contents(key, path, at, trace = { active: new Set(), cycles: 0 }) {
+    if (!at) return [];
+    const entries = [], shadowed = [], possible = [];
+    for (const store of writesAt(held.get(key) || [], at)) {
+      if (!reaches(store.point, at)) continue;
+      if (trace.active.has(store)) { trace.cycles++; continue; }
+      const whole = relativeSlot(store.path, path);
+      if (!whole && !relativeSlot(path, store.path)) continue;
+      const mandatory = !store.weak && !unstructuredJump && store.point.order < at.order && !unordered(store.point, at) &&
+        [...store.point.guards].every(([g, a]) => sameArm(g, a, store.point, at) === true);
+      trace.active.add(store);
+      for (const item of carried(store.value, store.point, trace)) {
+        const full = store.path + item.path, match = relativeSlot(path, full);
+        if (!match || shadowed.some(p => relativeSlot(p, full)?.covers)) continue;
+        const mutable = [...(rebound.get(key) || [])].some(p => relativeSlot(p, full));
+        entries.push({ ...item, path: match.rest, unknown: item.unknown || mutable,
+          weak: item.weak || !match.covers || !mandatory || mutable || possible.some(p => relativeSlot(p, full)) });
+      }
+      trace.active.delete(store);
+      if (mandatory && whole?.covers) break;
+      (mandatory ? shadowed : possible).push(store.path);
+    }
+    return entries;
+  }
+  function objectSlots(pointer, at, trace) {
+    if (!pointer?.decl) return [];
+    if (!pointer.throughPointer) return [{ ...pointer, key: objectKey(pointer.decl, unit) }];
+    const { operand, prefix, index } = pointer.indirection;
+    const tail = { slot: pointer.slot.slice(prefix.length), pointerIndex: index };
+    const result = [];
+    for (const addr of carried(operand, at, trace)) {
+      if (addr.path) continue;
+      const slot = argumentSlot(addr.slot, tail);
+      if (slot != null) result.push({ ...pointer, key: addr.key, slot, bounds: undefined, weak: addr.weak, unknown: addr.unknown });
+    }
+    return result;
+  }
+  function canCarry(value) {
+    const raw = unwrap(value);
+    return typeOf(value).includes('*') || typeOf(raw).endsWith(']') || unit.valueRecords.has(raw);
+  }
+  function remember(key, path, value, point, weak = false) {
+    if (!canCarry(value)) return;
+    if (!held.has(key)) held.set(key, []);
+    const list = held.get(key), store = { path, value, point, weak };
+    if (!list.length || list.at(-1).point.order <= point.order) list.push(store);
+    else list.splice(list.findIndex(w => w.point.order > point.order), 0, store);
   }
   let order = 0;
-  function add(key, slot, value, point, assignment = false) {
+  function add(key, slot, value, point, assignment = false, weak = false) {
     value = unwrap(value);
     // 字面函数初始化可以沿用不可变表的精确槽位。其他来源和后续赋值要按读取位置求值。
     if (assignment || (!fnRef(value) && value?.kind !== 'InitListExpr')) {
@@ -124,56 +174,99 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     if (!writes.has(key)) writes.set(key, []);
     const list = writes.get(key);
     if (value?.kind === 'InitListExpr') {
-      list.push({ slot, value: null, point }); // 未显式初始化的成员为零。
+      list.push({ slot, value: null, point, weak }); // 未显式初始化的成员为零。
       for (const { child, suffix } of initializerMembers(value, unit)) {
-        add(key, slot + suffix, child, point);
+        add(key, slot + suffix, child, point, false, weak);
       }
     } else {
-      list.push({ slot, value, point });
+      list.push({ slot, value, point, weak });
     }
   }
 
-  function addressOf(expr) {
+  // 只传播表达式结果携带的地址。函数调用的实参、逗号左侧和未求值分支不是结果。
+  function carried(expr, at, trace = { active: new Set(), cycles: 0 }) {
+    if (!at || !canCarry(expr)) return [];
+    const cached = addressCache.get(expr);
+    if (cached?.has(at)) return cached.get(at);
+    const cycles = trace.cycles, found = addressValues(expr, at, trace);
+    // 条件分支和复制可反复指向同一槽，按存储身份合并，避免路径数量随复制链倍增。
+    const keys = new Map();
+    const result = found.length < 2 ? found : found.filter(item => {
+      if (!keys.has(item.key)) keys.set(item.key, new Set());
+      const values = keys.get(item.key);
+      const id = JSON.stringify([item.path,item.slot,item.region,!!item.weak,!!item.unknown,!!item.readOnly]);
+      if (values.has(id)) return false;
+      values.add(id);
+      return true;
+    });
+    if (trace.cycles === cycles) {
+      if (!cached) addressCache.set(expr, new WeakMap());
+      addressCache.get(expr).set(at, result);
+    }
+    return result;
+  }
+  function addressValues(expr, at, trace) {
     const addr = unwrap(expr);
-    if (addr?.kind === 'BinaryOperator' && ['+', '-'].includes(addr.opcode) && typeOf(addr).includes('*')) {
+    if (addr.kind === 'CompoundLiteralExpr') return carried(children(addr)[0], at, trace);
+    if (addr.kind === 'InitListExpr') return initializerMembers(addr, unit).flatMap(({ child, suffix }) =>
+      carried(child, at, trace).map(item => ({ ...item, path: suffix + item.path })));
+    if (addr.kind === 'ConditionalOperator') return children(addr).slice(1).flatMap(alt =>
+      carried(alt, at, trace).map(item => ({ ...item, weak: true })));
+    if (addr.kind === 'BinaryOperator' && [',','='].includes(addr.opcode)) return carried(children(addr)[1], at, trace);
+    if (addr.kind === 'BinaryOperator' && ['+', '-'].includes(addr.opcode) && typeOf(addr).includes('*')) {
       const [left, right] = children(addr);
       const leftPointer = typeOf(left).includes('*');
-      const base = addressOf(leftPointer ? left : right);
-      if (!base) return null;
       const n = constIndexValue(leftPointer ? right : left, unit);
-      const slot = offsetSlot(base.slot, n == null ? null : addr.opcode === '-' ? -n : n);
-      return slot == null ? null : { ...base, slot };
+      return carried(leftPointer ? left : right, at, trace).flatMap(base => {
+        const slot = offsetSlot(base.slot, n == null ? null : addr.opcode === '-' ? -n : n);
+        return slot == null ? [] : [{ ...base, slot }];
+      });
     }
-    const decay = /\]$/.test(typeOf(addr)) && typeOf(expr).includes('*');
-    if (!decay && addr?.kind === 'DeclRefExpr') return aliases.get(objectKey(addr.referencedDecl, unit));
-    if (!decay && !(addr?.kind === 'UnaryOperator' && addr.opcode === '&')) return null;
-    const obj = objectSlot(pointerExpression(decay ? addr : children(addr)[0], unit));
-    if (obj?.decl.kind !== 'VarDecl') return null;
-    return { key: obj.key, slot: obj.slot + (decay ? '[0]' : ''), region: obj.slot };
+    const decay = typeOf(addr).endsWith(']') && typeOf(expr) !== typeOf(addr) && typeOf(expr).includes('*');
+    const takes = addr.kind === 'UnaryOperator' && addr.opcode === '&';
+    const result = [];
+    for (const obj of objectSlots(pointerExpression(takes ? children(addr)[0] : addr, unit), at, trace)) {
+      if (takes || decay) {
+        if (!['VarDecl','ParmVarDecl','CompoundLiteralExpr'].includes(obj.decl.kind)) continue;
+        result.push({ key: obj.key, path: '', slot: obj.slot + (decay ? '[0]' : ''), region: obj.slot,
+          readOnly: /\bconst\b[^*]*\*\s*$/.test(typeOf(addr)), weak: obj.weak, unknown: obj.unknown });
+      } else {
+        for (const item of contents(obj.key, obj.slot, at, trace)) {
+          result.push({ ...item, weak: item.weak || obj.weak, unknown: item.unknown || obj.unknown });
+        }
+      }
+    }
+    return result;
   }
 
-  function noteEscape(expr, point, call, index, conditional = false) {
-    const addr = unwrap(expr);
-    if (addr?.kind === 'ConditionalOperator') {
-      for (const alt of children(addr).slice(1)) noteEscape(alt, point, call, index, true);
-      return;
-    }
-    const base = addressOf(expr);
-    if (!base) return;
+  function noteEscape(expr, point, call, index) {
+    const values = carried(expr, point);
+    if (!values.length) return;
     const readOnly = /\bconst\b[^*]*\*\s*$/.test(typeOf(expr));
-    for (const effect of call ? parameterWrites(children(call)[0], index) : [null]) {
-      if (!effect && readOnly) continue;
-      const slot = effect ? argumentSlot(base.slot, effect) : base.region;
-      if (slot == null) continue;
-      const definite = effect?.replacesPointee && !conditional && addr?.kind === 'UnaryOperator' && addr.opcode === '&';
-      // 保留传址调用所在的栈帧，跨调用读取时才能把写入函数的形参绑定到实际值。
-      noteAddressWrite(base.key, slot, effect && { record, node: call, effect, aggregate: effect.aggregate });
-      const entry = { slot, point, effect, call, definite };
-      if (!escapes.has(base.key)) escapes.set(base.key, []);
-      escapes.get(base.key).push(entry);
-      if (effect) {
-        if (!writes.has(base.key)) writes.set(base.key, []);
-        writes.get(base.key).push(entry);
+    const effects = call ? parameterWrites(children(call)[0], index) : [null];
+    for (const item of values) {
+      transfer(item, item.readOnly || (!item.path && readOnly));
+      // 即使形参指向 const 结构体，结构体中保存的指针仍可改写其指向的对象。
+      if (!item.path) for (const child of contents(item.key, item.slot, point)) transfer(child, child.readOnly);
+    }
+    function transfer(base, onlyRead) {
+      for (const effect of effects) {
+        if (!effect && onlyRead) continue;
+        const prefix = effect?.indirection?.prefix || '';
+        if (effect && !matchingSlot(prefix, base.path)) continue;
+        const tail = effect && { slot: effect.slot.slice(prefix.length), pointerIndex: effect.indirection?.index };
+        const slot = effect ? argumentSlot(base.slot, tail) : base.region;
+        if (slot == null) continue;
+        const definite = effect?.replacesPointee && !base.weak && !base.path && unwrap(expr)?.opcode === '&';
+        // 跨调用读取时用传址调用的实际参数绑定形参。
+        noteAddressWrite(base.key, slot, effect && { record, node: call, effect, aggregate: effect.aggregate });
+        const entry = { slot, point, effect, call, definite, viaMember: !!base.path };
+        if (!escapes.has(base.key)) escapes.set(base.key, []);
+        escapes.get(base.key).push(entry);
+        if (effect) {
+          if (!writes.has(base.key)) writes.set(base.key, []);
+          writes.get(base.key).push(entry);
+        }
       }
     }
   }
@@ -276,25 +369,39 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       indirectActions.push(point);
     }
     if (call || (node.kind === 'BinaryOperator' && node.opcode === '=')) points.set(node, point);
-    const localPointer = node.kind === 'VarDecl' && !['static', 'extern'].includes(node.storageClass) &&
-      node.init && !rebound.has(node) && typeOf(node).includes('*');
-    const alias = localPointer && addressOf(initializer(node));
-    if (alias) aliases.set(node, alias);
-    else transferredValues(node).forEach((arg, index) => noteEscape(arg, point, call, index));
-    if (node.kind === 'VarDecl' && node.storageClass !== 'extern') {
+    if ((node.kind === 'VarDecl' && node.storageClass !== 'extern') || node.kind === 'CompoundLiteralExpr') {
       point.declaration = node;
-      const init = node.init && initializer(node);
-      add(objectKey(node, unit), '', init, point);
+      const value = node.kind === 'CompoundLiteralExpr' ? children(node)[0] : node.init && initializer(node);
+      const key = objectKey(node, unit);
+      remember(key, '', value, point);
+      events.push({ key, value, point });
     } else if (node.kind === 'BinaryOperator' && node.opcode === '=') {
-      const lhs = pointerExpression(children(node)[0], unit);
-      const dest = objectSlot(lhs);
-      if (dest) {
-        add(dest.key, dest.slot, children(node)[1], point, true);
-        if (lhs.throughPointer && writesByNode.has(node)) noteAddressWrite(dest.key, dest.slot, writesByNode.get(node));
-      } else if (lhs?.throughPointer) indirectActions.push(point);
-    }
+      const [target, value] = children(node), lhs = pointerExpression(target, unit);
+      if (lhs && !lhs.throughPointer) remember(objectKey(lhs.decl, unit), lhs.slot, value, point);
+      events.push({ node, lhs, value, point });
+    } else if (call || node.kind === 'ReturnStmt') events.push({ node, call, point });
   }
   visit(record.body, new Map(), null);
+  // 先取得完整程序点，再按真实写入顺序投影。循环回边和同一调用的兄弟实参可读到源码靠后的地址。
+  for (const { lhs, value, point } of events) if (lhs?.throughPointer && canCarry(value)) {
+    const destinations = objectSlots(lhs, point);
+    for (const dest of destinations) remember(dest.key, dest.slot, value, point, dest.weak || destinations.length > 1);
+    if (destinations.length) addressCache = new WeakMap();
+  }
+  for (const { node, key, lhs, value, point, call } of events) {
+    if (point.declaration) {
+      add(key, '', value, point);
+      if (hasStaticStorage(key)) noteEscape(value, point);
+    } else if (node.kind === 'BinaryOperator') {
+      const destinations = objectSlots(lhs, point);
+      for (const dest of destinations) {
+        add(dest.key, dest.slot, value, point, true, dest.weak || destinations.length > 1);
+        if (lhs.throughPointer && writesByNode.has(node)) noteAddressWrite(dest.key, dest.slot, writesByNode.get(node));
+      }
+      if (lhs?.throughPointer && (!destinations.length || destinations.some(d => d.unknown))) indirectActions.push(point);
+      if (!destinations.length || destinations.some(d => d.unknown || hasStaticStorage(d.key))) noteEscape(value, point);
+    } else transferredValues(node).forEach((arg, index) => noteEscape(arg, point, call, index));
+  }
 
   function reaches(point, at) {
     if (!at) return false;
@@ -336,7 +443,7 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     return slots;
   }
 
-  function resolve(pointer, value, at, valueSlot = '', effect = null) {
+  function resolve(sources, value, at, valueSlot = '', effect = null) {
     const targets = new Set(), parameters = [];
     let budget = 512, unknown = false, uncertainLayout = false;
     function merge(result) {
@@ -374,9 +481,12 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const direct = fnRef(value);
       if (direct && (!rest || rest === '.?')) { targets.add(resolveFunction(direct.referencedDecl, unit)); return; }
       const pointer = pointerExpression(value, unit);
-      const src = objectSlot(pointer);
-      if (src) {
-        for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId, rest ? unionId : src.unionId);
+      const inputs = objectSlots(pointer, point);
+      if (inputs.length) {
+        for (const src of inputs) {
+          unknown ||= src.unknown;
+          for (const slot of paths(src)) read(src.key, slot + rest, point, depth + 1, rest ? fieldId : src.fieldId, rest ? unionId : src.unionId);
+        }
       } else if (!rest || value.kind === 'CallExpr' || unstructuredJump ||
           (valueSlot && (pointer?.throughPointer || unit.valueRecords.has(value)))) {
         unknown = true;
@@ -396,12 +506,13 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
     function read(source, path, at, depth, fieldId, unionId) {
       const exposed = escapes.get(source)?.filter(w => !w.effect && reaches(w.point, at) && relativeSlot(w.slot, path));
       function possibleAliasWrite(since) {
+        if (initiallyEscaped(source, path) && indirectActions.some(p => !p.call && (!since || reaches(since, p)) && reaches(p, at))) unknown = true;
         if (!exposed?.length) return;
         // 明确覆盖之后，只有新的传址、调用或间接写才可能再次通过别名改变值。
         if (since && !exposed.some(w => reaches(since, w.point)) &&
             !indirectActions.some(p => p !== at && reaches(since, p) && reaches(p, at))) return;
         if (fieldId) merge(fieldWrites(fieldId, path, unionId));
-        else unknown = true;
+        if (!fieldId || exposed.some(e => e.viaMember || matchingSlot(e.slot, path))) unknown = true;
       }
       function mergeInterveningCalls(since) {
         if (!hasStaticStorage(source)) return;
@@ -414,12 +525,12 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       const history = writes.get(source) || [];
       // 大数组或未知长度保留符号下标。某个具体槽一旦被必经赋值覆盖，就不再取它更早的值。
       const shadowed = path.includes('[*]') ? new Set() : null;
-      for (const { slot, value, point, effect, call, definite } of writesAt(history, at)) {
+      for (const { slot, value, point, effect, call, definite, weak } of writesAt(history, at)) {
         if (shadowed?.has(slot)) continue;
         const match = effect ? writeProjection(effect, slot, path) : relativeSlot(slot, path);
         if (!match) continue;
         // 未建模的跳转下只收集同一对象和槽位的可能来源，不用任一赋值覆盖其他证据。
-        let mandatory = !unstructuredJump && point.order < at.order && !unordered(point, at), excluded = false;
+        let mandatory = !weak && !unstructuredJump && point.order < at.order && !unordered(point, at), excluded = false;
         if (mandatory) for (const [guard, arm] of point.guards) {
           const same = sameArm(guard, arm, point, at);
           if (same !== true) mandatory = false;
@@ -447,7 +558,10 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       } else merge(ambient(source, path));
     }
     if (!at) return { targets: [], parameters: [], unknown: true };
-    if (pointer) for (const slot of paths(pointer)) read(pointer.key, slot, at, 0, pointer.fieldId, pointer.unionId);
+    if (sources) for (const src of sources) {
+      unknown ||= src.unknown;
+      for (const slot of paths(src)) read(src.key, slot, at, 0, src.fieldId, src.unionId);
+    }
     else if (effect) evaluateWrite(effect, valueSlot, at.call, at, 0);
     else evaluate(value, valueSlot, at, 0);
     return { targets: [...targets], unknown, uncertainLayout, parameters };
@@ -462,11 +576,13 @@ export function callbackSlotReader(record, objectKey, resolveFunction, { ambient
       }
     },
     atCall(pointer, call) {
-      const src = objectSlot(pointer), at = designators.get(call) || points.get(call);
-      if (!src) return null;
-      const changed = [...(tracked.get(src.key) || [])].some(prefix => relativeSlot(prefix, src.slot));
-      const escaped = escapes.get(src.key)?.some(w => relativeSlot(w.slot, src.slot) && reaches(w.point, at));
-      return src.throughPointer || changed || escaped ? resolve(src, null, at) : null;
+      const at = designators.get(call) || points.get(call);
+      const sources = objectSlots(pointer, at);
+      if (!sources.length) return null;
+      const trackedSource = sources.some(src => src.throughPointer || src.decl.kind === 'CompoundLiteralExpr' ||
+        [...(tracked.get(src.key) || [])].some(prefix => relativeSlot(prefix, src.slot)) ||
+        escapes.get(src.key)?.some(w => relativeSlot(w.slot, src.slot) && reaches(w.point, at)));
+      return trackedSource ? resolve(sources, null, at) : null;
     },
     atAssignment(write, slot) {
       if (write.effect) return resolve(null, null, points.get(write.node), slot, write.effect);

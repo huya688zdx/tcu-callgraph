@@ -503,8 +503,9 @@ export function normalizeRecordBaseType(type, context) {
 
 export function pointerExpression(node, context = null) {
   node = unwrap(node);
-  if (node?.kind === 'DeclRefExpr') {
-    return { decl: node.referencedDecl, slot: '', sourceSlot: '', member: null, baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
+  if (node?.kind === 'DeclRefExpr' || node?.kind === 'CompoundLiteralExpr') {
+    return { decl: node.referencedDecl || node, slot: '', sourceSlot: '', member: null,
+      baseType: normalizeRecordBaseType(typeOf(node), context), exact: true };
   }
   if (!node) return null;
   if (node.kind === 'MemberExpr' || node.kind === 'ArraySubscriptExpr') {
@@ -515,6 +516,7 @@ export function pointerExpression(node, context = null) {
     const constant = node.kind === 'ArraySubscriptExpr' ? constIndexValue(rawIndex, context) : null;
     const rawBaseType = node.kind === 'MemberExpr' ? normalizeRecordBaseType(typeOf(baseNode), context) : base.baseType;
     const sourceSuffix = node.kind === 'MemberExpr' ? (node.name ? '.' + node.name : '') : `[${constant ?? '*'}]`;
+    const dereference = node.isArrow || (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay');
     return {
       ...base,
       slot: base.slot + (context?.storageFields?.slots.get(node.referencedMemberDecl) ?? sourceSuffix),
@@ -522,10 +524,8 @@ export function pointerExpression(node, context = null) {
       sourceSlot: base.sourceSlot + sourceSuffix,
       ...(node.kind === 'ArraySubscriptExpr' && constant === null
         ? { bounds: [...(base.bounds || []), Number(/\[(\d+)\]/.exec(typeOf(unwrap(baseNode)))?.[1])] } : {}),
-      ...(node.kind === 'ArraySubscriptExpr' && !base.slot && !base.throughPointer && baseNode.castKind !== 'ArrayToPointerDecay'
-        ? { pointerIndex: constant ?? '*' } : {}),
-      throughPointer: base.throughPointer || node.isArrow ||
-        (node.kind === 'ArraySubscriptExpr' && baseNode.castKind !== 'ArrayToPointerDecay'),
+      ...(dereference && { indirection: { operand: baseNode, prefix: base.slot, index: node.isArrow ? null : constant ?? '*' } }),
+      throughPointer: base.throughPointer || dereference,
       fieldId: node.kind === 'MemberExpr' ? node.referencedMemberDecl : base.fieldId,
       member: node.kind === 'MemberExpr' ? node.name : base.member,
       baseType: rawBaseType || base.baseType,
@@ -536,7 +536,7 @@ export function pointerExpression(node, context = null) {
     const operand = children(node)[0], base = pointerExpression(operand, context);
     // (*cb)() 对函数指示符的解引用等价于 cb()，而 (*slot)() 仍需读取另一个对象。
     if (context && cleanType(typeOf(node), context.aliases) === functionSignature(typeOf(operand), context)) return base;
-    return base && { ...base, throughPointer: true };
+    return base && { ...base, throughPointer: true, indirection: { operand, prefix: base.slot, index: null } };
   }
   return null;
 }
@@ -554,7 +554,7 @@ export function collectAssignmentWrites(body, context) {
     // 只有整个函数就是 *p = value 时，直接传入的确定对象一定被替换。
     const replacesPointee = !callback && children(body).length === 1 && children(body)[0] === node &&
       dest.kind === 'UnaryOperator' && dest.opcode === '*' && unwrap(children(dest)[0])?.kind === 'DeclRefExpr';
-    writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, pointerIndex: lhs.pointerIndex,
+    writes.push({ node, value, decl: lhs.decl, throughPointer: lhs.throughPointer, indirection: lhs.indirection,
       slot: lhs.slot, fieldId: lhs.fieldId, unionId: lhs.unionId, aggregate: !callback, replacesPointee });
   }
   return writes;

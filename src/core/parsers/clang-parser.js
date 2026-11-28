@@ -7,7 +7,7 @@ import { decodeSource, scanSources } from '../source-files.js';
 import { clangCacheKey, completeCompileUnits, dependencyStamp, detectClang, fileKey,
   findCompileCommands, readCompileCommands, relativeFile } from './clang-config.js';
 import { children, collectAssignmentWrites, evaluatedChildren, fnRef, functionModel, functionSignature, pointerExpression, pointerSlots,
-  readTranslationUnit, transferredValues, typeOf, variableModel, walk, walkEvaluated } from './clang-ast.js';
+  readTranslationUnit, transferredValues, typeOf, unwrap, variableModel, walk, walkEvaluated } from './clang-ast.js';
 import { argumentSource, callbackSlotReader, hasStaticStorage, matchingSlot, relativeSlot, writeProjection } from './clang-copy.js';
 import { collectDataflow } from './clang-dataflow.js';
 import { applyDataflow } from './ir.js';
@@ -84,6 +84,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
 
   // AST 地址只在单个编译单元内唯一。局部对象用声明节点本身作为键。
   const objectKey = (decl, unit) => {
+    if (decl?.kind === 'CompoundLiteralExpr') return decl;
     const id = resolveVariable(decl, unit);
     if (!id) return unit.declarations.get(decl?.id)?.node;
     const def = defs.get(id);
@@ -190,7 +191,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
           addressUsers.get(addr.key).add(record);
         }
         for (const value of transferredValues(node)) {
-          if (!typeOf(value).includes('*')) continue;
+          if (!typeOf(value).includes('*') && !unit.valueRecords.has(unwrap(value))) continue;
           for (const use of walkEvaluated(value)) {
             const ref = use.referencedDecl;
             if (ref?.kind === 'ParmVarDecl') forwardedParams.add(objectKey(ref, unit));
@@ -282,12 +283,11 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
     }
     return { records, callers };
   }
+  function initiallyEscaped(key, slot) {
+    return !tables.get(key)?.constant && [...(initialEscapes.get(key) || [])].some(prefix => relativeSlot(prefix, slot));
+  }
   function* storageWrites(key, slot, records) {
-    // 保存在静态初始化器中的地址也可传到工程外，只影响其指向的区域。
-    if (!records && !tables.get(key)?.constant) for (const prefix of initialEscapes.get(key) || []) {
-      const match = relativeSlot(prefix, slot);
-      if (match) yield { write: null, rest: match.rest };
-    }
+    if (!records && initiallyEscaped(key, slot)) yield { write: null, rest: '' };
     for (const w of declWrites.get(key) || []) {
       if (records && !records.has(w.record)) continue;
       const match = writeProjection(w, w.slot, slot);
@@ -370,7 +370,7 @@ function assemble(root, files, units, warnings, failedFiles, sourcePaths, dispat
         return writes;
       };
       const fieldWrites = (id, slot, unionId) => fieldValues(indirectFieldWrites, fieldLocation(record.context, id, slot, unionId));
-      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode }));
+      readers.set(record, callbackSlotReader(record, objectKey, resolveFunction, { ambient, parameterWrites, fieldWrites, writeValue, callWrites, writesByNode, initiallyEscaped }));
     }
     return readers.get(record);
   }
